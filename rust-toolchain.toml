@@ -1,3 +1,0 @@
-[toolchain]
-# @fb-only: path = "../../third-party-buck/platform010/build/rust/llvm-fb-15"
-channel = "nightly" # @oss-only
