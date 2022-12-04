@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+
+FROM hermit-dev AS builder
+# Should be built from the top-level directory:
+ADD . /hermit
+WORKDIR /hermit
+RUN cargo build --release
+
+FROM ubuntu:latest
+RUN apt-get update && apt-get install -y libunwind-dev
+COPY --from=builder /hermit/target/release/hermit /usr/bin/hermit

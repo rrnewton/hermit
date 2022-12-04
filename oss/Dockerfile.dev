@@ -1,0 +1,11 @@
+FROM ubuntu:latest
+# FROM debian:latest
+RUN apt-get update && apt-get install -y curl git build-essential libunwind-dev pkg-config
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+ENV PATH=$PATH:/root/.cargo/bin
+RUN rustup toolchain install nightly --allow-downgrade --profile minimal --component clippy
+
+# A workaround to cargo update running out of memory under QEMU:
+# See: https://users.rust-lang.org/t/cargo-uses-too-much-memory-being-run-in-qemu/76531
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
