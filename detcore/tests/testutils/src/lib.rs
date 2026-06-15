@@ -8,7 +8,6 @@
 
 //! Testing utilities.
 
-#![feature(trace_macros)]
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::Arc;
