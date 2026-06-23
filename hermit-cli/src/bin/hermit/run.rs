@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
@@ -23,7 +24,6 @@ use colored::Colorize;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
-use lazy_static::lazy_static;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -201,14 +201,13 @@ pub struct RunOpts {
 }
 
 fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
-    lazy_static! {
-        static ref ENV_RE: regex::Regex =
-           // Here we are extremely permissive, allowing all charecters in the "Portable Character
-           // Set", ISO/IEC 6429:1992 standard:
-           regex::Regex::new("^([\x07-<>-~]+)=([\x07-~]*)$").unwrap();
-        static ref VAR_RE: regex::Regex =
-           regex::Regex::new("^([\x07-<>-~]+)$").unwrap();
-    }
+    static ENV_RE: LazyLock<regex::Regex> = LazyLock::new(||
+        // Here we are extremely permissive, allowing all charecters in the "Portable Character
+        // Set", ISO/IEC 6429:1992 standard:
+        regex::Regex::new("^([\x07-<>-~]+)=([\x07-~]*)$").unwrap());
+    static VAR_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new("^([\x07-<>-~]+)$").unwrap());
+
     if let Some(capture) = ENV_RE.captures(src) {
         if let (Some(name), Some(value)) = (capture.get(1), capture.get(2)) {
             Ok((name.as_str().to_owned(), Some(value.as_str().to_owned())))

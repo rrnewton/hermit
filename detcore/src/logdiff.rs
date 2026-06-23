@@ -19,10 +19,10 @@ use std::ops::Bound;
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use clap;
 use clap::Parser;
-use lazy_static::lazy_static;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
@@ -158,31 +158,30 @@ impl Default for LogDiffOpts {
 /// As you can see this is overkill and smarter strategies would be possible. For example,
 /// ones that remember and post-facto-determinize certain identifiers.
 pub fn strip_log_entry(log: &str) -> String {
-    lazy_static! {
-        // Memory addresses, like 0x7fcfb7e7d450
-        //
-        // TODO: use a debug allocator that increases only, never reusing. Also, consider
-        // post-facto processing all of these into new virtual addresses based on the order they're seen.
-        static ref RE0: Regex = Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap();
+    // Memory addresses, like 0x7fcfb7e7d450
+    //
+    // TODO: use a debug allocator that increases only, never reusing. Also, consider
+    // post-facto processing all of these into new virtual addresses based on the order they're seen.
+    static RE0: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap());
 
-        // The basic reason for treating spawn_fn style tests differently is that using
-        // detcore for these forked function calls is really a *partial* version of detcore,
-        // not the full and proper setup.  In contrast, for all command tests, and for `hermit
-        // run` itself, the full contents of the COMMIT line should be deterministic and this
-        // hack should not be needed.
-        static ref RE1: Regex = Regex::new(r"\b[\d]+\b").unwrap(); // This one is terrible overkill.
+    // The basic reason for treating spawn_fn style tests differently is that using
+    // detcore for these forked function calls is really a *partial* version of detcore,
+    // not the full and proper setup.  In contrast, for all command tests, and for `hermit
+    // run` itself, the full contents of the COMMIT line should be deterministic and this
+    // hack should not be needed.
+    static RE1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[\d]+\b").unwrap()); // This one is terrible overkill.
 
-        // TODO: only strip this information if the config specified to the host /tmp through.
-        // Otherwise we can determinize /tmp access fully.
-        static ref RE2: Regex = Regex::new(r#"/tmp/.*""#).unwrap();
+    // TODO: only strip this information if the config specified to the host /tmp through.
+    // Otherwise we can determinize /tmp access fully.
+    static RE2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/tmp/.*""#).unwrap());
 
-        // TODO: only strip this one if we're allowing through the host /proc or failing to determinize tids/pids:
-        static ref RE3: Regex = Regex::new(r"/proc/[\d]+/").unwrap();
+    // TODO: only strip this one if we're allowing through the host /proc or failing to determinize tids/pids:
+    static RE3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/proc/[\d]+/").unwrap());
 
-        // TODO: only strip this if we're running a library-based test where we can't
-        // guarantee the starting state of the allocator/etc.
-        static ref RE4: Regex = Regex::new(r"\b[\d][\d_.]*s\b").unwrap();
-    }
+    // TODO: only strip this if we're running a library-based test where we can't
+    // guarantee the starting state of the allocator/etc.
+    static RE4: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[\d][\d_.]*s\b").unwrap());
+
     let log = RE4.replace_all(log, "<NANOSECONDS>");
     let log = RE3.replace_all(&log, "/proc/<PID>/");
     let log = RE0.replace_all(&log, "<ADDR>");
@@ -228,9 +227,9 @@ fn is_detlog(line: &str) -> bool {
 }
 
 fn is_detcore(line: &str) -> bool {
-    lazy_static! {
-        static ref PREFIX: Regex = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE).* detcore:").unwrap();
-    }
+    static PREFIX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE).* detcore:").unwrap());
+
     PREFIX.is_match(line)
 }
 

@@ -11,13 +11,13 @@
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use detcore::Config;
 use detcore::Detcore;
 use detcore::SchedHeuristic;
-use lazy_static::lazy_static;
 use pretty_assertions::assert_eq;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -43,12 +43,11 @@ struct DetTestState {
     test_run_num: u64,
 }
 
-lazy_static! {
-  static ref DEFAULT_CFG: Config = Default::default();
+static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
 
-  /// Standardized test config: all options off.
-  /// (This is the bottom element of a lattice containing exponentially many possibly Configs.)
-  pub static ref BOTTOM_CFG: Config = Config {
+/// Standardized test config: all options off.
+/// (This is the bottom element of a lattice containing exponentially many possibly Configs.)
+pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: false,
     virtualize_time: false,
     virtualize_metadata: false,
@@ -95,13 +94,13 @@ lazy_static! {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
-  };
+});
 
-  /// Standardized test config: common options on.
-  /// (This is drawn from the middle of the lattice of possible Configs.)
-  pub static ref MIDDLE_CFG: Config = Config {
+/// Standardized test config: common options on.
+/// (This is drawn from the middle of the lattice of possible Configs.)
+pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
-    virtualize_time: true,  // stat* could depends on this
+    virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
     imprecise_timers: false,
@@ -146,11 +145,11 @@ lazy_static! {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
-  };
+});
 
-  /// Standardized test config: all options on.
-  /// (This is the top element of a lattice containing exponentially many possibly Configs.)
-  pub static ref TOP_CFG: Config = Config {
+/// Standardized test config: all options on.
+/// (This is the top element of a lattice containing exponentially many possibly Configs.)
+pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
     virtualize_time: true,
     virtualize_metadata: true,
@@ -197,8 +196,7 @@ lazy_static! {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
-  };
-}
+});
 
 /// A basic oracle, which expects a success exit code.
 pub fn expect_success(o: &Output, _s: <Detcore as Tool>::GlobalState) {
