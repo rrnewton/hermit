@@ -15,10 +15,10 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use clap::Parser;
 use hermit::Error;
-use once_cell::sync::OnceCell;
 use reverie::Errno;
 use reverie::Error as TraceError;
 use reverie::ExitStatus;
@@ -59,7 +59,7 @@ pub struct BnzOpts {
     config: BnzConfig,
 }
 
-static LOGGER: OnceCell<std::fs::File> = OnceCell::new();
+static LOGGER: OnceLock<std::fs::File> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BnzResult {

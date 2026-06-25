@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 #[cfg(not(fbcode_build))]
 const OSS_VERSION: &str = "0.1";
@@ -17,7 +17,7 @@ impl Version {
     /// Gets a static string of the version. Useful for integration with
     /// clap.
     pub fn get() -> &'static str {
-        static VERSION: OnceCell<Version> = OnceCell::new();
+        static VERSION: OnceLock<Version> = OnceLock::new();
         VERSION.get_or_init(Self::new).version()
     }
 
