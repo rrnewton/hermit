@@ -24,7 +24,7 @@ num_cpus = "1.16"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 rand = "0.10.2"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
-regex = "1.13.0"
+regex = "1.13.1"
 reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
