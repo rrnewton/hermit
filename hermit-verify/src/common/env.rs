@@ -100,7 +100,7 @@ impl TemporaryEnvironmentBuilder {
             let workdir = run_temp_dir_path.join("workdir");
             create_dir(workdir.as_path())?;
             if self.verbose {
-                println!("  {}", format!("Work dir created: {:?}", &workdir).dimmed());
+                println!("  {}", format!("Work dir created: {:?}", workdir).dimmed());
             }
 
             let log_file_path = self.create_file(&run_temp_dir_path, "log")?;

@@ -673,9 +673,11 @@ impl GlobalState {
             } else {
                 // In replay mode, the context switch point will already have initialized the priority.
                 // UNLESS this is the root thread, in which case we need to fill it in:
-                if sched.priorities.get(&child_dettid).is_none() {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    sched.priorities.entry(child_dettid)
+                {
                     assert_eq!(parent_detpid, ROOT_DETPID);
-                    let _ = sched.priorities.insert(child_dettid, initial_priority);
+                    entry.insert(initial_priority);
                 }
             }
 
@@ -977,19 +979,19 @@ impl GlobalState {
             }
         };
 
-        if result.print_stack_strace.is_some() {
-            if let Some(sig) = &self.cfg.stacktrace_signal {
-                trace!(
-                    "[dtid {}] signaling thread with {} at the point of stack trace printing.",
-                    ev.dettid, sig.0
-                );
-                let tid = Pid::from_raw(ev.dettid.as_raw());
-                // TODO(T78538674): virtualize pid/tid:
-                // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
-                // We don't use the "signal_guest" method because we don't necessarily respect that
-                // protocol here.
-                signal::kill(tid, sig.0).unwrap();
-            }
+        if result.print_stack_strace.is_some()
+            && let Some(sig) = &self.cfg.stacktrace_signal
+        {
+            trace!(
+                "[dtid {}] signaling thread with {} at the point of stack trace printing.",
+                ev.dettid, sig.0
+            );
+            let tid = Pid::from_raw(ev.dettid.as_raw());
+            // TODO(T78538674): virtualize pid/tid:
+            // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
+            // We don't use the "signal_guest" method because we don't necessarily respect that
+            // protocol here.
+            signal::kill(tid, sig.0).unwrap();
         }
 
         result
@@ -1513,9 +1515,11 @@ where
                 write_backtrace(guest, m_path.as_ref());
             }
 
-            if timeslice.is_some() && guest.thread_state().past_global_first_execve {
+            if let Some(timeslice) = timeslice
+                && guest.thread_state().past_global_first_execve
+            {
                 let end_of_timeslice =
-                    guest.thread_state().thread_logical_time.as_nanos() + timeslice.unwrap();
+                    guest.thread_state().thread_logical_time.as_nanos() + timeslice;
                 trace!(
                     "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
                     guest.thread_state().dettid,

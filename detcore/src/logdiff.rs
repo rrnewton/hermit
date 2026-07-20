@@ -564,7 +564,7 @@ mod test {
         let str2 = "test2";
 
         assert_eq!(
-            format!("{}", &super::Comparison::new(true, str1, str2))
+            format!("{}", super::Comparison::new(true, str1, str2))
                 .split('\n')
                 .collect::<Vec<&str>>(),
             ["Diff < left / right > :", "<\"test1\"", ">\"test2\"", "",]
@@ -577,7 +577,7 @@ mod test {
         let str2 = "test2";
 
         assert_eq!(
-            format!("{}", &super::Comparison::new(false, str1, str2))
+            format!("{}", super::Comparison::new(false, str1, str2))
                 .split('\n')
                 .collect::<Vec<&str>>(),
             [

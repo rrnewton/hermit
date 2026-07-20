@@ -8,6 +8,10 @@
 
 #![feature(get_mut_unchecked)]
 #![feature(thread_id_value)]
+#![allow(
+    unexpected_cfgs,
+    reason = "`sanitized` is supplied by the internal sanitizer build"
+)]
 
 use std::sync::Arc;
 

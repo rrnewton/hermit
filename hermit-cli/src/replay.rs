@@ -164,10 +164,11 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     //     program headers until reaching the `INTERP` program header.
     chroot.copy_same(default_ldso)?;
 
-    if let Some(interp) = interp::elf_get_interp(&metadata.exe) {
-        if interp.is_file() && interp != default_ldso {
-            chroot.copy_same(&interp)?;
-        }
+    if let Some(interp) = interp::elf_get_interp(&metadata.exe)
+        && interp.is_file()
+        && interp != default_ldso
+    {
+        chroot.copy_same(&interp)?;
     }
 
     // Create the working directory.

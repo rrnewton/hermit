@@ -9,6 +9,10 @@
 // Treat all Clippy warnings as errors.
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
 
 mod analyze;
 mod bnz;

@@ -58,6 +58,29 @@ from running examples in the [./examples](./examples) folder.
 
 # Building and running Hermit
 
+## Build Prerequisites
+
+Hermit is supported on x86_64 Linux and requires the nightly Rust toolchain.
+The repository's `rust-toolchain.toml` selects nightly automatically when Rust
+is installed through [rustup](https://rustup.rs/).
+
+Install the libunwind and LZMA development packages before building. On Debian
+or Ubuntu, run:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libunwind-dev liblzma-dev
+```
+
+On Fedora or CentOS, run:
+
+```bash
+sudo dnf install -y libunwind-devel xz-devel
+```
+
+The LZMA development package (`liblzma-dev` on Debian/Ubuntu and `xz-devel` on
+Fedora/CentOS) is required to avoid `lzma` link errors.
+
 Hermit is built with the standard Rust cargo tool.
 
 ```bash

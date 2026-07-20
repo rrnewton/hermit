@@ -258,10 +258,10 @@ macro_rules! make_det_test_variants {
 /// as a separate unit test. This is in contrast with `det_test_all_configs` which runs
 /// multiple modes sequentially under one test target.
 ///
-/// Arguments are `basic_det_test(function, predicate, modes...)`, wWhere:
+/// Arguments are `basic_det_test(function, predicate, modes...)`, where:
 ///   - `function` is the procedure under test.
 ///   - `predicate` is a function that accepts a Config and returns true if the test should
-///      run deterministically in that configuration.
+///     run deterministically in that configuration.
 ///
 /// This generates calls to `det_test_fn_with_config`.
 #[macro_export]
@@ -566,7 +566,7 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
             if let [_pref, suffix] = vec[..] {
                 suffix.to_string()
             } else {
-                panic!("Unexpected form to COMMIT log line: {}", &s);
+                panic!("Unexpected form to COMMIT log line: {}", s);
             }
         })
         .collect();

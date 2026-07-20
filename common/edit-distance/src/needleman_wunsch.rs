@@ -133,8 +133,8 @@ impl<T: PartialEq + Clone> NeedlemanWunsch<T> {
             }
         }
 
-        for j in 1..col {
-            matrix[0][j] = mismatch_penalty * (j as i32);
+        for (j, score) in matrix[0].iter_mut().enumerate().skip(1) {
+            *score = mismatch_penalty * (j as i32);
         }
         let mut tracing_matrix: Vec<Vec<Trace>> = vec![vec![Trace::Stop; col]; row];
 

@@ -237,7 +237,7 @@ impl HermitData {
         // recording if this file does not exist.
         let metadata_path = path.join(METADATA_NAME);
         let metadata = fs::metadata(&metadata_path)
-            .with_context(|| format!("Failed to find {:?}", &metadata_path))?;
+            .with_context(|| format!("Failed to find {:?}", metadata_path))?;
 
         if !metadata.is_file() {
             return Err(anyhow!("{:?} is not a file", metadata_path));

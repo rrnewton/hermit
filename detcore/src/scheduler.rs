@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::u64;
 use std::vec::IntoIter;
 
 use detcore_model::summary::RunSummary;
@@ -582,15 +581,15 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
             if sched.run_queue.is_empty() && sched.blocked.is_empty() {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 return;
-            } else if let Some(stop) = sched.stop_after_turn {
-                if sched.turn > stop {
-                    tracing::warn!(
-                        "[scheduler] Early exit during turn {} due to --stop-after-turn.  Summary:\n\n{}",
-                        sched.turn,
-                        sched.full_summary()
-                    );
-                    immediate_fatal_exit(); // We don't want a backtrace of this thread.
-                }
+            } else if let Some(stop) = sched.stop_after_turn
+                && sched.turn > stop
+            {
+                tracing::warn!(
+                    "[scheduler] Early exit during turn {} due to --stop-after-turn.  Summary:\n\n{}",
+                    sched.turn,
+                    sched.full_summary()
+                );
+                immediate_fatal_exit(); // We don't want a backtrace of this thread.
             }
         }
 
@@ -692,7 +691,7 @@ pub async fn do_a_turn_blocking(
 fn assert_futex_request(nextturn: &ThreadNextTurn) {
     match nextturn.req.try_read() {
         Some(Ok(req)) => {
-            if !(req.resources.get(&ResourceID::FutexWait).is_some() && req.resources.len() == 1) {
+            if !(req.resources.contains_key(&ResourceID::FutexWait) && req.resources.len() == 1) {
                 panic!(
                     "assert_empty_request({}): internal invariant broken, expected empty resource request, found: {:?}",
                     nextturn.dettid, req
@@ -835,7 +834,7 @@ impl Scheduler {
         let nextturn = self.next_turns.get(det_tid).unwrap_or_else(|| {
             panic!(
                 "[check_request] internal error: dettid {} queued but missing entry in next_turns",
-                &det_tid
+                det_tid
             )
         });
         if nextturn.req.try_read().is_none() {
@@ -858,28 +857,28 @@ impl Scheduler {
         observed: &SchedEvent,
     ) -> MaybePrintStack {
         let mut result = None;
-        if let Some(iter) = &mut self.stacktrace_events {
-            if let Some((next_ix, event, m_path)) = iter.peek() {
-                let go = if let Some(ev) = event {
-                    (*next_ix == current_ix && events_consistent(observed, ev))
-                        || events_match(observed, ev)
-                } else {
-                    *next_ix == current_ix
-                };
-                if go {
-                    info!(
-                        "Now output stack trace for scheduled event #{} = {}:",
+        if let Some(iter) = &mut self.stacktrace_events
+            && let Some((next_ix, event, m_path)) = iter.peek()
+        {
+            let go = if let Some(ev) = event {
+                (*next_ix == current_ix && events_consistent(observed, ev))
+                    || events_match(observed, ev)
+            } else {
+                *next_ix == current_ix
+            };
+            if go {
+                info!(
+                    "Now output stack trace for scheduled event #{} = {}:",
+                    current_ix, observed,
+                );
+                if m_path.is_none() {
+                    eprintln!(
+                        "\nPrinting stack trace for scheduled event #{} = {}:",
                         current_ix, observed,
                     );
-                    if m_path.is_none() {
-                        eprintln!(
-                            "\nPrinting stack trace for scheduled event #{} = {}:",
-                            current_ix, observed,
-                        );
-                    }
-                    result = Some(m_path.clone());
-                    let _ = iter.next();
                 }
+                result = Some(m_path.clone());
+                let _ = iter.next();
             }
         }
         result
@@ -1687,16 +1686,16 @@ impl Scheduler {
         let old_priority = self.priorities.insert(dettid, new_priority);
 
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
-        if self.replayer.is_none() {
-            if let Some(pw) = &mut self.preemption_writer {
-                let old_prio = old_priority.unwrap();
-                debug!(
-                    "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
-                    dettid, guest_time, old_prio, new_priority
-                );
-                pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
-                pw.set_current(dettid, new_priority);
-            }
+        if self.replayer.is_none()
+            && let Some(pw) = &mut self.preemption_writer
+        {
+            let old_prio = old_priority.unwrap();
+            debug!(
+                "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
+                dettid, guest_time, old_prio, new_priority
+            );
+            pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
+            pw.set_current(dettid, new_priority);
         }
 
         let popped = self.run_queue.commit_tentative_pop(); // Begun in step3.
@@ -2123,7 +2122,7 @@ impl Scheduler {
     /// Summarize the state of the scheduler while executing (verbose).
     pub fn full_summary(&self) -> String {
         let mut buf = String::new();
-        write!(&mut buf, "  {}", &self.run_queue).unwrap();
+        write!(&mut buf, "  {}", self.run_queue).unwrap();
 
         let total_futex_blocked: usize = self.blocked.futex_waiters.iter().map(|v| v.1.len()).sum();
         writeln!(

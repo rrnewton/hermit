@@ -541,7 +541,7 @@ impl GlobalTime {
     // The expensive way to get the total (internal)
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
-        for (_tid, tm) in self.time_vector.iter() {
+        for tm in self.time_vector.values() {
             sum = sum + *tm;
         }
         sum + self.extra_time

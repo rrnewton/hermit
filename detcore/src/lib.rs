@@ -140,23 +140,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
-                if let Some(last_timer) = thread_state.last_rcb_timer {
-                    if delta_rcbs > last_timer && precise_timers {
-                        panic!(
-                            "prehook: Missed expected preemption! Clock_value: {}. Stepped forward {:?} RCBs, but should have trapped at {:?}",
-                            clock_value, delta_rcbs, last_timer
-                        );
-                        // TODO: turn the above panic into a warning again if we see any weirdness
-                        // on certain platforms.
-                        // We can repair the state and keep going, using the below:
-                        /*
-                        thread_state.end_of_timeslice = None;
-                        thread_state.last_rcb_timer = None;
-                        thread_state.next_timeslice(&self.cfg);
-                        */
-                    }
-                    // Otherwise we're very early, at the prehook of handle_thread_start.
+                if let Some(last_timer) = thread_state.last_rcb_timer
+                    && delta_rcbs > last_timer
+                    && precise_timers
+                {
+                    panic!(
+                        "prehook: Missed expected preemption! Clock_value: {}. Stepped forward {:?} RCBs, but should have trapped at {:?}",
+                        clock_value, delta_rcbs, last_timer
+                    );
+                    // TODO: turn the above panic into a warning again if we see any weirdness
+                    // on certain platforms.
+                    // We can repair the state and keep going, using the below:
+                    /*
+                    thread_state.end_of_timeslice = None;
+                    thread_state.last_rcb_timer = None;
+                    thread_state.next_timeslice(&self.cfg);
+                    */
                 }
+                // Otherwise we're very early, at the prehook of handle_thread_start.
             } else {
                 panic!(
                     "Invariant violation: end_of_timeslice is None during update_logical_time_rcbs..."

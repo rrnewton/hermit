@@ -710,7 +710,7 @@ impl AnalyzeOpts {
         let normalized_preempts = min_run.preempts_out().clone();
         eprintln!(
             ":: {}\n {}",
-            &format!(
+            format!(
                 "Normalized, that preemption record ({}) becomes:",
                 min_run
                     .preempts_path_out()

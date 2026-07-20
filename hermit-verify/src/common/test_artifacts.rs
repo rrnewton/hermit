@@ -26,14 +26,12 @@ impl TestArtifacts {
         if !Path::new(&self.test_result_artifact_dir).exists() {
             std::fs::create_dir_all(&self.test_result_artifact_dir)?;
         }
-        let mut env_number = 1;
-        for env in tmp_env.runs().iter() {
+        for (env_number, env) in (1..).zip(tmp_env.runs().iter()) {
             self.copy_file(&env.log_file_path, env_number)?;
             self.copy_file(&env.std_out_file_path, env_number)?;
             self.copy_file(&env.std_err_file_path, env_number)?;
             self.copy_file(&env.exit_status_file_path, env_number)?;
             self.copy_file(&env.schedule_file, env_number)?;
-            env_number += 1;
         }
 
         Ok(())

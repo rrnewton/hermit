@@ -55,7 +55,7 @@ pub enum FdType {
     Pidfd,
     /// userfaultfd
     Userfaultfd,
-    ///
+    /// Random-number generator device
     Rng,
 }
 
