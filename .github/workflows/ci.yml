@@ -11,8 +11,8 @@ env:
   RUSTFLAGS: -C link-arg=-llzma
 
 jobs:
-  build:
-
+  regular:
+    name: Regular tests (GitHub-hosted)
     runs-on: ubuntu-latest
 
     steps:
@@ -20,36 +20,32 @@ jobs:
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Build
-      run: cargo build
-
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
-    - name: Test
-      run: cargo test --workspace
-
-  clippy:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: cargo build --workspace
+    - name: Test regular workspace crates
+      run: cargo test --workspace --exclude detcore
+    - name: Test Detcore without hardware-dependent integration tests
+      run: |
+        cargo test -p detcore --lib --bins
+        cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
+    - name: Documentation tests
+      run: cargo test --workspace --doc
     - name: Rust components
-      run: rustup component add clippy
+      run: rustup component add clippy rustfmt
     - name: Clippy
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Format
+      run: cargo fmt --all -- --check
 
-  fmt:
-    runs-on: ubuntu-latest
+  hardware:
+    name: Hardware-dependent tests (self-hosted, disabled)
+    if: ${{ false }} # Enable after a compatible runner is available.
+    runs-on: [self-hosted, linux, x64]
 
     steps:
     - uses: actions/checkout@v3
-    - name: Rust components
-      run: rustup component add rustfmt
-    - name: Format
-      run: cargo fmt --check
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: CPUID and RDRAND/RDSEED tests
+      run: cargo test -p detcore --test tests_misc
+    - name: PMU preemption and CPU instruction tests
+      run: cargo test -p detcore --test tests_parallelism --test tests_time
