@@ -61,5 +61,11 @@ jobs:
         cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
     - name: PMU RCB counter smoke test
       run: cargo test -p detcore --test tests_time tod_is_stable -- --exact
-    - name: Hermit namespace and record/replay integration tests
-      run: cargo test -p hermit
+    - name: Hermit tests
+      run: |
+        if unshare --user --map-root-user --mount sh -c 'mount -t tmpfs tmpfs /mnt && umount /mnt' 2>/dev/null; then
+          cargo test -p hermit
+        else
+          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
+          cargo test -p hermit --lib --bins
+        fi
