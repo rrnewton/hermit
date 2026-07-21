@@ -167,6 +167,8 @@ fn run_help_exposes_determinism_modes() {
         "Bare names are resolved using the guest PATH",
         "hidden by Hermit's isolated `/tmp`",
         "without ptrace, seccomp interception, or determinization",
+        "--no-namespace",
+        "--core-only",
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
     }
@@ -328,6 +330,65 @@ fn incompatible_run_modes_fail_during_argument_parsing() {
     assert!(
         stderr.contains("cannot be used with"),
         "unexpected error:\n{stderr}"
+    );
+}
+
+#[test]
+fn no_namespace_rejects_container_only_options() {
+    let cases = [
+        "--namespace-only",
+        "--analyze-networking",
+        "--mount=type=bind,source=/tmp,target=/tmp",
+        "--bind=/tmp",
+    ];
+
+    for incompatible in cases {
+        let args = ["run", "--no-namespace", incompatible, "/bin/true"];
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "hermit {args:?} unexpectedly ran"
+        );
+
+        let stderr = String::from_utf8(output.stderr).expect("hermit stderr should be UTF-8");
+        assert!(
+            stderr.contains("--no-namespace"),
+            "unexpected error:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(incompatible.split_once("=").map_or(incompatible, |x| x.0)),
+            "unexpected error:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("cannot be used with"),
+            "unexpected error:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn no_namespace_runs_without_container_setup() {
+    let args = [
+        "run",
+        "--no-namespace",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/echo",
+        "hello",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+
+    assert_eq!(stdout(&output), "hello\n");
+    let stderr = String::from_utf8(output.stderr).expect("hermit stderr should be UTF-8");
+    assert!(
+        stderr.contains("WARNING: --no-namespace"),
+        "unexpected stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("less deterministic"),
+        "unexpected stderr:\n{stderr}"
     );
 }
 
