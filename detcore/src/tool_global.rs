@@ -429,7 +429,14 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::GlobalTimeLowerBound => {
-                let ns = self.global_time.lock().unwrap().as_nanos();
+                let global_time = self.global_time.lock().unwrap();
+                // Aggregate work is wall-clock-like only when threads cannot
+                // make progress concurrently.
+                let ns = if self.cfg.sequentialize_threads {
+                    global_time.as_nanos()
+                } else {
+                    global_time.wall_clock_time()
+                };
                 R::GlobalTimeLowerBound(ns)
             }
             GlobalRequest::TraceSchedEvent(ev, detpid) => {
