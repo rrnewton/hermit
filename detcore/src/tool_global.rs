@@ -88,6 +88,16 @@ struct DetInodeInfo {
     mtime: LogicalTime,
 }
 
+struct ChildRegistration {
+    parent_dettid: DetTid,
+    parent_detpid: DetPid,
+    child_dettid: DetTid,
+    child_tid_addr: usize,
+    flags: Option<CloneFlags>,
+    maybe_priority: Option<Priority>,
+    parent_is_kernel_blocked: bool,
+}
+
 impl Default for InodePool {
     fn default() -> Self {
         InodePool::new()
@@ -401,15 +411,41 @@ impl GlobalTool for GlobalState {
                 R::CreateChildThread(
                     self.recv_create_child_thread(
                         from,
-                        parent_detpid,
-                        dettid,
-                        ctid,
-                        flags,
-                        priority,
+                        ChildRegistration {
+                            parent_dettid: DetTid::from_raw(from.into()),
+                            parent_detpid,
+                            child_dettid: dettid,
+                            child_tid_addr: ctid,
+                            flags,
+                            maybe_priority: priority,
+                            parent_is_kernel_blocked: false,
+                        },
                     )
                     .await,
                 )
             }
+            GlobalRequest::CreateVforkChildThread(
+                parent_dettid,
+                parent_detpid,
+                child_dettid,
+                ctid,
+                flags,
+                priority,
+            ) => R::CreateChildThread(
+                self.recv_create_child_thread(
+                    from,
+                    ChildRegistration {
+                        parent_dettid,
+                        parent_detpid,
+                        child_dettid,
+                        child_tid_addr: ctid,
+                        flags: Some(flags),
+                        maybe_priority: priority,
+                        parent_is_kernel_blocked: true,
+                    },
+                )
+                .await,
+            ),
             // Requested by the child thread itself:
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
@@ -598,16 +634,17 @@ impl GlobalState {
         trace!("[detcore] All resources held by pid {} released", from);
     }
 
-    /// Global portion of parent-forking-child protocol.  Called by the parent thread.
-    async fn recv_create_child_thread(
-        &self,
-        from_parent: Tid,
-        parent_detpid: DetPid,
-        child_dettid: DetTid,
-        ctid: usize,
-        flags: Option<CloneFlags>,
-        maybe_priority: Option<Priority>,
-    ) {
+    /// Global portion of parent-forking-child protocol.
+    async fn recv_create_child_thread(&self, rpc_sender: Tid, registration: ChildRegistration) {
+        let ChildRegistration {
+            parent_dettid,
+            parent_detpid,
+            child_dettid,
+            child_tid_addr,
+            flags,
+            maybe_priority,
+            parent_is_kernel_blocked,
+        } = registration;
         let initial_priority = if let Some(pr) = &self.preemptions_to_replay {
             assert!(maybe_priority.is_none());
             let prio = pr
@@ -649,13 +686,12 @@ impl GlobalState {
                 .entry(child_dettid)
                 .or_insert_with(|| ThreadNextTurn {
                     dettid: child_dettid,
-                    child_tid_addr: ctid,
+                    child_tid_addr,
                     req: Ivar::new(),
                     resp: Ivar::new(),
                 });
 
             {
-                let parent_dettid = DetTid::from_raw(from_parent.into()); // TODO(T78538674)
                 let is_group_leader = if let Some(f) = flags {
                     !f.contains(CloneFlags::CLONE_THREAD)
                 } else {
@@ -693,10 +729,10 @@ impl GlobalState {
             sched.started_up.try_put(());
         }
         // Parent thread yields so child can run (if it is higher priority).
-        if self.cfg.sequentialize_threads {
+        if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
             let mut rs = Resources::new(parent_detpid);
             rs.insert(ResourceID::ParentContinue(), Permission::W);
-            self.recv_request_resources(from_parent, parent_detpid, rs)
+            self.recv_request_resources(rpc_sender, parent_detpid, rs)
                 .await;
         }
     }
@@ -1063,6 +1099,10 @@ pub enum GlobalRequest {
     /// initial priority.
     CreateChildThread(DetTid, DetPid, usize, Option<CloneFlags>, Option<Priority>),
 
+    /// A vfork child registers itself because its parent cannot run until the
+    /// kernel releases it after child exec or exit.
+    CreateVforkChildThread(DetTid, DetPid, DetTid, usize, CloneFlags, Option<Priority>),
+
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
     StartNewThread(DetTid, DetPid),
@@ -1283,6 +1323,49 @@ pub async fn create_child_thread<G, T>(
     let resp = send_and_update_time(
         guest,
         GlobalRequest::CreateChildThread(child_dettid, detpid, ctid, flags, starting_priority),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::CreateChildThread(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Register a vfork child while its parent is blocked inside `clone(2)`.
+pub async fn create_vfork_child_thread<G, T>(
+    guest: &mut G,
+    child_dettid: DetTid,
+    vfork: crate::tool_local::PendingVfork,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let starting_priority = if guest.config().replay_preemptions_from.is_some() {
+        None
+    } else if guest.config().replay_schedule_from.is_some() {
+        Some(if child_dettid <= DetTid::from_raw(3) {
+            REPLAY_FOREGROUND_PRIORITY
+        } else {
+            REPLAY_DEFERRED_PRIORITY
+        })
+    } else if guest.config().chaos {
+        Some(entropy_to_priority(vfork.child_priority_entropy.expect(
+            "vfork child priority entropy missing in chaos mode",
+        )))
+    } else {
+        Some(DEFAULT_PRIORITY)
+    };
+
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::CreateVforkChildThread(
+            vfork.parent_dettid,
+            vfork.parent_detpid,
+            child_dettid,
+            vfork.child_tid_addr,
+            vfork.flags,
+            starting_priority,
+        ),
     )
     .await;
     match resp.1 {
