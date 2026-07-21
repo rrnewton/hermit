@@ -7,6 +7,7 @@
  */
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -180,6 +181,42 @@ fn chaos_mode_matrix() {
 #[test]
 fn verify_mode_matrix() {
     run_stable_matrix(RunMode::Verify);
+}
+
+#[test]
+fn verify_honors_tmp_and_environment() {
+    let _guard = hermit_run_lock();
+    let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let guest = tmp.path().join("guest");
+    fs::write(
+        &guest,
+        r#"#!/bin/sh
+[ "${VERIFY_CONFIGURED-}" = expected ] || exit 11
+[ "${VERIFY_HOST_ONLY+set}" != set ] || exit 12
+printf 'configured\n'
+"#,
+    )
+    .expect("failed to write verify guest");
+    let mut permissions = fs::metadata(&guest)
+        .expect("failed to stat verify guest")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&guest, permissions).expect("failed to make verify guest executable");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--verify",
+            "--base-env=empty",
+            "--env=VERIFY_CONFIGURED=expected",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+        ])
+        .arg(format!("--tmp={}", tmp.path().display()))
+        .arg("/tmp/guest")
+        .env("VERIFY_HOST_ONLY", "unexpected");
+    command_output(command, "verify configuration");
 }
 
 #[test]
