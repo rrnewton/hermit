@@ -32,6 +32,28 @@ use tracing_subscriber::fmt::MakeWriter;
 /// How many runs for each test when confirming determinism.
 static TEST_REPS: u64 = 3;
 
+fn test_trace_level() -> String {
+    std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
+        // This is a compromise. We don't want to slow things down too much, but it's nice
+        // if we print some logs for failures on Sandcastle.
+        "detcore=info".into()
+    })
+}
+
+fn install_global_test_subscriber<W>(trace_level: &str, writer: W) -> bool
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let collector = tracing_subscriber::fmt()
+        .with_env_filter(trace_level)
+        .with_writer(writer)
+        .finish();
+    tracing::subscriber::set_global_default(collector).is_ok()
+}
+
+static GLOBAL_TEST_SUBSCRIBER: LazyLock<()> =
+    LazyLock::new(|| _ = install_global_test_subscriber(&test_trace_level(), std::io::stderr));
+
 /// Run a function multiple times, instrumenting it with DetCore and ensuring
 /// the outputs are the same on each run.
 #[derive(Default)]
@@ -392,11 +414,8 @@ where
     T: Tool + 'static,
     F: FnOnce(),
 {
-    let trace_level = std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
-        // This is a compromise. We don't want to slow things down too much, but it's nice
-        // if we print some logs for failures on Sandcastle.
-        "detcore=info".into()
-    });
+    LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
+    let trace_level = test_trace_level();
     let bufwriter = BufWriter::new();
     let collector = tracing_subscriber::fmt()
         .with_env_filter(trace_level)
@@ -428,6 +447,40 @@ where
         })
     })?;
     Ok((out, state, bufwriter.get_strings()))
+}
+
+/// Runs a function as a guest with Detcore's test log filter applied both to
+/// the calling thread and to tracer work performed on other threads.
+pub fn test_fn_with_config<T, F>(
+    f: F,
+    config: <T::GlobalState as GlobalTool>::Config,
+    capture_output: bool,
+) -> Result<(Output, T::GlobalState), Error>
+where
+    T: Tool + 'static,
+    F: FnOnce(),
+{
+    test_fn_with_logs::<T, F>(f, config, capture_output)
+        .map(|(output, state, _logs)| (output, state))
+}
+
+/// Runs a function as a guest with Detcore's test log filter and requires a
+/// successful guest exit status.
+pub fn check_fn_with_config<T, F>(
+    f: F,
+    config: <T::GlobalState as GlobalTool>::Config,
+    capture_output: bool,
+) -> T::GlobalState
+where
+    T: Tool + 'static,
+    F: FnOnce(),
+{
+    let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output).unwrap();
+    if output.status != ExitStatus::Exited(0) {
+        print_tracee_output(&output);
+        panic!("Got exit status {:?}", output.status);
+    }
+    state
 }
 
 /// Runs a function multiple times and checks to see if the output was
@@ -493,6 +546,7 @@ pub fn det_test_cmd_with_config<O>(program: &str, args: &[&str], oracle: O, conf
 where
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
+    LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
     let mut dts = DetTestState::default();
     for _ in 1..(TEST_REPS - 1) {
         let (output, state) =
@@ -598,4 +652,40 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
         }
     }
     dts.last_log = Some(filtered);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BufWriter;
+    use super::install_global_test_subscriber;
+
+    #[test]
+    fn global_test_filter_applies_on_spawned_threads() {
+        let writer = BufWriter::new();
+        assert!(install_global_test_subscriber(
+            "reverie_ptrace::timer=off,detcore_testutils=trace",
+            writer.clone(),
+        ));
+
+        std::thread::spawn(|| {
+            tracing::trace!(
+                target: "reverie_ptrace::timer",
+                "filtered timer instruction"
+            );
+            tracing::trace!(target: "detcore_testutils", "visible control event");
+        })
+        .join()
+        .unwrap();
+
+        let logs = writer.get_strings();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("visible control event"))
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("filtered timer instruction"))
+        );
+    }
 }
