@@ -93,7 +93,6 @@ jobs:
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test chaos_verify -- --ignored --test-threads=1
     - name: Schedule search E2E tests
-      if: steps.namespaces.outputs.available == 'true'
       run: ./tests/util/hermit_analyze_e2e.sh
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'

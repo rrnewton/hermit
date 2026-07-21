@@ -32,12 +32,15 @@ mkdir -p "$TARGET_DIR/debug"
     -o "$RACEWRITE"
 
 echo ":: [schedule_search] Localizing hello_race"
-EXPECTED_OUTPUT="flaky-tests/hello_race.rs:37" \
+# Neither fixture uses the network. Host mode avoids requiring a network/sysfs
+# namespace on otherwise PMU-capable CI runners.
+ANALYZE_OPTS="--run-arg=--network=host" \
+    EXPECTED_OUTPUT="flaky-tests/hello_race.rs:37" \
     timeout "$ANALYZE_TIMEOUT" \
     "$ANALYZE_DRIVER" "$HERMIT" "$HELLO_RACE"
 
 echo ":: [schedule_search] Localizing racewrite_nostdlib"
-ANALYZE_OPTS="--run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo" \
+ANALYZE_OPTS="--run-arg=--network=host --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo" \
     EXPECTED_OUTPUT="tests/c/simple/racewrite_nostdlib.c:35" \
     timeout "$ANALYZE_TIMEOUT" \
     "$ANALYZE_DRIVER" "$HERMIT" "$RACEWRITE"
