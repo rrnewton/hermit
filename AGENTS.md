@@ -2,6 +2,201 @@
 
 This file applies to the entire repository.
 
+## Workspace Discipline
+
+All mutating agent work must happen in an assigned private worktree. Never let
+two agents modify the same checkout, and never do feature development in the
+primary checkout.
+
+### Vocabulary And Layout
+
+- **Parent**: `~/work/dev-hermit/`, the local multi-agent development root.
+- **Primary checkout**: `~/work/dev-hermit/hermit/`. It stays on
+  `integration`, is used only by the integration coordinator, and donates its
+  warm `target/` cache to slots. Ordinary agents do not edit files here.
+- **Slot**: one permanent agent worktree at
+  `~/work/dev-hermit/worktrees/slot01/` through `slot04/`.
+- **Feature branch**: a descriptive, task-specific branch checked out in one
+  slot. Directory names stay opaque and stable even as branches change.
+- **Integration branch**: `integration`, the continuously combined and tested
+  branch checked out in the primary checkout.
+- **Release branch**: `main`, updated periodically from tested integration
+  batches rather than directly from agent feature branches.
+
+Expected layout:
+
+```text
+~/work/dev-hermit/
+|-- hermit/                 # primary checkout; integration coordinator only
+`-- worktrees/
+    |-- slot01/             # permanent worktree; active or parked
+    |-- slot02/
+    |-- slot03/
+    `-- slot04/
+```
+
+Do not use branch names as worktree directory names. Do not create ad hoc
+checkouts elsewhere for normal work. If a requested slot contains unexpected
+changes, treat it as occupied: do not reset, clean, overwrite, or reuse it.
+Select another free slot and report the conflict to the coordinator.
+
+### Permanent Slot Pool
+
+There are exactly four permanent worktree slots: `slot01` through `slot04`.
+Reuse them instead of removing and recreating worktrees. Keeping the worktree
+and its ignored `target/` directory avoids repeated dependency downloads and
+full rebuilds.
+
+A slot is in one of two states:
+
+- **Active**: checked out on a feature branch and owned by one agent/task.
+- **Parked**: clean, detached at a recorded commit, and available for reuse.
+
+Parking happens in place; never move or delete the slot directory and never run
+`git worktree remove` for a permanent slot. A detached slot is not abandoned
+work: its completed feature branch and commit SHA must already be recorded in
+the handoff.
+
+Creating the pool is an integration-coordinator operation. From the primary
+checkout, a missing slot is created from `integration` with:
+
+```bash
+git worktree add --detach ../worktrees/slot0X integration
+```
+
+The primary checkout is the build-cache donor. When a new or intentionally
+refreshed slot has no `target/`, seed it with a copy-on-write copy when the
+filesystem supports reflinks:
+
+```bash
+cp -a --reflink=auto \
+  ~/work/dev-hermit/hermit/target \
+  ~/work/dev-hermit/worktrees/slot0X/
+```
+
+Never symlink `target/` between checkouts: concurrent Cargo processes must not
+write to the same target directory. Cache seeding is optional when the donor
+does not exist or is stale; correctness must not depend on cached artifacts.
+
+Do not create `slot05` or later as another permanent cached slot. Temporary
+over-provisioning requires explicit coordinator approval and the temporary
+worktree must be removed after its committed work is integrated.
+
+### Starting Work In A Slot
+
+The coordinator assigns one free slot to exactly one agent. Before editing:
+
+1. Confirm the slot is a registered worktree and inspect its state:
+
+   ```bash
+   git -C ~/work/dev-hermit/hermit worktree list
+   git -C ~/work/dev-hermit/worktrees/slot0X status --short --branch
+   ```
+
+2. Require a clean worktree. Do not discard or absorb changes left by another
+   task.
+3. Fetch remote refs, then create a descriptive branch from the current local
+   `integration` branch:
+
+   ```bash
+   git -C ~/work/dev-hermit/worktrees/slot0X fetch origin
+   git -C ~/work/dev-hermit/worktrees/slot0X switch \
+     -c <feature-branch> integration
+   ```
+
+4. Record the slot, branch, task, and owner in the coordinator's task state
+   before the first edit.
+
+Agents may read the primary checkout, including its build artifacts, but they
+must run edits, formatting, builds, tests, and commits from their assigned
+slot.
+
+### Parking And Reusing A Slot
+
+Park a slot only after all intended work is committed and handed off:
+
+```bash
+git -C ~/work/dev-hermit/worktrees/slot0X status --short
+git -C ~/work/dev-hermit/worktrees/slot0X switch --detach HEAD
+```
+
+The first command must produce no output. Record the feature branch name, exact
+HEAD SHA, validation performed, and integration status before marking the slot
+free. Do not delete a feature branch until its commit is reachable from
+`integration` or the coordinator explicitly archives it.
+
+To reuse a parked slot, re-run the starting-work checks and create the next
+feature branch from the latest `integration`. A slot that is not clean remains
+active regardless of whether an agent is currently responding.
+
+### Branch And Integration Strategy
+
+The branch flow is:
+
+```text
+feature branches -> integration -> main
+```
+
+- Agents branch from `integration`, never directly develop on `integration` or
+  `main`.
+- Each feature branch contains one coherent task or tightly coupled change.
+- The agent validates and commits the feature branch, then hands its exact SHA
+  to the integration coordinator.
+- The coordinator reviews the diff and test evidence before landing it.
+- Landing onto `integration` uses a fast-forward merge from the clean primary
+  checkout:
+
+  ```bash
+  git status --short --branch
+  git merge --ff-only <feature-branch>
+  ```
+
+- If the fast-forward check fails, do not create a convenience merge commit.
+  Return the branch to its owner to update it against current `integration`,
+  rerun affected tests, and provide a new SHA.
+- After landing, run the integration-level checks appropriate to the combined
+  change. Keep `integration` green; repair a regression before accepting more
+  feature work.
+- Periodically promote a reviewed, green batch from `integration` to `main` as
+  one bulk diff or pull request. Do not bypass `integration` by landing feature
+  branches directly on `main`.
+
+Only the coordinator mutates the primary checkout. It must be clean before a
+merge or promotion. Unrelated primary-checkout changes are a blocker to that
+integration operation and must be attributed and resolved without destructive
+cleanup.
+
+### Commit Methodology
+
+Agents prepare clean, reviewable commits rather than leaving uncommitted files
+for the coordinator:
+
+- Inspect `git status` and the complete diff before staging.
+- Stage only task-owned paths. Keep generated artifacts, caches, debug output,
+  and unrelated concurrent changes out of commits.
+- Run focused tests while iterating, then the formatting, lint, and test gates
+  required by the change before handoff.
+- Prefer one logical commit per task. Split commits only when each commit is
+  independently coherent and useful to reviewers.
+- Write an imperative, descriptive subject that states what changed. Explain
+  the reason and non-obvious constraints in the body when needed.
+- Never use placeholder subjects such as `wip`, `tmp`, `checkpoint`,
+  `validate`, or `fix stuff`.
+- Do not create empty bookkeeping commits. Do not hide test failures or missing
+  validation in a commit message; report them explicitly in the handoff.
+- Rewrite or amend only commits that are still private to the agent's own
+  feature branch. Never rewrite a shared branch or a commit already integrated.
+- Do not push, force-push, merge, rebase, or delete branches unless the task or
+  coordinator explicitly authorizes that repository-side operation.
+
+Every handoff includes:
+
+- slot path and feature branch,
+- exact commit SHA and concise change summary,
+- commands run and their results,
+- known failures or environment limitations,
+- whether the branch is ready for fast-forward integration.
+
 ## Project Overview
 
 Hermit is an x86_64 Linux reproducible container. It runs a guest program under
