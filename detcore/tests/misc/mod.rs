@@ -15,6 +15,8 @@ use std::sync::atomic::Ordering;
 
 use nix::unistd;
 
+mod vfork;
+
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
 
