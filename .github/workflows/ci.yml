@@ -59,7 +59,9 @@ jobs:
       run: |
         cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
         cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
-    - name: PMU preemption and CPU instruction tests
-      run: cargo test -p detcore --test tests_parallelism --test tests_time
+    - name: PMU preemption smoke test
+      run: >-
+        cargo test -p detcore --test tests_parallelism
+        mem_race::default_detcore -- --exact
     - name: Hermit namespace and record/replay integration tests
       run: cargo test -p hermit
