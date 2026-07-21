@@ -68,7 +68,7 @@ enum Subcommand {
     Record(RecordOpts),
 
     /// Replay the execution of a program.
-    #[clap(name = "replay", trailing_var_arg = true)]
+    #[clap(name = "replay")]
     Replay(ReplayOpts),
 
     /// Take the difference of two (run/record) logs written to files.
@@ -115,5 +115,34 @@ fn display_error(error: Error) {
 
     for cause in chain {
         eprintln!("     {} {}", ">".dimmed().bold(), cause);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use clap::Parser;
+
+    use super::Args;
+    use super::Subcommand;
+
+    #[test]
+    fn clap_configuration_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn replay_accepts_an_optional_id_and_options() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "replay",
+            "--autopilot",
+            "--data-dir",
+            "/tmp/recordings",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::Replay(_)));
     }
 }
