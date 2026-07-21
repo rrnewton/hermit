@@ -118,16 +118,6 @@ pub struct RunOpts {
     )]
     namespace_only: bool,
 
-    /// Run syscall interception directly on the host without creating Linux namespaces or
-    /// mounting an isolated `/tmp`. This reduces isolation and determinism, but allows Hermit to
-    /// run where namespace or mount operations are unavailable.
-    #[clap(
-        long,
-        visible_alias = "core-only",
-        conflicts_with_all = ["mount", "bind", "namespace_only", "analyze_networking"]
-    )]
-    no_namespace: bool,
-
     /// Run the program in the minimally invasive mode which still intercepts syscalls.
     /// It should be combined with activating logging at the INFO level or higher (`hermit
     /// --log=info`), in order to print out those syscalls like strace.
@@ -380,9 +370,6 @@ impl fmt::Display for RunOpts {
         if self.namespace_only {
             write!(f, " --namespace-only")?;
         }
-        if self.no_namespace {
-            write!(f, " --no-namespace")?;
-        }
         if self.summary {
             write!(f, " --summary")?;
         }
@@ -544,27 +531,6 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
-fn no_namespace_forces_host_resources_and_disables_uts_assumption() {
-    let mut opts = RunOpts::parse_from([
-        "fakehermit",
-        "--core-only",
-        "--network=local",
-        "--tmp=/tmp/ignored",
-        "fakeprog",
-    ]);
-    opts.validate_args_with_perf_support(true);
-
-    assert!(opts.no_namespace);
-    assert_eq!(opts.network, NetworkingMode::Host);
-    assert_eq!(opts.tmp.as_deref(), Some(Path::new(TMP_DIR)));
-    assert!(!opts.det_opts.det_config.has_uts_namespace);
-    assert_eq!(
-        format!("{}", opts),
-        " --network=host --no-namespace --tmp=/tmp -- fakeprog"
-    );
-}
-
-#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -607,14 +573,6 @@ impl RunOpts {
         self.validate_args();
         // });
 
-        if self.no_namespace {
-            eprintln!(
-                "WARNING: --no-namespace disables PID, UTS, mount, and network namespace \
-                 isolation and uses the host filesystem and /tmp; PID/proc/filesystem-sensitive \
-                 programs may be less deterministic."
-            );
-        }
-
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
@@ -634,12 +592,7 @@ impl RunOpts {
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) {
         let config = &mut self.det_opts.det_config;
 
-        config.has_uts_namespace = !self.no_namespace;
-
-        if self.no_namespace {
-            self.network = NetworkingMode::Host;
-            self.tmp = Some(PathBuf::from(TMP_DIR));
-        }
+        config.has_uts_namespace = true;
 
         if self.analyze_networking {
             config.warn_non_zero_binds = true;
@@ -725,10 +678,6 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        if self.no_namespace {
-            return self.run_in_container(global, capture_output);
-        }
-
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
@@ -863,16 +812,6 @@ impl RunOpts {
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
-        if self.no_namespace {
-            // Verify initializes a process-global tracing subscriber for each run. Keep a plain
-            // child-process boundary between runs, but do not configure any namespaces or mounts.
-            let mut process = Container::new();
-            let mut log_file = Some(log_file);
-            return with_container(&mut process, || {
-                self.run_verify_in_container(&mut log_file, global)
-            });
-        }
-
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
