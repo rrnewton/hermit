@@ -63,7 +63,7 @@ jobs:
       run: cargo test -p detcore --test tests_time tod_is_stable -- --exact
     - name: Hermit tests
       run: |
-        if unshare --user --map-root-user --mount sh -c 'mount -t tmpfs tmpfs /mnt && umount /mnt' 2>/dev/null; then
+        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
           cargo test -p hermit
         else
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
