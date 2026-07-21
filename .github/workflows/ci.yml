@@ -17,7 +17,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Build
       run: cargo build
 
@@ -27,7 +27,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Test
       run: cargo test --workspace
 
@@ -37,7 +37,9 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: Rust components
+      run: rustup component add clippy
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 
@@ -46,5 +48,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Rust components
+      run: rustup component add rustfmt
     - name: Format
       run: cargo fmt --check
