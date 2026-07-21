@@ -63,16 +63,19 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enables strict mode. Currently this implies default mode plus
-    /// --sequentialize-threads, and --deterministic-io.
-    // #[clap(long, short)]
-    // strict: bool,
+    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
+    /// command-line compatibility.
+    #[clap(
+        long,
+        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+    )]
+    strict: bool,
 
-    // Disables sequentialize threads. On by default
+    /// Disable deterministic sequential thread execution.
     #[clap(long)]
     pub(crate) no_sequentialize_threads: bool,
 
-    // Disables deterministic io. On by default
+    /// Disable deterministic I/O behavior.
     #[clap(long)]
     no_deterministic_io: bool,
 
@@ -505,6 +508,50 @@ fn display_runopts4() {
 }
 
 #[test]
+fn strict_flag_preserves_deterministic_defaults() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    ro.validate_args_with_perf_support(true);
+
+    assert!(ro.det_opts.det_config.sequentialize_threads);
+    assert!(ro.det_opts.det_config.deterministic_io);
+    assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn strict_flag_rejects_determinism_opt_outs() {
+    for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
+        let error =
+            RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--strict"));
+        assert!(message.contains(opt_out));
+    }
+}
+
+#[test]
+fn strict_help_describes_compatibility_and_opt_outs() {
+    use clap::CommandFactory;
+
+    let help = RunOpts::command().render_long_help().to_string();
+    for expected in [
+        "--strict",
+        "This is currently the default",
+        "command-line compatibility",
+        "--no-sequentialize-threads",
+        "Disable deterministic sequential thread execution",
+        "--no-deterministic-io",
+        "Disable deterministic I/O behavior",
+    ] {
+        assert!(
+            help.contains(expected),
+            "missing {expected:?} in run help:\n{help}"
+        );
+    }
+}
+
+#[test]
 fn display_runopts_without_perf_support() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
     ro.validate_args_with_perf_support(false);
@@ -551,8 +598,8 @@ impl RunOpts {
             config.warn_non_zero_binds = true;
         }
 
-        config.sequentialize_threads = !self.no_sequentialize_threads;
-        config.deterministic_io = !self.no_deterministic_io;
+        config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
+        config.deterministic_io = self.strict || !self.no_deterministic_io;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
