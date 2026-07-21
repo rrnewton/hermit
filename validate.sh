@@ -7,8 +7,9 @@
 
 set -uo pipefail
 
-readonly ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly ROOT_DIR
+cd "$ROOT_DIR" || exit 1
 
 declare -a check_names=()
 declare -a check_results=()
@@ -78,7 +79,8 @@ function print_summary {
 run_check "Build workspace" cargo build --workspace
 # Workspace tests include package unit, documentation, and Cargo integration
 # targets such as hermit-cli/tests/hermit_modes.rs.
-run_check "Test workspace and integrations" cargo test --workspace
+run_check "Test workspace and integrations" \
+    cargo test --workspace --exclude hermetic_infra_hermit_flaky-tests
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps

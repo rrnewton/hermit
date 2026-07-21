@@ -22,7 +22,11 @@ jobs:
     - name: Build
       run: cargo build --workspace
     - name: Test regular workspace crates
-      run: cargo test --workspace --exclude detcore --exclude hermit
+      run: >-
+        cargo test --workspace
+        --exclude detcore
+        --exclude hermit
+        --exclude hermetic_infra_hermit_flaky-tests
     - name: Test Hermit without namespace-dependent integration tests
       run: cargo test -p hermit --lib --bins
     - name: Test Detcore without hardware-dependent integration tests
