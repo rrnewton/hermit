@@ -22,7 +22,7 @@ jobs:
     - name: Build
       run: cargo build --workspace
     - name: Test regular workspace crates
-      run: cargo test --workspace --exclude detcore
+      run: cargo test --workspace --exclude detcore --exclude hermetic_infra_hermit_flaky-tests -- --skip record_replay_matrix
     - name: Test Detcore without hardware-dependent integration tests
       run: |
         cargo test -p detcore --lib --bins
@@ -49,3 +49,5 @@ jobs:
       run: cargo test -p detcore --test tests_misc
     - name: PMU preemption and CPU instruction tests
       run: cargo test -p detcore --test tests_parallelism --test tests_time
+    - name: PMU record and replay test
+      run: cargo test -p hermit --test hermit_modes record_replay_matrix -- --exact
