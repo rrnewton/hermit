@@ -44,6 +44,14 @@ jobs:
 
   hardware:
     name: Host-dependent tests (self-hosted)
+    if: >-
+      ${{
+        github.event_name == 'push' ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.user.login == 'rrnewton'
+        )
+      }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
     timeout-minutes: 10
     env:
