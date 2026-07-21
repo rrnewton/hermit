@@ -70,6 +70,10 @@ pub struct Detcore<T = NoopTool> {
 /// The metadata associated with the file system view of a particular *process*.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
+    /// Identity of the Linux descriptor table represented by `file_handles`.
+    pub(crate) files_id: FilesId,
+    /// Sequence used to allocate open file descriptions observed through this table.
+    next_open_file_sequence: u64,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
@@ -130,38 +134,74 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-// XXX: this is required by `ThreadState: Default`.
-impl Default for FileMetadata {
-    fn default() -> Self {
-        FileMetadata::new()
-    }
-}
-
 impl FileMetadata {
     /// create an empty file metadata
-    fn new() -> Self {
+    fn new(owner: DetTid) -> Self {
         FileMetadata {
+            files_id: FilesId::initial(owner),
+            next_open_file_sequence: 0,
             file_handles: HashMap::new(),
         }
     }
 
+    fn allocate_open_file_id(&mut self, creator: DetTid) -> OpenFileId {
+        let id = OpenFileId::new(creator, self.next_open_file_sequence);
+        self.next_open_file_sequence += 1;
+        id
+    }
+
+    pub(crate) fn fork_for(&self, child: DetTid) -> Self {
+        Self {
+            files_id: FilesId::forked(child),
+            next_open_file_sequence: self.next_open_file_sequence,
+            file_handles: self.file_handles.clone(),
+        }
+    }
+
+    pub(crate) fn for_exec(&self, task: DetTid) -> Self {
+        Self {
+            files_id: self.files_id.for_exec(task),
+            next_open_file_sequence: self.next_open_file_sequence,
+            file_handles: self
+                .file_handles
+                .iter()
+                .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
+                .collect(),
+        }
+    }
+
     /// set default fds
-    fn setup_stdio(mut self, pid: Pid) -> Self {
+    fn setup_stdio(mut self, pid: Pid, owner: DetTid) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
         // SAFETY: stating stdin is likely to always be safe
         let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
             .unwrap()
             .into();
-        let stdin = DetFd::new(0, OFlag::empty(), FdType::Regular)
-            .with_stat(stat)
-            .with_resource(ResourceID::Path(format!("/proc/{}/fd/0", pid).into()));
-        let stdout = DetFd::new(1, OFlag::empty(), FdType::Regular)
-            .with_stat(stat)
-            .with_resource(ResourceID::Path(format!("/proc/{}/fd/1", pid).into()));
-        let stderr = DetFd::new(2, OFlag::empty(), FdType::Regular)
-            .with_stat(stat)
-            .with_resource(ResourceID::Path(format!("/proc/{}/fd/2", pid).into()));
+        let stdin = DetFd::new(
+            0,
+            OFlag::empty(),
+            FdType::Regular,
+            self.allocate_open_file_id(owner),
+        )
+        .with_stat(stat)
+        .with_resource(ResourceID::Path(format!("/proc/{}/fd/0", pid).into()));
+        let stdout = DetFd::new(
+            1,
+            OFlag::empty(),
+            FdType::Regular,
+            self.allocate_open_file_id(owner),
+        )
+        .with_stat(stat)
+        .with_resource(ResourceID::Path(format!("/proc/{}/fd/1", pid).into()));
+        let stderr = DetFd::new(
+            2,
+            OFlag::empty(),
+            FdType::Regular,
+            self.allocate_open_file_id(owner),
+        )
+        .with_stat(stat)
+        .with_resource(ResourceID::Path(format!("/proc/{}/fd/2", pid).into()));
 
         self.add_detfd(stdin);
         self.add_detfd(stdout);
@@ -188,12 +228,14 @@ impl FileMetadata {
     /// add a raw fd
     fn add_fd(
         &mut self,
+        creator: DetTid,
         fd: RawFd,
         flags: OFlag,
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        let detfd = DetFd::new(fd, flags, ty).with_stat(stat);
+        let id = self.allocate_open_file_id(creator);
+        let detfd = DetFd::new(fd, flags, ty, id).with_stat(stat);
         self.add_detfd(detfd);
         Ok(())
     }
@@ -208,10 +250,71 @@ impl FileMetadata {
     /// dup raw fds.
     fn dup_fd(&mut self, oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<(), Errno> {
         let detfd = self.with_detfd(oldfd, |old_detfd| {
-            old_detfd.clone().with_fd(newfd).with_flags(flags)
+            old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
         self.add_detfd(detfd);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod file_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn fork_copies_slots_but_preserves_open_file_aliases() {
+        let parent_tid = DetTid::from_raw(10);
+        let child_tid = DetTid::from_raw(11);
+        let mut parent = FileMetadata::new(parent_tid);
+        parent
+            .add_fd(parent_tid, 3, OFlag::O_NONBLOCK, FdType::Socket, None)
+            .expect("parent fd should be inserted");
+        parent
+            .dup_fd(3, 4, OFlag::O_CLOEXEC)
+            .expect("dup should succeed");
+
+        let parent_open = parent
+            .with_detfd(3, |fd| fd.open_file_id())
+            .expect("parent fd should exist");
+        let duplicate_open = parent
+            .with_detfd(4, |fd| fd.open_file_id())
+            .expect("duplicate fd should exist");
+        assert_eq!(parent_open, duplicate_open);
+
+        let mut child = parent.fork_for(child_tid);
+        assert_ne!(parent.files_id, child.files_id);
+        assert_ne!(
+            FdSlot {
+                files: parent.files_id,
+                fd: 3,
+            },
+            FdSlot {
+                files: child.files_id,
+                fd: 3,
+            }
+        );
+        assert_eq!(
+            parent_open,
+            child
+                .with_detfd(3, |fd| fd.open_file_id())
+                .expect("forked fd should retain its open file identity")
+        );
+
+        parent
+            .add_fd(parent_tid, 5, OFlag::empty(), FdType::Regular, None)
+            .expect("new parent fd should be inserted");
+        child
+            .add_fd(child_tid, 5, OFlag::empty(), FdType::Regular, None)
+            .expect("new child fd should be inserted");
+        assert_ne!(
+            parent
+                .with_detfd(5, |fd| fd.open_file_id())
+                .expect("new parent fd should exist"),
+            child
+                .with_detfd(5, |fd| fd.open_file_id())
+                .expect("new child fd should exist"),
+            "separate opens after fork must not alias"
+        );
     }
 }
 
@@ -275,6 +378,9 @@ pub struct ThreadState<T> {
     pub dettid: DetTid,
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
+
+    /// Linux memory address space shared by tasks created with `CLONE_VM`.
+    pub mm_id: MmId,
 
     /// This threads path within the thread/process ancestry tree. (The terminology comes from
     /// Cilk.)
@@ -344,6 +450,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
         f.debug_struct("ThreadState")
             .field("dettid", &self.dettid)
             .field("detpid", &self.detpid)
+            .field("mm_id", &self.mm_id)
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
@@ -409,10 +516,13 @@ impl<T> ThreadState<T> {
         );
         ThreadState {
             dettid: pid,
-            detpid: None,              // Initialized later.
+            detpid: None, // Initialized later.
+            mm_id: MmId::initial(pid),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
-            file_metadata: Arc::new(Mutex::new(FileMetadata::new().setup_stdio(pid.into()))),
+            file_metadata: Arc::new(Mutex::new(
+                FileMetadata::new(pid).setup_stdio(pid.into(), pid),
+            )),
             clone_flags: None,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
@@ -473,7 +583,7 @@ impl<T> ThreadState<T> {
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        self.metadata().add_fd(fd, flags, ty, stat)
+        self.metadata().add_fd(self.dettid, fd, flags, ty, stat)
     }
 
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and
