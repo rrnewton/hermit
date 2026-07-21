@@ -13,7 +13,6 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -56,6 +55,7 @@ use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -67,6 +67,7 @@ use crate::types::DetTid;
 use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
+use crate::types::MmId;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -145,8 +146,21 @@ pub type SchedRequest = Result<Resources, ThreadExited>;
 #[derive(Debug, Clone)]
 pub struct ThreadExited;
 
-/// This thread ID is waiting on a futex.
-pub type FutexWaiter = (DetTid, Ivar<SchedResponse>);
+/// A thread waiting on a futex, including the bitset accepted by wake operations.
+#[derive(Debug, Clone)]
+pub struct FutexWaiter {
+    dettid: DetTid,
+    response: Ivar<SchedResponse>,
+    bitset: u32,
+}
+
+fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -> Vec<FutexWaiter> {
+    let (matching, remaining) = std::mem::take(waiters)
+        .into_iter()
+        .partition(|waiter| waiter.bitset & wake_mask != 0);
+    *waiters = remaining;
+    matching
+}
 
 /// Actions that are blocked on another internal action of the guest, such as a pipe communication,
 /// or are blocked on external conditions such as a network request.  These cannot consume a logical
@@ -179,7 +193,7 @@ pub struct BlockedPool {
     /// `BlockedExternalContinue` request when the thread is past its blocking action and
     /// waiting for permission to resume.  The request will stay empty while the thread is
     /// doing the blocking action.  This is different than the normal relationship
-    pub external_io_blockers: BTreeSet<DetTid>,
+    pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
 }
 
 impl BlockedPool {
@@ -204,10 +218,13 @@ impl BlockedPool {
 }
 
 /// Record the expectations about requests to continue after blocking IO.
-fn assert_continue_request(req: &Resources) {
+fn external_continue_id(req: &Resources) -> ExternalOpId {
     assert_eq!(req.resources.len(), 1);
     let rsrc = req.resources.iter().next().unwrap().0;
-    assert_eq!(rsrc, &ResourceID::BlockedExternalContinue);
+    match rsrc {
+        ResourceID::BlockedExternalContinue(op_id) => *op_id,
+        other => panic!("expected external continue request, got {other:?}"),
+    }
 }
 
 /// The state for the deterministic scheduler.
@@ -952,7 +969,7 @@ impl Scheduler {
     ///
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
-    pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid) {
+    pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
         info!(
             "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
             dtid, detpid
@@ -979,7 +996,10 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 nextturn.req.try_put(Err(ThreadExited));
-                self.wake_futex_child_cleartid((*detpid, nextturn.child_tid_addr), *dtid);
+                self.wake_futex_child_cleartid(
+                    FutexID::private(mm, nextturn.child_tid_addr),
+                    *dtid,
+                );
             }
         }
     }
@@ -989,7 +1009,7 @@ impl Scheduler {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         for vec in &mut self.blocked.futex_waiters.values_mut() {
-            vec.retain(|(dt2, _)| dt2 != dtid);
+            vec.retain(|waiter| &waiter.dettid != dtid);
         }
     }
 
@@ -999,13 +1019,18 @@ impl Scheduler {
         dettid: &DetTid,
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
+        bitset: u32,
     ) {
         let nxt = self
             .next_turns
             .get(dettid)
             .expect("Missing next_turns entry");
         let entry: &mut Vec<_> = self.blocked.futex_waiters.entry(futexid).or_default();
-        entry.push((*dettid, nxt.resp.clone()));
+        entry.push(FutexWaiter {
+            dettid: *dettid,
+            response: nxt.resp.clone(),
+            bitset,
+        });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
         // we're not actually waiting on the scheduler giving us the resource.  We're waiting in the
@@ -1027,7 +1052,9 @@ impl Scheduler {
     }
 
     /// Reschedule a single thread that has been blocked on futex.
-    pub fn wake_futex_waiter(&mut self, (waiterid, waiter_ivar): FutexWaiter) {
+    pub fn wake_futex_waiter(&mut self, waiter: FutexWaiter) {
+        let waiterid = waiter.dettid;
+        let waiter_ivar = waiter.response;
         debug_assert!(!self.run_queue.contains_tid(waiterid));
 
         // If it was registered as a waiter-with-timeout, remove it:
@@ -1051,15 +1078,15 @@ impl Scheduler {
 
     fn choose_futex_wakees(
         &mut self,
-        vec: &mut Vec<(DetPid, Ivar<SchedResponse>)>,
+        vec: &mut Vec<FutexWaiter>,
         num_woken: usize,
-    ) -> Vec<(DetPid, Ivar<SchedResponse>)> {
+    ) -> Vec<FutexWaiter> {
         if self.fuzz_futexes {
             let rng = &mut self.fuzz_prng;
             debug!(
                 "[fuzz-futexes] selecting {} tids, pre shuffle: {:?}",
                 num_woken,
-                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
             );
 
             // No need to actually use the results here since vec was mutated:
@@ -1068,7 +1095,7 @@ impl Scheduler {
             info!(
                 "[fuzz-futexes] selecting {} tids, post shuffle: {:?}",
                 num_woken,
-                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
             );
         }
         // just take the first N, in whatever deterministic order they are in:
@@ -1081,6 +1108,7 @@ impl Scheduler {
         _waker_dettid: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
+        wake_mask: u32,
     ) -> u64 {
         if max_to_wake == 0 {
             trace!("[detcore] Futex wake of 0 waiters necessarily fizzles...");
@@ -1103,13 +1131,15 @@ impl Scheduler {
             max_to_wake,
             vec.len(),
         );
-        let num_woken: usize = std::cmp::min(vec.len(), max_to_wake.try_into().unwrap());
-        let to_wake = self.choose_futex_wakees(&mut vec, num_woken);
+        let mut matching = take_matching_futex_waiters(&mut vec, wake_mask);
+        let num_woken: usize = std::cmp::min(matching.len(), max_to_wake.try_into().unwrap());
+        let to_wake = self.choose_futex_wakees(&mut matching, num_woken);
 
         assert_eq!(to_wake.len(), num_woken);
         for waiter in to_wake {
             self.wake_futex_waiter(waiter);
         }
+        vec.extend(matching);
         // Put back what wasn't woken up:
         if !vec.is_empty() {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
@@ -1126,7 +1156,7 @@ impl Scheduler {
         );
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
-        self.wake_futex_waiters(dettid, futid, 1);
+        self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
@@ -1276,19 +1306,19 @@ impl Scheduler {
                 .blocked
                 .external_io_blockers
                 .iter()
-                .filter(|dtid| {
+                .filter(|(dtid, op_id)| {
                     let nt = self
                         .next_turns
                         .get(dtid)
                         .expect("internal invariant broken");
                     if let Some(Ok(req)) = nt.req.try_read() {
-                        assert_continue_request(&req);
+                        assert_eq!(external_continue_id(&req), **op_id);
                         true
                     } else {
                         false
                     }
                 })
-                .cloned()
+                .map(|(dtid, _)| *dtid)
                 .collect();
             debug!(
                 "Nondeterministic status of blocking IO: out of {}, completed on {}, dtids: {:?}",
@@ -1306,7 +1336,8 @@ impl Scheduler {
                 let first_dtid: DetTid = *self
                     .blocked
                     .external_io_blockers
-                    .first()
+                    .keys()
+                    .next()
                     .expect("internal logic error"); // See above blockers_empty check.
                 if ready.contains(&first_dtid) {
                     info!(
@@ -1590,7 +1621,7 @@ impl Scheduler {
             }
 
             // Thread BEGINS [potentially] blocking external IO
-            ResourceID::BlockingExternalIO => {
+            ResourceID::BlockingExternalIO(op_id) => {
                 info!(
                     "[scheduler] >>>>>>>\n\n COMMIT turn {}, BACKGROUND dettid {} (maybe-blocking)",
                     self.turn, dettid
@@ -1616,12 +1647,13 @@ impl Scheduler {
                 // Only once the ivars are cleared, and the guest is officially past the
                 // BlockingExternalIO phase ready to issue BlockedExternalContinue, do we
                 // then put it into the external_io_blockers struct.
-                self.blocked.external_io_blockers.insert(dettid);
+                let old = self.blocked.external_io_blockers.insert(dettid, *op_id);
+                assert!(old.is_none(), "thread started a second external operation");
                 Err(SkipTurn)
             }
 
             // Thread CONTINUES after completing [potentially] blocking IO.
-            ResourceID::BlockedExternalContinue => {
+            ResourceID::BlockedExternalContinue(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
                 // in, this resource request is immediately granted.
                 Ok(())
@@ -1641,8 +1673,8 @@ impl Scheduler {
             ResourceID::Path(_) => Ok(()),
             ResourceID::PathsTransitive(_) => Ok(()),
             ResourceID::Device(_) => Ok(()),
-            ResourceID::Exit(_) => Ok(()),
-            ResourceID::ParentContinue() => Ok(()),
+            ResourceID::Exit { .. } => Ok(()),
+            ResourceID::ParentContinue { .. } => Ok(()),
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
@@ -1999,8 +2031,8 @@ impl Scheduler {
             // Check all the places a blocked thread could be hiding.
             // TODO: this O(N) search could be made more efficient with more indexing structures.
             for v in self.blocked.futex_waiters.values() {
-                for (dt, _) in v {
-                    if *dt == dtid {
+                for waiter in v {
+                    if waiter.dettid == dtid {
                         return ThreadStatus::NotRunning;
                     }
                 }
@@ -2015,7 +2047,7 @@ impl Scheduler {
                     TimedEvent::AlarmEvt(_, _, _) => {}
                 }
             }
-            if self.blocked.external_io_blockers.contains(&dtid) {
+            if self.blocked.external_io_blockers.contains_key(&dtid) {
                 return ThreadStatus::NotRunning;
             }
             ThreadStatus::Gone
@@ -2217,6 +2249,47 @@ impl Scheduler {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn futex_waiter(dettid: i32, bitset: u32) -> FutexWaiter {
+        FutexWaiter {
+            dettid: DetTid::from_raw(dettid),
+            response: Ivar::new(),
+            bitset,
+        }
+    }
+
+    #[test]
+    fn futex_wake_bitset_only_selects_intersecting_waiters() {
+        let mut waiters = vec![
+            futex_waiter(1, 0b0001),
+            futex_waiter(2, 0b0010),
+            futex_waiter(3, 0b0011),
+        ];
+
+        let matching = take_matching_futex_waiters(&mut waiters, 0b0010);
+        assert_eq!(
+            matching
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [DetTid::from_raw(2), DetTid::from_raw(3)]
+        );
+        assert_eq!(
+            waiters
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [DetTid::from_raw(1)]
+        );
+
+        let matching = take_matching_futex_waiters(&mut waiters, 0);
+        assert!(
+            matching.is_empty(),
+            "a zero wake bitset must match no waiter"
+        );
+        assert_eq!(waiters.len(), 1, "nonmatching waiters must remain queued");
+    }
+
     #[test]
     fn test_my_thread_group1() {
         let mut tree: ThreadTree = Default::default();

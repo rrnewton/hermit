@@ -178,7 +178,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let (fd_type, resource) = guest
             .thread_state_mut()
-            .with_detfd(call.fd(), |detfd| (detfd.ty, detfd.resource.clone()))?;
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::R);
@@ -288,7 +288,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource.clone(), detfd.stat.map(|x| x.inode))
+            (detfd.resource(), detfd.stat().map(|x| x.inode))
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
@@ -458,6 +458,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
                 guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
                 Ok(newfd as i64)
+            }
+            F_SETFL(flags) => {
+                let result = self.record_or_replay(guest, call).await?;
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_status_flags(flags))?;
+                Ok(result)
+            }
+            F_SETFD(flags) => {
+                let result = self.record_or_replay(guest, call).await?;
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.set_cloexec(flags & libc::FD_CLOEXEC != 0);
+                })?;
+                Ok(result)
             }
             _ => {
                 trace!(

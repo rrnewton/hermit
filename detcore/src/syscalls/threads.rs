@@ -43,8 +43,8 @@ use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
 use crate::tool_local::Detcore;
-use crate::types::DetPid;
 use crate::types::DetTid;
+use crate::types::FutexID;
 use crate::types::LogicalTime;
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -102,9 +102,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Exit,
     ) -> Result<i64, Error> {
-        let request = guest
-            .thread_state()
-            .mk_request(ResourceID::Exit(false), Permission::RW);
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: false,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
         resource_request(guest, request).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
@@ -116,9 +121,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
-        let request = guest
-            .thread_state()
-            .mk_request(ResourceID::Exit(true), Permission::RW);
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
         resource_request(guest, request).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
@@ -147,6 +157,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.sequentialize_threads {
             Ok(guest.inject(call).await?)
         } else {
+            if call.futex_op() & libc::FUTEX_PRIVATE_FLAG == 0 {
+                return Err(Error::Errno(Errno::EOPNOTSUPP));
+            }
             match self.cfg.debug_futex_mode {
                 BlockingMode::Precise => self.handle_futex_blocking(guest, call, init_val).await,
                 BlockingMode::Polling => self.handle_futex_polling(guest, call, init_val).await,
@@ -164,14 +177,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Futex,
         init_val: i32,
     ) -> Result<i64, Error> {
-        let detpid = DetPid::from_raw(guest.pid().into()); // TODO(T78538674): virtualize pid/tid
         let ptr = call.uaddr().unwrap();
-        let futexid = (detpid, AddrMut::as_raw(ptr));
+        let futexid = FutexID::private(guest.thread_state().mm_id, AddrMut::as_raw(ptr));
         let futex_op = call.futex_op() & libc::FUTEX_CMD_MASK;
-        let mask = match futex_op {
-            libc::FUTEX_WAKE_BITSET | libc::FUTEX_WAIT_BITSET => call.val3(),
-            _ => !0,
+        let bitset = match futex_op {
+            libc::FUTEX_WAKE_BITSET | libc::FUTEX_WAIT_BITSET => call.val3() as u32,
+            _ => u32::MAX,
         };
+        if bitset == 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
         let dettid = guest.thread_state().dettid;
         match futex_op {
             libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET => {
@@ -180,7 +195,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     FutexAction::WakeRequest(call.val()),
                     &futexid,
                     init_val,
-                    mask,
+                    bitset,
                 )
                 .await
                 .expect("futex wake must return value")
@@ -199,7 +214,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     FutexAction::WakeFinished(0),
                     &futexid,
                     init_val,
-                    mask,
+                    bitset,
                 )
                 .await;
                 Ok(num as i64)
@@ -233,7 +248,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         FutexAction::WaitRequest(maybe_timeout_lt),
                         &futexid,
                         init_val,
-                        mask,
+                        bitset,
                     )
                     .await;
                     let res = if ans != Some(SchedValue::TimeOut) {
@@ -253,7 +268,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         trace!("[detcore, dtid {}] futex wait timed out", &dettid);
                         Err(Error::Errno(Errno::ETIMEDOUT))
                     };
-                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, mask).await;
+                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
+                        .await;
                     res
                 }
             }
@@ -369,28 +385,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             let guard = guest.thread_state().file_metadata.lock().unwrap();
             (*guard).clone()
         };
-        let new_metadata = FileMetadata {
-            file_handles: metadata
-                .file_handles
-                .iter()
-                .filter_map(|(&k, v)| {
-                    if v.flags & libc::O_CLOEXEC == libc::O_CLOEXEC {
-                        None
-                    } else {
-                        Some((k, v.clone()))
-                    }
-                })
-                .collect(),
-        };
+        let dettid = guest.thread_state().dettid;
+        let new_metadata = metadata.for_exec(dettid);
+        let old_mm_id = guest.thread_state().mm_id;
 
         // close fds with O_CLOEXEC
-        guest.thread_state_mut().file_metadata = Arc::new(Mutex::new(new_metadata));
+        {
+            let thread_state = guest.thread_state_mut();
+            thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            thread_state.mm_id = old_mm_id.for_exec(dettid);
+        }
 
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
 
         // execve failed, restore fds
-        guest.thread_state_mut().file_metadata = Arc::new(Mutex::new(metadata));
+        {
+            let thread_state = guest.thread_state_mut();
+            thread_state.file_metadata = Arc::new(Mutex::new(metadata));
+            thread_state.mm_id = old_mm_id;
+        }
 
         Err(errno.into())
     }
