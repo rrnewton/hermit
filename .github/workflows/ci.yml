@@ -45,27 +45,53 @@ jobs:
   hardware:
     name: Host-dependent tests (self-hosted)
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 10
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
 
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
+          sudo apt-get install -y golang-go libunwind-dev liblzma-dev
         else
-          sudo dnf install -y libunwind-devel xz-devel
+          sudo dnf install -y golang libunwind-devel xz-devel
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
         cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
         cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
-    - name: PMU RCB counter smoke test
-      run: cargo test -p detcore --test tests_time tod_is_stable -- --exact
-    - name: Hermit tests
+    - name: PMU timing and miscellaneous tests
+      run: |
+        cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
+        cargo test -p detcore --test tests_time -- --ignored --test-threads=4
+    - name: PMU parallel futex tests
+      run: >-
+        cargo test -p detcore --test tests_parallelism futex_wait_parent
+        -- --ignored --test-threads=3
+    - name: PMU parallel memory tests
+      run: |
+        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --ignored --test-threads=4
+        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --ignored --test-threads=4
+    - name: Check mount namespace support
+      id: namespaces
       run: |
         if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
-          cargo test -p hermit
+          echo "available=true" >> "$GITHUB_OUTPUT"
         else
+          echo "available=false" >> "$GITHUB_OUTPUT"
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
-          cargo test -p hermit --lib --bins
         fi
+    - name: Hermit tests including record/replay matrix
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit
+    - name: PMU Detcore lit tests
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
+    - name: PMU chaos and verify tests
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit --test chaos_verify -- --ignored --test-threads=1
+    - name: Hermit unit tests without mount namespaces
+      if: steps.namespaces.outputs.available != 'true'
+      run: cargo test -p hermit --lib --bins
