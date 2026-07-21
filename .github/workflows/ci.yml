@@ -61,11 +61,12 @@ jobs:
         cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
     - name: PMU RCB counter smoke test
       run: cargo test -p detcore --test tests_time tod_is_stable -- --exact
-    - name: Hermit tests
+    - name: Verify runner namespace support
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
-          cargo test -p hermit
-        else
-          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
-          cargo test -p hermit --lib --bins
-        fi
+        id
+        grep -E '^(NoNewPrivs|Seccomp|Cap(Inh|Prm|Eff|Bnd|Amb)):' /proc/self/status
+        cat /proc/sys/user/max_user_namespaces
+        unshare --user --map-root-user --pid --fork --uts --mount \
+          sh -euxc 'mount -t proc proc /proc; mount --bind /tmp /tmp; mount --make-rshared /tmp; umount /tmp'
+    - name: Full Hermit tests
+      run: cargo test -p hermit
