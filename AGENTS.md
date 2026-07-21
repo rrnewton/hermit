@@ -129,34 +129,43 @@ To reuse a parked slot, re-run the starting-work checks and create the next
 feature branch from the latest `integration`. A slot that is not clean remains
 active regardless of whether an agent is currently responding.
 
-### Branch And Integration Strategy
+### Branch, Pull Request, And Integration Strategy
 
-The branch flow is:
+The default branch flow is:
 
 ```text
-feature branches -> integration -> main
+feature branch -> pull request -> green required CI -> integration -> main
 ```
 
 - Agents branch from `integration`, never directly develop on `integration` or
   `main`.
 - Each feature branch contains one coherent task or tightly coupled change.
 - The agent validates and commits the feature branch, then hands its exact SHA
-  to the integration coordinator.
-- The coordinator reviews the diff and test evidence before landing it.
-- Landing onto `integration` uses a fast-forward merge from the clean primary
-  checkout:
-
-  ```bash
-  git status --short --branch
-  git merge --ff-only <feature-branch>
-  ```
-
-- If the fast-forward check fails, do not create a convenience merge commit.
-  Return the branch to its owner to update it against current `integration`,
-  rerun affected tests, and provide a new SHA.
-- After landing, run the integration-level checks appropriate to the combined
-  change. Keep `integration` green; repair a regression before accepting more
-  feature work.
+  and test evidence to the integration coordinator.
+- When repository operations are authorized, push the feature branch and open a
+  pull request targeting `integration`. A pull request is the default path for
+  every ordinary change.
+- Wait for every required CI check on the pull request's current head to pass.
+  Pending checks are not approval to merge.
+- Never merge a red pull request. Fix any failed required check on the feature
+  branch and rerun CI; do not waive or bypass it to move work forward.
+- The coordinator reviews the diff and validation evidence, confirms that the
+  required checks are green, and controls the merge into `integration`.
+- `integration` must stay green at all times. The coordinator serializes or
+  otherwise coordinates landings so that stale green results are not reused
+  after the base changes.
+- If CI breaks on `integration`, restoring green is P0. Stop accepting other
+  changes and fix the regression immediately.
+- After landing, run any integration-level checks appropriate to the combined
+  change and monitor the repository CI result.
+- An urgent direct landing on `integration` is an exception, not an alternate
+  normal workflow. Only the coordinator may authorize it. Before pushing the
+  exact commit directly, run `./validate.sh` from a clean repository root and
+  require it to pass. The direct landing must still pass CI; any failure is the
+  same P0 integration regression.
+- When concurrency grows beyond reliable manual serialization, add an automated
+  merge queue that retests pull requests against the latest `integration` head.
+  Until then, the coordinator is the merge queue and enforces this policy.
 - Periodically promote a reviewed, green batch from `integration` to `main` as
   one bulk diff or pull request. Do not bypass `integration` by landing feature
   branches directly on `main`.
@@ -195,7 +204,38 @@ Every handoff includes:
 - exact commit SHA and concise change summary,
 - commands run and their results,
 - known failures or environment limitations,
-- whether the branch is ready for fast-forward integration.
+- whether the branch is ready for a pull request and integration.
+
+### Locally Validated Pull Requests
+
+When GitHub-hosted CI cannot run Hermit's full CPUID/PMU-sensitive suite, a
+pull request may use local validation as the missing green signal. This is an
+exception for unavailable coverage, not a way to ignore a failing check that
+can run in CI.
+
+1. Check out the exact current pull request head in a clean worktree on a
+   supported x86_64 Linux machine with the required CPUID and PMU access.
+2. Run `./validate.sh` and require every gate to pass.
+3. Post this exact pull request comment, substituting the validated commit and
+   machine hostname:
+
+   ```text
+   Locally validated: ran validate.sh on SHA <sha> on <hostname>, all gates passed
+   ```
+
+4. Apply the GitHub label `locally-validated`:
+
+   ```bash
+   HTTPS_PROXY=http://fwdproxy:8080 \
+     gh pr edit <number> -R facebookexperimental/hermit \
+       --add-label locally-validated
+   ```
+
+Once the comment and label identify the current pull request head, the
+integration coordinator may treat the pull request as green for merge purposes
+when CI cannot run the full suite. A new commit invalidates the evidence and
+label until `./validate.sh` is rerun and the comment is updated. A failed or
+skipped gate is not locally validated.
 
 ## Project Overview
 
