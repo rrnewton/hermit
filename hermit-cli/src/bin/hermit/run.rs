@@ -765,9 +765,7 @@ impl RunOpts {
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
-        // TODO: Get this working with `--tmp`? Each run could use a separate
-        // subdirectory. Only preserve the temporary directory if verify failed?
-        let tmpfs = tempfile::TempDir::new()?;
+        let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
 
@@ -793,21 +791,7 @@ impl RunOpts {
         Ok(())
     }
 
-    fn save_config_to_disk(&self) -> Result<(), Error> {
-        if let Some(path) = &self.save_config {
-            let mut file = File::create(path)?;
-            file.write_all(format!("{:#?}\n", self).as_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn run_in_container(
-        &self,
-        global: &GlobalOpts,
-        capture_output: bool,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
-        let _guard = global.init_tracing();
-
+    fn guest_command(&self) -> Result<Command, Error> {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(current_dir) = &self.workdir {
@@ -828,11 +812,28 @@ impl RunOpts {
                 command.env("HOME", "/root");
                 self.merge_from_env_settings(&mut command)?
             }
-            BaseEnv::Host => {
-                // Let it all through.
-                self.merge_from_env_settings(&mut command)?
-            }
+            BaseEnv::Host => self.merge_from_env_settings(&mut command)?,
         }
+
+        Ok(command)
+    }
+
+    fn save_config_to_disk(&self) -> Result<(), Error> {
+        if let Some(path) = &self.save_config {
+            let mut file = File::create(path)?;
+            file.write_all(format!("{:#?}\n", self).as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn run_in_container(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
+        let _guard = global.init_tracing();
+
+        let command = self.guest_command()?;
 
         let config = self.det_opts.det_config.clone();
         self.save_config_to_disk()?;
@@ -864,12 +865,7 @@ impl RunOpts {
 
         let _guard = init_file_tracing(Some(level), log_file);
 
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-
-        if let Some(current_dir) = &self.workdir {
-            command.current_dir(current_dir);
-        }
+        let command = self.guest_command()?;
 
         let config = self.det_opts.det_config.clone();
         self.save_config_to_disk()?;
