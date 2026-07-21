@@ -51,12 +51,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - uses: actions/setup-go@v5
+      with:
+        go-version: stable
+        cache: false
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y golang-go libunwind-dev liblzma-dev
+          sudo apt-get install -y libunwind-dev liblzma-dev
         else
-          sudo dnf install -y golang libunwind-devel xz-devel
+          sudo dnf install -y libunwind-devel xz-devel
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
