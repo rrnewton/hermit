@@ -11,25 +11,27 @@ primary checkout.
 ### Vocabulary And Layout
 
 - **Parent**: `~/work/dev-hermit/`, the local multi-agent development root.
-- **Primary checkout**: `~/work/dev-hermit/hermit/`. It stays on
-  `integration`, is used only by the integration coordinator, and donates its
-  warm `target/` cache to slots. Ordinary agents do not edit files here.
-- **Slot**: one permanent agent worktree at
-  `~/work/dev-hermit/worktrees/slot01/` through `slot04/`.
+- **Primary checkout**: `~/work/dev-hermit/hermit/`. It stays on `main`, is
+  used only by the landing coordinator, and donates its warm `target/` cache
+  to slots. Ordinary agents do not edit files here.
+- **Slot**: the Hermit checkout inside one permanent parent worktree at
+  `~/work/dev-hermit/worktrees/slot01/hermit/` through `slot04/hermit/`.
 - **Feature branch**: a descriptive, task-specific branch checked out in one
   slot. Directory names stay opaque and stable even as branches change.
-- **Integration branch**: `integration`, the continuously combined and tested
-  branch checked out in the primary checkout.
-- **Release branch**: `main`, updated periodically from tested integration
-  batches rather than directly from agent feature branches.
+- **Primary branch**: `main` in `rrnewton/hermit`, the continuously tested
+  development branch checked out in the primary checkout.
+- **Upstream**: `facebookexperimental/hermit`, which receives periodic bulk
+  pull requests from tested fork `main` rather than day-to-day feature work.
 
 Expected layout:
 
 ```text
 ~/work/dev-hermit/
-|-- hermit/                 # primary checkout; integration coordinator only
+|-- hermit/                 # primary checkout; landing coordinator only
 `-- worktrees/
-    |-- slot01/             # permanent worktree; active or parked
+    |-- slot01/             # permanent parent worktree
+    |   |-- hermit/         # task-specific Hermit branch
+    |   `-- reverie/        # pinned sibling dependency
     |-- slot02/
     |-- slot03/
     `-- slot04/
@@ -57,11 +59,11 @@ Parking happens in place; never move or delete the slot directory and never run
 work: its completed feature branch and commit SHA must already be recorded in
 the handoff.
 
-Creating the pool is an integration-coordinator operation. From the primary
-checkout, a missing slot is created from `integration` with:
+Creating the pool is a landing-coordinator operation. From the parent checkout,
+create a missing slot from `devbig-lead` with:
 
 ```bash
-git worktree add --detach ../worktrees/slot0X integration
+./slot-init.sh slot0X
 ```
 
 The primary checkout is the build-cache donor. When a new or intentionally
@@ -71,7 +73,7 @@ filesystem supports reflinks:
 ```bash
 cp -a --reflink=auto \
   ~/work/dev-hermit/hermit/target \
-  ~/work/dev-hermit/worktrees/slot0X/
+  ~/work/dev-hermit/worktrees/slot0X/hermit/
 ```
 
 Never symlink `target/` between checkouts: concurrent Cargo processes must not
@@ -89,19 +91,18 @@ The coordinator assigns one free slot to exactly one agent. Before editing:
 1. Confirm the slot is a registered worktree and inspect its state:
 
    ```bash
-   git -C ~/work/dev-hermit/hermit worktree list
-   git -C ~/work/dev-hermit/worktrees/slot0X status --short --branch
+   git -C ~/work/dev-hermit worktree list
+   git -C ~/work/dev-hermit/worktrees/slot0X/hermit status --short --branch
    ```
 
 2. Require a clean worktree. Do not discard or absorb changes left by another
    task.
-3. Fetch remote refs, then create a descriptive branch from the current local
-   `integration` branch:
+3. Fetch fork refs, then create a descriptive branch from current fork `main`:
 
    ```bash
-   git -C ~/work/dev-hermit/worktrees/slot0X fetch origin
-   git -C ~/work/dev-hermit/worktrees/slot0X switch \
-     -c <feature-branch> integration
+   git -C ~/work/dev-hermit/worktrees/slot0X/hermit fetch origin
+   git -C ~/work/dev-hermit/worktrees/slot0X/hermit switch \
+     -c <feature-branch> origin/main
    ```
 
 4. Record the slot, branch, task, and owner in the coordinator's task state
@@ -116,17 +117,17 @@ slot.
 Park a slot only after all intended work is committed and handed off:
 
 ```bash
-git -C ~/work/dev-hermit/worktrees/slot0X status --short
-git -C ~/work/dev-hermit/worktrees/slot0X switch --detach HEAD
+git -C ~/work/dev-hermit/worktrees/slot0X/hermit status --short
+git -C ~/work/dev-hermit/worktrees/slot0X/hermit switch --detach HEAD
 ```
 
 The first command must produce no output. Record the feature branch name, exact
-HEAD SHA, validation performed, and integration status before marking the slot
+HEAD SHA, validation performed, and landing status before marking the slot
 free. Do not delete a feature branch until its commit is reachable from
-`integration` or the coordinator explicitly archives it.
+fork `main` or the coordinator explicitly archives it.
 
 To reuse a parked slot, re-run the starting-work checks and create the next
-feature branch from the latest `integration`. A slot that is not clean remains
+feature branch from the latest `origin/main`. A slot that is not clean remains
 active regardless of whether an agent is currently responding.
 
 ### Branch And Integration Strategy
@@ -134,17 +135,18 @@ active regardless of whether an agent is currently responding.
 The branch flow is:
 
 ```text
-feature branches -> integration -> main
+feature branches -> rrnewton/hermit main -> periodic upstream pull request
 ```
 
-- Agents branch from `integration`, never directly develop on `integration` or
-  `main`.
+- Agents branch from `origin/main` in the `rrnewton/hermit` fork and never
+  develop directly on `main`.
 - Each feature branch contains one coherent task or tightly coupled change.
-- The agent validates and commits the feature branch, then hands its exact SHA
-  to the integration coordinator.
-- The coordinator reviews the diff and test evidence before landing it.
-- Landing onto `integration` uses a fast-forward merge from the clean primary
-  checkout:
+- The agent validates and commits the feature branch, pushes it to `origin`,
+  and opens a pull request against fork `main`.
+- The landing coordinator reviews the diff, local test evidence, and fork CI
+  before merging it.
+- Direct emergency landing onto `main`, when explicitly authorized, uses a
+  fast-forward merge from the clean primary checkout:
 
   ```bash
   git status --short --branch
@@ -152,18 +154,17 @@ feature branches -> integration -> main
   ```
 
 - If the fast-forward check fails, do not create a convenience merge commit.
-  Return the branch to its owner to update it against current `integration`,
+  Return the branch to its owner to update it against current `origin/main`,
   rerun affected tests, and provide a new SHA.
-- After landing, run the integration-level checks appropriate to the combined
-  change. Keep `integration` green; repair a regression before accepting more
-  feature work.
-- Periodically promote a reviewed, green batch from `integration` to `main` as
-  one bulk diff or pull request. Do not bypass `integration` by landing feature
-  branches directly on `main`.
+- Keep fork `main` green; repair a regression before accepting more feature
+  work.
+- Periodically submit a reviewed, green batch from fork `main` to
+  `facebookexperimental/hermit` as one upstream pull request. Do not use the
+  upstream repository for routine feature branches or CI iteration.
 
 Only the coordinator mutates the primary checkout. It must be clean before a
 merge or promotion. Unrelated primary-checkout changes are a blocker to that
-integration operation and must be attributed and resolved without destructive
+landing operation and must be attributed and resolved without destructive
 cleanup.
 
 ### Commit Methodology
@@ -195,7 +196,7 @@ Every handoff includes:
 - exact commit SHA and concise change summary,
 - commands run and their results,
 - known failures or environment limitations,
-- whether the branch is ready for fast-forward integration.
+- whether the branch is ready for a pull request or authorized fast-forward.
 
 ## Project Overview
 
@@ -353,19 +354,20 @@ Start investigations in these locations:
 
 ## Repository And Issues
 
-This repository is the public GitHub export at
-`facebookexperimental/hermit`. Meta's internal source uses Buck and is exported
-to GitHub; public contributions use Cargo and GitHub pull requests. Follow
-`CONTRIBUTING.md`, update documentation for user-visible changes, and never
-publish security vulnerabilities as ordinary issues.
+Primary development happens in the `rrnewton/hermit` fork. Configure `origin`
+for that fork and `upstream` for `facebookexperimental/hermit`. Meta's internal
+source uses Buck and is exported upstream; this team develops and runs CI on
+fork `main`, then periodically submits a tested bulk pull request upstream.
+Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
+never publish security vulnerabilities as ordinary issues.
 
 GitHub Issues are the public issue tracker. On Meta devservers, direct GitHub
 API access is unavailable, so set the proxy for every `gh` invocation:
 
 ```bash
 export HTTPS_PROXY=http://fwdproxy:8080
-gh issue list -R facebookexperimental/hermit
-gh issue view <number> -R facebookexperimental/hermit
+gh issue list -R rrnewton/hermit
+gh issue view <number> -R rrnewton/hermit
 ```
 
 The proxy is an environment requirement, not an authentication workaround. If

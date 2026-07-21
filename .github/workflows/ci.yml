@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "main", "integration" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main", "integration" ]
+    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +22,13 @@ jobs:
     - name: Build
       run: cargo build --workspace
     - name: Test regular workspace crates
-      run: cargo test --workspace --exclude detcore
+      run: >-
+        cargo test --workspace
+        --exclude detcore
+        --exclude hermit
+        --exclude hermetic_infra_hermit_flaky-tests
+    - name: Test Hermit without namespace-dependent integration tests
+      run: cargo test -p hermit --lib --bins
     - name: Test Detcore without hardware-dependent integration tests
       run: |
         cargo test -p detcore --lib --bins
@@ -37,15 +43,29 @@ jobs:
       run: cargo fmt --all -- --check
 
   hardware:
-    name: Hardware-dependent tests (self-hosted, disabled)
-    if: ${{ false }} # Enable after a compatible runner is available.
-    runs-on: [self-hosted, linux, x64]
+    name: Host-dependent tests (self-hosted)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
 
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: |
+        if command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev
+        else
+          sudo dnf install -y libunwind-devel xz-devel
+        fi
     - name: CPUID and RDRAND/RDSEED tests
-      run: cargo test -p detcore --test tests_misc
-    - name: PMU preemption and CPU instruction tests
-      run: cargo test -p detcore --test tests_parallelism --test tests_time
+      run: |
+        cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
+        cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
+    - name: PMU RCB counter smoke test
+      run: cargo test -p detcore --test tests_time tod_is_stable -- --exact
+    - name: Hermit tests
+      run: |
+        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
+          cargo test -p hermit
+        else
+          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
+          cargo test -p hermit --lib --bins
+        fi

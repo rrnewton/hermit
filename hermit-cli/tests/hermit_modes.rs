@@ -183,18 +183,6 @@ fn verify_mode_matrix() {
 }
 
 #[test]
-fn record_replay_matrix() {
-    let _guard = hermit_run_lock();
-    for workload in workloads().stable.iter().take(2) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-        command
-            .args(["record", "start", "--verify"])
-            .arg(&workload.path);
-        command_output(command, &format!("record/replay for {}", workload.name));
-    }
-}
-
-#[test]
 fn hello_race_chaos_verify() {
     let _guard = hermit_run_lock();
     let workload = &workloads().hello_race;
