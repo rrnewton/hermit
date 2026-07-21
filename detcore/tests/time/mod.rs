@@ -15,6 +15,7 @@ use std::time;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore::Detcore;
+use detcore::types::NANOS_PER_CLOCK_READ;
 use detcore::types::NANOS_PER_RCB;
 use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
@@ -34,6 +35,16 @@ fn diff_nanos(t1: DateTime<Utc>, t2: DateTime<Utc>) -> i64 {
     let m1 = t1.timestamp() * 1_000_000 + t1.timestamp_subsec_nanos() as i64;
     let m2 = t2.timestamp() * 1_000_000 + t2.timestamp_subsec_nanos() as i64;
     m2 - m1
+}
+
+fn monotonic_nanos() -> u64 {
+    let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, tp.as_mut_ptr()) },
+        0
+    );
+    let tp = unsafe { tp.assume_init() };
+    tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64
 }
 
 #[test]
@@ -228,12 +239,15 @@ fn tod_clock_getres_2() {
             // Spot check a single syscall clock delta (clock_gettime).
             let nanos = now.elapsed().as_nanos();
             let expected = if sequentialize && timeout_disabled {
-                // Additional multiplier, see DetTime::new():
+                // Additional multiplier, see DetTime::new().
                 500 * (multiplier * NANOS_PER_SYSCALL) as u128
-            } else {
+            } else if sequentialize {
                 (multiplier * NANOS_PER_SYSCALL) as u128
+            } else {
+                (multiplier * NANOS_PER_CLOCK_READ) as u128
             };
-            // account for some slop from RCBs
+
+            // Account for some slop from RCBs.
             assert!(nanos >= expected);
             assert!(nanos < expected + 10 * ((multiplier * NANOS_PER_RCB) as u128));
         },
@@ -261,6 +275,36 @@ fn rdtsc_deltas() {
             );
             // Whatever the delta is, it has to have stepped by AT LEAST the multiplier:
             assert!(tsc2 - tsc1 > 12345);
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+fn rdtsc_observes_global_time() {
+    let config = detcore::Config {
+        sequentialize_threads: false,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            std::thread::spawn(|| {
+                for _ in 0..100 {
+                    monotonic_nanos();
+                }
+            })
+            .join()
+            .unwrap();
+
+            let clock_nanos = monotonic_nanos();
+            let tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
+
+            assert!(
+                tsc >= clock_nanos,
+                "RDTSC time {tsc} did not include global time {clock_nanos}"
+            );
         },
         config,
         true,
