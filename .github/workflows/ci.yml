@@ -69,3 +69,5 @@ jobs:
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
           cargo test -p hermit --lib --bins
         fi
+    - name: Schedule search E2E tests
+      run: ./tests/util/hermit_analyze_e2e.sh

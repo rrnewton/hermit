@@ -84,6 +84,8 @@ run_check "Test workspace and integrations" \
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps
+run_check "Schedule search E2E (requires PMU)" \
+    ./tests/util/hermit_analyze_e2e.sh
 
 print_summary
 ((failures == 0))
