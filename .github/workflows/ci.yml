@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "main", "integration" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main", "integration" ]
+    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,17 +39,21 @@ jobs:
       run: cargo fmt --all -- --check
 
   hardware:
-    name: Host-dependent tests (self-hosted, disabled)
-    if: ${{ false }} # Enable after a compatible runner is available.
-    runs-on: [self-hosted, linux, x64]
+    name: Host-dependent tests (self-hosted)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
 
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: |
+        if command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev
+        else
+          sudo dnf install -y libunwind-devel xz-devel
+        fi
     - name: CPUID and RDRAND/RDSEED tests
       run: cargo test -p detcore --test tests_misc
     - name: PMU preemption and CPU instruction tests
       run: cargo test -p detcore --test tests_parallelism --test tests_time
-    - name: Hermit user namespace integration tests
-      run: cargo test -p hermit --test hermit_modes
+    - name: Hermit namespace and record/replay integration tests
+      run: cargo test -p hermit
