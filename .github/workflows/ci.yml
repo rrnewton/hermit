@@ -117,3 +117,6 @@ jobs:
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
+    - name: Schedule search E2E tests
+      if: steps.namespaces.outputs.available == 'true'
+      run: ./tests/util/hermit_analyze_e2e.sh
