@@ -7,7 +7,6 @@
  */
 
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use reverie::Errno;
@@ -110,9 +109,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): {}",
                 call.name()
             );
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi(call.name());
+            let rsrc = internal_io_polling_resources(guest, call.name());
             Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
         } else {
             assert!(action == IOAction::PassThru);
@@ -136,6 +133,116 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedTimeout {
+    Immediate,
+    Infinite,
+    Deadline(LogicalTime),
+}
+
+impl ParsedTimeout {
+    fn deadline(self) -> Option<LogicalTime> {
+        match self {
+            Self::Immediate | Self::Infinite => None,
+            Self::Deadline(deadline) => Some(deadline),
+        }
+    }
+}
+
+pub fn checked_timespec_to_nanos(timeout: Timespec) -> Result<u128, Errno> {
+    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+
+    Ok(timeout.tv_sec as u128 * 1_000_000_000 + timeout.tv_nsec as u128)
+}
+
+fn saturating_logical_time(nanos: u128) -> LogicalTime {
+    LogicalTime::from_nanos(nanos.try_into().unwrap_or(u64::MAX))
+}
+
+fn saturating_deadline(base: LogicalTime, delta_nanos: u128) -> LogicalTime {
+    saturating_logical_time(base.as_nanos() as u128 + delta_nanos)
+}
+
+pub async fn relative_timespec_timeout<T, G>(
+    guest: &mut G,
+    timeout: Option<Timespec>,
+) -> Result<ParsedTimeout, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(timeout) = timeout else {
+        return Ok(ParsedTimeout::Infinite);
+    };
+    let timeout_nanos = checked_timespec_to_nanos(timeout)?;
+    Ok(relative_nanos_timeout(guest, timeout_nanos).await)
+}
+
+pub fn absolute_timespec_timeout(timeout: Option<Timespec>) -> Result<ParsedTimeout, Errno> {
+    let Some(timeout) = timeout else {
+        return Ok(ParsedTimeout::Infinite);
+    };
+    Ok(ParsedTimeout::Deadline(saturating_logical_time(
+        checked_timespec_to_nanos(timeout)?,
+    )))
+}
+
+pub async fn millis_timeout<T, G>(guest: &mut G, timeout_millis: i32) -> ParsedTimeout
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    match timeout_millis {
+        0 => ParsedTimeout::Immediate,
+        timeout if timeout < 0 => ParsedTimeout::Infinite,
+        timeout => relative_nanos_timeout(guest, timeout as u128 * 1_000_000).await,
+    }
+}
+
+async fn relative_nanos_timeout<T, G>(guest: &mut G, timeout_nanos: u128) -> ParsedTimeout
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if timeout_nanos == 0 {
+        ParsedTimeout::Immediate
+    } else {
+        let base = thread_observe_time(guest).await;
+        ParsedTimeout::Deadline(saturating_deadline(base, timeout_nanos))
+    }
+}
+
+fn internal_io_polling_resources<T, G>(guest: &G, name: &str) -> Resources
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut resources = Resources::new(guest.thread_state().dettid);
+    resources.insert(ResourceID::InternalIOPolling, Permission::W);
+    resources.fyi(name);
+    resources
+}
+
+pub async fn execute_internal_io_polling<T, G, C>(
+    guest: &mut G,
+    call: C,
+    timeout: ParsedTimeout,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+    C: NonblockableSyscall + TimeoutableSyscall,
+{
+    if timeout == ParsedTimeout::Immediate {
+        return Ok(guest.inject(call).await?);
+    }
+
+    let resources = internal_io_polling_resources(guest, call.name());
+    retry_nonblocking_syscall_with_timeout(guest, call, resources, timeout.deadline()).await
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:
@@ -401,6 +508,35 @@ async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
     (tp, guard)
 }
 
+async fn zero_timeval<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+) -> (Addr<'stack, libc::timeval>, <G::Stack as Stack>::StackGuard) {
+    let mut stack = guest.stack().await;
+    let timeout = stack.push(libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    });
+    let guard = stack.commit().expect("stack.commit to succeed");
+    (timeout, guard)
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Ppoll {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        let (timeout, guard) = zero_timeval(guest).await;
+        (self.with_timeout(Some(timeout)), Some(guard))
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Ppoll {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Wait4 {
     async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
@@ -505,6 +641,34 @@ impl NonblockableSyscall for reverie::syscalls::Write {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         // A return value of Ok(0) indicates end of file.
         // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Readv {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Writev {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
 }
@@ -821,32 +985,37 @@ where
     event
 }
 
-// Convert to absolute logical time point for the timeout.
-// 0 duration means no timeout, and this will return None.
-pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
-    guest: &mut G,
-    timeout_millis: i32,
-) -> Option<LogicalTime> {
-    if timeout_millis > 0 {
-        nanos_duration_to_absolute_timeout(guest, (timeout_millis as u128) * 1000).await
-    } else {
-        None
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// Convert to absolute logical time point for the timeout.
-// 0 duration means no timeout, and this will return None.
-pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
-    guest: &mut G,
-    timeout_nanos: u128,
-) -> Option<LogicalTime> {
-    if timeout_nanos > 0 {
-        let ns_delta = Duration::from_nanos(timeout_nanos as u64);
-        let base_time = thread_observe_time(guest).await;
-        let target_time = base_time + ns_delta;
-        Some(target_time)
-    } else {
-        None
+    #[test]
+    fn timespec_validation_and_saturation() {
+        assert_eq!(
+            checked_timespec_to_nanos(Timespec {
+                tv_sec: 1,
+                tv_nsec: 2,
+            }),
+            Ok(1_000_000_002)
+        );
+        assert_eq!(
+            checked_timespec_to_nanos(Timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            saturating_deadline(LogicalTime::from_nanos(7), u64::MAX as u128 + 1),
+            LogicalTime::MAX
+        );
+        assert_eq!(
+            absolute_timespec_timeout(Some(Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 999_999_999,
+            })),
+            Ok(ParsedTimeout::Deadline(LogicalTime::MAX))
+        );
     }
 }
 

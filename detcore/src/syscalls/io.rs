@@ -17,8 +17,12 @@ use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Timespec;
 use tracing::debug;
 use tracing::trace;
 
@@ -30,8 +34,10 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
-use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::ParsedTimeout;
+use crate::syscalls::helpers::execute_internal_io_polling;
+use crate::syscalls::helpers::millis_timeout;
+use crate::syscalls::helpers::relative_timespec_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 
@@ -82,16 +88,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        let timeout_millis = call.timeout();
-        if timeout_millis == 0 {
-            Ok(guest.inject(call).await?) // Already non-blocking.
-        } else {
-            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("poll");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+        let timeout = millis_timeout(guest, call.timeout()).await;
+        execute_internal_io_polling(guest, call, timeout).await
+    }
+
+    /// ppoll syscall (MAYHANG)
+    pub async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+    ) -> Result<i64, Error> {
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || call.sigmask().is_some()
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Ppoll(call))
+                .await;
         }
+
+        let timeout_addr = if let Some(addr) = call.timeout() {
+            // Reverie currently types this ABI-compatible pointer as timeval, while Linux
+            // ppoll interprets it as timespec.
+            Some(AddrMut::<Timespec>::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timespec_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = Timespec {
+                tv_sec: (remaining_nanos / 1_000_000_000) as i64,
+                tv_nsec: (remaining_nanos % 1_000_000_000) as i64,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
@@ -192,16 +232,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollWait,
     ) -> Result<i64, Error> {
-        let timeout_millis = call.timeout();
-        if timeout_millis == 0 {
-            Ok(guest.inject(call).await?) // Already non-blocking.
-        } else {
-            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("epoll_wait");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
-        }
+        let timeout = millis_timeout(guest, call.timeout()).await;
+        execute_internal_io_polling(guest, call, timeout).await
     }
 
     /// Connect system call (MAYHANG)

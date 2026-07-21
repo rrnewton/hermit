@@ -295,6 +295,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    /// SYS_readv system call (MAYHANG).
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let (fd_type, resource) = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = match fd_type {
+            FdType::Socket | FdType::Pipe => {
+                self.execute_nonblockable_fd_syscall(guest, call).await
+            }
+            _ => Ok(self.record_or_replay(guest, call).await?),
+        };
+        resource_release_all(guest).await;
+        res
+    }
+
     /// SYS_pread64 system call.
     pub async fn handle_pread64<G: Guest<Self>>(
         &self,
@@ -501,6 +526,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(self.record_or_replay(guest, call).await?)
         };
 
+        resource_release_all(guest).await;
+        res
+    }
+
+    /// SYS_writev system call (MAYHANG).
+    pub async fn handle_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
+        if guest.config().virtualize_metadata {
+            let inode = raw_ino.expect("Expect that virtualized metadata has populated DetFd stat");
+            touch_file(guest, inode).await;
+        }
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let res = if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        {
+            self.execute_nonblockable_fd_syscall(guest, call).await
+        } else {
+            Ok(self.record_or_replay(guest, call).await?)
+        };
         resource_release_all(guest).await;
         res
     }
