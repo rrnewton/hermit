@@ -35,6 +35,12 @@ const MICROS_PER_SEC: u64 = 1_000_000;
 /// Virtual nanoseconds elapsed per system call (uniform for now).
 pub const NANOS_PER_SYSCALL: f64 = 10000.0;
 
+/// Virtual nanoseconds elapsed per clock observation in concurrent mode.
+///
+/// This is finer than a general syscall tick so observing the clock does not
+/// introduce enough sampling error to disrupt hardware timer calibration.
+pub const NANOS_PER_CLOCK_READ: f64 = 2_000.0;
+
 /// Virtual nanoseconds elapsed per Retired Conditional Branch.
 pub const NANOS_PER_RCB: f64 = 10.0;
 
@@ -312,6 +318,9 @@ pub struct DetTime {
     /// Number of nondeterministic instructions (rdtsc, cpuid)
     nondet_instrs: u64,
 
+    /// Number of virtualized clock observations.
+    clock_reads: u64,
+
     /// Baseline amount of time to add.
     starting_micros: Microseconds,
 
@@ -326,6 +335,7 @@ impl Default for DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            clock_reads: 0,
             starting_micros: 0,
             multiplier: 1.0,
         }
@@ -362,6 +372,7 @@ impl From<&DateTime<Utc>> for DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            clock_reads: 0,
             starting_micros: micros_from_utc(dt),
             multiplier: 1.0,
         }
@@ -406,6 +417,7 @@ impl DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            clock_reads: 0,
             starting_micros: 0,
             multiplier: 1.0,
         }
@@ -423,6 +435,11 @@ impl DetTime {
     /// Register that an `rdtsc` intsruction has executed.
     pub fn add_rdtsc(&mut self) {
         self.nondet_instrs += 1;
+    }
+
+    /// Register a fine-grained observation of the virtual clock.
+    pub fn add_clock_read(&mut self) {
+        self.clock_reads += 1;
     }
 
     /// Register that an `cpuid` intsruction has executed.
@@ -448,6 +465,7 @@ impl DetTime {
             (self.starting_micros * 1000)
                 + ((self.syscalls as f64 * NANOS_PER_SYSCALL * self.multiplier) as u64)
                 + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
+                + ((self.clock_reads as f64 * NANOS_PER_CLOCK_READ * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
         )
     }
@@ -597,6 +615,21 @@ impl GlobalTime {
         })
     }
 
+    /// Deterministic wall-clock time shared by concurrent threads.
+    ///
+    /// Unlike [`Self::as_nanos`], this does not add work performed concurrently
+    /// by multiple threads. It advances with the furthest-progressed thread and
+    /// therefore remains suitable for process-wide clock observations.
+    pub fn wall_clock_time(&self) -> LogicalTime {
+        let thread_time = self
+            .time_vector
+            .values()
+            .max()
+            .copied()
+            .unwrap_or(LogicalTime::ZERO);
+        self.starting_nanos + thread_time + self.extra_time
+    }
+
     /// Deterministic lower bound on the amount of work that has happened across all
     /// threads, starting with the same epoch time as individual thread clocks.
     ///
@@ -604,4 +637,29 @@ impl GlobalTime {
     pub fn as_nanos(&self) -> LogicalTime {
         self.total
     }
+}
+
+#[test]
+fn clock_reads_use_fine_grained_ticks() {
+    let mut time = DetTime::default();
+    let start = time.as_nanos();
+
+    time.add_clock_read();
+
+    assert_eq!(
+        time.as_nanos() - start,
+        LogicalTime::from_nanos(NANOS_PER_CLOCK_READ as u64)
+    );
+}
+
+#[test]
+fn concurrent_wall_clock_does_not_sum_thread_work() {
+    let mut time = GlobalTime::new(&Config::default());
+    let start = time.starting_nanos;
+
+    time.update_global_time(DetTid::from_raw(1), start + LogicalTime::from_nanos(10));
+    time.update_global_time(DetTid::from_raw(2), start + LogicalTime::from_nanos(20));
+
+    assert_eq!(time.wall_clock_time(), start + LogicalTime::from_nanos(20));
+    assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(30));
 }
