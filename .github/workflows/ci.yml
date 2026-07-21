@@ -81,7 +81,7 @@ jobs:
     - name: Check mount namespace support
       id: namespaces
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
+        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
           echo "available=true" >> "$GITHUB_OUTPUT"
         else
           echo "available=false" >> "$GITHUB_OUTPUT"
