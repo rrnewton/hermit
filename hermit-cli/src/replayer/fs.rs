@@ -115,7 +115,11 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let request = syscall.request();
 
-        if request.direction() == ioctl::Direction::Read {
+        if matches!(request, ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX) {
+            // Replayed opens do not necessarily create host file descriptors.
+            // Detcore updates the logical descriptor metadata after this returns.
+            next_event!(guest, Return)
+        } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
             Ok(0)

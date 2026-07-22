@@ -20,6 +20,7 @@ use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
+use reverie::syscalls::ioctl;
 
 use super::Recorder;
 use crate::event::StatEvent;
@@ -131,7 +132,9 @@ impl Recorder {
             self.record_event(guest, Err(err));
         })?;
 
-        if let Some(output) = request.read_output(&guest.memory()).transpose() {
+        if matches!(request, ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX) {
+            self.record_event(guest, Ok(SyscallEvent::Return(ret)));
+        } else if let Some(output) = request.read_output(&guest.memory()).transpose() {
             // This ioctl request has an associated output.
             self.record_event(guest, output.map(SyscallEvent::Ioctl));
         } else {
