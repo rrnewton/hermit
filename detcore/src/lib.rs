@@ -68,6 +68,7 @@ use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Fork;
+use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -505,6 +506,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::signalfd,
                 Sysno::signalfd4,
                 Sysno::timerfd_create,
+                Sysno::timerfd_settime,
+                Sysno::timerfd_gettime,
+                Sysno::inotify_init,
+                Sysno::inotify_init1,
+                Sysno::inotify_add_watch,
+                Sysno::inotify_rm_watch,
                 Sysno::memfd_create,
                 Sysno::userfaultfd,
                 Sysno::accept,
@@ -1053,6 +1060,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
             Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
             Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
+            Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
+            Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+            Syscall::InotifyInit(s) => {
+                self.handle_inotify_init1(guest, InotifyInit1::from(s))
+                    .await
+            }
+            Syscall::InotifyInit1(s) => self.handle_inotify_init1(guest, s).await,
+            Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
+            Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
             Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
             Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
             Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,

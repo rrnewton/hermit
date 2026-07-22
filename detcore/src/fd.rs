@@ -48,6 +48,8 @@ pub enum FdType {
     Eventfd,
     /// timerfd
     Timerfd,
+    /// inotify instance
+    Inotify,
     /// socket fd
     Socket,
     /// pipe fd
