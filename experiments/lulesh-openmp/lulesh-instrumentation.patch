@@ -1,0 +1,134 @@
+diff --git a/lulesh.cc b/lulesh.cc
+index 6fcb5d0..2c0f117 100644
+--- a/lulesh.cc
++++ b/lulesh.cc
+@@ -2470,6 +2470,11 @@ void ApplyMaterialPropertiesForElems(Domain& domain, Real_t *vnew)
+ 
+ /******************************************/
+ 
++#if _OPENMP
++static Index_t observed_openmp_team_size = 0;
++static Index_t observed_openmp_parallel_regions = 0;
++#endif
++
+ static inline
+ void CalcCourantConstraintForElems(Domain &domain, Index_t length,
+                                    Index_t *regElemlist,
+@@ -2497,6 +2502,16 @@ void CalcCourantConstraintForElems(Domain &domain, Index_t length,
+       Real_t   dtcourant_tmp = dtcourant;
+       Index_t  courant_elem  = -1 ;
+ 
++#if _OPENMP
++#pragma omp single
++      {
++         Index_t team_size = omp_get_num_threads();
++         if (team_size > observed_openmp_team_size)
++            observed_openmp_team_size = team_size;
++         ++observed_openmp_parallel_regions;
++      }
++#endif
++
+ #if _OPENMP
+       Index_t thread_num = omp_get_thread_num();
+ #else
+@@ -2803,6 +2817,10 @@ int main(int argc, char *argv[])
+    }
+    
+    if ((myRank == 0) && (opts.quiet == 0)) {
++#if _OPENMP
++      printf("Observed OpenMP team size = %i\n", observed_openmp_team_size);
++      printf("Observed OpenMP parallel regions = %i\n", observed_openmp_parallel_regions);
++#endif
+       VerifyAndWriteFinalOutput(elapsed_timeG, *locDom, opts.nx, numRanks);
+    }
+ 
+diff --git a/lulesh-util.cc b/lulesh-util.cc
+index 8d0b18f..e4b2c45 100644
+--- a/lulesh-util.cc
++++ b/lulesh-util.cc
+@@ -177,6 +177,77 @@ void ParseCommandLineOptions(int argc, char *argv[],
+ 
+ /////////////////////////////////////////////////////////////////////
+ 
++static void WriteRealField(FILE *output,
++                           const char *name,
++                           Domain& domain,
++                           Index_t count,
++                           Domain_member field)
++{
++   fprintf(output, "field=%s count=%i\n", name, count);
++   for (Index_t i=0; i<count; ++i) {
++      fprintf(output, "%a\n", double((domain.*field)(i)));
++   }
++}
++
++static void WriteFullState(Domain& locDom)
++{
++   const char *state_path = getenv("LULESH_STATE_FILE");
++   if ((state_path == NULL) || (state_path[0] == '\0')) {
++      fprintf(stderr, "LULESH_STATE_FILE is required by the determinism test\n");
++      exit(EXIT_FAILURE);
++   }
++
++   FILE *output = fopen(state_path, "w");
++   if (output == NULL) {
++      fprintf(stderr, "Unable to open LULESH state file: %s\n", state_path);
++      exit(EXIT_FAILURE);
++   }
++
++   fprintf(output, "schema_version=1\n");
++   fprintf(output, "num_nodes=%i\n", locDom.numNode());
++   fprintf(output, "num_elements=%i\n", locDom.numElem());
++   fprintf(output, "cycle=%i\n", locDom.cycle());
++   fprintf(output, "time=%a\n", double(locDom.time()));
++   fprintf(output, "deltatime=%a\n", double(locDom.deltatime()));
++   fprintf(output, "dtcourant=%a\n", double(locDom.dtcourant()));
++   fprintf(output, "dthydro=%a\n", double(locDom.dthydro()));
++   fprintf(output, "dtmax=%a\n", double(locDom.dtmax()));
++   fprintf(output, "dtfixed=%a\n", double(locDom.dtfixed()));
++
++   WriteRealField(output, "x", locDom, locDom.numNode(), &Domain::x);
++   WriteRealField(output, "y", locDom, locDom.numNode(), &Domain::y);
++   WriteRealField(output, "z", locDom, locDom.numNode(), &Domain::z);
++   WriteRealField(output, "xd", locDom, locDom.numNode(), &Domain::xd);
++   WriteRealField(output, "yd", locDom, locDom.numNode(), &Domain::yd);
++   WriteRealField(output, "zd", locDom, locDom.numNode(), &Domain::zd);
++   WriteRealField(output, "xdd", locDom, locDom.numNode(), &Domain::xdd);
++   WriteRealField(output, "ydd", locDom, locDom.numNode(), &Domain::ydd);
++   WriteRealField(output, "zdd", locDom, locDom.numNode(), &Domain::zdd);
++   WriteRealField(output, "fx", locDom, locDom.numNode(), &Domain::fx);
++   WriteRealField(output, "fy", locDom, locDom.numNode(), &Domain::fy);
++   WriteRealField(output, "fz", locDom, locDom.numNode(), &Domain::fz);
++   WriteRealField(output, "nodalMass", locDom, locDom.numNode(), &Domain::nodalMass);
++
++   WriteRealField(output, "e", locDom, locDom.numElem(), &Domain::e);
++   WriteRealField(output, "p", locDom, locDom.numElem(), &Domain::p);
++   WriteRealField(output, "q", locDom, locDom.numElem(), &Domain::q);
++   WriteRealField(output, "ql", locDom, locDom.numElem(), &Domain::ql);
++   WriteRealField(output, "qq", locDom, locDom.numElem(), &Domain::qq);
++   WriteRealField(output, "v", locDom, locDom.numElem(), &Domain::v);
++   WriteRealField(output, "volo", locDom, locDom.numElem(), &Domain::volo);
++   WriteRealField(output, "delv", locDom, locDom.numElem(), &Domain::delv);
++   WriteRealField(output, "vdov", locDom, locDom.numElem(), &Domain::vdov);
++   WriteRealField(output, "arealg", locDom, locDom.numElem(), &Domain::arealg);
++   WriteRealField(output, "ss", locDom, locDom.numElem(), &Domain::ss);
++   WriteRealField(output, "elemMass", locDom, locDom.numElem(), &Domain::elemMass);
++
++   int write_failed = ferror(output);
++   if ((fclose(output) != 0) || write_failed) {
++      fprintf(stderr, "Unable to write LULESH state file: %s\n", state_path);
++      exit(EXIT_FAILURE);
++   }
++}
++
+ void VerifyAndWriteFinalOutput(Real_t elapsed_time,
+                                Domain& locDom,
+                                Int_t nx,
+@@ -217,5 +288,7 @@ void VerifyAndWriteFinalOutput(Real_t elapsed_time,
+    printf("Grind time (us/z/c)  = %10.8g (per dom)  (%10.8g overall)\n", grindTime1, grindTime2);
+    printf("FOM                  = %10.8g (z/s)\n\n", 1000.0/grindTime2); // zones per second
+ 
++   WriteFullState(locDom);
++
+    return ;
+ }
