@@ -2,9 +2,11 @@
 
 Hermit makes Linux program execution more reproducible by running a guest under
 the Reverie tracing framework and handling nondeterministic events in Detcore.
-This document describes the current ptrace backend: where state lives, how an
+This document focuses on the production ptrace backend: where state lives, how an
 event travels from the guest to Detcore and back, and how scheduling, resources,
-time, and chaos mode fit together.
+time, record/replay, signals, procfs, and CPUID fit together. It also describes
+the backend strategy — the abstraction that lets the same Detcore policy run over
+alternative execution mechanisms (in-process DBI and hardware virtualization).
 
 The most important boundary is:
 
@@ -51,6 +53,52 @@ Hermit has three layers plus the guest and host kernel:
 All Detcore global state is central in the tracer address space when using the
 ptrace backend. Guest processes do not link Detcore and cannot directly mutate
 its state. They communicate with it only by reaching traced events.
+
+## Backend strategy
+
+Detcore is written against Reverie's backend-independent `Tool`/`Guest`
+contract, not against ptrace directly. A backend's job is purely mechanism:
+observe guest events, expose register and memory access, and inject or suppress
+operations. Detcore supplies the policy — what is emulated, transformed,
+ordered, recorded, or replayed. Keeping that seam clean is what makes more than
+one backend conceivable without rewriting the deterministic core.
+
+Three backend mechanisms sit at different points on the speed/completeness/
+determinism curve:
+
+| Backend | Mechanism | Status | Trade-off |
+| --- | --- | --- | --- |
+| **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
+| **DBI** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
+| **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
+
+**ptrace (current).** seccomp selects which syscalls trap; ptrace delivers the
+stops to an out-of-process tracer that holds all Detcore state. This is the
+backend the rest of this document describes. It is complete (it sees every
+subscribed event from every thread) and integrates with the PMU for RCB-based
+preemption, at the cost of a context switch per intercepted event.
+
+**DBI (in-process).** A dynamic binary instrumentation backend such as the
+restored SaBRe loader rewrites syscall sites in-process and calls into a tool
+without leaving the guest address space, which is much cheaper per event. The
+current state is a low-overhead *syscall interceptor*: native guest threads run
+concurrently between callbacks, physical signals still arrive at host-selected
+points, there is no PMU preemption, and instructions outside the loader's scan
+set execute natively. It is therefore not yet equivalent to ptrace + Detcore for
+general multithreaded determinism. See `ai_docs/sabre-determinism-analysis.md`
+for the gap analysis and roadmap.
+
+**KVM / SVM (hardware virtualization).** Running the guest as a VM guest lets the
+monitor use hardware controls to trap instructions such as `RDRAND` and `CPUID`
+without relying on host user-space faulting support. A sufficiently complete
+DBI could instead decode and rewrite those instructions before they execute;
+the current DBI prototype does not provide that coverage. Hardware
+virtualization has a much larger integration surface and loses the simple
+"host process under ptrace" model.
+
+The important invariant across all three: interception alone does not create
+determinism. Whichever backend catches an event, a Detcore handler must still
+define the event's observable result and its place in the schedule.
 
 ## Startup and lifetime
 
@@ -261,6 +309,70 @@ RDTSC is trapped and converted to logical time when time virtualization is
 enabled. Timer events provide control even when a guest runs without making a
 syscall.
 
+## Instruction interception: CPUID and RDTSC
+
+`CPUID` and `RDTSC`/`RDTSCP` are unprivileged instructions that read
+host-specific, nondeterministic state without issuing a syscall, so seccomp
+cannot see them. Both are handled by trapping the instruction to a `SIGSEGV`
+and emulating it:
+
+- The backend arms faulting for the instruction, so a guest execution raises
+  `#GP`, which Linux delivers to the tracee as `SIGSEGV`.
+- The tracer's signal handler decodes the faulting instruction at the guest
+  RIP. The two-byte opcode `0f a2` is `CPUID`; `0f 31` is `RDTSC`; `0f 01 f9`
+  is `RDTSCP`.
+- Detcore computes the deterministic result, writes it into the guest
+  registers, and advances RIP past the instruction. RDTSC returns logical
+  nanoseconds as virtual cycles (see Virtual time); CPUID returns a fixed table.
+
+The same emulation path is shared by CPUID and the RDTSC family — only the
+*arming* mechanism differs between the two, and between CPU vendors.
+
+### CPUID: what Detcore reports
+
+Detcore does not pass the host's real CPUID through. It serves a fixed,
+conservative table (`detcore/src/cpuid.rs`) modeled on an older Intel part, with
+nondeterministic feature bits — notably `RDRAND` — masked off. Reporting that a
+feature is absent is how Hermit steers a guest onto a deterministic fallback
+path: a well-behaved program that checks CPUID before using `RDRAND`, `RDSEED`,
+TSX, or a wide vector ISA will avoid the non-determinizable instruction. This is
+why CPUID interception is essential for strict determinism, not cosmetic.
+
+CPUID virtualization is controlled by `Config::virtualize_cpuid`
+(`--no-virtualize-cpuid` disables it). Note the limit of the CPUID-lie approach:
+it only helps programs that *ask* before they act. A program that executes
+`RDRAND` unconditionally is unaffected by the CPUID table — trapping the
+instruction itself requires the KVM/SVM backend.
+
+### CPUID faulting: Intel vs AMD
+
+Arming CPUID interception depends on hardware "CPUID faulting", exposed uniformly
+by Linux as `arch_prctl(ARCH_SET_CPUID, 0)` and gated by the
+`X86_FEATURE_CPUID_FAULT` capability. The underlying MSR mechanism differs by
+vendor:
+
+- **Intel:** advertised via `MSR_PLATFORM_INFO[31]` and toggled through
+  `MSR_MISC_FEATURES_ENABLES` bit 0. Broadly available.
+- **AMD:** there is no `MSR_MISC_FEATURES_ENABLES`. Faulting is toggled through
+  `MSR_K7_HWCR` bit 35 ("CpuidUserDis"), advertised by the
+  `GP_ON_USER_CPUID` capability (CPUID leaf `0x80000021`, EAX bit 17). Kernel
+  support for wiring this to the same `arch_prctl` UAPI landed in Linux **6.17**;
+  older kernels return `ENODEV` on AMD even when the silicon is capable.
+
+When arming fails, the backend logs `Unable to intercept CPUID: Underlying
+hardware does not support CPUID faulting` and continues **without** CPUID
+virtualization — the guest then sees real host CPUID. Because the UAPI is
+identical across vendors, no Hermit or Reverie change is needed to gain CPUID
+interception on capable AMD hardware; it requires only a new-enough kernel (or a
+backport of the AMD CPUID-faulting patch). On hardware or kernels where faulting
+is unavailable, the alternatives are the KVM/SVM backend or best-effort
+environment shims that ask specific libraries to avoid `RDRAND`.
+
+RDTSC faulting is independent and more portable: it is armed via
+`prctl(PR_SET_TSC, PR_TSC_SIGSEGV)` (backed by `CR4.TSD`) and works on both
+Intel and AMD, so logical-time virtualization of the timestamp counter does not
+depend on CPUID-faulting availability.
+
 ## Deterministic scheduling
 
 Sequentialized execution is cooperative at event boundaries and enforced by
@@ -358,6 +470,40 @@ structures, and contributes its final logical time. `exit_group` is represented
 as a scheduler request so process-tree teardown has a deterministic commit
 point.
 
+## Signal handling
+
+Signals are a nondeterministic control-flow input: their timing, delivery
+thread, and interaction with blocking syscalls all vary across native runs.
+Detcore's model turns signal delivery into a scheduled event and emulates the
+signal-disposition syscalls (`detcore/src/syscalls/signal.rs`).
+
+- **Deferred delivery.** A pending signal is not delivered at the host-chosen
+  instruction. It is delivered when the scheduler grants the target thread an
+  `InboundSignal` turn, so the delivery point is a committed position in the
+  deterministic schedule rather than a host-timing artifact. Reverie carries the
+  actual signal to the tracee on resume.
+- **Disposition syscalls.** `rt_sigaction` and `rt_sigprocmask` are emulated so
+  Detcore tracks each thread's handlers and mask. For signal numbers Hermit does
+  not itself deliver, the corresponding action is treated as a no-op.
+- **Waiting for signals.** `rt_sigtimedwait` and `pause` are handled through the
+  scheduler; a `pause` is modeled as an unbounded sleep that a delivered signal
+  makes runnable. `alarm`/timer expirations are routed through `GlobalState` so
+  the deadline is measured in logical time.
+- **Interrupted syscalls.** For operations that Detcore leaves blocking in the
+  kernel, Linux retains its normal restart path; `restart_syscall` and
+  `rt_sigreturn` are allowed through seccomp. Emulated blocking I/O is a current
+  gap. Its nonblocking retry loop does not yet turn a signal wakeup into the
+  syscall-specific internal restart result, so a queued retry can continue
+  polling instead of returning `EINTR` or being transparently restarted. A fix
+  must also preserve Linux's distinction between restartable calls such as a
+  pipe `read` and calls such as `poll`, `epoll_wait`, and `rt_sigtimedwait`,
+  which are not restarted by `SA_RESTART`.
+
+Determinism boundary: signal *content*/delivery is scheduled, but signals are
+not currently written into the record/replay event stream, so a workload that
+depends on externally injected signals is a boundary that scheduling alone does
+not close. This is a known gap rather than a guarantee.
+
 ## Resource model
 
 `ResourceID` names guest-visible state whose effects need ordering. Current
@@ -410,6 +556,38 @@ Raw inode numbers are mapped through the global inode pool to deterministic
 inode numbers. Virtualized metadata uses the configured epoch and logical
 mtime updates. File existence and content can still be external inputs unless
 the operation is recorded or otherwise controlled by the environment.
+
+### Deterministic procfs
+
+Several `/proc` files expose host- and run-specific counters that would make an
+otherwise deterministic program observe different bytes on each run. Rather than
+synthesize a full virtual filesystem, Detcore takes a **snapshot-and-normalize**
+approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
+
+- `/proc/self/stat` — a fixed set of volatile numeric fields (the page-fault
+  counters, `utime`/`stime`/`cutime`/`cstime`, `itrealvalue`, `starttime`, the
+  last-run `processor`, and the trailing delay/guest-time accounting fields) are
+  rewritten to `0`, while the `comm` string and structural fields are preserved.
+- `/proc/self/status` — `voluntary_ctxt_switches` and
+  `nonvoluntary_ctxt_switches` are pinned to `0`.
+- `/proc/cpuinfo` — the `cpu MHz` line is pinned to `0.000`.
+
+The mechanism rides on the FD model. When `open`/`openat` resolves to one of
+these paths, the `DetFd` is tagged with a `ProcfsFile` descriptor. On the first
+`read`, Detcore captures the real kernel contents, runs the field normalizer,
+and stores the sanitized buffer on the open file description. Subsequent
+sequential reads return slices from that immutable snapshot using a shared
+logical offset, so partial reads of that one snapshot are consistent.
+
+This is not a complete host-independent representation of any of the three
+files. Fields not listed above remain exactly as the host kernel reported them,
+and a separately opened file receives a separate snapshot. The normalized
+fields are stable; equality across runs still depends on every unnormalized
+field and other external inputs remaining unchanged.
+
+This is deliberately a narrow allow-list of *observed* volatile fields, not a
+general procfs emulation: files and fields outside the list still read through to
+the host kernel and remain potential determinism boundaries.
 
 ### Futexes
 
@@ -495,6 +673,55 @@ changing either clock path.
 Virtual time also drives deterministic file timestamps, alarm deadlines,
 sleep timeouts, and scheduler accounting. Code that waits on time must go
 through the scheduler; reading a logical clock alone cannot make time advance.
+
+## Record and replay
+
+Scheduling and virtualization make *internal* nondeterminism reproducible.
+Record/replay handles the remaining *external* inputs — data that genuinely
+comes from outside the guest (file contents, network, host randomness, and
+timestamps that are not otherwise virtualized). It is implemented as a pair of
+Reverie sub-tools that Detcore delegates to, one for capture and one for replay.
+
+```text
+ record: Detcore --(non-determinizable event)--> Recorder --> event stream + metadata
+ replay: Detcore <--(recorded result)---------- Replayer <-- event stream
+                                                     |
+                                                     +-- optional raw-syscall check
+```
+
+**What is recorded.** Only syscalls that cannot be made deterministic by
+emulation or scheduling reach the `Recorder` (`hermit-cli/src/recorder/`, split
+into `fs`, `mmap`, `network`, `random`, and `time`). Anything Detcore can
+emulate or order locally is *not* recorded, which keeps traces small and focused
+on true external inputs.
+
+**Trace contents.** A recording directory holds:
+
+- a `metadata` file (`hermit-cli/src/metadata.rs`) capturing the executable,
+  program/arg0/args, working directory, hostname/domainname, environment, and a
+  `RecordVersion`. Replay refuses a trace whose version is incompatible with the
+  replayer's `RECORD_VERSION`;
+- a per-thread event stream written by the `EventWriter` and read back by the
+  `Replayer` (`hermit-cli/src/replayer/`) in the same deterministic order.
+
+**Replay environment.** `Replay::spawn` (`hermit-cli/src/replay.rs`) reconstructs
+the recorded process in a temporary chroot (`TempChroot`): it hard-links the
+recorded executable, copies the dynamic loader and any shebang/`env`
+interpreters, and recreates the working directory, so the replayed program
+resolves the same paths it saw at record time.
+
+**Desync detection.** The recorder writes a raw-syscall debug stream alongside
+the result-event stream. The replayer compares each live syscall with that
+debug stream only when the `HERMIT_VERIFY` environment variable is set. A
+mismatch in that mode raises a `DesyncError` (`hermit-cli/src/desync.rs`)
+identifying the thread and event index. Ordinary `hermit replay` still consumes
+the recorded result events, but it does not enable this full argument-by-
+argument syscall comparison by default.
+
+**Self-verification.** `hermit record start --verify` records a run, sets
+`HERMIT_VERIFY` for the replay, and compares captured output and exit status.
+It is the user-facing path that enables the raw-syscall desynchronization check
+described above as part of an end-to-end record/replay check.
 
 ## Chaos mode
 
@@ -593,11 +820,18 @@ The main implementation entry points are:
 | Runnable selection and polling backoff | `detcore/src/scheduler/runqueue.rs` |
 | Resource identities and requests | `detcore/src/resources.rs` |
 | FD model | `detcore/src/fd.rs` |
+| Deterministic procfs snapshots | `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs` |
 | Logical time | `detcore-model/src/time.rs`, `detcore/src/syscalls/time.rs` |
+| Signal handling | `detcore/src/syscalls/signal.rs` |
+| CPUID table | `detcore/src/cpuid.rs` |
 | Syscall-family handlers | `detcore/src/syscalls/` |
+| Record (capture) sub-tool | `hermit-cli/src/recorder/`, `hermit-cli/src/record.rs` |
+| Replay sub-tool and desync detection | `hermit-cli/src/replayer/`, `hermit-cli/src/replay.rs`, `hermit-cli/src/desync.rs` |
+| Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-cli/src/event_stream.rs` |
 | Reverie tool contract | Reverie `reverie/src/tool.rs` and `reverie/src/guest.rs` |
 | Ptrace startup/filter | Reverie `reverie-ptrace/src/tracer.rs` |
-| Ptrace stop and injection mechanics | Reverie `reverie-ptrace/src/task.rs` |
+| Ptrace stop, injection, CPUID/RDTSC trap | Reverie `reverie-ptrace/src/task.rs` |
+| DBI backend gap analysis | `ai_docs/sabre-determinism-analysis.md` |
 
 Start at the Detcore dispatch for policy questions and at Reverie's tracing task
 for execution-control questions. Scheduler bugs often cross both local and
