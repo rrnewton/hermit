@@ -220,6 +220,11 @@ impl DetFd {
         self.description().id
     }
 
+    /// Number of modeled descriptor slots that retain this open file description.
+    pub(crate) fn open_file_alias_count(&self) -> usize {
+        Arc::strong_count(&self.open_file)
+    }
+
     /// File type attached to the open file description.
     pub fn ty(&self) -> FdType {
         self.description().ty

@@ -170,14 +170,16 @@ fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -
 /// See NOTE [Blocking Syscalls via Internal Polling] in this folder.
 #[derive(Debug, Clone, Default)]
 pub struct BlockedPool {
-    /// BLOCKED futex transactions, waiting for wakers.  Multiple threads may be blocked n
+    /// BLOCKED futex transactions, waiting for wakers. Multiple threads may be blocked on
     /// the same futex.
     ///
     /// INVARIANT: because Futexes aren't currently modeled with `ResourceID`, a thread
     /// waiting on a futex will have a request filled in `next_turns` but for zero resources.
-    ///
-    /// TODO: the entries of this hashmap are never reclaimed (but they could be).
     pub futex_waiters: HashMap<FutexID, Vec<FutexWaiter>>,
+
+    /// Futex waiters whose deadlines expired and must receive `ETIMEDOUT` when scheduled.
+    /// Timed-out waiters are removed from `futex_waiters` before entering the run queue.
+    pub timed_out_futex_waiters: HashSet<DetTid>,
 
     /// Threads whose next event is waiting on a point in time to proceed.
     ///
@@ -1008,9 +1010,20 @@ impl Scheduler {
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
-        for vec in &mut self.blocked.futex_waiters.values_mut() {
-            vec.retain(|waiter| &waiter.dettid != dtid);
-        }
+        self.blocked.timed_out_futex_waiters.remove(dtid);
+        let _ = self.remove_futex_waiter(dtid);
+    }
+
+    fn remove_futex_waiter(&mut self, dettid: &DetTid) -> bool {
+        let mut removed = 0;
+        self.blocked.futex_waiters.retain(|_, waiters| {
+            let before = waiters.len();
+            waiters.retain(|waiter| &waiter.dettid != dettid);
+            removed += before - waiters.len();
+            !waiters.is_empty()
+        });
+        assert!(removed <= 1, "thread was registered on multiple futexes");
+        removed == 1
     }
 
     /// Put a Futex waiter to sleep, to be awoken by `wake_futex_waiter`.
@@ -1222,13 +1235,20 @@ impl Scheduler {
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
-        if enabled!(Level::TRACE) {
-            let nxtturn = self
+        let futex_timed_out = {
+            let next_turn = self
                 .next_turns
-                .get_mut(&dettid)
+                .get(&dettid)
                 .expect("internal invariant broken");
+            is_futex_request(next_turn)
+        };
+        if futex_timed_out {
+            assert!(self.remove_futex_waiter(&dettid));
+            assert!(self.blocked.timed_out_futex_waiters.insert(dettid));
+        }
 
-            if is_futex_request(nxtturn) {
+        if enabled!(Level::TRACE) {
+            if futex_timed_out {
                 info!(
                     "[sched-step2] Time-based event on thread {} (time {}, committed time {}) - futex wait timed out!",
                     dettid, time_ns, self.committed_time
@@ -1897,9 +1917,12 @@ impl Scheduler {
             &resp, &dtid
         );
         let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
+        let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         self.clear_nextturn(dtid);
         let answer = if sig {
             SchedResponse::Signaled()
+        } else if futex_timed_out {
+            SchedResponse::Go(Some(SchedValue::TimeOut))
         } else {
             let timeslice = self.timeslices.remove(&dtid).flatten();
             // TODO(T137799529): use a more strongly typed representation rather than reusing

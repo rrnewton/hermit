@@ -100,6 +100,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().add_fd(fd, flags, ty, stat)
     }
 
+    pub(crate) async fn release_port_for_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file_id: OpenFileId,
+    ) -> Option<u16> {
+        let mytime = guest.thread_state().thread_logical_time.clone();
+        let response = guest
+            .send_rpc((mytime, GlobalRequest::ReleasePort(open_file_id)))
+            .await;
+        match response.1 {
+            GlobalResponse::ReleasePort(port) => port,
+            other => panic!("unexpected release-port response: {other:?}"),
+        }
+    }
+
+    pub(crate) async fn restore_port_for_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file_id: OpenFileId,
+        port: u16,
+    ) {
+        let mytime = guest.thread_state().thread_logical_time.clone();
+        let response = guest
+            .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
+            .await;
+        match response.1 {
+            GlobalResponse::AddUsedPort => {}
+            other => panic!("unexpected restore-port response: {other:?}"),
+        }
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -145,17 +176,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let fd = call.fd();
         let res = self.record_or_replay(guest, call).await?;
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let resp = guest
-            .send_rpc((mytime, GlobalRequest::FreePortByFd(fd)))
-            .await;
-        match resp.1 {
-            GlobalResponse::FreePort => {
-                trace!("Closed {}", fd);
-            }
-            _ => unreachable!(),
+        if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
+            self.release_port_for_open_file(guest, open_file_id).await;
         }
-        guest.thread_state_mut().remove_fd(fd);
+        trace!("Closed {}", fd);
         Ok(res)
     }
 
@@ -436,7 +460,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.cmd() {
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
-                guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
+                let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
+                if let Some(open_file_id) = replaced {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
                 Ok(newfd as i64)
             }
             F_SETFL(flags) => {
@@ -471,9 +498,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Errno> {
         let old_fd = call.oldfd();
         let new_fd = self.record_or_replay(guest, call).await? as RawFd;
-        guest
+        let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(new_fd as i64)
     }
 
@@ -486,9 +516,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let res = self.record_or_replay(guest, call).await?;
-        guest
+        let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(res)
     }
 
@@ -502,7 +535,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let new_fd = call.newfd();
         let flags = call.flags();
         let res = self.record_or_replay(guest, call).await?;
-        guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
+        let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(res)
     }
 
@@ -718,6 +754,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let addr = call.umyaddr().ok_or(Errno::EFAULT)?;
         let sock_fd = call.fd();
+        let open_file_id = guest
+            .thread_state()
+            .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
         if sockaddr_family == libc::AF_INET as u16 {
@@ -738,7 +777,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 // Send RPC to make sure already used ports are not used.
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
@@ -750,7 +789,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 // Request a determinzed port
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
@@ -781,7 +820,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
@@ -792,7 +831,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {

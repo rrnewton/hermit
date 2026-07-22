@@ -157,8 +157,8 @@ pub struct GlobalState {
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
-    // fd to port
-    fd_to_port: Mutex<HashMap<i32, u16>>,
+    // Open file description to bound port.
+    open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
     port_start_range: AtomicU16,
     port_end_range: AtomicU16,
@@ -355,7 +355,7 @@ impl GlobalTool for GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
-            fd_to_port: Mutex::new(HashMap::new()),
+            open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             sched_handle: handle,
@@ -444,7 +444,7 @@ impl GlobalTool for GlobalState {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
             }
-            GlobalRequest::RequestPort(sock_fd) => {
+            GlobalRequest::RequestPort(open_file_id) => {
                 let mut mut_used_ports = self.used_ports.lock().unwrap();
                 self.update_port_range();
                 let total_available =
@@ -464,31 +464,26 @@ impl GlobalTool for GlobalState {
                     R::PortFull
                 } else {
                     (*mut_used_ports).insert(self.next_port.load(SeqCst));
-                    let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                    (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+                    let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
                     R::RequestPort(self.next_port.load(SeqCst))
                 }
             }
-            GlobalRequest::AddUsedPort(port, sock_fd) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).insert(port);
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+            GlobalRequest::AddUsedPort(port, open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                used_ports.insert(port);
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                open_file_to_port.insert(open_file_id, port);
                 R::AddUsedPort
             }
-            GlobalRequest::FreePort(port) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).remove(&port);
-                R::FreePort
-            }
-            GlobalRequest::FreePortByFd(sock_fd) => {
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                let port = (*mut_fd_to_port).remove(&sock_fd);
-                if let Some(x) = port {
-                    let mut mut_used_ports = self.used_ports.lock().unwrap();
-                    (*mut_used_ports).remove(&x);
+            GlobalRequest::ReleasePort(open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                let port = open_file_to_port.remove(&open_file_id);
+                if let Some(port) = port {
+                    used_ports.remove(&port);
                 }
-                R::FreePort
+                R::ReleasePort(port)
             }
         };
 
@@ -1102,16 +1097,14 @@ pub enum GlobalRequest {
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
-    // Request a port
-    RequestPort(i32),
+    // Request a port for an open file description.
+    RequestPort(OpenFileId),
 
-    // Add port to used ports list
-    AddUsedPort(u16, i32),
+    // Add a port to the used-port list for an open file description.
+    AddUsedPort(u16, OpenFileId),
 
-    // FreePort
-    FreePort(u16),
-
-    FreePortByFd(i32),
+    // Release the port when the last alias of its open file description closes.
+    ReleasePort(OpenFileId),
 }
 
 /// Responses from the global object
@@ -1138,7 +1131,7 @@ pub enum GlobalResponse {
 
     RequestPort(u16),
     AddUsedPort,
-    FreePort,
+    ReleasePort(Option<u16>),
     PortFull,
 }
 

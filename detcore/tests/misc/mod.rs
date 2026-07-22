@@ -112,6 +112,56 @@ fn dup_shares_status_flags_but_not_cloexec() {
 }
 
 #[test]
+fn bound_port_survives_closing_dup_alias() {
+    det_test_fn_sequential_without_pmu(|| {
+        fn bind_loopback_ephemeral(fd: libc::c_int) -> libc::c_int {
+            let mut address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    (&mut address as *mut libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+
+        let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(socket >= 0);
+        let mut first_bound = false;
+        for _ in 0..128 {
+            if bind_loopback_ephemeral(socket) == 0 {
+                first_bound = true;
+                break;
+            }
+            assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EADDRINUSE);
+        }
+        assert!(first_bound, "no deterministic ephemeral port was available");
+
+        let duplicate = unsafe { libc::dup(socket) };
+        assert!(duplicate >= 0);
+        assert_eq!(unsafe { libc::close(socket) }, 0);
+
+        let second = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(second >= 0);
+        assert_eq!(
+            bind_loopback_ephemeral(second),
+            0,
+            "closing one dup alias must not free its bound port reservation"
+        );
+
+        assert_eq!(unsafe { libc::close(duplicate) }, 0);
+        assert_eq!(unsafe { libc::close(second) }, 0);
+    });
+}
+
+#[test]
 fn unsupported_futex_keys_fail_explicitly() {
     det_test_fn_sequential_without_pmu(|| {
         let futex = 0_u32;
@@ -136,6 +186,153 @@ fn unsupported_futex_keys_fail_explicitly() {
             -1
         );
         assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EINVAL);
+    });
+}
+
+#[test]
+fn dup2_same_fd_preserves_cloexec() {
+    det_test_fn_sequential_without_pmu(|| {
+        let path = b"/dev/null\0";
+        let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        assert_eq!(unsafe { libc::dup2(fd, fd) }, fd);
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "dup2(fd, fd) must leave descriptor flags unchanged"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    });
+}
+
+#[test]
+fn failed_exec_preserves_shared_fd_table() {
+    det_test_fn_sequential_without_pmu(|| {
+        use std::ffi::CString;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicI32;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::sync_channel;
+
+        let path = b"/dev/null\0";
+        let original = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
+        assert!(original >= 0);
+
+        let shared_fd = Arc::new(AtomicI32::new(-1));
+        let worker_fd = Arc::clone(&shared_fd);
+        let (exec_failed_tx, exec_failed_rx) = sync_channel(0);
+        let (continue_tx, continue_rx) = sync_channel(0);
+        let (finished_tx, finished_rx) = sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            let missing = CString::new("/definitely/missing/hermit-exec").expect("valid path");
+            let argv = [missing.as_ptr(), std::ptr::null()];
+            let envp: [*const libc::c_char; 1] = [std::ptr::null()];
+            assert_eq!(
+                unsafe { libc::execve(missing.as_ptr(), argv.as_ptr(), envp.as_ptr()) },
+                -1
+            );
+            assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::ENOENT);
+            exec_failed_tx.send(()).expect("notify parent");
+            continue_rx.recv().expect("wait for sibling mutation");
+
+            let fd = worker_fd.load(Ordering::SeqCst);
+            let mut byte = 0_u8;
+            assert_eq!(
+                unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+                0,
+                "failed exec must restore the exact CLONE_FILES table"
+            );
+            finished_tx.send(()).expect("notify parent of completion");
+        });
+
+        exec_failed_rx.recv().expect("worker should fail exec");
+        let duplicate = unsafe { libc::fcntl(original, libc::F_DUPFD, 0) };
+        assert!(duplicate >= 0);
+        shared_fd.store(duplicate, Ordering::SeqCst);
+        continue_tx.send(()).expect("release worker");
+        finished_rx
+            .recv()
+            .expect("worker should observe the duplicate");
+        drop(worker);
+
+        assert_eq!(unsafe { libc::close(duplicate) }, 0);
+        assert_eq!(unsafe { libc::close(original) }, 0);
+    });
+}
+
+#[test]
+fn futex_wait_bitset_timeout_is_absolute_and_removes_waiter() {
+    det_test_fn_sequential_without_pmu(|| {
+        fn as_nanos(ts: libc::timespec) -> i128 {
+            i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec)
+        }
+
+        let futex = 0_u32;
+        let mut before = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut before) },
+            0
+        );
+        let mut deadline = before;
+        deadline.tv_nsec += 5_000_000;
+        if deadline.tv_nsec >= 1_000_000_000 {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1_000_000_000;
+        }
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &futex,
+                    libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    0,
+                    &deadline,
+                    std::ptr::null::<u32>(),
+                    1_u32,
+                )
+            },
+            -1
+        );
+        assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::ETIMEDOUT);
+
+        let mut after = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut after) },
+            0
+        );
+        let elapsed = as_nanos(after) - as_nanos(before);
+        assert!(
+            (5_000_000..1_000_000_000).contains(&elapsed),
+            "absolute WAIT_BITSET deadline advanced virtual time by {elapsed}ns"
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &futex,
+                    libc::FUTEX_WAKE_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    1,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    1_u32,
+                )
+            },
+            0,
+            "timed-out waiter must not remain in the futex queue"
+        );
     });
 }
 

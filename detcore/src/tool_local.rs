@@ -170,6 +170,31 @@ impl FileMetadata {
         }
     }
 
+    pub(crate) fn open_files_closed_on_exec(&self, table_is_shared: bool) -> Vec<OpenFileId> {
+        if table_is_shared {
+            return Vec::new();
+        }
+
+        let mut open_files = HashMap::new();
+        for detfd in self.file_handles.values() {
+            let id = detfd.open_file_id();
+            let total_aliases = detfd.open_file_alias_count();
+            let entry = open_files.entry(id).or_insert((0, total_aliases, true));
+            debug_assert_eq!(entry.1, total_aliases);
+            entry.0 += 1;
+            entry.2 &= detfd.is_cloexec();
+        }
+
+        let mut closed: Vec<_> = open_files
+            .into_iter()
+            .filter_map(|(id, (table_aliases, total_aliases, all_cloexec))| {
+                (all_cloexec && table_aliases == total_aliases).then_some(id)
+            })
+            .collect();
+        closed.sort();
+        closed
+    }
+
     /// set default fds
     fn setup_stdio(mut self, pid: Pid, owner: DetTid) -> Self {
         // guest stdio can be a pipe, which make things difficult
@@ -241,19 +266,29 @@ impl FileMetadata {
     }
 
     /// remove a rawfd
-    fn remove_fd(&mut self, fd: RawFd) {
-        if self.file_handles.remove(&fd).is_some() {
-            // Don't remove ino mapping here since files may still exist.
-        }
+    fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
+        let detfd = self.file_handles.remove(&fd)?;
+        (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
     /// dup raw fds.
-    fn dup_fd(&mut self, oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<(), Errno> {
+    fn dup_fd(
+        &mut self,
+        oldfd: RawFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, Errno> {
+        if oldfd == newfd {
+            self.with_detfd(oldfd, |_| ())?;
+            return Ok(None);
+        }
+
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
-        self.add_detfd(detfd);
-        Ok(())
+        let replaced = self.file_handles.insert(newfd, detfd);
+        Ok(replaced
+            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
     }
 }
 
@@ -314,6 +349,108 @@ mod file_metadata_tests {
                 .with_detfd(5, |fd| fd.open_file_id())
                 .expect("new child fd should exist"),
             "separate opens after fork must not alias"
+        );
+    }
+
+    #[test]
+    fn equal_fd_dup_preserves_descriptor_flags() {
+        let owner = DetTid::from_raw(20);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::O_CLOEXEC, FdType::Regular, None)
+            .expect("fd should be inserted");
+
+        assert_eq!(
+            metadata
+                .dup_fd(3, 3, OFlag::empty())
+                .expect("equal-fd dup should validate the source"),
+            None
+        );
+        assert!(
+            metadata
+                .with_detfd(3, |fd| fd.is_cloexec())
+                .expect("fd should remain present"),
+            "dup2(fd, fd) must not clear close-on-exec"
+        );
+    }
+
+    #[test]
+    fn last_open_file_alias_survives_dup_and_fork() {
+        let parent_tid = DetTid::from_raw(30);
+        let child_tid = DetTid::from_raw(31);
+        let mut parent = FileMetadata::new(parent_tid);
+        parent
+            .add_fd(parent_tid, 3, OFlag::empty(), FdType::Socket, None)
+            .expect("socket should be inserted");
+        let open_file_id = parent
+            .with_detfd(3, |fd| fd.open_file_id())
+            .expect("socket should exist");
+        assert_eq!(
+            parent
+                .dup_fd(3, 4, OFlag::empty())
+                .expect("dup should succeed"),
+            None
+        );
+        assert_eq!(parent.remove_fd(3), None, "duplicate retains the OFD");
+
+        let mut child = parent.fork_for(child_tid);
+        assert_eq!(parent.remove_fd(4), None, "forked child retains the OFD");
+        assert_eq!(
+            child.remove_fd(4),
+            Some(open_file_id),
+            "only the final alias releases the OFD"
+        );
+
+        let mut replacement = FileMetadata::new(parent_tid);
+        replacement
+            .add_fd(parent_tid, 3, OFlag::empty(), FdType::Socket, None)
+            .expect("source should be inserted");
+        replacement
+            .add_fd(parent_tid, 4, OFlag::empty(), FdType::Socket, None)
+            .expect("target should be inserted");
+        let target_id = replacement
+            .with_detfd(4, |fd| fd.open_file_id())
+            .expect("target should exist");
+        assert_eq!(
+            replacement
+                .dup_fd(3, 4, OFlag::empty())
+                .expect("dup replacement should succeed"),
+            Some(target_id),
+            "replacing the target must release its last OFD alias"
+        );
+    }
+
+    #[test]
+    fn exec_reports_only_cloexec_open_files_with_no_other_aliases() {
+        let owner = DetTid::from_raw(40);
+        let child_tid = DetTid::from_raw(41);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::O_CLOEXEC, FdType::Socket, None)
+            .expect("socket should be inserted");
+        let open_file_id = metadata
+            .with_detfd(3, |fd| fd.open_file_id())
+            .expect("socket should exist");
+
+        assert_eq!(metadata.open_files_closed_on_exec(false), [open_file_id]);
+        assert!(
+            metadata.open_files_closed_on_exec(true).is_empty(),
+            "a shared descriptor table retains the original slot"
+        );
+
+        let child = metadata.fork_for(child_tid);
+        assert!(
+            metadata.open_files_closed_on_exec(false).is_empty(),
+            "a copied table retains an OFD alias"
+        );
+        drop(child);
+
+        metadata
+            .dup_fd(3, 4, OFlag::empty())
+            .expect("non-CLOEXEC alias should be created");
+        assert!(
+            metadata.open_files_closed_on_exec(false).is_empty(),
+            "a non-CLOEXEC alias keeps the OFD live across exec"
         );
     }
 }
@@ -596,12 +733,17 @@ impl<T> ThreadState<T> {
     }
 
     /// remove a rawfd
-    pub fn remove_fd(&self, fd: RawFd) {
+    pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
     }
 
     /// dup raw fds.
-    pub fn dup_fd(&mut self, oldfd: RawFd, newfd: RawFd, flags: OFlag) -> Result<(), Errno> {
+    pub fn dup_fd(
+        &mut self,
+        oldfd: RawFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, Errno> {
         self.metadata().dup_fd(oldfd, newfd, flags)
     }
 
