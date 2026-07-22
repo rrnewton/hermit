@@ -562,7 +562,7 @@ fn strict_flag_rejects_determinism_opt_outs() {
 #[test]
 fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
-    opts.validate_args_with_perf_support(true);
+    opts.validate_args_with_perf_support(true).unwrap();
 
     assert!(opts.no_namespace);
     assert_eq!(opts.network, NetworkingMode::Host);

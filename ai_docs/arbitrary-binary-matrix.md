@@ -26,6 +26,10 @@ target/debug/hermit run \
   --preemption-timeout=disabled \
   -- PROGRAM ARGS...
 ```
+On branches that include PR #37 resource identity enforcement, the Node and Java
+launch probes add `--no-sequentialize-threads --no-deterministic-io`. Those runtimes
+use process-shared futexes, which deterministic sequential mode rejects explicitly;
+all other run probes retain the command above.
 
 Record and replay were tested as distinct phases:
 

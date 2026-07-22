@@ -191,16 +191,16 @@ fn assert_marker(tool: &Tool, output: &Output, label: &str) {
 
 fn hermit_run(tool: &Tool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(&tool.path)
-        .args(tool.args);
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--preemption-timeout=disabled",
+    ]);
+    if matches!(tool.name, "node" | "java") {
+        command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
+    }
+    command.arg("--").arg(&tool.path).args(tool.args);
     command_output(command, &format!("run for {}", tool.name))
 }
 
