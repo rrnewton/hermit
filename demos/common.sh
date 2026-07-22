@@ -34,6 +34,7 @@ fi
 export HERMIT="${HERMIT:-$HERMIT_REPO/target/debug/hermit}"
 export HELLO_RACE="${HELLO_RACE:-$HERMIT_REPO/target/debug/hello_race}"
 export HEAP_PTRS="${HEAP_PTRS:-$HERMIT_REPO/target/debug/rustbin_heap_ptrs}"
+export RACE_SH="${RACE_SH:-$HERMIT_REPO/examples/race.sh}"
 
 test -x "$HERMIT" || { echo "missing hermit binary: $HERMIT" >&2; exit 1; }
 
@@ -50,6 +51,21 @@ run_hermit() {
     --no-virtualize-cpuid \
     --preemption-timeout=disabled \
     "$@"
+}
+
+# Verify wrapper for the built-in --verify demonstration.
+#
+# Two deliberate differences from run_hermit:
+#   1. --log=info (not error). --verify compares the deterministic execution
+#      log; at --log=error that log is EMPTY and the comparison is meaningless
+#      ("Logs contain 0 | 0 messages total"). info populates it with thousands
+#      of DETLOG/scheduler messages.
+#   2. It does NOT pass --preemption-timeout=disabled. The racy guest below is
+#      only reliably determinized with real PMU-based preemption; with
+#      preemption disabled the two runs can diverge. This step therefore
+#      requires user-accessible CPU performance counters (PMU).
+verify_hermit() {
+  "$HERMIT" --log=info run --verify --no-virtualize-cpuid "$@"
 }
 
 # Chaos wrapper: seeded scheduler PRNG for concurrency exploration.
