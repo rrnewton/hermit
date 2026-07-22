@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -295,6 +296,17 @@ pub struct Scheduler {
     /// If a guest is to be unblocked on a thread the guest will receive this
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
+
+    /// Threads that are logically blocked inside an internal polling loop (e.g. a
+    /// blocking `read` implemented via nonblocking retries) and have had a signal
+    /// delivered while parked there.  Such a thread stays in the `run_queue` (it is
+    /// "Running" from the scheduler's perspective), so the normal `InboundSignal`
+    /// force-unblock path does not apply.  Instead we record it here and report
+    /// `SchedResponse::Signaled` on its next committed turn, which interrupts the
+    /// poll loop so the pending signal can actually be delivered to the guest.
+    ///
+    /// NB: BTreeSet over HashSet for deterministic printing in the detlog.
+    pub signaled_pollers: BTreeSet<DetTid>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -831,6 +843,7 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            signaled_pollers: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
         }
@@ -983,6 +996,7 @@ impl Scheduler {
         self.remove_blocking_entries(dtid);
 
         let _ = self.priorities.remove(dtid);
+        let _ = self.signaled_pollers.remove(dtid);
         match self.next_turns.remove(dtid) {
             None => {
                 trace!(
@@ -1292,6 +1306,19 @@ impl Scheduler {
             }
             ThreadStatus::Running => {
                 // TODO(T137242449): could reprioritize to run it sooner, but for now we leave the priorities alone.
+                //
+                // A thread that is "Running" may in fact be parked inside an
+                // internal polling loop (a blocking syscall such as `read`
+                // emulated via nonblocking retries).  Such a thread never
+                // returns to guest userspace on its own, so the physical signal
+                // we just sent would remain pending forever and the handler
+                // would never run.  Flag it so that its next committed turn
+                // reports `Signaled`, breaking the poll loop (see
+                // `retry_nonblocking_syscall_helper`) and letting the signal be
+                // delivered.
+                if self.thread_is_polling(dettid) {
+                    self.signaled_pollers.insert(dettid);
+                }
             }
             ThreadStatus::NotRunning => {
                 let mut rsrcs = Resources::new(dettid);
@@ -1916,7 +1943,11 @@ impl Scheduler {
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
         );
-        let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
+        // A signal is inbound either because the thread explicitly requested an
+        // InboundSignal resource, or because it was flagged while parked in a
+        // polling loop (see `signaled_pollers`).  Either way its turn resumes as
+        // an interruption rather than a normal continuation.
+        let sig = self.is_signal_inbound(dtid) | self.signaled_pollers.remove(&dtid); // Peek before we clear the ivars.
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         self.clear_nextturn(dtid);
         let answer = if sig {
@@ -1948,6 +1979,21 @@ impl Scheduler {
         } else {
             false
         }
+    }
+
+    /// Whether the thread is currently parked with a pending request for an
+    /// internal-IO polling turn (i.e. it is spinning through a nonblocking
+    /// retry loop emulating a blocking syscall).
+    fn thread_is_polling(&self, dettid: DetTid) -> bool {
+        if let Some(nxt) = self.next_turns.get(&dettid)
+            && let Some(Ok(rsrcs)) = nxt.req.try_read()
+        {
+            return rsrcs
+                .resources
+                .iter()
+                .any(|(rid, _)| matches!(rid, ResourceID::InternalIOPolling));
+        }
+        false
     }
 
     /// Clear the thread's nextturn, installing fresh ivars.

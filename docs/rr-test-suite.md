@@ -44,10 +44,10 @@ cargo test -p hermit --test rr_suite rr_hello -- --exact          # one
 
 Starting from the fbsource `RR_TEST_TARGETS` minus the tests fbsource already
 disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
-programs build against this checkout and **214** pass when each program receives
+programs build against this checkout and **215** pass when each program receives
 a fresh scratch directory.
 One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
- (intermittently hangs), so the harness enables the remaining **213**. Each run is
+ (intermittently hangs), so the harness enables the remaining **214**. Each run is
  wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
  future hang fails that test cleanly rather than blocking the serialized suite.
  Special cases carried over from fbsource:
@@ -64,7 +64,6 @@ They are excluded from the harness and tracked here:
 | --- | --- | --- |
 | `rr_rusage` | guest aborts: `rusage.c:10 !(r->ru_maxrss > 0)` | `getrusage` returns `ru_maxrss == 0` (rusage not virtualized) |
 | `rr_sigchld_interrupt_signal` | hangs (>60s timeout) | SIGCHLD interrupt/restart handling |
-| `rr_sigprocmask_in_syscallbuf_sighandler` | hangs (>60s timeout) | signal mask manipulation inside a signal handler |
 | `rr_spinlock_priorities` | hangs (>60s timeout) | priority-based scheduling / spin behavior |
 | `rr_multiple_pending_signals_sequential` | flaky: intermittently hangs (passed once, hung on a later run) | nondeterministic multi-signal delivery ordering |
 
