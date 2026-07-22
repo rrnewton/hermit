@@ -467,7 +467,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if cfg!(debug_assertions) {
             Subscription::all()
         } else {
-            let mut subscription = Subscription::none();
+            // The fallback handler cannot enforce panic semantics for syscalls that Reverie never
+            // sends to Detcore. Panic mode therefore needs complete syscall coverage even in
+            // optimized builds.
+            let mut subscription = if config.panic_on_unsupported_syscalls {
+                Subscription::all_syscalls()
+            } else {
+                Subscription::none()
+            };
             subscription.syscalls([
                 Sysno::write,
                 Sysno::openat,
@@ -1174,11 +1181,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
 
-            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
-            Syscall::AddKey(_) => self.passthrough(guest, call).await,
-            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
-            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
-
             _ => {
                 if config.panic_on_unsupported_syscalls {
                     error!(
@@ -1188,6 +1190,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     );
                     panic!("unsupported syscall: {:?}", call);
                 }
+                warn!(
+                    "[detcore, dtid {}] unsupported syscall passed through: {}; execution may not be deterministic",
+                    dettid,
+                    call.display(&guest.memory()),
+                );
                 self.passthrough(guest, call).await
             }
         };
