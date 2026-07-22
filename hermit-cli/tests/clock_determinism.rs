@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,6 +16,8 @@ use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+
+use common::nondeterminism::NondeterminismCase;
 
 const DETERMINISM_RUNS: usize = 5;
 
@@ -119,4 +123,16 @@ fn clock_apis_are_deterministic_across_five_runs() {
             iteration + 1,
         );
     }
+}
+
+// NONDET_SOURCE: timestamp
+#[test]
+fn strict_mode_eliminates_native_clock_nondeterminism() {
+    let _guard = hermit_clock_lock();
+    let case =
+        NondeterminismCase::new("timestamp", Path::new("/bin/date"), &["+%s%N"]).with_retries(5);
+
+    case.assert_nondeterministic_without_hermit();
+    case.assert_nondeterministic_with_noop_verify();
+    case.assert_deterministic_with_strict();
 }
