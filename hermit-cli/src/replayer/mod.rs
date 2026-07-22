@@ -114,6 +114,26 @@ impl Tool for Replayer {
             }
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
+            Syscall::Readv(syscall) => {
+                self.handle_readv_family(guest, syscall.iov().map(|a| a.as_raw()), syscall.len())
+                    .await
+            }
+            Syscall::Preadv(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len(),
+                )
+                .await
+            }
+            Syscall::Preadv2(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len() as usize,
+                )
+                .await
+            }
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
             Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
@@ -157,6 +177,7 @@ impl Tool for Replayer {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {

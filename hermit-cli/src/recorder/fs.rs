@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
@@ -27,7 +28,73 @@ use super::Recorder;
 use crate::event::StatEvent;
 use crate::event::SyscallEvent;
 
+/// Read the first `length` output bytes of a vectored read from the guest's
+/// `iovec` array, flattened in read order. `length` is the syscall return value,
+/// which may be smaller than the total iovec capacity (a short read), so we stop
+/// once `length` bytes have been collected.
+fn read_iovec_output<M: MemoryAccess>(
+    memory: &M,
+    iov_addr: Option<usize>,
+    iovcnt: usize,
+    length: usize,
+) -> Result<Vec<u8>, Errno> {
+    let mut buf = vec![0u8; length];
+    if length == 0 {
+        return Ok(buf);
+    }
+    let addr = iov_addr
+        .and_then(Addr::<libc::iovec>::from_raw)
+        .ok_or(Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        iovcnt
+    ];
+    memory.read_values(addr, &mut iovecs)?;
+
+    let mut filled = 0;
+    for iovec in iovecs {
+        if filled == length {
+            break;
+        }
+        let take = (length - filled).min(iovec.iov_len);
+        if take == 0 {
+            continue;
+        }
+        let src = Addr::<u8>::from_raw(iovec.iov_base as usize).ok_or(Errno::EFAULT)?;
+        memory.read_exact(src, &mut buf[filled..filled + take])?;
+        filled += take;
+    }
+    Ok(buf)
+}
+
 impl Recorder {
+    /// Records the vectored read family (`readv`/`preadv`/`preadv2`). Writes only
+    /// need their return count (see `handle_write_family`), but vectored reads
+    /// scatter output across guest `iovec` buffers, so we capture the exact
+    /// returned bytes flattened in read order.
+    pub(super) async fn handle_readv_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        iov_addr: Option<usize>,
+        iovcnt: usize,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let buf = read_iovec_output(&guest.memory(), iov_addr, iovcnt, length as usize)?;
+                Ok(SyscallEvent::Readv(buf))
+            }),
+        );
+
+        result
+    }
+
     pub(super) async fn handle_read<G: Guest<Self>>(
         &self,
         guest: &mut G,
