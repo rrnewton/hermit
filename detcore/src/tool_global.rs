@@ -157,8 +157,8 @@ pub struct GlobalState {
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
-    // fd to port
-    fd_to_port: Mutex<HashMap<i32, u16>>,
+    // Open file description to bound port.
+    open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
     port_start_range: AtomicU16,
     port_end_range: AtomicU16,
@@ -355,7 +355,7 @@ impl GlobalTool for GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
-            fd_to_port: Mutex::new(HashMap::new()),
+            open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             sched_handle: handle,
@@ -414,8 +414,8 @@ impl GlobalTool for GlobalState {
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid) => {
-                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid).await)
+            GlobalRequest::DeregisterThread(dettid, detpid, mm) => {
+                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid, mm).await)
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -444,7 +444,7 @@ impl GlobalTool for GlobalState {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
             }
-            GlobalRequest::RequestPort(sock_fd) => {
+            GlobalRequest::RequestPort(open_file_id) => {
                 let mut mut_used_ports = self.used_ports.lock().unwrap();
                 self.update_port_range();
                 let total_available =
@@ -464,31 +464,26 @@ impl GlobalTool for GlobalState {
                     R::PortFull
                 } else {
                     (*mut_used_ports).insert(self.next_port.load(SeqCst));
-                    let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                    (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+                    let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
                     R::RequestPort(self.next_port.load(SeqCst))
                 }
             }
-            GlobalRequest::AddUsedPort(port, sock_fd) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).insert(port);
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+            GlobalRequest::AddUsedPort(port, open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                used_ports.insert(port);
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                open_file_to_port.insert(open_file_id, port);
                 R::AddUsedPort
             }
-            GlobalRequest::FreePort(port) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).remove(&port);
-                R::FreePort
-            }
-            GlobalRequest::FreePortByFd(sock_fd) => {
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                let port = (*mut_fd_to_port).remove(&sock_fd);
-                if let Some(x) = port {
-                    let mut mut_used_ports = self.used_ports.lock().unwrap();
-                    (*mut_used_ports).remove(&x);
+            GlobalRequest::ReleasePort(open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                let port = open_file_to_port.remove(&open_file_id);
+                if let Some(port) = port {
+                    used_ports.remove(&port);
                 }
-                R::FreePort
+                R::ReleasePort(port)
             }
         };
 
@@ -533,7 +528,7 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
-        if rs.resources.contains_key(&ResourceID::Exit(true)) {
+        if let Some((true, process, mm)) = rs.exit_identity() {
             info!(
                 "Scheduler authorized an exit-group scenario, from dettid {} / detpid {}",
                 dettid, detpid
@@ -550,7 +545,7 @@ impl GlobalState {
                     // We don't need to do anything extra for our own thread. That can use the
                     // same mechanics as a normal exit:
                     if tid != dettid {
-                        sched.logically_kill_thread(&tid, &dettid);
+                        sched.logically_kill_thread(&tid, &process, mm);
                     }
                 }
             }
@@ -695,7 +690,13 @@ impl GlobalState {
         // Parent thread yields so child can run (if it is higher priority).
         if self.cfg.sequentialize_threads {
             let mut rs = Resources::new(parent_detpid);
-            rs.insert(ResourceID::ParentContinue(), Permission::W);
+            rs.insert(
+                ResourceID::ParentContinue {
+                    parent: DetTid::from_raw(from_parent.into()),
+                    child: child_dettid,
+                },
+                Permission::W,
+            );
             self.recv_request_resources(from_parent, parent_detpid, rs)
                 .await;
         }
@@ -789,13 +790,13 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid) {
+    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         self.sched
             .lock()
             .unwrap()
-            .logically_kill_thread(&dettid, &detpid);
+            .logically_kill_thread(&dettid, &detpid, mm);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -809,7 +810,7 @@ impl GlobalState {
         action: FutexAction,
         futexid: FutexID,
         _init_read: i32,
-        _mask: i32,
+        mask: u32,
     ) -> Option<SchedValue> {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
@@ -822,14 +823,14 @@ impl GlobalState {
                 .clone();
             match action {
                 FutexAction::WaitRequest(maybe_timeout) => {
-                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout);
+                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
-                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads);
+                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeFinished(_num_threads) => {
@@ -1069,11 +1070,11 @@ pub enum GlobalRequest {
 
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
     /// further turns.
-    DeregisterThread(DetTid, DetPid),
+    DeregisterThread(DetTid, DetPid, MmId),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
-    FutexAction(DetTid, FutexAction, FutexID, i32, i32),
+    FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
     /// Translate nondeterministic to deterministic inode.
     DeterminizeInode(RawInode),
@@ -1096,16 +1097,14 @@ pub enum GlobalRequest {
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
-    // Request a port
-    RequestPort(i32),
+    // Request a port for an open file description.
+    RequestPort(OpenFileId),
 
-    // Add port to used ports list
-    AddUsedPort(u16, i32),
+    // Add a port to the used-port list for an open file description.
+    AddUsedPort(u16, OpenFileId),
 
-    // FreePort
-    FreePort(u16),
-
-    FreePortByFd(i32),
+    // Release the port when the last alias of its open file description closes.
+    ReleasePort(OpenFileId),
 }
 
 /// Responses from the global object
@@ -1132,7 +1131,7 @@ pub enum GlobalResponse {
 
     RequestPort(u16),
     AddUsedPort,
-    FreePort,
+    ReleasePort(Option<u16>),
     PortFull,
 }
 
@@ -1301,6 +1300,7 @@ pub async fn deregister_thread<R>(
     cfg: &Config,
     reverie: &R,
     detpid: DetPid,
+    mm: MmId,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1310,7 +1310,7 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid),
+                GlobalRequest::DeregisterThread(dettid, detpid, mm),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
@@ -1341,7 +1341,7 @@ pub async fn futex_action<G, T>(
     futex_action: FutexAction,
     futexid: &FutexID,
     init_read: i32,
-    mask: i32,
+    mask: u32,
 ) -> Option<SchedValue>
 where
     G: Guest<Detcore<T>>,

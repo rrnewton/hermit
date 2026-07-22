@@ -21,6 +21,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -47,11 +48,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
         {
             let mut rsrcs = Resources::new(dettid);
             // TODO: check if the file descriptors include anything EXTERNAL before
             // asking for this resource:
-            rsrcs.insert(ResourceID::BlockingExternalIO, Permission::RW);
+            rsrcs.insert(ResourceID::BlockingExternalIO(op_id), Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
@@ -64,7 +66,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // explicitly here:
         {
             let mut rsrcs = Resources::new(dettid);
-            rsrcs.insert(ResourceID::BlockedExternalContinue, Permission::RW);
+            rsrcs.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
@@ -128,7 +130,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| {
-                    detfd.physically_nonblocking = true;
+                    detfd.set_physically_nonblocking();
                 })
                 .unwrap();
         }
@@ -160,7 +162,7 @@ pub fn ioaction_based_on_fd_status<
     let (phys, virt) = guest
         .thread_state()
         .with_detfd(fd, |detfd| {
-            (detfd.physically_nonblocking, detfd.is_nonblocking())
+            (detfd.physically_nonblocking(), detfd.is_nonblocking())
         })
         .unwrap();
     tracing::trace!(
@@ -492,7 +494,7 @@ fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo 
         .thread_state()
         .with_detfd(fd, |detfd| {
             assert!(
-                detfd.physically_nonblocking,
+                detfd.physically_nonblocking(),
                 "expecting sockets/pipes to be physically nonblocking"
             );
         })

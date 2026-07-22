@@ -21,6 +21,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
+use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
@@ -100,6 +101,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().add_fd(fd, flags, ty, stat)
     }
 
+    pub(crate) async fn release_port_for_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file_id: OpenFileId,
+    ) -> Option<u16> {
+        let mytime = guest.thread_state().thread_logical_time.clone();
+        let response = guest
+            .send_rpc((mytime, GlobalRequest::ReleasePort(open_file_id)))
+            .await;
+        match response.1 {
+            GlobalResponse::ReleasePort(port) => port,
+            other => panic!("unexpected release-port response: {other:?}"),
+        }
+    }
+
+    pub(crate) async fn restore_port_for_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file_id: OpenFileId,
+        port: u16,
+    ) {
+        let mytime = guest.thread_state().thread_logical_time.clone();
+        let response = guest
+            .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
+            .await;
+        match response.1 {
+            GlobalResponse::AddUsedPort => {}
+            other => panic!("unexpected restore-port response: {other:?}"),
+        }
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -145,17 +177,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let fd = call.fd();
         let res = self.record_or_replay(guest, call).await?;
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let resp = guest
-            .send_rpc((mytime, GlobalRequest::FreePortByFd(fd)))
-            .await;
-        match resp.1 {
-            GlobalResponse::FreePort => {
-                trace!("Closed {}", fd);
-            }
-            _ => unreachable!(),
+        if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
+            self.release_port_for_open_file(guest, open_file_id).await;
         }
-        guest.thread_state_mut().remove_fd(fd);
+        trace!("Closed {}", fd);
         Ok(res)
     }
 
@@ -173,7 +198,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let (fd_type, resource) = guest
             .thread_state_mut()
-            .with_detfd(call.fd(), |detfd| (detfd.ty, detfd.resource.clone()))?;
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::R);
@@ -268,7 +293,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource.clone(), detfd.stat.map(|x| x.inode))
+            (detfd.resource(), detfd.stat().map(|x| x.inode))
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
@@ -331,19 +356,86 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Mmap,
     ) -> Result<i64, Error> {
-        // This is a far-from-complete placeholder:
-        if call.fd() == -1 {
-            return Ok(self.record_or_replay(guest, call).await?);
+        enum SharedBacking {
+            Anonymous,
+            File {
+                object: SharedMemoryObjectId,
+                offset: u64,
+            },
         }
-        // TODO/FIXME: a writable memory mapping means the file is essentially written continuously UNTIL it is closed.
-        /* Therefore we need something that will grab write permission but maybe not release it?  Like so:
-                let request = guest.thread_state().mk_request(rsrc, Permission::W);
-                resource_request(guest, request).await; // Request but don't release?
-        */
 
-        // More accurately, this *associates* write permission with all future timeslices of this thread.
-        // TODO(T78627117): We need thread-level permissions associated with scheduling each thread.
-        Ok(self.record_or_replay(guest, call).await?)
+        let backing = if call.flags().contains(MapFlags::MAP_SHARED) {
+            if call.fd() == -1 {
+                Some(SharedBacking::Anonymous)
+            } else {
+                let offset = u64::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+                guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |fd| {
+                        let object = fd.stat().map_or_else(
+                            || SharedMemoryObjectId::OpenFile {
+                                id: fd.open_file_id(),
+                            },
+                            |stat| SharedMemoryObjectId::File {
+                                device: stat.dev,
+                                inode: stat.inode,
+                            },
+                        );
+                        SharedBacking::File { object, offset }
+                    })
+                    .ok()
+            }
+        } else {
+            None
+        };
+        let len = call.len();
+        let result = self.record_or_replay(guest, call).await?;
+        let start = usize::try_from(result).expect("a successful mmap must return an address");
+
+        guest.thread_state().unmap_memory(start, len);
+        match backing {
+            Some(SharedBacking::Anonymous) => {
+                guest.thread_state().map_shared_anonymous(start, len);
+            }
+            Some(SharedBacking::File { object, offset }) => {
+                guest
+                    .thread_state()
+                    .map_shared_object(start, len, object, offset);
+            }
+            None => {}
+        }
+        Ok(result)
+    }
+
+    /// SYS_munmap system call.
+    pub async fn handle_munmap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Munmap,
+    ) -> Result<i64, Error> {
+        let start = call.addr().map(Addr::as_raw).unwrap_or(0);
+        let len = call.len();
+        let result = self.record_or_replay(guest, call).await?;
+        guest.thread_state().unmap_memory(start, len);
+        Ok(result)
+    }
+
+    /// SYS_mremap system call.
+    pub async fn handle_mremap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Mremap,
+    ) -> Result<i64, Error> {
+        let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
+        let old_len = call.old_len();
+        let new_len = call.new_len();
+        let result = self.record_or_replay(guest, call).await?;
+        let new_start =
+            usize::try_from(result).expect("a successful mremap must return an address");
+        guest
+            .thread_state()
+            .remap_memory(old_start, old_len, new_start, new_len);
+        Ok(result)
     }
 
     // Determinize stat by doing:
@@ -436,8 +528,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.cmd() {
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
-                guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
+                let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
+                if let Some(open_file_id) = replaced {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
                 Ok(newfd as i64)
+            }
+            F_SETFL(flags) => {
+                let result = self.record_or_replay(guest, call).await?;
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_status_flags(flags))?;
+                Ok(result)
+            }
+            F_SETFD(flags) => {
+                let result = self.record_or_replay(guest, call).await?;
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.set_cloexec(flags & libc::FD_CLOEXEC != 0);
+                })?;
+                Ok(result)
             }
             _ => {
                 trace!(
@@ -457,9 +566,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Errno> {
         let old_fd = call.oldfd();
         let new_fd = self.record_or_replay(guest, call).await? as RawFd;
-        guest
+        let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(new_fd as i64)
     }
 
@@ -472,9 +584,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let res = self.record_or_replay(guest, call).await?;
-        guest
+        let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(res)
     }
 
@@ -488,7 +603,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let new_fd = call.newfd();
         let flags = call.flags();
         let res = self.record_or_replay(guest, call).await?;
-        guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
+        let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(res)
     }
 
@@ -704,6 +822,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let addr = call.umyaddr().ok_or(Errno::EFAULT)?;
         let sock_fd = call.fd();
+        let open_file_id = guest
+            .thread_state()
+            .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
         if sockaddr_family == libc::AF_INET as u16 {
@@ -724,7 +845,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 // Send RPC to make sure already used ports are not used.
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
@@ -736,7 +857,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 // Request a determinzed port
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
@@ -767,7 +888,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
@@ -778,7 +899,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 let mytime = guest.thread_state().thread_logical_time.clone();
                 let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
                     .await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
