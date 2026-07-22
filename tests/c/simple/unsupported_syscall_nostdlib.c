@@ -1,7 +1,7 @@
 // @lint-ignore LICENSELINT
 
 #define ENOSYS 38
-#define SYS_getpid 39
+#define SYS_getppid 110
 #define SYS_write 1
 #define SYS_exit 60
 
@@ -39,8 +39,8 @@ _Noreturn void exit(int code) {
 void _start(void) {
   const char blocked[] = "blocked\n";
   const char passed[] = "passed\n";
-  long first = syscall0(SYS_getpid);
-  long second = syscall0(SYS_getpid);
+  long first = syscall0(SYS_getppid);
+  long second = syscall0(SYS_getppid);
 
   if (first == -ENOSYS && second == -ENOSYS) {
     write(1, blocked, sizeof(blocked) - 1);

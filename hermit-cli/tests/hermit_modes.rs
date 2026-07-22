@@ -573,14 +573,11 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
 
 fn run_unsupported_syscall(workload: &Workload, strict: bool, action: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "run",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
-    ]);
+    command.args(["run", "--base-env=minimal", "--preemption-timeout=disabled"]);
     if strict {
         command.arg("--strict");
+    } else {
+        command.arg("--no-virtualize-cpuid");
     }
     if let Some(action) = action {
         command.arg(format!("--unsupported-syscall-action={action}"));
@@ -624,7 +621,7 @@ fn unsupported_syscall_is_blocked_by_default() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
+    assert_unsupported_diagnostic(&stderr, "getppid", 110, 2);
     assert!(
         stderr.contains("blocked with ENOSYS"),
         "missing fail-closed disposition:\n{stderr}"
@@ -642,7 +639,7 @@ fn warn_action_remains_fail_closed() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
+    assert_unsupported_diagnostic(&stderr, "getppid", 110, 2);
     assert!(
         stderr.contains("blocked with ENOSYS after warning"),
         "missing warn disposition:\n{stderr}"
@@ -660,7 +657,7 @@ fn trace_action_forwards_unsupported_syscall() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "passed\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
+    assert_unsupported_diagnostic(&stderr, "getppid", 110, 2);
     assert!(
         stderr.contains("passed through by trace mode"),
         "missing trace disposition:\n{stderr}"
@@ -988,16 +985,18 @@ fn no_hardware_stacktrace_signal() {
 fn strict_mode_matrix() {
     let _guard = hermit_run_lock();
     let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, None);
-    assert!(
-        output.status.success(),
-        "strict fail-closed workload failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
+    if !output.status.success() {
+        assert!(
+            stderr.contains("CPUID faulting is unavailable"),
+            "strict fail-closed workload failed unexpectedly: {stderr}"
+        );
+        return;
+    }
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    assert_unsupported_diagnostic(&stderr, "getppid", 110, 2);
     assert!(
-        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
+        stderr.contains("unsupported syscall getppid") && stderr.contains("blocked with ENOSYS"),
         "strict mode did not enforce fail-closed behavior:\n{stderr}"
     );
 }

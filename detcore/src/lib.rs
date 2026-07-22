@@ -608,6 +608,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
+                Sysno::getpid,
+                Sysno::gettid,
+                Sysno::tgkill,
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
@@ -1202,6 +1205,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
+            // libc and Rust use this pair to implement raise() and thread-directed signals.
+            // The kernel IDs must stay paired, so forward both calls together.
+            Syscall::Getpid(_) | Syscall::Gettid(_) | Syscall::Tgkill(_) => {
+                self.passthrough(guest, call).await
+            }
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
