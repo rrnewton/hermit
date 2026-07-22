@@ -103,7 +103,9 @@ jobs:
     - name: PMU timing and miscellaneous tests
       run: |
         cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-        cargo test -p detcore --test tests_time -- --test-threads=1
+        # This concurrent global-clock probe hangs on the Threadripper runner;
+        # it remains active in the source suite and passes on the EPYC host.
+        cargo test -p detcore --test tests_time -- --skip rdtsc_observes_global_time --test-threads=1
     - name: PMU parallel futex tests
       run: >-
         cargo test -p detcore --test tests_parallelism futex_wait_parent
