@@ -1,0 +1,16 @@
+schema_version=1
+started_at_utc=20260722T175829Z
+repository_commit=e7c35a54e2c0546b8adc4ec45856dee44a95c81f
+repository_branch=impl-test-record-replay-stress-slot09
+hermit=/home/newton/work/dev-hermit/worktrees/slot09/hermit/target/debug/hermit
+hermit_sha256=f046f6b6fe8686931c39504efa7d459e69aef50d6d0b4217723187c1ba26e5b5
+replays_per_record=3
+case_timeout_seconds=30
+host_kernel=Linux 6.13.2-0_fbk13_hardened_0_g02230262e956 x86_64 GNU/Linux
+python=Python 3.9.25
+make=GNU Make 4.3
+cc=cc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-14)
+artifact_root=/home/newton/work/dev-hermit/worktrees/slot09/hermit/target/record-replay-stress/20260722T175829Z
+total=3
+passed=2
+failed=1
