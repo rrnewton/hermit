@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there's any breaking changes, i.e.:
 // when new syscalls are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x100);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x101);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]

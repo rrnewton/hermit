@@ -133,6 +133,7 @@ impl Tool for Replayer {
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
             Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
