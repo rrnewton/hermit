@@ -137,6 +137,53 @@ clock for guest TSC and device timers:
 The verified boot calibrated a coherent 1000.031 MHz TSC and emitted none of
 the PIT, watchdog-skew, or no-clocksource warnings.
 
+## Host time virtualization and clock calibration (issue #6)
+
+Even without `-icount`, the QEMU-side symptom above has a Hermit-side cause and
+a Hermit-side workaround.
+
+By default Hermit virtualizes the guest's clocks, but it does so from **two
+independent logical-time bases that are not coordinated with each other**:
+
+- `rdtsc` is answered from a synthetic per-thread counter
+  (`detcore::handle_rdtsc_event`);
+- `clock_gettime` (and `gettimeofday`) return Hermit's virtual logical time
+  regardless of the requested clock id (`detcore::handle_clock_gettime`).
+
+QEMU derives the emulated TSC from the host `rdtsc`, but derives the emulated
+PIT, PM timer, APIC timer, and RTC from host `clock_gettime`. Because those two
+Hermit time bases advance independently — and, under
+`--no-sequentialize-threads`, are per-thread and not globally coherent — the
+nested Linux guest compares mutually inconsistent clock domains during
+calibration and fails:
+
+```text
+tsc: Unable to calibrate against PIT
+tsc: using PMTIMER reference calibration
+clocksource: timekeeping watchdog ... 'tsc-early' skewed ... ns
+clocksource: No current clocksource.
+tsc: Marking TSC unstable due to clocksource watchdog
+```
+
+There are two independent ways to avoid this:
+
+1. **QEMU side (deterministic-friendly):** `-icount shift=0,sleep=off`, which
+   makes QEMU drive both the guest TSC and the emulated device timers from one
+   instruction-derived virtual clock, as used by the verified profile above.
+2. **Hermit side:** `--no-virtualize-time --no-virtualize-metadata`, which lets
+   QEMU read the real, mutually consistent host clocks. This sacrifices time
+   determinism for the whole run but calibrates normally and reaches the
+   expected boot outcome.
+
+To surface this, `hermit run` prints a one-line advisory when it launches a
+`qemu-system-*` program while virtual time is enabled, pointing at both
+workarounds. The advisory is informational only; it does not change behavior.
+
+A fully coherent multi-clock model (a single Hermit time base shared by
+`rdtsc`, `clock_gettime`, and their derived clocks, coordinated across threads)
+would remove the need for either workaround but is out of scope here; this
+section documents the supported workarounds instead.
+
 ## Kernel and initramfs
 
 The smoke test defaults to `/boot/vmlinuz`. A distribution kernel is suitable

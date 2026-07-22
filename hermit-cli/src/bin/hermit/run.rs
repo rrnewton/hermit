@@ -475,6 +475,81 @@ impl fmt::Display for RunOpts {
     }
 }
 
+/// Returns true if `program` names a hardware emulator / virtual machine
+/// monitor whose emulated guest runs its own clock calibration. Such programs
+/// (notably the `qemu-system-*` family) are sensitive to Hermit's host-time
+/// virtualization. This is a filename heuristic used only to surface an advisory
+/// warning; it never changes Hermit's behavior.
+fn is_vmm_program(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("qemu-system-"))
+}
+
+/// Advisory warning for running a VMM under Hermit's host-time virtualization.
+///
+/// QEMU and similar emulators derive the emulated PIT, PM timer, APIC timer,
+/// RTC, and TSC from several different host clocks. Hermit virtualizes RDTSC and
+/// `clock_gettime` from separate logical-time bases that are not mutually
+/// coherent (especially under `--no-sequentialize-threads`), so the nested guest
+/// observes inconsistent clock domains and its calibration breaks. See issue #6
+/// and `docs/QEMU_BOOT.md`. Returns the message to print, or `None` when no
+/// warning applies.
+fn vmm_time_virtualization_warning(program: &Path, virtualize_time: bool) -> Option<String> {
+    if virtualize_time && is_vmm_program(program) {
+        Some(format!(
+            "WARNING: {} looks like a hardware emulator (VMM). Hermit's host-time \
+             virtualization exposes mutually inconsistent clock sources (a synthetic RDTSC \
+             versus a virtualized clock_gettime) to the emulated guest, which can corrupt its \
+             clock calibration (for example \"Unable to calibrate against PIT\", TSC marked \
+             unstable, or \"No current clocksource\") and stall boot. If the nested guest \
+             misbehaves, either disable Hermit's virtual clock with \
+             --no-virtualize-time --no-virtualize-metadata, or make the emulator use a single \
+             instruction-derived clock (for QEMU: -icount shift=0,sleep=off). \
+             See docs/QEMU_BOOT.md.",
+            program.display()
+        ))
+    } else {
+        None
+    }
+}
+
+#[test]
+fn vmm_time_warning_fires_for_qemu_with_virtual_time() {
+    // A qemu-system-* emulator under virtual time gets the advisory.
+    for program in [
+        "qemu-system-x86_64",
+        "/usr/bin/qemu-system-x86_64",
+        "qemu-system-aarch64",
+    ] {
+        let warning = vmm_time_virtualization_warning(Path::new(program), true);
+        let message = warning
+            .unwrap_or_else(|| panic!("expected a warning for {program} under virtual time"));
+        assert!(message.contains("--no-virtualize-time"));
+        assert!(message.contains("-icount"));
+    }
+}
+
+#[test]
+fn vmm_time_warning_silent_without_virtual_time() {
+    // The workaround (disabling virtual time) must not itself warn.
+    assert!(
+        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), false).is_none(),
+        "no warning is expected once virtual time is disabled"
+    );
+}
+
+#[test]
+fn vmm_time_warning_silent_for_non_vmm_programs() {
+    for program in ["ls", "/bin/echo", "qemu-img", "my-qemu-wrapper"] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new(program), true).is_none(),
+            "unexpected VMM warning for {program}"
+        );
+    }
+}
+
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
@@ -928,6 +1003,16 @@ impl RunOpts {
                  while the gdbserver is attached."
             );
             self.network = NetworkingMode::Host;
+        }
+
+        // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
+        // whose emulated guest clock calibration this corrupts (issue #6).
+        // Checked last so it reflects any overrides above that disable virtual
+        // time (e.g. --strace-only).
+        let virtualize_time = self.det_opts.det_config.virtualize_time;
+        if let Some(warning) = vmm_time_virtualization_warning(&self.program, virtualize_time) {
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            eprintln!("{warning}");
         }
 
         Ok(())
