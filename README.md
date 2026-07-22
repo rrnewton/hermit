@@ -88,11 +88,11 @@ hermit run --backend=ptrace -- /bin/echo hello
 ```
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit `dbi` or `kvm` request. The DynamoRIO prototype does not yet expose a
-Detcore process launcher, and the bare KVM prototype requires root, `/dev/kvm`,
-and a guest-kernel Linux ABI before it can execute host ELF programs. Until
-those adapters are integrated, selecting either prototype returns an actionable
-availability error rather than running the command without determinization.
+explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
+SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
+requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
+and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
+an availability error rather than running the command without determinization.
 
 A quick determinism check is to run the same virtual random-data read twice:
 

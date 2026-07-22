@@ -19,7 +19,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::ptr;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -60,8 +59,8 @@ pub(crate) struct DetOptions {
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
     /// Select the process instrumentation backend.
-    #[clap(long, value_enum, default_value_t)]
-    backend: Backend,
+    #[clap(long, value_enum)]
+    backend: Option<Backend>,
 
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
@@ -131,7 +130,8 @@ pub struct RunOpts {
         long,
         alias = "lite",
         conflicts_with = "chaos",
-        conflicts_with = "verify"
+        conflicts_with = "verify",
+        conflicts_with = "backend"
     )]
     namespace_only: bool,
 
@@ -372,8 +372,8 @@ impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let dop = &self.det_opts.det_config;
 
-        if self.backend != Backend::default() {
-            write!(f, " --backend={}", self.backend.as_str())?;
+        if let Some(backend) = self.backend {
+            write!(f, " --backend={}", backend.as_str())?;
         }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
@@ -490,7 +490,8 @@ fn display_runopts1() {
 fn backend_defaults_to_ptrace() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(ro.backend, Backend::Ptrace);
+    assert_eq!(ro.backend, None);
+    assert_eq!(ro.selected_backend(), Backend::Ptrace);
     assert_eq!(format!("{}", ro), " -- fakeprog");
 }
 
@@ -503,12 +504,9 @@ fn backend_values_parse_and_round_trip() {
     ] {
         let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
         ro.validate_args_with_perf_support(true).unwrap();
-        assert_eq!(ro.backend, expected);
-        if expected == Backend::Ptrace {
-            assert_eq!(format!("{}", ro), " -- fakeprog");
-        } else {
-            assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
-        }
+        assert_eq!(ro.backend, Some(expected));
+        assert_eq!(ro.selected_backend(), expected);
+        assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
     }
 }
 
@@ -632,96 +630,6 @@ fn display_runopts_without_perf_support() {
     );
 }
 
-#[derive(Clone, Copy)]
-enum CapabilityProbe {
-    Ptrace,
-    Seccomp,
-}
-
-fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
-    // SAFETY: The child calls only async-signal-safe syscalls and exits immediately. The probe runs
-    // before Hermit creates its Tokio runtime or tracing threads.
-    let pid = unsafe { libc::fork() };
-    if pid == -1 {
-        return Err(std::io::Error::last_os_error()).context("Failed to fork capability probe");
-    }
-    if pid == 0 {
-        let supported = match probe {
-            CapabilityProbe::Ptrace => {
-                // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
-                unsafe {
-                    libc::ptrace(
-                        libc::PTRACE_TRACEME,
-                        0,
-                        ptr::null_mut::<libc::c_void>(),
-                        ptr::null_mut::<libc::c_void>(),
-                    ) != -1
-                }
-            }
-            CapabilityProbe::Seccomp => {
-                let mut filter = libc::sock_filter {
-                    code: 0x06, // BPF_RET | BPF_K
-                    jt: 0,
-                    jf: 0,
-                    k: 0x7fff0000, // SECCOMP_RET_ALLOW
-                };
-                let program = libc::sock_fprog {
-                    len: 1,
-                    filter: &mut filter,
-                };
-                // SAFETY: The filter is an allow-all program with a valid one-element lifetime.
-                unsafe {
-                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-                        && libc::syscall(
-                            libc::SYS_seccomp,
-                            1, // SECCOMP_SET_MODE_FILTER
-                            0,
-                            &program,
-                        ) == 0
-                }
-            }
-        };
-        // SAFETY: Avoid running Rust destructors after fork.
-        unsafe { libc::_exit(i32::from(!supported)) }
-    }
-
-    let mut status = 0;
-    loop {
-        // SAFETY: pid is the child created above and status points to valid storage.
-        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if result == pid {
-            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-        }
-        if result == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("Failed to wait for capability probe");
-        }
-    }
-}
-
-fn validate_tracing_environment() -> Result<(), Error> {
-    if !run_capability_probe(CapabilityProbe::Ptrace)? {
-        anyhow::bail!(
-            "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
-             denied. Allow same-UID parent-child ptrace in the container seccomp and host \
-             Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
-             a sandbox smoke test without syscall interception."
-        );
-    }
-    if !run_capability_probe(CapabilityProbe::Seccomp)? {
-        anyhow::bail!(
-            "Hermit cannot install its tracee seccomp filter: \
-             seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
-             prctl(PR_SET_NO_NEW_PRIVS) in the container policy, or use --namespace-only for a \
-             sandbox smoke test without syscall interception."
-        );
-    }
-    Ok(())
-}
-
 fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     let mut file = File::open(path).ok()?;
     let mut bytes = [0_u8; 256];
@@ -808,6 +716,10 @@ fn mapped_path(path: &Path, source: &Path, target: &Path) -> Option<PathBuf> {
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    fn selected_backend(&self) -> Backend {
+        self.backend.unwrap_or_default()
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -815,21 +727,20 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
-        if self.namespace_only && self.backend != Backend::Ptrace {
-            anyhow::bail!(
-                "--backend={} cannot be used with --namespace-only because namespace-only mode \
-                 bypasses instrumentation",
-                self.backend.as_str()
-            );
-        }
-        if !self.namespace_only {
-            self.backend.ensure_available()?;
+        let backend = self.selected_backend();
+        if self.namespace_only {
+            if let Some(explicit_backend) = self.backend {
+                anyhow::bail!(
+                    "--backend={} cannot be used with --namespace-only because namespace-only mode \
+                     bypasses instrumentation",
+                    explicit_backend.as_str()
+                );
+            }
+        } else {
+            backend.ensure_available()?;
         }
         self.validate_mount_sources()?;
         self.validate_program()?;
-        if !self.namespace_only && self.backend == Backend::Ptrace {
-            validate_tracing_environment()?;
-        }
         // });
 
         if self.namespace_only {
@@ -845,7 +756,7 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported = match self.backend {
+        let perf_supported = match self.selected_backend() {
             Backend::Ptrace => reverie_ptrace::is_perf_supported(),
             Backend::Dbi | Backend::Kvm => true,
         };
@@ -1251,7 +1162,7 @@ impl RunOpts {
                 config,
                 self.summary,
                 &self.summary_json,
-                self.backend,
+                self.selected_backend(),
             )?;
             Ok((out.status, Some(out)))
         } else {
@@ -1260,7 +1171,7 @@ impl RunOpts {
                 config,
                 self.summary,
                 &self.summary_json,
-                self.backend,
+                self.selected_backend(),
             )?;
             Ok((status, None))
         }
@@ -1294,7 +1205,7 @@ impl RunOpts {
             config,
             self.summary,
             &self.summary_json,
-            self.backend,
+            self.selected_backend(),
         )
     }
 }

@@ -42,7 +42,6 @@ pub use error::Error;
 pub use error::SerializableError;
 pub use id::Id;
 use metadata::Metadata;
-use nix::unistd::Uid;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
@@ -64,6 +63,142 @@ pub struct Recording {
 
     /// The exit code of the command.
     pub exit_status: ExitStatus,
+}
+
+#[derive(Clone, Copy)]
+enum CapabilityProbe {
+    Namespaces,
+    Ptrace,
+    Seccomp,
+}
+
+fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
+    // SAFETY: The child calls only async-signal-safe syscalls and exits immediately.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(std::io::Error::last_os_error()).context("Failed to fork capability probe");
+    }
+    if pid == 0 {
+        let supported = match probe {
+            CapabilityProbe::Namespaces => unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
+            },
+            CapabilityProbe::Ptrace => {
+                // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_TRACEME,
+                        0,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    ) != -1
+                }
+            }
+            CapabilityProbe::Seccomp => {
+                let mut filter = libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff0000, // SECCOMP_RET_ALLOW
+                };
+                let program = libc::sock_fprog {
+                    len: 1,
+                    filter: &mut filter,
+                };
+                // SAFETY: The filter is an allow-all program with a valid one-element lifetime.
+                unsafe {
+                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                        && libc::syscall(
+                            libc::SYS_seccomp,
+                            1, // SECCOMP_SET_MODE_FILTER
+                            0,
+                            &program,
+                        ) == 0
+                }
+            }
+        };
+        // SAFETY: Avoid running Rust destructors after fork.
+        unsafe { libc::_exit(i32::from(!supported)) }
+    }
+
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is the child created above and status points to valid storage.
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("Failed to wait for capability probe");
+        }
+    }
+}
+
+fn validate_tracing_environment() -> Result<(), Error> {
+    if !run_capability_probe(CapabilityProbe::Namespaces)? {
+        anyhow::bail!(
+            "Hermit cannot create its required user and PID namespaces: \
+             unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
+             and the unshare syscall in the host/container policy."
+        );
+    }
+    if !run_capability_probe(CapabilityProbe::Ptrace)? {
+        anyhow::bail!(
+            "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
+             denied. Allow same-UID parent-child ptrace in the container seccomp and host \
+             Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
+             a sandbox smoke test without syscall interception."
+        );
+    }
+    if !run_capability_probe(CapabilityProbe::Seccomp)? {
+        anyhow::bail!(
+            "Hermit cannot install its tracee seccomp filter: \
+             seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
+             prctl(PR_SET_NO_NEW_PRIVS) in the container policy, or use --namespace-only for a \
+             sandbox smoke test without syscall interception."
+        );
+    }
+    Ok(())
+}
+
+fn is_dynamorio_sdk(path: &Path) -> bool {
+    path.join("include/dr_api.h").is_file()
+        || path.join("DynamoRIOConfig.cmake").is_file()
+        || path.join("cmake/DynamoRIOConfig.cmake").is_file()
+}
+
+fn dynamorio_sdk_available() -> bool {
+    const DEFAULT_ROOTS: [&str; 3] = [
+        "/usr/lib/cmake/DynamoRIO",
+        "/usr/local/lib/cmake/DynamoRIO",
+        "/opt/dynamorio",
+    ];
+
+    ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
+        .any(|path| is_dynamorio_sdk(&path))
+}
+
+fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .err()
+        .map(|error| {
+            format!(
+                "cannot open {} read-write: {error}; grant access through the device owner/group \
+                 or root",
+                path.display()
+            )
+        })
 }
 
 /// Process instrumentation backend used to run a Hermit guest.
@@ -114,34 +249,39 @@ impl Backend {
         }
     }
 
-    fn unavailable_reason(self) -> Option<&'static str> {
+    fn unavailable_reason(self) -> Option<String> {
         match self {
-            Self::Ptrace => None,
-            Self::Dbi => {
-                Some("the DynamoRIO prototype does not yet expose a Detcore process launcher")
-            }
-            Self::Kvm if !Uid::effective().is_root() => {
-                Some("KVM execution requires root privileges")
-            }
-            Self::Kvm if !Path::new("/dev/kvm").exists() => {
-                Some("the host does not expose /dev/kvm")
-            }
-            Self::Kvm => Some(
-                "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI",
+            Self::Ptrace => validate_tracing_environment()
+                .err()
+                .map(|error| error.to_string()),
+            Self::Dbi if !dynamorio_sdk_available() => Some(
+                "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
+                    .to_owned(),
             ),
+            Self::Dbi => Some(
+                "the DynamoRIO prototype does not yet expose a Detcore process launcher".to_owned(),
+            ),
+            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
+                Some(
+                    "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
+                        .to_owned(),
+                )
+            }),
         }
     }
 }
 
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
-    backend.ensure_available()?;
-    if backend != Backend::Ptrace {
-        return Err(anyhow!(
-            "backend `{}` has no Hermit dispatch implementation",
-            backend.as_str()
-        ));
+    // The CLI probes ptrace readiness before entering its container; repeating
+    // the namespace probe here would test nested namespaces instead of the host.
+    if backend == Backend::Ptrace {
+        return Ok(());
     }
-    Ok(())
+    backend.ensure_available()?;
+    Err(anyhow!(
+        "backend `{}` has no Hermit dispatch implementation",
+        backend.as_str()
+    ))
 }
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
@@ -441,12 +581,35 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::Backend;
+    use super::is_dynamorio_sdk;
+    use super::kvm_device_unavailable_reason;
 
     #[test]
-    fn ptrace_is_the_default_and_only_integrated_backend() {
+    fn default_and_available_backends_reflect_host_probes() {
         assert_eq!(Backend::default(), Backend::Ptrace);
-        assert_eq!(Backend::available().collect::<Vec<_>>(), [Backend::Ptrace]);
+        let available = Backend::available().collect::<Vec<_>>();
+        assert_eq!(
+            available.contains(&Backend::Ptrace),
+            Backend::Ptrace.is_available()
+        );
+        assert!(!available.contains(&Backend::Dbi));
+        assert!(!available.contains(&Backend::Kvm));
+    }
+
+    #[test]
+    fn dependency_probes_require_usable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!is_dynamorio_sdk(temp.path()));
+        fs::create_dir(temp.path().join("include")).unwrap();
+        fs::write(temp.path().join("include/dr_api.h"), b"/* marker */").unwrap();
+        assert!(is_dynamorio_sdk(temp.path()));
+
+        let reason = kvm_device_unavailable_reason(temp.path())
+            .expect("a directory must not pass the read-write KVM device probe");
+        assert!(reason.contains("read-write"));
     }
 
     #[test]
@@ -454,17 +617,20 @@ mod tests {
         let dbi_error = Backend::Dbi
             .ensure_available()
             .expect_err("DBI must fail closed");
-        assert!(dbi_error.to_string().contains("Detcore process launcher"));
+        let message = dbi_error.to_string();
+        assert!(
+            message.contains("DynamoRIO SDK") || message.contains("Detcore process launcher"),
+            "unexpected DBI availability error: {message}"
+        );
 
         let kvm_error = Backend::Kvm
             .ensure_available()
             .expect_err("KVM must fail closed");
         let message = kvm_error.to_string();
         assert!(
-            message.contains("root privileges")
-                || message.contains("/dev/kvm")
-                || message.contains("guest-kernel ABI"),
+            message.contains("/dev/kvm") || message.contains("guest-kernel ABI"),
             "unexpected KVM availability error: {message}"
         );
+        assert!(!message.contains("requires root privileges"));
     }
 }
