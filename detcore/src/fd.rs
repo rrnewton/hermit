@@ -101,6 +101,10 @@ struct OpenFileDescription {
     /// purposes.
     physically_nonblocking: bool,
 
+    /// Whether Hermit is currently emulating a blocking `connect` on this socket.
+    #[serde(default)]
+    connect_in_progress: bool,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -157,6 +161,7 @@ impl DetFd {
                 procfs: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
+                connect_in_progress: false,
             })),
         }
     }
@@ -292,6 +297,27 @@ impl DetFd {
         description.status_flags = flags & !OFlag::O_CLOEXEC.bits();
         description.physically_nonblocking = oflags_nonblocking(flags);
     }
+
+    /// Whether another logical `connect` currently owns this open file description.
+    pub(crate) fn connect_in_progress(&self) -> bool {
+        self.description().connect_in_progress
+    }
+
+    /// Claim ownership of an emulated blocking `connect` operation.
+    pub(crate) fn try_start_connect(&self) -> bool {
+        let mut description = self.description();
+        if description.connect_in_progress {
+            false
+        } else {
+            description.connect_in_progress = true;
+            true
+        }
+    }
+
+    /// Release ownership after an emulated blocking `connect` completes.
+    pub(crate) fn finish_connect(&self) {
+        self.description().connect_in_progress = false;
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -328,6 +354,14 @@ mod tests {
             duplicate.is_nonblocking(),
             "dup must preserve shared status flags"
         );
+
+        assert!(original.try_start_connect());
+        assert!(
+            !duplicate.try_start_connect(),
+            "dup aliases must share connect ownership"
+        );
+        duplicate.finish_connect();
+        assert!(!original.connect_in_progress());
 
         duplicate.set_status_flags(OFlag::empty().bits());
         assert!(
