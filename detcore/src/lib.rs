@@ -1150,6 +1150,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
+            // rseq is registered by glibc for every thread during startup. When
+            // a guest is spawned via fork (spawn_fn) it inherits the harness's
+            // rseq-enabled state, so glibc treats a per-thread registration that
+            // returns ENOSYS as fatal ("Fatal glibc error: rseq registration
+            // failed"). Blocking rseq with ENOSYS (the default for unsupported
+            // syscalls) therefore aborts newly created guest threads, which
+            // deadlocks any thread waiting on them (e.g. a parent blocked in
+            // FUTEX_WAIT). Pass it through to the host, matching the previous
+            // default-passthrough behavior. Under panic_on_unsupported_syscalls
+            // we still emulate a kernel without rseq support.
+            _ if call.number() == Sysno::rseq && config.panic_on_unsupported_syscalls => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            _ if call.number() == Sysno::rseq => self.passthrough(guest, call).await,
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
