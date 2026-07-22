@@ -20,11 +20,29 @@ static void check(int condition, const char *message) {
 }
 
 int main(void) {
+  int pipefds[2];
+  check(pipe(pipefds) == 0, "pipe");
+
+  int nonblocking = 1;
+  check(ioctl(pipefds[0], FIONBIO, &nonblocking) == 0, "ioctl(FIONBIO set)");
+  int flags = fcntl(pipefds[0], F_GETFL);
+  check(flags >= 0, "fcntl(F_GETFL)");
+  check((flags & O_NONBLOCK) != 0, "FIONBIO did not set O_NONBLOCK");
+
+  nonblocking = 0;
+  check(ioctl(pipefds[0], FIONBIO, &nonblocking) == 0, "ioctl(FIONBIO clear)");
+  flags = fcntl(pipefds[0], F_GETFL);
+  check(flags >= 0, "fcntl(F_GETFL)");
+  check((flags & O_NONBLOCK) == 0, "FIONBIO did not clear O_NONBLOCK");
+
+  check(close(pipefds[0]) == 0, "close pipe read");
+  check(close(pipefds[1]) == 0, "close pipe write");
+
   int fd = open("/dev/null", O_RDONLY);
   check(fd >= 0, "open");
 
   check(ioctl(fd, FIOCLEX) == 0, "ioctl(FIOCLEX)");
-  int flags = fcntl(fd, F_GETFD);
+  flags = fcntl(fd, F_GETFD);
   check(flags >= 0, "fcntl(F_GETFD)");
   check((flags & FD_CLOEXEC) != 0, "FIOCLEX did not set FD_CLOEXEC");
 

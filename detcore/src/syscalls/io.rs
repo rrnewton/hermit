@@ -57,7 +57,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+            // This cannot block, but still yield a scheduler turn so a polling thread cannot
+            // monopolize the guest between preemptions.
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.
             Ok(self.handle_external_poll(guest, call).await?)
@@ -146,7 +151,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollWait,
     ) -> Result<i64, Error> {
-        if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+            // This cannot block, but still yield a scheduler turn so a polling thread cannot
+            // monopolize the guest between preemptions.
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             Ok(self
                 .record_or_replay_blocking(guest, Syscall::EpollWait(call))
                 .await?)

@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::Recvfrom;
@@ -16,6 +17,26 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Replayer;
 
 impl Replayer {
+    pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: EpollWait,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, EpollWait)?;
+        assert_eq!(
+            event.events.len(),
+            event.updated * std::mem::size_of::<libc::epoll_event>()
+        );
+        assert!(event.updated <= syscall.maxevents() as usize);
+
+        if !event.events.is_empty() {
+            guest
+                .memory()
+                .write_exact(syscall.events().ok_or(Errno::EFAULT)?.cast(), &event.events)?;
+        }
+        Ok(event.updated as i64)
+    }
+
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,

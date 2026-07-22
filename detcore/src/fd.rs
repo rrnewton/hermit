@@ -221,6 +221,17 @@ impl DetFd {
         self.fd_flags = if enabled { OFlag::O_CLOEXEC.bits() } else { 0 };
     }
 
+    /// Update nonblocking status for every alias of this open file description.
+    pub fn set_nonblocking(&self, enabled: bool) {
+        let mut description = self.description();
+        if enabled {
+            description.status_flags |= OFlag::O_NONBLOCK.bits();
+        } else {
+            description.status_flags &= !OFlag::O_NONBLOCK.bits();
+        }
+        description.physically_nonblocking = enabled;
+    }
+
     /// Stable identity shared by dup and fork aliases.
     pub fn open_file_id(&self) -> OpenFileId {
         self.description().id
