@@ -39,6 +39,7 @@ use crate::fd::*;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::resources::Resources;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
@@ -219,14 +220,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd
-            | FdType::Eventfd
-            | FdType::Timerfd
-            | FdType::Memfd
-            | FdType::Pidfd
-            | FdType::Userfaultfd => {
+            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+                trace!(
+                    "Possibly blocking read call on notification fd {}, type {:?}",
+                    call.fd(),
+                    fd_type
+                );
+                self.execute_nonblockable_fd_syscall(guest, call).await
+            }
+            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
-                // TODO, WARNING: this code path is not exercised by our tests [2021.11.09].
                 Ok(self.record_or_replay(guest, call).await?)
             }
 
@@ -976,6 +979,70 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
         .await?;
         Ok(fd as i64)
+    }
+
+    /// Serialize a notification descriptor control operation.
+    async fn notification_fd_control<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await;
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// timerfd_settime system call.
+    pub async fn handle_timerfd_settime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerfdSettime,
+    ) -> Result<i64, Error> {
+        self.notification_fd_control(guest, call.into()).await
+    }
+
+    /// timerfd_gettime system call.
+    pub async fn handle_timerfd_gettime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerfdGettime,
+    ) -> Result<i64, Error> {
+        self.notification_fd_control(guest, call.into()).await
+    }
+
+    /// inotify_init1 system call.
+    pub async fn handle_inotify_init1<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::InotifyInit1,
+    ) -> Result<i64, Error> {
+        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        self.add_fd(
+            guest,
+            fd,
+            OFlag::from_bits_truncate(call.flags().bits() & (libc::IN_CLOEXEC | libc::IN_NONBLOCK)),
+            FdType::Inotify,
+        )
+        .await?;
+        Ok(fd as i64)
+    }
+
+    /// inotify_add_watch system call.
+    pub async fn handle_inotify_add_watch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::InotifyAddWatch,
+    ) -> Result<i64, Error> {
+        self.notification_fd_control(guest, call.into()).await
+    }
+
+    /// inotify_rm_watch system call.
+    pub async fn handle_inotify_rm_watch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::InotifyRmWatch,
+    ) -> Result<i64, Error> {
+        self.notification_fd_control(guest, call.into()).await
     }
 
     /// memfd_create system call.

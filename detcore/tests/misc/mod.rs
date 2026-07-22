@@ -8,6 +8,8 @@
 
 //! misc syscall tests
 
+mod notification_fds;
+
 use nix::unistd;
 
 #[global_allocator]
