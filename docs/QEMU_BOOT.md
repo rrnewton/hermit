@@ -70,7 +70,8 @@ is:
 timeout --signal=KILL 90s target/release/hermit --log error run \
   --no-sequentialize-threads \
   --preemption-timeout disabled \
-  --no-virtualize-cpuid -- \
+  --no-virtualize-cpuid \
+  --allow-passthrough -- \
   qemu-system-x86_64 \
   -m 256M \
   -accel tcg,thread=single \
@@ -89,6 +90,40 @@ timeout --signal=KILL 90s target/release/hermit --log error run \
 provide usable CPUID faulting. It exposes host CPUID results and is separate
 from the scheduling and clock configuration. A host on which Hermit's CPUID
 virtualization works may omit this option.
+
+`--allow-passthrough` is required on current `frontier`: QEMU's shared-memory
+allocation (`qemu_memfd_alloc`) calls `ftruncate` and `unlink`, which Detcore
+does not yet implement and otherwise rejects with `ENOSYS`. That makes QEMU
+abort during startup (see Troubleshooting) before any firmware output. The flag
+lets those file syscalls execute on the host. This is a compatibility relaxation
+that further weakens determinism; it is acceptable for this compatibility
+profile, which is already non-deterministic because of
+`--no-sequentialize-threads`. The proper fix is to implement `ftruncate` and
+`unlink` in Detcore, after which this flag can be dropped.
+
+## Minimal reproduction without an initramfs
+
+To reproduce and check the scheduling behavior alone, boot a host kernel to its
+expected no-root-filesystem panic (this mirrors
+[issue #5](https://github.com/rrnewton/hermit/issues/5)):
+
+```bash
+timeout 150 target/release/hermit --log error run \
+  --no-sequentialize-threads \
+  --preemption-timeout disabled \
+  --no-virtualize-cpuid \
+  --allow-passthrough -- \
+  qemu-system-x86_64 -nographic -m 256 \
+  -accel tcg,thread=single -smp 1 -icount shift=0,sleep=off \
+  -kernel /boot/vmlinuz-$(uname -r) \
+  -append 'console=ttyS0 panic=1' -no-reboot
+```
+
+On the evidence host this reached the `Kernel panic - not syncing: VFS: Unable
+to mount root fs` message and exited 0 in about 42 seconds, matching the
+line-for-line output of the same command run without Hermit. Dropping the
+scheduling flags (the default `hermit run`) makes the same boot fail to reach
+firmware output within minutes.
 
 ## Why QEMU needs concurrent host threads
 
@@ -186,6 +221,13 @@ reboot: Power down
 
 ## Troubleshooting
 
+- **QEMU aborts at startup with `qemu_memfd_alloc() ... failed to allocate
+  shared memory: Function not implemented`:** QEMU's shared-memory allocation
+  uses `ftruncate` (and `unlink`), which Detcore currently rejects with
+  `ENOSYS`. QEMU then calls `abort()`, whose `tgkill`-based `raise` is also
+  `ENOSYS`, so the process dumps core in a few seconds before any firmware
+  output. Add `--allow-passthrough` (see the working command above) until
+  Detcore implements those syscalls.
 - **No serial output before the timeout:** Confirm both Hermit scheduling
   options are present. Default sequentialization is functionally live but was
   too slow for the bounded boot.
