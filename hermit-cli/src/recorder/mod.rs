@@ -12,6 +12,9 @@ mod network;
 mod random;
 mod time;
 
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::path::PathBuf;
 
 use reverie::Errno;
@@ -24,6 +27,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -145,8 +149,27 @@ impl Tool for Recorder {
             // We must let through execve without any modification. Recording
             // events for these is hard because execve only returns upon
             // failure.
-            Syscall::Execve(_) => guest.inject(syscall).await,
-            Syscall::Execveat(_) => guest.inject(syscall).await,
+            //
+            // Capture the target binary so replay can stage every exec'd
+            // executable into its chroot, not just the root program. Without
+            // this, a child `execve` (e.g. a shell pipeline running
+            // `/usr/bin/wc`) fails with ENOENT during replay and desyncs.
+            Syscall::Execve(execve) => {
+                if let Some(path) = execve.path()
+                    && let Ok(path) = path.read(&guest.memory())
+                {
+                    self.record_executable(&path);
+                }
+                guest.inject(syscall).await
+            }
+            Syscall::Execveat(execveat) => {
+                if let Some(path) = execveat.path()
+                    && let Ok(path) = path.read(&guest.memory())
+                {
+                    self.record_executable(&path);
+                }
+                guest.inject(syscall).await
+            }
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
             Syscall::ArchPrctl(_) => {
@@ -225,6 +248,32 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    /// Appends an `execve`'d binary path to the recording's `executables`
+    /// manifest so that replay can populate its chroot with every executable
+    /// the program ran, not just the root one.
+    ///
+    /// This is best-effort: a failure to record an executable only degrades
+    /// replay (it may desync on that exec), so we never fail the recording over
+    /// it. Concurrent guest processes may append at the same time; each line is
+    /// written with a single `O_APPEND` `write(2)`, which the kernel serializes
+    /// for regular files, so lines never interleave.
+    fn record_executable(&self, path: &Path) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+
+        let manifest = self.data.join(crate::consts::EXECUTABLES_NAME);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest)
+        {
+            let mut line = path.as_os_str().as_bytes().to_vec();
+            line.push(b'\n');
+            let _ = file.write_all(&line);
+        }
+    }
+
     fn record_raw_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let debug_event = DebugEvent::new(syscall, &guest.memory());
         guest

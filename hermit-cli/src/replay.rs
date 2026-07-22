@@ -6,8 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use reverie::ExitStatus;
@@ -19,6 +21,7 @@ use reverie::process::Stdio;
 use crate::Shebang;
 use crate::chroot::TempChroot;
 use crate::consts::EXE_NAME;
+use crate::consts::EXECUTABLES_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
@@ -173,8 +176,86 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
         chroot.copy_same(&interp)?;
     }
 
+    // Stage every executable that the recording `execve`'d, not just the root
+    // program. A pipeline or any program that spawns children (e.g.
+    // `bash -c "… | wc -l"`) execs binaries beyond `metadata.exe`. Those files
+    // must exist inside the chroot for the child `execve` to succeed during
+    // replay; otherwise it fails with ENOENT, the guest takes a different code
+    // path than it did while recording, and replay desyncs from the recorded
+    // event stream.
+    //
+    // FIXME: Like ld.so above, these binaries are copied from the host rather
+    // than reconstructed from the recording. They should eventually be recorded
+    // so that replay does not depend on host filesystem state.
+    stage_recorded_executables(dir, metadata, &chroot);
+
     // Create the working directory.
     chroot.create_dir_all(&metadata.current_dir)?;
 
     Ok(chroot)
+}
+
+/// Copies every executable listed in the recording's `executables` manifest into
+/// the chroot, along with each one's ELF interpreter (`ld.so`). The dynamic
+/// linker's own file operations are replayed from the recording, so only the
+/// executable and its interpreter files themselves need to exist on disk.
+///
+/// This is best-effort: any path that is missing, unreadable, or already present
+/// (the root executable is hard-linked earlier) is skipped rather than failing
+/// the replay, so that a single odd exec target cannot block an otherwise valid
+/// replay.
+fn stage_recorded_executables(dir: &Path, metadata: &Metadata, chroot: &TempChroot) {
+    let manifest = dir.join(EXECUTABLES_NAME);
+    let contents = match fs::read(&manifest) {
+        Ok(contents) => contents,
+        // No manifest means the recording predates executable tracking (or
+        // recorded no execs); nothing to stage.
+        Err(_) => return,
+    };
+
+    for line in contents.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+
+        let path = Path::new(OsStr::from_bytes(line));
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            metadata.current_dir.join(path)
+        };
+
+        // The root executable is already hard-linked into the chroot; don't
+        // clobber it (or re-copy any binary we've already staged).
+        if chroot.relpath(&resolved).exists() {
+            continue;
+        }
+
+        if !resolved.is_file() {
+            continue;
+        }
+
+        if let Err(err) = chroot.copy_same(&resolved) {
+            tracing::warn!(
+                "Failed to stage executable {:?} into replay chroot: {}",
+                resolved,
+                err
+            );
+            continue;
+        }
+
+        // The kernel needs this binary's dynamic linker present to exec it.
+        if let Some(interp) = interp::elf_get_interp(&resolved)
+            && interp.is_file()
+            && !chroot.relpath(&interp).exists()
+            && let Err(err) = chroot.copy_same(&interp)
+        {
+            tracing::warn!(
+                "Failed to stage interpreter {:?} for {:?} into replay chroot: {}",
+                interp,
+                resolved,
+                err
+            );
+        }
+    }
 }

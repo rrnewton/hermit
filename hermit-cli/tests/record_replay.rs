@@ -307,6 +307,42 @@ fn record_curl_version() {
     record_replay_command("curl", curl, &[OsStr::new("--version")]);
 }
 
+/// Regression test for a `record --verify` desync on a minimal cross-process
+/// shell pipeline (GitHub issue #80). `bash -c "printf … | wc -l"` forks a child
+/// that `execve`s `/usr/bin/wc`, redirecting its stdout onto a pipe first.
+///
+/// Two independent bugs made this fail:
+///   1. The replay chroot only contained the root executable (`bash`), so the
+///      child's `execve("/usr/bin/wc")` failed with ENOENT and the guest
+///      desynchronized from the recorded syscall stream (and leaked stopped
+///      children).
+///   2. The replayer echoed any write to fd 1/2 to the real console by fd
+///      number, so `printf`'s write to its pipe-redirected stdout leaked into
+///      the replay's captured output and failed the record/replay comparison.
+///
+/// A passing verify exercises both the exec-staging and console-fd-tracking
+/// fixes end to end.
+#[test]
+fn record_shell_pipeline_two_processes() {
+    let _guard = hermit_record_lock();
+
+    let bash = Path::new("/bin/bash");
+    let wc = Path::new("/usr/bin/wc");
+    if !bash.is_file() || !wc.is_file() {
+        eprintln!("bash or wc is missing; skipping shell-pipeline record/replay coverage");
+        return;
+    }
+
+    record_replay_command(
+        "shell_pipeline",
+        bash,
+        &[
+            OsStr::new("-c"),
+            OsStr::new("printf 'a\\nb\\n' | /usr/bin/wc -l"),
+        ],
+    );
+}
+
 #[test]
 fn record_timeout_kills_guest_without_committing_partial_data() {
     let _guard = hermit_record_lock();
