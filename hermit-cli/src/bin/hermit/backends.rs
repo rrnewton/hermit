@@ -77,7 +77,7 @@ pub fn run_kvm(program: &Path) -> Result<ExitStatus, Error> {
             // KVM backend now hands us a decoded Reverie `Syscall`; recover the
             // raw ABI arguments via `SyscallInfo::into_parts`.
             let (_number, args) = syscall.into_parts();
-            let len = args.arg2 as usize;
+            let len = args.arg2;
             let mut buf = vec![0u8; len];
             if memory.read(args.arg1 as u64, &mut buf).is_err() {
                 return -(libc::EFAULT as i64);

@@ -743,7 +743,16 @@ impl RunOpts {
                 );
             }
         } else {
-            backend.ensure_available()?;
+            // The experimental Dbi/Kvm backends are intentionally "unavailable"
+            // as full Linux execution backends (see `Backend::unavailable_reason`),
+            // so `ensure_available` fails them closed. They still expose a
+            // built-in demonstration through their real interception path; the
+            // dispatch below reaches it, and each performs its own prerequisite
+            // check (e.g. opening `/dev/kvm`). Only gate the production ptrace
+            // backend on the tracing-environment probe here.
+            if backend == Backend::Ptrace {
+                backend.ensure_available()?;
+            }
         }
         self.validate_mount_sources()?;
         self.validate_program()?;
