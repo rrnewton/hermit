@@ -2,6 +2,33 @@
 
 Status: research snapshot, 2026-07-21
 
+> **Update, 2026-07-22 — the subscription gap is closed.** This document was an
+> audit of Hermit revision `592d5c6`, where release `hermit run` subscribed to
+> only 78 syscalls and the other 291 executed on the host without reaching
+> Detcore (fail-open). That gap has since been fixed:
+>
+> - `befa3f4` "Make unsupported syscalls fail closed" makes the optimized,
+>   non-record/replay run subscribe to `Subscription::all_syscalls()`
+>   (`SysnoSet::all()`), so **every** syscall is now trapped. Syscalls without a
+>   deterministic model reach the dispatch fallback and return `ENOSYS` by
+>   default; `--allow-passthrough` restores the old warn-and-forward behavior.
+> - `5f930d6` "Fix unsupported syscall panic enforcement" forces
+>   `all_syscalls()` (and the panic fallback) whenever
+>   `--panic-on-unsupported-syscalls` / strict mode is set, including
+>   record/replay.
+>
+> Both commits are ancestors of the current frontier and are covered by the
+> `hermit_modes.rs` fail-closed tests (`unsupported_syscall_is_blocked_by_default`,
+> `allow_passthrough_forwards_unsupported_syscall`,
+> `keyctl_obeys_unsupported_syscall_policy`,
+> `panic_on_unsupported_syscalls_panics`, `strict_panics_on_unsupported_syscalls`).
+>
+> The classifications below still describe **deterministic-model** coverage
+> accurately: the 291 "MISSING" syscalls still lack a semantic model. What has
+> changed is that they are no longer *unsubscribed* — they now fail closed
+> instead of silently escaping Detcore. Read the "Release trap" column and the
+> fail-open passages in the executive summary as the pre-fix (`592d5c6`) state.
+
 ## Executive summary
 
 This audit uses Hermit revision
@@ -25,19 +52,26 @@ only in the relevant configured mode: `alarm`, `pause`,
 61 are partial models that still use the host kernel, cover only some commands
 or file-descriptor types, or depend on a stable filesystem/network environment.
 
-Release `hermit run` subscribes to 78 syscall numbers. That set comprises the
-69 determinized entries, six explicit passthroughs, and three blocked entries.
-Normal CLI defaults enable scheduling, deterministic I/O, time virtualization,
-and metadata virtualization, so all conditional subscription groups are active
-unless the user opts out. A debug build instead uses `Subscription::all()`.
+At revision `592d5c6`, release `hermit run` subscribed to only 78 syscall
+numbers. That set comprised the 69 determinized entries, six explicit
+passthroughs, and three blocked entries. Normal CLI defaults enable scheduling,
+deterministic I/O, time virtualization, and metadata virtualization, so all
+conditional subscription groups were active unless the user opted out. A debug
+build instead uses `Subscription::all()`. **As of `befa3f4` the optimized run
+subscribes to `all_syscalls()`, so this 78-syscall selective set no longer
+applies to the default `hermit run`; it now describes only the record/replay
+subscription path.**
 
-The largest correctness issue is fail-open coverage. In an optimized run, an
-unsubscribed syscall never reaches `handle_syscall_event`; it executes in the
-kernel without Detcore's prehook, scheduler, logical-time update, statistics, or
-unsupported-syscall check. Consequently
-`--panic-on-unsupported-syscalls` does not detect the 291 missing release
-entries. It only affects an unsupported syscall that some subscriber already
-caused Reverie to trap.
+The largest correctness issue was fail-open coverage. In the pre-fix optimized
+run, an unsubscribed syscall never reached `handle_syscall_event`; it executed
+in the kernel without Detcore's prehook, scheduler, logical-time update,
+statistics, or unsupported-syscall check. Consequently
+`--panic-on-unsupported-syscalls` did not detect the 291 missing release
+entries; it only affected an unsupported syscall that some subscriber had
+already caused Reverie to trap. **This is now fixed: because every syscall is
+trapped, an unmodeled syscall reaches the dispatch fallback and fails closed
+(ENOSYS by default, panic under `--panic-on-unsupported-syscalls`), so the
+panic flag now covers the full syscall surface.**
 
 ## Classification rules
 

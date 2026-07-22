@@ -104,16 +104,30 @@ documented failures, no ignored tests, and 257 mode-N/A tests. The additional
 documented failures expose `rseq` as the next blocker for threaded strict-mode
 workloads after `pread64` support.
 
-## Current Limitation
+## Syscall Subscription Coverage
 
-This metric is a lower bound on unsupported-syscall exposure, not a claim of
-complete fail-closed enforcement. Optimized Detcore runs subscribe to selected
-syscalls. An unsubscribed syscall executes in the kernel without reaching the
-unsupported-syscall panic. The current coverage audit identifies 291 such
-missing release entries; see
+Earlier revisions of Hermit subscribed optimized Detcore runs to only a
+selected subset of syscalls. An unsubscribed syscall executed in the kernel
+without reaching the unsupported-syscall panic, so a coverage audit at revision
+`592d5c6` identified 291 such missing release entries; see
 [`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md).
 
-A future true fail-closed mode must subscribe to all syscalls (or install an
-equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 9/105 to full
-coverage of the currently applicable integration inventory.
+That subscription gap is now closed. Commit `befa3f4` ("Make unsupported
+syscalls fail closed") makes the optimized, non-record/replay run subscribe to
+`Subscription::all_syscalls()`, so every syscall is trapped. A syscall without a
+deterministic model reaches the dispatch fallback, which returns `ENOSYS` by
+default (`--allow-passthrough` restores warn-and-forward), and commit `5f930d6`
+("Fix unsupported syscall panic enforcement") makes
+`--panic-on-unsupported-syscalls` / strict mode panic on that fallback with full
+syscall coverage. The `hermit_modes.rs` fail-closed tests
+(`unsupported_syscall_is_blocked_by_default`,
+`allow_passthrough_forwards_unsupported_syscall`,
+`keyctl_obeys_unsupported_syscall_policy`,
+`panic_on_unsupported_syscalls_panics`, `strict_panics_on_unsupported_syscalls`)
+guard this behavior.
+
+Note the scope: closing the subscription gap guarantees that no syscall silently
+bypasses Detcore, not that every syscall has a deterministic model. The 291
+entries still marked "MISSING" in the coverage map lack semantic models; they
+now fail closed instead of failing open. The ratchet above continues to track
+progress on the modeled calls that Detcore observes.
