@@ -106,14 +106,21 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
 
 #[cfg(target_arch = "x86_64")]
 fn cpuid_faulting_supported() -> bool {
+    const ARCH_GET_CPUID: libc::c_ulong = 0x1011;
     const ARCH_SET_CPUID: libc::c_ulong = 0x1012;
 
     // Probe in a child because disabling CPUID is a per-thread setting.
     let child = unsafe { libc::fork() };
     assert_ne!(child, -1, "failed to fork CPUID capability probe");
     if child == 0 {
-        let result = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) };
-        unsafe { libc::_exit(i32::from(result != 0)) };
+        let initial =
+            unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0 as libc::c_ulong) };
+        let disabled = initial >= 0
+            && unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0 as libc::c_ulong) }
+                == 0
+            && unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0 as libc::c_ulong) }
+                == 0;
+        unsafe { libc::_exit(i32::from(!disabled)) };
     }
 
     let mut status = 0;
@@ -335,6 +342,22 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
 }
 
 #[test]
+fn strict_mode_rejects_namespace_only() {
+    let args = ["run", "--strict", "--namespace-only", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    for message in ["--strict", "--namespace-only", "cannot be used with"] {
+        assert!(
+            stderr.contains(message),
+            "missing {message:?} in:\n{stderr}"
+        );
+    }
+    assert!(!stderr.contains("panicked"), "unexpected panic:\n{stderr}");
+}
+
+#[test]
 #[cfg(target_arch = "x86_64")]
 fn strict_mode_requires_cpuid_faulting() {
     let supported = cpuid_faulting_supported();
@@ -357,9 +380,9 @@ fn strict_mode_requires_cpuid_faulting() {
         assert_failure_contains(
             &strict,
             &[
-                "CPUID faulting not available",
-                "AMD CPU with kernel < 6.17?",
-                "Upgrade to kernel >= 6.17",
+                "ARCH_GET_CPUID",
+                "Linux 6.17+ upstream",
+                "backported",
                 "--no-strict",
             ],
         );

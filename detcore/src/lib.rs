@@ -107,7 +107,7 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
-const STRICT_CPUID_INTERCEPTION_ERROR: &str = "CPUID faulting not available (AMD CPU with kernel < 6.17?). Upgrade to kernel >= 6.17 for AMD CPUID faulting support, or use --no-strict.";
+const STRICT_CPUID_INTERCEPTION_ERROR: &str = "CPUID interception setup failed after the host capability probe. Verify arch_prctl(ARCH_GET_CPUID) support; on AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported, or use --no-strict.";
 
 fn ensure_strict_cpuid_interception(required: bool, available: bool) -> Result<(), Error> {
     if required && !available {
