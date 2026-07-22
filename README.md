@@ -1,211 +1,334 @@
-# Hermit
+# Hermit: Reproducible Linux Execution
 
-Hermit is a reproducible container for x86-64 Linux programs. It runs an
-unmodified guest under the [Reverie](https://github.com/facebookexperimental/reverie)
-ptrace backend and controls sources of nondeterminism including thread
-scheduling, time, random data, CPUID results, and selected file metadata.
+Hermit runs unmodified x86-64 Linux programs under the
+[Reverie](https://github.com/facebookexperimental/reverie) ptrace backend. It
+controls common sources of nondeterminism, including thread scheduling, time,
+random data, CPUID results, address layout, and selected file metadata.
 
-Hermit is useful for repeatable execution, controlled concurrency testing,
-record/replay experiments, and diagnosing schedule-sensitive failures.
+This walkthrough demonstrates four working workflows:
+
+1. repeat an execution with stable guest-visible inputs;
+2. record an execution and replay it, with or without GDB;
+3. search seeded thread schedules for a concurrency failure; and
+4. bisect two schedules to identify the events that change the outcome.
 
 > [!WARNING]
 >
-> Hermit is in maintenance mode. Linux compatibility is substantial but
-> incomplete, especially for uncommon syscalls and complex record/replay
-> workloads. Hermit is not a security boundary, and changing files or external
-> network responses remain inputs to the guest.
+> Hermit is in maintenance mode. It is not a security boundary, and it does not
+> make changing files or external network responses deterministic. Record/replay
+> support is experimental and narrower than `hermit run` compatibility.
 
 ## Requirements
 
-Hermit currently supports x86-64 Linux. Building and running it requires:
+Use an x86-64 Linux host with Rust nightly (selected by
+`rust-toolchain.toml`), libunwind and LZMA development libraries, Linux user/PID
+namespaces, and parent-child ptrace and seccomp support. GDB is needed for the
+debugger section, and the Python demo uses `/usr/bin/python3`. The
+final schedule-bisection demo also needs user-accessible CPU performance
+counters.
 
-- Rust nightly through [rustup](https://rustup.rs/); `rust-toolchain.toml`
-  selects the repository toolchain automatically.
-- Linux user, PID, and mount namespaces.
-- Parent-child ptrace and seccomp filter support.
-- libunwind and LZMA development packages.
-- User-space performance counters for precise scheduler preemption. Hermit can
-  run without them, but CPU-bound workloads receive fewer preemption points.
+Run every command below from the repository root in the same Bash session.
+The commands use private temporary and ignored build-artifact directories; they
+require no external network access.
 
-On Debian or Ubuntu:
+## Quick Build
 
-```bash
-sudo apt-get update
-sudo apt-get install -y libunwind-dev liblzma-dev
-```
-
-On Fedora or CentOS:
+Build the optimized workspace, then build the debug binaries used for this
+walkthrough and establish their paths:
 
 ```bash
-sudo dnf install -y libunwind-devel xz-devel
+cargo build --release
+cargo build
+export HERMIT="$PWD/target/debug/hermit"
+export HELLO_RACE="$PWD/target/debug/hello_race"
+export HEAP_PTRS="$PWD/target/debug/rustbin_heap_ptrs"
+export DEMO_TMP="$(mktemp -d -t hermit-demo.XXXXXX)"
+export DEMO_ARTIFACTS="$PWD/target/${DEMO_TMP##*/}"
+mkdir -p "$DEMO_ARTIFACTS"
+test -x "$HERMIT" && test -x "$HELLO_RACE" && test -x "$HEAP_PTRS"
+"$HERMIT" --version
 ```
 
-## Install From Source
+The walkthrough uses debug artifacts for the validated record/replay path and
+source-resolved analyzer output; the release build remains available for normal
+use.
 
-Clone the maintained fork and install the CLI into Cargo's binary directory,
-normally `~/.cargo/bin`:
+These demos explicitly disable CPUID virtualization and PMU timer preemption
+so that the short examples also work on hosts without those features. CPUID is
+therefore a host input in these commands, and CPU-bound guests receive fewer
+preemption opportunities.
 
 ```bash
-git clone https://github.com/rrnewton/hermit.git
-cd hermit
-cargo install --path hermit-cli
-hermit --version
+run_hermit() {
+  "$HERMIT" --log=error run \
+    --base-env=minimal \
+    --no-virtualize-cpuid \
+    --preemption-timeout=disabled \
+    "$@"
+}
 ```
 
-To build without installing:
+## Deterministic Run
+
+### Basic Execution And Virtual Inputs
+
+Hermit preserves the guest's exit status and output:
 
 ```bash
-cargo build --workspace
-./target/debug/hermit --version
+run_hermit -- /bin/echo hello
 ```
 
-## Quick Start
-
-Run a command deterministically by placing `hermit run --` before it:
+Random bytes and wall-clock time are virtual guest inputs. Repeating either
+command produces identical output when the executable, arguments, inputs, and
+Hermit configuration are unchanged:
 
 ```bash
-hermit run -- /bin/echo hello
+for attempt in 1 2; do
+  run_hermit -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
+done
+
+for attempt in 1 2; do
+  run_hermit -- /bin/date +%s.%N
+done
 ```
 
-The `--` separator is recommended so arguments beginning with `-` are passed to
-the guest. The command above prints `hello` and exits with the guest's status.
+### Python Entropy And Hash Ordering
 
-Hermit's current defaults are strict and deterministic. `--strict` is retained
-as an explicit compatibility spelling for those defaults; it does not enable a
-stronger mode:
+This program observes three process-level entropy sources: random bytes,
+Python's randomized string hash, and hash-set iteration order. Native processes
+normally differ; the two Hermit executions match exactly.
 
 ```bash
-hermit run --strict -- /bin/echo hello
+export PYTHON="/usr/bin/python3"
+export PYTHON_DEMO='import os; print("random="+os.urandom(16).hex()); print("hash="+str(hash("hermit-demo"))); print("set="+",".join(set(["alpha","beta","gamma","delta","epsilon"])))'
+
+for attempt in 1 2; do
+  "$PYTHON" -c "$PYTHON_DEMO"
+done
+
+for attempt in 1 2; do
+  run_hermit -- "$PYTHON" -c "$PYTHON_DEMO" | tee "$DEMO_TMP/python-hermit-$attempt.txt"
+done
+cmp "$DEMO_TMP/python-hermit-1.txt" "$DEMO_TMP/python-hermit-2.txt"
 ```
 
-A quick determinism check is to run the same virtual random-data read twice:
+### Address Layout And Built-In Verification
+
+The heap-pointer guest shows stable addresses across separate Hermit runs:
 
 ```bash
-hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
-hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
+for attempt in 1 2; do
+  run_hermit -- "$HEAP_PTRS" | tee "$DEMO_TMP/heap-hermit-$attempt.txt"
+done
+cmp "$DEMO_TMP/heap-hermit-1.txt" "$DEMO_TMP/heap-hermit-2.txt"
 ```
 
-Both invocations should print the same bytes when the command, inputs, and
-Hermit configuration are unchanged.
-
-## Key Workflows
-
-| Goal | Command | Status |
-| --- | --- | --- |
-| Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Compares output, status, and deterministic logs |
-| Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
-| Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
-| Replay the latest recording | `hermit replay --autopilot` | Experimental |
-| Diagnose a concurrency failure | `hermit analyze --search -- PROGRAM` | Advanced, may run the guest many times |
-
-A minimal record/replay session is:
+`--verify` runs the guest twice and compares status, output, and Hermit's
+deterministic execution log:
 
 ```bash
-hermit record start -- /bin/echo recorded
-hermit replay --autopilot
+run_hermit --verify -- /bin/echo reproducible
 ```
 
-Record/replay is less broadly compatible than deterministic `run` mode. Keep
-the recording directory, executable, inputs, environment, and Hermit revision
-unchanged between phases.
+The guest must be idempotent. A first run that changes a file, database, cache,
+or external service can legitimately change the second run.
 
-## Compatibility
+## Record And Replay
 
-The following matrix summarizes unmodified host-binary testing on x86-64 Linux
-as of 2026-07-21. "Verified" describes the named probe, not every workflow a
-program supports. Run and record/replay results are intentionally separate.
-
-Some launch probes disabled CPUID virtualization and PMU preemption to match
-the test host's capabilities; the linked report records the exact flags.
-
-| Program or workload | Deterministic run | Record/replay | Scope |
-| --- | --- | --- | --- |
-| `/bin/echo` | Verified | Verified | Output and exit status match |
-| `ls`, `cat`, `grep`, `sed`, `awk`, `sort`, `wc` | Verified | Verified for tested file fixtures | Inputs must remain stable and visible in the guest |
-| `sh -c` shell built-ins | Verified | Verified | Child-process pipelines have additional limitations |
-| System Python 3 | Verified for `print` and tested file/JSON work | Verified for simple `print`; limited for complex imports and subprocesses | Some recording paths remain incomplete |
-| Node.js 16 | Verified for `console.log` | Limited; tested record/replay hangs | Basic launch works; this is not full Node compatibility |
-| OpenJDK 8 | Verified for `java -version` | Limited; replay hangs | Version probe only |
-| curl, wget, Git, GCC | Verified for version probes | Verified for version probes; functional workflows vary | External network and child-process behavior need separate testing |
-| SQLite | Verified for an in-memory query | Limited; replay diverges | Filesystem-event replay remains incomplete |
-
-See the full [arbitrary binary compatibility matrix](ai_docs/arbitrary-binary-matrix.md)
-for exact commands, host details, functional workloads, and linked issues.
-Compatibility evolves with syscall coverage, so validate the smallest real
-workload you depend on rather than relying on a version probe alone.
-
-## Performance
-
-Hermit's deterministic ptrace backend should generally be budgeted at roughly
-3-6x native wall-clock time. This is a planning range, not a benchmark promise:
-overhead varies with syscall frequency, thread count, PMU availability, and the
-amount of scheduling and logging enabled.
-
-`--strict` uses the normal deterministic defaults and has the same performance
-profile as a default run. Chaos, verify, record/replay, and analyze modes may
-perform multiple executions or retain additional events, so their total cost
-can be higher. Benchmark your actual workload on the deployment CPU and kernel.
-
-## Architecture
-
-Hermit has three main layers:
-
-1. The `hermit` CLI validates configuration and creates the guest namespaces,
-   mounts, environment, and process tree.
-2. Reverie uses ptrace and seccomp-assisted interception to stop and resume the
-   guest around subscribed syscalls and CPU events.
-3. Detcore applies deterministic policy: it virtualizes selected results,
-   serializes threads, models resources and logical time, and records or
-   replays external inputs.
-
-Linux still performs most operations. Hermit is a determinization layer, not a
-replacement kernel or sandbox. See the [architecture guide](docs/ARCHITECTURE.md)
-for the event lifecycle, state ownership, scheduler, resource model, virtual
-time, and record/replay design.
-
-## Troubleshooting
-
-Hosts and container runtimes commonly block namespaces, ptrace, seccomp, or
-`perf_event_open`. Start with:
+Create an isolated recording directory, record `/bin/echo`, inspect the
+recording, and replay it to completion:
 
 ```bash
-hermit run --namespace-only -- /bin/true
-hermit --log=info run --strace-only -- /bin/true
+export DEMO_DATA_DIR="$DEMO_TMP/recordings"
+mkdir -p "$DEMO_DATA_DIR"
+"$HERMIT" --log=error record start \
+  --data-dir="$DEMO_DATA_DIR" -- /bin/echo recorded
+"$HERMIT" record list --data-dir="$DEMO_DATA_DIR"
+"$HERMIT" record list --json --data-dir="$DEMO_DATA_DIR"
+"$HERMIT" --log=error replay --autopilot --data-dir="$DEMO_DATA_DIR"
 ```
 
-These are diagnostic modes and do not provide normal determinism. The
-[User Guide](docs/USER_GUIDE.md#troubleshooting) covers host setup, PMU access,
-program visibility, hangs, verification differences, and record/replay. The
-[Error Catalog](docs/ERROR_CATALOG.md) maps stable error text to causes and
-fixes.
+Hermit can also record and immediately verify a replay. This form deletes its
+temporary recording after a successful match:
 
-## Contributing
+```bash
+"$HERMIT" --log=error record start --verify \
+  --data-dir="$DEMO_TMP/verified-recording" -- /bin/echo verified-recording
+```
 
-Focused contributions are welcome. Before opening a pull request:
+### Replay Under GDB
 
-1. Fork the repository and create a branch from `main`.
-2. Add a focused regression test for behavior changes.
-3. Keep generated manifests and documentation consistent with the source.
-4. Run formatting and the broadest tests your Linux host supports:
+Without `--autopilot`, `hermit replay` starts a replay gdbserver and GDB client.
+The following noninteractive session connects, stops at the loader entry,
+continues the guest, and exits after `/bin/echo` completes:
 
-   ```bash
-   cargo fmt --all -- --check
-   cargo test -p AFFECTED_PACKAGE
-   cargo test --workspace
-   ```
+```bash
+timeout 90 "$HERMIT" --log=error replay \
+  --data-dir="$DEMO_DATA_DIR" \
+  --gdbex='set confirm off' \
+  --gdbex='set pagination off' \
+  --gdbex=continue
+```
 
-5. Document host-dependent skips or failures instead of weakening the test.
+For an interactive debugging session, omit the three `--gdbex` options and the
+external timeout. Keep the recording directory, executable, inputs, and Hermit
+revision unchanged between recording and replay.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the pull-request, CLA, issue, style,
-and licensing guidelines.
+## Chaos Concurrency Testing
 
-## More Documentation
+`hello_race` contains an intentional data race. Chaos mode makes scheduler
+choices with a seeded PRNG, so different seeds explore different interleavings
+and the same seed reproduces the same result.
 
-- [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
-- [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
-  record/replay internals.
-- [Error Catalog](docs/ERROR_CATALOG.md): errors, triggers, and remediations.
-- [Examples](examples/README.md): small programs demonstrating controlled
-  nondeterminism.
-- [License](LICENSE): BSD 3-Clause.
+```bash
+chaos_run() {
+  local seed="$1"
+  "$HERMIT" --log=error run \
+    --chaos \
+    --seed="$seed" \
+    --base-env=minimal \
+    --no-virtualize-cpuid \
+    --preemption-timeout=disabled \
+    --env=HERMIT_MODE=chaos \
+    -- "$HELLO_RACE"
+}
+```
+
+Seed 1 passes. Seed 0 reaches the antagonistic schedule and returns the guest's
+expected failure status; the shell assertion turns that expected failure into
+a successful demo step.
+
+```bash
+chaos_run 1
+
+if chaos_run 0; then
+  echo 'unexpected pass for seed 0' >&2
+  exit 1
+else
+  echo 'seed 0 reproduced the expected concurrency failure'
+fi
+```
+
+Surveying a small seed range finds both outcomes while retaining each run's
+output for inspection:
+
+```bash
+for seed in $(seq 0 15); do
+  if chaos_run "$seed" >"$DEMO_TMP/chaos-$seed.txt"; then
+    result=pass
+  else
+    result=fail
+  fi
+  printf 'seed=%s result=%s\n' "$seed" "$result"
+done
+```
+
+### Save And Replay A Failing Schedule
+
+A schedule artifact reproduces the exact observed failure without relying only
+on the seed. Both commands are expected to return the guest's failure status.
+
+```bash
+export CHAOS_SCHEDULE="$DEMO_ARTIFACTS/hello-race-schedule.json"
+
+if "$HERMIT" --log=error run \
+  --chaos --seed=0 \
+  --base-env=minimal \
+  --no-virtualize-cpuid \
+  --preemption-timeout=disabled \
+  --env=HERMIT_MODE=chaos \
+  --record-preemptions-to="$CHAOS_SCHEDULE" \
+  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-recorded.txt"; then
+  echo 'unexpected pass while recording the failing schedule' >&2
+  exit 1
+fi
+test -s "$CHAOS_SCHEDULE"
+
+if "$HERMIT" --log=error run \
+  --chaos \
+  --base-env=minimal \
+  --no-virtualize-cpuid \
+  --preemption-timeout=disabled \
+  --env=HERMIT_MODE=chaos \
+  --replay-preemptions-from="$CHAOS_SCHEDULE" \
+  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-replayed.txt"; then
+  echo 'unexpected pass while replaying the failing schedule' >&2
+  exit 1
+fi
+cmp "$DEMO_TMP/chaos-recorded.txt" "$DEMO_TMP/chaos-replayed.txt"
+```
+
+## Schedule Bisection
+
+`hermit analyze` first finds passing and failing schedules, then bisects their
+event streams to identify the ordering that changes the outcome. Build a debug
+copy of the guest so the final report can resolve source locations:
+
+```bash
+cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race
+export HELLO_RACE_DEBUG="$PWD/target/debug/hello_race"
+export ANALYSIS_REPORT="$DEMO_ARTIFACTS/hello-race-analysis.json"
+```
+
+The analysis is intentionally the slow finale: it runs the guest many times,
+requires PMU access, and can emit scheduler-desynchronization diagnostics while
+converging. A successful run ends with `Completed analysis successfully`.
+
+```bash
+timeout 600 "$HERMIT" analyze \
+  --run-arg=--base-env=host \
+  --report-file="$ANALYSIS_REPORT" \
+  --analyze-seed=0 \
+  --search -- \
+  --chaos --summary --preemption-timeout=400000 -- \
+  "$HELLO_RACE_DEBUG"
+
+"$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["header"]); print("critical events:", d["critical_event1"]["event_index"], d["critical_event2"]["event_index"])' "$ANALYSIS_REPORT"
+```
+
+On the verified host, the report identified two adjacent events in different
+`hello_race` threads and resolved both stacks to the intentional racy access in
+`flaky-tests/hello_race.rs`. Event numbers can vary with the binary and Hermit
+revision; the source-level diagnosis is the durable result.
+
+## Current High-Water Mark
+
+The following numbers describe the tested `rrnewton/hermit` main line used for
+this walkthrough. They are scoped evidence, not universal compatibility claims.
+
+- **Public Cargo inventory:** 333 discoverable tests, with 319 runnable by
+  default and 14 explicitly ignored slow or PMU-sensitive tests. The largest
+  packages are `hermit` (158 tests) and `detcore` (105 tests).
+- **Internal integration matrix:** Meta's Buck configuration contains more
+  than 700 guest/mode/rr combinations. It has not been fully ported to Cargo.
+- **Run-mode launch coverage:** static and dynamic ELF programs, shell, Python,
+  Node.js, OpenJDK, Go, curl, wget, Git, GCC, Make, direct Cargo, SQLite, and a
+  multithreaded signal workload have passed bounded probes.
+- **Functional application coverage:** a curl/Python loopback HTTP workflow
+  completed three out of three strict-mode runs with identical output and
+  status hashes. Git, nginx, and Redis functional experiments timed out
+  repeatably and are not claimed as supported workflows.
+- **Record/replay coverage:** exact record/replay succeeded for the checked
+  `echo`, `ls`, `cat`, `grep`, `sort`, and `wc` fixtures. More complex
+  subprocess, filesystem, network, JVM, and Node.js cases remain limited.
+
+See the [arbitrary-binary matrix](ai_docs/arbitrary-binary-matrix.md),
+[record/replay experiment](experiments/record-replay-matrix_20260721/README.md),
+and [wave-three application experiment](experiments/arbitrary-binary-wave3/README.md)
+for commands, host metadata, hashes, and failure details.
+
+## Scope And Next Steps
+
+- Keep file contents and mount layouts fixed, prefer a minimal environment,
+  and avoid external networking when asserting reproducibility.
+- Use PMU timer preemption when exploring CPU-bound races. The portable chaos
+  commands above still find this syscall-rich demo failure without it.
+- Treat version probes as launch coverage, not proof that every workflow of a
+  program works.
+- Benchmark the real workload; ptrace overhead varies with syscall frequency,
+  thread count, scheduling, and logging.
+
+For full option and troubleshooting coverage, continue with the
+[User Guide](docs/USER_GUIDE.md), [Architecture](docs/ARCHITECTURE.md), and
+[Error Catalog](docs/ERROR_CATALOG.md). Hermit is BSD-licensed; see
+[LICENSE](LICENSE).
