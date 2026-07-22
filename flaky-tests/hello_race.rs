@@ -42,7 +42,7 @@ fn do_work(iters: usize) -> u64 {
 }
 
 #[inline(never)]
-fn thread1(var: Arc<AtomicUsize>) {
+fn thread1(var: Arc<AtomicUsize>, done: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
     // Provide a little extra context so we can judge the accuracy of the pinpointing result.
     let fin = rdtsc(); // last intercepted instruction
@@ -54,10 +54,11 @@ fn thread1(var: Arc<AtomicUsize>) {
         var.store(11, SeqCst); // critical event
     }
     do_work(4 * WORK_AMT);
+    done.fetch_add(1, SeqCst);
 }
 
 #[inline(never)]
-fn thread2(var: Arc<AtomicUsize>) {
+fn thread2(var: Arc<AtomicUsize>, done: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
 
     // Provide a little extra context so we can judge the accuracy of the pinpointing result.
@@ -71,6 +72,7 @@ fn thread2(var: Arc<AtomicUsize>) {
     }
 
     do_work(4 * WORK_AMT);
+    done.fetch_add(1, SeqCst);
 }
 
 #[test]
@@ -82,13 +84,17 @@ fn run_test() {
     let d = Arc::new(AtomicUsize::new(1));
     let d1 = Arc::clone(&d);
     let d2 = Arc::clone(&d);
+    let done = Arc::new(AtomicUsize::new(0));
+    let done1 = Arc::clone(&done);
+    let done2 = Arc::clone(&done);
 
-    let h1 = std::thread::spawn(move || thread1(d1));
-    let h2 = std::thread::spawn(move || thread2(d2));
-    h1.join().unwrap();
-    h2.join().unwrap();
+    let _h1 = std::thread::spawn(move || thread1(d1, done1));
+    let _h2 = std::thread::spawn(move || thread2(d2, done2));
+    while done.load(SeqCst) != 2 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 
-    let val = Arc::try_unwrap(d).unwrap().into_inner();
+    let val = d.load(SeqCst);
     println!("Final value: {}", val);
     if val == 1 || val == 11 {
         println!("Antagonistic schedule reached, failing.");
