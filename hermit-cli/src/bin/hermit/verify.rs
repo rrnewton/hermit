@@ -153,3 +153,58 @@ fn display_diff(left: &str, right: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::Exited(status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    fn empty_logs() -> (TempPath, TempPath) {
+        let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
+        (left.into_temp_path(), right.into_temp_path())
+    }
+
+    #[test]
+    fn identical_outputs_verify_successfully() {
+        let left = output(0, b"hello\n", b"");
+        let right = left.clone();
+        let (log1, log2) = empty_logs();
+
+        assert_eq!(
+            compare_two_runs(&left, log1, &right, log2, "verified", "failed").unwrap(),
+            ExitStatus::Exited(0)
+        );
+    }
+
+    #[test]
+    fn stdout_stderr_and_status_mismatches_fail_verification() {
+        let baseline = output(0, b"hello\n", b"");
+        let mismatches = [
+            output(0, b"different\n", b""),
+            output(0, b"hello\n", b"different\n"),
+            output(1, b"hello\n", b""),
+        ];
+
+        for mismatch in mismatches {
+            let (log1, log2) = empty_logs();
+            let path1 = log1.to_path_buf();
+            let path2 = log2.to_path_buf();
+
+            assert!(
+                compare_two_runs(&baseline, log1, &mismatch, log2, "verified", "failed").is_err()
+            );
+
+            let _ = fs::remove_file(path1);
+            let _ = fs::remove_file(path2);
+        }
+    }
+}
