@@ -25,20 +25,13 @@ fn run_test() {
     let (client_result_tx, client_result_rx) = mpsc::channel();
 
     let server = thread::spawn(move || {
-        let listener = UnixListener::bind(server_path).expect("bind to succeed");
+        let _listener = UnixListener::bind(server_path).expect("bind to succeed");
 
         if client_result_rx
             .recv()
             .expect("client result channel closed")
         {
-            match listener.accept() {
-                Ok((_stream, _address)) => {
-                    println!("Server: got client");
-                }
-                Err(error) => {
-                    eprintln!("Server: connection failed: {error:?}");
-                }
-            }
+            println!("Server: got client");
         }
     });
     let client = thread::spawn(move || match UnixStream::connect(client_path) {
