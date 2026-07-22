@@ -184,6 +184,7 @@ fn workloads() -> &'static Workloads {
 
         let stable_c_sources = [
             ("getpid", "getpid.c"),
+            ("io_uring_fallback", "io_uring_fallback.c"),
             ("uname", "uname.c"),
             ("sysinfo", "sysinfo.c"),
             ("wait_on_child", "wait_on_child.c"),
