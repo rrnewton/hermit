@@ -26,6 +26,7 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
@@ -60,6 +61,10 @@ pub(crate) struct DetOptions {
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
+    /// Select the process instrumentation backend.
+    #[clap(long, value_enum, default_value_t)]
+    backend: Backend,
+
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
     #[clap(value_name = "PROGRAM")]
@@ -369,6 +374,9 @@ impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let dop = &self.det_opts.det_config;
 
+        if self.backend != Backend::default() {
+            write!(f, " --backend={}", self.backend.as_str())?;
+        }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
         }
@@ -481,6 +489,32 @@ fn display_runopts1() {
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+}
+
+#[test]
+fn backend_defaults_to_ptrace() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(ro.backend, Backend::Ptrace);
+    assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn backend_values_parse_and_round_trip() {
+    for (value, expected) in [
+        ("ptrace", Backend::Ptrace),
+        ("dbi", Backend::Dbi),
+        ("kvm", Backend::Kvm),
+    ] {
+        let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
+        ro.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(ro.backend, expected);
+        if expected == Backend::Ptrace {
+            assert_eq!(format!("{}", ro), " -- fakeprog");
+        } else {
+            assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
+        }
+    }
 }
 
 #[test]
@@ -600,6 +634,11 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
         "Disable deterministic I/O behavior",
+        "--backend <BACKEND>",
+        "Select the process instrumentation backend",
+        "ptrace",
+        "dbi",
+        "kvm",
     ] {
         assert!(
             help.contains(expected),
@@ -801,9 +840,19 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
+        if self.namespace_only && self.backend != Backend::Ptrace {
+            anyhow::bail!(
+                "--backend={} cannot be used with --namespace-only because namespace-only mode \
+                 bypasses instrumentation",
+                self.backend.as_str()
+            );
+        }
+        if !self.namespace_only {
+            self.backend.ensure_available()?;
+        }
         self.validate_mount_sources()?;
         self.validate_program()?;
-        if !self.namespace_only {
+        if !self.namespace_only && self.backend == Backend::Ptrace {
             validate_tracing_environment()?;
         }
         // });
@@ -821,7 +870,11 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        self.validate_args_with_perf_support(reverie_ptrace::is_perf_supported())
+        let perf_supported = match self.backend {
+            Backend::Ptrace => reverie_ptrace::is_perf_supported(),
+            Backend::Dbi | Backend::Kvm => true,
+        };
+        self.validate_args_with_perf_support(perf_supported)
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
@@ -1249,10 +1302,22 @@ impl RunOpts {
         self.save_config_to_disk()?;
 
         if capture_output {
-            let out = hermit::run_with_output(command, config, self.summary, &self.summary_json)?;
+            let out = hermit::run_with_output_backend(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+                self.backend,
+            )?;
             Ok((out.status, Some(out)))
         } else {
-            let status = hermit::run(command, config, self.summary, &self.summary_json)?;
+            let status = hermit::run_with_backend(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+                self.backend,
+            )?;
             Ok((status, None))
         }
     }
@@ -1280,7 +1345,13 @@ impl RunOpts {
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output(command, config, self.summary, &self.summary_json)
+        hermit::run_with_output_backend(
+            command,
+            config,
+            self.summary,
+            &self.summary_json,
+            self.backend,
+        )
     }
 }
 
