@@ -8,15 +8,11 @@
 
 //! System calls for dealing with the file system.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
-use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
@@ -37,7 +33,6 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::config::SchedHeuristic;
-use crate::detlog;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::record_or_replay::RecordOrReplay;
@@ -189,23 +184,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let mut local_buf: Vec<u8> = vec![0; call.len()];
-                guest
-                    .thread_state_mut()
-                    .thread_prng()
-                    .fill(local_buf.as_mut_slice());
-                let n = guest.memory().write(remote_buf, &local_buf)?;
-                if cfg!(debug_assertions) {
-                    let mut hasher = DefaultHasher::new();
-                    local_buf.hash(&mut hasher);
-                    detlog!(
-                        "[dtid {}] USER RAND [/dev/urandom] Filled guest memory with {} random bytes, hash of bytes: {}",
-                        guest.thread_state().dettid,
-                        n,
-                        hasher.finish()
-                    );
-                }
-                return Ok(call.len() as i64);
+                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                return Ok(n as i64);
             }
             FdType::Regular => {
                 if guest.config().deterministic_io {
