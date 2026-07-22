@@ -14,6 +14,7 @@ mod time;
 
 use std::path::PathBuf;
 
+pub(crate) use network::read_iovecs;
 use reverie::Errno;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -120,6 +121,7 @@ impl Tool for Recorder {
             Sysno::connect,
             Sysno::sendto,
             Sysno::sendmsg,
+            Sysno::recvmsg,
             Sysno::poll,
             Sysno::getsockopt,
             Sysno::getpeername,
@@ -196,6 +198,7 @@ impl Tool for Recorder {
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {

@@ -62,6 +62,7 @@ pub enum SyscallEvent {
     Timeofday((Timeval, Timezone)),
     Poll(PollEvent),
     SockOpt(SockOptEvent),
+    RecvMsg(RecvMsgEvent),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,4 +112,37 @@ pub struct SockOptEvent {
     /// The length of the value. If this is the same as `value.len()`, then
     /// no truncation of the value occurred.
     pub length: libc::socklen_t,
+}
+
+/// The outputs of a `recvmsg` syscall that must be reproduced during replay.
+///
+/// `recvmsg` scatters the received message across the caller's `msg_iov`
+/// buffers and, unlike `recvfrom`, can also fill in a source address
+/// (`msg_name`) and ancillary control data (`msg_control`, e.g. `SCM_RIGHTS`
+/// file-descriptor passing). The kernel only writes the fields captured here;
+/// every other field of the `msghdr` is a strict input supplied by the guest.
+///
+/// The recorded lengths are simply the vector lengths: `msg_namelen` is
+/// `name.len()`, `msg_controllen` is `control.len()`, and the return value is
+/// `data.len()`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RecvMsgEvent {
+    /// The received payload, gathered in order across the guest's `msg_iov`
+    /// scatter buffers. Its length equals the syscall's return value.
+    pub data: Vec<u8>,
+
+    /// The ancillary/control data written to `msg_control`, verbatim. This is
+    /// where `SCM_RIGHTS` control messages (passed file descriptors) live. It
+    /// is replayed byte-for-byte; any descriptor numbers it carries are only
+    /// meaningful because every later syscall on those descriptors is itself
+    /// replayed from the recording.
+    pub control: Vec<u8>,
+
+    /// The source address written to `msg_name`, verbatim. Empty when the
+    /// caller passed a NULL `msg_name` or a zero `msg_namelen`.
+    pub name: Vec<u8>,
+
+    /// The `msg_flags` the kernel reported back in the `msghdr` (e.g.
+    /// `MSG_TRUNC`, `MSG_CTRUNC`, `MSG_EOR`).
+    pub msg_flags: i32,
 }

@@ -198,6 +198,9 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            ("c_writev", "writev.c"),
+            ("c_sendmsg_recvmsg", "sendmsg_recvmsg.c"),
+            ("c_scm_rights", "scm_rights.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -268,6 +271,29 @@ fn record_replay_matrix() {
     for name in BASELINE_RECORD_WORKLOADS {
         record_replay(workload(name));
     }
+}
+
+/// Vectored write (`writev`) record/replay: three gathered segments must be
+/// reproduced byte-for-byte on the stdout stream.
+#[test]
+fn record_c_writev() {
+    run_record_replay("c_writev");
+}
+
+/// Scatter-gather socket messaging (`sendmsg`/`recvmsg`) record/replay over an
+/// AF_UNIX socketpair: the received payload must be scattered back across the
+/// caller's iovecs exactly as recorded.
+#[test]
+fn record_c_sendmsg_recvmsg() {
+    run_record_replay("c_sendmsg_recvmsg");
+}
+
+/// `recvmsg` ancillary control data (`SCM_RIGHTS`) record/replay: the control
+/// message buffer must be reconstructed so the receiver parses the same cmsg on
+/// replay. See `tests/c/scm_rights.c` for why the passed fd itself is not used.
+#[test]
+fn record_c_scm_rights() {
+    run_record_replay("c_scm_rights");
 }
 
 #[test]
