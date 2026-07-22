@@ -475,6 +475,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::close,
                 Sysno::read,
                 Sysno::pread64,
+                Sysno::lseek,
+                Sysno::fadvise64,
                 Sysno::mmap,
                 Sysno::munmap,
                 Sysno::mremap,
@@ -533,6 +535,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
+                Sysno::rseq,
+                Sysno::getpid,
+                Sysno::gettid,
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
@@ -1011,6 +1016,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Close(s) => self.handle_close(guest, s).await,
             Syscall::Read(s) => self.handle_read(guest, s).await,
             Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+            Syscall::Lseek(_) => self.passthrough(guest, call).await,
+            // This syscall is advisory; fixed success preserves its API contract.
+            Syscall::Fadvise64(_) => Ok(0),
             Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
             Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
             Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
@@ -1121,6 +1129,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
+            // Rseq exposes host CPU migration. Emulate a kernel without Rseq support.
+            _ if call.number() == Sysno::rseq => Err(Error::Errno(Errno::ENOSYS)),
+            // The guest PID namespace provides stable process and thread IDs.
+            Syscall::Getpid(_) => self.passthrough(guest, call).await,
+            Syscall::Gettid(_) => self.passthrough(guest, call).await,
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
