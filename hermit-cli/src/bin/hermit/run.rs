@@ -45,6 +45,7 @@ use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
+const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 
 // Just a place to put the clap(flatten) directive..
 #[derive(Debug, Parser, Clone)]
@@ -1143,6 +1144,14 @@ impl RunOpts {
         Ok(())
     }
 
+    fn effective_det_config(&self) -> DetConfig {
+        let mut config = self.det_opts.det_config.clone();
+        if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
+            config.panic_on_unsupported_syscalls = true;
+        }
+        config
+    }
+
     fn run_in_container(
         &self,
         global: &GlobalOpts,
@@ -1152,7 +1161,7 @@ impl RunOpts {
 
         let command = self.guest_command()?;
 
-        let config = self.det_opts.det_config.clone();
+        let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
         if capture_output {
@@ -1184,7 +1193,7 @@ impl RunOpts {
 
         let command = self.guest_command()?;
 
-        let config = self.det_opts.det_config.clone();
+        let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
         hermit::run_with_output(command, config, self.summary, &self.summary_json)
