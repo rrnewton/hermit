@@ -38,19 +38,22 @@ Expected layout:
 |-- main/
 |   |-- hermit/                 # Hermit primary; main; rebase base
 |   `-- reverie/                # Reverie primary; main; rebase base
-|-- ACTIVE.md                   # Hermit worktree assignments (source of truth)
-|-- ACTIVE_REVERIE.md           # Reverie worktree assignments
-|-- ARCHIVED.md                 # Hermit completed-slot history (append-only)
-|-- ARCHIVED_REVERIE.md         # Reverie completed-slot history (append-only)
-|-- worktrees/
+|-- worktrees/                  # Hermit worktree tree, self-contained
+|   |-- ACTIVE.md               # Hermit slot assignments (source of truth)
+|   |-- ARCHIVED.md             # Hermit completed-slot history (append-only)
 |   |-- slot01                  # direct Hermit worktree (feature branch)
 |   |-- slot02
 |   `-- slotNN
-`-- worktrees_reverie/
+`-- worktrees_reverie/          # Reverie worktree tree, self-contained
+    |-- ACTIVE.md               # Reverie slot assignments
+    |-- ARCHIVED.md             # Reverie completed-slot history (append-only)
     |-- slot01                  # direct Reverie worktree (feature branch)
     |-- slot02
     `-- slotNN
 ```
+
+Each `worktrees*` directory is self-contained: its own `ACTIVE.md` and
+`ARCHIVED.md` track the slots beside them.
 
 Hermit and Reverie worktrees are independent: a Hermit-only task uses a
 `worktrees/slotNN` checkout and leaves any matching `worktrees_reverie/slotNN`
@@ -69,13 +72,14 @@ dependency downloads and full rebuilds.
 A slot is in one of two states:
 
 - **Active**: checked out on a feature branch, owned by one agent/task, and
-  listed in the relevant `ACTIVE*.md`.
-- **Parked**: clean, detached at a recorded commit, absent from `ACTIVE*.md`,
+  listed in its `ACTIVE.md` (`worktrees/ACTIVE.md` for Hermit,
+  `worktrees_reverie/ACTIVE.md` for Reverie).
+- **Parked**: clean, detached at a recorded commit, absent from that `ACTIVE.md`,
   and available for reuse.
 
 Parking happens in place; do not `git worktree move` a slot. A detached slot is
 not abandoned work: its completed feature branch and commit SHA must already be
-recorded in the handoff and in `ARCHIVED*.md`.
+recorded in the handoff and in the sibling `ARCHIVED.md`.
 
 Creating slots is a coordinator operation. From the parent root, create a
 Hermit and/or Reverie slot from the primaries with the helper:
@@ -122,8 +126,9 @@ The coordinator assigns one free slot to exactly one agent. Before editing:
      -c <feature-branch> origin/main
    ```
 
-4. Record the slot, branch, task, and owner in the relevant `ACTIVE*.md` and in
-   the coordinator's task state before the first edit.
+4. Record the slot, branch, task, and owner in the slot's `ACTIVE.md`
+   (`worktrees/ACTIVE.md` or `worktrees_reverie/ACTIVE.md`) and in the
+   coordinator's task state before the first edit.
 
 Agents may read the primary checkouts, including their build artifacts, but
 they must run edits, formatting, builds, tests, and commits from their assigned
@@ -139,8 +144,9 @@ git -C ~/work/dev-hermit/worktrees/slot0X switch --detach HEAD
 ```
 
 The first command must produce no output. Record the feature branch name, exact
-HEAD SHA, validation performed, and landing status in `ARCHIVED*.md` and remove
-the slot's row from `ACTIVE*.md` before marking it free. Do not delete a feature
+HEAD SHA, validation performed, and landing status in the sibling `ARCHIVED.md`
+and remove the slot's row from its `ACTIVE.md` before marking it free. Do not
+delete a feature
 branch until its commit is reachable from fork `main` or the coordinator
 explicitly archives it.
 
