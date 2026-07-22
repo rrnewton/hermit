@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
@@ -31,6 +32,8 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::StatFamily;
 use tracing::info;
@@ -180,13 +183,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
-    fn procfs_self_exe_stat(&self) -> DetStat {
+    fn procfs_self_exe_stat(&self, follow_symlink: bool) -> DetStat {
         let epoch = Timespec {
             tv_sec: self.cfg.epoch.timestamp(),
             tv_nsec: self.cfg.epoch.timestamp_subsec_nanos() as i64,
         };
         DetStat {
-            mode: libc::S_IFREG | 0o555,
+            mode: if follow_symlink {
+                libc::S_IFREG | 0o555
+            } else {
+                libc::S_IFLNK | 0o777
+            },
             dev: 1,
             inode: 10_007,
             size: 0,
@@ -364,6 +371,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    async fn validate_procfs_openat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat2,
+    ) -> Result<OFlag, Error> {
+        // Preserve Linux's versioned open_how and path-resolution checks before synthesis.
+        // The validation descriptor is closed without ever becoming guest-visible.
+        let validation_fd = guest.inject_with_retry(Syscall::Openat2(call)).await? as RawFd;
+        guest
+            .inject_with_retry(Syscall::Close(
+                syscalls::Close::new().with_fd(validation_fd),
+            ))
+            .await?;
+
+        let how = call.how().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let raw_flags = i32::try_from(how.flags).map_err(|_| Errno::EINVAL)?;
+        OFlag::from_bits(raw_flags).ok_or_else(|| Errno::EINVAL.into())
+    }
+
     /// Openat2 system call.
     pub async fn handle_openat2<G: Guest<Self>>(
         &self,
@@ -372,22 +398,45 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let path = call.path().ok_or(Errno::EFAULT)?;
         let path: PathBuf = path.read(&guest.memory())?;
-        let how = call.how().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
-        let flags = OFlag::from_bits_truncate(how.flags as i32);
+        let lookup = self.procfs_lookup_at(guest, call.dirfd(), &path);
+        let non_procfs_flags = if lookup == ProcfsLookup::NotProcfs {
+            let how = call.how().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+            Some(OFlag::from_bits_truncate(how.flags as i32))
+        } else {
+            None
+        };
         let resource = ResourceID::Path(path.clone());
         let request = guest.thread_state().mk_request(resource, Permission::R);
         resource_request(guest, request).await;
 
-        let result = match self.procfs_lookup_at(guest, call.dirfd(), &path) {
-            ProcfsLookup::File(file) => self.open_procfs_file(guest, flags, file).await,
-            ProcfsLookup::SelfExe | ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
-            ProcfsLookup::NotProcfs => {
-                let result = self.record_or_replay(guest, call).await;
-                self.finish_open(guest, &path, flags, result).await
+        let result = if let Some(flags) = non_procfs_flags {
+            let result = self.record_or_replay(guest, call).await;
+            self.finish_open(guest, &path, flags, result).await
+        } else {
+            match self.validate_procfs_openat2(guest, call).await {
+                Ok(flags) => match lookup {
+                    ProcfsLookup::File(file) => self.open_procfs_file(guest, flags, file).await,
+                    ProcfsLookup::SelfExe | ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
+                    ProcfsLookup::NotProcfs => unreachable!(),
+                },
+                Err(error) => Err(error),
             }
         };
         resource_release_all(guest).await;
         result
+    }
+
+    /// statfs system call.
+    pub async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Statfs,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if self.procfs_lookup_at(guest, libc::AT_FDCWD, &path) != ProcfsLookup::NotProcfs {
+            return Err(Errno::ENOENT.into());
+        }
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// SYS_close system call.
@@ -871,12 +920,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.procfs_lookup_at(guest, dirfd, &path))
     }
 
+    fn stat_follows_symlinks(call: &StatFamily) -> bool {
+        match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            StatFamily::Lstat(_) => false,
+            StatFamily::Fstatat(call) => !call.flags().contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+            _ => true,
+        }
+    }
+
     /// Handles all stat syscalls.
     pub async fn handle_stat_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: StatFamily,
     ) -> Result<i64, Error> {
+        let follow_symlink = Self::stat_follows_symlinks(&call);
         match self.stat_procfs_lookup(guest, call)? {
             ProcfsLookup::File(file) => {
                 let statptr = call.stat().ok_or(Errno::EFAULT)?;
@@ -886,7 +945,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             ProcfsLookup::SelfExe => {
                 let statptr = call.stat().ok_or(Errno::EFAULT)?;
-                let stat: libc::stat = self.procfs_self_exe_stat().into();
+                let stat: libc::stat = self.procfs_self_exe_stat(follow_symlink).into();
                 guest.memory().write_value(statptr.0, &stat)?;
                 return Ok(0);
             }
@@ -927,7 +986,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             ProcfsLookup::SelfExe => {
                 let statptr = call.statx().ok_or(Errno::EFAULT)?;
-                let stat: libc::statx = self.procfs_self_exe_stat().into();
+                let follow_symlink = !call.flags().contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+                let stat: libc::statx = self.procfs_self_exe_stat(follow_symlink).into();
                 guest.memory().write_value(statptr.0, &stat)?;
                 return Ok(0);
             }
@@ -1023,6 +1083,35 @@ impl<T: RecordOrReplay> Detcore<T> {
             return result;
         }
         Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// faccessat2 system call (represented as a raw syscall by Reverie).
+    pub async fn handle_faccessat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        const VALID_FLAGS: i32 = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+        let mode = args.arg2 as i32;
+        let flags = args.arg3 as i32;
+        if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0 || flags & !VALID_FLAGS != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        if args.arg1 == 0 {
+            return Err(Errno::EFAULT.into());
+        }
+        let path = PathPtr::from_ptr(args.arg1 as *const libc::c_char)
+            .ok_or(Errno::EFAULT)?
+            .read(&guest.memory())?;
+        if let Some(result) =
+            Self::procfs_access_result(self.procfs_lookup_at(guest, args.arg0 as i32, &path), mode)
+        {
+            return result;
+        }
+        Ok(self
+            .record_or_replay(guest, Syscall::Other(Sysno::faccessat2, args))
+            .await?)
     }
 
     /// fcntl system call
