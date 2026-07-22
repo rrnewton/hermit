@@ -1,6 +1,6 @@
 # Updating the pinned Reverie revision
 
-Hermit depends on [Reverie](https://github.com/facebookexperimental/reverie) as
+Hermit depends on [Reverie](https://github.com/rrnewton/reverie) as
 a git dependency, pinned to a **specific commit** (`rev = "<hash>"`) rather than
 a moving `branch = "main"`. Pinning makes builds reproducible: when hermit's
 tests pass, the exact Reverie commit is recorded in the manifests (and is not
@@ -22,14 +22,14 @@ build. As of this writing the deps are:
 1. Pick the target commit and confirm it exists upstream:
 
    ```bash
-   with-proxy git ls-remote https://github.com/facebookexperimental/reverie.git refs/heads/main
+   with-proxy git ls-remote https://github.com/rrnewton/reverie.git refs/heads/main
    # or choose any specific commit hash you want to pin to
    ```
 
 2. Replace the hash everywhere (one `sed` keeps them in sync):
 
    ```bash
-   OLD=96693397ed60aa07c59ffeed4df3deed89b183e2
+   OLD=6981ac0a5f4463f051525fd294a3538b4516a44e
    NEW=<new-hash>
    grep -rl "$OLD" --include=Cargo.toml . | xargs sed -i "s/$OLD/$NEW/g"
    ```
