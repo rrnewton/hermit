@@ -48,6 +48,36 @@ use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_CPUID: libc::c_ulong = 0x1011;
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_CPUID: libc::c_ulong = 0x1012;
+const STRICT_CPUID_CAPABILITY_ERROR: &str = "CPUID faulting is unavailable: the arch_prctl(ARCH_GET_CPUID/ARCH_SET_CPUID) probe did not confirm support. On AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported, or use --no-strict.";
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_faulting_supported() -> bool {
+    // CPUID faulting is per-thread. Probe on a short-lived thread so no caller
+    // can execute with CPUID disabled, and verify SET by reading the state back.
+    std::thread::spawn(|| unsafe {
+        let initial = libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0 as libc::c_ulong);
+        if initial < 0
+            || libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0 as libc::c_ulong) < 0
+        {
+            return false;
+        }
+
+        let disabled = libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0 as libc::c_ulong) == 0;
+        let restored = libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 1 as libc::c_ulong) == 0;
+        disabled && restored
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpuid_faulting_supported() -> bool {
+    false
+}
 
 // Just a place to put the clap(flatten) directive..
 #[derive(Debug, Parser, Clone)]
@@ -76,19 +106,24 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. Unsupported syscalls panic instead of passing through to
-    /// the host kernel.
+    /// Require deterministic host capabilities. Unsupported syscalls panic instead of passing
+    /// through to the host kernel.
     #[clap(
         long,
         conflicts_with_all = [
             "no_sequentialize_threads",
             "no_deterministic_io",
+            "no_strict",
             "namespace_only",
             "strace_only",
             "allow_passthrough"
         ]
     )]
     strict: bool,
+
+    /// Allow unavailable host capabilities to fall back to best-effort behavior.
+    #[clap(long, conflicts_with = "strict")]
+    no_strict: bool,
 
     /// Disable deterministic sequential thread execution.
     #[clap(long)]
@@ -517,14 +552,14 @@ impl fmt::Display for RunOpts {
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
 #[test]
 fn backend_defaults_to_ptrace() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
     assert_eq!(ro.backend, None);
     assert_eq!(ro.selected_backend(), Backend::Ptrace);
     assert_eq!(format!("{}", ro), " -- fakeprog");
@@ -538,7 +573,7 @@ fn backend_values_parse_and_round_trip() {
         ("kvm", Backend::Kvm),
     ] {
         let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
-        ro.validate_args_with_perf_support(true).unwrap();
+        ro.validate_args_with_capabilities(true, true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
         assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
@@ -555,7 +590,7 @@ fn display_runopts2() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -571,7 +606,7 @@ fn display_runopts3() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
     assert_eq!(
         format!("{}", ro),
         " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 -- fakeprog arg1 arg2"
@@ -582,14 +617,14 @@ fn display_runopts3() {
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1");
 }
 
 #[test]
 fn allow_passthrough_is_explicit_and_round_trips() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
 
     assert!(ro.det_opts.det_config.allow_passthrough);
     assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");
@@ -598,11 +633,12 @@ fn allow_passthrough_is_explicit_and_round_trips() {
 #[test]
 fn strict_flag_preserves_deterministic_defaults() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+    ro.validate_args_with_capabilities(true, true).unwrap();
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
     assert!(ro.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert!(ro.det_opts.det_config.require_cpuid_interception);
     assert_eq!(
         format!("{}", ro),
         " --panic-on-unsupported-syscalls -- fakeprog"
@@ -631,7 +667,7 @@ fn strict_flag_rejects_determinism_opt_outs() {
 #[test]
 fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
-    opts.validate_args_with_perf_support(true).unwrap();
+    opts.validate_args_with_capabilities(true, true).unwrap();
 
     assert!(opts.no_namespace);
     assert_eq!(opts.network, NetworkingMode::Host);
@@ -645,13 +681,61 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
+fn strict_flag_rejects_namespace_only() {
+    let error = RunOpts::try_parse_from(["fakehermit", "--strict", "--namespace-only", "fakeprog"])
+        .unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let message = error.to_string();
+    assert!(message.contains("--strict"));
+    assert!(message.contains("--namespace-only"));
+}
+
+#[test]
+fn strict_flag_requires_cpuid_faulting_capability() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    let error = ro.validate_args_with_capabilities(true, false).unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("ARCH_GET_CPUID"));
+    assert!(message.contains("Linux 6.17+ upstream"));
+    assert!(message.contains("backported"));
+    assert!(message.contains("--no-strict"));
+}
+
+#[test]
+fn no_strict_flag_keeps_capability_fallbacks() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--no-strict", "fakeprog"]);
+    ro.validate_args_with_capabilities(true, true).unwrap();
+
+    assert!(!ro.det_opts.det_config.require_cpuid_interception);
+}
+
+#[test]
+fn strict_flag_rejects_disabling_cpuid_virtualization() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--strict",
+        "--no-virtualize-cpuid",
+        "fakeprog",
+    ]);
+    let error = ro.validate_args_with_capabilities(true, true).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--strict"));
+    assert!(message.contains("--no-virtualize-cpuid"));
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
+        "Require deterministic host capabilities",
         "Unsupported syscalls panic",
+        "--no-strict",
+        "best-effort behavior",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -674,7 +758,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
 #[test]
 fn display_runopts_without_perf_support() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
-    ro.validate_args_with_perf_support(false).unwrap();
+    ro.validate_args_with_capabilities(false, true).unwrap();
     assert_eq!(
         format!("{}", ro),
         " --preemption-timeout=disabled -- fakeprog arg1"
@@ -816,17 +900,27 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported = match self.selected_backend() {
+        let backend = self.selected_backend();
+        let perf_supported = match backend {
             Backend::Ptrace => reverie_ptrace::is_perf_supported(),
             Backend::Dbi | Backend::Kvm => true,
         };
-        self.validate_args_with_perf_support(perf_supported)
+        let cpuid_supported = match backend {
+            Backend::Ptrace => cpuid_faulting_supported(),
+            Backend::Dbi | Backend::Kvm => true,
+        };
+        self.validate_args_with_capabilities(perf_supported, cpuid_supported)
     }
 
-    fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+    fn validate_args_with_capabilities(
+        &mut self,
+        perf_supported: bool,
+        cpuid_supported: bool,
+    ) -> Result<(), Error> {
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = !self.no_namespace;
+        config.require_cpuid_interception = self.strict && !self.no_strict;
 
         if self.no_namespace {
             self.network = NetworkingMode::Host;
@@ -840,6 +934,15 @@ impl RunOpts {
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         config.panic_on_unsupported_syscalls |= self.strict;
+
+        if self.strict && !config.virtualize_cpuid {
+            anyhow::bail!(
+                "--strict cannot be combined with --no-virtualize-cpuid; strict mode requires CPUID interception"
+            );
+        }
+        if config.require_cpuid_interception && !cpuid_supported {
+            anyhow::bail!(STRICT_CPUID_CAPABILITY_ERROR);
+        }
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {

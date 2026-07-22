@@ -108,6 +108,16 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+const STRICT_CPUID_INTERCEPTION_ERROR: &str = "CPUID interception setup failed after the host capability probe. Verify arch_prctl(ARCH_GET_CPUID) support; on AMD hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported, or use --no-strict.";
+
+fn ensure_strict_cpuid_interception(required: bool, available: bool) -> Result<(), Error> {
+    if required && !available {
+        return Err(anyhow::anyhow!(STRICT_CPUID_INTERCEPTION_ERROR).into());
+    }
+
+    Ok(())
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn passthrough<G: Guest<Self>>(
         &self,
@@ -880,6 +890,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         assert_eq!(new_dettid, guest.thread_state().dettid);
 
         if guest.is_root_thread() {
+            ensure_strict_cpuid_interception(
+                self.cfg.require_cpuid_interception,
+                guest.has_cpuid_interception(),
+            )?;
+
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -1286,5 +1301,23 @@ mod release_subscription_tests {
                 "missing {syscall} subscription"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_cpuid_requires_interception() {
+        let error = ensure_strict_cpuid_interception(true, false)
+            .expect_err("strict mode must reject missing CPUID interception");
+        assert_eq!(error.to_string(), STRICT_CPUID_INTERCEPTION_ERROR);
+    }
+
+    #[test]
+    fn cpuid_interception_fallback_remains_available() {
+        assert!(ensure_strict_cpuid_interception(false, false).is_ok());
+        assert!(ensure_strict_cpuid_interception(true, true).is_ok());
     }
 }
