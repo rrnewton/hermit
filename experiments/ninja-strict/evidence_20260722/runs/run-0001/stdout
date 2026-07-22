@@ -1,5 +1,5 @@
-Note: Google Test filter = -SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLogTest.*
-[==========] Running 378 tests from 28 test suites.
+Note: Google Test filter = -SubprocessTest.*
+[==========] Running 397 tests from 30 test suites.
 [----------] Global test environment set-up.
 [----------] 5 tests from CanonicalizePath
 [ RUN      ] CanonicalizePath.PathSamples
@@ -430,6 +430,27 @@ Note: Google Test filter = -SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLo
 [       OK ] DyndepParserTest.MultipleEdges (0 ms)
 [----------] 42 tests from DyndepParserTest (45 ms total)
 
+[----------] 9 tests from DiskInterfaceTest
+[ RUN      ] DiskInterfaceTest.StatMissingFile
+[       OK ] DiskInterfaceTest.StatMissingFile (0 ms)
+[ RUN      ] DiskInterfaceTest.StatMissingFileWithCache
+[       OK ] DiskInterfaceTest.StatMissingFileWithCache (0 ms)
+[ RUN      ] DiskInterfaceTest.StatBadPath
+[       OK ] DiskInterfaceTest.StatBadPath (0 ms)
+[ RUN      ] DiskInterfaceTest.StatExistingFile
+[       OK ] DiskInterfaceTest.StatExistingFile (0 ms)
+[ RUN      ] DiskInterfaceTest.StatExistingDir
+[       OK ] DiskInterfaceTest.StatExistingDir (0 ms)
+[ RUN      ] DiskInterfaceTest.ReadFile
+[       OK ] DiskInterfaceTest.ReadFile (1 ms)
+[ RUN      ] DiskInterfaceTest.MakeDirs
+[       OK ] DiskInterfaceTest.MakeDirs (0 ms)
+[ RUN      ] DiskInterfaceTest.RemoveFile
+[       OK ] DiskInterfaceTest.RemoveFile (0 ms)
+[ RUN      ] DiskInterfaceTest.RemoveDirectory
+[       OK ] DiskInterfaceTest.RemoveDirectory (0 ms)
+[----------] 9 tests from DiskInterfaceTest (14 ms total)
+
 [----------] 4 tests from StatTest
 [ RUN      ] StatTest.Simple
 [       OK ] StatTest.Simple (0 ms)
@@ -813,6 +834,29 @@ Note: Google Test filter = -SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLo
 [       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOnlySecondaryOutput (0 ms)
 [----------] 6 tests from BuildWithQueryDepsLogTest (11 ms total)
 
+[----------] 10 tests from BuildWithDepsLogTest
+[ RUN      ] BuildWithDepsLogTest.Straightforward
+[       OK ] BuildWithDepsLogTest.Straightforward (1 ms)
+[ RUN      ] BuildWithDepsLogTest.ObsoleteDeps
+[       OK ] BuildWithDepsLogTest.ObsoleteDeps (1 ms)
+[ RUN      ] BuildWithDepsLogTest.DepsIgnoredInDryRun
+[       OK ] BuildWithDepsLogTest.DepsIgnoredInDryRun (0 ms)
+[ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceCondition
+[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceCondition (2 ms)
+[ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile
+[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile (2 ms)
+[ RUN      ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog
+[       OK ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog (1 ms)
+[ RUN      ] BuildWithDepsLogTest.DepFileOKDepsLog
+[       OK ] BuildWithDepsLogTest.DepFileOKDepsLog (1 ms)
+[ RUN      ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged
+[       OK ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged (3 ms)
+[ RUN      ] BuildWithDepsLogTest.RestatMissingDepfileDepslog
+[       OK ] BuildWithDepsLogTest.RestatMissingDepfileDepslog (14 ms)
+[ RUN      ] BuildWithDepsLogTest.ValidationThroughDepfile
+[       OK ] BuildWithDepsLogTest.ValidationThroughDepfile (2 ms)
+[----------] 10 tests from BuildWithDepsLogTest (43 ms total)
+
 [----------] 10 tests from BuildLogTest
 [ RUN      ] BuildLogTest.WriteRead
 [       OK ] BuildLogTest.WriteRead (1 ms)
@@ -842,5 +886,5 @@ Note: Google Test filter = -SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLo
 [----------] 1 test from BuildLogRecompactTest (9 ms total)
 
 [----------] Global test environment tear-down
-[==========] 378 tests from 28 test suites ran. (2116 ms total)
-[  PASSED  ] 378 tests.
+[==========] 397 tests from 30 test suites ran. (2176 ms total)
+[  PASSED  ] 397 tests.
