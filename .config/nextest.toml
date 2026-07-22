@@ -28,31 +28,6 @@ path = "junit.xml"
 [test-groups.hermit-serialized]
 max-threads = 1
 
-# PMU-backed Detcore tests share per-host performance-counter resources and can
-# deadlock when separate nextest processes run them concurrently.
-[test-groups.detcore-hardware-serialized]
-max-threads = 1
-
 [[profile.default.overrides]]
-filter = '''
-package(=hermit) & kind(=test) & (
-    binary(=arbitrary_binaries) |
-    binary(=clock_determinism) |
-    binary(=epoll_determinism) |
-    binary(=hermit_modes) |
-    binary(=mmap_determinism) |
-    binary(=record_replay) |
-    binary(=signal_determinism) |
-    binary(=stress_suite)
-)'''
+filter = "package(=hermit) & kind(=test)"
 test-group = "hermit-serialized"
-
-[[profile.default.overrides]]
-filter = '''
-package(=detcore) & kind(=test) & (
-    binary(=tests_misc) |
-    binary(=tests_parallelism) |
-    binary(=tests_time)
-)
-'''
-test-group = "detcore-hardware-serialized"
