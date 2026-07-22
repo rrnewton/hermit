@@ -317,6 +317,13 @@ run_check "Hermit analyze scenarios" \
     cargo test -p hermit --test analyze -- --ignored
 run_check "Schedule search E2E (requires PMU)" \
     ./tests/util/hermit_analyze_e2e.sh
+# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
+if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+    run_check "rr syscall suite" \
+        cargo test -p hermit --test rr_suite -- --ignored
+else
+    echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
+fi
 
 wait_for_background_checks
 print_summary
