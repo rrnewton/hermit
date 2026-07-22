@@ -32,6 +32,7 @@ use reverie::process::Mount;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
@@ -119,12 +120,22 @@ pub struct RunOpts {
     namespace_only: bool,
 
     /// Run syscall interception directly on the host without creating Linux namespaces or
-    /// mounting an isolated `/tmp`. This reduces isolation and determinism, but allows Hermit to
-    /// run where namespace or mount operations are unavailable.
+    /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
+    /// guests. Host process, filesystem, and network state are shared, reducing determinism.
+    /// Schedule and preemption replay require stable namespace PIDs and are not supported.
     #[clap(
         long,
         visible_alias = "core-only",
-        conflicts_with_all = ["mount", "bind", "namespace_only", "analyze_networking"]
+        conflicts_with_all = [
+            "mount",
+            "bind",
+            "network",
+            "tmp",
+            "namespace_only",
+            "analyze_networking",
+            "replay_schedule_from",
+            "replay_preemptions_from"
+        ]
     )]
     no_namespace: bool,
 
@@ -544,20 +555,15 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
-fn no_namespace_forces_host_resources_and_disables_uts_assumption() {
-    let mut opts = RunOpts::parse_from([
-        "fakehermit",
-        "--core-only",
-        "--network=local",
-        "--tmp=/tmp/ignored",
-        "fakeprog",
-    ]);
+fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
     opts.validate_args_with_perf_support(true);
 
     assert!(opts.no_namespace);
     assert_eq!(opts.network, NetworkingMode::Host);
     assert_eq!(opts.tmp.as_deref(), Some(Path::new(TMP_DIR)));
     assert!(!opts.det_opts.det_config.has_uts_namespace);
+    assert!(opts.pin_threads);
     assert_eq!(
         format!("{}", opts),
         " --network=host --no-namespace --tmp=/tmp -- fakeprog"
@@ -609,9 +615,10 @@ impl RunOpts {
 
         if self.no_namespace {
             eprintln!(
-                "WARNING: --no-namespace disables PID, UTS, mount, and network namespace \
-                 isolation and uses the host filesystem and /tmp; PID/proc/filesystem-sensitive \
-                 programs may be less deterministic."
+                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
+                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
+                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
+                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
             );
         }
 
@@ -726,7 +733,11 @@ impl RunOpts {
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         if self.no_namespace {
-            return self.run_in_container(global, capture_output);
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            return with_container(&mut process, || {
+                self.run_in_container(global, capture_output)
+            });
         }
 
         let tmpfs = self.tmpfs()?;
@@ -867,6 +878,7 @@ impl RunOpts {
             // Verify initializes a process-global tracing subscriber for each run. Keep a plain
             // child-process boundary between runs, but do not configure any namespaces or mounts.
             let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
             let mut log_file = Some(log_file);
             return with_container(&mut process, || {
                 self.run_verify_in_container(&mut log_file, global)

@@ -8,6 +8,9 @@
 
 use std::process::Command;
 use std::process::Output;
+use std::sync::Mutex;
+
+static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hermit"))
@@ -102,6 +105,11 @@ fn no_namespace_rejects_container_only_options() {
         "--analyze-networking",
         "--mount=type=bind,source=/tmp,target=/tmp",
         "--bind=/tmp",
+        "--network=local",
+        "--network=host",
+        "--tmp=/tmp/custom",
+        "--replay-schedule-from=/tmp/schedule.json",
+        "--replay-preemptions-from=/tmp/preemptions.json",
     ];
 
     for incompatible in cases {
@@ -131,6 +139,7 @@ fn no_namespace_rejects_container_only_options() {
 
 #[test]
 fn no_namespace_runs_without_container_setup() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
     let args = [
         "run",
         "--no-namespace",
@@ -152,6 +161,37 @@ fn no_namespace_runs_without_container_setup() {
         stderr.contains("less deterministic"),
         "unexpected stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn no_namespace_preserves_affinity_for_run_and_verify() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+
+    let run_args = [
+        "run",
+        "--no-namespace",
+        "--pin-threads",
+        "--preemption-timeout=disabled",
+        "--",
+        "/usr/bin/nproc",
+    ];
+    let output = hermit(&run_args);
+    assert_success(&output, &run_args);
+    assert_eq!(stdout(&output), "1\n");
+
+    let verify_args = [
+        "run",
+        "--no-namespace",
+        "--verify",
+        "--pin-threads",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/sh",
+        "-c",
+        "test $(nproc) -eq 1",
+    ];
+    let output = hermit(&verify_args);
+    assert_success(&output, &verify_args);
 }
 
 #[test]
