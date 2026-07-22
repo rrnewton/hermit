@@ -465,6 +465,12 @@ rr_test!(rr_signal_unstoppable, "signal_unstoppable", 0, &[]);
 rr_test!(rr_signalfd, "signalfd", 0, &[]);
 rr_test!(rr_sigprocmask, "sigprocmask", 0, &[]);
 rr_test!(rr_sigprocmask_evil, "sigprocmask_evil", 0, &[]);
+rr_test!(
+    rr_sigprocmask_in_syscallbuf_sighandler,
+    "sigprocmask_in_syscallbuf_sighandler",
+    0,
+    &[]
+);
 rr_test!(rr_sigprocmask_syscallbuf, "sigprocmask_syscallbuf", 0, &[]);
 rr_test!(rr_sigpwr, "sigpwr", 0, &[]);
 rr_test!(rr_sigqueueinfo, "sigqueueinfo", 0, &[]);
