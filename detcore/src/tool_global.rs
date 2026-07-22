@@ -844,23 +844,13 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-<<<<<<< HEAD
     async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
-        // Invariant: will only be called when sequentialize-threads is on.
-        assert!(self.cfg.sequentialize_threads);
-        self.sched
-            .lock()
-            .unwrap()
-            .logically_kill_thread(&dettid, &detpid, mm);
-=======
-    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid) {
         if self.cfg.sequentialize_threads {
             self.sched
                 .lock()
                 .unwrap()
-                .logically_kill_thread(&dettid, &detpid);
+                .logically_kill_thread(&dettid, &detpid, mm);
         }
->>>>>>> origin/pr/35
         trace!(
             "[detcore, dtid {}] thread deregistered (scheduler cleanup: {}).",
             dettid, self.cfg.sequentialize_threads,
@@ -1416,32 +1406,17 @@ pub async fn deregister_thread<R>(
 ) where
     R: GlobalRPC<GlobalState>,
 {
-<<<<<<< HEAD
-    if cfg.sequentialize_threads {
-        // TODO: void_send_rpc
-        let resp = reverie
-            .send_rpc((
-                threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm),
-            ))
-            .await;
-        // We can't update the thread time here.  But it's dead anyway!
-        match resp.1 {
-            GlobalResponse::DeregisterThread(x) => x,
-            _ => unreachable!(),
-        }
-=======
     // TODO: void_send_rpc
     let resp = reverie
         .send_rpc((
             threads_time,
-            GlobalRequest::DeregisterThread(dettid, detpid),
+            GlobalRequest::DeregisterThread(dettid, detpid, mm),
         ))
         .await;
+    // We cannot update the thread time here, but the thread is dead anyway.
     match resp.1 {
         GlobalResponse::DeregisterThread(x) => x,
         _ => unreachable!(),
->>>>>>> origin/pr/35
     }
 }
 
