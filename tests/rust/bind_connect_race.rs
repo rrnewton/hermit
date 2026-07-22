@@ -6,8 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io::ErrorKind;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::thread;
 
 use tempfile::tempdir;
@@ -19,33 +21,46 @@ use tempfile::tempdir;
 fn run_test() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("sock");
-    let p2 = path.clone();
+    let server_path = path.clone();
+    let client_path = path.clone();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
 
-    let _t1 = thread::spawn(move || {
-        let listener = UnixListener::bind(p2).expect("bind to succeed");
+    let server = thread::spawn(move || {
+        let listener = UnixListener::bind(server_path).expect("bind to succeed");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking to succeed");
 
-        if let Some(stream) = listener.incoming().next() {
-            match stream {
-                Ok(_stream) => {
-                    /* connection succeeded */
+        loop {
+            match listener.accept() {
+                Ok((_stream, _address)) => {
                     println!("Server: got client");
+                    return;
                 }
-                Err(err) => {
-                    /* connection failed */
-                    eprintln!("Server: connection failed: {:?}", err);
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if cancel_rx.try_recv().is_ok() {
+                        return;
+                    }
+                    thread::yield_now();
+                }
+                Err(error) => {
+                    eprintln!("Server: connection failed: {error:?}");
+                    return;
                 }
             }
         }
     });
-    let t2 = thread::spawn(move || {
-        if let Ok(_stream) = UnixStream::connect(path) {
+    let client = thread::spawn(move || {
+        if let Ok(_stream) = UnixStream::connect(client_path) {
             eprintln!("Client: connection succeeded..");
         } else {
             eprintln!("Client: connection failed.");
         }
     });
 
-    t2.join().expect("client to be ok");
+    client.join().expect("client to be ok");
+    cancel_tx.send(()).ok();
+    server.join().expect("server to be ok");
 }
 
 fn main() {
