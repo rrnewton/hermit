@@ -657,6 +657,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// ioctl system call
+    pub async fn handle_ioctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ioctl,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        let cloexec = match call.request() {
+            syscalls::ioctl::Request::FIOCLEX => Some(true),
+            syscalls::ioctl::Request::FIONCLEX => Some(false),
+            _ => None,
+        };
+
+        let result = self.record_or_replay(guest, call).await?;
+        if let Some(enabled) = cloexec {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_cloexec(enabled))?;
+        }
+        Ok(result)
+    }
+
     /// dup system call.
     pub async fn handle_dup<G: Guest<Self>>(
         &self,
