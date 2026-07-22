@@ -61,19 +61,18 @@ jobs:
     - uses: actions/checkout@v3
     - name: Dependencies
       run: |
-        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma).
-        # A Go toolchain is OPTIONAL: hermit-cli/tests/arbitrary_binaries.rs skips
-        # the `go` tool when the binary is absent, so no test needs it. The
-        # self-hosted runner has apt (no dnf) but cannot locate `golang-go`, which
-        # previously failed the whole job. Install the required libs and treat Go
-        # as best-effort so a missing golang package no longer blocks CI.
+        # libunwind + lzma are required for linking. Go builds the mandatory
+        # goroutine scheduling determinism fixture.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y libunwind-devel xz-devel
-          sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
+          sudo dnf install -y libunwind-devel xz-devel golang
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
-          sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
+          sudo apt-get update
+          sudo apt-get install -y libunwind-dev liblzma-dev golang-go
+        else
+          echo "::error::No supported package manager; cannot install test dependencies."
+          exit 1
         fi
+        go version
     - name: CPUID and RDRAND/RDSEED tests
       run: |
         cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
