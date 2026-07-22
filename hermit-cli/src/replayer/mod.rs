@@ -181,7 +181,11 @@ impl Replayer {
     fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let debug_event = guest.thread_state_mut().next_debug_event().unwrap();
 
-        if debug_event.syscall() == syscall {
+        // Compare with arity awareness: argument registers beyond a syscall's
+        // ABI arity hold caller-leftover garbage that differs between record and
+        // replay, so a raw `==` would produce false desync positives on any 2-
+        // or 3-argument syscall (see `syscall_arity`).
+        if crate::syscall_arity::syscalls_match(debug_event.syscall(), syscall) {
             return;
         }
 
