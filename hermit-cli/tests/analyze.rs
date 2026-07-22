@@ -15,12 +15,10 @@
 //! printed, optionally blaming a specific source line.
 //!
 //! The search bisects over chaos schedules and relies on PMU branch counters
-//! plus working user/mount namespaces, so the tests are `#[ignore]`d by default
-//! (like the `chaos_buck_*` cases in `hermit_modes.rs`) and are exercised
-//! explicitly by `validate.sh`. Run them with:
+//! plus working user/mount namespaces. Run them with:
 //!
 //! ```text
-//! cargo test -p hermit --test analyze -- --ignored
+//! cargo test -p hermit --test analyze -- --test-threads=1
 //! ```
 
 use std::fs;
@@ -176,7 +174,6 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
 }
 
 #[test]
-#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_hello_race() {
     run_analyze(
         "analyze hello_race",
@@ -187,7 +184,6 @@ fn analyze_hello_race() {
 }
 
 #[test]
-#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_racewrite_nostdlib() {
     run_analyze(
         "analyze racewrite_nostdlib",
@@ -204,7 +200,6 @@ fn analyze_racewrite_nostdlib() {
 }
 
 #[test]
-#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_nanosleep_threads_nocrash() {
     run_analyze(
         "analyze nanosleep-threads-nocrash",

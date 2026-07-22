@@ -1,0 +1,16 @@
+diff --git a/src/test.cc b/src/test.cc
+index f9bb85a..e5bda03 100644
+--- a/src/test.cc
++++ b/src/test.cc
+@@ -228,3 +228,11 @@ void ScopedTempDir::Cleanup() {
++  // Hermit gives each strict test run a private temporary filesystem. Avoid
++  // spawning rm during fixture teardown so otherwise in-process tests do not
++  // require subprocess support.
++  if (getenv("NINJA_TEST_KEEP_TEMP_DIRS")) {
++    temp_dir_name_.clear();
++    return;
++  }
++
+ #ifdef _WIN32
+   string command = "rmdir /s /q " + temp_dir_name_;
+ #else

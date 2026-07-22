@@ -201,7 +201,6 @@ fn count_exposures(category: &str, threads: usize, seeds: std::ops::Range<u64>) 
 }
 
 #[test]
-#[ignore = "explicit fast stress tier"]
 fn fast_chaos_matrix() {
     let _guard = hermit_run_lock();
     for category in FAST_CATEGORIES {
@@ -238,7 +237,6 @@ fn fast_chaos_matrix() {
 }
 
 #[test]
-#[ignore = "explicit slow stress tier"]
 fn slow_race_matrix() {
     let _guard = hermit_run_lock();
     for category in ["producer-consumer", "condvar-lost-wakeup"] {
@@ -289,8 +287,11 @@ fn cas_replay_command(seed: u64, schedule: &Path) -> Command {
 }
 
 #[test]
-#[ignore = "explicit PMU-dependent slow stress tier"]
 fn slow_cas_search_and_replay() {
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: slow_cas_search_and_replay requires accessible PMU hardware counters"
+    );
     let _guard = hermit_run_lock();
     let schedules = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create CAS schedule directory");

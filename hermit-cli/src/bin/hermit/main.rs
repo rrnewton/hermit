@@ -145,4 +145,32 @@ mod tests {
 
         assert!(matches!(args.command, Subcommand::Replay(_)));
     }
+
+    #[test]
+    fn record_accepts_a_positive_timeout() {
+        Args::try_parse_from([
+            "hermit",
+            "record",
+            "start",
+            "--record-timeout=1",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn record_rejects_a_zero_timeout() {
+        assert!(
+            Args::try_parse_from([
+                "hermit",
+                "record",
+                "start",
+                "--record-timeout=0",
+                "--",
+                "/bin/true",
+            ])
+            .is_err()
+        );
+    }
 }

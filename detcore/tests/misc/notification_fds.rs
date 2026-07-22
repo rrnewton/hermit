@@ -11,7 +11,9 @@ const RUNS: usize = 5;
 const MAX_ATTEMPTS: usize = 100_000;
 
 fn run_five_times(guest: fn()) {
+    let _guard = super::detcore_test_lock();
     let config = Config {
+        allow_passthrough: true,
         sequentialize_threads: true,
         preemption_timeout: None,
         ..Default::default()
