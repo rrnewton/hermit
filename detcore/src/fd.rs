@@ -221,7 +221,11 @@ impl DetFd {
         self.fd_flags = if enabled { OFlag::O_CLOEXEC.bits() } else { 0 };
     }
 
-    /// Update nonblocking status for every alias of this open file description.
+    /// Update both the logical (guest-visible) and physical (scheduler)
+    /// nonblocking status for every alias of this open file description. Use this
+    /// only when the physical fd genuinely tracks the guest's request; when
+    /// Detcore forces the fd physically nonblocking for the scheduler, update the
+    /// logical view alone via [`Self::set_logical_nonblocking`].
     pub fn set_nonblocking(&self, enabled: bool) {
         let mut description = self.description();
         if enabled {
@@ -230,6 +234,19 @@ impl DetFd {
             description.status_flags &= !OFlag::O_NONBLOCK.bits();
         }
         description.physically_nonblocking = enabled;
+    }
+
+    /// Update only the logical (guest-visible) O_NONBLOCK status flag, leaving
+    /// the physical (scheduler) nonblocking state untouched. This lets a guest
+    /// clear O_NONBLOCK while Detcore keeps the fd physically nonblocking, which
+    /// the scheduler relies on for nonblockize-and-retry.
+    pub fn set_logical_nonblocking(&self, enabled: bool) {
+        let mut description = self.description();
+        if enabled {
+            description.status_flags |= OFlag::O_NONBLOCK.bits();
+        } else {
+            description.status_flags &= !OFlag::O_NONBLOCK.bits();
+        }
     }
 
     /// Stable identity shared by dup and fork aliases.
@@ -345,6 +362,34 @@ mod tests {
             !original.is_nonblocking(),
             "status flag changes through one alias must be visible through every alias"
         );
+    }
+
+    #[test]
+    fn clearing_logical_nonblocking_preserves_physical() {
+        // Models a FIONBIO(0) clear on an fd that Detcore forced physically
+        // nonblocking for the scheduler: the guest-visible flag clears, but the
+        // physical (scheduler) state must survive.
+        let owner = DetTid::from_raw(10);
+        let fd = DetFd::new(3, OFlag::empty(), FdType::Socket, OpenFileId::new(owner, 0));
+        fd.set_physically_nonblocking();
+        fd.set_logical_nonblocking(true);
+        assert!(fd.is_nonblocking());
+        assert!(fd.physically_nonblocking());
+
+        fd.set_logical_nonblocking(false);
+        assert!(
+            !fd.is_nonblocking(),
+            "the guest must observe O_NONBLOCK cleared"
+        );
+        assert!(
+            fd.physically_nonblocking(),
+            "the scheduler's physical nonblocking state must be preserved"
+        );
+
+        // The both-flags setter still tracks physical alongside logical.
+        fd.set_nonblocking(false);
+        assert!(!fd.is_nonblocking());
+        assert!(!fd.physically_nonblocking());
     }
 
     #[test]
