@@ -6,132 +6,100 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Deterministic snapshots for volatile procfs files.
+//! Minimal deterministic procfs exposed to guest programs.
 
+use std::path::Component;
 use std::path::Path;
 
-use serde::Deserialize;
-use serde::Serialize;
+const MAPS: &[u8] = b"00400000-00401000 r-xp 00000000 00:00 0 [hermit]\n";
+const STAT: &[u8] = b"1 (hermit) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+const STATUS: &[u8] = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nThreads:\t1\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n";
+const CMDLINE: &[u8] = b"hermit-guest\0";
+const CPUINFO: &[u8] = b"processor\t: 0\nvendor_id\t: Hermit\nmodel name\t: Hermit Virtual CPU\ncpu MHz\t\t: 0.000\ncpu cores\t: 1\nsiblings\t: 1\nflags\t\t:\n";
+const ENTROPY_AVAILABLE: &[u8] = b"256\n";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum ProcfsKind {
+/// A file in Hermit's deliberately small virtual procfs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcfsFile {
+    Maps,
     Stat,
     Status,
+    Cmdline,
     Cpuinfo,
-}
-
-/// State for a procfs file whose volatile fields require normalization.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ProcfsFile {
-    kind: ProcfsKind,
-    contents: Option<Vec<u8>>,
-    offset: usize,
+    EntropyAvailable,
 }
 
 impl ProcfsFile {
-    /// Recognizes procfs files that contain observed volatile fields.
-    pub(crate) fn from_path(path: &Path) -> Option<Self> {
-        let kind = match path.to_str()? {
-            "/proc/self/stat" => ProcfsKind::Stat,
-            "/proc/self/status" => ProcfsKind::Status,
-            "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
-            _ => return None,
-        };
-        Some(Self {
-            kind,
-            contents: None,
-            offset: 0,
-        })
+    /// Fixed bytes returned for this virtual file.
+    pub(crate) fn contents(self) -> &'static [u8] {
+        match self {
+            Self::Maps => MAPS,
+            Self::Stat => STAT,
+            Self::Status => STATUS,
+            Self::Cmdline => CMDLINE,
+            Self::Cpuinfo => CPUINFO,
+            Self::EntropyAvailable => ENTROPY_AVAILABLE,
+        }
     }
 
-    /// Returns true until the underlying procfs content has been captured.
-    pub(crate) fn needs_snapshot(&self) -> bool {
-        self.contents.is_none()
-    }
-
-    /// Normalizes and stores a complete snapshot captured from the kernel.
-    pub(crate) fn initialize(&mut self, contents: Vec<u8>) {
-        self.contents = Some(match self.kind {
-            ProcfsKind::Stat => sanitize_stat(&contents),
-            ProcfsKind::Status => sanitize_status(&contents),
-            ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
-        });
-        self.offset = 0;
-    }
-
-    /// Returns the next bytes from the normalized snapshot.
-    pub(crate) fn take(&mut self, maximum: usize) -> Option<Vec<u8>> {
-        let contents = self.contents.as_ref()?;
-        let end = self.offset.saturating_add(maximum).min(contents.len());
-        let bytes = contents[self.offset..end].to_vec();
-        self.offset = end;
-        Some(bytes)
+    /// Stable inode reserved for this virtual file.
+    pub(crate) fn inode(self) -> u64 {
+        match self {
+            Self::Maps => 10_001,
+            Self::Stat => 10_002,
+            Self::Status => 10_003,
+            Self::Cmdline => 10_004,
+            Self::Cpuinfo => 10_005,
+            Self::EntropyAvailable => 10_006,
+        }
     }
 }
 
-fn sanitize_stat(contents: &[u8]) -> Vec<u8> {
-    const VOLATILE_FIELDS: &[usize] = &[10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 39, 42, 43, 44];
-
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let Some(comm_end) = text.rfind(") ") else {
-        return contents.to_vec();
-    };
-    let comm = &text[..=comm_end];
-    let mut fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
-    if fields.len() < 50 {
-        return contents.to_vec();
-    }
-
-    // `fields` starts with proc stat field 3 (state).
-    for field in VOLATILE_FIELDS {
-        fields[*field - 3] = "0";
-    }
-    format!("{} {}\n", comm, fields.join(" ")).into_bytes()
+/// Result of applying the minimal procfs pathname policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcfsLookup {
+    /// The path is outside procfs and should keep its normal behavior.
+    NotProcfs,
+    /// The path is in procfs but is intentionally not exposed.
+    Missing,
+    /// The process executable symlink, simulated by Detcore.
+    SelfExe,
+    /// The path names one of the fixed virtual files.
+    File(ProcfsFile),
 }
 
-fn sanitize_status(contents: &[u8]) -> Vec<u8> {
-    const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
-    const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(VOLUNTARY) {
-            normalized.extend_from_slice(VOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else if body.starts_with(NONVOLUNTARY) {
-            normalized.extend_from_slice(NONVOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else {
-            normalized.extend_from_slice(body);
+impl ProcfsLookup {
+    /// Classifies absolute `/proc/...` and relative `proc/...` spellings.
+    pub(crate) fn from_path(path: &Path) -> Self {
+        let mut parts = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir => parts.clear(),
+                Component::CurDir => {}
+                Component::ParentDir if parts.pop().is_none() => return Self::NotProcfs,
+                Component::ParentDir => {}
+                Component::Normal(part) => match part.to_str() {
+                    Some(part) => parts.push(part),
+                    None => return Self::Missing,
+                },
+                Component::Prefix(_) => return Self::Missing,
+            }
         }
-        if has_newline {
-            normalized.push(b'\n');
+
+        match parts.as_slice() {
+            ["proc", "self", "maps"] => Self::File(ProcfsFile::Maps),
+            ["proc", "self", "stat"] => Self::File(ProcfsFile::Stat),
+            ["proc", "self", "status"] => Self::File(ProcfsFile::Status),
+            ["proc", "self", "cmdline"] => Self::File(ProcfsFile::Cmdline),
+            ["proc", "self", "exe"] => Self::SelfExe,
+            ["proc", "cpuinfo"] => Self::File(ProcfsFile::Cpuinfo),
+            ["proc", "sys", "kernel", "random", "entropy_avail"] => {
+                Self::File(ProcfsFile::EntropyAvailable)
+            }
+            ["proc", ..] => Self::Missing,
+            _ => Self::NotProcfs,
         }
     }
-    normalized
-}
-
-fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
-    const CPU_MHZ: &[u8] = b"cpu MHz";
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(CPU_MHZ) {
-            normalized.extend_from_slice(b"cpu MHz\t\t: 0.000");
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]
@@ -139,66 +107,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_normalized_procfs_paths() {
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/stat"))
-                .unwrap()
-                .kind,
-            ProcfsKind::Stat
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/status"))
-                .unwrap()
-                .kind,
-            ProcfsKind::Status
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
-                .unwrap()
-                .kind,
-            ProcfsKind::Cpuinfo
-        );
-        assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
-    }
-
-    #[test]
-    fn stat_normalizes_runtime_counters() {
-        let input = b"3 (name with spaces) R 1 0 0 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 0 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
-        let output = String::from_utf8(sanitize_stat(input)).unwrap();
-        let comm_end = output.rfind(") ").unwrap();
-        let fields = output[comm_end + 2..]
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 39, 42, 43, 44] {
-            assert_eq!(fields[field - 3], "0", "field {field} was not normalized");
+    fn exposes_only_the_minimal_file_set() {
+        let cases = [
+            ("/proc/self/maps", ProcfsFile::Maps),
+            ("/proc/self/stat", ProcfsFile::Stat),
+            ("/proc/self/status", ProcfsFile::Status),
+            ("/proc/self/cmdline", ProcfsFile::Cmdline),
+            ("/proc/cpuinfo", ProcfsFile::Cpuinfo),
+            (
+                "/proc/sys/kernel/random/entropy_avail",
+                ProcfsFile::EntropyAvailable,
+            ),
+            ("proc/self/stat", ProcfsFile::Stat),
+            ("/proc//self/./status", ProcfsFile::Status),
+            ("/tmp/../proc/cpuinfo", ProcfsFile::Cpuinfo),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                ProcfsLookup::from_path(Path::new(path)),
+                ProcfsLookup::File(expected)
+            );
         }
-        assert!(output.starts_with("3 (name with spaces) R "));
     }
 
     #[test]
-    fn status_normalizes_context_switches() {
-        let input = b"Name:\tcat\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+    fn hides_other_procfs_paths_and_does_not_capture_similar_paths() {
         assert_eq!(
-            sanitize_status(input),
-            b"Name:\tcat\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            ProcfsLookup::from_path(Path::new("/proc/self/exe")),
+            ProcfsLookup::SelfExe
         );
+        for path in [
+            "/proc",
+            "/proc/meminfo",
+            "/proc/self/environ",
+            "proc/sys/kernel/hostname",
+            "/tmp/../proc/meminfo",
+        ] {
+            assert_eq!(
+                ProcfsLookup::from_path(Path::new(path)),
+                ProcfsLookup::Missing,
+                "{path} was not hidden"
+            );
+        }
+        for path in [
+            "/proc/../etc/passwd",
+            "/tmp/proc/self/stat",
+            "proc-info",
+            "/process/self/stat",
+        ] {
+            assert_eq!(
+                ProcfsLookup::from_path(Path::new(path)),
+                ProcfsLookup::NotProcfs,
+                "{path} was incorrectly classified as procfs"
+            );
+        }
     }
 
     #[test]
-    fn cpuinfo_normalizes_frequency() {
-        let input = b"processor\t: 0\ncpu MHz\t\t: 2994.183\ncache size\t: 1024 KB\n";
-        assert_eq!(
-            sanitize_cpuinfo(input),
-            b"processor\t: 0\ncpu MHz\t\t: 0.000\ncache size\t: 1024 KB\n"
-        );
+    fn fixed_stat_has_the_linux_field_count() {
+        let text = std::str::from_utf8(ProcfsFile::Stat.contents()).unwrap();
+        let comm_end = text.rfind(") ").unwrap();
+        assert_eq!(2 + text[comm_end + 2..].split_whitespace().count(), 52);
     }
 
     #[test]
-    fn snapshot_supports_partial_reads() {
-        let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec());
-        assert_eq!(file.take(5).unwrap(), b"volun");
-        assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
-        assert!(file.take(1).unwrap().is_empty());
+    fn fixed_contents_are_small_and_host_independent() {
+        for file in [
+            ProcfsFile::Maps,
+            ProcfsFile::Stat,
+            ProcfsFile::Status,
+            ProcfsFile::Cmdline,
+            ProcfsFile::Cpuinfo,
+            ProcfsFile::EntropyAvailable,
+        ] {
+            assert!(!file.contents().is_empty());
+            assert!(file.contents().len() <= 256);
+        }
+        assert_eq!(ProcfsFile::Cmdline.contents(), b"hermit-guest\0");
+        assert!(
+            ProcfsFile::Cpuinfo
+                .contents()
+                .windows(6)
+                .any(|w| w == b"Hermit")
+        );
     }
 }
