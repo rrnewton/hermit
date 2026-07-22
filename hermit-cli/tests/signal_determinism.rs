@@ -158,6 +158,15 @@ fn signal_interrupts_rt_sigtimedwait_despite_sa_restart() {
 }
 
 #[test]
+fn blocking_sigsuspend_releases_the_scheduler() {
+    run_signal_scenario(
+        "blocking-sigsuspend",
+        "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
+    );
+}
+
+#[test]
+
 fn signal_masks_survive_fork_and_clone() {
     run_signal_scenario(
         "masks-fork-clone",
