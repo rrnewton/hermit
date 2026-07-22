@@ -35,15 +35,22 @@
 //! cargo test -p hermit --test rr_suite -- --ignored
 //! ```
 //!
-//! Only the programs that currently pass under Hermit are enabled here. The
-//! upstream programs that fail or hang are tracked in
-//! `docs/rr-test-suite.md`.
+//! All 219 programs in the exported target set are tracked here. Passing tests
+//! assert their native exit code; known failures run as xfails that assert a
+//! specific failure shape. An xfail that unexpectedly passes fails the test so
+//! it cannot remain hidden after the underlying bug is fixed. See
+//! `docs/rr-test-suite.md` for issue links and triage details.
 
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
+use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -53,6 +60,30 @@ static GENERATED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Per-test wall-clock cap (argument to `timeout(1)`).
 const RR_TEST_TIMEOUT: &str = "120s";
+
+/// Known hangs should fail quickly without slowing the full suite by minutes.
+const RR_XFAIL_TIMEOUT: &str = "10s";
+
+const RR_TRACKED_TESTS: usize = 219;
+const RR_PASSING_TESTS: usize = 214;
+const RR_XFAIL_TESTS: usize = 5;
+
+#[derive(Clone, Copy)]
+enum ExpectedFailure {
+    Signal {
+        signal: i32,
+        output_contains: &'static str,
+    },
+    Timeout,
+    IntermittentTimeout {
+        attempts: usize,
+    },
+}
+
+struct RrExecution {
+    output: Output,
+    rendered: String,
+}
 
 /// rr's test harness includes these generated headers (guarded by target arch).
 const GENERATED_HEADERS: [&str; 3] = [
@@ -116,7 +147,7 @@ fn generated_dir() -> &'static Path {
 
 /// Compiles the rr `src/test/<basename>.c` program (matching rr's own
 /// `RR_TEST_FLAGS`) and returns the resulting binary path, reusing it if present.
-fn compile_test(basename: &str) -> PathBuf {
+fn compile_test_source(basename: &str, source: &str) -> PathBuf {
     let rr = rr_root();
     let generated = generated_dir();
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-workloads");
@@ -141,7 +172,7 @@ fn compile_test(basename: &str) -> PathBuf {
             .arg(rr.join("include"))
             .arg("-I")
             .arg(generated)
-            .arg(rr.join("src/test").join(format!("{basename}.c")))
+            .arg(rr.join("src/test").join(source))
             .arg("-o")
             .arg(&binary)
             .args(["-ldl", "-lrt"]);
@@ -177,20 +208,28 @@ fn rr_scratch_directories_are_fresh_and_cleaned() {
     assert!(!second_path.exists());
 }
 
-/// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
-fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
-    let binary = compile_test(basename);
-    // Give every invocation a unique working directory. TempDir removes all files produced by
-    // the guest when this function returns or unwinds.
+fn execute_rr_test(basename: &str, source: &str, args: &[&str], timeout: &str) -> RrExecution {
+    let binary = compile_test_source(basename, source);
     let scratch = fresh_scratch_dir(basename);
+    let capture_dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let mut stdout =
+        tempfile::tempfile_in(capture_dir).expect("failed to create rr stdout capture file");
+    let mut stderr =
+        tempfile::tempfile_in(capture_dir).expect("failed to create rr stderr capture file");
 
     let _guard = hermit_run_lock();
-    // Wrap in `timeout` so a single hang fails that test cleanly instead of
-    // blocking the whole (serialized) suite forever.
+    // Keep timeout and every descendant in a dedicated process group. Capture
+    // through regular files so an orphan cannot keep Command::output pipes
+    // open, then kill any group members that survive timeout's own cleanup.
     let mut command = Command::new("timeout");
     command
         .current_dir(scratch.path())
-        .args([RR_TEST_TIMEOUT, env!("CARGO_BIN_EXE_hermit")])
+        .args([
+            "--foreground",
+            "--kill-after=1s",
+            timeout,
+            env!("CARGO_BIN_EXE_hermit"),
+        ])
         .args([
             "run",
             "--base-env=minimal",
@@ -198,22 +237,155 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
             "--",
         ])
         .arg(&binary)
-        .args(args);
+        .args(args)
+        .process_group(0)
+        .stdout(Stdio::from(
+            stdout.try_clone().expect("failed to clone rr stdout file"),
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().expect("failed to clone rr stderr file"),
+        ));
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
-    assert_eq!(
-        output.status.code(),
-        Some(expected_exit),
-        "rr test {basename} exited unexpectedly (124 == timeout): {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    let process_group = i32::try_from(child.id()).expect("rr child PID must fit in i32");
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| panic!("failed to wait for {basename}: {rendered}: {error}"));
+
+    // SAFETY: process_group is the positive PID assigned to the child above;
+    // negating it targets only that child's dedicated process group.
+    let cleanup = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if cleanup != 0 {
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ESRCH),
+            "failed to clean rr process group {process_group}: {error}"
+        );
+    }
+
+    stdout.rewind().expect("failed to rewind rr stdout");
+    stderr.rewind().expect("failed to rewind rr stderr");
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .expect("failed to read rr stdout");
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .expect("failed to read rr stderr");
+
     scratch
         .close()
         .expect("failed to clean rr scratch directory");
+    RrExecution {
+        output: Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        rendered,
+    }
+}
+
+fn execute_standard_rr_test(basename: &str, args: &[&str], timeout: &str) -> RrExecution {
+    execute_rr_test(basename, &format!("{basename}.c"), args, timeout)
+}
+
+fn execution_details(execution: &RrExecution) -> String {
+    format!(
+        "{}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        execution.rendered,
+        execution.output.status,
+        String::from_utf8_lossy(&execution.output.stdout),
+        String::from_utf8_lossy(&execution.output.stderr),
+    )
+}
+
+/// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
+fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
+    let execution = execute_standard_rr_test(basename, args, RR_TEST_TIMEOUT);
+    assert_eq!(
+        execution.output.status.code(),
+        Some(expected_exit),
+        "rr test {basename} exited unexpectedly (124 == timeout): {}",
+        execution_details(&execution),
+    );
+}
+
+fn run_rr_source_test(basename: &str, source: &str, expected_exit: i32, args: &[&str]) {
+    let execution = execute_rr_test(basename, source, args, RR_TEST_TIMEOUT);
+    assert_eq!(
+        execution.output.status.code(),
+        Some(expected_exit),
+        "rr test {basename} exited unexpectedly (124 == timeout): {}",
+        execution_details(&execution),
+    );
+}
+
+fn run_rr_xfail(
+    basename: &str,
+    args: &[&str],
+    expected: ExpectedFailure,
+    reason: &str,
+    issue: &str,
+) {
+    let assert_timeout = |execution: &RrExecution| {
+        assert_eq!(
+            execution.output.status.code(),
+            Some(124),
+            "rr xfail {basename} changed failure shape or XPASSed; {reason}; {issue}: {}",
+            execution_details(execution),
+        );
+    };
+
+    match expected {
+        ExpectedFailure::Signal {
+            signal,
+            output_contains,
+        } => {
+            let execution = execute_standard_rr_test(basename, args, RR_XFAIL_TIMEOUT);
+            assert_eq!(
+                execution.output.status.signal(),
+                Some(signal),
+                "rr xfail {basename} changed failure shape or XPASSed; {reason}; {issue}: {}",
+                execution_details(&execution),
+            );
+            let stdout = String::from_utf8_lossy(&execution.output.stdout);
+            let stderr = String::from_utf8_lossy(&execution.output.stderr);
+            assert!(
+                stdout.contains(output_contains) || stderr.contains(output_contains),
+                "rr xfail {basename} did not contain expected diagnostic {output_contains:?}; {reason}; {issue}: {}",
+                execution_details(&execution),
+            );
+        }
+        ExpectedFailure::Timeout => {
+            let execution = execute_standard_rr_test(basename, args, RR_XFAIL_TIMEOUT);
+            assert_timeout(&execution);
+        }
+        ExpectedFailure::IntermittentTimeout { attempts } => {
+            let mut timeout_seen = false;
+            for attempt in 1..=attempts {
+                let execution = execute_standard_rr_test(basename, args, RR_XFAIL_TIMEOUT);
+                match execution.output.status.code() {
+                    Some(0) => {}
+                    Some(124) => timeout_seen = true,
+                    _ => panic!(
+                        "rr xfail {basename} produced an untracked failure on attempt {attempt}; {reason}; {issue}: {}",
+                        execution_details(&execution),
+                    ),
+                }
+            }
+            assert!(
+                timeout_seen,
+                "rr xfail {basename} XPASSed in all {attempts} attempts; remove the xfail and resolve {issue}"
+            );
+        }
+    }
+
+    eprintln!("XFAIL {basename}: {reason}; {issue}");
 }
 
 macro_rules! rr_test {
@@ -226,6 +398,45 @@ macro_rules! rr_test {
     };
 }
 
+macro_rules! rr_source_test {
+    ($name:ident, $base:literal, $source:literal, $exit:literal, $args:expr) => {
+        #[test]
+        #[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
+        fn $name() {
+            run_rr_source_test($base, $source, $exit, $args);
+        }
+    };
+}
+
+macro_rules! rr_xfail {
+    ($name:ident, $base:literal, $args:expr, $expected:expr, $reason:literal, $issue:literal) => {
+        #[test]
+        #[ignore = "known Hermit bug; executes in hardware CI and must fail in the documented way"]
+        fn $name() {
+            run_rr_xfail($base, $args, $expected, $reason, $issue);
+        }
+    };
+}
+
+#[test]
+fn all_exported_rr_tests_are_classified() {
+    let source = include_str!("rr_suite.rs");
+    let macro_count = |name: &str| source.matches(&format!("{name}!(")).count();
+    let passing = macro_count("rr_test") + macro_count("rr_source_test");
+    let xfails = macro_count("rr_xfail");
+
+    assert_eq!(passing, RR_PASSING_TESTS);
+    assert_eq!(xfails, RR_XFAIL_TESTS);
+    assert_eq!(passing + xfails, RR_TRACKED_TESTS);
+}
+
+rr_source_test!(
+    rr_arch_prctl,
+    "arch_prctl_x86",
+    "x86/arch_prctl_x86.c",
+    0,
+    &[]
+);
 rr_test!(
     rr_args,
     "args",
@@ -350,8 +561,14 @@ rr_test!(
     0,
     &[]
 );
-// rr_multiple_pending_signals_sequential is flaky under Hermit (intermittently
-// hangs); see docs/rr-test-suite.md.
+rr_xfail!(
+    rr_multiple_pending_signals_sequential,
+    "multiple_pending_signals_sequential",
+    &[],
+    ExpectedFailure::IntermittentTimeout { attempts: 3 },
+    "intermittent hang in sequential delivery of multiple pending signals",
+    "https://github.com/rrnewton/hermit/issues/116"
+);
 rr_test!(rr_munmap_discontinuous, "munmap_discontinuous", 0, &[]);
 rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
@@ -392,6 +609,17 @@ rr_test!(rr_readv, "readv", 0, &[]);
 rr_test!(rr_recvfrom, "recvfrom", 0, &[]);
 rr_test!(rr_rename, "rename", 0, &[]);
 rr_test!(rr_rlimit, "rlimit", 0, &[]);
+rr_xfail!(
+    rr_rusage,
+    "rusage",
+    &[],
+    ExpectedFailure::Signal {
+        signal: libc::SIGABRT,
+        output_contains: "rusage.c:10: !(r->ru_maxrss > 0)",
+    },
+    "getrusage returns ru_maxrss == 0",
+    "https://github.com/rrnewton/hermit/issues/114"
+);
 rr_test!(rr_sched_attr, "sched_attr", 0, &[]);
 rr_test!(rr_sched_setaffinity, "sched_setaffinity", 0, &[]);
 rr_test!(rr_sched_setparam, "sched_setparam", 0, &[]);
@@ -431,6 +659,14 @@ rr_test!(rr_shm, "shm", 0, &[]);
 rr_test!(rr_shm_unmap, "shm_unmap", 0, &[]);
 rr_test!(rr_sigaction_old, "sigaction_old", 0, &[]);
 rr_test!(rr_sigaltstack, "sigaltstack", 0, &[]);
+rr_xfail!(
+    rr_sigchld_interrupt_signal,
+    "sigchld_interrupt_signal",
+    &[],
+    ExpectedFailure::Timeout,
+    "hang in SIGCHLD interrupt/restart handling",
+    "https://github.com/rrnewton/hermit/issues/115"
+);
 rr_test!(rr_sigcont, "sigcont", 0, &[]);
 rr_test!(
     rr_sighandler_bad_rsp_sigsegv,
@@ -453,6 +689,14 @@ rr_test!(rr_signal_unstoppable, "signal_unstoppable", 0, &[]);
 rr_test!(rr_signalfd, "signalfd", 0, &[]);
 rr_test!(rr_sigprocmask, "sigprocmask", 0, &[]);
 rr_test!(rr_sigprocmask_evil, "sigprocmask_evil", 0, &[]);
+rr_xfail!(
+    rr_sigprocmask_in_syscallbuf_sighandler,
+    "sigprocmask_in_syscallbuf_sighandler",
+    &[],
+    ExpectedFailure::Timeout,
+    "hang changing the signal mask from a syscall-buffer signal handler",
+    "https://github.com/rrnewton/hermit/issues/112"
+);
 rr_test!(rr_sigprocmask_syscallbuf, "sigprocmask_syscallbuf", 0, &[]);
 rr_test!(rr_sigpwr, "sigpwr", 0, &[]);
 rr_test!(rr_sigqueueinfo, "sigqueueinfo", 0, &[]);
@@ -460,6 +704,14 @@ rr_test!(rr_sigreturn_reg, "sigreturn_reg", 0, &[]);
 rr_test!(rr_sigtrap, "sigtrap", 0, &[]);
 rr_test!(rr_simple_threads_stress, "simple_threads_stress", 0, &[]);
 rr_test!(rr_small_holes, "small_holes", 0, &[]);
+rr_xfail!(
+    rr_spinlock_priorities,
+    "spinlock_priorities",
+    &[],
+    ExpectedFailure::Timeout,
+    "priority-sensitive scheduler progress hangs around a userspace spinlock",
+    "https://github.com/rrnewton/hermit/issues/113"
+);
 rr_test!(rr_splice, "splice", 0, &[]);
 rr_test!(
     rr_stack_growth_after_syscallbuf,
