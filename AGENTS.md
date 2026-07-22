@@ -11,15 +11,21 @@ primary checkout.
 ### Vocabulary And Layout
 
 - **Parent**: `~/work/dev-hermit/`, the local multi-agent development root.
-- **Primary checkout**: `~/work/dev-hermit/hermit/`. It stays on `main`, is
-  used only by the landing coordinator, and donates its warm `target/` cache
-  to slots. Ordinary agents do not edit files here.
-- **Slot**: the Hermit checkout inside one permanent parent worktree at
-  `~/work/dev-hermit/worktrees/slot01/hermit/` through `slot04/hermit/`.
+- **Primary checkouts**: coordinator-owned integration surfaces that ordinary
+  agents read but never edit. There are two per product:
+  - `~/work/dev-hermit/hermit/` on `frontier` and
+    `~/work/dev-hermit/main/hermit/` on `main` for Hermit.
+  - `~/work/dev-hermit/reverie/` on `frontier` and
+    `~/work/dev-hermit/main/reverie/` on `main` for Reverie.
+  The primaries donate their warm `target/` caches to new slots.
+- **Slot**: a numbered feature worktree, `slotNN`. Each slot is a **direct**
+  Git worktree — the checkout root itself, not a subdirectory. Hermit slots
+  live at `~/work/dev-hermit/worktrees/slotNN`; Reverie slots live at the
+  parallel path `~/work/dev-hermit/worktrees_reverie/slotNN`.
 - **Feature branch**: a descriptive, task-specific branch checked out in one
-  slot. Directory names stay opaque and stable even as branches change.
+  slot. Slot directory names stay opaque and stable even as branches change.
 - **Primary branch**: `main` in `rrnewton/hermit`, the continuously tested
-  development branch checked out in the primary checkout.
+  development branch checked out in `main/hermit/`.
 - **Upstream**: `facebookexperimental/hermit`, which receives periodic bulk
   pull requests from tested fork `main` rather than day-to-day feature work.
 
@@ -27,62 +33,73 @@ Expected layout:
 
 ```text
 ~/work/dev-hermit/
-|-- hermit/                 # primary checkout; landing coordinator only
-`-- worktrees/
-    |-- slot01/             # permanent parent worktree
-    |   |-- hermit/         # task-specific Hermit branch
-    |   `-- reverie/        # pinned sibling dependency
-    |-- slot02/
-    |-- slot03/
-    `-- slot04/
+|-- hermit/                     # Hermit primary; frontier; coordinator only
+|-- reverie/                    # Reverie primary; frontier; coordinator only
+|-- main/
+|   |-- hermit/                 # Hermit primary; main; rebase base
+|   `-- reverie/                # Reverie primary; main; rebase base
+|-- ACTIVE.md                   # Hermit worktree assignments (source of truth)
+|-- ACTIVE_REVERIE.md           # Reverie worktree assignments
+|-- ARCHIVED.md                 # Hermit completed-slot history (append-only)
+|-- ARCHIVED_REVERIE.md         # Reverie completed-slot history (append-only)
+|-- worktrees/
+|   |-- slot01                  # direct Hermit worktree (feature branch)
+|   |-- slot02
+|   `-- slotNN
+`-- worktrees_reverie/
+    |-- slot01                  # direct Reverie worktree (feature branch)
+    |-- slot02
+    `-- slotNN
 ```
 
-Do not use branch names as worktree directory names. Do not create ad hoc
-checkouts elsewhere for normal work. If a requested slot contains unexpected
-changes, treat it as occupied: do not reset, clean, overwrite, or reuse it.
-Select another free slot and report the conflict to the coordinator.
+Hermit and Reverie worktrees are independent: a Hermit-only task uses a
+`worktrees/slotNN` checkout and leaves any matching `worktrees_reverie/slotNN`
+untouched. A coordinated change uses the same slot number in both trees. Do not
+use branch names as worktree directory names. Do not create ad hoc checkouts
+elsewhere for normal work. If a requested slot contains unexpected changes,
+treat it as occupied: do not reset, clean, overwrite, or reuse it. Select
+another free slot and report the conflict to the coordinator.
 
-### Permanent Slot Pool
+### Slot Pool
 
-There are exactly four permanent worktree slots: `slot01` through `slot04`.
-Reuse them instead of removing and recreating worktrees. Keeping the worktree
-and its ignored `target/` directory avoids repeated dependency downloads and
-full rebuilds.
+Reuse existing numbered slots instead of removing and recreating worktrees.
+Keeping the worktree and its ignored `target/` directory avoids repeated
+dependency downloads and full rebuilds.
 
 A slot is in one of two states:
 
-- **Active**: checked out on a feature branch and owned by one agent/task.
-- **Parked**: clean, detached at a recorded commit, and available for reuse.
+- **Active**: checked out on a feature branch, owned by one agent/task, and
+  listed in the relevant `ACTIVE*.md`.
+- **Parked**: clean, detached at a recorded commit, absent from `ACTIVE*.md`,
+  and available for reuse.
 
-Parking happens in place; never move or delete the slot directory and never run
-`git worktree remove` for a permanent slot. A detached slot is not abandoned
-work: its completed feature branch and commit SHA must already be recorded in
-the handoff.
+Parking happens in place; do not `git worktree move` a slot. A detached slot is
+not abandoned work: its completed feature branch and commit SHA must already be
+recorded in the handoff and in `ARCHIVED*.md`.
 
-Creating the pool is a landing-coordinator operation. From the parent checkout,
-create a missing slot from `devbig-lead` with:
+Creating slots is a coordinator operation. From the parent root, create a
+Hermit and/or Reverie slot from the primaries with the helper:
 
 ```bash
-./slot-init.sh slot0X
+./slot-init.sh slot0X            # Hermit + Reverie worktrees for slot0X
+./slot-init.sh slot0X hermit     # Hermit worktree only
+./slot-init.sh slot0X reverie    # Reverie worktree only
 ```
 
-The primary checkout is the build-cache donor. When a new or intentionally
-refreshed slot has no `target/`, seed it with a copy-on-write copy when the
-filesystem supports reflinks:
+The helper runs `git -C <primary> worktree add` against the owning repository
+(`hermit` for `worktrees/slotNN`, `reverie` for `worktrees_reverie/slotNN`),
+never `git worktree add` from the parent. The primary is the build-cache donor.
+When a new or refreshed slot has no `target/`, seed it with a copy-on-write
+copy when the filesystem supports reflinks:
 
 ```bash
-cp -a --reflink=auto \
-  ~/work/dev-hermit/hermit/target \
-  ~/work/dev-hermit/worktrees/slot0X/hermit/
+cp -a --reflink=auto ~/work/dev-hermit/hermit/target \
+  ~/work/dev-hermit/worktrees/slot0X/
 ```
 
 Never symlink `target/` between checkouts: concurrent Cargo processes must not
 write to the same target directory. Cache seeding is optional when the donor
 does not exist or is stale; correctness must not depend on cached artifacts.
-
-Do not create `slot05` or later as another permanent cached slot. Temporary
-over-provisioning requires explicit coordinator approval and the temporary
-worktree must be removed after its committed work is integrated.
 
 ### Starting Work In A Slot
 
@@ -91,8 +108,8 @@ The coordinator assigns one free slot to exactly one agent. Before editing:
 1. Confirm the slot is a registered worktree and inspect its state:
 
    ```bash
-   git -C ~/work/dev-hermit worktree list
-   git -C ~/work/dev-hermit/worktrees/slot0X/hermit status --short --branch
+   git -C ~/work/dev-hermit/hermit worktree list
+   git -C ~/work/dev-hermit/worktrees/slot0X status --short --branch
    ```
 
 2. Require a clean worktree. Do not discard or absorb changes left by another
@@ -100,16 +117,16 @@ The coordinator assigns one free slot to exactly one agent. Before editing:
 3. Fetch fork refs, then create a descriptive branch from current fork `main`:
 
    ```bash
-   git -C ~/work/dev-hermit/worktrees/slot0X/hermit fetch origin
-   git -C ~/work/dev-hermit/worktrees/slot0X/hermit switch \
+   git -C ~/work/dev-hermit/worktrees/slot0X fetch origin
+   git -C ~/work/dev-hermit/worktrees/slot0X switch \
      -c <feature-branch> origin/main
    ```
 
-4. Record the slot, branch, task, and owner in the coordinator's task state
-   before the first edit.
+4. Record the slot, branch, task, and owner in the relevant `ACTIVE*.md` and in
+   the coordinator's task state before the first edit.
 
-Agents may read the primary checkout, including its build artifacts, but they
-must run edits, formatting, builds, tests, and commits from their assigned
+Agents may read the primary checkouts, including their build artifacts, but
+they must run edits, formatting, builds, tests, and commits from their assigned
 slot.
 
 ### Parking And Reusing A Slot
@@ -117,14 +134,15 @@ slot.
 Park a slot only after all intended work is committed and handed off:
 
 ```bash
-git -C ~/work/dev-hermit/worktrees/slot0X/hermit status --short
-git -C ~/work/dev-hermit/worktrees/slot0X/hermit switch --detach HEAD
+git -C ~/work/dev-hermit/worktrees/slot0X status --short
+git -C ~/work/dev-hermit/worktrees/slot0X switch --detach HEAD
 ```
 
 The first command must produce no output. Record the feature branch name, exact
-HEAD SHA, validation performed, and landing status before marking the slot
-free. Do not delete a feature branch until its commit is reachable from
-fork `main` or the coordinator explicitly archives it.
+HEAD SHA, validation performed, and landing status in `ARCHIVED*.md` and remove
+the slot's row from `ACTIVE*.md` before marking it free. Do not delete a feature
+branch until its commit is reachable from fork `main` or the coordinator
+explicitly archives it.
 
 To reuse a parked slot, re-run the starting-work checks and create the next
 feature branch from the latest `origin/main`. A slot that is not clean remains
