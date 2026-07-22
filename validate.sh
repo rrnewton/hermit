@@ -317,6 +317,13 @@ run_check "Test detcore package" cargo test -p detcore
 run_check "Fast concurrency stress suite" \
     "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
     --run-ignored only -E 'test(=fast_chaos_matrix)'
+# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
+if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+    run_check "rr syscall suite" \
+        cargo test -p hermit --test rr_suite -- --ignored
+else
+    echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
+fi
 # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
 run_check "Hermit analyze scenarios" \
     cargo test -p hermit --test analyze -- --ignored
