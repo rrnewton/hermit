@@ -73,11 +73,16 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Enable strict deterministic mode. Unsupported syscalls panic instead of passing through to
+    /// the host kernel.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = [
+            "no_sequentialize_threads",
+            "no_deterministic_io",
+            "namespace_only",
+            "strace_only"
+        ]
     )]
     strict: bool,
 
@@ -551,12 +556,21 @@ fn strict_flag_preserves_deterministic_defaults() {
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    assert!(ro.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
 fn strict_flag_rejects_determinism_opt_outs() {
-    for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
+    for opt_out in [
+        "--no-sequentialize-threads",
+        "--no-deterministic-io",
+        "--namespace-only",
+        "--strace-only",
+    ] {
         let error =
             RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
 
@@ -574,8 +588,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "Unsupported syscalls panic",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -747,6 +760,7 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+        config.panic_on_unsupported_syscalls |= self.strict;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
