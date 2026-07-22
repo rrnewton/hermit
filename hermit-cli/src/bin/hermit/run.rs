@@ -67,7 +67,11 @@ pub struct RunOpts {
     /// command-line compatibility.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = [
+            "no_sequentialize_threads",
+            "no_deterministic_io",
+            "allow_passthrough"
+        ]
     )]
     strict: bool,
 
@@ -528,7 +532,11 @@ fn strict_flag_preserves_deterministic_defaults() {
 
 #[test]
 fn strict_flag_rejects_determinism_opt_outs() {
-    for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
+    for opt_out in [
+        "--no-sequentialize-threads",
+        "--no-deterministic-io",
+        "--allow-passthrough",
+    ] {
         let error =
             RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
 
