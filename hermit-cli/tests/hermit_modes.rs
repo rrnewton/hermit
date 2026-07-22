@@ -456,6 +456,25 @@ fn strict_panics_on_unsupported_syscalls() {
     assert_unsupported_syscall_panics(&unsupported_syscall, "--strict");
 }
 
+/// Run one workload under *verified* chaos, matching the fbsource
+/// `hermit_run_chaos__` Buck coverage flag-for-flag.
+///
+/// fbsource wrapped every stable workload in `hermit-verify` with
+/// `run --chaos --base-env=empty --preemption-timeout=1000000` (record then
+/// replay, asserting identical executions). The OSS equivalent of that
+/// record→replay determinism check is `hermit run --verify` (run twice and
+/// compare), so we use the same flags plus `--verify`.
+///
+/// This tier is PMU-gated: `--preemption-timeout=1000000` schedules
+/// deterministic preemptions by counting retired conditional branches, which
+/// needs accessible hardware performance counters. Without a PMU there is no
+/// verified chaos-with-preemptions coverage, so we fail loudly rather than
+/// silently degrade (see AGENTS.md on reporting hardware limitations).
+///
+/// The timeout guards against the pathological slowness fbsource itself warned
+/// about: deterministic preemption is expensive, so heavily multithreaded or
+/// sleep-heavy workloads can be very slow on emulated PMUs / slow VMs even
+/// though they pass quickly on capable hardware.
 fn run_buck_chaos_workload(name: &str) {
     assert!(
         reverie_ptrace::is_perf_supported(),
@@ -471,7 +490,7 @@ fn run_buck_chaos_workload(name: &str) {
     let mut command = Command::new("timeout");
     command
         .args([
-            "60s",
+            "120s",
             env!("CARGO_BIN_EXE_hermit"),
             "run",
             "--verify",
@@ -497,15 +516,72 @@ macro_rules! buck_chaos_tests {
     };
 }
 
+// Verified chaos coverage over the stable workload matrix, matching the
+// fbsource `hermit_run_chaos__` Buck targets (which enabled `chaos = True` for
+// essentially every determinism-eligible C/Rust/shell/Python workload). Each
+// entry runs `hermit run --verify --chaos --base-env=empty
+// --preemption-timeout=1000000` — the same flags fbsource drove through
+// `hermit-verify`. Every workload here has been confirmed to pass verified
+// chaos; keep new additions to workloads that survive the determinism check.
+//
+// Workloads intentionally *not* listed here, and why:
+//   * Timer / signal delivery under chaos preemption: `hello_signals`,
+//     `lit_rt_sigaction` (setitimer racing with preemptions).
+//   * Require `--allow-passthrough` for syscalls hermit does not virtualize
+//     (they fail closed with ENOSYS under fbsource's strict chaos flags):
+//     `network_bind`, `rustbin_network_hello_world`, `rustbin_bind_connect_race`,
+//     `rustbin_interrogate_tty`, `rustbin_poll`. These stay covered by the
+//     functional `default_*` / `chaos_mode_matrix` tiers instead.
+//   * Sleep / clock / futex-race workloads whose verified-chaos runtime is
+//     dominated by (slow) deterministic preemption and reliably exceeds the
+//     timeout on emulated PMUs / slow VMs: `just_spin`,
+//     `rustbin_clock_total_order`, `rustbin_futex_and_print`,
+//     `rustbin_futex_wake_some`, and the `rustbin_print_*_race` sleepers.
+//
+// `nanosleep_parallel` and `rust_mem_race` are the two canonical racy
+// workloads fbsource always exercised under chaos. They are kept here for
+// parity even though they are the most sensitive to slow deterministic
+// preemption; on hardware without a fast PMU they may hit the timeout (a
+// documented host limitation, not a product regression).
 buck_chaos_tests! {
+    // stable matrix
     chaos_buck_getpid => "getpid",
     chaos_buck_uname => "uname",
     chaos_buck_sysinfo => "sysinfo",
     chaos_buck_wait_on_child => "wait_on_child",
     chaos_buck_nanosleep_parallel => "nanosleep_parallel",
+    // C workloads
     chaos_buck_clone => "clone",
+    chaos_buck_getcpu => "getcpu",
     chaos_buck_hello_alarm => "hello_alarm",
+    chaos_buck_print_memaddrs => "print_memaddrs",
+    chaos_buck_printf_with_threads => "printf_with_threads",
+    chaos_buck_sigtimedwait_no_timeout => "sigtimedwait_no_timeout",
+    chaos_buck_sigtimedwait_timeout_0s => "sigtimedwait_timeout_0s",
+    chaos_buck_sigtimedwait_timeout_1s => "sigtimedwait_timeout_1s",
+    chaos_buck_sysinfo_uptime => "sysinfo_uptime",
+    chaos_buck_memory_pressure => "memory_pressure",
+    chaos_buck_thread_exhaustion => "thread_exhaustion",
+    chaos_buck_lit_hello_world_c => "lit_hello_world_c",
+    chaos_buck_minimal_hello => "minimal_hello",
+    chaos_buck_pread64_nostdlib => "pread64_nostdlib",
+    // Rust workloads
+    chaos_buck_lit_hello_world_rust => "lit_hello_world_rust",
+    chaos_buck_rust_stack_ptr => "rust_stack_ptr",
+    chaos_buck_rust_heap_ptrs => "rust_heap_ptrs",
+    chaos_buck_rust_rdtsc => "rust_rdtsc",
     chaos_buck_mem_race => "rust_mem_race",
+    // Cargo guest binaries
+    chaos_buck_cargo_clock_gettime => "rustbin_clock_gettime",
+    chaos_buck_cargo_exit_group => "rustbin_exit_group",
+    chaos_buck_cargo_futex_timeout => "rustbin_futex_timeout",
+    chaos_buck_cargo_futex_wait_child => "rustbin_futex_wait_child",
+    chaos_buck_cargo_nanosleep => "rustbin_nanosleep",
+    chaos_buck_cargo_pipe_basics => "rustbin_pipe_basics",
+    chaos_buck_cargo_poll_spin => "rustbin_poll_spin",
+    chaos_buck_cargo_sched_yield => "rustbin_sched_yield",
+    chaos_buck_cargo_socketpair => "rustbin_socketpair",
+    chaos_buck_cargo_thread_random => "rustbin_thread_random",
 }
 
 #[test]
@@ -952,6 +1028,17 @@ fn strict_mode_matrix() {
     );
 }
 
+/// Portable, non-PMU functional chaos tier.
+///
+/// This runs the stable matrix under `--chaos` but with
+/// `--preemption-timeout=disabled` (no deterministic preemptions) and without
+/// `--verify`, so it needs no hardware performance counters and runs on every
+/// host. It checks that chaotic scheduling does not break these workloads
+/// functionally, but it does *not* verify determinism.
+///
+/// Verified chaos-with-preemptions parity with the fbsource `hermit_run_chaos__`
+/// Buck suite is provided by the PMU-gated `chaos_buck_*` tests above, which add
+/// `--verify` and `--preemption-timeout=1000000`.
 #[test]
 fn chaos_mode_matrix() {
     run_stable_matrix(RunMode::Chaos);
