@@ -169,7 +169,9 @@ pub fn strip_log_entry(log: &str) -> String {
     // not the full and proper setup.  In contrast, for all command tests, and for `hermit
     // run` itself, the full contents of the COMMIT line should be deterministic and this
     // hack should not be needed.
-    static RE1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[\d]+\b").unwrap()); // This one is terrible overkill.
+    // Include common duration suffixes so fractional timing jitter is not left behind.
+    static RE1: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[\d][\d_]*(?:\.[\d][\d_]*)?(?:ns|us|µs|ms)?\b").unwrap()); // This one is terrible overkill.
 
     // TODO: only strip this information if the config specified to the host /tmp through.
     // Otherwise we can determinize /tmp access fully.
@@ -873,6 +875,9 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     #[test]
     fn test_strip_log() {
         assert_eq!(super::strip_log_entry("800.709_180s"), "<NANOSECONDS>");
+        assert_eq!(super::strip_log_entry("98.91618ms"), "<NUM>");
+        assert_eq!(super::strip_log_entry("98.91619ms"), "<NUM>");
+        assert_eq!(super::strip_log_entry("x86_64"), "x86_64");
         assert_eq!(
             super::strip_log_entry(
                 "COMMIT turn 66, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946_684_800.709_180_000s"
