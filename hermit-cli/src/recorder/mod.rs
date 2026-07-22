@@ -126,6 +126,7 @@ impl Tool for Recorder {
             Sysno::sendto,
             Sysno::sendmsg,
             Sysno::poll,
+            Sysno::epoll_wait,
             Sysno::getsockopt,
             Sysno::getpeername,
             Sysno::getsockname,
@@ -213,6 +214,7 @@ impl Tool for Recorder {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
                 self.handle_sockopt_family(guest, syscall.into()).await

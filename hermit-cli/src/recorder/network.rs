@@ -11,6 +11,7 @@
 use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Addr;
+use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
@@ -20,6 +21,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
+use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SockOptEvent;
@@ -59,6 +61,28 @@ fn read_iovecs<M: MemoryAccess>(
 }
 
 impl Recorder {
+    pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: EpollWait,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        let event = result.and_then(|ret| {
+            let updated = ret as usize;
+            let mut events = vec![0; updated * std::mem::size_of::<libc::epoll_event>()];
+            if !events.is_empty() {
+                guest
+                    .memory()
+                    .read_exact(syscall.events().ok_or(Errno::EFAULT)?.cast(), &mut events)?;
+            }
+            Ok(SyscallEvent::EpollWait(EpollWaitEvent { events, updated }))
+        });
+
+        self.record_event(guest, event);
+        result
+    }
+
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,

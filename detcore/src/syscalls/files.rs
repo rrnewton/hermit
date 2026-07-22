@@ -749,17 +749,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ioctl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
-        let cloexec = match call.request() {
-            syscalls::ioctl::Request::FIOCLEX => Some(true),
-            syscalls::ioctl::Request::FIONCLEX => Some(false),
-            _ => None,
+        let (cloexec, nonblocking) = match call.request() {
+            syscalls::ioctl::Request::FIOCLEX => (Some(true), None),
+            syscalls::ioctl::Request::FIONCLEX => (Some(false), None),
+            syscalls::ioctl::Request::FIONBIO(value) => {
+                let enabled = guest.memory().read_value(value.ok_or(Errno::EFAULT)?)? != 0;
+                (None, Some(enabled))
+            }
+            _ => (None, None),
         };
 
         let result = self.record_or_replay(guest, call).await?;
-        if let Some(enabled) = cloexec {
-            guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.set_cloexec(enabled))?;
+        if cloexec.is_some() || nonblocking.is_some() {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                if let Some(enabled) = cloexec {
+                    detfd.set_cloexec(enabled);
+                }
+                if let Some(enabled) = nonblocking {
+                    detfd.set_nonblocking(enabled);
+                }
+            })?;
         }
         Ok(result)
     }
