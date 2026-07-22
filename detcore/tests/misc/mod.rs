@@ -1080,3 +1080,110 @@ fn network_syscalls_are_deterministic_across_five_runs() {
         detcore_testutils::expect_success,
     );
 }
+
+#[test]
+fn concurrent_same_socket_connect_preserves_eisconn() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        deterministic_io: true,
+        preemption_timeout: None,
+        ..Default::default()
+    };
+
+    detcore_testutils::det_test_fn_with_config_repetitions(
+        5,
+        true,
+        || {
+            use std::net::Ipv4Addr;
+            use std::net::SocketAddr;
+            use std::net::TcpListener;
+            use std::sync::Arc;
+            use std::sync::Barrier;
+
+            fn connect_once(
+                fd: libc::c_int,
+                address: libc::sockaddr_in,
+                barrier: Arc<Barrier>,
+            ) -> i32 {
+                barrier.wait();
+                let result = unsafe {
+                    libc::connect(
+                        fd,
+                        std::ptr::from_ref(&address).cast(),
+                        std::mem::size_of_val(&address) as libc::socklen_t,
+                    )
+                };
+                if result == 0 {
+                    0
+                } else {
+                    -std::io::Error::last_os_error().raw_os_error().unwrap()
+                }
+            }
+
+            let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 43), 0)).unwrap();
+            let SocketAddr::V4(listener_address) = listener.local_addr().unwrap() else {
+                unreachable!()
+            };
+            let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = listener_address.port().to_be();
+            address.sin_addr.s_addr = u32::from_ne_bytes(listener_address.ip().octets());
+
+            let client_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(client_fd >= 0);
+            let barrier = Arc::new(Barrier::new(3));
+            let first_barrier = Arc::clone(&barrier);
+            let first = std::thread::spawn(move || connect_once(client_fd, address, first_barrier));
+            let second_barrier = Arc::clone(&barrier);
+            let second =
+                std::thread::spawn(move || connect_once(client_fd, address, second_barrier));
+
+            barrier.wait();
+            let (accepted, _) = listener.accept().unwrap();
+            let mut results = [first.join().unwrap(), second.join().unwrap()];
+            results.sort_unstable();
+            assert_eq!(results, [-libc::EISCONN, 0]);
+            println!("same-socket connect results: {results:?}");
+
+            drop(accepted);
+            assert_eq!(unsafe { libc::close(client_fd) }, 0);
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+#[test]
+fn fcntl_nonblocking_accept_returns_eagain() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        deterministic_io: true,
+        preemption_timeout: None,
+        ..Default::default()
+    };
+
+    detcore_testutils::det_test_fn_with_config_repetitions(
+        5,
+        true,
+        || {
+            use std::net::Ipv4Addr;
+            use std::net::TcpListener;
+            use std::os::fd::AsRawFd;
+
+            let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 44), 0)).unwrap();
+            let fd = listener.as_raw_fd();
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
+                0
+            );
+
+            let accepted = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            assert_eq!(accepted, -1);
+            assert_eq!(errno, libc::EAGAIN);
+            println!("empty nonblocking accept errno: {errno}");
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
