@@ -106,6 +106,51 @@ hermit record start -- /bin/echo recorded
 hermit replay --autopilot
 ```
 
+### Chaos Mode Demonstration
+
+The `order_violation` guest reads shared state without ensuring that another
+thread has published it. Build Hermit and the guest, then run the default
+deterministic schedule twice:
+
+```bash
+cargo build --release -p hermit --bin hermit
+mkdir -p target/chaos-demo
+cc -std=c11 -O2 -pthread tests/chaos/order_violation.c \
+  -o target/chaos-demo/order-violation
+
+for run in 1 2; do
+  target/release/hermit run --preemption-timeout=disabled -- \
+    ./target/chaos-demo/order-violation
+done
+```
+
+Both runs print `Hello world!`. Chaos mode explores other deterministic
+schedules; this bounded search reports the guest status for each seed:
+
+```bash
+for seed in {0..15}; do
+  target/release/hermit run --chaos --sched-heuristic=random \
+    --preemption-timeout=disabled --seed="$seed" -- \
+    ./target/chaos-demo/order-violation
+  printf 'seed=%s status=%s\n' "$seed" "$?"
+done
+```
+
+With this Hermit revision and guest, seed 9 prints
+`ERROR! global_str is null at use.` and exits 1. Repeating the exact command
+reproduces the same failure:
+
+```bash
+target/release/hermit run --chaos --sched-heuristic=random \
+  --preemption-timeout=disabled --seed=9 -- \
+  ./target/chaos-demo/order-violation
+```
+
+The seed identifies a schedule for a particular Hermit build, guest binary,
+and configuration. Keep all three fixed when reproducing a failure. This demo
+disables PMU preemption and relies on thread and syscall scheduling points, so
+it also works on hosts without accessible performance counters.
+
 Record/replay is less broadly compatible than deterministic `run` mode. Keep
 the recording directory, executable, inputs, environment, and Hermit revision
 unchanged between phases.
