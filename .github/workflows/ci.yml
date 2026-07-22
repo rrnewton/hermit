@@ -53,7 +53,7 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -61,18 +61,18 @@ jobs:
     - uses: actions/checkout@v3
     - name: Dependencies
       run: |
-        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma).
-        # A Go toolchain is OPTIONAL: hermit-cli/tests/arbitrary_binaries.rs skips
-        # the `go` tool when the binary is absent, so no test needs it. The
-        # self-hosted runner has apt (no dnf) but cannot locate `golang-go`, which
-        # previously failed the whole job. Install the required libs and treat Go
-        # as best-effort so a missing golang package no longer blocks CI.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y libunwind-devel xz-devel
-          sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
+          sudo dnf install -y \
+            libunwind-devel xz-devel busybox coreutils python3 nodejs \
+            java-17-openjdk-headless golang curl wget git gcc make cmake sqlite
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
-          sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
+          sudo apt-get update
+          sudo apt-get install -y \
+            libunwind-dev liblzma-dev busybox coreutils python3 nodejs \
+            default-jre-headless golang-go curl wget git gcc make cmake sqlite3
+        else
+          echo "::error::No supported package manager; test dependencies cannot be installed."
+          exit 1
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
@@ -81,39 +81,20 @@ jobs:
     - name: PMU timing and miscellaneous tests
       run: |
         cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-        cargo test -p detcore --test tests_time -- --ignored --test-threads=4
+        cargo test -p detcore --test tests_time -- --test-threads=4
     - name: PMU parallel futex tests
       run: >-
         cargo test -p detcore --test tests_parallelism futex_wait_parent
-        -- --ignored --test-threads=3
+        -- --test-threads=3
     - name: PMU parallel memory tests
       run: |
-        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --ignored --test-threads=4
-        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --ignored --test-threads=4
-    - name: Check mount namespace support
-      id: namespaces
+        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=4
+        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=4
+    - name: Require mount namespace support
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
-          echo "available=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
+        if ! unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'; then
+          echo "::error::Mount namespaces are required for Hermit integration tests."
+          exit 1
         fi
-    - name: Hermit tests including record/replay matrix
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit
-    - name: PMU Detcore lit tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
-    - name: PMU chaos and verify tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test chaos_verify -- --ignored --test-threads=1
-    - name: Concurrency stress suites
-      if: steps.namespaces.outputs.available == 'true'
-      run: |
-        cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
-        cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
-        cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
-    - name: Hermit unit tests without mount namespaces
-      if: steps.namespaces.outputs.available != 'true'
-      run: cargo test -p hermit --lib --bins
+    - name: Hermit tests including record/replay and stress matrices
+      run: cargo test -p hermit -- --test-threads=1

@@ -363,6 +363,10 @@ fn run_stable_matrix(mode: RunMode) {
 }
 
 fn run_buck_chaos_workload(name: &str) {
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: {name} chaos coverage requires accessible PMU hardware counters"
+    );
     let _guard = hermit_run_lock();
     let workload = workloads()
         .stable
@@ -370,9 +374,11 @@ fn run_buck_chaos_workload(name: &str) {
         .chain(&workloads().default_only)
         .find(|workload| workload.name == name)
         .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new("timeout");
     command
         .args([
+            "60s",
+            env!("CARGO_BIN_EXE_hermit"),
             "run",
             "--verify",
             "--chaos",
@@ -390,7 +396,6 @@ macro_rules! buck_chaos_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "requires PMU branch counters and working mount namespaces"]
             fn $test_name() {
                 run_buck_chaos_workload($workload_name);
             }
