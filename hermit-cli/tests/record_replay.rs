@@ -15,6 +15,8 @@ use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
@@ -233,7 +235,7 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .env("HERMIT_MODE", "record")
-        .args(["record", "start", "--verify"])
+        .args(["record", "start", "--verify", "--record-timeout=30"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
         .arg(program)
@@ -290,6 +292,57 @@ fn record_find_directory_tree() {
             OsStr::new("-print"),
         ],
     );
+}
+
+#[test]
+fn record_curl_version() {
+    let _guard = hermit_record_lock();
+    let curl = [Path::new("/usr/bin/curl"), Path::new("/usr/local/bin/curl")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(curl) = curl else {
+        eprintln!("curl is not installed; skipping record/replay coverage");
+        return;
+    };
+
+    record_replay_command("curl", curl, &[OsStr::new("--version")]);
+}
+
+#[test]
+fn record_timeout_kills_guest_without_committing_partial_data() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let started = Instant::now();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["record", "start", "--record-timeout=1"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", "while :; do :; done"]);
+    let output = command.output().expect("failed to start timeout recording");
+
+    assert!(
+        !output.status.success(),
+        "timed recording unexpectedly succeeded"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "record timeout took too long: {:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Recording timed out after 1 seconds"),
+        "missing timeout diagnostic:\n{stderr}"
+    );
+    assert!(
+        !data_dir.path().join("last").exists(),
+        "timed-out recording was committed"
+    );
+    let partials = fs::read_dir(data_dir.path().join("tmp"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(partials, 0, "timed-out recording left partial data");
 }
 
 macro_rules! record_replay_tests {
