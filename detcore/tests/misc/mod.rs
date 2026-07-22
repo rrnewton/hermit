@@ -475,3 +475,139 @@ fn rdrand_rdseed_is_masked() {
         assert!(!feature_ext.has_rdseed());
     })
 }
+
+#[test]
+fn network_syscalls_are_deterministic_across_five_runs() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        deterministic_io: true,
+        preemption_timeout: None,
+        ..Default::default()
+    };
+
+    detcore_testutils::det_test_fn_with_config_repetitions(
+        5,
+        true,
+        || {
+            use std::net::Ipv4Addr;
+            use std::net::TcpListener;
+            use std::net::TcpStream;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::net::UnixListener;
+            use std::os::unix::net::UnixStream;
+            use std::sync::Arc;
+            use std::sync::Barrier;
+
+            fn send_exact(fd: libc::c_int, bytes: &[u8]) {
+                assert_eq!(
+                    unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), 0) },
+                    bytes.len() as isize
+                );
+            }
+
+            fn recv_exact(fd: libc::c_int, bytes: &mut [u8]) {
+                assert_eq!(
+                    unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+                    bytes.len() as isize
+                );
+            }
+
+            let socket_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert_eq!(socket_fd, 3);
+            assert_eq!(unsafe { libc::close(socket_fd) }, 0);
+            println!("socket fd: {socket_fd}");
+
+            let mut pair = [-1; 2];
+            assert_eq!(
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+                0
+            );
+            send_exact(pair[0], b"pair");
+            let mut pair_payload = [0; 4];
+            recv_exact(pair[1], &mut pair_payload);
+            println!("socketpair fds: {pair:?}; payload: {pair_payload:?}");
+            assert_eq!(unsafe { libc::close(pair[0]) }, 0);
+            assert_eq!(unsafe { libc::close(pair[1]) }, 0);
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let socket_path = temp_dir.path().join("network-determinism.sock");
+            let unix_listener = UnixListener::bind(&socket_path).unwrap();
+            let unix_listener_fd = unix_listener.as_raw_fd();
+            let client_path = socket_path.clone();
+            let unix_client = std::thread::spawn(move || {
+                let client = UnixStream::connect(client_path).unwrap();
+                let client_fd = client.as_raw_fd();
+                send_exact(client_fd, b"unix");
+                let mut ack = [0; 2];
+                recv_exact(client_fd, &mut ack);
+                (client_fd, ack)
+            });
+            let (unix_server, _) = unix_listener.accept().unwrap();
+            let unix_accepted_fd = unix_server.as_raw_fd();
+            let mut unix_payload = [0; 4];
+            recv_exact(unix_accepted_fd, &mut unix_payload);
+            send_exact(unix_accepted_fd, b"ok");
+            let (unix_client_fd, unix_ack) = unix_client.join().unwrap();
+            println!(
+                "unix fds: listener={unix_listener_fd}, client={unix_client_fd}, accepted={unix_accepted_fd}; payload={unix_payload:?}; ack={unix_ack:?}"
+            );
+            drop(unix_server);
+            drop(unix_listener);
+            drop(temp_dir);
+
+            // Stay on loopback while avoiding the address used by other networking tests that
+            // may run concurrently.
+            let tcp_listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 42), 0)).unwrap();
+            let tcp_listener_fd = tcp_listener.as_raw_fd();
+            let tcp_addr = tcp_listener.local_addr().unwrap();
+            assert_eq!(tcp_addr.port(), 32768);
+
+            let barrier = Arc::new(Barrier::new(3));
+            let clients: Vec<_> = (*b"AB")
+                .into_iter()
+                .map(|label| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let client = TcpStream::connect(tcp_addr).unwrap();
+                        let client_fd = client.as_raw_fd();
+                        send_exact(client_fd, &[label]);
+                        let mut ack = [0; 1];
+                        recv_exact(client_fd, &mut ack);
+                        (label, client_fd, ack[0])
+                    })
+                })
+                .collect();
+            barrier.wait();
+
+            let mut accepted_fds = Vec::new();
+            let mut accepted_order = Vec::new();
+            let mut accepted_connections = Vec::new();
+            for _ in 0..clients.len() {
+                let (server, _) = tcp_listener.accept().unwrap();
+                accepted_fds.push(server.as_raw_fd());
+                let mut label = [0; 1];
+                recv_exact(server.as_raw_fd(), &mut label);
+                accepted_order.push(label[0]);
+                send_exact(server.as_raw_fd(), &[label[0].to_ascii_lowercase()]);
+                accepted_connections.push(server);
+            }
+            let client_results: Vec<_> = clients
+                .into_iter()
+                .map(|client| client.join().unwrap())
+                .collect();
+            assert_eq!(
+                client_results
+                    .iter()
+                    .map(|(label, _, ack)| (*label, *ack))
+                    .collect::<Vec<_>>(),
+                vec![(b'A', b'a'), (b'B', b'b')]
+            );
+            println!(
+                "tcp listener: fd={tcp_listener_fd}, addr={tcp_addr}; accepted_fds={accepted_fds:?}; order={accepted_order:?}; clients={client_results:?}"
+            );
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}

@@ -322,6 +322,16 @@ pub trait NonblockableSyscall: SyscallInfo {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Ok(0)
     }
+
+    /// Convert a physical nonblocking completion into the result expected by the guest.
+    /// `retried` is true after a prior result was classified as blocked.
+    fn normalize_nonblocking_result(
+        &self,
+        res: Result<i64, Errno>,
+        _retried: bool,
+    ) -> Result<i64, Errno> {
+        res
+    }
 }
 
 /// A system call which can logically timeout and then would return a given value
@@ -618,7 +628,21 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
     }
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
-        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+        res == Err(Errno::EAGAIN)
+            || res == Err(Errno::EWOULDBLOCK)
+            || res == Err(Errno::EINPROGRESS)
+            || res == Err(Errno::EALREADY)
+    }
+
+    fn normalize_nonblocking_result(
+        &self,
+        res: Result<i64, Errno>,
+        retried: bool,
+    ) -> Result<i64, Errno> {
+        match (retried, res) {
+            (true, Err(Errno::EISCONN)) => Ok(0),
+            (_, res) => res,
+        }
     }
 }
 
@@ -707,7 +731,9 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
-            let res = res.map_err(|e| e.into());
+            let res = call
+                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,
@@ -790,5 +816,25 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
         Some(target_time)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_nonblocking_results() {
+        let call = reverie::syscalls::Connect::new();
+        assert!(call.syscall_would_have_blocked(Err(Errno::EINPROGRESS)));
+        assert!(call.syscall_would_have_blocked(Err(Errno::EALREADY)));
+        assert_eq!(
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), true),
+            Ok(0)
+        );
+        assert_eq!(
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
+            Err(Errno::EISCONN)
+        );
     }
 }

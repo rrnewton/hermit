@@ -500,13 +500,29 @@ where
     F: Fn(),
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
+    det_test_fn_with_config_repetitions(TEST_REPS - 1, isdet, f, config, oracle)
+}
+
+/// Like [`det_test_fn_with_config`], but runs and compares exactly `repetitions` times.
+pub fn det_test_fn_with_config_repetitions<F, O>(
+    repetitions: u64,
+    isdet: bool,
+    f: F,
+    config: Config,
+    oracle: O,
+) where
+    F: Fn(),
+    O: Fn(&Output, <Detcore as Tool>::GlobalState),
+{
+    assert!(repetitions > 0, "at least one test repetition is required");
+
     if isdet {
         println!("Expecting determinism:");
     } else {
         println!("Not expecting determinism, but still performing multiple test runs:");
     }
     let mut dts = DetTestState::default();
-    for ix in 1..(TEST_REPS - 1) {
+    for ix in 1..repetitions {
         println!("Test Run {}:", ix);
         let (output, state, logs) =
             test_fn_with_logs::<Detcore, _>(&f, config.clone(), true).unwrap();
@@ -518,7 +534,7 @@ where
             check_output(&output, logs, &mut dts);
         }
     }
-    println!("Test Run {}:", TEST_REPS - 1);
+    println!("Test Run {}:", repetitions);
     let (output, state, logs) = test_fn_with_logs::<Detcore, _>(f, config, true).unwrap();
     println!("({} log lines captured.)", logs.len());
     oracle(&output, state);
