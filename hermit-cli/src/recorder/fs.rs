@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -98,6 +99,29 @@ impl Recorder {
         result
     }
 
+    pub(super) async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        buf: Option<AddrMut<'_, libc::statfs>>,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|ret| {
+                debug_assert_eq!(ret, 0);
+                let mut bytes = vec![0; std::mem::size_of::<libc::statfs>()];
+                guest
+                    .memory()
+                    .read_exact(buf.ok_or(Errno::EFAULT)?.cast(), &mut bytes)?;
+                Ok(SyscallEvent::Statfs(bytes))
+            }),
+        );
+
+        result
+    }
+
     pub(super) async fn handle_statx<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -132,7 +156,10 @@ impl Recorder {
             self.record_event(guest, Err(err));
         })?;
 
-        if matches!(request, ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX) {
+        if matches!(
+            request,
+            ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
+        ) {
             self.record_event(guest, Ok(SyscallEvent::Return(ret)));
         } else if let Some(output) = request.read_output(&guest.memory()).transpose() {
             // This ioctl request has an associated output.

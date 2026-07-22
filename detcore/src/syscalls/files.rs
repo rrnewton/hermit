@@ -749,17 +749,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ioctl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
-        let cloexec = match call.request() {
-            syscalls::ioctl::Request::FIOCLEX => Some(true),
-            syscalls::ioctl::Request::FIONCLEX => Some(false),
-            _ => None,
+        let (cloexec, nonblocking) = match call.request() {
+            syscalls::ioctl::Request::FIOCLEX => (Some(true), None),
+            syscalls::ioctl::Request::FIONCLEX => (Some(false), None),
+            syscalls::ioctl::Request::FIONBIO(value) => {
+                let enabled = guest.memory().read_value(value.ok_or(Errno::EFAULT)?)? != 0;
+                (None, Some(enabled))
+            }
+            _ => (None, None),
         };
 
+        // When the guest clears O_NONBLOCK via FIONBIO on an fd that Detcore keeps
+        // physically nonblocking for the scheduler, we must NOT let the clear
+        // reach the kernel: doing so would make the fd physically blocking and
+        // violate the scheduler's invariant (nonblockize-and-retry could then
+        // block, risking deadlock). Instead we update only the guest-visible
+        // logical flag and leave the physical fd -- and Detcore's physical
+        // tracking -- nonblocking. This mirrors the F_SETFL handler's treatment
+        // of the same force condition.
+        if nonblocking == Some(false) {
+            let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
+            let force_nonblocking = self.cfg.use_nonblocking_sockets()
+                && !self.cfg.recordreplay_modes
+                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
+            if force_nonblocking {
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.set_logical_nonblocking(false);
+                })?;
+                // FIONBIO returns 0 on success; the fd stays physically nonblocking.
+                return Ok(0);
+            }
+        }
+
         let result = self.record_or_replay(guest, call).await?;
-        if let Some(enabled) = cloexec {
-            guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.set_cloexec(enabled))?;
+        if cloexec.is_some() || nonblocking.is_some() {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                if let Some(enabled) = cloexec {
+                    detfd.set_cloexec(enabled);
+                }
+                if let Some(enabled) = nonblocking {
+                    detfd.set_nonblocking(enabled);
+                }
+            })?;
         }
         Ok(result)
     }

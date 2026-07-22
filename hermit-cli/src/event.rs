@@ -50,11 +50,13 @@ pub enum SyscallEvent {
     Bytes(Vec<u8>),
     Write(i64),
     Mmap(MmapEvent),
+    Recvmsg(RecvmsgEvent),
     /// A syscall whose only value we care about is the return value. For many
     /// syscalls, this is often the only output of the syscall and thus it is the
     /// only piece of information that needs to be recorded.
     Return(i64),
     Stat(StatEvent),
+    Statfs(Vec<u8>),
     Statx(StatxBuf),
     Rdtsc(RdtscResult),
     Ioctl(ioctl::Output),
@@ -62,6 +64,7 @@ pub enum SyscallEvent {
     Timeofday((Timeval, Timezone)),
     Poll(PollEvent),
     SockOpt(SockOptEvent),
+    EpollWait(EpollWaitEvent),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +74,17 @@ pub struct MmapEvent {
     /// The contents of the memory map. Note that this may be less than the
     /// requested `length`.
     pub buf: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecvmsgEvent {
+    pub result: i64,
+    pub iovs: Vec<Vec<u8>>,
+    pub name: Vec<u8>,
+    pub name_len: libc::socklen_t,
+    pub control: Vec<u8>,
+    pub control_len: usize,
+    pub flags: libc::c_int,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,6 +114,14 @@ pub struct PollEvent {
     ///
     /// A value of 0 indicates that the call timed out and no file descriptors
     /// were ready.
+    pub updated: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EpollWaitEvent {
+    /// Raw initialized epoll_event bytes returned by the kernel.
+    pub events: Vec<u8>,
+    /// The number of initialized events in the buffer.
     pub updated: usize,
 }
 

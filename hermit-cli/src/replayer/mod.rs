@@ -115,6 +115,7 @@ impl Tool for Replayer {
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
+            Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwrite64(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
@@ -126,6 +127,8 @@ impl Tool for Replayer {
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Newfstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            Syscall::Statfs(syscall) => self.handle_statfs(guest, syscall.buf()).await,
+            Syscall::Fstatfs(syscall) => self.handle_statfs(guest, syscall.buf()).await,
             Syscall::Statx(syscall) => self.handle_statx(guest, syscall).await,
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
@@ -136,6 +139,8 @@ impl Tool for Replayer {
             Syscall::Close(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
@@ -152,6 +157,7 @@ impl Tool for Replayer {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
                 self.handle_sockopt_family(guest, syscall.into()).await
