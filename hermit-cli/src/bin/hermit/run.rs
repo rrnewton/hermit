@@ -174,6 +174,14 @@ pub struct RunOpts {
     )]
     strace_only: bool,
 
+    /// Select the execution backend. `ptrace` (default) is the production
+    /// backend and runs arbitrary ELF guests. `dbi` (DynamoRIO) and `kvm` are
+    /// experimental prototypes that currently run a minimal hello-world
+    /// demonstration through their real interception path rather than executing
+    /// the given program.
+    #[clap(long, value_enum, default_value_t = Backend::Ptrace)]
+    backend: Backend,
+
     /// Specifies the directory to use as `/tmp`. This path gets bind-mounted
     /// over `/tmp` and the guest program does not see the real `/tmp` directory.
     /// If this path does not exist, it is created.
@@ -913,6 +921,15 @@ impl RunOpts {
         }
         self.validate_mount_sources()?;
         self.validate_program()?;
+
+        // Dispatch to an alternative Reverie backend if one was requested. These
+        // are experimental prototypes handled entirely outside the ptrace
+        // container machinery below.
+        match backend {
+            Backend::Ptrace => {}
+            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Kvm => return super::backends::run_kvm(&self.program),
+        }
         // });
 
         if self.no_namespace {
