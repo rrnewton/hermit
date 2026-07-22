@@ -458,14 +458,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
-    /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
-    /// subscriptions specified in recorder/mod.rs.
+    /// Optimized run mode traps all syscalls so unsupported calls cannot bypass this tool.
+    /// Record/replay keeps the selective Detcore subscriptions and composes them with its subtool.
     fn subscriptions(config: &Config) -> Subscription {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;
 
         if cfg!(debug_assertions) {
             Subscription::all()
+        } else if !config.recordreplay_modes {
+            let mut subscription = Subscription::all_syscalls();
+
+            if config.virtualize_time {
+                subscription.rdtsc();
+            }
+            if config.virtualize_cpuid {
+                subscription.cpuid();
+            }
+
+            subscription | T::subscriptions(config)
         } else {
             let mut subscription = Subscription::none();
             subscription.syscalls([
@@ -1145,11 +1156,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
 
-            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
-            Syscall::AddKey(_) => self.passthrough(guest, call).await,
-            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
-            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
-
             _ => {
                 if config.panic_on_unsupported_syscalls {
                     error!(
@@ -1159,7 +1165,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     );
                     panic!("unsupported syscall: {:?}", call);
                 }
-                self.passthrough(guest, call).await
+                if config.recordreplay_modes {
+                    self.passthrough(guest, call).await
+                } else if config.allow_passthrough {
+                    warn!(
+                        "unsupported syscall {} ({:?}) passed through because --allow-passthrough is set; execution may not be deterministic",
+                        call.name(),
+                        call.number(),
+                    );
+                    self.passthrough(guest, call).await
+                } else {
+                    warn!(
+                        "unsupported syscall {} ({:?}) blocked with ENOSYS; use --allow-passthrough to run it nondeterministically",
+                        call.name(),
+                        call.number(),
+                    );
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
             }
         };
 
