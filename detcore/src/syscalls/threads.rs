@@ -15,13 +15,11 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::syscalls;
-use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
-use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
 use tracing::error;
@@ -35,19 +33,40 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
-use crate::syscalls::helpers::nanos_duration_to_absolute_timeout;
+use crate::syscalls::helpers::ParsedTimeout;
+use crate::syscalls::helpers::absolute_timespec_timeout;
+use crate::syscalls::helpers::execute_internal_io_polling;
+use crate::syscalls::helpers::relative_timespec_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
+use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn futex_timeout<G: Guest<Self>>(
+        guest: &mut G,
+        call: syscalls::Futex,
+        futex_op: i32,
+    ) -> Result<ParsedTimeout, Error> {
+        let timeout = if let Some(addr) = call.timeout() {
+            Some(guest.memory().read_value(addr)?)
+        } else {
+            None
+        };
+
+        if futex_op == libc::FUTEX_WAIT_BITSET {
+            Ok(absolute_timespec_timeout(timeout)?)
+        } else {
+            relative_timespec_timeout(guest, timeout).await
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -205,15 +224,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(num as i64)
             }
             libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {
-                // For futex_wait, timeout is a RELATIVE value.
-                let ts_ptr: Option<Addr<Timespec>> = call.timeout();
-                let timeout_nanos: Option<u128> = if let Some(addr) = ts_ptr {
-                    let ts = guest.memory().read_value(addr)?;
-                    Some(ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128)
-                } else {
-                    None
-                };
-
                 if init_val != call.val() {
                     info!(
                         "[detcore, dtid {}] Futex wait running immediately because it will fizzle ({} != {}).",
@@ -223,10 +233,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
-                    let maybe_timeout_lt = if let Some(ns) = timeout_nanos {
-                        nanos_duration_to_absolute_timeout(guest, ns).await
-                    } else {
-                        None
+                    let timeout = Self::futex_timeout(guest, call, futex_op).await?;
+                    let maybe_timeout_lt = match timeout {
+                        ParsedTimeout::Immediate => Some(thread_observe_time(guest).await),
+                        ParsedTimeout::Infinite => None,
+                        ParsedTimeout::Deadline(deadline) => Some(deadline),
                     };
                     let ans = futex_action(
                         guest,
@@ -280,13 +291,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrc
         }
 
-        fn make_futex_wait_request(dettid: DetTid) -> Resources {
-            let mut rsrc = Resources::new(dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("futex_wait");
-            rsrc
-        }
-
         let dettid = guest.thread_state().dettid;
         let futex_op = call.futex_op() & libc::FUTEX_CMD_MASK;
         match futex_op {
@@ -310,16 +314,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let res = guest.inject(call).await;
                     Ok(res?)
                 } else {
-                    // For futex_wait, timeout is a RELATIVE value.
-                    let ts_ptr: Option<Addr<Timespec>> = call.timeout();
-                    let timeout_nanos: Option<u128> = if let Some(addr) = ts_ptr {
-                        let ts = guest.memory().read_value(addr)?;
-                        Some(ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128)
-                    } else {
-                        None
-                    };
-
-                    if timeout_nanos == Some(0) {
+                    let timeout = Self::futex_timeout(guest, call, futex_op).await?;
+                    if timeout == ParsedTimeout::Immediate {
                         info!(
                             "[detcore, dtid {}] Letting Futex wait through because it's nonblocking ({} != {}).",
                             dettid,
@@ -328,19 +324,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         );
                         Ok(guest.inject(call).await?) // Already non-blocking.
                     } else {
-                        let rsrc = make_futex_wait_request(dettid);
-                        let maybe_timeout_ns = if let Some(ns) = timeout_nanos {
-                            nanos_duration_to_absolute_timeout(guest, ns).await
-                        } else {
-                            None
-                        };
-                        let res = retry_nonblocking_syscall_with_timeout(
-                            guest,
-                            call,
-                            rsrc,
-                            maybe_timeout_ns,
-                        )
-                        .await?;
+                        let res = execute_internal_io_polling(guest, call, timeout).await?;
                         trace!(
                             "[detcore, dtid {}] after futex wait, memory value is {}",
                             &dettid,
