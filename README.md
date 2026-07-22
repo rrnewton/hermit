@@ -88,6 +88,19 @@ hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
 Both invocations should print the same bytes when the command, inputs, and
 Hermit configuration are unchanged.
 
+## Compatibility
+
+Hermit can run substantial multi-process applications, but unsupported
+syscalls and host-specific CPU behavior remain. One compatibility milestone is
+booting a minimal x86_64 Linux system under QEMU TCG. The working profile uses
+QEMU's instruction-counting clock and lets QEMU's host threads run
+concurrently:
+
+- [Booting Linux with QEMU under Hermit](docs/QEMU_BOOT.md)
+
+That profile is a boot compatibility demonstration, not a fully deterministic
+virtual-machine configuration.
+
 ## Key Workflows
 
 | Goal | Command | Status |
