@@ -129,6 +129,9 @@ jobs:
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: ./scripts/test-fail-closed.sh
+    - name: Debugger (gdb/lldb) integration tests
+      if: steps.namespaces.outputs.available == 'true'
+      run: ./tests/debugger/run_debugger_tests.sh
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
