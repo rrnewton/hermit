@@ -209,6 +209,9 @@ fn select_ready_and_timeout() {
 #[test]
 fn select_fd_set_abi_boundaries() {
     det_test_fn_without_pmu(|| {
+        // Deliberately bogus, misaligned pointer to exercise select(2)'s ABI
+        // boundary handling; not a dangling-pointer construction.
+        #[allow(clippy::manual_dangling_ptr)]
         let invalid_set = 1_usize as *mut libc::fd_set;
         let mut timeout = libc::timeval {
             tv_sec: 0,
