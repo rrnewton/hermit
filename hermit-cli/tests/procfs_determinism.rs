@@ -53,9 +53,12 @@ fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
 
     for run in 2..=RUNS {
         let output = read_procfs(path);
-        assert!(
-            first == output,
-            "{path} differed between run 1 and run {run}"
+        assert_eq!(
+            first,
+            output,
+            "{path} differed between run 1 and run {run}\nrun 1: {}\nrun {run}: {}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&output),
         );
     }
 }
@@ -84,7 +87,7 @@ fn proc_self_stat_is_deterministic() {
         let comm_end = text.rfind(") ").expect("stat has no comm terminator");
         let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
         assert!(fields.len() >= 50, "stat has too few fields");
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 39, 42, 43, 44] {
+        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44] {
             assert_eq!(fields[field - 3], "0", "stat field {field} is volatile");
         }
     });

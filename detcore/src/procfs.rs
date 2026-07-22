@@ -70,7 +70,7 @@ impl ProcfsFile {
 }
 
 fn sanitize_stat(contents: &[u8]) -> Vec<u8> {
-    const VOLATILE_FIELDS: &[usize] = &[10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 39, 42, 43, 44];
+    const VOLATILE_FIELDS: &[usize] = &[10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44];
 
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -163,13 +163,13 @@ mod tests {
 
     #[test]
     fn stat_normalizes_runtime_counters() {
-        let input = b"3 (name with spaces) R 1 0 0 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 0 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
+        let input = b"3 (name with spaces) R 1 0 0 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 123 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
         let output = String::from_utf8(sanitize_stat(input)).unwrap();
         let comm_end = output.rfind(") ").unwrap();
         let fields = output[comm_end + 2..]
             .split_whitespace()
             .collect::<Vec<_>>();
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 39, 42, 43, 44] {
+        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44] {
             assert_eq!(fields[field - 3], "0", "field {field} was not normalized");
         }
         assert!(output.starts_with("3 (name with spaces) R "));
