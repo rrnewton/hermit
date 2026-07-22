@@ -258,9 +258,12 @@ impl Backend {
                 "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
                     .to_owned(),
             ),
-            Self::Dbi => Some(
-                "the DynamoRIO prototype does not yet expose a Detcore process launcher".to_owned(),
-            ),
+            // The DBI prototype does not yet drive Detcore's scheduler, but it
+            // does run the guest under DynamoRIO with real branch counting,
+            // syscall interception, and the deterministic CPUID identity (see
+            // `backends::run_dbi`). Treat it as available once the SDK is present
+            // so `hermit run --backend dbi` can exercise that interception path.
+            Self::Dbi => None,
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
                 Some(
                     "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
@@ -595,8 +598,14 @@ mod tests {
             available.contains(&Backend::Ptrace),
             Backend::Ptrace.is_available()
         );
-        assert!(!available.contains(&Backend::Dbi));
-        assert!(!available.contains(&Backend::Kvm));
+        assert_eq!(
+            available.contains(&Backend::Dbi),
+            Backend::Dbi.is_available()
+        );
+        assert_eq!(
+            available.contains(&Backend::Kvm),
+            Backend::Kvm.is_available()
+        );
     }
 
     #[test]
@@ -614,14 +623,19 @@ mod tests {
 
     #[test]
     fn prototype_backends_fail_closed() {
-        let dbi_error = Backend::Dbi
-            .ensure_available()
-            .expect_err("DBI must fail closed");
-        let message = dbi_error.to_string();
-        assert!(
-            message.contains("DynamoRIO SDK") || message.contains("Detcore process launcher"),
-            "unexpected DBI availability error: {message}"
-        );
+        // DBI is available only when a DynamoRIO SDK is configured; without one
+        // it must fail closed with an actionable message rather than attempting
+        // to launch `drrun`.
+        match Backend::Dbi.ensure_available() {
+            Ok(()) => assert!(
+                super::dynamorio_sdk_available(),
+                "DBI reported available without a DynamoRIO SDK on PATH"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("DynamoRIO SDK"),
+                "unexpected DBI availability error: {error}"
+            ),
+        }
 
         let kvm_error = Backend::Kvm
             .ensure_available()

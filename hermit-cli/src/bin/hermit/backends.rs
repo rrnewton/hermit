@@ -16,10 +16,16 @@
 //! * [`hermit::Backend::Dbi`] — in-process DynamoRIO instrumentation (`reverie-dbi`).
 //! * [`hermit::Backend::Kvm`] — a small KVM guest (`reverie-kvm`).
 //!
-//! Both are prototypes and do not yet load and execute arbitrary Linux ELF
-//! programs the way the ptrace backend does (see each crate's README). To keep
-//! `hermit run --backend {dbi,kvm}` useful for kicking the tires, they run a
-//! minimal "hello world" demonstration through their real interception path.
+//! The DBI backend runs the *real* guest ELF: [`run_dbi`] shells out to
+//! DynamoRIO's `drrun` with the `reverie-dbi` client, which loads and executes
+//! `program` in-process while counting branches, intercepting syscalls, and
+//! applying the deterministic CPUID identity — no ptrace. It is still a
+//! prototype: it does not yet drive Detcore's scheduler, so cross-thread
+//! determinism is not enforced the way the ptrace backend enforces it.
+//!
+//! The KVM backend is a narrower prototype and does not yet load arbitrary
+//! Linux ELF programs; [`run_kvm`] runs a minimal built-in "hello world" guest
+//! through its real VM-exit interception path.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -77,7 +83,7 @@ pub fn run_kvm(program: &Path) -> Result<ExitStatus, Error> {
             // KVM backend now hands us a decoded Reverie `Syscall`; recover the
             // raw ABI arguments via `SyscallInfo::into_parts`.
             let (_number, args) = syscall.into_parts();
-            let len = args.arg2 as usize;
+            let len = args.arg2;
             let mut buf = vec![0u8; len];
             if memory.read(args.arg1 as u64, &mut buf).is_err() {
                 return -(libc::EFAULT as i64);

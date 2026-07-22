@@ -35,18 +35,35 @@ TSX/AVX-512 masked). Requires `/dev/kvm` (usable by non-root here).
 ## dbi (experimental) — DynamoRIO instrumentation
 
 ```bash
+$ export DYNAMORIO_HOME=$HOME/dynamorio/install          # marks the backend available
 $ export HERMIT_DRRUN=$HOME/dynamorio/install/bin64/drrun
 $ export HERMIT_DBI_CLIENT=<reverie>/target/debug/reverie-dbi-native/libreverie_dbi_client.so
-$ hermit run --backend dbi -- ./experiments/hello/hello
-hello world
+$ hermit run --backend dbi -- /bin/echo hello
+hello
 ```
 
 `reverie-dbi` is an in-process DynamoRIO client (built outside Cargo because
 DynamoRIO's CMake package supplies the client linker flags). `hermit run
 --backend dbi` shells out to `drrun` with that client, which rewrites the guest
 in-process, counts branches, replaces `CPUID` with the deterministic identity,
-and forwards `write` through a Reverie `Tool`. Without the two env vars it prints
-an actionable error.
+and forwards `write` through a Reverie `Tool`. `DYNAMORIO_HOME` (or
+`DynamoRIO_DIR`) marks the backend available; without `HERMIT_DRRUN` /
+`HERMIT_DBI_CLIENT` it prints an actionable error.
+
+Unlike the KVM prototype, the DBI backend loads and runs the *real* guest ELF
+(`/bin/echo` above executes under DynamoRIO). It does not yet drive Detcore's
+scheduler, so it is not a full determinism backend, but the interception path
+(branch counting, syscall capture, deterministic CPUID) is real.
+
+> **Client revision caveat.** The client built from the `reverie` revision that
+> `hermit-cli` currently pins (`e3e2c965`) **stack-overflows/SIGSEGVs** on
+> dynamic binaries such as `/bin/echo` and `/bin/true`. Build the client from a
+> `reverie` revision on the DBI development line that fixes this — verified with
+> `69f47d9` ("DBI parity: virtualize clocks and resource limits"), which runs
+> `/bin/echo hello` cleanly. `hermit-cli` does not link `reverie-dbi` in Rust
+> (it only shells out to `drrun`), so the client revision is chosen at client
+> build time and is independent of the pinned `reverie` used by the ptrace/kvm
+> backends.
 
 ### Build recipe (required — use a source build, not a prebuilt release)
 
