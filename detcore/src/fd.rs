@@ -50,6 +50,8 @@ pub enum FdType {
     Timerfd,
     /// inotify instance
     Inotify,
+    /// epoll instance (from epoll_create/epoll_create1)
+    Epoll,
     /// socket fd
     Socket,
     /// pipe fd
