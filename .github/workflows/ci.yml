@@ -102,6 +102,9 @@ jobs:
     - name: Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit
+    - name: Fail-closed Hermit test ratchet
+      if: steps.namespaces.outputs.available == 'true'
+      run: ./scripts/test-fail-closed.sh
     - name: PMU Detcore lit tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
