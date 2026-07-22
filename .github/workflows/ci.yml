@@ -79,9 +79,9 @@ jobs:
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev
+          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev
         elif command -v dnf >/dev/null; then
-          sudo dnf install -y libunwind-devel xz-devel
+          sudo dnf install -y cmake gcc-c++ libunwind-devel xz-devel
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
@@ -125,6 +125,20 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    - name: Build pinned LevelDB integration fixture
+      if: steps.namespaces.outputs.available == 'true'
+      run: >-
+        ./hermit-cli/tests/prepare_leveldb.sh
+        "${GITHUB_WORKSPACE}/target/hermit-leveldb-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        "${GITHUB_WORKSPACE}/target/hermit-leveldb-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+    - name: Focused LevelDB strict determinism test
+      if: steps.namespaces.outputs.available == 'true'
+      env:
+        HERMIT_LEVELDB_BUILD_DIR: ${{ github.workspace }}/target/hermit-leveldb-build-${{ github.run_id }}-${{ github.run_attempt }}
+      run: >-
+        cargo test -p hermit --release --test leveldb
+        focused_leveldb_tests_are_deterministic_under_strict
+        -- --exact --test-threads=1
     - name: rr syscall test suite
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test rr_suite -- --ignored
