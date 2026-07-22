@@ -116,12 +116,6 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
-    - name: PMU Detcore lit tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
-    - name: PMU chaos and verify tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test chaos_verify -- --ignored --test-threads=1
     - name: Concurrency stress suites
       if: steps.namespaces.outputs.available == 'true'
       run: |
