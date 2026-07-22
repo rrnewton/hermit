@@ -19,6 +19,7 @@ export ANALYSIS_REPORT="$DEMO_ARTIFACTS/hello-race-analysis.json"
 
 demo_banner "Search and bisect schedules (needs PMU; up to 10 minutes)"
 timeout 600 "$HERMIT" analyze \
+  "${HERMIT_ANALYZE_TMP_FLAGS[@]}" \
   --run-arg=--base-env=host \
   --report-file="$ANALYSIS_REPORT" \
   --analyze-seed=0 \

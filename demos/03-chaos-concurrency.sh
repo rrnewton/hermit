@@ -34,6 +34,7 @@ export CHAOS_SCHEDULE="$DEMO_ARTIFACTS/hello-race-schedule.json"
 
 # Both commands are expected to return the guest's failure status.
 if "$HERMIT" --log=error run \
+  "${HERMIT_TMP_FLAGS[@]}" \
   --chaos --seed=0 \
   --base-env=minimal \
   --no-virtualize-cpuid \
@@ -47,6 +48,7 @@ fi
 test -s "$CHAOS_SCHEDULE"
 
 if "$HERMIT" --log=error run \
+  "${HERMIT_TMP_FLAGS[@]}" \
   --chaos \
   --base-env=minimal \
   --no-virtualize-cpuid \
