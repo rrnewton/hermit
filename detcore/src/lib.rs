@@ -1261,10 +1261,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
 
-            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
-            Syscall::AddKey(_) => self.passthrough(guest, call).await,
-            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
-            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
 
             // POSIX per-process timers. Arming is tracked against the virtual
             // clock so these verify deterministically under --strict; timer
