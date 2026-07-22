@@ -808,7 +808,7 @@ impl RunOpts {
             log1_path,
             &out2,
             log2_path,
-            "Success: deterministic.",
+            "Success: deterministic. Determinism verified.",
             "Failure: nondeterministic.",
         )
     }
