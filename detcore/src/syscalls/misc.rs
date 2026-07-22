@@ -45,7 +45,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         source: &str,
     ) -> Result<usize, Error> {
         let word_size = std::mem::size_of::<u64>();
-        let word_count = len / word_size + usize::from(len % word_size != 0);
+        let word_count = len / word_size + usize::from(!len.is_multiple_of(word_size));
         let mut local_words = vec![0_u64; word_count];
         // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
         let local_buf =
