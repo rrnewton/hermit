@@ -96,6 +96,8 @@ impl Tool for Recorder {
             Sysno::fstat,
             Sysno::lstat,
             Sysno::newfstatat,
+            Sysno::statfs,
+            Sysno::fstatfs,
             Sysno::statx,
             Sysno::getdents,
             Sysno::getdents64,
@@ -106,6 +108,8 @@ impl Tool for Recorder {
             Sysno::close,
             Sysno::fchdir,
             Sysno::fadvise64,
+            Sysno::flock,
+            Sysno::ftruncate,
             Sysno::dup,
             Sysno::dup2,
             Sysno::dup3,
@@ -171,6 +175,14 @@ impl Tool for Recorder {
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Newfstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            Syscall::Statfs(syscall) => {
+                self.handle_statfs(guest, syscall.into(), syscall.buf())
+                    .await
+            }
+            Syscall::Fstatfs(syscall) => {
+                self.handle_statfs(guest, syscall.into(), syscall.buf())
+                    .await
+            }
             Syscall::Statx(syscall) => self.handle_statx(guest, syscall).await,
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
@@ -181,6 +193,8 @@ impl Tool for Recorder {
             Syscall::Close(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
