@@ -77,8 +77,7 @@ fn main() {
         - close(5)
         - close(3)
          */
-        eprintln!("Skipping test in record mode.");
-    } else {
-        run_test();
+        panic!("ERROR: bind_connect_race does not support record mode");
     }
+    run_test();
 }

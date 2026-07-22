@@ -112,9 +112,9 @@ The tested base does not contain the open `CLONE_VFORK` implementation in [PR #2
 
 `hermit-cli/tests/arbitrary_binaries.rs` adds two black-box tests:
 
-- `run_arbitrary_binary_matrix` discovers installed tools and runs static and dynamic ELF, shell, Python, Node, Java, Go, curl, wget, Git, GCC, Make, CMake, SQLite, and a direct Cargo binary. Missing optional packages are skipped; `ls` and `sh` are required baselines.
+- `run_arbitrary_binary_matrix` discovers installed tools and runs static and dynamic ELF, shell, Python, Node, Java, Go, curl, wget, Git, GCC, Make, CMake, SQLite, and a direct Cargo binary. Every declared tool is required; a missing executable fails with its searched paths.
 - `record_replay_stable_arbitrary_binaries` runs `record start --verify` for the locally proven subset: BusyBox, `ls`, `sh`, system Python, curl, wget, system Git, GCC, Make, and direct Cargo.
 
-The existing self-hosted CI job runs `cargo test -p hermit`, so Cargo discovers these integration tests without a workflow change. On this host the run test covered 15 installed categories in 1.9 seconds, and the stable record/replay test covered 10 categories in 16.4 seconds.
+The existing self-hosted CI job runs `cargo test -p hermit`, so Cargo discovers these integration tests without a workflow change. On this host the run test covered all 15 required categories in 1.9 seconds, and the stable record/replay test covered 10 categories in 16.4 seconds.
 
 Keep failing cases out of the green CI matrix until their linked issues are fixed. When a fix lands, move the smallest corresponding probe into the stable record/replay set and retain the functional workload as regression coverage.

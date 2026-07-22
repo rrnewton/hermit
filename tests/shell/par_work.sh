@@ -24,8 +24,8 @@ if [[ "$HERMIT_MODE" = "chaosreplay" ]] ||
    [[ "$HERMIT_MODE" = "tracereplay" ]];
 then
     # TODO(T100400409): Reenable after performance improvements
-    echo "Skipping par_work in unsupported mode. Re-enable when it is fixed." >&2
-    exit 0
+    echo "ERROR: par_work does not support chaosreplay or tracereplay mode." >&2
+    exit 1
 fi
 
 PARALLELISM=10

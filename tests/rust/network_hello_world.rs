@@ -25,8 +25,7 @@ type ServerReadyPair = Arc<(Mutex<bool>, Condvar)>;
 fn main() {
     if matches!(std::env::var("HERMIT_MODE"), Ok(mode) if mode == "record") {
         // TODO: Record mode currently hangs for this test
-        eprintln!("Skipping test in record mode.");
-        return;
+        panic!("ERROR: network_hello_world does not support record mode");
     }
 
     let temp_dir = tempdir().unwrap();

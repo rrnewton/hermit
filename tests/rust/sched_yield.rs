@@ -15,8 +15,7 @@ fn main() {
         // 1. There are no branches to cause preemption points.
         // 2. Timeouts are reset by syscalls.
         // TODO(T100400409) enable this test by (1) adding branches when (2) is fixed
-        eprintln!("Skipping test in unsupported mode.");
-        return;
+        panic!("ERROR: sched_yield does not support chaos or replay modes");
     }
     let _ = std::thread::spawn(move || {
         loop {

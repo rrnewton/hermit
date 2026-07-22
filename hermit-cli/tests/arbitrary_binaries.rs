@@ -53,16 +53,21 @@ fn tool(
     candidates: &[&str],
     args: &'static [&'static str],
     marker: &'static str,
-) -> Option<Tool> {
-    Some(Tool {
+) -> Tool {
+    let path = executable(candidates).unwrap_or_else(|| {
+        panic!(
+            "ERROR: required arbitrary-binary tool {name} is missing; expected an executable at one of {candidates:?}"
+        )
+    });
+    Tool {
         name,
-        path: executable(candidates)?,
+        path,
         args,
         marker,
-    })
+    }
 }
 
-fn available_tools() -> Vec<Tool> {
+fn required_tools() -> Vec<Tool> {
     let mut tools = [
         tool(
             "static_busybox",
@@ -145,17 +150,17 @@ fn available_tools() -> Vec<Tool> {
         ),
     ]
     .into_iter()
-    .flatten()
     .collect::<Vec<_>>();
 
-    if let Some(path) = rustup_tool("cargo") {
-        tools.push(Tool {
-            name: "cargo",
-            path,
-            args: &["--version"],
-            marker: "cargo",
-        });
-    }
+    let path = rustup_tool("cargo").unwrap_or_else(|| {
+        panic!("ERROR: required arbitrary-binary tool cargo is unavailable through rustup")
+    });
+    tools.push(Tool {
+        name: "cargo",
+        path,
+        args: &["--version"],
+        marker: "cargo",
+    });
     tools
 }
 
@@ -226,7 +231,7 @@ fn record_replay(tool: &Tool) -> Output {
 #[test]
 fn run_arbitrary_binary_matrix() {
     let _guard = hermit_run_lock();
-    let tools = available_tools();
+    let tools = required_tools();
     assert!(
         tools.iter().any(|tool| tool.name == "dynamic_ls")
             && tools.iter().any(|tool| tool.name == "shell"),
@@ -254,7 +259,7 @@ fn record_replay_stable_arbitrary_binaries() {
         "make",
         "cargo",
     ];
-    let tools = available_tools();
+    let tools = required_tools();
 
     for tool in tools.iter().filter(|tool| stable.contains(&tool.name)) {
         let output = record_replay(tool);

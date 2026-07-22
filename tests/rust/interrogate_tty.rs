@@ -46,17 +46,14 @@ fn main() {
     println!("fstat(1) = {:?}", fstat(std::io::stdout()));
     println!("fstat(2) = {:?}", fstat(std::io::stderr()));
 
-    if let Ok(mut tty) = fs::OpenOptions::new()
+    let mut tty = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
-    {
-        writeln!(tty, "Hello TTY").unwrap();
-        unsafe {
-            println!("/dev/tty isatty = {:?}", libc::isatty(tty.as_raw_fd()));
-        }
-        println!("fstat(/dev/tty) = {:?}", fstat(&tty));
-    } else {
-        eprintln!("WARNING: This machine does not have /dev/tty available. Skipping part of test.");
+        .expect("ERROR: interrogate_tty requires /dev/tty");
+    writeln!(tty, "Hello TTY").unwrap();
+    unsafe {
+        println!("/dev/tty isatty = {:?}", libc::isatty(tty.as_raw_fd()));
     }
+    println!("fstat(/dev/tty) = {:?}", fstat(&tty));
 }
