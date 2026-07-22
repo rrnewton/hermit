@@ -65,9 +65,9 @@ jobs:
         # PATH, so the old `command -v apt-get` branch wrongly ran
         # `apt-get install golang-go` -> "Unable to locate package golang-go".
         if command -v dnf >/dev/null; then
-          sudo dnf install -y golang libunwind-devel xz-devel
+          sudo dnf install -y golang libunwind-devel sqlite xz-devel
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y golang-go libunwind-dev liblzma-dev
+          sudo apt-get install -y golang-go libunwind-dev liblzma-dev sqlite3
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
