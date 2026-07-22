@@ -99,12 +99,26 @@ jobs:
           echo "available=false" >> "$GITHUB_OUTPUT"
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
         fi
-    - name: Hermit tests including record/replay matrix
+    - name: Stable Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
-      # Hermit integration tests use process-local locks. A single libtest
-      # thread avoids accumulating dozens of blocked harness threads around
-      # the one active guest on resource-constrained self-hosted runners.
-      run: cargo test -p hermit -- --test-threads=1
+      run: |
+        cargo test -p hermit --lib --bins
+        for test in \
+          arbitrary_binaries \
+          cli \
+          clock_determinism \
+          epoll_determinism \
+          ipc_determinism \
+          mmap_determinism \
+          procfs_determinism \
+          random_determinism \
+          record_replay \
+          signal_determinism \
+          thread_sync_determinism
+        do
+          cargo test -p hermit --test "$test" -- --test-threads=1
+        done
+        cargo test -p hermit --test hermit_modes mode_matrix -- --test-threads=1
     - name: PMU Detcore lit tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
