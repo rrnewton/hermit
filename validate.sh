@@ -7,7 +7,12 @@
 
 set -uo pipefail
 
+# Deny warnings for every compiler and rustdoc invocation while preserving any
+# caller-provided flags.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
+export RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 

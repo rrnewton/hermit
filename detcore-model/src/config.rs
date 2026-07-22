@@ -151,7 +151,7 @@ pub struct Config {
     #[clap(long, value_name = "signame")]
     pub stacktrace_signal: Option<SigWrapper>,
 
-    /// [DEPRECATED] Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
+    /// **Deprecated:** Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
     /// and typically goes with preemption recording/replaying.
     #[clap(long)]
     pub preemption_stacktrace: bool,
@@ -173,12 +173,12 @@ pub struct Config {
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 
-    /// [Internal] Set to `true` if we're inside a UTS namespace.
+    /// **Internal:** Set to `true` if we're inside a UTS namespace.
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
     #[clap(skip)]
     pub has_uts_namespace: bool,
 
-    /// [Internal] Path to the replay data folder.
+    /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
 
@@ -238,29 +238,29 @@ pub struct Config {
     #[clap(long, default_value = "0.0", value_name = "double")]
     pub sched_sticky_random_param: f64,
 
-    /// [Internal] An internal flag for indicating to Detcore whether we are in `hermit record` or
+    /// **Internal:** An internal flag for indicating to Detcore whether we are in `hermit record` or
     /// `hermit replay` mode.  This is necessary because there are DIFFERENT global
     /// invariants in record mode (e.g. files dont exist).  If we move to a chroot model
     /// and reproduce more, recording less, then this flag should become obsolete.
     #[clap(skip = false)]
     pub recordreplay_modes: bool,
 
-    /// [Internal] debugging option to stop execution after a specific scheduler commit, aka turn number
+    /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "turn_N")]
     pub stop_after_turn: Option<u64>,
 
-    /// [Internal] debugging option to stop execution after a scheduler loop iteration (non-negative integer).
+    /// **Internal:** debugging option to stop execution after a scheduler loop iteration (non-negative integer).
     /// This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "iter_N")]
     pub stop_after_iter: Option<u64>,
 
-    /// [Internal] Debugging option to treat all sockets as mysterious external, nondeterministic
+    /// **Internal:** Debugging option to treat all sockets as mysterious external, nondeterministic
     /// entities, rather than container-internal and determinstically scheduled.
     #[clap(long)]
     pub debug_externalize_sockets: bool,
 
-    /// [Internal] Debugging option to change how futexes are implemented, either precisely modeled
+    /// **Internal:** Debugging option to change how futexes are implemented, either precisely modeled
     /// by hermit, by polling the kernel with non-blocking futex operations, or treated as external
     /// (nondeterministic) operations which unblock at imprecise times.
     #[clap(
@@ -607,7 +607,7 @@ pub enum BlockingMode {
     /// (and the backoff policy there on) is decided by the scheduler.
     /// See NOTE [Blocking Syscalls via Internal Polling] in this folder.
     Polling,
-    /// Precisely model the [un]blocking behavior inside hermit.
+    /// Precisely model the blocking and unblocking behavior inside hermit.
     /// TODO: This work is not completed yet for all forms of blocking syscalls.
     Precise,
 }
