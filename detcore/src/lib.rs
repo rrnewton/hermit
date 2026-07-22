@@ -534,6 +534,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
+                Sysno::getrusage,
                 Sysno::sysinfo,
                 // TODO(T137258824): add proper Select / PSelect6
                 // Sysno::pselect6,
@@ -1133,6 +1134,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
             Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
+            Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
             Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
