@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::io::ErrorKind;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -23,43 +22,40 @@ fn run_test() {
     let path = dir.path().join("sock");
     let server_path = path.clone();
     let client_path = path.clone();
-    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let (client_result_tx, client_result_rx) = mpsc::channel();
 
     let server = thread::spawn(move || {
         let listener = UnixListener::bind(server_path).expect("bind to succeed");
-        listener
-            .set_nonblocking(true)
-            .expect("set nonblocking to succeed");
 
-        loop {
+        if client_result_rx
+            .recv()
+            .expect("client result channel closed")
+        {
             match listener.accept() {
                 Ok((_stream, _address)) => {
                     println!("Server: got client");
-                    return;
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if cancel_rx.try_recv().is_ok() {
-                        return;
-                    }
-                    thread::yield_now();
                 }
                 Err(error) => {
                     eprintln!("Server: connection failed: {error:?}");
-                    return;
                 }
             }
         }
     });
-    let client = thread::spawn(move || {
-        if let Ok(_stream) = UnixStream::connect(client_path) {
+    let client = thread::spawn(move || match UnixStream::connect(client_path) {
+        Ok(_stream) => {
             eprintln!("Client: connection succeeded..");
-        } else {
+            true
+        }
+        Err(_) => {
             eprintln!("Client: connection failed.");
+            false
         }
     });
 
-    client.join().expect("client to be ok");
-    cancel_tx.send(()).ok();
+    let connected = client.join().expect("client to be ok");
+    client_result_tx
+        .send(connected)
+        .expect("server result channel closed");
     server.join().expect("server to be ok");
 }
 
