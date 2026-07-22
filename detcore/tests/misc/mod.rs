@@ -9,6 +9,7 @@
 //! misc syscall tests
 
 mod notification_fds;
+mod vfork;
 
 use nix::unistd;
 
