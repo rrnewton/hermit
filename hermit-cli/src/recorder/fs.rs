@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -92,6 +93,29 @@ impl Recorder {
                 debug_assert_eq!(ret, 0);
                 let statbuf = syscall.stat().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
                 Ok(SyscallEvent::Stat(StatEvent { statbuf }))
+            }),
+        );
+
+        result
+    }
+
+    pub(super) async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        buf: Option<AddrMut<'_, libc::statfs>>,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|ret| {
+                debug_assert_eq!(ret, 0);
+                let mut bytes = vec![0; std::mem::size_of::<libc::statfs>()];
+                guest
+                    .memory()
+                    .read_exact(buf.ok_or(Errno::EFAULT)?.cast(), &mut bytes)?;
+                Ok(SyscallEvent::Statfs(bytes))
             }),
         );
 
