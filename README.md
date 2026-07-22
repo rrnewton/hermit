@@ -78,6 +78,22 @@ stronger mode:
 hermit run --strict -- /bin/echo hello
 ```
 
+### Execution Backends
+
+`hermit run` accepts `--backend=ptrace|dbi|kvm`. Omitting the option selects
+`ptrace`, preserving the existing behavior:
+
+```bash
+hermit run --backend=ptrace -- /bin/echo hello
+```
+
+Backend selection fails closed. Hermit never substitutes ptrace after an
+explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
+SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
+requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
+and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
+an availability error rather than running the command without determinization.
+
 A quick determinism check is to run the same virtual random-data read twice:
 
 ```bash

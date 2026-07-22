@@ -125,6 +125,26 @@ the variables the program needs:
 hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 ```
 
+#### Backend Selection
+
+Use `--backend=ptrace|dbi|kvm` to select the process instrumentation backend.
+The default is `ptrace`, so existing commands are unchanged:
+
+```bash
+hermit run --backend=ptrace -- /bin/echo hello
+```
+
+Hermit detects whether the requested backend is integrated and available on
+the current host. It does not silently fall back to a different backend. The
+current DynamoRIO prototype requires a discoverable SDK and has no Detcore
+process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
+commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
+those prototypes therefore fail before the guest starts and explain the missing
+capability.
+
+`--namespace-only` bypasses instrumentation entirely. Combining it with any
+explicit `--backend` selection is rejected because the backend would be ignored.
+
 Hermit does not snapshot the host file system. If `PROGRAM` reads a file that
 changes between runs, the result is allowed to change. Use immutable inputs,
 a fixed container image, or explicit mounts to control this dependency.
