@@ -54,6 +54,7 @@ where
     F: Fn(),
 {
     let config = detcore::Config {
+        allow_passthrough: true,
         preemption_timeout: None,
         ..Default::default()
     };
@@ -65,6 +66,7 @@ where
     F: Fn(),
 {
     let config = detcore::Config {
+        allow_passthrough: true,
         preemption_timeout: None,
         sequentialize_threads: true,
         ..Default::default()
