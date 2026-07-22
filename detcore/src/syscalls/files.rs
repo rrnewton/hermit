@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use futures::future::BoxFuture;
 use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use reverie::Error;
@@ -109,6 +110,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         guest.thread_state().add_fd(fd, flags, ty, stat)
+    }
+
+    async fn with_fd_resource<G, F>(
+        &self,
+        guest: &mut G,
+        resource: Option<ResourceID>,
+        permission: Permission,
+        operation: F,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        F: for<'a> FnOnce(&'a Self, &'a mut G) -> BoxFuture<'a, Result<i64, Error>>,
+    {
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, permission);
+            resource_request(guest, request).await;
+        }
+
+        let result = operation(self, guest).await;
+        resource_release_all(guest).await;
+        result
     }
 
     pub(crate) async fn release_port_for_open_file<G: Guest<Self>>(
@@ -470,49 +492,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
-            resource_request(guest, request).await;
-        }
-
-        let res = match fd_type {
-            FdType::Rng => {
-                trace!("Read call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                return Ok(n as i64);
-            }
-            FdType::Regular => {
-                if guest.config().deterministic_io {
-                    self.deterministic_read(guest, call).await
-                } else {
-                    Ok(self.record_or_replay(guest, call).await?)
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Rng => {
+                        trace!("Read call RNG fd {}, simulating...", call.fd());
+                        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                        let n = this.fill_random_bytes(
+                            guest,
+                            remote_buf,
+                            call.len(),
+                            "/dev/[u]random",
+                        )?;
+                        Ok(n as i64)
+                    }
+                    FdType::Regular => {
+                        if guest.config().deterministic_io {
+                            this.deterministic_read(guest, call).await
+                        } else {
+                            Ok(this.record_or_replay(guest, call).await?)
+                        }
+                    }
+                    FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+                        trace!(
+                            "Possibly blocking read call on notification fd {}, type {:?}",
+                            call.fd(),
+                            fd_type
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
+                        trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
+                        Ok(this.record_or_replay(guest, call).await?)
+                    }
+                    FdType::Socket | FdType::Pipe => {
+                        trace!(
+                            "Possibly blocking read call on {:?} fd {}",
+                            fd_type,
+                            call.fd()
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
                 }
-            }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
-                trace!(
-                    "Possibly blocking read call on notification fd {}, type {:?}",
-                    call.fd(),
-                    fd_type
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
-                trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
-                Ok(self.record_or_replay(guest, call).await?)
-            }
+            })
+        })
+        .await
+    }
 
-            FdType::Socket | FdType::Pipe => {
-                trace!(
-                    "Possibly blocking read call on {:?} fd {}",
-                    fd_type,
-                    call.fd()
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-        };
-        resource_release_all(guest).await;
-        res
+    /// SYS_readv system call (MAYHANG).
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let (fd_type, resource) = guest
+            .thread_state_mut()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Socket | FdType::Pipe => {
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    _ => Ok(this.record_or_replay(guest, call).await?),
+                }
+            })
+        })
+        .await
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its
@@ -638,6 +685,39 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         resource_release_all(guest).await;
         res
+    }
+
+    /// SYS_writev system call (MAYHANG).
+    pub async fn handle_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
+        if guest.config().virtualize_metadata {
+            let inode =
+                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+            touch_file(guest, inode).await;
+        }
+
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move {
+                if physically_nonblocking && matches!(fd_type, FdType::Socket | FdType::Pipe) {
+                    this.execute_nonblockable_fd_syscall(guest, call).await
+                } else {
+                    Ok(this.record_or_replay(guest, call).await?)
+                }
+            })
+        })
+        .await
     }
 
     /// SYS_mmap system call.

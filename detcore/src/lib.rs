@@ -68,7 +68,6 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
-use reverie::syscalls::Fork;
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -505,6 +504,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::statfs,
                 Sysno::close,
                 Sysno::read,
+                Sysno::readv,
+                Sysno::writev,
                 Sysno::mmap,
                 Sysno::munmap,
                 Sysno::mremap,
@@ -555,6 +556,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
                 Sysno::poll,
+                Sysno::ppoll,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -1036,6 +1038,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
             Syscall::Close(s) => self.handle_close(guest, s).await,
             Syscall::Read(s) => self.handle_read(guest, s).await,
+            Syscall::Readv(s) => self.handle_readv(guest, s).await,
+            Syscall::Writev(s) => self.handle_writev(guest, s).await,
             Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
             Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
             Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
@@ -1115,6 +1119,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
             Syscall::Poll(s) => self.handle_poll(guest, s).await,
+            Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
             Syscall::EpollCreate(s) => {
                 self.handle_epoll_create1(guest, EpollCreate1::from(s))
                     .await
@@ -1262,5 +1267,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+mod release_subscription_tests {
+    use super::*;
+    use crate::record_or_replay::NoopTool;
+
+    #[test]
+    fn qemu_syscalls_are_in_optimized_subscription() {
+        let subscription = <Detcore<NoopTool> as Tool>::subscriptions(&Config::default());
+        let syscalls: Vec<_> = subscription.iter_syscalls().collect();
+
+        for syscall in [Sysno::ppoll, Sysno::readv, Sysno::writev] {
+            assert!(
+                syscalls.contains(&syscall),
+                "missing {syscall} subscription"
+            );
+        }
     }
 }

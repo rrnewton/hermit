@@ -10,19 +10,18 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use rand::Rng;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::syscalls;
-use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+#[cfg(test)]
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
@@ -32,12 +31,16 @@ use tracing::trace;
 use crate::config::BlockingMode;
 use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
+use crate::syscalls::helpers::ParsedTimeout;
+use crate::syscalls::helpers::absolute_timespec_timeout;
+use crate::syscalls::helpers::execute_internal_io_polling;
+use crate::syscalls::helpers::relative_timespec_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
@@ -45,16 +48,17 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
-use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FutexTimeout {
     Relative(u64),
     Absolute(LogicalTime),
 }
 
+#[cfg(test)]
 fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
     let nanoseconds = u64::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
@@ -75,29 +79,25 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     }
 }
 
-async fn futex_timeout_deadline<G, T>(
-    guest: &mut G,
-    futex_op: i32,
-    timeout: Option<Addr<'_, Timespec>>,
-) -> Result<Option<LogicalTime>, Error>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let Some(timeout) = timeout else {
-        return Ok(None);
-    };
-    let timeout = parse_futex_timeout(futex_op, guest.memory().read_value(timeout)?)?;
-    match timeout {
-        FutexTimeout::Relative(nanos) => {
-            let now = thread_observe_time(guest).await;
-            Ok(Some(now + Duration::from_nanos(nanos)))
-        }
-        FutexTimeout::Absolute(deadline) => Ok(Some(deadline)),
-    }
-}
-
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn futex_timeout<G: Guest<Self>>(
+        guest: &mut G,
+        call: syscalls::Futex,
+        futex_op: i32,
+    ) -> Result<ParsedTimeout, Error> {
+        let timeout = if let Some(addr) = call.timeout() {
+            Some(guest.memory().read_value(addr)?)
+        } else {
+            None
+        };
+
+        if futex_op == libc::FUTEX_WAIT_BITSET {
+            Ok(absolute_timespec_timeout(timeout)?)
+        } else {
+            relative_timespec_timeout(guest, timeout).await
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -114,6 +114,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
+        let vfork_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         let child_priority_entropy = if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
@@ -140,7 +141,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Remove it from Detcore's run queue before entering that blocking call.
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockingExternalIO, Permission::RW);
+            resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
             resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }
@@ -149,7 +150,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockedExternalContinue, Permission::RW);
+            resources.insert(
+                ResourceID::BlockedExternalContinue(vfork_op_id),
+                Permission::RW,
+            );
             resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }
@@ -329,8 +333,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
-                    let maybe_timeout_lt =
-                        futex_timeout_deadline(guest, futex_op, call.timeout()).await?;
+                    let timeout = Self::futex_timeout(guest, call, futex_op).await?;
+                    let maybe_timeout_lt = match timeout {
+                        ParsedTimeout::Immediate => Some(thread_observe_time(guest).await),
+                        ParsedTimeout::Infinite => None,
+                        ParsedTimeout::Deadline(deadline) => Some(deadline),
+                    };
                     let ans = futex_action(
                         guest,
                         FutexAction::WaitRequest(maybe_timeout_lt),
@@ -384,13 +392,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrc
         }
 
-        fn make_futex_wait_request(dettid: DetTid) -> Resources {
-            let mut rsrc = Resources::new(dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("futex_wait");
-            rsrc
-        }
-
         let dettid = guest.thread_state().dettid;
         let futex_op = call.futex_op() & libc::FUTEX_CMD_MASK;
         match futex_op {
@@ -414,16 +415,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let res = guest.inject(call).await;
                     Ok(res?)
                 } else {
-                    let rsrc = make_futex_wait_request(dettid);
-                    let deadline = futex_timeout_deadline(guest, futex_op, call.timeout()).await?;
-                    let res =
-                        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await?;
-                    trace!(
-                        "[detcore, dtid {}] after futex wait, memory value is {}",
-                        &dettid,
-                        guest.memory().read_value(call.uaddr().unwrap()).unwrap()
-                    );
-                    Ok(res)
+                    let timeout = Self::futex_timeout(guest, call, futex_op).await?;
+                    if timeout == ParsedTimeout::Immediate {
+                        info!(
+                            "[detcore, dtid {}] Letting Futex wait through because it's nonblocking ({} != {}).",
+                            dettid,
+                            init_val,
+                            call.val()
+                        );
+                        Ok(guest.inject(call).await?)
+                    } else {
+                        let res = execute_internal_io_polling(guest, call, timeout).await?;
+                        trace!(
+                            "[detcore, dtid {}] after futex wait, memory value is {}",
+                            &dettid,
+                            guest.memory().read_value(call.uaddr().unwrap()).unwrap()
+                        );
+                        Ok(res)
+                    }
                 }
             }
             libc::FUTEX_FD => {
