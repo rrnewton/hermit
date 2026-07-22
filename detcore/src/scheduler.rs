@@ -76,9 +76,6 @@ use crate::util::truncated;
 /// Unique identifier for an action.
 pub type ActionID = u64;
 
-/// A non-negative integer number of seconds.
-pub type Seconds = u32;
-
 /// A representation of side effects that are happening, or could be happening, right now
 /// in the background.
 #[derive(Debug, Clone)]
@@ -2242,29 +2239,31 @@ impl Scheduler {
         print_stack
     }
 
-    // Returns the number of seconds until any previously scheduled alarm, if any (zero otherwise).
+    // Returns the logical duration until any previously scheduled alarm, if any (zero otherwise).
     pub fn register_alarm(
         &mut self,
         detpid: DetPid,
         dettid: DetTid,
-        seconds: Seconds,
+        duration: LogicalTime,
         sig: Signal,
-    ) -> Seconds {
-        let old = if seconds == 0 {
+    ) -> LogicalTime {
+        let old = if duration == LogicalTime::ZERO {
             // Alarm of 0 cancels any pending signal.
             self.blocked.timed_waiters.remove_alarm(detpid)
         } else {
-            let target_time = self.committed_time + Duration::from_secs(seconds as u64);
+            let target_time = self.committed_time + duration;
             self.blocked
                 .timed_waiters
                 .insert_alarm(target_time, detpid, dettid, sig)
         };
         if let Some(old_target_time) = old {
-            let remain_ns: u64 = old_target_time.as_nanos() - self.committed_time.as_nanos();
-            (remain_ns / 1_000_000_000) as u32
+            let remain_ns: u64 = old_target_time
+                .as_nanos()
+                .saturating_sub(self.committed_time.as_nanos());
+            LogicalTime::from_nanos(remain_ns)
         } else {
             // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
-            0
+            LogicalTime::ZERO
         }
     }
 }

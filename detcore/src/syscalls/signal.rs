@@ -38,6 +38,26 @@ use crate::types::LogicalTime;
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
 const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
 
+fn timeval_to_logical_time(value: libc::timeval) -> Result<LogicalTime, Errno> {
+    let seconds = u64::try_from(value.tv_sec).map_err(|_| Errno::EINVAL)?;
+    let micros = u64::try_from(value.tv_usec).map_err(|_| Errno::EINVAL)?;
+    if micros >= 1_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    let nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(micros * 1_000))
+        .ok_or(Errno::EINVAL)?;
+    Ok(LogicalTime::from_nanos(nanos))
+}
+
+fn logical_time_to_timeval(value: LogicalTime) -> libc::timeval {
+    libc::timeval {
+        tv_sec: value.as_secs() as libc::time_t,
+        tv_usec: value.subsec_micros() as libc::suseconds_t,
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// We send the alarms to the global scheduler to handle.
     pub async fn handle_alarm<G: Guest<Self>>(
@@ -46,8 +66,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Alarm,
     ) -> Result<i64, Error> {
         if guest.config().sequentialize_threads {
-            let remaining = register_alarm(guest, call.seconds(), Signal::SIGALRM).await;
-            Ok(remaining as i64)
+            let remaining = register_alarm(
+                guest,
+                LogicalTime::from_secs(call.seconds() as u64),
+                Signal::SIGALRM,
+            )
+            .await;
+            Ok(remaining.as_secs() as i64)
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting alarm call through...",
@@ -55,6 +80,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             Ok(guest.inject(call).await?)
         }
+    }
+
+    /// Schedule a one-shot real-time interval timer on Detcore logical time.
+    pub async fn handle_setitimer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Setitimer,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            info!(
+                "[dtid {}] Running without scheduler, so letting setitimer call through...",
+                guest.thread_state().dettid
+            );
+            return Ok(guest.inject(call).await?);
+        }
+        if call.which() != libc::ITIMER_REAL {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
+
+        let value = call.value().ok_or(Errno::EFAULT)?;
+        let timer: libc::itimerval = guest.memory().read_value(value)?;
+        if timeval_to_logical_time(timer.it_interval)? != LogicalTime::ZERO {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
+
+        let duration = timeval_to_logical_time(timer.it_value)?;
+        let remaining = register_alarm(guest, duration, Signal::SIGALRM).await;
+        if let Some(old_value) = call.ovalue() {
+            let old_timer = libc::itimerval {
+                it_interval: logical_time_to_timeval(LogicalTime::ZERO),
+                it_value: logical_time_to_timeval(remaining),
+            };
+            guest.memory().write_value(old_value, &old_timer)?;
+        }
+        Ok(0)
     }
 
     /// A pause is really just an unbounded sleep.
@@ -161,5 +221,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
         retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timeval(seconds: libc::time_t, micros: libc::suseconds_t) -> libc::timeval {
+        libc::timeval {
+            tv_sec: seconds,
+            tv_usec: micros,
+        }
+    }
+
+    #[test]
+    fn timeval_conversion_preserves_subsecond_precision() {
+        let logical_time =
+            timeval_to_logical_time(timeval(2, 345_678)).expect("valid timeval should convert");
+        assert_eq!(
+            logical_time,
+            LogicalTime::from_nanos(2_345_678_000),
+            "timeval conversion should preserve microsecond precision"
+        );
+
+        let round_trip = logical_time_to_timeval(logical_time);
+        assert_eq!(round_trip.tv_sec, 2, "round trip should preserve seconds");
+        assert_eq!(
+            round_trip.tv_usec, 345_678,
+            "round trip should preserve microseconds"
+        );
+    }
+
+    #[test]
+    fn timeval_conversion_rejects_invalid_values() {
+        for invalid in [
+            timeval(-1, 0),
+            timeval(0, -1),
+            timeval(0, 1_000_000),
+            timeval(libc::time_t::MAX, 0),
+        ] {
+            assert_eq!(
+                timeval_to_logical_time(invalid),
+                Err(Errno::EINVAL),
+                "invalid timeval should return EINVAL"
+            );
+        }
     }
 }

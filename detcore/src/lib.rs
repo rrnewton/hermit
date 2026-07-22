@@ -74,6 +74,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use reverie::syscalls::ioctl::Request as IoctlRequest;
 pub use scheduler::Priority;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
@@ -477,6 +478,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::pread64,
                 Sysno::lseek,
                 Sysno::fadvise64,
+                Sysno::ioctl,
+                Sysno::mkdir,
                 Sysno::mmap,
                 Sysno::munmap,
                 Sysno::mremap,
@@ -503,6 +506,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futimesat,
                 Sysno::socket,
                 Sysno::socketpair,
+                Sysno::setsockopt,
                 Sysno::eventfd,
                 Sysno::eventfd2,
                 Sysno::sched_getaffinity,
@@ -512,6 +516,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::timerfd_create,
                 Sysno::timerfd_settime,
                 Sysno::timerfd_gettime,
+                Sysno::setitimer,
                 Sysno::inotify_init,
                 Sysno::inotify_init1,
                 Sysno::inotify_add_watch,
@@ -533,15 +538,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
                 Sysno::rt_sigtimedwait,
+                Sysno::kill,
+                Sysno::tgkill,
                 Sysno::execve,
                 Sysno::execveat,
                 Sysno::rseq,
+                Sysno::clock_settime,
                 Sysno::getpid,
                 Sysno::gettid,
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
+                Sysno::getrlimit,
                 Sysno::sysinfo,
                 // TODO(T137258824): add proper Select / PSelect6
                 // Sysno::pselect6,
@@ -1019,6 +1028,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Lseek(_) => self.passthrough(guest, call).await,
             // This syscall is advisory; fixed success preserves its API contract.
             Syscall::Fadvise64(_) => Ok(0),
+            Syscall::Ioctl(s) => match s.request() {
+                IoctlRequest::TCGETS(_) | IoctlRequest::TIOCGWINSZ(_) => {
+                    Err(Error::Errno(Errno::ENOTTY))
+                }
+                IoctlRequest::FIOCLEX | IoctlRequest::FIONCLEX => {
+                    self.passthrough(guest, call).await
+                }
+                _ => Err(Error::Errno(Errno::ENOSYS)),
+            },
+            Syscall::Mkdir(_) => self.passthrough(guest, call).await,
             Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
             Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
             Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
@@ -1046,6 +1065,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_clock_gettime(guest, s).await
             }
             Syscall::ClockGetres(s) if virtualize_time => self.handle_clock_getres(guest, s).await,
+            Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
+            Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
             Syscall::Uname(s) => self.handle_uname(guest, s).await,
             Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
             Syscall::Exit(s) => self.handle_exit(guest, s).await,
@@ -1065,6 +1086,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
             Syscall::Socket(s) => self.handle_socket(guest, s).await,
             Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
+            Syscall::Setsockopt(_) => self.passthrough(guest, call).await,
             Syscall::Connect(s) => self.handle_connect(guest, s).await,
             Syscall::Bind(s) => self.handle_bind(guest, s).await,
             Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
@@ -1125,6 +1147,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO: handle timeout behavior:
             // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
             Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
+            Syscall::Kill(_) => self.passthrough(guest, call).await,
+            Syscall::Tgkill(_) => self.passthrough(guest, call).await,
 
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
@@ -1151,6 +1175,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
             Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
+            Syscall::Getrlimit(_) => self.passthrough(guest, call).await,
             Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
