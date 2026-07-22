@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Virtualize uname syscall
+//! Miscellaneous virtualized syscalls.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
@@ -18,6 +18,7 @@ use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
@@ -35,6 +36,36 @@ fn from_str(s: &str) -> [i8; 65] {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Fill guest memory from the deterministic PRNG owned by the current thread.
+    pub(super) fn fill_random_bytes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        remote_buf: AddrMut<u8>,
+        len: usize,
+        source: &str,
+    ) -> Result<usize, Error> {
+        let word_size = std::mem::size_of::<u64>();
+        let word_count = len / word_size + usize::from(!len.is_multiple_of(word_size));
+        let mut local_words = vec![0_u64; word_count];
+        // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
+        let local_buf =
+            unsafe { std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), len) };
+        guest.thread_state_mut().thread_prng().fill(local_buf);
+        let n = guest.memory().write(remote_buf, local_buf)?;
+        if cfg!(debug_assertions) {
+            let mut hasher = DefaultHasher::new();
+            Hash::hash_slice(local_buf, &mut hasher);
+            detlog!(
+                "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
+                guest.thread_state().dettid,
+                source,
+                n,
+                hasher.finish()
+            );
+        }
+        Ok(n)
+    }
+
     /// uname syscall
     pub async fn handle_uname<G: Guest<Self>>(
         &self,
@@ -61,7 +92,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(ret)
     }
 
-    /// getrandon system call
+    /// getrandom system call
     pub async fn handle_getrandom<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -69,23 +100,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let buf = call.buf().ok_or(Errno::EFAULT)?;
 
-        let mut local_buf: Vec<u8> = vec![0; call.buflen()];
-        guest
-            .thread_state_mut()
-            .thread_prng()
-            .fill(local_buf.as_mut_slice());
-        let n = guest.memory().write(buf, local_buf.as_slice())?;
-        if cfg!(debug_assertions) {
-            let mut hasher = DefaultHasher::new();
-            Hash::hash_slice(local_buf.as_slice(), &mut hasher);
-            detlog!(
-                "[dtid {}] USER RAND [getrandom] Filled guest memory with {} random bytes, hash of bytes: {}",
-                guest.thread_state().dettid,
-                n,
-                hasher.finish()
-            );
-        }
-
+        let n = self.fill_random_bytes(guest, buf, call.buflen(), "getrandom")?;
         Ok(n as i64)
     }
 
