@@ -7,6 +7,21 @@
 # directory, executable, inputs, and Hermit revision unchanged between recording
 # and replay.
 
+set -euo pipefail
+
+# shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
+DEMO_LABEL="Demo 2: Record And Replay"
+cat <<'DESC'
+=== Demo 2: Record And Replay ===
+
+Hermit records an execution into an isolated data directory, lists the recording
+in text and JSON, and replays it to completion with --autopilot. It can also
+record and immediately verify a replay. Without --autopilot, hermit replay
+starts a replay gdbserver and GDB client; the demo drives a noninteractive GDB
+session that continues the guest to completion. Keep the recording directory,
+executable, inputs, and Hermit revision unchanged between recording and replay.
+DESC
+
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export DEMO_DATA_DIR="$DEMO_TMP/recordings"
@@ -38,5 +53,4 @@ timeout 90 "$HERMIT" --log=error replay \
   --gdbex=continue \
   --gdbex=quit
 
-echo
-echo "Demo 2 complete."
+demo_success
