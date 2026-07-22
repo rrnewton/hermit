@@ -10,6 +10,8 @@
 
 mod notification_fds;
 mod vfork;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use nix::unistd;
 
@@ -536,6 +538,112 @@ fn select_ready_and_timeout() {
 }
 
 #[test]
+fn select_fd_set_abi_boundaries() {
+    det_test_fn_without_pmu(|| {
+        let invalid_set = 1_usize as *mut libc::fd_set;
+        let mut timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    0,
+                    invalid_set,
+                    invalid_set,
+                    invalid_set,
+                    &mut timeout,
+                )
+            },
+            0
+        );
+
+        timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    -1,
+                    invalid_set,
+                    invalid_set,
+                    invalid_set,
+                    &mut timeout,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    1,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut timeout,
+                )
+            },
+            0
+        );
+
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let protected_page = unsafe { mapping.cast::<u8>().add(page_size) };
+        assert_eq!(
+            unsafe { libc::mprotect(protected_page.cast(), page_size, libc::PROT_NONE) },
+            0
+        );
+        let one_word_set = unsafe {
+            protected_page
+                .sub(std::mem::size_of::<libc::c_ulong>())
+                .cast::<libc::fd_set>()
+        };
+        unsafe { one_word_set.cast::<libc::c_ulong>().write(0) };
+        timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    1,
+                    one_word_set,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut timeout,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { libc::munmap(mapping, page_size * 2) }, 0);
+    });
+}
+
+#[test]
 fn pselect6_ready_and_timeout() {
     #[derive(Clone, Copy)]
     #[repr(C)]
@@ -616,6 +724,96 @@ fn pselect6_ready_and_timeout() {
         assert_eq!((expired_timeout.tv_sec, expired_timeout.tv_nsec), (0, 0));
         assert_eq!(unsafe { libc::close(pipefds[0]) }, 0);
         assert_eq!(unsafe { libc::close(pipefds[1]) }, 0);
+    });
+}
+
+static PSELECT_SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn pselect_signal_handler(_: libc::c_int) {
+    PSELECT_SIGNAL_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn pselect6_temporarily_unmasks_signal() {
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct Pselect6SigmaskArg {
+        sigmask: *const libc::sigset_t,
+        sigsetsize: usize,
+    }
+
+    det_test_fn_without_pmu(|| {
+        PSELECT_SIGNAL_RECEIVED.store(false, Ordering::SeqCst);
+
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = pselect_signal_handler as *const () as usize;
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+            0
+        );
+
+        let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut blocked, libc::SIGUSR1) }, 0);
+        let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut old_mask) },
+            0
+        );
+
+        let main_thread = unsafe { libc::pthread_self() };
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert_eq!(unsafe { libc::pthread_kill(main_thread, libc::SIGUSR1) }, 0);
+        });
+
+        let mut temporary_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut temporary_mask) }, 0);
+        let sigmask_arg = Pselect6SigmaskArg {
+            sigmask: &temporary_mask,
+            sigsetsize: std::mem::size_of::<libc::c_ulong>(),
+        };
+        let mut timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pselect6,
+                    0,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut timeout,
+                    &sigmask_arg,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+        sender.join().unwrap();
+        assert!(PSELECT_SIGNAL_RECEIVED.load(Ordering::SeqCst));
+
+        let mut current_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut current_mask)
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::sigismember(&current_mask, libc::SIGUSR1) },
+            1
+        );
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut()) },
+            0
+        );
     });
 }
 

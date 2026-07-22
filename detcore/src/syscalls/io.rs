@@ -42,13 +42,6 @@ use crate::syscalls::helpers::relative_timeval_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Pselect6SigmaskArg {
-    sigmask: usize,
-    sigsetsize: usize,
-}
-
 fn fd_set_exceeds_scratch_capacity(nfds: i32) -> bool {
     // The raw Linux ABI accepts dynamically sized fd sets, but Reverie's syscall model and our
     // retry scratch storage use libc's fixed-size fd_set.
@@ -154,6 +147,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Select,
     ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
         if !self.cfg.sequentialize_threads
             || self.cfg.recordreplay_modes
             || fd_set_exceeds_scratch_capacity(call.nfds())
@@ -190,6 +187,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pselect6,
     ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
         if !self.cfg.sequentialize_threads
             || self.cfg.recordreplay_modes
             || fd_set_exceeds_scratch_capacity(call.nfds())
@@ -197,14 +198,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self
                 .record_or_replay_blocking(guest, Syscall::Pselect6(call))
                 .await;
-        }
-        if let Some(addr) = call.sigmask() {
-            let arg: Pselect6SigmaskArg = guest.memory().read_value(addr.cast())?;
-            if arg.sigmask != 0 {
-                return self
-                    .record_or_replay_blocking(guest, Syscall::Pselect6(call))
-                    .await;
-            }
         }
 
         let timeout_addr = if let Some(addr) = call.timeout() {
