@@ -135,6 +135,28 @@ fn signal_restarts_emulated_blocking_read() {
         "blocking read restarted deliveries=1 bytes=xx\n",
     );
 }
+
+#[test]
+fn signal_interrupts_poll_despite_sa_restart() {
+    run_signal_scenario("poll-sa-restart", "poll interrupted deliveries=1\n");
+}
+
+#[test]
+fn signal_interrupts_epoll_wait_despite_sa_restart() {
+    run_signal_scenario(
+        "epoll-wait-sa-restart",
+        "epoll_wait interrupted deliveries=1\n",
+    );
+}
+
+#[test]
+fn signal_interrupts_rt_sigtimedwait_despite_sa_restart() {
+    run_signal_scenario(
+        "sigtimedwait-sa-restart",
+        "rt_sigtimedwait interrupted deliveries=1 pending=SIGUSR2\n",
+    );
+}
+
 #[test]
 fn signal_masks_survive_fork_and_clone() {
     run_signal_scenario(

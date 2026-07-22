@@ -324,6 +324,12 @@ pub trait NonblockableSyscall: SyscallInfo {
         res == Ok(0)
     }
 
+    /// Return the errno used when a signal interrupts this internally polled syscall.
+    /// Most blocking I/O is restartable when its handler uses `SA_RESTART`.
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::ERESTARTSYS
+    }
+
     /// Convert a physical nonblocking completion into the result expected by the guest.
     /// `retried` is true after a prior result was classified as blocked.
     fn normalize_nonblocking_result(
@@ -350,6 +356,10 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
         (self.with_timeout(0), None)
     }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Poll {
@@ -365,6 +375,10 @@ impl NonblockableSyscall for reverie::syscalls::EpollWait {
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
         (self.with_timeout(0), None)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
     }
 }
 
@@ -443,11 +457,19 @@ impl NonblockableSyscall for reverie::syscalls::RtSigtimedwait {
         let (tp, guard) = zero_timespec(guest).await;
         (self.with_timeout(Some(tp)), Some(guard))
     }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
-        Ok(0)
+        Err(Errno::EAGAIN)
     }
 }
 
@@ -700,11 +722,13 @@ where
 
     loop {
         if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+            let errno = call.signal_interrupt_errno();
             tracing::trace!(
-                "retry_nonblocking_syscall: interrupted by signal before retrying {}",
-                call.display(&guest.memory())
+                "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",
+                call.display(&guest.memory()),
+                errno
             );
-            return Err(Errno::ERESTARTSYS.into());
+            return Err(errno.into());
         }
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
@@ -842,6 +866,30 @@ mod tests {
         assert_eq!(
             call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
             Err(Errno::EISCONN)
+        );
+    }
+
+    #[test]
+    fn signal_interruption_errno_matches_linux_restart_policy() {
+        assert_eq!(
+            reverie::syscalls::Poll::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::EpollWait::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        let sigtimedwait = reverie::syscalls::RtSigtimedwait::new();
+        assert_eq!(sigtimedwait.signal_interrupt_errno(), Errno::EINTR);
+        assert!(sigtimedwait.syscall_would_have_blocked(Err(Errno::EAGAIN)));
+        assert_eq!(sigtimedwait.timeout_return_val(), Err(Errno::EAGAIN));
+        assert_eq!(
+            reverie::syscalls::Read::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
+        );
+        assert_eq!(
+            reverie::syscalls::Futex::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
         );
     }
 }
