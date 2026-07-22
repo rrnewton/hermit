@@ -89,11 +89,12 @@ general multithreaded determinism. See `ai_docs/sabre-determinism-analysis.md`
 for the gap analysis and roadmap.
 
 **KVM / SVM (hardware virtualization).** Running the guest as a VM guest lets the
-monitor trap on VM-exits, which is the only mechanism that can intercept
-unconditional non-deterministic instructions (e.g. `RDRAND`, and `CPUID` on
-hardware/kernels that do not expose user-space CPUID faulting). The cost is a
-much larger integration surface and the loss of the simple "host process under
-ptrace" model.
+monitor use hardware controls to trap instructions such as `RDRAND` and `CPUID`
+without relying on host user-space faulting support. A sufficiently complete
+DBI could instead decode and rewrite those instructions before they execute;
+the current DBI prototype does not provide that coverage. Hardware
+virtualization has a much larger integration surface and loses the simple
+"host process under ptrace" model.
 
 The important invariant across all three: interception alone does not create
 determinism. Whichever backend catches an event, a Detcore handler must still
@@ -488,10 +489,15 @@ signal-disposition syscalls (`detcore/src/syscalls/signal.rs`).
   scheduler; a `pause` is modeled as an unbounded sleep that a delivered signal
   makes runnable. `alarm`/timer expirations are routed through `GlobalState` so
   the deadline is measured in logical time.
-- **Interrupted syscalls.** When a signal interrupts a blocking operation, the
-  handler path preserves the kernel's restart semantics (`restart_syscall` and
-  `rt_sigreturn` are always allowed through seccomp) so a deferred signal does
-  not corrupt an in-flight syscall.
+- **Interrupted syscalls.** For operations that Detcore leaves blocking in the
+  kernel, Linux retains its normal restart path; `restart_syscall` and
+  `rt_sigreturn` are allowed through seccomp. Emulated blocking I/O is a current
+  gap. Its nonblocking retry loop does not yet turn a signal wakeup into the
+  syscall-specific internal restart result, so a queued retry can continue
+  polling instead of returning `EINTR` or being transparently restarted. A fix
+  must also preserve Linux's distinction between restartable calls such as a
+  pipe `read` and calls such as `poll`, `epoll_wait`, and `rt_sigtimedwait`,
+  which are not restarted by `SA_RESTART`.
 
 Determinism boundary: signal *content*/delivery is scheduled, but signals are
 not currently written into the record/replay event stream, so a workload that
@@ -569,10 +575,15 @@ approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
 The mechanism rides on the FD model. When `open`/`openat` resolves to one of
 these paths, the `DetFd` is tagged with a `ProcfsFile` descriptor. On the first
 `read`, Detcore captures the real kernel contents, runs the field normalizer,
-and stores the sanitized buffer on the open file description; subsequent reads
-(including partial reads at an offset) are served from that immutable snapshot.
-Because the snapshot is taken once and normalized, repeated reads and re-reads
-are stable within a run and identical across runs.
+and stores the sanitized buffer on the open file description. Subsequent
+sequential reads return slices from that immutable snapshot using a shared
+logical offset, so partial reads of that one snapshot are consistent.
+
+This is not a complete host-independent representation of any of the three
+files. Fields not listed above remain exactly as the host kernel reported them,
+and a separately opened file receives a separate snapshot. The normalized
+fields are stable; equality across runs still depends on every unnormalized
+field and other external inputs remaining unchanged.
 
 This is deliberately a narrow allow-list of *observed* volatile fields, not a
 general procfs emulation: files and fields outside the list still read through to
@@ -675,7 +686,7 @@ Reverie sub-tools that Detcore delegates to, one for capture and one for replay.
  record: Detcore --(non-determinizable event)--> Recorder --> event stream + metadata
  replay: Detcore <--(recorded result)---------- Replayer <-- event stream
                                                      |
-                                                     +-- desync check vs live event
+                                                     +-- optional raw-syscall check
 ```
 
 **What is recorded.** Only syscalls that cannot be made deterministic by
@@ -699,15 +710,18 @@ recorded executable, copies the dynamic loader and any shebang/`env`
 interpreters, and recreates the working directory, so the replayed program
 resolves the same paths it saw at record time.
 
-**Desync detection.** During replay, each live event is checked against the next
-recorded event for that thread. A mismatch raises a `DesyncError`
-(`hermit-cli/src/desync.rs`) identifying the thread and the event index where the
-streams diverged, which is the primary debugging signal that emulation,
-scheduling, or coverage changed between record and replay.
+**Desync detection.** The recorder writes a raw-syscall debug stream alongside
+the result-event stream. The replayer compares each live syscall with that
+debug stream only when the `HERMIT_VERIFY` environment variable is set. A
+mismatch in that mode raises a `DesyncError` (`hermit-cli/src/desync.rs`)
+identifying the thread and event index. Ordinary `hermit replay` still consumes
+the recorded result events, but it does not enable this full argument-by-
+argument syscall comparison by default.
 
-**Self-verification.** `hermit record start --verify` records a run and then
-immediately replays it, asserting the replay matches — the fast built-in check
-that a workload is deterministic under Hermit end to end.
+**Self-verification.** `hermit record start --verify` records a run, sets
+`HERMIT_VERIFY` for the replay, and compares captured output and exit status.
+It is the user-facing path that enables the raw-syscall desynchronization check
+described above as part of an end-to-end record/replay check.
 
 ## Chaos mode
 
