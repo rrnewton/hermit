@@ -107,8 +107,8 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Require deterministic host capabilities. Unsupported syscalls panic instead of passing
-    /// through to the host kernel.
+    /// Require deterministic host capabilities. Unsupported syscalls are blocked with ENOSYS
+    /// instead of passing through to the host kernel.
     #[clap(
         long,
         conflicts_with_all = [
@@ -648,12 +648,13 @@ fn strict_flag_preserves_deterministic_defaults() {
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
-    assert!(ro.det_opts.det_config.panic_on_unsupported_syscalls);
-    assert!(ro.det_opts.det_config.require_cpuid_interception);
+    assert!(!ro.det_opts.det_config.panic_on_unsupported_syscalls);
     assert_eq!(
-        format!("{}", ro),
-        " --panic-on-unsupported-syscalls -- fakeprog"
+        ro.det_opts.det_config.unsupported_syscall_action,
+        UnsupportedSyscallAction::Error
     );
+    assert!(ro.det_opts.det_config.require_cpuid_interception);
+    assert_eq!(format!("{}", ro), " -- fakeprog");
 }
 
 #[test]
@@ -744,7 +745,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     for expected in [
         "--strict",
         "Require deterministic host capabilities",
-        "Unsupported syscalls panic",
+        "Unsupported syscalls are blocked with ENOSYS",
         "--no-strict",
         "best-effort behavior",
         "--no-sequentialize-threads",
@@ -959,7 +960,6 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
-        config.panic_on_unsupported_syscalls |= self.strict;
 
         if self.strict && !config.virtualize_cpuid {
             anyhow::bail!(

@@ -562,6 +562,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
+    /// SYS_pread64 system call. Positioned reads do not mutate the shared file offset.
+    pub async fn handle_pread64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pread64,
+    ) -> Result<i64, Error> {
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move { Ok(this.record_or_replay(guest, call).await?) })
+        })
+        .await
+    }
+
     /// Helper for performing a deterministic read that retries until it gets all its
     /// bytes.
     async fn deterministic_read<G: Guest<Self>>(
@@ -716,6 +731,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(this.record_or_replay(guest, call).await?)
                 }
             })
+        })
+        .await
+    }
+
+    /// SYS_pwrite64 system call. Positioned writes do not mutate the shared file offset.
+    pub async fn handle_pwrite64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwrite64,
+    ) -> Result<i64, Error> {
+        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        })?;
+        if guest.config().virtualize_metadata {
+            let inode =
+                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+            touch_file(guest, inode).await;
+        }
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move { Ok(this.record_or_replay(guest, call).await?) })
         })
         .await
     }

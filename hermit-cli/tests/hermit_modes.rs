@@ -474,13 +474,6 @@ fn panic_on_unsupported_syscalls_panics() {
     assert_unsupported_syscall_panics(&keyctl_syscall, "--panic-on-unsupported-syscalls");
 }
 
-#[test]
-fn strict_panics_on_unsupported_syscalls() {
-    let _guard = hermit_run_lock();
-    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
-    assert_unsupported_syscall_panics(&unsupported_syscall, "--strict");
-}
-
 fn run_buck_chaos_workload(name: &str) {
     assert!(
         reverie_ptrace::is_perf_supported(),
