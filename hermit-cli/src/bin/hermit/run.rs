@@ -80,7 +80,8 @@ pub struct RunOpts {
             "no_sequentialize_threads",
             "no_deterministic_io",
             "namespace_only",
-            "strace_only"
+            "strace_only",
+            "allow_passthrough"
         ]
     )]
     strict: bool,
@@ -532,7 +533,7 @@ fn display_runopts4() {
 #[test]
 fn allow_passthrough_is_explicit_and_round_trips() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
-    ro.validate_args_with_perf_support(true);
+    ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.allow_passthrough);
     assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");
@@ -559,6 +560,7 @@ fn strict_flag_rejects_determinism_opt_outs() {
         "--no-deterministic-io",
         "--namespace-only",
         "--strace-only",
+        "--allow-passthrough",
     ] {
         let error =
             RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();

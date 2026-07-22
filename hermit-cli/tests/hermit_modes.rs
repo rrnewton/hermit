@@ -33,12 +33,12 @@ struct Workloads {
     hello_race: Workload,
     resource_determinism: Workload,
     unsupported_syscall: Workload,
+    keyctl_syscall: Workload,
 }
 
 #[derive(Clone, Copy)]
 enum RunMode {
     Default,
-    Strict,
     Chaos,
     Verify,
 }
@@ -47,7 +47,6 @@ impl RunMode {
     fn name(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Strict => "strict",
             Self::Chaos => "chaos",
             Self::Verify => "verify",
         }
@@ -339,12 +338,23 @@ fn workloads() -> &'static Workloads {
             &unsupported_syscall.path,
         );
 
+        let keyctl_syscall = Workload {
+            name: "keyctl_syscall",
+            path: build_root.join("keyctl_syscall"),
+            args: &[],
+        };
+        compile_c_without_libc(
+            &repository.join("tests/c/simple/keyctl_syscall_nostdlib.c"),
+            &keyctl_syscall.path,
+        );
+
         Workloads {
             stable,
             default_only,
             hello_race,
             resource_determinism,
             unsupported_syscall,
+            keyctl_syscall,
         }
     })
 }
@@ -354,11 +364,13 @@ fn hermit_command(base_env: &str) -> Command {
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args([
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--allow-passthrough",
-        ]);
+        .args(["--no-virtualize-cpuid", "--preemption-timeout=disabled"]);
+    command
+}
+
+fn compatibility_hermit_command(base_env: &str) -> Command {
+    let mut command = hermit_command(base_env);
+    command.arg("--allow-passthrough");
     command
 }
 
@@ -394,18 +406,17 @@ fn remove_retained_verify_logs(stderr: &str) {
 }
 
 fn default_hermit_command(base_env: &str) -> Command {
-    let mut command = hermit_command(base_env);
+    let mut command = compatibility_hermit_command(base_env);
     command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
     command
 }
 
 fn hermit_run(mode: RunMode, workload: &Workload) {
-    let mut command = hermit_command("minimal");
+    let mut command = compatibility_hermit_command("minimal");
     match mode {
         RunMode::Default => {
             command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
         }
-        RunMode::Strict => {}
         RunMode::Chaos => {
             command.arg("--chaos");
         }
@@ -569,7 +580,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
     }
 }
 
-fn run_unsupported_syscall(allow_passthrough: bool) -> Output {
+fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "run",
@@ -577,10 +588,13 @@ fn run_unsupported_syscall(allow_passthrough: bool) -> Output {
         "--no-virtualize-cpuid",
         "--preemption-timeout=disabled",
     ]);
+    if strict {
+        command.arg("--strict");
+    }
     if allow_passthrough {
         command.arg("--allow-passthrough");
     }
-    command.arg(&workloads().unsupported_syscall.path);
+    command.arg(&workload.path);
     command
         .output()
         .expect("failed to run unsupported-syscall workload")
@@ -589,7 +603,7 @@ fn run_unsupported_syscall(allow_passthrough: bool) -> Output {
 #[test]
 fn unsupported_syscall_is_blocked_by_default() {
     let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(false);
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, false);
     assert!(
         output.status.success(),
         "fail-closed workload failed: {}",
@@ -606,7 +620,7 @@ fn unsupported_syscall_is_blocked_by_default() {
 #[test]
 fn allow_passthrough_forwards_unsupported_syscall() {
     let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(true);
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, true);
     assert!(
         output.status.success(),
         "passthrough workload failed: {}",
@@ -617,6 +631,39 @@ fn allow_passthrough_forwards_unsupported_syscall() {
     assert!(
         stderr.contains("unsupported syscall getpid") && stderr.contains("passed through"),
         "missing passthrough warning:\n{stderr}"
+    );
+}
+
+#[test]
+fn keyctl_obeys_unsupported_syscall_policy() {
+    let _guard = hermit_run_lock();
+
+    let blocked = run_unsupported_syscall(&workloads().keyctl_syscall, false, false);
+    assert!(
+        blocked.status.success(),
+        "fail-closed keyctl workload failed: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&blocked.stdout), "blocked\n");
+    let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_stderr.contains("unsupported syscall keyctl")
+            && blocked_stderr.contains("blocked with ENOSYS"),
+        "missing fail-closed keyctl warning:\n{blocked_stderr}"
+    );
+
+    let allowed = run_unsupported_syscall(&workloads().keyctl_syscall, false, true);
+    assert!(
+        allowed.status.success(),
+        "passthrough keyctl workload failed: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allowed.stdout), "passed\n");
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed_stderr.contains("unsupported syscall keyctl")
+            && allowed_stderr.contains("passed through"),
+        "missing keyctl passthrough warning:\n{allowed_stderr}"
     );
 }
 
@@ -919,7 +966,19 @@ fn no_hardware_stacktrace_signal() {
 
 #[test]
 fn strict_mode_matrix() {
-    run_stable_matrix(RunMode::Strict);
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, false);
+    assert!(
+        output.status.success(),
+        "strict fail-closed workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
+        "strict mode did not enforce fail-closed behavior:\n{stderr}"
+    );
 }
 
 #[test]
