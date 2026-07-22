@@ -265,6 +265,13 @@ fn workloads() -> &'static Workloads {
         );
         default_only.push(workload("minimal_hello", minimal_hello));
 
+        let pread64_nostdlib = build_root.join("pread64_nostdlib");
+        compile_c_without_libc(
+            &repository.join("tests/c/simple/pread64_nostdlib.c"),
+            &pread64_nostdlib,
+        );
+        default_only.push(workload("pread64_nostdlib", pread64_nostdlib));
+
         let lit_sigprocmask = build_root.join("lit_rt_sigprocmask");
         default_only.extend([
             Workload {
@@ -495,7 +502,6 @@ default_workload_tests! {
     default_lit_rt_sigprocmask_mask => "lit_rt_sigprocmask_mask",
     default_lit_rt_sigprocmask_block => "lit_rt_sigprocmask_block",
     default_network_bind => "network_bind",
-    default_minimal_hello => "minimal_hello",
     default_rust_stack_ptr => "rust_stack_ptr",
     default_rust_heap_ptrs => "rust_heap_ptrs",
     default_rust_rdtsc => "rust_rdtsc",
@@ -533,6 +539,12 @@ fn default_cargo_bind_connect_race() {
 #[ignore = "default mode can block in clock total-order scheduling"]
 fn default_cargo_clock_total_order() {
     run_default_workload("rustbin_clock_total_order");
+}
+
+#[test]
+fn default_minimal_hello() {
+    run_default_workload("minimal_hello");
+    run_default_workload("pread64_nostdlib");
 }
 
 #[test]
