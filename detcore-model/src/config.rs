@@ -180,10 +180,19 @@ pub struct Config {
 
     /// DANGEROUS: Panic on unsupported syscalls, this is useful for
     /// debugging detcore itself, not recommended otherwise.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "allow_passthrough")]
     pub panic_on_unsupported_syscalls: bool,
 
-    /// **Internal:** Set to `true` if we're inside a UTS namespace.
+    /// Allow unsupported syscalls to execute on the host kernel.
+    ///
+    /// By default, unsupported syscalls are blocked with ENOSYS so that a
+    /// deterministic run cannot silently use nondeterministic host behavior.
+    /// This compatibility option logs a warning and passes the syscall through.
+    #[clap(long)]
+    #[serde(default)]
+    pub allow_passthrough: bool,
+
+    /// [Internal] Set to `true` if we're inside a UTS namespace.
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
     #[clap(skip)]
     pub has_uts_namespace: bool,
@@ -511,6 +520,9 @@ impl fmt::Display for Config {
         }
         if self.panic_on_unsupported_syscalls {
             write!(f, " --panic-on-unsupported-syscalls")?;
+        }
+        if self.allow_passthrough {
+            write!(f, " --allow-passthrough")?;
         }
         if self.kill_daemons {
             write!(f, " --kill-daemons")?;
