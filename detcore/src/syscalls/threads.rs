@@ -30,6 +30,7 @@ use tracing::info;
 use tracing::trace;
 
 use crate::config::BlockingMode;
+use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -44,7 +45,6 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
-use crate::types::FutexID;
 use crate::types::LogicalTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,9 +205,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.sequentialize_threads {
             Ok(guest.inject(call).await?)
         } else {
-            if call.futex_op() & libc::FUTEX_PRIVATE_FLAG == 0 {
-                return Err(Error::Errno(Errno::EOPNOTSUPP));
-            }
             match self.cfg.debug_futex_mode {
                 BlockingMode::Precise => self.handle_futex_blocking(guest, call, init_val).await,
                 BlockingMode::Polling => self.handle_futex_polling(guest, call, init_val).await,
@@ -226,7 +223,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         init_val: i32,
     ) -> Result<i64, Error> {
         let ptr = call.uaddr().unwrap();
-        let futexid = FutexID::private(guest.thread_state().mm_id, AddrMut::as_raw(ptr));
+        let futexid = guest.thread_state().futex_id(
+            AddrMut::as_raw(ptr),
+            call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0,
+        );
         let futex_op = call.futex_op() & libc::FUTEX_CMD_MASK;
         let bitset = match futex_op {
             libc::FUTEX_WAKE_BITSET | libc::FUTEX_WAIT_BITSET => call.val3() as u32,
@@ -389,10 +389,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Execveat,
     ) -> Result<i64, Error> {
-        let (old_metadata, table_is_shared, dettid, old_mm_id) = {
+        let (old_metadata, old_memory_metadata, table_is_shared, dettid, old_mm_id) = {
             let thread_state = guest.thread_state();
             (
                 Arc::clone(&thread_state.file_metadata),
+                Arc::clone(&thread_state.memory_metadata),
                 Arc::strong_count(&thread_state.file_metadata) > 1,
                 thread_state.dettid,
                 thread_state.mm_id,
@@ -409,6 +410,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
             thread_state.mm_id = old_mm_id.for_exec(dettid);
         }
 
@@ -430,6 +432,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = old_metadata;
+            thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;
         }
 

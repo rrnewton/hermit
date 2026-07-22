@@ -20,6 +20,7 @@ mod fd;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
+mod memory;
 #[allow(unused)]
 mod mvar;
 mod procmaps;
@@ -472,6 +473,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::close,
                 Sysno::read,
                 Sysno::mmap,
+                Sysno::munmap,
+                Sysno::mremap,
                 Sysno::fcntl,
                 Sysno::futex,
                 Sysno::clone,
@@ -773,6 +776,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         dettid,
                         clone_flags.contains(CloneFlags::CLONE_VM),
                     ),
+                    memory_metadata: if clone_flags.contains(CloneFlags::CLONE_VM) {
+                        Arc::clone(&pts.1.memory_metadata)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .memory_metadata
+                                .lock()
+                                .expect("memory metadata mutex poisoned")
+                                .clone(),
+                        ))
+                    },
                     pedigree: child_pedigree,
                     stats: ThreadStats::new(),
                     file_metadata: {
@@ -987,6 +1001,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Close(s) => self.handle_close(guest, s).await,
             Syscall::Read(s) => self.handle_read(guest, s).await,
             Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
+            Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
+            Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
             Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
             Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
             Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
@@ -1103,7 +1119,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
             Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
-            Syscall::Munmap(_) => self.passthrough(guest, call).await,
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,

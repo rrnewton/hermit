@@ -37,6 +37,7 @@ use tracing::debug;
 use crate::config::Config;
 use crate::detlog;
 use crate::fd::*;
+use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
@@ -519,6 +520,9 @@ pub struct ThreadState<T> {
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
+    /// Shared memory mappings used to resolve process-shared futex keys.
+    pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
+
     /// This threads path within the thread/process ancestry tree. (The terminology comes from
     /// Cilk.)
     pub pedigree: Pedigree,
@@ -588,6 +592,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("dettid", &self.dettid)
             .field("detpid", &self.detpid)
             .field("mm_id", &self.mm_id)
+            .field("memory_metadata", &self.memory_metadata)
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
@@ -655,6 +660,7 @@ impl<T> ThreadState<T> {
             dettid: pid,
             detpid: None, // Initialized later.
             mm_id: MmId::initial(pid),
+            memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(
@@ -673,6 +679,62 @@ impl<T> ThreadState<T> {
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
         }
+    }
+
+    /// Resolve a futex key from its opcode mode and virtual address.
+    pub(crate) fn futex_id(&self, address: usize, is_private: bool) -> FutexID {
+        if is_private {
+            FutexID::private(self.mm_id, address)
+        } else {
+            self.memory_metadata
+                .lock()
+                .expect("memory metadata mutex poisoned")
+                .futex_id(self.mm_id, address)
+        }
+    }
+
+    /// Record an anonymous shared mapping.
+    pub(crate) fn map_shared_anonymous(&self, start: usize, len: usize) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_anonymous(self.mm_id, start, len);
+    }
+
+    /// Record a file-backed shared mapping.
+    pub(crate) fn map_shared_object(
+        &self,
+        start: usize,
+        len: usize,
+        object: SharedMemoryObjectId,
+        object_offset: u64,
+    ) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_object(start, len, object, object_offset);
+    }
+
+    /// Remove a range from the shared mapping model.
+    pub(crate) fn unmap_memory(&self, start: usize, len: usize) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .unmap(start, len);
+    }
+
+    /// Move or resize a range in the shared mapping model.
+    pub(crate) fn remap_memory(
+        &self,
+        old_start: usize,
+        old_len: usize,
+        new_start: usize,
+        new_len: usize,
+    ) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .remap(old_start, old_len, new_start, new_len);
     }
 
     /// Build a singleton resource request from the current thread.

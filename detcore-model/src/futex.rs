@@ -9,6 +9,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::fd::OpenFileId;
 use crate::pid::DetTid;
 
 /// Identity of a Linux memory address space (`mm_struct`).
@@ -50,19 +51,48 @@ impl MmId {
     }
 }
 
-/// Identity of a supported private futex.
+/// Identity of an object that backs a process-shared memory mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FutexID {
-    /// Address space containing the futex word.
-    pub mm: MmId,
-    /// Virtual address of the futex word within `mm`.
-    pub address: usize,
+pub enum SharedMemoryObjectId {
+    /// Anonymous shared mapping, identified by its deterministic allocation.
+    Anonymous {
+        /// Address space in which the mapping was created.
+        origin: MmId,
+        /// Per-address-space mapping sequence.
+        sequence: u64,
+    },
+    /// File-backed shared mapping.
+    File {
+        /// Device containing the file.
+        device: u64,
+        /// Inode of the file.
+        inode: u64,
+    },
+    /// Open-file-description fallback used when inode metadata is unavailable.
+    OpenFile { id: OpenFileId },
+}
+
+/// Identity of a futex word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FutexID {
+    /// Process-private futex, keyed by its address space and virtual address.
+    Private { mm: MmId, address: usize },
+    /// Process-shared futex, keyed by its backing object and byte offset.
+    Shared {
+        object: SharedMemoryObjectId,
+        offset: u64,
+    },
 }
 
 impl FutexID {
     /// Create a private futex key.
     pub const fn private(mm: MmId, address: usize) -> Self {
-        Self { mm, address }
+        Self::Private { mm, address }
+    }
+
+    /// Create a process-shared futex key.
+    pub const fn shared(object: SharedMemoryObjectId, offset: u64) -> Self {
+        Self::Shared { object, offset }
     }
 }
 
@@ -89,6 +119,29 @@ mod tests {
             FutexID::private(parent, 0x1000),
             FutexID::private(parent.for_exec(DetTid::from_raw(10)), 0x1000),
             "exec should replace the private futex namespace"
+        );
+    }
+
+    #[test]
+    fn shared_futexes_alias_by_object_and_offset() {
+        let object = SharedMemoryObjectId::File {
+            device: 10,
+            inode: 20,
+        };
+        assert_eq!(
+            FutexID::shared(object, 64),
+            FutexID::shared(object, 64),
+            "virtual-address aliases of one backing offset must share a key"
+        );
+        assert_ne!(
+            FutexID::shared(object, 64),
+            FutexID::shared(object, 68),
+            "different words in one backing object need distinct keys"
+        );
+        assert_ne!(
+            FutexID::shared(object, 64),
+            FutexID::private(MmId::initial(DetTid::from_raw(10)), 64),
+            "private and shared namespaces must remain distinct"
         );
     }
 }

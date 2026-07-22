@@ -21,6 +21,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
+use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
@@ -355,19 +356,86 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Mmap,
     ) -> Result<i64, Error> {
-        // This is a far-from-complete placeholder:
-        if call.fd() == -1 {
-            return Ok(self.record_or_replay(guest, call).await?);
+        enum SharedBacking {
+            Anonymous,
+            File {
+                object: SharedMemoryObjectId,
+                offset: u64,
+            },
         }
-        // TODO/FIXME: a writable memory mapping means the file is essentially written continuously UNTIL it is closed.
-        /* Therefore we need something that will grab write permission but maybe not release it?  Like so:
-                let request = guest.thread_state().mk_request(rsrc, Permission::W);
-                resource_request(guest, request).await; // Request but don't release?
-        */
 
-        // More accurately, this *associates* write permission with all future timeslices of this thread.
-        // TODO(T78627117): We need thread-level permissions associated with scheduling each thread.
-        Ok(self.record_or_replay(guest, call).await?)
+        let backing = if call.flags().contains(MapFlags::MAP_SHARED) {
+            if call.fd() == -1 {
+                Some(SharedBacking::Anonymous)
+            } else {
+                let offset = u64::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+                guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |fd| {
+                        let object = fd.stat().map_or_else(
+                            || SharedMemoryObjectId::OpenFile {
+                                id: fd.open_file_id(),
+                            },
+                            |stat| SharedMemoryObjectId::File {
+                                device: stat.dev,
+                                inode: stat.inode,
+                            },
+                        );
+                        SharedBacking::File { object, offset }
+                    })
+                    .ok()
+            }
+        } else {
+            None
+        };
+        let len = call.len();
+        let result = self.record_or_replay(guest, call).await?;
+        let start = usize::try_from(result).expect("a successful mmap must return an address");
+
+        guest.thread_state().unmap_memory(start, len);
+        match backing {
+            Some(SharedBacking::Anonymous) => {
+                guest.thread_state().map_shared_anonymous(start, len);
+            }
+            Some(SharedBacking::File { object, offset }) => {
+                guest
+                    .thread_state()
+                    .map_shared_object(start, len, object, offset);
+            }
+            None => {}
+        }
+        Ok(result)
+    }
+
+    /// SYS_munmap system call.
+    pub async fn handle_munmap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Munmap,
+    ) -> Result<i64, Error> {
+        let start = call.addr().map(Addr::as_raw).unwrap_or(0);
+        let len = call.len();
+        let result = self.record_or_replay(guest, call).await?;
+        guest.thread_state().unmap_memory(start, len);
+        Ok(result)
+    }
+
+    /// SYS_mremap system call.
+    pub async fn handle_mremap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Mremap,
+    ) -> Result<i64, Error> {
+        let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
+        let old_len = call.old_len();
+        let new_len = call.new_len();
+        let result = self.record_or_replay(guest, call).await?;
+        let new_start =
+            usize::try_from(result).expect("a successful mremap must return an address");
+        guest
+            .thread_state()
+            .remap_memory(old_start, old_len, new_start, new_len);
+        Ok(result)
     }
 
     // Determinize stat by doing:

@@ -162,15 +162,14 @@ fn bound_port_survives_closing_dup_alias() {
 }
 
 #[test]
-fn unsupported_futex_keys_fail_explicitly() {
+fn shared_futex_modes_are_supported_and_validate_bitsets() {
     det_test_fn_sequential_without_pmu(|| {
         let futex = 0_u32;
         assert_eq!(
             unsafe { libc::syscall(libc::SYS_futex, &futex, libc::FUTEX_WAKE, 1) },
-            -1
+            0,
+            "a shared-mode wake with no waiters should succeed"
         );
-        assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EOPNOTSUPP);
-
         assert_eq!(
             unsafe {
                 libc::syscall(
@@ -186,6 +185,71 @@ fn unsupported_futex_keys_fail_explicitly() {
             -1
         );
         assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EINVAL);
+    });
+}
+
+#[test]
+fn shared_anonymous_futex_wakes_across_processes() {
+    det_test_fn_sequential_without_pmu(|| {
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let futex = mapping.cast::<u32>();
+        unsafe { futex.write(0) };
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork should succeed");
+        if child == 0 {
+            let waited = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    futex,
+                    libc::FUTEX_WAIT,
+                    0,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    0,
+                )
+            };
+            unsafe { libc::_exit(i32::from(waited != 0)) };
+        }
+
+        let mut woke = 0;
+        for _ in 0..1024 {
+            woke = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    futex,
+                    libc::FUTEX_WAKE,
+                    1,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    0,
+                )
+            };
+            if woke == 1 {
+                break;
+            }
+            assert_eq!(unsafe { libc::sched_yield() }, 0);
+        }
+        assert_eq!(
+            woke, 1,
+            "parent should wake the child through the shared mapping"
+        );
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
     });
 }
 
