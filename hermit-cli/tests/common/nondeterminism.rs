@@ -86,7 +86,7 @@ impl<'a> NondeterminismCase<'a> {
         let mut last = None;
 
         for _ in 0..=self.retries {
-            let output = self.run_hermit(&["run", "--strace-only", "--verify", "--"]);
+            let output = self.run_noop_passthrough(&["run", "--strace-only", "--verify", "--"]);
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(
@@ -132,6 +132,22 @@ impl<'a> NondeterminismCase<'a> {
     fn run_hermit(&self, mode_args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command.args(mode_args).arg(self.program).args(self.args);
+        run_command(command, self.source, "Hermit verification")
+    }
+
+    /// Like [`Self::run_hermit`], but for the deliberately non-deterministic
+    /// passthrough preset (`--strace-only`).
+    ///
+    /// This preset is not `hermit run`'s Detcore path, so the fail-closed test
+    /// ratchet's `HERMIT_FAIL_CLOSED=1` must not apply here: otherwise a
+    /// passed-through syscall (e.g. `clock_gettime`) turns into an
+    /// unsupported-syscall panic and masks the nondeterminism this assertion is
+    /// designed to observe. Outside the ratchet the variable is unset, so
+    /// removing it is a no-op.
+    fn run_noop_passthrough(&self, mode_args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command.args(mode_args).arg(self.program).args(self.args);
+        command.env_remove("HERMIT_FAIL_CLOSED");
         run_command(command, self.source, "Hermit verification")
     }
 
