@@ -25,6 +25,7 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use detcore::UnsupportedSyscallAction;
 use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
@@ -116,7 +117,7 @@ pub struct RunOpts {
             "no_strict",
             "namespace_only",
             "strace_only",
-            "allow_passthrough"
+            "unsupported_syscall_action"
         ]
     )]
     strict: bool,
@@ -622,12 +623,22 @@ fn display_runopts4() {
 }
 
 #[test]
-fn allow_passthrough_is_explicit_and_round_trips() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
+fn unsupported_syscall_action_is_explicit_and_round_trips() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--unsupported-syscall-action=trace",
+        "fakeprog",
+    ]);
     ro.validate_args_with_capabilities(true, true).unwrap();
 
-    assert!(ro.det_opts.det_config.allow_passthrough);
-    assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");
+    assert_eq!(
+        ro.det_opts.det_config.unsupported_syscall_action,
+        UnsupportedSyscallAction::Trace
+    );
+    assert_eq!(
+        format!("{}", ro),
+        " --unsupported-syscall-action=trace -- fakeprog"
+    );
 }
 
 #[test]
@@ -652,7 +663,7 @@ fn strict_flag_rejects_determinism_opt_outs() {
         "--no-deterministic-io",
         "--namespace-only",
         "--strace-only",
-        "--allow-passthrough",
+        "--unsupported-syscall-action=trace",
     ] {
         let error =
             RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
@@ -660,7 +671,7 @@ fn strict_flag_rejects_determinism_opt_outs() {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         let message = error.to_string();
         assert!(message.contains("--strict"));
-        assert!(message.contains(opt_out));
+        assert!(message.contains(opt_out.split('=').next().unwrap()));
     }
 }
 
@@ -745,8 +756,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "ptrace",
         "dbi",
         "kvm",
-        "--allow-passthrough",
-        "Allow unsupported syscalls to execute on the host kernel",
+        "--unsupported-syscall-action",
+        "Choose how unsupported syscalls are diagnosed and handled",
     ] {
         assert!(
             help.contains(expected),
@@ -1013,7 +1024,7 @@ impl RunOpts {
             config.virtualize_metadata = false;
             config.virtualize_time = false;
             config.deterministic_io = false;
-            config.allow_passthrough = true;
+            config.unsupported_syscall_action = UnsupportedSyscallAction::Trace;
             self.network = NetworkingMode::Host;
             config.sequentialize_threads = false;
             config.no_rcb_time = true;

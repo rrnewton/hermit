@@ -39,9 +39,10 @@ _Noreturn void exit(int code) {
 void _start(void) {
   const char blocked[] = "blocked\n";
   const char passed[] = "passed\n";
-  long result = syscall0(SYS_getpid);
+  long first = syscall0(SYS_getpid);
+  long second = syscall0(SYS_getpid);
 
-  if (result == -ENOSYS) {
+  if (first == -ENOSYS && second == -ENOSYS) {
     write(1, blocked, sizeof(blocked) - 1);
   } else {
     write(1, passed, sizeof(passed) - 1);

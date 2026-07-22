@@ -18,6 +18,7 @@ use std::sync::MutexGuard;
 use detcore::Config;
 use detcore::Detcore;
 use detcore::SchedHeuristic;
+use detcore::UnsupportedSyscallAction;
 use pretty_assertions::assert_eq;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -82,7 +83,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     has_uts_namespace: false,
     require_cpuid_interception: false,
     panic_on_unsupported_syscalls: false,
-    allow_passthrough: true,
+    unsupported_syscall_action: UnsupportedSyscallAction::Trace,
     replay_data: None,
     kill_daemons: false,
     seed: DEFAULT_CFG.seed,
@@ -135,7 +136,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     has_uts_namespace: false,
     require_cpuid_interception: false,
     panic_on_unsupported_syscalls: false,
-    allow_passthrough: true,
+    unsupported_syscall_action: UnsupportedSyscallAction::Trace,
     replay_data: None,
     kill_daemons: false,
     seed: DEFAULT_CFG.seed,
@@ -188,7 +189,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     has_uts_namespace: false,
     require_cpuid_interception: false,
     panic_on_unsupported_syscalls: false,
-    allow_passthrough: true,
+    unsupported_syscall_action: UnsupportedSyscallAction::Trace,
     replay_data: None,
     kill_daemons: false,
     seed: DEFAULT_CFG.seed,
