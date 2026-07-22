@@ -611,6 +611,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
+                Sysno::rseq,
                 Sysno::getrusage,
                 Sysno::sysinfo,
                 Sysno::pselect6,
@@ -1219,6 +1220,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
             Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
+            // glibc treats rseq registration failure during pthread startup as fatal once
+            // the process-wide capability probe has succeeded. Registration is per-thread
+            // kernel bookkeeping and is safe under Detcore's serialized scheduler.
+            Syscall::Other(Sysno::rseq, _) => self.passthrough(guest, call).await,
             Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
             Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
