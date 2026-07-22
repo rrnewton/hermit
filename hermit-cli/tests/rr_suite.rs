@@ -446,6 +446,12 @@ rr_test!(rr_shm, "shm", 0, &[]);
 rr_test!(rr_shm_unmap, "shm_unmap", 0, &[]);
 rr_test!(rr_sigaction_old, "sigaction_old", 0, &[]);
 rr_test!(rr_sigaltstack, "sigaltstack", 0, &[]);
+rr_test!(
+    rr_sigchld_interrupt_signal,
+    "sigchld_interrupt_signal",
+    0,
+    &[]
+);
 rr_test!(rr_sigcont, "sigcont", 0, &[]);
 rr_test!(
     rr_sighandler_bad_rsp_sigsegv,
