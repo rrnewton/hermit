@@ -187,6 +187,9 @@ if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
 else
     echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
 fi
+# `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
+run_check "Hermit analyze scenarios" \
+    cargo test -p hermit --test analyze -- --ignored
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps
