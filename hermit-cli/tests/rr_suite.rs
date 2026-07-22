@@ -152,22 +152,45 @@ fn compile_test(basename: &str) -> PathBuf {
     binary
 }
 
+fn fresh_scratch_dir(basename: &str) -> tempfile::TempDir {
+    // Use target/ rather than /tmp because Hermit isolates the guest's /tmp.
+    let scratch_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-scratch");
+    fs::create_dir_all(&scratch_root).expect("failed to create rr scratch root");
+    tempfile::Builder::new()
+        .prefix(&format!("{basename}-"))
+        .tempdir_in(&scratch_root)
+        .expect("failed to create fresh rr scratch directory")
+}
+
+#[test]
+fn rr_scratch_directories_are_fresh_and_cleaned() {
+    let first = fresh_scratch_dir("scratch-regression");
+    let first_path = first.path().to_owned();
+    fs::write(first.path().join("dummy.txt"), "stale").expect("failed to dirty first scratch");
+
+    let second = fresh_scratch_dir("scratch-regression");
+    let second_path = second.path().to_owned();
+    assert_ne!(first_path, second_path);
+    assert!(!second.path().join("dummy.txt").exists());
+
+    first.close().expect("failed to clean first rr scratch");
+    second.close().expect("failed to clean second rr scratch");
+    assert!(!first_path.exists());
+    assert!(!second_path.exists());
+}
+
 /// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
 fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker: Option<&str>) {
     let binary = compile_test(basename);
-    // Give the guest a private working directory (under target/, not /tmp, which
-    // Hermit isolates) so file-creating tests don't collide or dirty the tree.
-    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("rr-scratch")
-        .join(basename);
-    let _ = fs::remove_dir_all(&scratch);
-    fs::create_dir_all(&scratch).expect("failed to create rr scratch directory");
+    // Give every invocation a unique working directory. TempDir removes all files produced by
+    // the guest when this function returns or unwinds.
+    let scratch = fresh_scratch_dir(basename);
 
     let _guard = hermit_run_lock();
     // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
     let mut command = Command::new("timeout");
     command
-        .current_dir(&scratch)
+        .current_dir(scratch.path())
         .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
@@ -198,6 +221,9 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    scratch
+        .close()
+        .expect("failed to clean rr scratch directory");
 }
 
 macro_rules! rr_test {
@@ -292,7 +318,9 @@ rr_test!(
     &[]
 );
 rr_test!(rr_mmap_recycle, "mmap_recycle", 0, &[]);
+rr_test!(rr_mmap_ro, "mmap_ro", 0, &[]);
 rr_test!(rr_mmap_self_maps_shared, "mmap_self_maps_shared", 0, &[]);
+rr_test!(rr_mmap_short_file, "mmap_short_file", 0, &[]);
 rr_test!(rr_mmap_shared_dev_zero, "mmap_shared_dev_zero", 0, &[]);
 rr_test!(
     rr_mmap_shared_grow_under_map,
