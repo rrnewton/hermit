@@ -7,6 +7,30 @@
  */
 
 //! Detcore is a Reverie tool that determinizes the execution of a process.
+//!
+//! # Backend-abstraction commandment
+//!
+//! Detcore is a *tool* written against Reverie's **abstract** instrumentation
+//! interface (the `reverie` crate). It depends only on those traits and types
+//! and is deliberately ignorant of how a guest is actually traced.
+//!
+//! Detcore MUST NEVER depend on or import a concrete Reverie backend --
+//! `reverie-ptrace`, `reverie-dbi`, or `reverie-kvm`. Choosing and
+//! instantiating a backend, and running a detcore tool against it, is the sole
+//! responsibility of the `hermit-cli` package. There are no backend-specific
+//! hacks in detcore: any tracing-mechanism-specific behavior belongs behind the
+//! Reverie abstraction, not here.
+//!
+//! Why: Hermit follows Reverie's abstract model. A backend dependency in
+//! detcore would couple the determinism engine to one tracing mechanism and
+//! break the clean abstraction boundary that lets the same tool run over any
+//! backend.
+//!
+//! The one allowed exception is test-only: detcore's own integration tests
+//! (under `detcore/tests/`, wired via the `reverie-ptrace` **dev-dependency**)
+//! drive a real tracer to exercise the tool. That coupling never reaches the
+//! shipped library. This invariant is enforced in CI by
+//! `scripts/check-detcore-backend-abstraction.sh`.
 
 #![deny(clippy::all)]
 #![deny(missing_docs)]
