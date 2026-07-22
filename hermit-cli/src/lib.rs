@@ -24,6 +24,7 @@ mod recorder;
 mod replay;
 mod replayer;
 mod script;
+mod syscall_arity;
 
 use std::fs;
 use std::io::Write;

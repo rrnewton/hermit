@@ -34,7 +34,6 @@ use serde::Serialize;
 use crate::desync::DesyncError;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
-use crate::event_stream::normalize_unused_args;
 
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
@@ -215,12 +214,11 @@ impl Replayer {
                 )
             });
 
-        // Compare only the argument registers the syscall actually uses. Reverie
-        // keeps all six raw registers in every typed syscall and derives
-        // `PartialEq` over them, so unused registers (which hold arbitrary
-        // leftover guest values) would otherwise produce false desyncs for any
-        // syscall with fewer than six arguments.
-        if normalize_unused_args(debug_event.syscall()) == normalize_unused_args(syscall) {
+        // Compare with arity awareness: argument registers beyond a syscall's
+        // ABI arity hold caller-leftover garbage that differs between record and
+        // replay, so a raw `==` would produce false desync positives on any 2-
+        // or 3-argument syscall (see `syscall_arity`).
+        if crate::syscall_arity::syscalls_match(debug_event.syscall(), syscall) {
             return;
         }
 
