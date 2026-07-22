@@ -1,0 +1,33 @@
+[==========] Running 410 tests from 31 test suites.
+[----------] Global test environment set-up.
+[----------] 5 tests from CanonicalizePath
+[ RUN      ] CanonicalizePath.PathSamples
+[       OK ] CanonicalizePath.PathSamples (0 ms)
+[ RUN      ] CanonicalizePath.TooManyComponents
+[       OK ] CanonicalizePath.TooManyComponents (0 ms)
+[ RUN      ] CanonicalizePath.UpDir
+[       OK ] CanonicalizePath.UpDir (0 ms)
+[ RUN      ] CanonicalizePath.AbsolutePath
+[       OK ] CanonicalizePath.AbsolutePath (0 ms)
+[ RUN      ] CanonicalizePath.NotNullTerminated
+[       OK ] CanonicalizePath.NotNullTerminated (0 ms)
+[----------] 5 tests from CanonicalizePath (5 ms total)
+
+[----------] 3 tests from PathEscaping
+[ RUN      ] PathEscaping.TortureTest
+[       OK ] PathEscaping.TortureTest (0 ms)
+[ RUN      ] PathEscaping.SensiblePathsAreNotNeedlesslyEscaped
+[       OK ] PathEscaping.SensiblePathsAreNotNeedlesslyEscaped (0 ms)
+[ RUN      ] PathEscaping.SensibleWin32PathsAreNotNeedlesslyEscaped
+[       OK ] PathEscaping.SensibleWin32PathsAreNotNeedlesslyEscaped (0 ms)
+[----------] 3 tests from PathEscaping (3 ms total)
+
+[----------] 2 tests from StripAnsiEscapeCodes
+[ RUN      ] StripAnsiEscapeCodes.EscapeAtEnd
+[       OK ] StripAnsiEscapeCodes.EscapeAtEnd (0 ms)
+[ RUN      ] StripAnsiEscapeCodes.StripColors
+[       OK ] StripAnsiEscapeCodes.StripColors (0 ms)
+[----------] 2 tests from StripAnsiEscapeCodes (2 ms total)
+
+[----------] 13 tests from SubprocessTest
+[ RUN      ] SubprocessTest.BadCommandStderr
