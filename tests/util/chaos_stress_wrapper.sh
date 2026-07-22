@@ -15,9 +15,9 @@ max_iters="${4:-1000}"
 RANDOM=42 # Set random seed
 
 perf list hardware | grep -i "Hardware event" > /dev/null || {
-  >&2 echo "It seems that perf is not supported, so this chaos test will be skipped."
-  >&2 echo "Chaos mode requires hardware performance counters."
-  exit 0
+  >&2 echo "ERROR: chaos stress requires perf hardware event support."
+  >&2 echo "ERROR: enable accessible hardware performance counters before running this test."
+  exit 1
 }
 
 run_count=1

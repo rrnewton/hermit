@@ -7,7 +7,6 @@
  */
 
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use reverie::Errno;
@@ -15,6 +14,8 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -109,9 +110,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): {}",
                 call.name()
             );
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi(call.name());
+            let rsrc = internal_io_polling_resources(guest, call.name());
             Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
         } else {
             assert!(action == IOAction::PassThru);
@@ -135,6 +134,139 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedTimeout {
+    Immediate,
+    Infinite,
+    Deadline(LogicalTime),
+}
+
+impl ParsedTimeout {
+    fn deadline(self) -> Option<LogicalTime> {
+        match self {
+            Self::Immediate | Self::Infinite => None,
+            Self::Deadline(deadline) => Some(deadline),
+        }
+    }
+}
+
+pub fn checked_timespec_to_nanos(timeout: Timespec) -> Result<u128, Errno> {
+    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+
+    Ok(timeout.tv_sec as u128 * 1_000_000_000 + timeout.tv_nsec as u128)
+}
+
+pub fn checked_timeval_to_nanos(timeout: libc::timeval) -> Result<u128, Errno> {
+    if timeout.tv_sec < 0 || timeout.tv_usec < 0 || timeout.tv_usec >= 1_000_000 {
+        return Err(Errno::EINVAL);
+    }
+
+    Ok(timeout.tv_sec as u128 * 1_000_000_000 + timeout.tv_usec as u128 * 1_000)
+}
+
+fn saturating_logical_time(nanos: u128) -> LogicalTime {
+    LogicalTime::from_nanos(nanos.try_into().unwrap_or(u64::MAX))
+}
+
+fn saturating_deadline(base: LogicalTime, delta_nanos: u128) -> LogicalTime {
+    saturating_logical_time(base.as_nanos() as u128 + delta_nanos)
+}
+
+pub async fn relative_timespec_timeout<T, G>(
+    guest: &mut G,
+    timeout: Option<Timespec>,
+) -> Result<ParsedTimeout, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(timeout) = timeout else {
+        return Ok(ParsedTimeout::Infinite);
+    };
+    let timeout_nanos = checked_timespec_to_nanos(timeout)?;
+    Ok(relative_nanos_timeout(guest, timeout_nanos).await)
+}
+
+pub async fn relative_timeval_timeout<T, G>(
+    guest: &mut G,
+    timeout: Option<libc::timeval>,
+) -> Result<ParsedTimeout, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(timeout) = timeout else {
+        return Ok(ParsedTimeout::Infinite);
+    };
+    let timeout_nanos = checked_timeval_to_nanos(timeout)?;
+    Ok(relative_nanos_timeout(guest, timeout_nanos).await)
+}
+
+pub fn absolute_timespec_timeout(timeout: Option<Timespec>) -> Result<ParsedTimeout, Errno> {
+    let Some(timeout) = timeout else {
+        return Ok(ParsedTimeout::Infinite);
+    };
+    Ok(ParsedTimeout::Deadline(saturating_logical_time(
+        checked_timespec_to_nanos(timeout)?,
+    )))
+}
+
+pub async fn millis_timeout<T, G>(guest: &mut G, timeout_millis: i32) -> ParsedTimeout
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    match timeout_millis {
+        0 => ParsedTimeout::Immediate,
+        timeout if timeout < 0 => ParsedTimeout::Infinite,
+        timeout => relative_nanos_timeout(guest, timeout as u128 * 1_000_000).await,
+    }
+}
+
+async fn relative_nanos_timeout<T, G>(guest: &mut G, timeout_nanos: u128) -> ParsedTimeout
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if timeout_nanos == 0 {
+        ParsedTimeout::Immediate
+    } else {
+        let base = thread_observe_time(guest).await;
+        ParsedTimeout::Deadline(saturating_deadline(base, timeout_nanos))
+    }
+}
+
+fn internal_io_polling_resources<T, G>(guest: &G, name: &str) -> Resources
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut resources = Resources::new(guest.thread_state().dettid);
+    resources.insert(ResourceID::InternalIOPolling, Permission::W);
+    resources.fyi(name);
+    resources
+}
+
+pub async fn execute_internal_io_polling<T, G, C>(
+    guest: &mut G,
+    call: C,
+    timeout: ParsedTimeout,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+    C: NonblockableSyscall + TimeoutableSyscall,
+{
+    if timeout == ParsedTimeout::Immediate {
+        return Ok(guest.inject(call).await?);
+    }
+
+    let resources = internal_io_polling_resources(guest, call.name());
+    retry_nonblocking_syscall_with_timeout(guest, call, resources, timeout.deadline()).await
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:
@@ -317,18 +449,55 @@ pub trait NonblockableSyscall: SyscallInfo {
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>);
 
+    /// Restore inputs that the kernel overwrites during a nonblocking probe.
+    fn prepare_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        _guest: &mut G,
+        _original: Self,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Publish probe outputs once the syscall has completed or timed out.
+    fn finish_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        _guest: &mut G,
+        _original: Self,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Check if the result (in nonblocking mode) is analogous to blocking in blocking mode.
     /// I.e. the result means "try again".
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Ok(0)
     }
 
+    /// Whether this result means the current syscall invocation started an asynchronous operation.
+    fn syscall_started_operation(&self, _res: Result<i64, Errno>) -> bool {
+        false
+    }
+
+    /// Whether another invocation currently owns an asynchronous operation on this descriptor.
+    fn operation_in_progress<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) -> bool {
+        false
+    }
+
+    /// Atomically claim ownership of an asynchronous operation started by this invocation.
+    fn try_start_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) -> bool {
+        true
+    }
+
+    /// Release ownership after the asynchronous operation has completed.
+    fn finish_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) {}
+
     /// Convert a physical nonblocking completion into the result expected by the guest.
-    /// `retried` is true after a prior result was classified as blocked.
+    /// `operation_started` is true only if this invocation started the asynchronous operation.
     fn normalize_nonblocking_result(
         &self,
         res: Result<i64, Errno>,
-        _retried: bool,
+        _operation_started: bool,
+        _operation_contended: bool,
     ) -> Result<i64, Errno> {
         res
     }
@@ -384,6 +553,191 @@ async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
     let tp = stack.push(tp_val);
     let guard = stack.commit().expect("stack.commit to succeed");
     (tp, guard)
+}
+
+async fn zero_timeval<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+) -> (Addr<'stack, libc::timeval>, <G::Stack as Stack>::StackGuard) {
+    let mut stack = guest.stack().await;
+    let timeout = stack.push(libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    });
+    let guard = stack.commit().expect("stack.commit to succeed");
+    (timeout, guard)
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Ppoll {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        let (timeout, guard) = zero_timeval(guest).await;
+        (self.with_timeout(Some(timeout)), Some(guard))
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Ppoll {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
+fn select_fd_set_len(nfds: i32) -> Result<usize, Errno> {
+    let nfds = usize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+    let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
+    Ok(nfds.div_ceil(bits_per_word) * std::mem::size_of::<libc::c_ulong>())
+}
+
+fn copy_select_fd_sets<T, G>(
+    guest: &mut G,
+    nfds: i32,
+    sources: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    destinations: [Option<AddrMut<'_, libc::fd_set>>; 3],
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let len = select_fd_set_len(nfds)?;
+    if len == 0 {
+        return Ok(());
+    }
+
+    let mut memory = guest.memory();
+    for (source, destination) in sources.into_iter().zip(destinations) {
+        if let (Some(source), Some(destination)) = (source, destination) {
+            let mut bytes = vec![0; len];
+            memory.read_exact(source.cast::<u8>(), &mut bytes)?;
+            memory.write_exact(destination.cast::<u8>(), &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Select {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        let mut stack = guest.stack().await;
+        let readfds = self.readfds().map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = self.writefds().map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = self.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        let timeout = stack.reserve::<libc::timeval>();
+        let guard = stack.commit().expect("stack.commit to succeed");
+        (
+            self.with_readfds(readfds)
+                .with_writefds(writefds)
+                .with_exceptfds(exceptfds)
+                .with_timeout(Some(timeout)),
+            Some(guard),
+        )
+    }
+
+    fn prepare_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        guest: &mut G,
+        original: Self,
+    ) -> Result<(), Error> {
+        copy_select_fd_sets(
+            guest,
+            self.nfds(),
+            [
+                original.readfds(),
+                original.writefds(),
+                original.exceptfds(),
+            ],
+            [self.readfds(), self.writefds(), self.exceptfds()],
+        )
+    }
+
+    fn finish_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        guest: &mut G,
+        original: Self,
+    ) -> Result<(), Error> {
+        copy_select_fd_sets(
+            guest,
+            self.nfds(),
+            [self.readfds(), self.writefds(), self.exceptfds()],
+            [
+                original.readfds(),
+                original.writefds(),
+                original.exceptfds(),
+            ],
+        )
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Select {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Pselect6 {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        let mut stack = guest.stack().await;
+        let readfds = self.readfds().map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = self.writefds().map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = self.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        let timeout = stack.reserve::<libc::timeval>();
+        let guard = stack.commit().expect("stack.commit to succeed");
+        (
+            self.with_readfds(readfds)
+                .with_writefds(writefds)
+                .with_exceptfds(exceptfds)
+                .with_timeout(Some(timeout.into())),
+            Some(guard),
+        )
+    }
+
+    fn prepare_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        guest: &mut G,
+        original: Self,
+    ) -> Result<(), Error> {
+        copy_select_fd_sets(
+            guest,
+            self.nfds(),
+            [
+                original.readfds(),
+                original.writefds(),
+                original.exceptfds(),
+            ],
+            [self.readfds(), self.writefds(), self.exceptfds()],
+        )
+    }
+
+    fn finish_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        &self,
+        guest: &mut G,
+        original: Self,
+    ) -> Result<(), Error> {
+        copy_select_fd_sets(
+            guest,
+            self.nfds(),
+            [self.readfds(), self.writefds(), self.exceptfds()],
+            [
+                original.readfds(),
+                original.writefds(),
+                original.exceptfds(),
+            ],
+        )
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Pselect6 {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -482,6 +836,34 @@ impl NonblockableSyscall for reverie::syscalls::Write {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         // A return value of Ok(0) indicates end of file.
         // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Readv {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Writev {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
 }
@@ -634,14 +1016,41 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
             || res == Err(Errno::EALREADY)
     }
 
+    fn syscall_started_operation(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EINPROGRESS)
+    }
+
+    fn operation_in_progress<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.connect_in_progress())
+            .unwrap()
+    }
+
+    fn try_start_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.try_start_connect())
+            .unwrap()
+    }
+
+    fn finish_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.finish_connect())
+            .unwrap();
+    }
+
     fn normalize_nonblocking_result(
         &self,
         res: Result<i64, Errno>,
-        retried: bool,
+        operation_started: bool,
+        operation_contended: bool,
     ) -> Result<i64, Errno> {
-        match (retried, res) {
-            (true, Err(Errno::EISCONN)) => Ok(0),
-            (_, res) => res,
+        match (operation_started, operation_contended, res) {
+            (true, _, Err(Errno::EISCONN)) => Ok(0),
+            (false, true, Ok(0)) => Err(Errno::EISCONN),
+            (_, _, res) => res,
         }
     }
 }
@@ -696,15 +1105,24 @@ where
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
     let mut rsrc = rsrc.clone();
+    let mut operation_started = false;
+    let mut operation_contended = false;
 
     loop {
+        call.prepare_nonblocking(guest, call0)?;
         resource_request(guest, rsrc.clone()).await;
+        operation_contended |= !operation_started && call.operation_in_progress(guest);
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
+            if !operation_started && call.syscall_started_operation(res) {
+                operation_started = call.try_start_operation(guest);
+                operation_contended |= !operation_started;
+            }
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
                 let new_time = thread_observe_time(guest).await;
                 if new_time >= timeout {
+                    call.finish_nonblocking(guest, call0)?;
                     tracing::trace!(
                         "Timing out syscall after #{} retries: {}",
                         rsrc.poll_attempt - 1,
@@ -731,9 +1149,13 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
+            call.finish_nonblocking(guest, call0)?;
             let res = call
-                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .normalize_nonblocking_result(res, operation_started, operation_contended)
                 .map_err(|e| e.into());
+            if operation_started {
+                call.finish_operation(guest);
+            }
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,
@@ -790,32 +1212,55 @@ where
     event
 }
 
-// Convert to absolute logical time point for the timeout.
-// 0 duration means no timeout, and this will return None.
-pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
-    guest: &mut G,
-    timeout_millis: i32,
-) -> Option<LogicalTime> {
-    if timeout_millis > 0 {
-        nanos_duration_to_absolute_timeout(guest, (timeout_millis as u128) * 1000).await
-    } else {
-        None
-    }
-}
+#[cfg(test)]
+mod nonblocking_tests {
+    use super::*;
 
-// Convert to absolute logical time point for the timeout.
-// 0 duration means no timeout, and this will return None.
-pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
-    guest: &mut G,
-    timeout_nanos: u128,
-) -> Option<LogicalTime> {
-    if timeout_nanos > 0 {
-        let ns_delta = Duration::from_nanos(timeout_nanos as u64);
-        let base_time = thread_observe_time(guest).await;
-        let target_time = base_time + ns_delta;
-        Some(target_time)
-    } else {
-        None
+    #[test]
+    fn timespec_validation_and_saturation() {
+        assert_eq!(
+            checked_timespec_to_nanos(Timespec {
+                tv_sec: 1,
+                tv_nsec: 2,
+            }),
+            Ok(1_000_000_002)
+        );
+        assert_eq!(
+            checked_timespec_to_nanos(Timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            saturating_deadline(LogicalTime::from_nanos(7), u64::MAX as u128 + 1),
+            LogicalTime::MAX
+        );
+        assert_eq!(
+            absolute_timespec_timeout(Some(Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 999_999_999,
+            })),
+            Ok(ParsedTimeout::Deadline(LogicalTime::MAX))
+        );
+        assert_eq!(select_fd_set_len(-1), Err(Errno::EINVAL));
+        assert_eq!(select_fd_set_len(0), Ok(0));
+        assert_eq!(select_fd_set_len(1), Ok(8));
+        assert_eq!(select_fd_set_len(65), Ok(16));
+        assert_eq!(
+            checked_timeval_to_nanos(libc::timeval {
+                tv_sec: 1,
+                tv_usec: 2,
+            }),
+            Ok(1_000_002_000)
+        );
+        assert_eq!(
+            checked_timeval_to_nanos(libc::timeval {
+                tv_sec: 0,
+                tv_usec: 1_000_000,
+            }),
+            Err(Errno::EINVAL)
+        );
     }
 }
 
@@ -828,12 +1273,18 @@ mod tests {
         let call = reverie::syscalls::Connect::new();
         assert!(call.syscall_would_have_blocked(Err(Errno::EINPROGRESS)));
         assert!(call.syscall_would_have_blocked(Err(Errno::EALREADY)));
+        assert!(call.syscall_started_operation(Err(Errno::EINPROGRESS)));
+        assert!(!call.syscall_started_operation(Err(Errno::EALREADY)));
         assert_eq!(
-            call.normalize_nonblocking_result(Err(Errno::EISCONN), true),
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), true, false),
             Ok(0)
         );
         assert_eq!(
-            call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), false, true),
+            Err(Errno::EISCONN)
+        );
+        assert_eq!(
+            call.normalize_nonblocking_result(Ok(0), false, true),
             Err(Errno::EISCONN)
         );
     }

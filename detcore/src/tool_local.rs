@@ -509,6 +509,17 @@ impl ThreadStats {
     }
 }
 
+/// Information inherited by a `CLONE_VFORK` child so it can register itself
+/// while its parent is blocked inside the kernel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingVfork {
+    pub parent_dettid: DetTid,
+    pub parent_detpid: DetPid,
+    pub child_tid_addr: usize,
+    pub flags: CloneFlags,
+    pub child_priority_entropy: Option<u64>,
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -544,6 +555,10 @@ pub struct ThreadState<T> {
     ///
     /// Stated differently, this is just for message-passing communication.
     pub clone_flags: Option<CloneFlags>,
+
+    /// Registration metadata for a vfork child. The child consumes this in
+    /// `handle_thread_start`; the parent clears its copy when vfork returns.
+    pub pending_vfork: Option<PendingVfork>,
 
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
@@ -667,6 +682,7 @@ impl<T> ThreadState<T> {
                 FileMetadata::new(pid).setup_stdio(pid.into(), pid),
             )),
             clone_flags: None,
+            pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),

@@ -24,11 +24,30 @@ const RUN_TOOLS: &[&str] = &[
     "dynamic_ls",
     "shell",
     "python",
+    "node",
+    "java",
+    "go",
     "curl",
+    "wget",
     "git",
     "gcc",
+    "make",
+    "cmake",
+    "sqlite",
+    "cargo",
 ];
-const RECORD_REPLAY_TOOLS: &[&str] = &["static_busybox", "shell"];
+const RECORD_REPLAY_TOOLS: &[&str] = &[
+    "static_busybox",
+    "dynamic_ls",
+    "shell",
+    "python",
+    "curl",
+    "wget",
+    "git",
+    "gcc",
+    "make",
+    "cargo",
+];
 
 #[derive(Clone, Debug)]
 struct Tool {
@@ -66,16 +85,21 @@ fn tool(
     candidates: &[&str],
     args: &'static [&'static str],
     marker: &'static str,
-) -> Option<Tool> {
-    Some(Tool {
+) -> Tool {
+    let path = executable(candidates).unwrap_or_else(|| {
+        panic!(
+            "ERROR: required arbitrary-binary tool {name} is missing; expected an executable at one of {candidates:?}"
+        )
+    });
+    Tool {
         name,
-        path: executable(candidates)?,
+        path,
         args,
         marker,
-    })
+    }
 }
 
-fn available_tools(allowed: &[&str]) -> Vec<Tool> {
+fn required_tools() -> Vec<Tool> {
     let mut tools = [
         tool(
             "static_busybox",
@@ -158,20 +182,17 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
         ),
     ]
     .into_iter()
-    .flatten()
-    .filter(|tool| allowed.contains(&tool.name))
     .collect::<Vec<_>>();
 
-    if allowed.contains(&"cargo")
-        && let Some(path) = rustup_tool("cargo")
-    {
-        tools.push(Tool {
-            name: "cargo",
-            path,
-            args: &["--version"],
-            marker: "cargo",
-        });
-    }
+    let path = rustup_tool("cargo").unwrap_or_else(|| {
+        panic!("ERROR: required arbitrary-binary tool cargo is unavailable through rustup")
+    });
+    tools.push(Tool {
+        name: "cargo",
+        path,
+        args: &["--version"],
+        marker: "cargo",
+    });
     tools
 }
 
@@ -251,7 +272,7 @@ fn record_replay(tool: &Tool) -> Output {
 #[test]
 fn run_arbitrary_binary_matrix() {
     let _guard = hermit_run_lock();
-    let tools = available_tools(RUN_TOOLS);
+    let tools = required_tools();
     assert!(
         tools.iter().any(|tool| tool.name == "dynamic_ls")
             && tools.iter().any(|tool| tool.name == "shell"),
@@ -267,9 +288,12 @@ fn run_arbitrary_binary_matrix() {
 #[test]
 fn record_replay_stable_arbitrary_binaries() {
     let _guard = hermit_run_lock();
-    let tools = available_tools(RECORD_REPLAY_TOOLS);
+    let tools = required_tools();
 
-    for tool in &tools {
+    for tool in tools
+        .iter()
+        .filter(|tool| RECORD_REPLAY_TOOLS.contains(&tool.name))
+    {
         let output = record_replay(tool);
         let combined = format!(
             "{}{}",
@@ -299,13 +323,8 @@ fn arbitrary_binary_commands_are_bounded() {
 }
 
 #[test]
-fn arbitrary_binary_lists_are_curated_for_ci() {
-    for name in [
-        "node", "java", "go", "wget", "make", "cmake", "sqlite", "cargo",
-    ] {
-        assert!(!RUN_TOOLS.contains(&name));
-        assert!(!RECORD_REPLAY_TOOLS.contains(&name));
-    }
+fn arbitrary_binary_lists_are_complete_and_bounded() {
+    assert_eq!(RUN_TOOLS.len(), 15);
     assert!(
         RECORD_REPLAY_TOOLS
             .iter()
@@ -315,7 +334,7 @@ fn arbitrary_binary_lists_are_curated_for_ci() {
     let worst_case_seconds =
         (RUN_TOOLS.len() + RECORD_REPLAY_TOOLS.len()) as u64 * BINARY_TIMEOUT.as_secs();
     assert!(
-        worst_case_seconds < 5 * 60,
-        "curated arbitrary binary probes can exceed five minutes"
+        worst_case_seconds < 10 * 60,
+        "bounded arbitrary binary probes can exceed ten minutes"
     );
 }

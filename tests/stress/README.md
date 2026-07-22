@@ -26,7 +26,7 @@ preemption schedule, and requires a precise replay of that failure.
 Run the tiers with:
 
 ```bash
-cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
-cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
-cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
+cargo test -p hermit --test stress_suite fast_chaos_matrix -- --exact
+cargo test -p hermit --test stress_suite slow_race_matrix -- --exact
+cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact
 ```

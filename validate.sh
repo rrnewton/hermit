@@ -316,12 +316,20 @@ run_check "Test workspace and integrations" \
 run_check "Test detcore package" cargo test -p detcore
 run_check "Fast concurrency stress suite" \
     "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
-    --run-ignored only -E 'test(=fast_chaos_matrix)'
+    -E 'test(=fast_chaos_matrix)'
 # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
 run_check "Hermit analyze scenarios" \
-    cargo test -p hermit --test analyze -- --ignored
+    cargo test -p hermit --test analyze -- --test-threads=1
 run_check "Schedule search E2E (requires PMU)" \
     ./tests/util/hermit_analyze_e2e.sh
+# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
+if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+    run_check "rr syscall suite" \
+        cargo test -p hermit --test rr_suite -- --test-threads=1
+else
+    run_check "rr syscall suite prerequisite" \
+        test -f "$ROOT_DIR/third-party/rr/src/test/util.h"
+fi
 
 wait_for_background_checks
 print_summary
