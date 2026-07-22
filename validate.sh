@@ -16,6 +16,26 @@ declare -a check_results=()
 declare -a check_durations=()
 failures=0
 
+COLOR_GREEN=""
+COLOR_RED=""
+COLOR_RESET=""
+if [[ -t 1 && ${TERM:-dumb} != "dumb" && -z ${NO_COLOR:-} ]]; then
+    COLOR_GREEN=$'\033[32m'
+    COLOR_RED=$'\033[31m'
+    COLOR_RESET=$'\033[0m'
+fi
+readonly COLOR_GREEN COLOR_RED COLOR_RESET
+
+readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
+readonly HERMIT_SMOKE_TIMEOUT="30s"
+readonly SMOKE_MARKER="hermit-validation-smoke"
+declare -ar HERMIT_RUN_ARGS=(
+    run
+    --base-env=minimal
+    --no-virtualize-cpuid
+    --preemption-timeout=disabled
+)
+
 function interrupted {
     echo
     echo "Validation interrupted."
@@ -45,16 +65,71 @@ function run_check {
     if "$@"; then
         status=0
         check_results+=("PASS")
-        echo "PASS: $name"
+        printf "%bPASS%b: %s\n" "$COLOR_GREEN" "$COLOR_RESET" "$name"
     else
         status=$?
         check_results+=("FAIL (exit $status)")
         failures=$((failures + 1))
-        echo "FAIL: $name (exit $status)"
+        printf "%bFAIL%b: %s (exit %s)\n" \
+            "$COLOR_RED" "$COLOR_RESET" "$name" "$status"
     fi
 
     check_names+=("$name")
     check_durations+=("$((SECONDS - started_at))")
+}
+
+function hermit_echo {
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" -- \
+        /bin/echo "$SMOKE_MARKER"
+}
+
+function hermit_run_smoke {
+    local output
+    local status
+
+    output=$(hermit_echo)
+    status=$?
+    if ((status != 0)); then
+        return "$status"
+    fi
+
+    if [[ "$output" != "$SMOKE_MARKER" ]]; then
+        printf "Unexpected Hermit stdout: %q\n" "$output" >&2
+        return 1
+    fi
+}
+
+function hermit_determinism_check {
+    local first_output
+    local second_output
+    local status
+
+    first_output=$(hermit_echo)
+    status=$?
+    if ((status != 0)); then
+        return "$status"
+    fi
+
+    second_output=$(hermit_echo)
+    status=$?
+    if ((status != 0)); then
+        return "$status"
+    fi
+
+    if [[ "$first_output" != "$second_output" ]]; then
+        echo "Hermit stdout differed between identical runs:" >&2
+        diff -u \
+            <(printf "%s\n" "$first_output") \
+            <(printf "%s\n" "$second_output") >&2 || true
+        return 1
+    fi
+}
+
+function hermit_verify_smoke {
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" --verify -- \
+        /bin/echo "$SMOKE_MARKER"
 }
 
 function print_summary {
@@ -62,10 +137,13 @@ function print_summary {
 
     local i
     for i in "${!check_names[@]}"; do
-        printf "  %-48s %-16s %ss\n" \
-            "${check_names[$i]}" \
-            "${check_results[$i]}" \
-            "${check_durations[$i]}"
+        local color=$COLOR_RED
+        if [[ ${check_results[$i]} == "PASS" ]]; then
+            color=$COLOR_GREEN
+        fi
+        printf "  %-48s %b%-16s%b %ss\n" \
+            "${check_names[$i]}" "$color" "${check_results[$i]}" \
+            "$COLOR_RESET" "${check_durations[$i]}"
     done
 
     echo
@@ -77,6 +155,9 @@ function print_summary {
 }
 
 run_check "Build workspace" cargo build --workspace
+run_check "Hermit run smoke test" hermit_run_smoke
+run_check "Hermit output determinism" hermit_determinism_check
+run_check "Hermit verify-mode smoke test" hermit_verify_smoke
 # Workspace tests include package unit, documentation, and Cargo integration
 # targets such as hermit-cli/tests/hermit_modes.rs.
 run_check "Test workspace and integrations" \
