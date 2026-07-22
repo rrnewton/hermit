@@ -56,6 +56,7 @@ pub enum SyscallEvent {
     /// only piece of information that needs to be recorded.
     Return(i64),
     Stat(StatEvent),
+    Statfs(Vec<u8>),
     Statx(StatxBuf),
     Rdtsc(RdtscResult),
     Ioctl(ioctl::Output),
