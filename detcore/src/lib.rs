@@ -552,9 +552,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // TODO(T137258824): add proper Select / PSelect6
-                // Sysno::pselect6,
-                // Sysno::select,
+                Sysno::pselect6,
+                Sysno::select,
             ]);
 
             if do_sched {
@@ -1100,6 +1099,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             Syscall::Poll(s) => self.handle_poll(guest, s).await,
             Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+            Syscall::Select(s) => self.handle_select(guest, s).await,
+            Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
             Syscall::EpollCreate(s) => {
                 self.handle_epoll_create1(guest, EpollCreate1::from(s))
                     .await
@@ -1257,7 +1258,13 @@ mod release_subscription_tests {
         let subscription = <Detcore<NoopTool> as Tool>::subscriptions(&Config::default());
         let syscalls: Vec<_> = subscription.iter_syscalls().collect();
 
-        for syscall in [Sysno::ppoll, Sysno::readv, Sysno::writev] {
+        for syscall in [
+            Sysno::ppoll,
+            Sysno::pselect6,
+            Sysno::readv,
+            Sysno::select,
+            Sysno::writev,
+        ] {
             assert!(
                 syscalls.contains(&syscall),
                 "missing {syscall} subscription"

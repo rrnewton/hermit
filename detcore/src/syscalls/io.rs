@@ -35,8 +35,15 @@ use crate::syscalls::helpers::ParsedTimeout;
 use crate::syscalls::helpers::execute_internal_io_polling;
 use crate::syscalls::helpers::millis_timeout;
 use crate::syscalls::helpers::relative_timespec_timeout;
+use crate::syscalls::helpers::relative_timeval_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
+
+fn fd_set_exceeds_scratch_capacity(nfds: i32) -> bool {
+    // The raw Linux ABI accepts dynamically sized fd sets, but Reverie's syscall model and our
+    // retry scratch storage use libc's fixed-size fd_set.
+    nfds > libc::FD_SETSIZE as i32
+}
 
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
@@ -102,6 +109,92 @@ impl<T: RecordOrReplay> Detcore<T> {
         let timeout_addr = if let Some(addr) = call.timeout() {
             // Reverie currently types this ABI-compatible pointer as timeval, while Linux
             // ppoll interprets it as timespec.
+            Some(AddrMut::<Timespec>::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timespec_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = Timespec {
+                tv_sec: (remaining_nanos / 1_000_000_000) as i64,
+                tv_nsec: (remaining_nanos % 1_000_000_000) as i64,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
+    }
+
+    /// select syscall (MAYHANG)
+    pub async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+    ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || fd_set_exceeds_scratch_capacity(call.nfds())
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .await;
+        }
+
+        let timeout_addr = call.timeout();
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timeval_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = libc::timeval {
+                tv_sec: (remaining_nanos / 1_000_000_000) as libc::time_t,
+                tv_usec: ((remaining_nanos % 1_000_000_000) / 1_000) as libc::suseconds_t,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
+    }
+
+    /// pselect6 syscall (MAYHANG)
+    pub async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || fd_set_exceeds_scratch_capacity(call.nfds())
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                .await;
+        }
+
+        let timeout_addr = if let Some(addr) = call.timeout() {
+            // Reverie types this ABI-compatible pointer as timeval, while Linux
+            // pselect6 interprets it as timespec.
             Some(AddrMut::<Timespec>::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?)
         } else {
             None
