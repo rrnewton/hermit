@@ -222,6 +222,74 @@ Every handoff includes:
 - known failures or environment limitations,
 - whether the branch is ready for a pull request or authorized fast-forward.
 
+## Precise Communication
+
+Agent reports drive coordinator decisions, so every claim must be precise and
+independently verifiable. Vague status language is a defect: it hides what was
+and was not actually checked.
+
+### Banned Vague Terms
+
+Do not describe results with unquantified words. In particular, never report
+that something is "working", "demonstrated", "audited", or that features are
+"present together" without stating exactly what was run and observed. Replace
+each with a concrete claim: the command, the backend, the assurance level, and
+the observed output. If you cannot ground a word in evidence, do not use it.
+
+### Assurance Levels
+
+State the exact assurance level whenever you claim a run passes. The ladder is
+cumulative; each level presupposes the ones below it:
+
+| Level | Meaning | How it is established |
+| --- | --- | --- |
+| L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
+| L1 | Runs deterministically under strict mode | `hermit run --strict` |
+| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
+| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
+
+A claim of "passing" with no level is meaningless. Write "passes at L2 (ptrace
+backend)" rather than "verified" or "works".
+
+### Required Run Context
+
+Every result about a Hermit run states, explicitly:
+
+- **Backend**: `ptrace`, `DBI`, or `KVM`.
+- **Log level**: the `--log`/`RUST_LOG` level, or "default" when unset.
+- **Relaxations**: any flag that weakens determinism, for example
+  `--no-strict` or `--no-sequentialize-threads`. State "none" when there are
+  none.
+
+A non-strict result never counts as "passing" on its own. If a run used
+`--no-strict` or any other relaxation, label it as such and do not present it
+as a determinism guarantee.
+
+### Completion Reports
+
+Every completion report includes:
+
+- the PR number as a full hyperlink, for example
+  `https://github.com/rrnewton/hermit/pull/<n>`;
+- the worktree slot path and current working directory;
+- the feature branch name;
+- the assurance level reached, with backend, log level, and relaxations;
+- the exact commands run and their observed output, not a paraphrase.
+
+### Evidence, Not Assertion
+
+Ground every claim in evidence a reader can re-check: file paths with line
+numbers, the exact command, and its output. Separate what you verified from
+what you assume. Under-claiming beats false closure: if a check did not run,
+say so and say why.
+
+### No Dirty State
+
+Commit and push each change immediately; never leave a checkout dirty or claim
+"done" without a pushed commit behind it. A report that work is complete
+implies a clean `git status` and a pushed branch.
+
 ## Project Overview
 
 Hermit is an x86_64 Linux reproducible container. It runs a guest program under
