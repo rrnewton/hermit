@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -16,6 +18,8 @@ use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+
+use common::xfail_dbi;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
@@ -527,6 +531,10 @@ default_workload_tests! {
 
 #[test]
 fn default_lit_networking() {
+    if xfail_dbi("network analysis events are not exported by the DBI backend") {
+        return;
+    }
+
     let _guard = hermit_run_lock();
     let workload = workloads()
         .default_only
@@ -660,6 +668,10 @@ fn default_environment_selection() {
 
 #[test]
 fn no_hardware_minimal_hello_backtraces() {
+    if xfail_dbi("scheduled-event recording and stack capture are not implemented for DBI") {
+        return;
+    }
+
     let _guard = hermit_run_lock();
     let workload = workloads()
         .default_only
@@ -702,6 +714,10 @@ fn no_hardware_minimal_hello_backtraces() {
 
 #[test]
 fn no_hardware_stacktrace_signal() {
+    if xfail_dbi("DBI does not record scheduling events or deliver stacktrace signals") {
+        return;
+    }
+
     let _guard = hermit_run_lock();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
@@ -788,6 +804,10 @@ printf 'configured\n'
 
 #[test]
 fn hello_race_chaos_verify() {
+    if xfail_dbi("DBI has no deterministic thread scheduler for chaos verification") {
+        return;
+    }
+
     let _guard = hermit_run_lock();
     let workload = &workloads().hello_race;
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));

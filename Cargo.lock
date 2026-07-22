@@ -1508,7 +1508,7 @@ dependencies = [
 [[package]]
 name = "reverie"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072#f359a6695efdace1cfe94af434899ba988d2e072"
+source = "git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee#69f47d9edee6421a0757456b54ca760f1d000fee"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1523,8 +1523,8 @@ dependencies = [
  "object 0.36.7",
  "procfs",
  "raw-cpuid",
- "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072)",
- "reverie-syscalls 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072)",
+ "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee)",
+ "reverie-syscalls 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee)",
  "serde",
  "syscalls",
  "thiserror",
@@ -1534,11 +1534,11 @@ dependencies = [
 [[package]]
 name = "reverie-dbi"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072#f359a6695efdace1cfe94af434899ba988d2e072"
+source = "git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee#69f47d9edee6421a0757456b54ca760f1d000fee"
 dependencies = [
  "libc",
- "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072)",
- "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072)",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee)",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee)",
  "serde",
 ]
 
@@ -1553,7 +1553,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072#f359a6695efdace1cfe94af434899ba988d2e072"
+source = "git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee#69f47d9edee6421a0757456b54ca760f1d000fee"
 dependencies = [
  "syscalls",
 ]
@@ -1578,7 +1578,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072#f359a6695efdace1cfe94af434899ba988d2e072"
+source = "git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee#69f47d9edee6421a0757456b54ca760f1d000fee"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1641,14 +1641,14 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072#f359a6695efdace1cfe94af434899ba988d2e072"
+source = "git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee#69f47d9edee6421a0757456b54ca760f1d000fee"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
  "libc",
  "nix",
  "paste",
- "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=f359a6695efdace1cfe94af434899ba988d2e072)",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=69f47d9edee6421a0757456b54ca760f1d000fee)",
  "serde",
  "syscalls",
 ]

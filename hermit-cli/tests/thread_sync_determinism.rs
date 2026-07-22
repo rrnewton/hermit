@@ -6,12 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
+
+use common::xfail_dbi;
 
 const PATTERNS: [&str; 6] = [
     "barrier",
@@ -93,6 +97,10 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
 
 #[test]
 fn thread_sync_patterns_are_deterministic_across_five_runs() {
+    if xfail_dbi("DBI does not control synchronization wake and completion order") {
+        return;
+    }
+
     for pattern in PATTERNS {
         let expected = run_pattern(pattern, 1);
         assert!(
