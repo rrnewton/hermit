@@ -79,9 +79,18 @@ jobs:
     - name: Dependencies
       run: |
         if command -v apt-get >/dev/null; then
-          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev
+          sudo apt-get update
+          sudo apt-get install -y \
+            busybox cmake coreutils curl default-jre-headless g++ gcc git \
+            liblzma-dev libunwind-dev make nodejs python3 sqlite3 wget
         elif command -v dnf >/dev/null; then
-          sudo dnf install -y cmake gcc-c++ libunwind-devel xz-devel
+          sudo dnf install -y \
+            busybox cmake coreutils curl gcc gcc-c++ git \
+            java-17-openjdk-headless libunwind-devel make nodejs python3 \
+            sqlite wget xz-devel
+        else
+          echo "::error::No supported package manager; test dependencies cannot be installed."
+          exit 1
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
@@ -90,26 +99,22 @@ jobs:
     - name: PMU timing and miscellaneous tests
       run: |
         cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-        cargo test -p detcore --test tests_time -- --ignored --test-threads=4
+        cargo test -p detcore --test tests_time -- --test-threads=4
     - name: PMU parallel futex tests
       run: >-
         cargo test -p detcore --test tests_parallelism futex_wait_parent
-        -- --ignored --test-threads=3
+        -- --test-threads=3
     - name: PMU parallel memory tests
       run: |
-        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --ignored --test-threads=4
-        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --ignored --test-threads=4
-    - name: Check mount namespace support
-      id: namespaces
+        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=4
+        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=4
+    - name: Require mount namespace support
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
-          echo "available=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
+        if ! unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'; then
+          echo "::error::Mount namespaces are required for Hermit integration tests."
+          exit 1
         fi
     - name: Stable Hermit tests including record/replay matrix
-      if: steps.namespaces.outputs.available == 'true'
       run: |
         cargo test -p hermit --lib --bins
         for test in \
@@ -118,6 +123,7 @@ jobs:
           clock_determinism \
           epoll_determinism \
           mmap_determinism \
+          no_silent_skips \
           procfs_determinism \
           signal_determinism
         do
@@ -126,13 +132,11 @@ jobs:
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
     - name: Build pinned LevelDB integration fixture
-      if: steps.namespaces.outputs.available == 'true'
       run: >-
         ./hermit-cli/tests/prepare_leveldb.sh
         "${GITHUB_WORKSPACE}/target/hermit-leveldb-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         "${GITHUB_WORKSPACE}/target/hermit-leveldb-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
     - name: Focused LevelDB strict determinism test
-      if: steps.namespaces.outputs.available == 'true'
       env:
         HERMIT_LEVELDB_BUILD_DIR: ${{ github.workspace }}/target/hermit-leveldb-build-${{ github.run_id }}-${{ github.run_attempt }}
       run: >-
@@ -140,8 +144,4 @@ jobs:
         focused_leveldb_tests_are_deterministic_under_strict
         -- --exact --test-threads=1
     - name: rr syscall test suite
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test rr_suite -- --ignored
-    - name: Hermit unit tests without mount namespaces
-      if: steps.namespaces.outputs.available != 'true'
-      run: cargo test -p hermit --lib --bins
+      run: cargo test -p hermit --test rr_suite -- --test-threads=1

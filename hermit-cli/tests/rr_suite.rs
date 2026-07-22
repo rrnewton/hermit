@@ -28,11 +28,10 @@
 //! ```
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
-//! user/mount namespaces, so like the other Hermit integration suites these are
-//! `#[ignore]`d by default and exercised explicitly (e.g. from `validate.sh`):
+//! user/mount namespaces, so CI runs them on the required self-hosted runner:
 //!
 //! ```text
-//! cargo test -p hermit --test rr_suite -- --ignored
+//! cargo test -p hermit --test rr_suite -- --test-threads=1
 //! ```
 //!
 //! Only the programs that currently pass under Hermit are enabled here. The
@@ -204,7 +203,6 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
 macro_rules! rr_test {
     ($name:ident, $base:literal, $exit:literal, $args:expr) => {
         #[test]
-        #[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
         fn $name() {
             run_rr_test($base, $exit, $args, None);
         }
@@ -341,7 +339,6 @@ rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
 rr_test!(rr_no_mask_timeslice, "no_mask_timeslice", 0, &[]);
 rr_test!(rr_numa, "numa", 0, &[]);
 #[test]
-#[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
 fn rr_pause() {
     run_rr_test("pause", 1, &[], Some("EXIT-SUCCESS"));
 }

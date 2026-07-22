@@ -123,7 +123,6 @@ fn focused_leveldb_tests_are_deterministic_under_strict() {
 }
 
 #[test]
-#[ignore = "the full LevelDB suite contains long concurrent and randomized stress cases"]
 fn full_leveldb_suite_is_deterministic_under_strict() {
     let build_dir = required_build_dir();
     assert_deterministic(
@@ -134,7 +133,6 @@ fn full_leveldb_suite_is_deterministic_under_strict() {
 }
 
 #[test]
-#[ignore = "LevelDB's repeated fork+exec close-on-exec checks are slow under ptrace"]
 fn leveldb_env_posix_is_deterministic_under_strict() {
     let build_dir = required_build_dir();
     assert_deterministic(

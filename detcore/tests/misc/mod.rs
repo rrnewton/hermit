@@ -910,7 +910,10 @@ fn futex_wait_bitset_timeout_is_absolute_and_removes_waiter() {
 
 #[test]
 fn getrandom_intercepted() {
-    reverie_ptrace::ret_without_perf!();
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: getrandom_intercepted requires accessible PMU hardware counters"
+    );
     detcore_testutils::det_test_fn(|| {
         let mut got: u64 = 0;
         assert_eq!(
@@ -946,10 +949,10 @@ fn getrandom_intercepted() {
 #[test]
 fn has_rdrand_without_detcore() {
     let features = hardware_random_features();
-    if !features.rdrand {
-        eprintln!("host does not expose RDRAND; skipping host feature prerequisite");
-        return;
-    }
+    assert!(
+        features.rdrand,
+        "ERROR: has_rdrand_without_detcore requires the host to expose RDRAND"
+    );
 
     if !features.rdseed {
         eprintln!("host exposes RDRAND without RDSEED; RDSEED is not required by this host test");
@@ -959,14 +962,14 @@ fn has_rdrand_without_detcore() {
 #[test]
 fn rdrand_rdseed_is_masked() {
     let features = hardware_random_features();
-    if !features.rdrand && !features.rdseed {
-        eprintln!("host exposes neither RDRAND nor RDSEED; skipping CPUID masking test");
-        return;
-    }
-    if !cpuid_faulting_supported() {
-        eprintln!("host does not support CPUID faulting; skipping CPUID masking test");
-        return;
-    }
+    assert!(
+        features.rdrand || features.rdseed,
+        "ERROR: rdrand_rdseed_is_masked requires the host to expose RDRAND or RDSEED"
+    );
+    assert!(
+        cpuid_faulting_supported(),
+        "ERROR: rdrand_rdseed_is_masked requires host CPUID faulting support"
+    );
 
     det_test_fn_without_pmu(|| {
         let cpuid = raw_cpuid::CpuId::new();
