@@ -26,6 +26,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -1110,7 +1111,19 @@ where
 
     loop {
         call.prepare_nonblocking(guest, call0)?;
-        resource_request(guest, rsrc.clone()).await;
+        // If a signal was delivered to this thread while it was parked polling,
+        // interrupt the emulated blocking syscall with -ERESTARTSYS. Returning
+        // -ERESTARTSYS (rather than -EINTR) lets the kernel run the guest's
+        // signal handler and then honor `SA_RESTART`: syscalls installed with
+        // SA_RESTART restart (re-entering this handler, where they observe any
+        // side effects the handler produced, e.g. a byte written to the pipe we
+        // are reading), while others are converted to -EINTR by the kernel. This
+        // is what lets a thread blocked on a pipe read make progress after
+        // another thread signals it, instead of polling forever.
+        if let ResumeStatus::Signaled = resource_request(guest, rsrc.clone()).await {
+            call.finish_nonblocking(guest, call0)?;
+            return Err(Errno::ERESTARTSYS.into());
+        }
         operation_contended |= !operation_started && call.operation_in_progress(guest);
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
