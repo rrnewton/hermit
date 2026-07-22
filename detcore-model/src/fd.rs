@@ -66,7 +66,18 @@ pub struct FdSlot {
 }
 
 /// Identity of a Linux open file description (`struct file`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub struct OpenFileId {
     creator: DetTid,
     sequence: u64,
