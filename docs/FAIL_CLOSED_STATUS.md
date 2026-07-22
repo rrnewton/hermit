@@ -1,6 +1,6 @@
 # Fail-Closed Test Status
 
-Status: baseline and ratchet policy, 2026-07-22
+Status: `pread64` modeled; next blocker identified, 2026-07-22
 
 Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
 Detcore into a panic instead of silently passing it through. The integration
@@ -17,6 +17,15 @@ with `HERMIT_FAIL_CLOSED=1`. The raw integration harness result was 37 passed,
 86 failed, and 11 ignored. The policy classification below separates tests
 that actually exercise the `hermit run` fail-closed path from tests for which
 the mode is not applicable.
+
+Detcore now handles `pread64` deterministically, including positional retries
+for short regular-file reads and seeded reads from random devices. The 85
+tests previously blocked at `pread64` proceed further, but each next reaches
+the unsupported `rseq` registration performed by the system C library. A
+representative `clock_determinism` run and a direct `/bin/true` run both
+confirmed this sequence. The measured applicable pass count therefore remains
+3/89 rather than the projected 88/89; the known-failure manifest now records
+`Rseq` as the first current blocker for those tests.
 
 | Test target or category | Fail-closed pass | Known failure | Ignored | Mode N/A |
 | --- | ---: | ---: | ---: | ---: |
@@ -47,7 +56,8 @@ machine-readable exception lists:
 
 - [`fail_closed_known_failures.tsv`](../hermit-cli/tests/fail_closed_known_failures.tsv)
   records every failing target/test pair and its first observed blocker. The
-  baseline has 85 failures at `pread64` and one at `ioctl`.
+  original baseline had 85 failures at `pread64` and one at `ioctl`. After
+  `pread64` handling, those 85 failures advance to `rseq`.
 - [`fail_closed_allowed_ignores.tsv`](../hermit-cli/tests/fail_closed_allowed_ignores.tsv)
   records the eight PMU-dependent mode tests and three explicit stress tiers.
 - Unit tests, `cli`, and `record_replay` do not execute Detcore's `hermit run`
