@@ -3,3 +3,6 @@ pkg
 .tmp*
 target/
 *.preempts
+
+# pr-dag-health.sh report artifact (regenerate with the script)
+pr-dag-health.json
