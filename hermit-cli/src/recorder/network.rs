@@ -15,6 +15,7 @@ use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
+use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Syscall;
@@ -216,5 +217,39 @@ impl Recorder {
         result
     }
 
-    // TODO: Add support for ppoll, epoll, and select here.
+    pub(super) async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Ppoll,
+    ) -> Result<i64, Errno> {
+        let len = syscall.nfds() as usize;
+        let result = guest.inject(syscall).await;
+
+        // `ppoll` differs from `poll` only in its inputs (a `timespec` timeout
+        // and a temporary signal mask). Neither is mutated by the kernel, so the
+        // only outputs to record are the `revents` in each `pollfd` and the
+        // ready count. Reuse `PollEvent`. Note `Ppoll::fds()` yields a
+        // `libc::pollfd` pointer; cast it to reverie's layout-compatible,
+        // serializable `PollFd`.
+        let event = result.and_then(|ret| {
+            let mut fds = vec![PollFd::default(); len];
+
+            // It is fine for `fds` to be NULL: with `nfds == 0`, `ppoll` is a
+            // pure sleep and returns 0 after the timeout elapses.
+            if let Some(addr) = syscall.fds() {
+                guest
+                    .memory()
+                    .read_values(addr.cast::<PollFd>().into(), &mut fds)?;
+            }
+
+            let updated = ret as usize;
+            Ok(SyscallEvent::Poll(PollEvent { fds, updated }))
+        });
+
+        self.record_event(guest, event);
+
+        result
+    }
+
+    // TODO: Add support for epoll and select here.
 }

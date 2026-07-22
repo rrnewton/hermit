@@ -13,6 +13,8 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
+use reverie::syscalls::PollFd;
+use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::family::SockOptFamily;
@@ -85,6 +87,31 @@ impl Replayer {
         // Write out the recorded fds (if any).
         if let Some(addr) = syscall.fds() {
             guest.memory().write_values(addr, &event.fds)?;
+        }
+
+        Ok(event.updated as i64)
+    }
+
+    pub(super) async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Ppoll,
+    ) -> Result<i64, Errno> {
+        // `ppoll` records the same `PollEvent` as `poll` (recorded `revents`
+        // plus the ready count); its timeout and signal-mask arguments are not
+        // mutated by the kernel. `Ppoll::fds()` is a `libc::pollfd` pointer, so
+        // cast it to reverie's layout-compatible `PollFd`.
+        let event = next_event!(guest, Poll)?;
+
+        let nfds = syscall.nfds() as usize;
+
+        assert_eq!(event.fds.len(), nfds);
+
+        // Write out the recorded fds (if any).
+        if let Some(addr) = syscall.fds() {
+            guest
+                .memory()
+                .write_values(addr.cast::<PollFd>(), &event.fds)?;
         }
 
         Ok(event.updated as i64)

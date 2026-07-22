@@ -271,6 +271,27 @@ fn record_replay_matrix() {
     }
 }
 
+/// Regression test for `ppoll(2)` record/replay support.
+///
+/// Before dedicated handling, `hermit replay` panicked when it reached a
+/// `ppoll` syscall (the replayer had no arm for it and refuses to consult live
+/// fd readiness). This records and replays a guest that exercises a ready pipe
+/// (`POLLIN`), a timed-out poll, and the `nfds == 0` sleep, asserting the
+/// recorded `revents`/ready-count are reconstructed deterministically.
+#[test]
+fn record_ppoll() {
+    let _guard = hermit_record_lock();
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("record-replay-workloads");
+    fs::create_dir_all(&build_root).expect("failed to create workload build directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+        .join("tests/c/ppoll.c");
+    let program = build_root.join("c_ppoll");
+    compile_c(&source, &program);
+    record_replay_command("ppoll", &program, &[]);
+}
+
 #[test]
 fn record_find_directory_tree() {
     let _guard = hermit_record_lock();

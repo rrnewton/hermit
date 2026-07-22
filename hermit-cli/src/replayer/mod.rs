@@ -157,6 +157,7 @@ impl Tool for Replayer {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
