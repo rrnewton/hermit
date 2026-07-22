@@ -1130,7 +1130,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
             // Rseq exposes host CPU migration. Emulate a kernel without Rseq support.
-            _ if call.number() == Sysno::rseq => Err(Error::Errno(Errno::ENOSYS)),
+            _ if call.number() == Sysno::rseq && config.panic_on_unsupported_syscalls => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
             // The guest PID namespace provides stable process and thread IDs.
             Syscall::Getpid(_) => self.passthrough(guest, call).await,
             Syscall::Gettid(_) => self.passthrough(guest, call).await,
