@@ -11,20 +11,16 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
-declare -a check_names=()
-declare -a check_results=()
-declare -a check_durations=()
+checks=0
 failures=0
 
-COLOR_GREEN=""
-COLOR_RED=""
-COLOR_RESET=""
-if [[ -t 1 && ${TERM:-dumb} != "dumb" && -z ${NO_COLOR:-} ]]; then
-    COLOR_GREEN=$'\033[32m'
-    COLOR_RED=$'\033[31m'
-    COLOR_RESET=$'\033[0m'
+LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/hermit-validate.XXXXXX.log")
+if [[ -z $LOG_FILE ]]; then
+    echo "Unable to create validation log." >&2
+    exit 1
 fi
-readonly COLOR_GREEN COLOR_RED COLOR_RESET
+readonly LOG_FILE
+printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
 
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
@@ -37,17 +33,35 @@ declare -ar HERMIT_RUN_ARGS=(
 )
 
 function interrupted {
-    echo
-    echo "Validation interrupted."
+    printf "❌ Validation interrupted (full log: %s)\n" "$LOG_FILE"
     exit 130
 }
 trap interrupted INT TERM
 
-function banner {
-    echo
-    echo "================================================================================"
-    echo ">>> $*"
-    echo "================================================================================"
+function failure_summary {
+    local output_start=$1
+    local output
+    local summary
+
+    output=$(
+        tail -n "+$output_start" "$LOG_FILE" |
+            sed $'s/\033\\[[0-9;]*[[:alpha:]]//g; s/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g'
+    )
+    summary=$(
+        printf "%s\n" "$output" |
+            grep -E '(^error(\[[^]]+\])?:|^FAIL:|^test result: FAILED|^failures:|panicked at|Unexpected .*:|differed between|timed out|command not found|No such file)' |
+            tail -n 1
+    ) || true
+
+    if [[ -z $summary ]]; then
+        summary=$(printf "%s\n" "$output" | sed '/^[[:space:]]*$/d' | tail -n 1)
+    fi
+    if [[ -z $summary ]]; then
+        summary="command exited without an error message"
+    elif ((${#summary} > 180)); then
+        summary="${summary:0:177}..."
+    fi
+    printf "%s" "$summary"
 }
 
 function run_check {
@@ -55,27 +69,35 @@ function run_check {
     shift
 
     local started_at=$SECONDS
+    local output_start
     local status
+    local summary
 
-    banner "$name"
-    printf "Command:"
-    printf " %q" "$@"
-    echo
+    {
+        printf "=== %s ===\n" "$name"
+        printf "Command:"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
-    if "$@"; then
+    if "$@" >>"$LOG_FILE" 2>&1; then
         status=0
-        check_results+=("PASS")
-        printf "%bPASS%b: %s\n" "$COLOR_GREEN" "$COLOR_RESET" "$name"
+        printf "✅ %s (1 passed, 0 failed, %ss)\n" \
+            "$name" "$((SECONDS - started_at))"
     else
         status=$?
-        check_results+=("FAIL (exit $status)")
         failures=$((failures + 1))
-        printf "%bFAIL%b: %s (exit %s)\n" \
-            "$COLOR_RED" "$COLOR_RESET" "$name" "$status"
+        summary=$(failure_summary "$output_start")
+        printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
+            "$name" "$status" "$summary" "$LOG_FILE"
     fi
 
-    check_names+=("$name")
-    check_durations+=("$((SECONDS - started_at))")
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    checks=$((checks + 1))
 }
 
 function hermit_echo {
@@ -133,24 +155,13 @@ function hermit_verify_smoke {
 }
 
 function print_summary {
-    banner "Validation summary"
-
-    local i
-    for i in "${!check_names[@]}"; do
-        local color=$COLOR_RED
-        if [[ ${check_results[$i]} == "PASS" ]]; then
-            color=$COLOR_GREEN
-        fi
-        printf "  %-48s %b%-16s%b %ss\n" \
-            "${check_names[$i]}" "$color" "${check_results[$i]}" \
-            "$COLOR_RESET" "${check_durations[$i]}"
-    done
-
-    echo
+    local passed=$((checks - failures))
     if ((failures == 0)); then
-        echo "All ${#check_names[@]} validation checks passed."
+        printf "✅ Validation summary (%s passed, 0 failed; full log: %s)\n" \
+            "$passed" "$LOG_FILE"
     else
-        echo "$failures of ${#check_names[@]} validation checks failed."
+        printf "❌ Validation summary (%s passed, %s failed; full log: %s)\n" \
+            "$passed" "$failures" "$LOG_FILE"
     fi
 }
 
