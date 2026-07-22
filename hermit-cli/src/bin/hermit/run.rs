@@ -876,6 +876,15 @@ impl RunOpts {
         }
         self.validate_mount_sources()?;
         self.validate_program()?;
+
+        // The experimental backends use their native launchers instead of the
+        // ptrace container machinery below.
+        match backend {
+            Backend::Ptrace => {}
+            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Kvm => return super::backends::run_kvm(&self.program),
+        }
+
         // });
 
         if self.no_namespace {

@@ -257,15 +257,8 @@ impl Backend {
                 "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
                     .to_owned(),
             ),
-            Self::Dbi => Some(
-                "the DynamoRIO prototype does not yet expose a Detcore process launcher".to_owned(),
-            ),
-            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
-                Some(
-                    "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
-                        .to_owned(),
-                )
-            }),
+            Self::Dbi => None,
+            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }
 }
