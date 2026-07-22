@@ -66,6 +66,8 @@ use crate::scheduler::Scheduler;
 use crate::scheduler::Seconds;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
+use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
@@ -1268,11 +1270,23 @@ pub async fn create_child_thread<G, T>(
             Some(REPLAY_DEFERRED_PRIORITY)
         }
     } else if guest.config().chaos {
-        Some(entropy_to_priority(
-            guest
-                .thread_state_mut()
-                .chaos_prng_next_u64("child_priority"),
-        ))
+        let entropy = guest
+            .thread_state_mut()
+            .chaos_prng_next_u64("child_priority");
+        if guest.config().chaos_target_races {
+            // Targeted chaos: bias a freshly created child to an extreme priority
+            // so it either runs before the parent resumes or strictly after it,
+            // instead of landing at a uniformly random priority. This maximizes
+            // parent/child ordering divergence to surface fork/exec races.
+            // Reproducible under `--fuzz-seed`/`--sched-seed`.
+            if entropy.is_multiple_of(2) {
+                Some(FIRST_PRIORITY)
+            } else {
+                Some(LAST_PRIORITY)
+            }
+        } else {
+            Some(entropy_to_priority(entropy))
+        }
     } else {
         Some(DEFAULT_PRIORITY)
     };
