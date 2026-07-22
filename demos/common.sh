@@ -38,6 +38,23 @@ export RACE_SH="${RACE_SH:-$HERMIT_REPO/examples/race.sh}"
 
 test -x "$HERMIT" || { echo "missing hermit binary: $HERMIT" >&2; exit 1; }
 
+# Hermit's `run` mounts a private tmpfs over /tmp, so the guest does not see the
+# real /tmp directory. When this checkout lives under /tmp, that hides the demo's
+# own guest programs and scripts (hello_race, rustbin_heap_ptrs, race.sh, and the
+# recorded schedule under target/), and hermit fails with "Could not execute ...
+# No such file or directory". In that case, bind-mount the real /tmp (an identity
+# mount via --tmp=/tmp) so those paths remain visible. For checkouts outside /tmp
+# the default isolation is kept unchanged. HERMIT_ANALYZE_TMP_FLAGS forwards the
+# same flag to the guest runs that `hermit analyze` spawns (demo 4).
+HERMIT_TMP_FLAGS=()
+HERMIT_ANALYZE_TMP_FLAGS=()
+case "$HERMIT_REPO/" in
+  /tmp/*)
+    HERMIT_TMP_FLAGS=(--tmp=/tmp)
+    HERMIT_ANALYZE_TMP_FLAGS=(--run-arg=--tmp=/tmp)
+    ;;
+esac
+
 # Per-run scratch (private tmp) and ignored build-artifact scratch (under the
 # hermit target/ directory). Both are created once and shared by the demo steps.
 export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
@@ -47,6 +64,7 @@ mkdir -p "$DEMO_TMP" "$DEMO_ARTIFACTS"
 # Portable run wrapper: minimal environment, CPUID and PMU preemption disabled.
 run_hermit() {
   "$HERMIT" --log=error run \
+    "${HERMIT_TMP_FLAGS[@]}" \
     --base-env=minimal \
     --no-virtualize-cpuid \
     --preemption-timeout=disabled \
@@ -65,13 +83,14 @@ run_hermit() {
 #      preemption disabled the two runs can diverge. This step therefore
 #      requires user-accessible CPU performance counters (PMU).
 verify_hermit() {
-  "$HERMIT" --log=info run --verify --no-virtualize-cpuid "$@"
+  "$HERMIT" --log=info run --verify --no-virtualize-cpuid "${HERMIT_TMP_FLAGS[@]}" "$@"
 }
 
 # Chaos wrapper: seeded scheduler PRNG for concurrency exploration.
 chaos_run() {
   local seed="$1"
   "$HERMIT" --log=error run \
+    "${HERMIT_TMP_FLAGS[@]}" \
     --chaos \
     --seed="$seed" \
     --base-env=minimal \
