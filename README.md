@@ -195,7 +195,7 @@ Focused contributions are welcome. Before opening a pull request:
    cargo test --workspace
    ```
 
-5. Document host-dependent skips or failures instead of weakening the test.
+5. Report host-dependent prerequisite failures instead of weakening the test.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the pull-request, CLA, issue, style,
 and licensing guidelines.
