@@ -24,6 +24,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -146,6 +147,7 @@ impl Tool for Recorder {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         self.record_raw_syscall(guest, syscall);
+        self.record_exec_path(guest, syscall);
 
         Ok(match syscall {
             // We must let through execve without any modification. Recording
@@ -249,6 +251,64 @@ impl Recorder {
             .thread_state_mut()
             .push_debug_event(debug_event)
             .unwrap();
+    }
+
+    /// Records the absolute path of any executable that the guest execs, so that
+    /// the replayer can make the same binary available inside its chroot.
+    ///
+    /// Without this, a guest process that forks and execs another binary (for
+    /// example a shell running an external command) would desynchronize on
+    /// replay: the injected `execve` fails with `ENOENT` inside the chroot,
+    /// causing the guest to take a different code path than it did while
+    /// recording.
+    fn record_exec_path<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
+        let path = match syscall {
+            Syscall::Execve(call) => call.path().map(|p| p.read(&guest.memory())),
+            // Only AT_FDCWD execveat calls carry a path we can resolve without
+            // reconstructing the guest's fd table; dirfd-relative execs are rare
+            // and are skipped (best effort).
+            Syscall::Execveat(call) if call.dirfd() == libc::AT_FDCWD => {
+                call.path().map(|p| p.read(&guest.memory()))
+            }
+            _ => return,
+        };
+        let Some(Ok(path)) = path else {
+            return;
+        };
+        // Only absolute paths can be reproduced in the chroot without also
+        // knowing the guest's working directory at exec time.
+        if !path.is_absolute() {
+            return;
+        }
+        if let Err(err) = self.append_exec_path(&path) {
+            tracing::warn!("Failed to record exec path {:?}: {}", path, err);
+        }
+    }
+
+    /// Appends a single executable path to the recording's `exec_paths` file.
+    ///
+    /// The file is opened in append mode for every exec so that concurrent guest
+    /// threads each contribute their targets; a single small `write` is atomic
+    /// under `O_APPEND` on Linux. Duplicates are deduplicated by the replayer.
+    fn append_exec_path(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        // Paths are newline-delimited in the manifest; skip the (pathological)
+        // case of an embedded newline rather than corrupt the file.
+        if bytes.contains(&b'\n') {
+            return Ok(());
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.data.join(crate::consts::EXEC_PATHS_NAME))?;
+        let mut line = Vec::with_capacity(bytes.len() + 1);
+        line.extend_from_slice(bytes);
+        line.push(b'\n');
+        file.write_all(&line)
     }
 
     fn record_event<G: Guest<Self>>(&self, guest: &mut G, event: Result<SyscallEvent, Errno>) {

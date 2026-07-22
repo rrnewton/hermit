@@ -294,6 +294,38 @@ fn record_find_directory_tree() {
     );
 }
 
+/// Regression test for issue #19: a shell that forks and execs an external
+/// binary must be able to re-exec that binary during replay. The replay chroot
+/// previously contained only the root executable, so the forked child's
+/// `execve` failed with `ENOENT` and the guest desynchronized (it took its
+/// exec-failure path and issued an extra `newfstatat`).
+#[test]
+fn record_shell_forked_external_command() {
+    let _guard = hermit_record_lock();
+
+    let shell = [Path::new("/bin/bash"), Path::new("/usr/bin/bash")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(shell) = shell else {
+        eprintln!("bash is not installed; skipping shell fork/exec record coverage");
+        return;
+    };
+
+    let true_bin = [Path::new("/bin/true"), Path::new("/usr/bin/true")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("coreutils `true` is missing");
+
+    // `cmd && cmd` forces bash to fork a child for the first command rather than
+    // exec-optimizing it in place, so the child's execve exercises the chroot.
+    let script = format!("{bin} && {bin}", bin = true_bin.display());
+    record_replay_command(
+        "shell-fork-exec",
+        shell,
+        &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
