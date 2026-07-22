@@ -51,12 +51,13 @@ redis_cli=$source_root/src/redis-cli
 
 run_workload() {
   local run=$1
+  local port=$((20000 + ((BASHPID * 17 + run * 131) % 30000)))
   local stdout=$artifact_root/strict-extended-$run.stdout
   local stderr=$artifact_root/strict-extended-$run.stderr
 
   if ! timeout 120 "$hermit_bin" --log off run --strict -- \
     /bin/sh "$script_dir/workload.sh" \
-    "$redis_server" "$redis_cli" extended "source-$run" \
+    "$redis_server" "$redis_cli" extended "source-$BASHPID-$run" "$port" \
     >"$stdout" 2>"$stderr"; then
     cat "$stdout" >&2
     cat "$stderr" >&2
