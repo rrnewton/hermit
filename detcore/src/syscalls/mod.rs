@@ -12,6 +12,7 @@ mod files;
 pub mod helpers;
 mod io;
 mod misc;
+mod pid;
 mod signal;
 mod sysinfo;
 mod threads;
