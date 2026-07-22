@@ -552,6 +552,7 @@ fn select_ready_and_timeout() {
 }
 
 #[test]
+#[allow(clippy::manual_dangling_ptr)]
 fn select_fd_set_abi_boundaries() {
     det_test_fn_without_pmu(|| {
         let invalid_set = 1_usize as *mut libc::fd_set;
