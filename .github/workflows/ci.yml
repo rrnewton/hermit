@@ -67,7 +67,9 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 10
+    # Raised from 10 to accommodate the hardware-gated integration tests that
+    # were previously never executed on any runner (analyze/chaos/stress below).
+    timeout-minutes: 30
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -134,6 +136,26 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    - name: Hardware-gated Hermit integration tests (previously #[ignore]d)
+      if: steps.namespaces.outputs.available == 'true'
+      # These integration tests are #[ignore]d so the GitHub-hosted runner --
+      # which lacks PMU branch counters and CPUID faulting -- skips them. This
+      # self-hosted runner HAS that hardware, so it must actually run them here
+      # instead of leaving them silently unexecuted on every runner. Each test is
+      # tracked in hermit-cli/tests/fail_closed_allowed_ignores.tsv; before this
+      # step they ran in no CI job (validate.sh's --envelope-compare path used by
+      # the envelope gate exits after the envelope probes, before its analyze and
+      # stress run_check lines).
+      #
+      # hermit_modes' two default_cargo_* ignores are deliberately skipped: they
+      # are gated on a product bug (default mode can block in connect/clock
+      # emulation), not on missing hardware, so forcing them would hang the job.
+      run: |
+        cargo test -p hermit --test analyze -- --ignored --test-threads=1
+        cargo test -p hermit --test hermit_modes -- --ignored --test-threads=1 \
+          --skip default_cargo_bind_connect_race \
+          --skip default_cargo_clock_total_order
+        cargo test -p hermit --test stress_suite -- --ignored --test-threads=1
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: ./scripts/test-fail-closed.sh
