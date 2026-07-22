@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -225,7 +226,7 @@ fn workload(name: &str) -> &Workload {
         .unwrap_or_else(|| panic!("unknown record/replay workload: {name}"))
 }
 
-fn record_replay(workload: &Workload) {
+fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -233,8 +234,9 @@ fn record_replay(workload: &Workload) {
         .args(["record", "start", "--verify"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
-        .arg(&workload.path);
-    let output = command_output(command, &format!("record/replay for {}", workload.name));
+        .arg(program)
+        .args(args);
+    let output = command_output(command, &format!("record/replay for {name}"));
     let combined_output = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -242,10 +244,12 @@ fn record_replay(workload: &Workload) {
     );
     assert!(
         combined_output.contains("Success: replay matched recording."),
-        "Hermit did not report deterministic replay for {}:\n{}",
-        workload.name,
-        combined_output
+        "Hermit did not report deterministic replay for {name}:\n{combined_output}"
     );
+}
+
+fn record_replay(workload: &Workload) {
+    record_replay_command(workload.name, &workload.path, &[]);
 }
 
 fn run_record_replay(name: &str) {
@@ -261,6 +265,29 @@ fn record_replay_matrix() {
     for name in BASELINE_RECORD_WORKLOADS {
         record_replay(workload(name));
     }
+}
+
+#[test]
+fn record_find_directory_tree() {
+    let _guard = hermit_record_lock();
+    let tree = tempfile::tempdir().expect("failed to create find fixture directory");
+    let nested = tree.path().join("nested");
+    fs::create_dir(&nested).expect("failed to create nested find fixture directory");
+    fs::write(tree.path().join("root.txt"), "root\n").expect("failed to write root find fixture");
+    fs::write(nested.join("child.txt"), "child\n").expect("failed to write nested find fixture");
+
+    let find = Path::new("/usr/bin/find");
+    assert!(find.is_file(), "GNU find is missing at {}", find.display());
+    record_replay_command(
+        "find",
+        find,
+        &[
+            tree.path().as_os_str(),
+            OsStr::new("-type"),
+            OsStr::new("f"),
+            OsStr::new("-print"),
+        ],
+    );
 }
 
 macro_rules! record_replay_tests {
