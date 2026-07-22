@@ -475,6 +475,7 @@ rr_test!(rr_sigreturn_reg, "sigreturn_reg", 0, &[]);
 rr_test!(rr_sigtrap, "sigtrap", 0, &[]);
 rr_test!(rr_simple_threads_stress, "simple_threads_stress", 0, &[]);
 rr_test!(rr_small_holes, "small_holes", 0, &[]);
+rr_test!(rr_spinlock_priorities, "spinlock_priorities", 0, &[]);
 rr_test!(rr_splice, "splice", 0, &[]);
 rr_test!(
     rr_stack_growth_after_syscallbuf,

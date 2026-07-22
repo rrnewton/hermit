@@ -699,6 +699,7 @@ pub async fn do_a_turn_blocking(
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
         mg.step6_reenquue(next_dtid);
+        mg.maybe_upgrade_pollers_after_yield(next_dtid, &rsrcs);
         if let Some(call) = rsrcs.as_exit_syscall() {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -1993,6 +1994,45 @@ impl Scheduler {
             "[sched-step6] dettid {} going back into queue at position {}.",
             next_dtid, pos
         );
+    }
+
+    /// After a thread has taken a turn, detect the case where it merely
+    /// *yielded* (an immediate `SleepUntil` produced by `sched_yield` or a
+    /// timeslice preemption) while the only other runnable threads are
+    /// backed-off pollers. In that situation the yielding thread would be
+    /// reselected ahead of the deprioritized pollers on every turn, starving
+    /// them until the periodic `POLLING_UPGRADE_INTERVAL` upgrade eventually
+    /// fires (which can take hundreds of full timeslices when a thread busy
+    /// spins). Eagerly upgrade those pollers so one of them runs on the next
+    /// turn, giving a spin/yield loop the chance to observe progress made by a
+    /// blocked reader whose I/O is now ready.
+    ///
+    /// The yielding thread has already been re-enqueued by `step6`, so it is not
+    /// starved in turn: it and the upgraded poller alternate.
+    ///
+    /// Precondition: no tentative_pop transaction is in flight (step6 committed
+    /// it).
+    fn maybe_upgrade_pollers_after_yield(&mut self, yielder: DetTid, rsrcs: &Resources) {
+        if self.is_immediate_yield(rsrcs) && self.run_queue.only_pollers_besides(yielder) {
+            debug!(
+                "[dtid {}] yielded with only pollers left runnable; eagerly upgrading pollers.",
+                yielder
+            );
+            self.run_queue.force_poll_upgrade();
+        }
+    }
+
+    /// Whether `rsrcs` is a bare yield: a single `SleepUntil` whose target time
+    /// has already passed (`<= committed_time`), meaning the thread is
+    /// immediately runnable again rather than sleeping into the future.
+    fn is_immediate_yield(&self, rsrcs: &Resources) -> bool {
+        if rsrcs.resources.len() != 1 {
+            return false;
+        }
+        match rsrcs.resources.keys().next() {
+            Some(ResourceID::SleepUntil(target)) => *target <= self.committed_time,
+            _ => false,
+        }
     }
 
     /// Add a simulated "post hook" for exit calls which we're about to let through.

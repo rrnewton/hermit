@@ -487,6 +487,43 @@ impl RunQueue {
         }
     }
 
+    /// Returns true if the queue holds at least one poll-upgradeable poller and
+    /// every queued thread *other than* `except` is such a poller.
+    ///
+    /// This identifies the situation where the only threads that could run
+    /// besides `except` are backed-off pollers. A thread that merely yields
+    /// (e.g. `sched_yield` or a timeslice preemption) would otherwise be
+    /// reselected indefinitely ahead of those deprioritized pollers, starving
+    /// them until the periodic `POLLING_UPGRADE_INTERVAL` upgrade eventually
+    /// fires. See `Scheduler::maybe_upgrade_pollers_after_yield`.
+    pub fn only_pollers_besides(&self, except: DetTid) -> bool {
+        let mut saw_poller = false;
+        for qv in self.queue.values() {
+            if qv.tid == except {
+                continue;
+            }
+            if qv.poll_upgrade.is_some() {
+                saw_poller = true;
+            } else {
+                // A non-polling thread other than `except` is runnable; it will
+                // be scheduled through the normal round-robin, so no forced
+                // upgrade is warranted.
+                return false;
+            }
+        }
+        saw_poller
+    }
+
+    /// Immediately upgrade all outstanding polling tasks to their original
+    /// priority, bypassing the periodic `POLLING_UPGRADE_INTERVAL` cadence.
+    ///
+    /// Mutating operation: this will error if a tentative_pop/commit transaction
+    /// is underway.
+    pub fn force_poll_upgrade(&mut self) {
+        assert!(self.tentative_selection.is_none());
+        self.do_poll_upgrade();
+    }
+
     /// Upgrade polled tasks to their specified normal priority.
     #[cold]
     fn do_poll_upgrade(&mut self) {
