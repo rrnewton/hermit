@@ -188,6 +188,32 @@ fn run_fails_closed_for_unavailable_kvm_backend() {
 }
 
 #[test]
+fn strict_rejects_backends_without_full_detcore() {
+    // `--strict` promises full determinism, which only ptrace implements. The
+    // check must fire before backend-availability probing, so it works even for
+    // backends that are unavailable on this host.
+    for backend in ["dbi", "kvm"] {
+        let args = ["run", "--strict", "--backend", backend, "--", "/bin/true"];
+        let output = hermit(&args);
+        assert_failure_contains(&output, &["--strict requires the ptrace backend", backend]);
+    }
+}
+
+#[test]
+fn strict_allows_ptrace_backend() {
+    // The ptrace backend has full Detcore, so `--strict --backend ptrace` must
+    // not be rejected by the strict/backend guard (it may still succeed or fail
+    // for other reasons, but not with the strict-backend error).
+    let args = ["run", "--strict", "--backend", "ptrace", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert!(
+        !stderr(&output).contains("--strict requires the ptrace backend"),
+        "ptrace must be accepted under --strict:\n{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn namespace_only_rejects_every_explicit_backend() {
     for backend in ["ptrace", "dbi", "kvm"] {
         let args = [

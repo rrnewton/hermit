@@ -97,22 +97,23 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
 
 #[test]
 fn thread_sync_patterns_are_deterministic_across_five_runs() {
-    if xfail_dbi("DBI does not control synchronization wake and completion order") {
-        return;
-    }
-
-    for pattern in PATTERNS {
-        let expected = run_pattern(pattern, 1);
-        assert!(
-            expected.starts_with(&format!("{pattern}:")),
-            "unexpected {pattern} output: {expected:?}"
-        );
-        for iteration in 2..=REPEAT_COUNT {
-            assert_eq!(
-                run_pattern(pattern, iteration),
-                expected,
-                "{pattern} output changed on iteration {iteration}"
-            );
-        }
-    }
+    xfail_dbi(
+        "DBI does not control synchronization wake and completion order",
+        || {
+            for pattern in PATTERNS {
+                let expected = run_pattern(pattern, 1);
+                assert!(
+                    expected.starts_with(&format!("{pattern}:")),
+                    "unexpected {pattern} output: {expected:?}"
+                );
+                for iteration in 2..=REPEAT_COUNT {
+                    assert_eq!(
+                        run_pattern(pattern, iteration),
+                        expected,
+                        "{pattern} output changed on iteration {iteration}"
+                    );
+                }
+            }
+        },
+    );
 }

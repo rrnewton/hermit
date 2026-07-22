@@ -85,22 +85,23 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
 
 #[test]
 fn ipc_patterns_are_deterministic_across_five_runs() {
-    if xfail_dbi("DBI does not control competing IPC thread scheduling") {
-        return;
-    }
-
-    for pattern in PATTERNS {
-        let expected = run_pattern(pattern, 1);
-        assert!(
-            expected.starts_with(&format!("{pattern}:")),
-            "unexpected {pattern} output: {expected:?}"
-        );
-        for iteration in 2..=REPEAT_COUNT {
-            assert_eq!(
-                run_pattern(pattern, iteration),
-                expected,
-                "{pattern} output changed on iteration {iteration}"
-            );
-        }
-    }
+    xfail_dbi(
+        "DBI does not control competing IPC thread scheduling",
+        || {
+            for pattern in PATTERNS {
+                let expected = run_pattern(pattern, 1);
+                assert!(
+                    expected.starts_with(&format!("{pattern}:")),
+                    "unexpected {pattern} output: {expected:?}"
+                );
+                for iteration in 2..=REPEAT_COUNT {
+                    assert_eq!(
+                        run_pattern(pattern, iteration),
+                        expected,
+                        "{pattern} output changed on iteration {iteration}"
+                    );
+                }
+            }
+        },
+    );
 }

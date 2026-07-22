@@ -118,13 +118,14 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
 
 #[test]
 fn sigalrm_itimer_delivery_is_deterministic() {
-    if xfail_dbi("deterministic interval-timer delivery is not implemented for DBI") {
-        return;
-    }
-
-    run_signal_scenario(
-        "itimer-delivery",
-        "alarm delivered\nalarm pending=1 phase=2 deliveries=1\n",
+    xfail_dbi(
+        "deterministic interval-timer delivery is not implemented for DBI",
+        || {
+            run_signal_scenario(
+                "itimer-delivery",
+                "alarm delivered\nalarm pending=1 phase=2 deliveries=1\n",
+            );
+        },
     );
 }
 
@@ -154,12 +155,13 @@ fn alternate_signal_stack_is_preserved() {
 
 #[test]
 fn pending_signal_and_mask_survive_exec() {
-    if xfail_dbi("DynamoRIO does not preserve pending signal state across exec") {
-        return;
-    }
-
-    run_signal_scenario(
-        "pending-exec",
-        "exec mask=blocked pending=preserved consumed=SIGUSR1\n",
+    xfail_dbi(
+        "DynamoRIO does not preserve pending signal state across exec",
+        || {
+            run_signal_scenario(
+                "pending-exec",
+                "exec mask=blocked pending=preserved consumed=SIGUSR1\n",
+            );
+        },
     );
 }

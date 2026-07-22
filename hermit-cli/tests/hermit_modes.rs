@@ -531,28 +531,29 @@ default_workload_tests! {
 
 #[test]
 fn default_lit_networking() {
-    if xfail_dbi("network analysis events are not exported by the DBI backend") {
-        return;
-    }
-
-    let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == "lit_networking")
-        .expect("missing lit networking workload");
-    let mut command = default_hermit_command("minimal");
-    command
-        .args(["--analyze-networking", "--"])
-        .arg(&workload.path);
-    let output = command_output(command, "lit networking diagnostics");
-    let diagnostics = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    xfail_dbi(
+        "network analysis events are not exported by the DBI backend",
+        || {
+            let _guard = hermit_run_lock();
+            let workload = workloads()
+                .default_only
+                .iter()
+                .find(|workload| workload.name == "lit_networking")
+                .expect("missing lit networking workload");
+            let mut command = default_hermit_command("minimal");
+            command
+                .args(["--analyze-networking", "--"])
+                .arg(&workload.path);
+            let output = command_output(command, "lit networking diagnostics");
+            let diagnostics = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(diagnostics.contains("0.0.0.0:1299"));
+            assert!(diagnostics.contains(":::1299"));
+        },
     );
-    assert!(diagnostics.contains("0.0.0.0:1299"));
-    assert!(diagnostics.contains(":::1299"));
 }
 
 #[test]
@@ -668,86 +669,90 @@ fn default_environment_selection() {
 
 #[test]
 fn no_hardware_minimal_hello_backtraces() {
-    if xfail_dbi("scheduled-event recording and stack capture are not implemented for DBI") {
-        return;
-    }
+    xfail_dbi(
+        "scheduled-event recording and stack capture are not implemented for DBI",
+        || {
+            let _guard = hermit_run_lock();
+            let workload = workloads()
+                .default_only
+                .iter()
+                .find(|workload| workload.name == "minimal_hello")
+                .expect("missing minimal hello workload");
 
-    let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == "minimal_hello")
-        .expect("missing minimal hello workload");
+            let mut first = hermit_command("minimal");
+            first
+                .args(["--record-preemptions", "--summary", "--"])
+                .arg(&workload.path);
+            let first_output = command_output(first, "minimal hello event count");
+            let first_stderr = String::from_utf8_lossy(&first_output.stderr);
+            let event_count = first_stderr
+                .lines()
+                .find_map(|line| {
+                    let (_, suffix) = line.split_once("recorded ")?;
+                    let (count, _) = suffix.split_once(" events")?;
+                    count.parse::<usize>().ok()
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing recorded event count in stderr:\n{first_stderr}")
+                });
+            assert!(event_count > 0);
 
-    let mut first = hermit_command("minimal");
-    first
-        .args(["--record-preemptions", "--summary", "--"])
-        .arg(&workload.path);
-    let first_output = command_output(first, "minimal hello event count");
-    let first_stderr = String::from_utf8_lossy(&first_output.stderr);
-    let event_count = first_stderr
-        .lines()
-        .find_map(|line| {
-            let (_, suffix) = line.split_once("recorded ")?;
-            let (count, _) = suffix.split_once(" events")?;
-            count.parse::<usize>().ok()
-        })
-        .unwrap_or_else(|| panic!("missing recorded event count in stderr:\n{first_stderr}"));
-    assert!(event_count > 0);
-
-    let mut second = hermit_command("minimal");
-    second.args(["--record-preemptions", "--summary"]);
-    for index in 0..event_count {
-        second.arg(format!("--stacktrace-event={index}"));
-    }
-    second.arg("--").arg(&workload.path);
-    let second_output = command_output(second, "minimal hello event stacktraces");
-    let second_stderr = String::from_utf8_lossy(&second_output.stderr);
-    assert_eq!(
-        second_stderr
-            .matches("Printing stack trace for scheduled event")
-            .count(),
-        event_count,
-        "wrong stacktrace count in stderr:\n{second_stderr}"
+            let mut second = hermit_command("minimal");
+            second.args(["--record-preemptions", "--summary"]);
+            for index in 0..event_count {
+                second.arg(format!("--stacktrace-event={index}"));
+            }
+            second.arg("--").arg(&workload.path);
+            let second_output = command_output(second, "minimal hello event stacktraces");
+            let second_stderr = String::from_utf8_lossy(&second_output.stderr);
+            assert_eq!(
+                second_stderr
+                    .matches("Printing stack trace for scheduled event")
+                    .count(),
+                event_count,
+                "wrong stacktrace count in stderr:\n{second_stderr}"
+            );
+        },
     );
 }
 
 #[test]
 fn no_hardware_stacktrace_signal() {
-    if xfail_dbi("DBI does not record scheduling events or deliver stacktrace signals") {
-        return;
-    }
-
-    let _guard = hermit_run_lock();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=info",
-        "run",
-        "-u",
-        "--stacktrace-signal=SIGQUIT",
-        "--stacktrace-event=10",
-        "--record-preemptions",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
-        "--",
-        "/bin/date",
-    ]);
-    let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start stacktrace signal: {rendered}: {error}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.signal(),
-        Some(libc::SIGQUIT),
-        "guest did not propagate SIGQUIT: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-    );
-    assert!(
-        stderr.contains("SIGQUIT"),
-        "stacktrace log did not mention SIGQUIT:\n{stderr}"
+    xfail_dbi(
+        "DBI does not record scheduling events or deliver stacktrace signals",
+        || {
+            let _guard = hermit_run_lock();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+            command.args([
+                "--log=info",
+                "run",
+                "-u",
+                "--stacktrace-signal=SIGQUIT",
+                "--stacktrace-event=10",
+                "--record-preemptions",
+                "--base-env=minimal",
+                "--no-virtualize-cpuid",
+                "--preemption-timeout=disabled",
+                "--",
+                "/bin/date",
+            ]);
+            let rendered = format!("{command:?}");
+            let output = command.output().unwrap_or_else(|error| {
+                panic!("failed to start stacktrace signal: {rendered}: {error}")
+            });
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGQUIT),
+                "guest did not propagate SIGQUIT: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+            );
+            assert!(
+                stderr.contains("SIGQUIT"),
+                "stacktrace log did not mention SIGQUIT:\n{stderr}"
+            );
+        },
     );
 }
 
@@ -804,36 +809,37 @@ printf 'configured\n'
 
 #[test]
 fn hello_race_chaos_verify() {
-    if xfail_dbi("DBI has no deterministic thread scheduler for chaos verification") {
-        return;
-    }
+    xfail_dbi(
+        "DBI has no deterministic thread scheduler for chaos verification",
+        || {
+            let _guard = hermit_run_lock();
+            let workload = &workloads().hello_race;
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+            command
+                .args([
+                    "run",
+                    "--verify",
+                    "--verify-allow=both",
+                    "--chaos",
+                    "--base-env=minimal",
+                    "--no-virtualize-cpuid",
+                    "--preemption-timeout=disabled",
+                    "--env=HERMIT_MODE=chaos",
+                ])
+                .arg(&workload.path);
+            let rendered = format!("{command:?}");
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
-    let _guard = hermit_run_lock();
-    let workload = &workloads().hello_race;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args([
-            "run",
-            "--verify",
-            "--verify-allow=both",
-            "--chaos",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--env=HERMIT_MODE=chaos",
-        ])
-        .arg(&workload.path);
-    let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Hermit propagates the guest status even when --verify-allow=both accepts it.
-    assert!(
-        output.status.code().is_some() && stderr.contains("Success: deterministic."),
-        "chaos verification for hello_race failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
+            // Hermit propagates the guest status even when --verify-allow=both accepts it.
+            assert!(
+                output.status.code().is_some() && stderr.contains("Success: deterministic."),
+                "chaos verification for hello_race failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+            );
+        },
     );
 }

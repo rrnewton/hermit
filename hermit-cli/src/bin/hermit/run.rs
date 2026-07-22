@@ -707,6 +707,17 @@ impl RunOpts {
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
         let backend = self.selected_backend();
+        // `--strict` promises full Detcore determinism, which only the ptrace
+        // backend implements. The DBI and KVM backends lack the deterministic
+        // scheduler (see the DBI xfails), so accepting an explicit `--strict`
+        // with them would be a false guarantee.
+        if self.strict && backend != Backend::Ptrace {
+            anyhow::bail!(
+                "--strict requires the ptrace backend: backend `{}` does not implement \
+                 full Detcore determinism (e.g. deterministic thread scheduling)",
+                backend.as_str()
+            );
+        }
         if self.namespace_only {
             if let Some(explicit_backend) = self.backend {
                 anyhow::bail!(
