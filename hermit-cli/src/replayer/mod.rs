@@ -27,6 +27,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::ExitGroup;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
@@ -79,7 +80,9 @@ impl Tool for Replayer {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        self.expect_syscall(guest, syscall);
+        if let Err(desync) = self.expect_syscall(guest, syscall) {
+            return self.abort_replay(guest, desync).await;
+        }
 
         // NOTE: This match statement should be identical to the one in the
         // recorder. Otherwise, our recorder and replayer will disagree about
@@ -169,30 +172,38 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
-    // Check if we received the expected syscall or not.
-    fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
+    /// Checks that the syscall the guest is about to execute matches the next
+    /// recorded syscall.
+    ///
+    /// On a mismatch (a "desync") this returns the concise diagnostic as an
+    /// [`Error`] rather than panicking; the caller routes it to
+    /// [`Self::abort_replay`] for a clean shutdown. Panicking here would unwind
+    /// out of the Reverie tool callback, which runs inside the guest container
+    /// entered via a non-unwinding `clone` trampoline; that unwind aborts the
+    /// process and surfaces as a spurious `SIGSEGV` instead of a clean failure.
+    fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) -> Result<(), Error> {
         let thread = guest.tid();
         let next_count = guest.thread_state().count + 1;
-        let debug_event = guest
-            .thread_state_mut()
-            .next_debug_event()
-            .unwrap_or_else(|source| {
-                panic!(
+        let debug_event = match guest.thread_state_mut().next_debug_event() {
+            Ok(debug_event) => debug_event,
+            Err(source) => {
+                return Err(Error::Tool(anyhow::anyhow!(
                     "Replay syscall stream ended unexpectedly for recording {} on thread {} at event {} while the guest executed {:?}: {}",
                     self.data.display(),
                     thread,
                     next_count,
                     syscall,
                     source,
-                )
-            });
+                )));
+            }
+        };
 
         // Compare with arity awareness: argument registers beyond a syscall's
         // ABI arity hold caller-leftover garbage that differs between record and
         // replay, so a raw `==` would produce false desync positives on any 2-
         // or 3-argument syscall (see `syscall_arity`).
         if crate::syscall_arity::syscalls_match(debug_event.syscall(), syscall) {
-            return;
+            return Ok(());
         }
 
         if guest.is_root_thread() {
@@ -201,7 +212,7 @@ impl Replayer {
             // than what we originally recorded because the pointers originate
             // outside of the current address space.
             match syscall {
-                Syscall::Execve(_) | Syscall::Execveat(_) => return,
+                Syscall::Execve(_) | Syscall::Execveat(_) => return Ok(()),
                 _ => {}
             }
         }
@@ -220,14 +231,39 @@ impl Replayer {
             }
         };
 
-        panic!(
+        Err(Error::Tool(anyhow::anyhow!(
             "Replay diverged from recording {} on thread {} at syscall event {}. Re-record the workload with the same Hermit build after diagnosing the mismatch.\n{}\n{}",
             self.data.display(),
             thread,
             error.count,
             summary,
             report,
-        );
+        )))
+    }
+
+    /// Exit status used when replay is aborted because it diverged from the
+    /// recording. Distinct from the usual `1` so a divergence is
+    /// distinguishable from an ordinary guest failure.
+    const DESYNC_EXIT_STATUS: i32 = 42;
+
+    /// Cleanly terminates the replay after a desynchronization was detected.
+    ///
+    /// We deliberately do *not* `panic!` here. The tool callback runs inside the
+    /// guest container, which is entered through a non-unwinding `clone`
+    /// trampoline; unwinding a panic across that boundary aborts the process and
+    /// surfaces as a spurious `SIGSEGV` ("Sandbox container exited
+    /// unexpectedly"). Instead we print the concise desync report and inject an
+    /// `exit_group`, which tears the guest down through Reverie's normal exit
+    /// path and yields a clean, non-zero exit status.
+    async fn abort_replay<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        desync: Error,
+    ) -> Result<i64, Error> {
+        eprintln!("{}", desync);
+        guest
+            .tail_inject(ExitGroup::new().with_status(Self::DESYNC_EXIT_STATUS))
+            .await
     }
 
     /// Called for syscalls to explicitly let through. This should only be called
