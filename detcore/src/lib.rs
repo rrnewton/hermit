@@ -66,7 +66,6 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
-use reverie::syscalls::Fork;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -77,6 +76,7 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
+use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
@@ -785,6 +785,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         }
                     },
                     clone_flags: None,
+                    pending_vfork: pts.1.pending_vfork.clone(),
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -833,6 +834,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.config()
             );
             create_child_thread(guest, new_dettid, 0, None).await;
+        } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+            create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
 
         // Except for the root task, let's block until it's our turn to go:
@@ -993,13 +996,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
             Syscall::Futex(s) => self.handle_futex(guest, s).await,
 
-            // TODO(): fix vfork and handle CLONE_VFORK cases here:
             Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
-
-            // Our child-thread-creation protocol doesn't support vfork blocking the parent thread yet:
-            Syscall::Vfork(_s) => self.handle_clone_family(guest, Fork::new().into()).await,
+            Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
 
             Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
