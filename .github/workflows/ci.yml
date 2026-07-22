@@ -59,20 +59,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - uses: actions/setup-go@v5
+      with:
+        go-version: stable
+        cache: false
     - name: Dependencies
       run: |
-        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma).
-        # A Go toolchain is OPTIONAL: hermit-cli/tests/arbitrary_binaries.rs skips
-        # the `go` tool when the binary is absent, so no test needs it. The
-        # self-hosted runner has apt (no dnf) but cannot locate `golang-go`, which
-        # previously failed the whole job. Install the required libs and treat Go
-        # as best-effort so a missing golang package no longer blocks CI.
-        if command -v dnf >/dev/null; then
-          sudo dnf install -y libunwind-devel xz-devel
-          sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
-        elif command -v apt-get >/dev/null; then
+        if command -v apt-get >/dev/null; then
           sudo apt-get install -y libunwind-dev liblzma-dev
-          sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
+        elif command -v dnf >/dev/null; then
+          sudo dnf install -y libunwind-devel xz-devel
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
@@ -93,7 +89,7 @@ jobs:
     - name: Check mount namespace support
       id: namespaces
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
+        if unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
           echo "available=true" >> "$GITHUB_OUTPUT"
         else
           echo "available=false" >> "$GITHUB_OUTPUT"
@@ -114,6 +110,8 @@ jobs:
         cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
         cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
         cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
+    - name: Schedule search E2E tests
+      run: ./tests/util/hermit_analyze_e2e.sh
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
