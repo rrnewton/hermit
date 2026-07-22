@@ -295,6 +295,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    /// SYS_pread64 system call.
+    pub async fn handle_pread64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pread64,
+    ) -> Result<i64, Error> {
+        if call.len() == 0 {
+            // Zero-count reads only serve to detect errors.
+            let res = guest.inject(Syscall::from(call)).await?;
+            return Ok(res);
+        }
+
+        let (fd_type, resource) = guest
+            .thread_state_mut()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = match fd_type {
+            FdType::Rng => (|| -> Result<i64, Error> {
+                trace!("Pread64 call RNG fd {}, simulating...", call.fd());
+                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                Ok(n as i64)
+            })(),
+            FdType::Regular if guest.config().deterministic_io => {
+                self.deterministic_pread64(guest, call).await
+            }
+            _ => match self.record_or_replay(guest, call).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.into()),
+            },
+        };
+
+        resource_release_all(guest).await;
+        res
+    }
+
     /// Helper for performing a deterministic read that retries until it gets all its
     /// bytes.
     async fn deterministic_read<G: Guest<Self>>(
@@ -334,6 +375,50 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(e) => {
                     break Err(e.into());
                 }
+            }
+        }
+    }
+
+    /// Perform a positional read until the requested buffer is full or EOF is reached.
+    async fn deterministic_pread64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mut call: syscalls::Pread64,
+    ) -> Result<i64, Error> {
+        let mut total_read_bytes = 0;
+        let mut remaining_buf = call.len();
+
+        trace!(
+            "[detcore/det_io]: Requested pread64 buffer size: {:?}",
+            remaining_buf
+        );
+
+        loop {
+            match guest.inject_with_retry(call).await {
+                Ok(res) => {
+                    remaining_buf -= res as usize;
+                    total_read_bytes += res;
+
+                    trace!(
+                        "[detcore/det_io]: Remaining pread64 buffer size: {:?}",
+                        remaining_buf
+                    );
+
+                    if res == 0 || remaining_buf == 0 {
+                        break Ok(total_read_bytes);
+                    }
+
+                    let old_ptr = call
+                        .buf()
+                        .expect("successful pread64 requires a valid guest buffer")
+                        .as_raw();
+                    let offset = call.offset().checked_add(res).ok_or(Errno::EOVERFLOW)?;
+                    call = call
+                        .with_len(remaining_buf)
+                        .with_buf(AddrMut::<u8>::from_raw(old_ptr + res as usize))
+                        .with_offset(offset);
+                }
+                Err(error) => break Err(error.into()),
             }
         }
     }
