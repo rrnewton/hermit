@@ -37,6 +37,7 @@ use hermit::ExitStatus;
 /// policy applied to the vCPU).
 pub fn run_kvm(program: &Path) -> Result<ExitStatus, Error> {
     use reverie_kvm::KvmBackend;
+    use reverie_kvm::SyscallInfo;
     use reverie_kvm::SyscallRequest;
 
     const MEMORY_SIZE: usize = 0x1_0000;
@@ -70,15 +71,18 @@ pub fn run_kvm(program: &Path) -> Result<ExitStatus, Error> {
 
     let mut result: i64 = -1;
     backend
-        .run(|request, memory| {
+        .run(|syscall, memory| {
             // Perform the intercepted write on the host so its bytes reach the
-            // real fd, mirroring what a full backend's Tool would delegate.
-            let len = request.args()[2] as usize;
+            // real fd, mirroring what a full backend's Tool would delegate. The
+            // KVM backend now hands us a decoded Reverie `Syscall`; recover the
+            // raw ABI arguments via `SyscallInfo::into_parts`.
+            let (_number, args) = syscall.into_parts();
+            let len = args.arg2 as usize;
             let mut buf = vec![0u8; len];
-            if memory.read(request.args()[1], &mut buf).is_err() {
+            if memory.read(args.arg1 as u64, &mut buf).is_err() {
                 return -(libc::EFAULT as i64);
             }
-            let fd = request.args()[0] as i32;
+            let fd = args.arg0 as i32;
             let written =
                 unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, len) } as i64;
             result = written;
