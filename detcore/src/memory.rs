@@ -175,6 +175,7 @@ impl MemoryMetadata {
         old_len: usize,
         new_start: usize,
         new_len: usize,
+        dont_unmap: bool,
     ) {
         let old_len = page_aligned_len(old_len);
         let new_len = page_aligned_len(new_len);
@@ -190,7 +191,9 @@ impl MemoryMetadata {
                     .then_some((mapping.object, mapping.offset_at(mapping_start, old_start)))
             });
 
-        self.unmap(old_start, old_len);
+        if !dont_unmap {
+            self.unmap(old_start, old_len);
+        }
         self.unmap(new_start, new_len);
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
@@ -272,12 +275,32 @@ mod tests {
 
         mappings.map_anonymous(mm(10), 0x5000, 0x1000);
         let before_remap = mappings.futex_id(mm(10), 0x5010);
-        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, false);
         assert_eq!(
             before_remap,
             mappings.futex_id(mm(10), 0x9010),
             "mremap must retain the backing-object offset"
         );
         assert_ne!(original, before_remap);
+    }
+
+    #[test]
+    fn dont_unmap_remap_retains_both_aliases() {
+        let mut mappings = MemoryMetadata::new();
+        mappings.map_anonymous(mm(10), 0x1000, 0x1000);
+        let original = mappings.futex_id(mm(10), 0x1010);
+
+        mappings.remap(0x1000, 0x1000, 0x5000, 0x1000, true);
+
+        assert_eq!(
+            mappings.futex_id(mm(10), 0x1010),
+            original,
+            "MREMAP_DONTUNMAP must retain the source mapping identity"
+        );
+        assert_eq!(
+            mappings.futex_id(mm(10), 0x5010),
+            original,
+            "the new mapping must alias the retained source mapping"
+        );
     }
 }

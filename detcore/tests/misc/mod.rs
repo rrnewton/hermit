@@ -10,6 +10,8 @@
 
 mod notification_fds;
 
+use std::os::fd::AsRawFd;
+
 use nix::unistd;
 
 #[global_allocator]
@@ -67,6 +69,59 @@ where
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+fn det_test_fn_sequential_without_pmu_or_metadata<F>(f: F)
+where
+    F: Fn(),
+{
+    let config = detcore::Config {
+        preemption_timeout: None,
+        sequentialize_threads: true,
+        virtualize_metadata: false,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+fn wait_on_one_futex_and_wake_another(
+    wait_address: *mut u32,
+    wake_address: *mut u32,
+) -> (libc::c_long, libc::c_long, nix::errno::Errno) {
+    let wait_address = wait_address as usize;
+    let waiter = std::thread::spawn(move || {
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                wait_address as *mut u32,
+                libc::FUTEX_WAIT,
+                0,
+                &timeout,
+                std::ptr::null::<u32>(),
+                0,
+            )
+        };
+        (result, nix::errno::Errno::last())
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let woke = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            wake_address,
+            libc::FUTEX_WAKE,
+            1,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0,
+        )
+    };
+    let (waited, wait_errno) = waiter.join().unwrap();
+    (woke, waited, wait_errno)
 }
 
 #[test]
@@ -252,6 +307,77 @@ fn shared_anonymous_futex_wakes_across_processes() {
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
+    });
+}
+
+#[test]
+fn distinct_shared_anonymous_mappings_do_not_alias_with_ignored_fd() {
+    det_test_fn_sequential_without_pmu(|| {
+        let map = || unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                libc::STDIN_FILENO,
+                0,
+            )
+        };
+        let first = map();
+        let second = map();
+        assert_ne!(first, libc::MAP_FAILED);
+        assert_ne!(second, libc::MAP_FAILED);
+        assert_ne!(first, second);
+
+        let first_futex = first.cast::<u32>();
+        let second_futex = second.cast::<u32>();
+        unsafe {
+            first_futex.write(0);
+            second_futex.write(0);
+        }
+        let (woke, waited, wait_errno) =
+            wait_on_one_futex_and_wake_another(first_futex, second_futex);
+        assert_eq!(woke, 0, "independent anonymous mappings must not alias");
+        assert_eq!(waited, -1);
+        assert_eq!(wait_errno, nix::errno::Errno::ETIMEDOUT);
+
+        assert_eq!(unsafe { libc::munmap(first, 4096) }, 0);
+        assert_eq!(unsafe { libc::munmap(second, 4096) }, 0);
+    });
+}
+
+#[test]
+fn independent_opens_share_file_backed_futex_without_metadata_virtualization() {
+    det_test_fn_sequential_without_pmu_or_metadata(|| {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let reopened = file.reopen().unwrap();
+
+        let map = |fd| unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        let first = map(file.as_raw_fd());
+        let second = map(reopened.as_raw_fd());
+        assert_ne!(first, libc::MAP_FAILED);
+        assert_ne!(second, libc::MAP_FAILED);
+        assert_ne!(first, second);
+
+        let first_futex = first.cast::<u32>();
+        let second_futex = second.cast::<u32>();
+        unsafe { first_futex.write(0) };
+        let (woke, waited, _) = wait_on_one_futex_and_wake_another(first_futex, second_futex);
+        assert_eq!(woke, 1, "aliases of one inode and offset must share a key");
+        assert_eq!(waited, 0);
+
+        assert_eq!(unsafe { libc::munmap(first, 4096) }, 0);
+        assert_eq!(unsafe { libc::munmap(second, 4096) }, 0);
     });
 }
 

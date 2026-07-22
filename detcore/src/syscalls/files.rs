@@ -53,32 +53,37 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Inject an extra fstat to retrieve file metadata.
-    async fn inject_fstat<G: Guest<Self>>(
+    /// Read raw file identity without exposing it as guest-visible metadata.
+    async fn read_fd_stat<G: Guest<Self>>(
         &self,
         guest: &mut G,
         raw_fd: RawFd,
     ) -> Result<libc::stat, Errno> {
-        info!(
-            "Injecting additional fstat to retrieve file metadata on fd {}.",
-            raw_fd
-        );
+        info!("Reading additional fstat metadata on fd {}.", raw_fd);
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
         stack.commit()?;
 
-        // NOTE: Must retry the injection here. This could get interrupted and
-        // we don't want to rerun the entire syscall handler twice.
-        guest
-            .inject_with_retry(Syscall::Fstat(
-                syscalls::Fstat::new()
-                    .with_fd(raw_fd)
-                    .with_stat(Some(statptr)),
-            ))
-            .await?;
+        // Replay may not have a live file descriptor, so preserve this internal stat in the trace.
+        loop {
+            let result = self
+                .record_or_replay(
+                    guest,
+                    Syscall::Fstat(
+                        syscalls::Fstat::new()
+                            .with_fd(raw_fd)
+                            .with_stat(Some(statptr)),
+                    ),
+                )
+                .await;
+            match result {
+                Ok(_) => break,
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error),
+            }
+        }
 
         let copied = statptr.read(&guest.memory())?;
-        // clear stack memory used for fstat allocation
         guest
             .memory()
             .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
@@ -95,7 +100,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ty: FdType,
     ) -> Result<(), Errno> {
         let stat = if guest.config().virtualize_metadata {
-            Some(self.inject_fstat(guest, fd).await?.into())
+            Some(self.read_fd_stat(guest, fd).await?.into())
         } else {
             None
         };
@@ -367,26 +372,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         }
 
-        let backing = if call.flags().contains(MapFlags::MAP_SHARED) {
-            if call.fd() == -1 {
+        let flags = call.flags();
+        let backing = if flags.contains(MapFlags::MAP_SHARED) {
+            if flags.contains(MapFlags::MAP_ANONYMOUS) {
                 Some(SharedBacking::Anonymous)
             } else {
                 let offset = u64::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-                guest
+                let stat: DetStat = match guest
                     .thread_state()
-                    .with_detfd(call.fd(), |fd| {
-                        let object = fd.stat().map_or_else(
-                            || SharedMemoryObjectId::OpenFile {
-                                id: fd.open_file_id(),
-                            },
-                            |stat| SharedMemoryObjectId::File {
-                                device: stat.dev,
-                                inode: stat.inode,
-                            },
-                        );
-                        SharedBacking::File { object, offset }
-                    })
+                    .with_detfd(call.fd(), |fd| fd.stat())
                     .ok()
+                    .flatten()
+                {
+                    Some(stat) => stat,
+                    None => self.read_fd_stat(guest, call.fd()).await?.into(),
+                };
+                Some(SharedBacking::File {
+                    object: SharedMemoryObjectId::File {
+                        device: stat.dev,
+                        inode: stat.inode,
+                    },
+                    offset,
+                })
             }
         } else {
             None
@@ -432,12 +439,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
         let old_len = call.old_len();
         let new_len = call.new_len();
+        let dont_unmap = call.flags() & libc::MREMAP_DONTUNMAP as usize != 0;
         let result = self.record_or_replay(guest, call).await?;
         let new_start =
             usize::try_from(result).expect("a successful mremap must return an address");
         guest
             .thread_state()
-            .remap_memory(old_start, old_len, new_start, new_len);
+            .remap_memory(old_start, old_len, new_start, new_len, dont_unmap);
         Ok(result)
     }
 
