@@ -132,6 +132,13 @@ unchanged between phases.
 
 ## Compatibility
 
+Hermit can run substantial multi-process applications, but unsupported syscalls
+and host-specific CPU behavior remain. One compatibility milestone is booting a
+minimal x86_64 Linux system under QEMU TCG. The working profile uses QEMU's
+instruction-counting clock and lets QEMU's host threads run concurrently; see
+[Booting Linux with QEMU under Hermit](docs/QEMU_BOOT.md). This is a boot
+compatibility demonstration, not a fully deterministic virtual-machine profile.
+
 The following matrix summarizes unmodified host-binary testing on x86-64 Linux
 as of 2026-07-21. "Verified" describes the named probe, not every workflow a
 program supports. Run and record/replay results are intentionally separate.
