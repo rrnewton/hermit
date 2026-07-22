@@ -12,6 +12,8 @@ mod notification_fds;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use nix::unistd;
 
@@ -19,6 +21,13 @@ mod vfork;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
+static DETCORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn detcore_test_lock() -> MutexGuard<'static, ()> {
+    DETCORE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Copy)]
 struct HardwareRandomFeatures {
@@ -55,6 +64,7 @@ fn det_test_fn_without_pmu<F>(f: F)
 where
     F: Fn(),
 {
+    let _guard = detcore_test_lock();
     let config = detcore::Config {
         allow_passthrough: true,
         preemption_timeout: None,
@@ -568,6 +578,7 @@ fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
     F: Fn(),
 {
+    let _guard = detcore_test_lock();
     let config = detcore::Config {
         allow_passthrough: true,
         preemption_timeout: None,
@@ -912,6 +923,7 @@ fn futex_wait_bitset_timeout_is_absolute_and_removes_waiter() {
 
 #[test]
 fn getrandom_intercepted() {
+    let _guard = detcore_test_lock();
     assert!(
         reverie_ptrace::is_perf_supported(),
         "ERROR: getrandom_intercepted requires accessible PMU hardware counters"
@@ -989,7 +1001,9 @@ fn rdrand_rdseed_is_masked() {
 
 #[test]
 fn network_syscalls_are_deterministic_across_five_runs() {
+    let _guard = detcore_test_lock();
     let config = detcore::Config {
+        allow_passthrough: true,
         sequentialize_threads: true,
         deterministic_io: true,
         preemption_timeout: None,
@@ -1125,7 +1139,9 @@ fn network_syscalls_are_deterministic_across_five_runs() {
 
 #[test]
 fn concurrent_same_socket_connect_preserves_eisconn() {
+    let _guard = detcore_test_lock();
     let config = detcore::Config {
+        allow_passthrough: true,
         sequentialize_threads: true,
         deterministic_io: true,
         preemption_timeout: None,
@@ -1197,7 +1213,9 @@ fn concurrent_same_socket_connect_preserves_eisconn() {
 
 #[test]
 fn fcntl_nonblocking_accept_returns_eagain() {
+    let _guard = detcore_test_lock();
     let config = detcore::Config {
+        allow_passthrough: true,
         sequentialize_threads: true,
         deterministic_io: true,
         preemption_timeout: None,
