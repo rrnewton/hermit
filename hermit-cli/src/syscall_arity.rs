@@ -151,7 +151,6 @@ fn syscall_arity(sysno: Sysno) -> usize {
         | "fremovexattr"
         | "timerfd_create"
         | "eventfd2"
-        | "signalfd"
         | "setns"
         | "pkey_alloc"
         | "memfd_create"
@@ -176,10 +175,10 @@ fn syscall_arity(sysno: Sysno) -> usize {
         | "io_submit" | "io_cancel" | "lookup_dcookie" | "getcpu" | "inotify_add_watch"
         | "sched_setaffinity" | "sched_getaffinity" | "sched_setattr" | "timer_create"
         | "tgkill" | "mkdirat" | "unlinkat" | "symlinkat" | "fchmodat" | "faccessat"
-        | "readlinkat" | "rt_sigqueueinfo" | "get_robust_list" | "seccomp" | "getrandom"
-        | "bpf" | "membarrier" | "mlock2" | "open_by_handle_at" | "sendmmsg" | "fspick"
-        | "fsmount" | "close_range" | "pidfd_getfd" | "quotactl_fd" | "open_tree"
-        | "futex_wake" | "msgctl" | "ioprio_set" | "semop" | "semget" => 3,
+        | "rt_sigqueueinfo" | "get_robust_list" | "seccomp" | "getrandom" | "bpf"
+        | "membarrier" | "mlock2" | "open_by_handle_at" | "fspick" | "fsmount" | "close_range"
+        | "pidfd_getfd" | "open_tree" | "msgctl" | "ioprio_set" | "semop" | "semget"
+        | "signalfd" | "futimesat" | "dup3" => 3,
 
         // 4 arguments.
         "rt_sigaction"
@@ -207,12 +206,9 @@ fn syscall_arity(sysno: Sysno) -> usize {
         | "socketpair"
         | "newfstatat"
         | "renameat"
-        | "fchownat"
-        | "futimesat"
         | "utimensat"
         | "accept4"
         | "signalfd4"
-        | "dup3"
         | "rseq"
         | "rt_tgsigqueueinfo"
         | "prlimit64"
@@ -233,16 +229,22 @@ fn syscall_arity(sysno: Sysno) -> usize {
         | "faccessat2"
         | "fchmodat2"
         | "cachestat"
-        | "set_mempolicy_home_node" => 4,
+        | "set_mempolicy_home_node"
+        | "readlinkat"
+        | "sendmmsg"
+        | "quotactl_fd"
+        | "futex_wake"
+        | "kexec_load"
+        | "mknodat" => 4,
 
         // 5 arguments.
         "select" | "mremap" | "setsockopt" | "getsockopt" | "msgrcv" | "clone" | "waitid"
         | "add_key" | "keyctl" | "setxattr" | "lsetxattr" | "fsetxattr" | "io_getevents"
-        | "get_mempolicy" | "mq_timedsend" | "mq_timedreceive" | "kexec_load"
-        | "kexec_file_load" | "perf_event_open" | "recvmmsg" | "fanotify_mark"
-        | "name_to_handle_at" | "linkat" | "renameat2" | "execveat" | "preadv" | "pwritev"
-        | "ppoll" | "remap_file_pages" | "mknodat" | "statx" | "prctl" | "process_madvise"
-        | "move_mount" | "fsconfig" | "mount_setattr" | "mount" | "futex_waitv" => 5,
+        | "get_mempolicy" | "mq_timedsend" | "mq_timedreceive" | "kexec_file_load"
+        | "perf_event_open" | "recvmmsg" | "fanotify_mark" | "name_to_handle_at" | "linkat"
+        | "renameat2" | "execveat" | "preadv" | "pwritev" | "ppoll" | "remap_file_pages"
+        | "statx" | "prctl" | "process_madvise" | "move_mount" | "fsconfig" | "mount_setattr"
+        | "mount" | "futex_waitv" | "fchownat" => 5,
 
         // 6 arguments.
         "mmap" | "sendto" | "recvfrom" | "futex" | "mbind" | "pselect6" | "epoll_pwait"
@@ -286,6 +288,12 @@ mod tests {
         Syscall::from_raw(sysno, args)
     }
 
+    fn args(values: [usize; 6]) -> SyscallArgs {
+        SyscallArgs::new(
+            values[0], values[1], values[2], values[3], values[4], values[5],
+        )
+    }
+
     #[test]
     fn ignores_garbage_in_unused_registers() {
         // statfs (arity 2): only arg0/arg1 are defined. Garbage in arg2..arg5
@@ -323,9 +331,51 @@ mod tests {
     }
 
     #[test]
-    fn unknown_syscall_compares_all_registers() {
-        // Arity defaults to 6 for unknown syscalls, so every register still
-        // participates and a divergence in any is detected.
-        assert_eq!(syscall_arity(Sysno::mmap), 6);
+    fn verified_kernel_arities_preserve_the_last_used_argument() {
+        let cases = [
+            (Sysno::signalfd, 3),
+            (Sysno::readlinkat, 4),
+            (Sysno::sendmmsg, 4),
+            (Sysno::quotactl_fd, 4),
+            (Sysno::futex_wake, 4),
+            (Sysno::fchownat, 5),
+            (Sysno::dup3, 3),
+            (Sysno::futimesat, 3),
+            (Sysno::kexec_load, 4),
+            (Sysno::mknodat, 4),
+        ];
+
+        for (sysno, arity) in cases {
+            assert_eq!(syscall_arity(sysno), arity, "{}", sysno.name());
+
+            let baseline = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+            let mut changed = baseline;
+            changed[arity - 1] ^= 1;
+            assert!(
+                !syscalls_match(raw(sysno, args(baseline)), raw(sysno, args(changed))),
+                "{} ignored its last used argument",
+                sysno.name()
+            );
+
+            changed = baseline;
+            changed[arity] ^= 1;
+            assert!(
+                syscalls_match(raw(sysno, args(baseline)), raw(sysno, args(changed))),
+                "{} compared its first unused argument",
+                sysno.name()
+            );
+        }
+    }
+
+    #[test]
+    fn six_argument_syscall_compares_all_registers() {
+        let baseline = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let mut changed = baseline;
+        changed[5] ^= 1;
+
+        assert!(!syscalls_match(
+            raw(Sysno::mmap, args(baseline)),
+            raw(Sysno::mmap, args(changed)),
+        ));
     }
 }
