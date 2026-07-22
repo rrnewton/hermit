@@ -86,6 +86,161 @@ fn ppoll_ready_and_timeout() {
 }
 
 #[test]
+fn select_ready_and_timeout() {
+    det_test_fn_without_pmu(|| {
+        let mut pipefds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipefds.as_mut_ptr()) }, 0);
+
+        let writer_fd = pipefds[1];
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let byte = b"s";
+            assert_eq!(
+                unsafe { libc::write(writer_fd, byte.as_ptr().cast(), byte.len()) },
+                1
+            );
+        });
+
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_SET(pipefds[0], &mut readfds) };
+        let mut ready_timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    pipefds[0] + 1,
+                    &mut readfds,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut ready_timeout,
+                )
+            },
+            1
+        );
+        assert!(unsafe { libc::FD_ISSET(pipefds[0], &readfds) });
+        assert!((ready_timeout.tv_sec, ready_timeout.tv_usec) > (0, 0));
+        assert!((ready_timeout.tv_sec, ready_timeout.tv_usec) < (1, 0));
+        writer.join().unwrap();
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            unsafe { libc::read(pipefds[0], byte.as_mut_ptr().cast(), byte.len()) },
+            1
+        );
+
+        unsafe { libc::FD_SET(pipefds[0], &mut readfds) };
+        let mut expired_timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 1_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_select,
+                    pipefds[0] + 1,
+                    &mut readfds,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut expired_timeout,
+                )
+            },
+            0
+        );
+        assert!(!unsafe { libc::FD_ISSET(pipefds[0], &readfds) });
+        assert_eq!((expired_timeout.tv_sec, expired_timeout.tv_usec), (0, 0));
+        assert_eq!(unsafe { libc::close(pipefds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(pipefds[1]) }, 0);
+    });
+}
+
+#[test]
+fn pselect6_ready_and_timeout() {
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct Pselect6SigmaskArg {
+        sigmask: *const libc::sigset_t,
+        sigsetsize: usize,
+    }
+
+    det_test_fn_without_pmu(|| {
+        let mut pipefds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipefds.as_mut_ptr()) }, 0);
+
+        let writer_fd = pipefds[1];
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let byte = b"p";
+            assert_eq!(
+                unsafe { libc::write(writer_fd, byte.as_ptr().cast(), byte.len()) },
+                1
+            );
+        });
+
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_SET(pipefds[0], &mut readfds) };
+        let mut ready_timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let sigmask_arg = Pselect6SigmaskArg {
+            sigmask: std::ptr::null(),
+            sigsetsize: std::mem::size_of::<libc::sigset_t>(),
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pselect6,
+                    pipefds[0] + 1,
+                    &mut readfds,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut ready_timeout,
+                    &sigmask_arg,
+                )
+            },
+            1
+        );
+        assert!(unsafe { libc::FD_ISSET(pipefds[0], &readfds) });
+        assert!((ready_timeout.tv_sec, ready_timeout.tv_nsec) > (0, 0));
+        assert!((ready_timeout.tv_sec, ready_timeout.tv_nsec) < (1, 0));
+        writer.join().unwrap();
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            unsafe { libc::read(pipefds[0], byte.as_mut_ptr().cast(), byte.len()) },
+            1
+        );
+
+        unsafe { libc::FD_SET(pipefds[0], &mut readfds) };
+        let mut expired_timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pselect6,
+                    pipefds[0] + 1,
+                    &mut readfds,
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    std::ptr::null_mut::<libc::fd_set>(),
+                    &mut expired_timeout,
+                    &sigmask_arg,
+                )
+            },
+            0
+        );
+        assert!(!unsafe { libc::FD_ISSET(pipefds[0], &readfds) });
+        assert_eq!((expired_timeout.tv_sec, expired_timeout.tv_nsec), (0, 0));
+        assert_eq!(unsafe { libc::close(pipefds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(pipefds[1]) }, 0);
+    });
+}
+
+#[test]
 fn vectored_socket_io() {
     det_test_fn_without_pmu(|| {
         let mut sockets = [0; 2];
