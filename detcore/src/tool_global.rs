@@ -380,7 +380,7 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let time_from_guest = gr.0.as_nanos();
-        let deregistering = matches!(&gr.1, GlobalRequest::DeregisterThread(_, _));
+        let deregistering = matches!(&gr.1, GlobalRequest::DeregisterThread(..));
 
         // This portion of the time updates "asynchronously", and we can tick it on every rpc:
         // TODO: eventually the vector clock should be in shared memory, and
