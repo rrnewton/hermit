@@ -78,6 +78,7 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+use tool_global::thread_observe_time;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 pub use tool_local::ThreadState;
@@ -672,13 +673,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // TODO: use global time for rdtsc:
+            let observed_time = thread_observe_time(guest).await;
             Ok(RdtscResult {
-                tsc: guest
-                    .thread_state()
-                    .thread_logical_time
-                    .as_nanos()
-                    .as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
+                // We treat virtual cycles as equivalent to virtual nanoseconds.
+                tsc: observed_time.as_nanos(),
                 aux: None,
             })
         } else {
@@ -962,16 +960,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Add the syscall to our thread's logical progress, advancing logical time.
             if config.sequentialize_threads {
                 thread_state.thread_logical_time.add_syscall();
-            } else {
-                let bumpit = matches!(
+            } else if virtualize_time {
+                if matches!(
                     call,
-                    Syscall::Gettimeofday(_)
-                        | Syscall::Time(_)
-                        | Syscall::ClockGettime(_)
-                        | Syscall::Write(_)
-                );
-                // TODO(T86591083): remove this conditional to bump logical time unconditionally:
-                if bumpit && virtualize_time {
+                    Syscall::Gettimeofday(_) | Syscall::Time(_) | Syscall::ClockGettime(_)
+                ) {
+                    thread_state.thread_logical_time.add_clock_read();
+                } else if matches!(call, Syscall::Write(_)) {
+                    // TODO(T86591083): remove this conditional to bump logical time
+                    // unconditionally in concurrent mode.
                     thread_state.thread_logical_time.add_syscall();
                 }
             }
