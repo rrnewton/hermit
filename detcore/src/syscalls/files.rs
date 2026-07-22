@@ -12,6 +12,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
+use futures::future::BoxFuture;
 use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
@@ -134,6 +135,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    async fn with_fd_resource<G, F>(
+        &self,
+        guest: &mut G,
+        resource: Option<ResourceID>,
+        permission: Permission,
+        operation: F,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        F: for<'a> FnOnce(&'a Self, &'a mut G) -> BoxFuture<'a, Result<i64, Error>>,
+    {
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, permission);
+            resource_request(guest, request).await;
+        }
+
+        let result = operation(self, guest).await;
+        resource_release_all(guest).await;
+        result
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -250,49 +272,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
-            resource_request(guest, request).await;
-        }
-
-        let res = match fd_type {
-            FdType::Rng => {
-                trace!("Read call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                return Ok(n as i64);
-            }
-            FdType::Regular => {
-                if guest.config().deterministic_io {
-                    self.deterministic_read(guest, call).await
-                } else {
-                    Ok(self.record_or_replay(guest, call).await?)
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Rng => {
+                        trace!("Read call RNG fd {}, simulating...", call.fd());
+                        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                        let n = this.fill_random_bytes(
+                            guest,
+                            remote_buf,
+                            call.len(),
+                            "/dev/[u]random",
+                        )?;
+                        Ok(n as i64)
+                    }
+                    FdType::Regular => {
+                        if guest.config().deterministic_io {
+                            this.deterministic_read(guest, call).await
+                        } else {
+                            Ok(this.record_or_replay(guest, call).await?)
+                        }
+                    }
+                    FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+                        trace!(
+                            "Possibly blocking read call on notification fd {}, type {:?}",
+                            call.fd(),
+                            fd_type
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
+                        trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
+                        Ok(this.record_or_replay(guest, call).await?)
+                    }
+                    FdType::Socket | FdType::Pipe => {
+                        trace!(
+                            "Possibly blocking read call on {:?} fd {}",
+                            fd_type,
+                            call.fd()
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
                 }
-            }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
-                trace!(
-                    "Possibly blocking read call on notification fd {}, type {:?}",
-                    call.fd(),
-                    fd_type
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
-                trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
-                Ok(self.record_or_replay(guest, call).await?)
-            }
+            })
+        })
+        .await
+    }
 
-            FdType::Socket | FdType::Pipe => {
-                trace!(
-                    "Possibly blocking read call on {:?} fd {}",
-                    fd_type,
-                    call.fd()
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-        };
-        resource_release_all(guest).await;
-        res
+    /// SYS_readv system call (MAYHANG).
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let (fd_type, resource) = guest
+            .thread_state_mut()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Socket | FdType::Pipe => {
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    _ => Ok(this.record_or_replay(guest, call).await?),
+                }
+            })
+        })
+        .await
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its
@@ -342,7 +389,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_write<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: syscalls::Write,
+        call: syscalls::Write,
     ) -> Result<i64, Error> {
         let (fd_type, physically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -360,64 +407,85 @@ impl<T: RecordOrReplay> Detcore<T> {
             touch_file(guest, r).await;
         }
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
-            resource_request(guest, request).await;
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move {
+                if physically_nonblocking
+                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+                {
+                    this.execute_nonblockable_fd_syscall(guest, call).await
+                } else if guest.config().deterministic_io {
+                    let mut call = call;
+                    let mut total_written_bytes = 0;
+                    let mut remaining_buf = call.len();
+
+                    trace!(
+                        "[detcore/det_io]: Requested write buffer size: {:?}",
+                        remaining_buf
+                    );
+
+                    loop {
+                        match this.record_or_replay(guest, call).await {
+                            Ok(res) => {
+                                remaining_buf -= res as usize;
+                                total_written_bytes += res;
+
+                                trace!(
+                                    "[detcore/det_io]: Remaining write buffer size: {:?}",
+                                    remaining_buf
+                                );
+
+                                if res == 0 || remaining_buf == 0 {
+                                    break Ok(total_written_bytes);
+                                }
+
+                                // Buf is guaranteed to exist as we already issued a syscall.
+                                let old_ptr = call.buf().unwrap().as_raw();
+                                call = call
+                                    .with_len(remaining_buf)
+                                    .with_buf(Addr::<u8>::from_raw(old_ptr + res as usize));
+                            }
+                            Err(e) => break Err(e.into()),
+                        }
+                    }
+                } else {
+                    Ok(this.record_or_replay(guest, call).await?)
+                }
+            })
+        })
+        .await
+    }
+
+    /// SYS_writev system call (MAYHANG).
+    pub async fn handle_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
+        if guest.config().virtualize_metadata {
+            let inode =
+                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+            touch_file(guest, inode).await;
         }
 
-        // Only route writes through the nonblockable-fd path when the fd is actually
-        // physically nonblocking (the "hermit run" case, where pipe2/eventfd2 injected
-        // O_NONBLOCK and we can nonblockize-and-retry deterministically). On a physically
-        // blocking fd (e.g. record/replay mode, where O_NONBLOCK is intentionally not
-        // injected) that path would treat the write as BlockingExternalIO and deschedule it
-        // to run in the background, which assumes non-interference -- but a pipe/socket write
-        // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
-        // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
-            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
-        {
-            self.execute_nonblockable_fd_syscall(guest, call).await
-        } else if guest.config().deterministic_io {
-            let mut total_written_bytes = 0;
-            let mut remaining_buf = call.len();
-
-            trace!(
-                "[detcore/det_io]: Requested write buffer size: {:?}",
-                remaining_buf
-            );
-
-            loop {
-                match self.record_or_replay(guest, call).await {
-                    Ok(res) => {
-                        remaining_buf -= res as usize;
-                        total_written_bytes += res;
-
-                        trace!(
-                            "[detcore/det_io]: Remaining write buffer size: {:?}",
-                            remaining_buf
-                        );
-
-                        if res == 0 || remaining_buf == 0 {
-                            break Ok(total_written_bytes);
-                        }
-
-                        // Buf is guaranteed to exist as we already issued a syscall.
-                        let old_ptr = call.buf().unwrap().as_raw();
-                        call = call
-                            .with_len(remaining_buf)
-                            .with_buf(Addr::<u8>::from_raw(old_ptr + res as usize));
-                    }
-                    Err(e) => {
-                        break Err(e.into());
-                    }
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move {
+                if physically_nonblocking && matches!(fd_type, FdType::Socket | FdType::Pipe) {
+                    this.execute_nonblockable_fd_syscall(guest, call).await
+                } else {
+                    Ok(this.record_or_replay(guest, call).await?)
                 }
-            }
-        } else {
-            Ok(self.record_or_replay(guest, call).await?)
-        };
-
-        resource_release_all(guest).await;
-        res
+            })
+        })
+        .await
     }
 
     /// SYS_mmap system call.

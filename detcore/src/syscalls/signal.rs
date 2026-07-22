@@ -8,8 +8,6 @@
 
 //! System calls dealing with signals.
 
-use std::time::Duration;
-
 use nix::sys::signal::Signal;
 use reverie::Errno;
 use reverie::Error;
@@ -23,14 +21,11 @@ use tracing::info;
 
 use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
-use crate::resources::Permission;
-use crate::resources::ResourceID;
-use crate::resources::Resources;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::execute_internal_io_polling;
+use crate::syscalls::helpers::relative_timespec_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resource_request;
-use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
 
 // NB: note kernel has different notation of sigaction, we cannot
@@ -145,21 +140,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigtimedwait,
     ) -> Result<i64, Error> {
-        let dettid = guest.thread_state().dettid;
-
-        let maybe_timeout = if let Some(timeout) = call.timeout() {
-            let ts: Timespec = guest.memory().read_value(timeout)?;
-            let ns_delta =
-                Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64);
-            let base_time = thread_observe_time(guest).await;
-            let target_time = base_time + ns_delta;
-            Some(target_time)
+        let timeout = if let Some(timeout) = call.timeout() {
+            let timespec: Timespec = guest.memory().read_value(timeout)?;
+            relative_timespec_timeout(guest, Some(timespec)).await?
         } else {
-            None
+            relative_timespec_timeout(guest, None).await?
         };
-        let mut rsrc = Resources::new(dettid);
-        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-        rsrc.fyi("rt_sigtimedwait");
-        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+        execute_internal_io_polling(guest, call, timeout).await
     }
 }
