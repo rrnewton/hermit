@@ -530,6 +530,15 @@ fn display_runopts4() {
 }
 
 #[test]
+fn allow_passthrough_is_explicit_and_round_trips() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
+    ro.validate_args_with_perf_support(true);
+
+    assert!(ro.det_opts.det_config.allow_passthrough);
+    assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");
+}
+
+#[test]
 fn strict_flag_preserves_deterministic_defaults() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
@@ -613,6 +622,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
         "Disable deterministic I/O behavior",
+        "--allow-passthrough",
+        "Allow unsupported syscalls to execute on the host kernel",
     ] {
         assert!(
             help.contains(expected),
@@ -910,6 +921,7 @@ impl RunOpts {
             config.virtualize_metadata = false;
             config.virtualize_time = false;
             config.deterministic_io = false;
+            config.allow_passthrough = true;
             self.network = NetworkingMode::Host;
             config.sequentialize_threads = false;
             config.no_rcb_time = true;

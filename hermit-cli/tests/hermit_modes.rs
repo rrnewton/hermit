@@ -32,6 +32,7 @@ struct Workloads {
     default_only: Vec<Workload>,
     hello_race: Workload,
     resource_determinism: Workload,
+    unsupported_syscall: Workload,
 }
 
 #[derive(Clone, Copy)]
@@ -328,11 +329,22 @@ fn workloads() -> &'static Workloads {
             &hello_race.path,
         );
 
+        let unsupported_syscall = Workload {
+            name: "unsupported_syscall",
+            path: build_root.join("unsupported_syscall"),
+            args: &[],
+        };
+        compile_c_without_libc(
+            &repository.join("tests/c/simple/unsupported_syscall_nostdlib.c"),
+            &unsupported_syscall.path,
+        );
+
         Workloads {
             stable,
             default_only,
             hello_race,
             resource_determinism,
+            unsupported_syscall,
         }
     })
 }
@@ -342,7 +354,11 @@ fn hermit_command(base_env: &str) -> Command {
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--preemption-timeout=disabled"]);
+        .args([
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--allow-passthrough",
+        ]);
     command
 }
 
@@ -551,6 +567,57 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             baseline = Some(stdout);
         }
     }
+}
+
+fn run_unsupported_syscall(allow_passthrough: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--preemption-timeout=disabled",
+    ]);
+    if allow_passthrough {
+        command.arg("--allow-passthrough");
+    }
+    command.arg(&workloads().unsupported_syscall.path);
+    command
+        .output()
+        .expect("failed to run unsupported-syscall workload")
+}
+
+#[test]
+fn unsupported_syscall_is_blocked_by_default() {
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(false);
+    assert!(
+        output.status.success(),
+        "fail-closed workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
+        "missing fail-closed warning:\n{stderr}"
+    );
+}
+
+#[test]
+fn allow_passthrough_forwards_unsupported_syscall() {
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(true);
+    assert!(
+        output.status.success(),
+        "passthrough workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "passed\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("passed through"),
+        "missing passthrough warning:\n{stderr}"
+    );
 }
 
 fn run_default_workload(name: &str) {
@@ -828,6 +895,7 @@ fn no_hardware_stacktrace_signal() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--preemption-timeout=disabled",
+        "--allow-passthrough",
         "--",
         "/bin/date",
     ]);
@@ -1000,6 +1068,7 @@ printf 'configured\n'
             "--env=VERIFY_CONFIGURED=expected",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
+            "--allow-passthrough",
         ])
         .arg(format!("--tmp={}", tmp.path().display()))
         .arg("/tmp/guest")
@@ -1021,6 +1090,7 @@ fn hello_race_chaos_verify() {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
+            "--allow-passthrough",
             "--env=HERMIT_MODE=chaos",
         ])
         .arg(&workload.path);
