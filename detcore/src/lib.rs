@@ -470,8 +470,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             subscription.syscalls([
                 Sysno::write,
                 Sysno::openat,
+                Sysno::openat2,
                 Sysno::open,
                 Sysno::creat,
+                Sysno::readlink,
+                Sysno::readlinkat,
+                Sysno::access,
+                Sysno::faccessat,
+                Sysno::stat,
+                Sysno::lstat,
+                Sysno::newfstatat,
+                Sysno::statx,
                 Sysno::close,
                 Sysno::read,
                 Sysno::mmap,
@@ -551,15 +560,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
 
             if config.virtualize_metadata {
-                subscription.syscalls([
-                    Sysno::getdents,
-                    Sysno::getdents64,
-                    Sysno::stat,
-                    Sysno::lstat,
-                    Sysno::fstat,
-                    Sysno::newfstatat,
-                    Sysno::statx,
-                ]);
+                subscription.syscalls([Sysno::getdents, Sysno::getdents64, Sysno::fstat]);
             }
 
             if true
@@ -1005,6 +1006,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let res = match call {
             Syscall::Write(w) => self.handle_write(guest, w).await,
             Syscall::Openat(o) => self.handle_openat(guest, o).await,
+            Syscall::Openat2(o) => self.handle_openat2(guest, o).await,
             Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
             Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
             Syscall::Close(s) => self.handle_close(guest, s).await,
@@ -1128,15 +1130,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // These are to allow execution of a minimal rust executable
             // (namely //hermetic_infra/detcore:get-syscall-support)
             Syscall::Brk(_) => self.passthrough(guest, call).await,
-            Syscall::Readlink(_) => self.passthrough(guest, call).await,
-            Syscall::Access(_) => self.passthrough(guest, call).await,
+            Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
+            Syscall::Access(s) => self.handle_access(guest, s).await,
+            Syscall::Faccessat(s) => self.handle_faccessat(guest, s).await,
             Syscall::Mprotect(_) => self.passthrough(guest, call).await,
             Syscall::ArchPrctl(_) => self.passthrough(guest, call).await,
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
             Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
             Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
-            Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
+            Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
