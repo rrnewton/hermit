@@ -81,15 +81,17 @@ impl Replay {
             prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
 
         // bind mount fbcode otherwise many program can fail to execve due to missing
-        // shared libraries.
-        command.mount(
-            Mount::bind(
-                Path::new("/usr/local/fbcode"),
-                chroot.path().join("usr/local/fbcode"),
-            )
-            .recursive()
-            .touch_target(),
-        );
+        // shared libraries. This path only exists on Meta hosts; skip it elsewhere
+        // (e.g. generic self-hosted CI runners) where the missing source would make
+        // mount(2) fail with ENOENT.
+        let fbcode = Path::new("/usr/local/fbcode");
+        if fbcode.exists() {
+            command.mount(
+                Mount::bind(fbcode, chroot.path().join("usr/local/fbcode"))
+                    .recursive()
+                    .touch_target(),
+            );
+        }
 
         command.chroot(chroot.path());
 
