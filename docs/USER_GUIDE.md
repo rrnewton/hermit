@@ -282,6 +282,24 @@ Hermit's strongest control over thread interleavings. Results may still benefit
 from virtualized time and randomness, but the guest schedule is no longer
 fully deterministic.
 
+With the default `none` scheduling heuristic, runnable threads at the same
+priority are selected in deterministic round-robin order. A thread is placed at
+the back of its priority level after a committed scheduler turn. Therefore, if
+`N` same-priority threads remain runnable and keep reaching intercepted yield
+or synchronization boundaries, no thread waits behind more than `N - 1` other
+runnable turns. The four-thread fairness test observes a maximum worker-progress
+gap of three and also checks bounded-buffer producer progress and `RwLock`
+writer completion across five identical runs.
+
+This is a scheduler-turn guarantee, not a wall-clock deadline or a promise that
+all user-space locking policies are writer-fair. Blocked threads are absent from
+the run queue, higher priorities run first, polling operations use deterministic
+backoff, and external I/O completion can add delay. Hermit does not change a
+standard library's reader/writer-lock preference policy. PMU preemption bounds a CPU-only
+time slice; with `--preemption-timeout=disabled`, a thread that never reaches an
+intercepted event can starve its peers. No separate fairness flag is needed for
+the default equal-priority policy.
+
 ### Virtual Inputs
 
 | Option | Effect |
