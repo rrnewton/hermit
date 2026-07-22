@@ -540,6 +540,8 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             baseline = Some(stdout);
         }
     }
+}
+
 fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
