@@ -64,6 +64,7 @@ pub enum SyscallEvent {
     Timeofday((Timeval, Timezone)),
     Poll(PollEvent),
     SockOpt(SockOptEvent),
+    EpollWait(EpollWaitEvent),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +114,14 @@ pub struct PollEvent {
     ///
     /// A value of 0 indicates that the call timed out and no file descriptors
     /// were ready.
+    pub updated: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EpollWaitEvent {
+    /// Raw initialized epoll_event bytes returned by the kernel.
+    pub events: Vec<u8>,
+    /// The number of initialized events in the buffer.
     pub updated: usize,
 }
 

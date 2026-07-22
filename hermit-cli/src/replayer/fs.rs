@@ -129,7 +129,10 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let request = syscall.request();
 
-        if matches!(request, ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX) {
+        if matches!(
+            request,
+            ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
+        ) {
             // Replayed opens do not necessarily create host file descriptors.
             // Detcore updates the logical descriptor metadata after this returns.
             next_event!(guest, Return)

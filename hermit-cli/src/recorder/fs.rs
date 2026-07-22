@@ -156,7 +156,10 @@ impl Recorder {
             self.record_event(guest, Err(err));
         })?;
 
-        if matches!(request, ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX) {
+        if matches!(
+            request,
+            ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
+        ) {
             self.record_event(guest, Ok(SyscallEvent::Return(ret)));
         } else if let Some(output) = request.read_output(&guest.memory()).transpose() {
             // This ioctl request has an associated output.

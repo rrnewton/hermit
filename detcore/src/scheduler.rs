@@ -1367,11 +1367,16 @@ impl Scheduler {
             );
 
             // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
-            // "Nondeterminstic algorithm" below, but record & replay those scheduler events.  In
-            // the meantime, to get recording partially working, we use the dumb/eager policy where
-            // we eagerly block on any ExternalBlocking actions, which essentially is the same as
-            // not background them at all.
+            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
+            // the meantime, use a deterministic eager policy once there is no other runnable work.
             if self.recordreplay_modes {
+                // Waiting here while deterministic work is runnable can deadlock thread creation:
+                // the parent and new child cannot complete clone while an existing worker blocks
+                // indefinitely in epoll_wait.
+                if !self.run_queue.is_empty() {
+                    return Ok(());
+                }
+
                 let first_dtid: DetTid = *self
                     .blocked
                     .external_io_blockers
