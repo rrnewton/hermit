@@ -182,6 +182,9 @@ impl RunData {
             } else {
                 None
             },
+            // Analyze threads the backend through its own `RunOpts`, so there is no
+            // separate global-position backend to apply here.
+            backend: None,
         };
         let final_record_path = self
             .runopts

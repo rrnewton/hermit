@@ -80,12 +80,16 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-`hermit run` accepts `--backend=ptrace|dbi|kvm`. Omitting the option selects
-`ptrace`, preserving the existing behavior:
+Hermit accepts `--backend=ptrace|dbi|kvm` as a global option, before the
+subcommand, since the backend applies to how any subcommand instruments the
+guest. Omitting the option selects `ptrace`, preserving the existing behavior:
 
 ```bash
-hermit run --backend=ptrace -- /bin/echo hello
+hermit --backend=ptrace run -- /bin/echo hello
 ```
+
+For backwards compatibility, `run` still accepts `--backend` after the
+subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
 explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
