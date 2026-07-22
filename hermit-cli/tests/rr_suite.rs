@@ -21,11 +21,29 @@
 //!
 //! Each test compiles its rr `.c` program (rr's test harness needs a couple of
 //! generated syscall-enum headers, produced here by rr's `generate_syscalls.py`)
-//! and runs it as:
+//! and runs it under `--verify`, which executes the program twice and asserts the
+//! two runs are deterministic (identical stdout/stderr, exit status, and internal
+//! scheduler-step logs):
 //!
 //! ```text
-//! hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
+//! hermit run --base-env=minimal --preemption-timeout=80000000 --verify -- <program> [args]
 //! ```
+//!
+//! This mirrors fbsource's `test_hermit_strict__rr_*` targets, which ran each rr
+//! program under `hermit run --base-env=minimal --verify --preemption-timeout=80000000`
+//! (see `ai_docs/reference/fbsource-oss-flag-verification-2026-07-22.md`). It
+//! upgrades these programs from an exit-code-only check to a bitwise-determinism
+//! check.
+//!
+//! Note: the `--strict` CLI flag is intentionally *not* passed. In Hermit
+//! `--strict` only affects command-line compatibility for the determinism defaults
+//! (thread sequentialization and deterministic I/O are already on by default) but
+//! additionally enables `--panic-on-unsupported-syscalls`. That fails closed on the
+//! `rseq` registration glibc performs at startup for every program, so `--strict`
+//! is a fail-closed policy check rather than the determinism verification these
+//! tests need. fbsource's rr targets likewise used `--verify` on `hermit run`, not
+//! the `--strict` flag; the "strict" in their target names refers to full
+//! determinism (Hermit's default), which `--verify` confirms.
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
 //! user/mount namespaces, so CI runs them on the required self-hosted runner:
@@ -34,9 +52,11 @@
 //! cargo test -p hermit --test rr_suite -- --test-threads=1
 //! ```
 //!
-//! Only the programs that currently pass under Hermit are enabled here. The
-//! upstream programs that fail or hang are tracked in
-//! `docs/rr-test-suite.md`.
+//! Only the programs that currently pass under Hermit are enabled here. Programs
+//! that pass an exit-code check but are not yet bitwise-deterministic under
+//! `--verify` are marked `#[ignore]` (still compiled and runnable with
+//! `--ignored`, not removed). The upstream programs that fail or hang are tracked
+//! in `docs/rr-test-suite.md`.
 
 use std::fs;
 use std::path::Path;
@@ -179,12 +199,28 @@ fn rr_scratch_directories_are_fresh_and_cleaned() {
     assert!(!second_path.exists());
 }
 
-/// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
-fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker: Option<&str>) {
+/// Compiles and runs one rr test program under Hermit with `--verify`, asserting
+/// both that the guest exits with `expected_exit` and that the two internal runs
+/// are deterministic.
+///
+/// Under `--verify` Hermit runs the guest twice and compares them; on a successful
+/// (deterministic) verification it exits with the guest's own exit status, and on a
+/// mismatch it exits non-zero. `--verify-allow` states what guest exit status each
+/// of the two runs must have: `success` (exit 0) for the vast majority of rr
+/// programs, `failure` (non-zero) for the few that are expected to exit non-zero.
+fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
     let binary = compile_test(basename);
     // Give every invocation a unique working directory. TempDir removes all files produced by
     // the guest when this function returns or unwinds.
     let scratch = fresh_scratch_dir(basename);
+
+    // Both `--verify` runs must reach the expected exit status; pick the allowance
+    // that matches so the second run is actually performed and compared.
+    let verify_allow = if expected_exit == 0 {
+        "--verify-allow=success"
+    } else {
+        "--verify-allow=failure"
+    };
 
     let _guard = hermit_run_lock();
     // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
@@ -197,6 +233,14 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
             "run",
             "--base-env=minimal",
             "--preemption-timeout=80000000",
+            // Run the guest in the isolated guest `/tmp`, which Hermit mounts fresh
+            // for each of the two `--verify` runs. rr programs create scratch files
+            // in their working directory; without an isolated workdir the first run's
+            // files would leak into the second and be misreported as nondeterminism
+            // (this matches fbsource's `--workdir=/tmp`).
+            "--workdir=/tmp",
+            "--verify",
+            verify_allow,
             "--",
         ])
         .arg(&binary)
@@ -205,22 +249,71 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // On a deterministic verification Hermit exits with the guest's exit status.
     assert_eq!(
         output.status.code(),
         Some(expected_exit),
-        "rr test {basename} exited unexpectedly (124/137 == timeout/forced kill): {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        "rr test {basename} exited unexpectedly under --verify (124/137 == timeout/forced kill): {rendered}\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
+    );
+    // A matching exit code alone is not sufficient: a `--verify` mismatch also exits
+    // non-zero (which for a non-zero `expected_exit` could otherwise masquerade as
+    // success), and a program can reach the expected status yet diverge internally.
+    // Require Hermit's explicit determinism-verified message.
+    assert!(
+        stderr.contains("Determinism verified"),
+        "rr test {basename} did not verify as deterministic under --verify: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    scratch
+        .close()
+        .expect("failed to clean rr scratch directory");
+}
+
+/// Compiles and runs one rr program once (without `--verify`) and asserts its exit
+/// status and that it printed the given stdout completion marker.
+///
+/// A few rr programs signal real success with a stdout line rather than the exit
+/// code. `--verify` captures the guest's stdout internally and does not re-emit it
+/// on a successful run, so the marker is checked with this dedicated plain run;
+/// determinism is then confirmed separately via [`run_rr_test`].
+fn assert_rr_marker(basename: &str, expected_exit: i32, args: &[&str], marker: &str) {
+    let binary = compile_test(basename);
+    let scratch = fresh_scratch_dir(basename);
+
+    let _guard = hermit_run_lock();
+    let mut command = Command::new("timeout");
+    command
+        .current_dir(scratch.path())
+        .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--base-env=minimal",
+            "--preemption-timeout=80000000",
+            "--workdir=/tmp",
+            "--",
+        ])
+        .arg(&binary)
+        .args(args);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit),
+        "rr test {basename} exited unexpectedly (124/137 == timeout/forced kill): {rendered}\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr),
     );
-    if let Some(marker) = success_marker {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.lines().any(|line| line == marker),
-            "rr test {basename} did not print success marker {marker:?}: {rendered}\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
+    assert!(
+        stdout.lines().any(|line| line == marker),
+        "rr test {basename} did not print success marker {marker:?}: {rendered}\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
     scratch
         .close()
         .expect("failed to clean rr scratch directory");
@@ -230,7 +323,31 @@ macro_rules! rr_test {
     ($name:ident, $base:literal, $exit:literal, $args:expr) => {
         #[test]
         fn $name() {
-            run_rr_test($base, $exit, $args, None);
+            run_rr_test($base, $exit, $args);
+        }
+    };
+}
+
+/// Like [`rr_test!`] but for programs that pass an exit-code check yet are not
+/// currently bitwise-deterministic under `--verify`. Marked `#[ignore]` with the
+/// reason so the program is still compiled and can be run with `--ignored`, rather
+/// than removed. Re-promote to `rr_test!` once the underlying nondeterminism is
+/// fixed.
+///
+/// No programs are currently marked: local `--verify` runs on non-PMU / heavily
+/// contended hosts could not distinguish genuine nondeterminism from host
+/// artifacts (mmap crashes, timeouts), and once `--workdir=/tmp` isolates each
+/// run's scratch files no real determinism divergence was observed. The
+/// self-hosted CI runner is the authoritative place to identify any programs that
+/// need this marker; `#[allow(unused_macros)]` keeps the mechanism available until
+/// then.
+#[allow(unused_macros)]
+macro_rules! rr_test_known_failing {
+    ($name:ident, $base:literal, $exit:literal, $args:expr, $reason:literal) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_rr_test($base, $exit, $args);
         }
     };
 }
@@ -368,7 +485,11 @@ rr_test!(rr_no_mask_timeslice, "no_mask_timeslice", 0, &[]);
 rr_test!(rr_numa, "numa", 0, &[]);
 #[test]
 fn rr_pause() {
-    run_rr_test("pause", 1, &[], Some("EXIT-SUCCESS"));
+    // `pause` blocks in pause(2), is interrupted by a signal, prints its completion
+    // marker, then exits 1. Check the marker with a plain run (see `assert_rr_marker`),
+    // then confirm determinism via the shared `--verify` path.
+    assert_rr_marker("pause", 1, &[], "EXIT-SUCCESS");
+    run_rr_test("pause", 1, &[]);
 }
 rr_test!(rr_personality, "personality", 0, &[]);
 rr_test!(rr_poll_sig_race, "poll_sig_race", 0, &[]);

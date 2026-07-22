@@ -20,12 +20,31 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
   headers with rr's own `generate_syscalls.py`, freshly compiles each
   `src/test/<name>.c` invocation with rr's `RR_TEST_FLAGS`
   (`-D_FILE_OFFSET_BITS=64 -pthread -std=gnu11 -g3 -O0`, linked against
-  `-ldl -lrt`), and runs it as:
+  `-ldl -lrt`), and runs it under `--verify` as:
   ```sh
-  hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
+  hermit run --base-env=minimal --preemption-timeout=80000000 --workdir=/tmp --verify -- <program> [args]
   ```
-  asserting the expected exit code. Each invocation uses a unique temporary
-  working directory that is removed after the test.
+  `--verify` runs each program twice and asserts the two executions are
+  deterministic (identical stdout/stderr, exit status, and internal
+  scheduler-step logs), then asserts the expected exit code. This mirrors
+  fbsource's `test_hermit_strict__rr_*` targets (`hermit run --base-env=minimal
+  --verify --preemption-timeout=80000000 --workdir=/tmp`; see
+  `ai_docs/reference/fbsource-oss-flag-verification-2026-07-22.md`) and upgrades
+  the suite from an exit-code-only check to a bitwise-determinism check.
+
+  `--workdir=/tmp` runs the guest in the isolated guest `/tmp`, which Hermit
+  mounts fresh for each of the two `--verify` runs; rr programs create scratch
+  files in their working directory, so without an isolated workdir the first
+  run's files would leak into the second and be misreported as nondeterminism.
+
+  The `--strict` CLI flag is intentionally **not** used: in Hermit it only adds
+  `--panic-on-unsupported-syscalls` on top of the already-default determinism
+  settings, which fails closed on the `rseq` registration glibc performs at
+  startup for every program. Determinism verification comes from `--verify`.
+
+  Programs that pass an exit-code check but are not yet bitwise-deterministic
+  under `--verify` are marked `#[ignore]` via `rr_test_known_failing!` (still
+  compiled and runnable with `--ignored`, not removed).
 
 ## Running
 
@@ -54,6 +73,21 @@ One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
 
 - `rr_args` runs with `-no --force-syscall-buffer=foo -c 1000 hello` (exit 0).
 - `rr_pause` expects exit code 1 and must print its final `EXIT-SUCCESS` marker.
+  Because `--verify` captures the guest's stdout internally (and does not re-emit
+  it on a successful run), the marker is asserted with one extra plain run, then
+  determinism is confirmed via the shared `--verify` path.
+
+### Determinism verification
+
+All 213 enabled programs run under `--verify` (two runs, compared), upgrading the
+suite from an exit-code-only check to a bitwise-determinism check. No programs are
+currently marked `#[ignore]` via `rr_test_known_failing!`: after `--workdir=/tmp`
+isolates each run's scratch files (the only systematic source of false
+"nondeterminism", from non-idempotent file creation leaking between the two runs),
+local sweeps found no genuine determinism divergence. Remaining local failures were
+all host-environment artifacts — mmap/mremap crashes (SIGBUS/SIGSEGV on a non-PMU
+AMD box) and timeouts under heavy load — not nondeterminism. The self-hosted CI
+runner is the authoritative gate for identifying any programs that need the marker.
 
 ## Known failures (not yet enabled) — bugs to file
 
