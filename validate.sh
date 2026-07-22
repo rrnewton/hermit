@@ -18,6 +18,7 @@ cd "$ROOT_DIR" || exit 1
 
 checks=0
 failures=0
+known_failures=0
 declare -a background_pids=()
 declare -a background_names=()
 declare -a background_logs=()
@@ -52,12 +53,28 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
+# Every direct `hermit run` invocation below goes through this argument list, so
+# `--strict` here guarantees each smoke, determinism, and verify check runs in
+# strict deterministic mode (unsupported syscalls panic instead of silently
+# passing through to the host). Relaxed runs prove nothing about determinism, so
+# strict is the minimum bar for validation. The verify check appends `--verify`,
+# yielding the L2 `--strict --verify` standard.
 declare -ar HERMIT_RUN_ARGS=(
     run
+    --strict
     --base-env=minimal
     --no-virtualize-cpuid
     --preemption-timeout=disabled
 )
+
+# Strict validation currently panics on the `rseq` syscall that glibc registers
+# during process startup, so every direct `hermit run` smoke check inherits the
+# repository-wide "Rseq" unsupported-syscall debt already tracked in
+# hermit-cli/tests/fail_closed_known_failures.tsv. These checks are kept (not
+# removed) and continue to run under --strict; their failure is expected until
+# rseq is supported. If one unexpectedly passes it is reported as a regression
+# so the exception is removed promptly, matching the fail-closed ratchet.
+readonly STRICT_RSEQ_KNOWN_FAILURE="unsupported-syscall: Rseq (glibc startup rseq registration; tracked in hermit-cli/tests/fail_closed_known_failures.tsv)"
 
 function cleanup {
     local pid
@@ -128,6 +145,50 @@ function run_check {
         failures=$((failures + 1))
         summary=$(failure_summary "$output_start")
         printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
+            "$name" "$status" "$summary" "$LOG_FILE"
+    fi
+
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    checks=$((checks + 1))
+}
+
+# Run a check that is expected to fail because of a tracked known-failure. The
+# check still executes under the same strict configuration as every other check
+# so its output is captured, but an expected failure does not fail validation.
+# An unexpected success is treated as a regression: the exception is now stale
+# and must be removed, so it is counted as a failure.
+function run_known_failure_check {
+    local name=$1
+    local reason=$2
+    shift 2
+
+    local started_at=$SECONDS
+    local output_start
+    local status
+    local summary
+
+    {
+        printf "=== %s (known failure) ===\n" "$name"
+        printf "Expected failure: %s\n" "$reason"
+        printf "Command:"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if "$@" >>"$LOG_FILE" 2>&1; then
+        status=0
+        failures=$((failures + 1))
+        printf "❌ %s (known failure now PASSES — remove the exception; %ss)\n" \
+            "$name" "$((SECONDS - started_at))"
+    else
+        status=$?
+        known_failures=$((known_failures + 1))
+        summary=$(failure_summary "$output_start")
+        printf "⚠️  %s (known failure, exit %s: %s; full log: %s)\n" \
             "$name" "$status" "$summary" "$LOG_FILE"
     fi
 
@@ -284,13 +345,13 @@ function hermit_verify_smoke {
 }
 
 function print_summary {
-    local passed=$((checks - failures))
+    local passed=$((checks - failures - known_failures))
     if ((failures == 0)); then
-        printf "✅ Validation summary (%s passed, 0 failed; full log: %s)\n" \
-            "$passed" "$LOG_FILE"
+        printf "✅ Validation summary (%s passed, 0 failed, %s known failures; full log: %s)\n" \
+            "$passed" "$known_failures" "$LOG_FILE"
     else
-        printf "❌ Validation summary (%s passed, %s failed; full log: %s)\n" \
-            "$passed" "$failures" "$LOG_FILE"
+        printf "❌ Validation summary (%s passed, %s failed, %s known failures; full log: %s)\n" \
+            "$passed" "$failures" "$known_failures" "$LOG_FILE"
     fi
 }
 
@@ -304,9 +365,16 @@ start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 start_check "Rustfmt" cargo fmt --all -- --check
 start_check "Documentation" cargo doc --workspace --no-deps
 
-run_check "Hermit run smoke test" hermit_run_smoke
-run_check "Hermit output determinism" hermit_determinism_check
-run_check "Hermit verify-mode smoke test" hermit_verify_smoke
+# These direct `hermit run` checks now execute under --strict (see
+# HERMIT_RUN_ARGS). Strict mode panics on glibc's startup rseq syscall, so they
+# are tracked as known failures rather than removed or downgraded to a
+# meaningless relaxed run. Restore them to run_check once rseq is supported.
+run_known_failure_check "Hermit run smoke test" \
+    "$STRICT_RSEQ_KNOWN_FAILURE" hermit_run_smoke
+run_known_failure_check "Hermit output determinism" \
+    "$STRICT_RSEQ_KNOWN_FAILURE" hermit_determinism_check
+run_known_failure_check "Hermit verify-mode smoke test" \
+    "$STRICT_RSEQ_KNOWN_FAILURE" hermit_verify_smoke
 # Nextest runs most package unit and Cargo integration targets in parallel.
 # Detcore's PMU tests depend on same-binary coordination; nextest would launch
 # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.

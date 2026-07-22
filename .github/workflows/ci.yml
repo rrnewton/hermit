@@ -137,6 +137,39 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    - name: Strict-mode hermit run smoke (L2 minimum standard)
+      run: |
+        # validate.sh runs every direct `hermit run` under --strict; mirror that
+        # here so CI never green-lights a meaningless relaxed run. A relaxed run
+        # proves nothing about determinism. Strict mode currently panics on the
+        # rseq syscall glibc registers at startup (the dominant known-failure
+        # class in hermit-cli/tests/fail_closed_known_failures.tsv), so tolerate
+        # ONLY that tracked failure. Any other failure, or an unexpected success
+        # (rseq now supported -> remove this exception), fails the job.
+        cargo build -p hermit --bin hermit
+        hermit_bin="$PWD/target/debug/hermit"
+        strict_args=(run --strict --base-env=minimal --no-virtualize-cpuid --preemption-timeout=disabled)
+        strict_check() {
+          local name=$1; shift
+          local log
+          log=$(mktemp)
+          if "$@" >"$log" 2>&1; then
+            echo "::error::strict $name unexpectedly passed; rseq may now be supported -- remove the known-failure exception"
+            cat "$log"
+            return 1
+          fi
+          if grep -q 'unsupported syscall: Other(rseq' "$log"; then
+            echo "::warning::strict $name: known failure (unsupported-syscall: Rseq)"
+            return 0
+          fi
+          echo "::error::strict $name failed for an unexpected reason (not the tracked rseq known-failure)"
+          cat "$log"
+          return 1
+        }
+        strict_check "run smoke" \
+          timeout 30s "$hermit_bin" "${strict_args[@]}" -- /bin/echo hermit-ci-strict-smoke
+        strict_check "verify smoke" \
+          timeout 30s "$hermit_bin" "${strict_args[@]}" --verify -- /bin/echo hermit-ci-strict-smoke
     - name: Fail-closed Hermit test ratchet
       run: ./scripts/test-fail-closed.sh
     - name: Build pinned LevelDB integration fixture
