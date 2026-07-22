@@ -42,9 +42,17 @@ extern "C" fn recording_timeout_handler(_signal: libc::c_int) {
     let len = TIMEOUT_MESSAGE_LEN.load(Ordering::Acquire);
     let message = TIMEOUT_MESSAGE.load(Ordering::Acquire);
     if !message.is_null() && len != 0 {
-        // SAFETY: `message` is leaked before the timer is armed, and write(2) and
-        // _exit(2) are async-signal-safe.
+        // SAFETY: `message` is leaked before the timer is armed, and fcntl(2),
+        // write(2), and _exit(2) are all async-signal-safe.
         unsafe {
+            // Make stderr non-blocking before writing. If stderr is a pipe or
+            // socket whose buffer is full, a blocking write(2) would wedge the
+            // handler and never reach _exit, defeating the deadline. A dropped
+            // diagnostic is acceptable; a hung timeout is not.
+            let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+            if flags != -1 {
+                libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
             libc::write(libc::STDERR_FILENO, message.cast(), len);
         }
     }
@@ -56,6 +64,15 @@ extern "C" fn recording_timeout_handler(_signal: libc::c_int) {
 
 struct RecordingDeadline {
     previous_handler: SigAction,
+    // Whether SIGALRM was blocked in the inherited mask and must be re-blocked
+    // when the deadline is disarmed.
+    reblock_sigalrm: bool,
+}
+
+fn sigalrm_set() -> SigSet {
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGALRM);
+    set
 }
 
 impl RecordingDeadline {
@@ -82,10 +99,25 @@ impl RecordingDeadline {
         // SAFETY: the handler uses only async-signal-safe operations and remains
         // installed until this guard disarms the alarm.
         let previous_handler = unsafe { sigaction(Signal::SIGALRM, &action) }?;
+
+        // A signal mask inherited from our parent may have SIGALRM blocked. If
+        // it is, the alarm signal stays perpetually pending and the handler
+        // never runs, silently disabling the deadline. Unblock SIGALRM so the
+        // alarm is deliverable, and remember to restore the original state.
+        let reblock_sigalrm = SigSet::thread_get_mask()
+            .map(|mask| mask.contains(Signal::SIGALRM))
+            .unwrap_or(false);
+        if reblock_sigalrm {
+            let _ = sigalrm_set().thread_unblock();
+        }
+
         // SAFETY: the timeout is nonzero and fits c_uint.
         unsafe { libc::alarm(seconds) };
 
-        Ok(Self { previous_handler })
+        Ok(Self {
+            previous_handler,
+            reblock_sigalrm,
+        })
     }
 }
 
@@ -95,6 +127,11 @@ impl Drop for RecordingDeadline {
         unsafe {
             libc::alarm(0);
             let _ = sigaction(Signal::SIGALRM, &self.previous_handler);
+        }
+        // Restore SIGALRM to its inherited blocked state without disturbing the
+        // rest of the mask.
+        if self.reblock_sigalrm {
+            let _ = sigalrm_set().thread_block();
         }
         TIMEOUT_MESSAGE_LEN.store(0, Ordering::Release);
         TIMEOUT_MESSAGE.store(ptr::null_mut(), Ordering::Release);
@@ -323,5 +360,49 @@ impl StartOpts {
             .context("Container exited unexpectedly")??;
         let _ = gdb_client.wait();
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
+    // perpetually pending and silently disable the deadline. Arming must unblock
+    // SIGALRM, and dropping must restore the prior blocked state without
+    // spuriously blocking a signal that started unblocked. A long timeout keeps
+    // the process-wide alarm from firing during the test; the guard's Drop
+    // cancels it.
+    #[test]
+    fn recording_deadline_manages_sigalrm_mask() {
+        let sigalrm = sigalrm_set();
+
+        // Case 1: SIGALRM starts blocked. Arm unblocks it; drop re-blocks it.
+        sigalrm.thread_block().unwrap();
+        assert!(SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        {
+            let _deadline = RecordingDeadline::arm(Duration::from_secs(3600)).unwrap();
+            assert!(
+                !SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+                "arming the deadline must unblock SIGALRM so the alarm is deliverable"
+            );
+        }
+        assert!(
+            SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+            "dropping the deadline must restore the inherited blocked state"
+        );
+
+        // Case 2: SIGALRM starts unblocked. Arm leaves it unblocked; drop must
+        // not spuriously block it.
+        sigalrm.thread_unblock().unwrap();
+        assert!(!SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        {
+            let _deadline = RecordingDeadline::arm(Duration::from_secs(3600)).unwrap();
+            assert!(!SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM));
+        }
+        assert!(
+            !SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
+            "dropping must not block SIGALRM when it started unblocked"
+        );
     }
 }

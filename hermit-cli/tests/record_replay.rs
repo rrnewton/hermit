@@ -8,6 +8,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -341,6 +342,180 @@ fn record_timeout_kills_guest_without_committing_partial_data() {
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or(0);
     assert_eq!(partials, 0, "timed-out recording left partial data");
+}
+
+/// Builds a `hermit record start --record-timeout` command for a guest that
+/// never exits on its own, so the deadline must terminate it.
+fn timeout_recording_command(data_dir: &Path, timeout_secs: u32, guest: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .env("HERMIT_MODE", "record")
+        .arg("record")
+        .arg("start")
+        .arg(format!("--record-timeout={timeout_secs}"))
+        .arg(format!("--data-dir={}", data_dir.display()))
+        .arg("--")
+        .args(guest);
+    command
+}
+
+fn count_tmp_partials(data_dir: &Path) -> usize {
+    fs::read_dir(data_dir.join("tmp"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+/// End-to-end guard for the adversarial "inherited blocked SIGALRM" finding: a
+/// parent with SIGALRM blocked must not be able to disable the recording
+/// deadline. The precise arm/drop mask handling is covered by the
+/// `recording_deadline_manages_sigalrm_mask` unit test; this test locks in the
+/// observable guarantee that a blocked caller mask still yields a timeout.
+#[test]
+fn record_timeout_fires_even_when_sigalrm_is_blocked() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let started = Instant::now();
+    let mut command = timeout_recording_command(
+        data_dir.path(),
+        1,
+        &["/bin/sh", "-c", "while :; do :; done"],
+    );
+    // SAFETY: `pre_exec` runs in the forked child before exec; it only calls
+    // async-signal-safe libc signal-mask functions and touches no shared state.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGALRM);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
+        .output()
+        .expect("failed to start timeout recording with SIGALRM blocked");
+
+    assert!(
+        !output.status.success(),
+        "timed recording unexpectedly succeeded with SIGALRM blocked"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "record timeout did not fire with SIGALRM blocked: {:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Recording timed out after 1 seconds"),
+        "missing timeout diagnostic with SIGALRM blocked:\n{stderr}"
+    );
+    assert!(
+        !data_dir.path().join("last").exists(),
+        "timed-out recording was committed"
+    );
+}
+
+/// A recording that times out must never disturb a previously committed
+/// recording: `last` and the existing recording directory must be preserved.
+#[test]
+fn record_timeout_preserves_existing_last() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+
+    // Commit a successful baseline recording so `last` points at real data.
+    let mut baseline = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    baseline
+        .env("HERMIT_MODE", "record")
+        .arg("record")
+        .arg("start")
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/true"]);
+    let baseline_output = command_output(baseline, "baseline recording");
+    let _ = baseline_output;
+
+    let last_path = data_dir.path().join("last");
+    let last_before =
+        fs::read_to_string(&last_path).expect("baseline recording did not create last");
+    assert!(!last_before.is_empty(), "baseline last pointer was empty");
+
+    // Now run a recording that times out.
+    let started = Instant::now();
+    let mut command = timeout_recording_command(
+        data_dir.path(),
+        1,
+        &["/bin/sh", "-c", "while :; do :; done"],
+    );
+    let output = command.output().expect("failed to start timeout recording");
+
+    assert!(
+        !output.status.success(),
+        "timed recording unexpectedly succeeded"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "record timeout took too long: {:?}",
+        started.elapsed()
+    );
+    let last_after = fs::read_to_string(&last_path)
+        .expect("last pointer disappeared after a timed-out recording");
+    assert_eq!(
+        last_before, last_after,
+        "timed-out recording overwrote the existing last pointer"
+    );
+    assert!(
+        data_dir.path().join(last_after.trim()).is_dir(),
+        "committed recording referenced by last was removed by a timed-out recording"
+    );
+    assert_eq!(
+        count_tmp_partials(data_dir.path()),
+        0,
+        "timed-out recording left partial data"
+    );
+}
+
+/// A guest that spawns a long-lived descendant must still be torn down by the
+/// deadline. Exiting PID 1 collapses the recording namespace, so the whole
+/// process tree dies and `record start` returns promptly instead of hanging on
+/// the surviving descendant.
+#[test]
+fn record_timeout_terminates_descendant_processes() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let started = Instant::now();
+    let mut command = timeout_recording_command(
+        data_dir.path(),
+        1,
+        &["/bin/sh", "-c", "sleep 300 & while :; do :; done"],
+    );
+    let output = command
+        .output()
+        .expect("failed to start timeout recording with a descendant");
+
+    assert!(
+        !output.status.success(),
+        "timed recording unexpectedly succeeded"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a surviving descendant kept the timeout from returning: {:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Recording timed out after 1 seconds"),
+        "missing timeout diagnostic:\n{stderr}"
+    );
+    assert!(
+        !data_dir.path().join("last").exists(),
+        "timed-out recording was committed"
+    );
+    assert_eq!(
+        count_tmp_partials(data_dir.path()),
+        0,
+        "timed-out recording left partial data"
+    );
 }
 
 macro_rules! record_replay_tests {
