@@ -44,15 +44,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         len: usize,
         source: &str,
     ) -> Result<usize, Error> {
-        let mut local_buf = vec![0; len];
-        guest
-            .thread_state_mut()
-            .thread_prng()
-            .fill(local_buf.as_mut_slice());
-        let n = guest.memory().write(remote_buf, local_buf.as_slice())?;
+        let word_size = std::mem::size_of::<u64>();
+        let word_count = len / word_size + usize::from(len % word_size != 0);
+        let mut local_words = vec![0_u64; word_count];
+        // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
+        let local_buf =
+            unsafe { std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), len) };
+        guest.thread_state_mut().thread_prng().fill(local_buf);
+        let n = guest.memory().write(remote_buf, local_buf)?;
         if cfg!(debug_assertions) {
             let mut hasher = DefaultHasher::new();
-            Hash::hash_slice(local_buf.as_slice(), &mut hasher);
+            Hash::hash_slice(local_buf, &mut hasher);
             detlog!(
                 "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
                 guest.thread_state().dettid,
