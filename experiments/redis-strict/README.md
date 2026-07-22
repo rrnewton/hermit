@@ -10,6 +10,13 @@ sets, Lua, streams, background persistence, restart/reload, and clean server
 shutdown. It runs twice and requires byte-identical stdout and stderr. The
 runner also executes Redis's built-in memory test under strict Hermit.
 
+Each workload receives a unique loopback port, rejects an endpoint that is
+already serving, and matches Redis's pidfile to `INFO server` before issuing
+commands. Persistence coverage waits for the original PID to exit and requires
+a different live PID after restart. The packaged-Redis version of that path is
+nonignored and runs in self-hosted CI; the ignored suite adds the pinned source
+build and memory test.
+
 ```bash
 experiments/redis-strict/run.sh
 ```
