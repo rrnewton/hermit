@@ -40,8 +40,21 @@ for attempt in 1 2; do
 done
 cmp "$DEMO_TMP/heap-hermit-1.txt" "$DEMO_TMP/heap-hermit-2.txt"
 
-demo_banner "Built-in --verify re-runs and compares status, output, and log"
-run_hermit --verify -- /bin/echo reproducible
+demo_banner "Built-in --verify determinizes a racy multi-process guest"
+# examples/race.sh forks two shells that print interleaved output, so the
+# interleaving differs on every native run. Show that nondeterminism first:
+echo "-- native race: output interleaving differs each run (checksum of output) --"
+for attempt in 1 2; do
+  race_out="$(/bin/bash "$RACE_SH")"
+  printf 'native run %s: cksum=%s\n' "$attempt" "$(printf '%s' "$race_out" | cksum | cut -d' ' -f1)"
+done
+# --verify runs the guest twice under Hermit and compares exit status, output,
+# and the deterministic execution log -- thousands of DETLOG/scheduler messages,
+# not the empty "0 | 0" that results from a too-quiet log level. This step uses
+# PMU-based preemption (see verify_hermit in common.sh) and therefore needs
+# accessible CPU performance counters.
+echo "-- hermit --verify (identical output + verified execution log) --"
+verify_hermit -- /bin/bash "$RACE_SH"
 
 echo
 echo "Demo 1 complete. The guest must be idempotent: a first run that changes a"
