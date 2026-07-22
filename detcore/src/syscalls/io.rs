@@ -10,17 +10,25 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::os::unix::io::RawFd;
 use std::time::Duration;
 
+use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
 
 use crate::config::SchedHeuristic;
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -205,7 +213,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
-    /// Handles all of: recvfrom, recvmsg, sendto, sendmsg, sendmmsg syscalls (MAYHANG)
+    /// Handles all of: recvfrom, sendto, sendmsg, sendmmsg syscalls (MAYHANG)
+    ///
+    /// `recvmsg` has its own wrapper ([`Self::handle_recvmsg`]) because it can
+    /// carry `SCM_RIGHTS` ancillary file descriptors that Detcore must register.
     pub async fn handle_sendrecv<
         G: Guest<Self>,
         C: SyscallInfo + NonblockableSyscall + Into<Syscall>,
@@ -215,5 +226,171 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: C,
     ) -> Result<i64, Error> {
         self.execute_nonblockable_fd_syscall(guest, call).await
+    }
+
+    /// Handles `recvmsg` (MAYHANG).
+    ///
+    /// A `recvmsg` on a Unix domain socket can carry `SCM_RIGHTS` ancillary
+    /// messages, which hand the receiving process brand-new file descriptors
+    /// (this is how, for example, the QEMU vhost-user protocol passes shared
+    /// memory `memfd`s and socket endpoints). Those descriptors are created by
+    /// the kernel as a side effect of the syscall, so — like the fds returned by
+    /// `accept`, `socket`, or `pipe` — Detcore must add them to its per-thread
+    /// [`crate::fd::DetFd`] table. Without this, the very next operation on a
+    /// received fd (e.g. `read`) fails with `EBADF` because
+    /// [`crate::tool_local`]'s `with_detfd` cannot find it.
+    pub async fn handle_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Recvmsg,
+    ) -> Result<i64, Error> {
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        if result >= 0 {
+            self.register_received_fds(guest, call).await?;
+        }
+        Ok(result)
+    }
+
+    /// Parse the `msg_control` buffer written by a completed `recvmsg` and
+    /// register every descriptor delivered via an `SCM_RIGHTS` control message
+    /// in Detcore's fd table.
+    async fn register_received_fds<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Recvmsg,
+    ) -> Result<(), Error> {
+        let msg_addr = match call.msg() {
+            Some(addr) => addr,
+            None => return Ok(()),
+        };
+        // `AddrMut<msghdr>` -> read the (kernel-updated) header back out.
+        let header: libc::msghdr = guest.memory().read_value(msg_addr)?;
+        if header.msg_control.is_null() || header.msg_controllen == 0 {
+            return Ok(());
+        }
+
+        let control_len = header.msg_controllen;
+        let control_addr =
+            Addr::<u8>::from_raw(header.msg_control as usize).ok_or(Errno::EFAULT)?;
+        let mut control = vec![0u8; control_len];
+        guest.memory().read_exact(control_addr, &mut control)?;
+
+        for fd in scm_rights_fds(&control) {
+            self.register_received_fd(guest, fd).await?;
+        }
+        Ok(())
+    }
+
+    /// Register a single `SCM_RIGHTS`-received descriptor.
+    async fn register_received_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        if guest.config().recordreplay_modes {
+            // In record/replay mode the descriptor's byte-level behavior is
+            // reconstructed from the recorded event stream, so record and replay
+            // must take the *same* Detcore code path for every later syscall on
+            // this fd. We therefore register it generically rather than probing
+            // the live kernel object: during replay the recorded fd number is
+            // not a real kernel descriptor, so an `fstat` would fail and, worse,
+            // classifying by type would diverge from the recording. `Regular`
+            // routes reads/writes through `record_or_replay`, matching how the
+            // recorder captured them.
+            guest
+                .thread_state()
+                .add_fd(fd, OFlag::empty(), FdType::Regular, None)?;
+            return Ok(());
+        }
+
+        // Plain `hermit run`: the received descriptor is a live kernel object.
+        // Classify it so later syscalls are routed correctly, and reject types
+        // we do not know how to model deterministically.
+        let stat = self.inject_fstat(guest, fd).await?;
+        let ty = received_fd_type(stat.st_mode).ok_or_else(|| {
+            warn!(
+                "recvmsg received an SCM_RIGHTS fd {} of unsupported type (st_mode {:#o}); \
+                 only regular files, memfds, sockets, pipes, and character devices are supported",
+                fd, stat.st_mode
+            );
+            Errno::EOPNOTSUPP
+        })?;
+        let det_stat = guest.config().virtualize_metadata.then(|| stat.into());
+        guest
+            .thread_state()
+            .add_fd(fd, OFlag::empty(), ty, det_stat)?;
+        Ok(())
+    }
+}
+
+/// Extract the file descriptors carried by every `SOL_SOCKET`/`SCM_RIGHTS`
+/// control message in a `msg_control` buffer.
+///
+/// This walks the `cmsghdr` chain manually rather than using the libc `CMSG_*`
+/// macros on a borrowed buffer so it can operate on bytes copied out of guest
+/// memory. Partially-delivered fd arrays (possible when `MSG_CTRUNC` is set) are
+/// handled by only reading whole `RawFd`s that fit within `cmsg_len`.
+fn scm_rights_fds(control: &[u8]) -> Vec<RawFd> {
+    let hdr_size = std::mem::size_of::<libc::cmsghdr>();
+    let align = std::mem::align_of::<libc::cmsghdr>();
+    let mut fds = Vec::new();
+    let mut offset = 0usize;
+
+    while offset + hdr_size <= control.len() {
+        // SAFETY: we only read a `cmsghdr` worth of bytes that lie within the
+        // buffer, and `cmsghdr` is a plain-old-data C struct.
+        let mut cmsg: libc::cmsghdr = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                control[offset..].as_ptr(),
+                &mut cmsg as *mut libc::cmsghdr as *mut u8,
+                hdr_size,
+            );
+        }
+
+        let cmsg_len = cmsg.cmsg_len as usize;
+        // A well-formed control message covers at least its own header and does
+        // not run past the end of the buffer.
+        if cmsg_len < hdr_size || offset + cmsg_len > control.len() {
+            break;
+        }
+
+        if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
+            let data_start = offset + cmsg_align(hdr_size, align);
+            let data_end = offset + cmsg_len;
+            let mut cursor = data_start;
+            while cursor + std::mem::size_of::<RawFd>() <= data_end {
+                let mut raw = [0u8; std::mem::size_of::<RawFd>()];
+                raw.copy_from_slice(&control[cursor..cursor + std::mem::size_of::<RawFd>()]);
+                fds.push(RawFd::from_ne_bytes(raw));
+                cursor += std::mem::size_of::<RawFd>();
+            }
+        }
+
+        // Advance to the next header, honoring the kernel's cmsg alignment.
+        let advance = cmsg_align(cmsg_len, align).max(cmsg_align(hdr_size, align));
+        offset += advance;
+    }
+
+    fds
+}
+
+/// Round `len` up to the control-message alignment, matching `CMSG_ALIGN`.
+fn cmsg_align(len: usize, align: usize) -> usize {
+    len.div_ceil(align) * align
+}
+
+/// Map a received descriptor's `st_mode` to the Detcore [`FdType`] used to route
+/// its syscalls, or `None` for a type we do not support passing via
+/// `SCM_RIGHTS`.
+fn received_fd_type(st_mode: libc::mode_t) -> Option<FdType> {
+    match st_mode & libc::S_IFMT {
+        // Regular files and memfds are both `S_IFREG`; a memfd is just an
+        // anonymous regular file, and both route through `record_or_replay`.
+        libc::S_IFREG => Some(FdType::Regular),
+        libc::S_IFSOCK => Some(FdType::Socket),
+        libc::S_IFIFO => Some(FdType::Pipe),
+        libc::S_IFCHR => Some(FdType::Regular),
+        _ => None,
     }
 }

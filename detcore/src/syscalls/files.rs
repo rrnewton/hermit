@@ -55,7 +55,7 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
-    async fn inject_fstat<G: Guest<Self>>(
+    pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
         raw_fd: RawFd,

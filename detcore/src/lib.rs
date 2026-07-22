@@ -1126,7 +1126,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
 
             Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
-            Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
+            Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
             Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
             Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,
             Syscall::Sendmmsg(s) => self.handle_sendrecv(guest, s).await,
