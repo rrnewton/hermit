@@ -69,13 +69,16 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Require deterministic host capabilities instead of silently degrading.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "no_strict"]
     )]
     strict: bool,
+
+    /// Allow unavailable host capabilities to fall back to best-effort behavior.
+    #[clap(long, conflicts_with = "strict")]
+    no_strict: bool,
 
     /// Disable deterministic sequential thread execution.
     #[clap(long)]
@@ -519,6 +522,7 @@ fn strict_flag_preserves_deterministic_defaults() {
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
+    assert!(ro.det_opts.det_config.require_cpuid_interception);
     assert_eq!(format!("{}", ro), " -- fakeprog");
 }
 
@@ -536,14 +540,37 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
+fn no_strict_flag_keeps_capability_fallbacks() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--no-strict", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(!ro.det_opts.det_config.require_cpuid_interception);
+}
+
+#[test]
+fn strict_flag_rejects_disabling_cpuid_virtualization() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--strict",
+        "--no-virtualize-cpuid",
+        "fakeprog",
+    ]);
+    let error = ro.validate_args_with_perf_support(true).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--strict"));
+    assert!(message.contains("--no-virtualize-cpuid"));
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "Require deterministic host capabilities",
+        "--no-strict",
+        "best-effort behavior",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -776,6 +803,7 @@ impl RunOpts {
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = true;
+        config.require_cpuid_interception = self.strict && !self.no_strict;
 
         if self.analyze_networking {
             config.warn_non_zero_binds = true;
@@ -783,6 +811,12 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+
+        if self.strict && !config.virtualize_cpuid {
+            anyhow::bail!(
+                "--strict cannot be combined with --no-virtualize-cpuid; strict mode requires CPUID interception"
+            );
+        }
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {

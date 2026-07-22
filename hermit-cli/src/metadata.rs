@@ -155,6 +155,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         virtualize_metadata: false,
         virtualize_cpuid: true,
         has_uts_namespace: true,
+        require_cpuid_interception: false,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,

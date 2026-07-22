@@ -178,6 +178,11 @@ pub struct Config {
     #[clap(skip)]
     pub has_uts_namespace: bool,
 
+    /// [Internal] Fail startup if Reverie cannot intercept CPUID.
+    #[clap(skip)]
+    #[serde(skip)]
+    pub require_cpuid_interception: bool,
+
     /// [Internal] Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,

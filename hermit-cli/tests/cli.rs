@@ -104,6 +104,27 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn cpuid_faulting_supported() -> bool {
+    const ARCH_SET_CPUID: libc::c_ulong = 0x1012;
+
+    // Probe in a child because disabling CPUID is a per-thread setting.
+    let child = unsafe { libc::fork() };
+    assert_ne!(child, -1, "failed to fork CPUID capability probe");
+    if child == 0 {
+        let result = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) };
+        unsafe { libc::_exit(i32::from(result != 0)) };
+    }
+
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(child, &mut status, 0) },
+        child,
+        "failed to wait for CPUID capability probe"
+    );
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
 #[test]
 fn top_level_help_lists_user_facing_commands() {
     let args = ["--help"];
@@ -310,5 +331,37 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         deny_syscall(&mut command, syscall);
         let output = command.output().expect("failed to run restricted hermit");
         assert_failure_contains(&output, &expected);
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn strict_mode_requires_cpuid_faulting() {
+    let supported = cpuid_faulting_supported();
+
+    let non_strict_args = ["run", "--preemption-timeout=disabled", "--", "/bin/true"];
+    let non_strict = hermit(&non_strict_args);
+    assert_success(&non_strict, &non_strict_args);
+
+    let strict_args = [
+        "run",
+        "--strict",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/true",
+    ];
+    let strict = hermit(&strict_args);
+    if supported {
+        assert_success(&strict, &strict_args);
+    } else {
+        assert_failure_contains(
+            &strict,
+            &[
+                "CPUID faulting not available",
+                "AMD CPU with kernel < 6.17?",
+                "Upgrade to kernel >= 6.17",
+                "--no-strict",
+            ],
+        );
     }
 }
