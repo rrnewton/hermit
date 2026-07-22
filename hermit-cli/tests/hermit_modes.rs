@@ -351,6 +351,53 @@ fn run_stable_matrix(mode: RunMode) {
     }
 }
 
+fn run_buck_chaos_workload(name: &str) {
+    let _guard = hermit_run_lock();
+    let workload = workloads()
+        .stable
+        .iter()
+        .chain(&workloads().default_only)
+        .find(|workload| workload.name == name)
+        .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--verify",
+            "--chaos",
+            "--base-env=empty",
+            "--preemption-timeout=1000000",
+            "--env=HERMIT_MODE=chaos",
+            "--",
+        ])
+        .arg(&workload.path)
+        .args(workload.args);
+    command_output(command, &format!("Buck chaos mode for {}", workload.name));
+}
+
+macro_rules! buck_chaos_tests {
+    ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
+        $(
+            #[test]
+            #[ignore = "requires PMU branch counters and working mount namespaces"]
+            fn $test_name() {
+                run_buck_chaos_workload($workload_name);
+            }
+        )+
+    };
+}
+
+buck_chaos_tests! {
+    chaos_buck_getpid => "getpid",
+    chaos_buck_uname => "uname",
+    chaos_buck_sysinfo => "sysinfo",
+    chaos_buck_wait_on_child => "wait_on_child",
+    chaos_buck_nanosleep_parallel => "nanosleep_parallel",
+    chaos_buck_clone => "clone",
+    chaos_buck_hello_alarm => "hello_alarm",
+    chaos_buck_mem_race => "rust_mem_race",
+}
+
 #[test]
 fn default_mode_matrix() {
     run_stable_matrix(RunMode::Default);
