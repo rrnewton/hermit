@@ -5,7 +5,6 @@ export LC_ALL=C
 
 repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 known_failure_manifest="$repository/hermit-cli/tests/fail_closed_known_failures.tsv"
-allowed_ignore_manifest="$repository/hermit-cli/tests/fail_closed_allowed_ignores.tsv"
 cargo_args=("$@")
 cargo_bin=${CARGO:-cargo}
 
@@ -29,7 +28,6 @@ run_cargo() {
 
 cd "$repository"
 [[ -f "$known_failure_manifest" ]] || fail "missing $known_failure_manifest"
-[[ -f "$allowed_ignore_manifest" ]] || fail "missing $allowed_ignore_manifest"
 
 mapfile -t targets < <(
   find hermit-cli/tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
@@ -60,37 +58,25 @@ while IFS=$'\t' read -r target test failure_class reason; do
   previous_key="$key"
 done < "$known_failure_manifest"
 
-declare -A allowed_ignores=()
-previous_key=
-while IFS=$'\t' read -r target test reason; do
-  [[ -z "$target" || "$target" == \#* ]] && continue
-  [[ -n "$test" && -n "$reason" ]] \
-    || fail "malformed row in $allowed_ignore_manifest"
-  [[ -n "${target_exists[$target]+set}" ]] \
-    || fail "unknown target '$target' in $allowed_ignore_manifest"
-  key="$target/$test"
-  [[ -z "${allowed_ignores[$key]+set}" ]] \
-    || fail "duplicate allowed-ignore row for $key"
-  [[ -z "$previous_key" || "$previous_key" < "$key" ]] \
-    || fail "$allowed_ignore_manifest must remain sorted"
-  allowed_ignores["$key"]="$reason"
-  previous_key="$key"
-done < "$allowed_ignore_manifest"
-
-# These targets exercise the CLI or record/replay engine, not `hermit run`'s
+# These targets exercise separate coverage paths rather than `hermit run`'s
 # Detcore unsupported-syscall policy.
 declare -A mode_na_targets=(
   [cli]=1
+  [leveldb]=1
+  [no_silent_skips]=1
   [record_replay]=1
+  [rr_suite]=1
+  [stress_suite]=1
 )
 declare -A mode_na_tests=(
   [arbitrary_binaries/record_replay_stable_arbitrary_binaries]="record/replay path"
+  [hermit_modes/allow_passthrough_forwards_unsupported_syscall]="explicit compatibility opt-out"
+  [hermit_modes/keyctl_obeys_unsupported_syscall_policy]="tests ENOSYS and compatibility policies"
+  [hermit_modes/unsupported_syscall_is_blocked_by_default]="tests ENOSYS policy rather than panic mode"
 )
 
 declare -A seen_tests=()
-declare -A seen_ignores=()
 passed=0
-ignored=0
 mode_na=0
 
 export HERMIT_FAIL_CLOSED=1
@@ -107,28 +93,10 @@ for target in "${targets[@]}"; do
     continue
   fi
 
-  ignored_output=$(run_cargo test -p hermit --test "$target" "${cargo_args[@]}" -- --list --ignored)
-  declare -A target_ignored=()
-  while IFS= read -r test; do
-    [[ -z "$test" ]] && continue
-    key="$target/$test"
-    target_ignored["$key"]=1
-    [[ -n "${allowed_ignores[$key]+set}" ]] \
-      || fail "$key is ignored but is not in $allowed_ignore_manifest"
-    seen_ignores["$key"]=1
-  done < <(printf '%s\n' "$ignored_output" | sed -n 's/: test$//p')
-
   for test in "${tests[@]}"; do
     key="$target/$test"
     seen_tests["$key"]=1
 
-    if [[ -n "${allowed_ignores[$key]+set}" && -z "${target_ignored[$key]+set}" ]]; then
-      fail "$key is allowlisted as ignored but is now active; remove its ignore row"
-    fi
-    if [[ -n "${target_ignored[$key]+set}" ]]; then
-      ignored=$((ignored + 1))
-      continue
-    fi
     if [[ -n "${mode_na_tests[$key]+set}" ]]; then
       mode_na=$((mode_na + 1))
       continue
@@ -148,14 +116,10 @@ for key in "${!known_failures[@]}"; do
   [[ -n "${seen_tests[$key]+set}" ]] \
     || fail "stale known-failure row for missing test $key"
 done
-for key in "${!allowed_ignores[@]}"; do
-  [[ -n "${seen_ignores[$key]+set}" ]] \
-    || fail "stale allowed-ignore row for $key"
-done
 for key in "${!mode_na_tests[@]}"; do
   [[ -n "${seen_tests[$key]+set}" ]] \
     || fail "stale mode-N/A exception for $key"
 done
 
-printf '\nFail-closed ratchet passed: %d enabled, %d known failures, %d ignored, %d mode N/A.\n' \
-  "$passed" "${#known_failures[@]}" "$ignored" "$mode_na"
+printf '\nFail-closed ratchet passed: %d enabled, %d known failures, %d mode N/A.\n' \
+  "$passed" "${#known_failures[@]}" "$mode_na"

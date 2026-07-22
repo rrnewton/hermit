@@ -1,6 +1,6 @@
 # Fail-Closed Test Status
 
-Status: baseline and ratchet policy, 2026-07-22
+Status: baseline and integrated review-stack ratchet policy, 2026-07-22
 
 Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
 Detcore into a panic instead of silently passing it through. The integration
@@ -49,7 +49,7 @@ machine-readable exception lists:
   records every failing target/test pair and its first observed blocker. The
   baseline has 85 failures at `pread64` and one at `ioctl`.
 - [`fail_closed_allowed_ignores.tsv`](../hermit-cli/tests/fail_closed_allowed_ignores.tsv)
-  records the eight PMU-dependent mode tests and three explicit stress tiers.
+  records that the human-review stack has activated every formerly ignored test.
 - Unit tests, `cli`, and `record_replay` do not execute Detcore's `hermit run`
   syscall policy. The record/replay case in `arbitrary_binaries` is also mode
   N/A. They remain covered by regular CI instead of inflating the fail-closed
@@ -71,24 +71,28 @@ which is useful for a local dependency override:
 ```
 
 The runner discovers every integration target and test at runtime. It validates
-both exception files, rejects duplicate or stale entries, rejects new ignored
-tests, and runs each applicable unlisted test by exact name with fail-closed
-enabled. Therefore:
+the known-failure manifest, rejects duplicate or stale entries, and runs each
+applicable unlisted test by exact name with fail-closed enabled. Source control
+separately rejects ignored tests through `no_silent_skips`. Therefore:
 
 1. Every new applicable integration test must pass fail-closed on its first CI
    run. It receives no exemption by default.
 2. A regression in an enabled test is a release blocker.
 3. When a syscall is modeled, remove the affected known-failure rows in the
    same change. The tests then join the enabled set automatically.
-4. Adding a known failure or allowed ignore expands debt and requires explicit
-   review with a concrete syscall or hardware reason. It is not a routine way
-   to make CI green.
-5. Changes to either exception list are part of the ratchet's review surface.
-   Counts may only move from failure/ignored to pass unless expansion is
-   deliberately approved.
+4. Adding a known failure expands debt and requires explicit review with a
+   concrete syscall or hardware reason. It is not a routine way to make CI green.
+5. Changes to the exception list are part of the ratchet's review surface.
+   Counts may only move from failure to pass unless expansion is deliberately
+   approved.
 
 The self-hosted CI job runs the ratchet after the regular Hermit integration
 suite when mount namespaces are available.
+
+With the human-review stack applied, the ratchet reports 9 enabled tests, 96
+documented failures, no ignored tests, and 257 mode-N/A tests. The additional
+documented failures expose `rseq` as the next blocker for threaded strict-mode
+workloads after `pread64` support.
 
 ## Current Limitation
 
@@ -101,5 +105,5 @@ missing release entries; see
 
 A future true fail-closed mode must subscribe to all syscalls (or install an
 equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 3/89 to full
+calls that Detcore does observe and provides a visible path from 9/105 to full
 coverage of the currently applicable integration inventory.
