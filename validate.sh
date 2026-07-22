@@ -13,6 +13,17 @@ cd "$ROOT_DIR" || exit 1
 
 checks=0
 failures=0
+declare -a background_pids=()
+declare -a background_names=()
+declare -a background_logs=()
+declare -a background_duration_files=()
+
+VALIDATION_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hermit-validate.XXXXXX")
+if [[ -z $VALIDATION_TMP_DIR ]]; then
+    echo "Unable to create validation workspace." >&2
+    exit 1
+fi
+readonly VALIDATION_TMP_DIR
 
 LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/hermit-validate.XXXXXX.log")
 if [[ -z $LOG_FILE ]]; then
@@ -43,10 +54,21 @@ declare -ar HERMIT_RUN_ARGS=(
     --preemption-timeout=disabled
 )
 
+function cleanup {
+    local pid
+    for pid in "${background_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    rm -rf "$VALIDATION_TMP_DIR"
+}
+
 function interrupted {
+    trap - INT TERM
     printf "❌ Validation interrupted (full log: %s)\n" "$LOG_FILE"
     exit 130
 }
+trap cleanup EXIT
 trap interrupted INT TERM
 
 function failure_summary {
@@ -109,6 +131,81 @@ function run_check {
         printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
     } >>"$LOG_FILE"
     checks=$((checks + 1))
+}
+
+function start_check {
+    local name=$1
+    shift
+
+    local index=${#background_pids[@]}
+    local log_file="$VALIDATION_TMP_DIR/check-$index.log"
+    local duration_file="$VALIDATION_TMP_DIR/check-$index.duration"
+
+    (
+        local started_at=$SECONDS
+        local status
+
+        printf "Command:"
+        printf " %q" "$@"
+        printf "\n"
+        "$@"
+        status=$?
+        printf "%s\n" "$((SECONDS - started_at))" >"$duration_file"
+        exit "$status"
+    ) >"$log_file" 2>&1 &
+
+    background_pids+=("$!")
+    background_names+=("$name")
+    background_logs+=("$log_file")
+    background_duration_files+=("$duration_file")
+    checks=$((checks + 1))
+}
+
+function wait_for_background_checks {
+    local i
+    for i in "${!background_pids[@]}"; do
+        local pid=${background_pids[$i]}
+        local name=${background_names[$i]}
+        local log_file=${background_logs[$i]}
+        local duration_file=${background_duration_files[$i]}
+        local output_start
+        local status
+        local duration
+        local summary
+
+        if wait "$pid"; then
+            status=0
+        else
+            status=$?
+            failures=$((failures + 1))
+        fi
+
+        printf "=== %s ===\n" "$name" >>"$LOG_FILE"
+        output_start=$(($(wc -l <"$LOG_FILE") + 1))
+        cat "$log_file" >>"$LOG_FILE"
+        if [[ -r $duration_file ]]; then
+            duration=$(<"$duration_file")
+        else
+            duration=0
+        fi
+
+        if ((status == 0)); then
+            printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
+        else
+            summary=$(failure_summary "$output_start")
+            printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
+                "$name" "$status" "$summary" "$LOG_FILE"
+        fi
+        {
+            printf "Exit: %s\n" "$status"
+            printf "Duration: %ss\n\n" "$duration"
+        } >>"$LOG_FILE"
+    done
+
+    background_pids=()
+    background_names=()
+    background_logs=()
+    background_duration_files=()
 }
 
 function ensure_cargo_nextest {
@@ -194,6 +291,14 @@ function print_summary {
 
 run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
+
+# Cargo supports concurrent commands in one target directory. Run checks that
+# do not execute Hermit guests alongside the ordered runtime and PMU gates.
+start_check "Test workspace documentation" cargo test --workspace --doc
+start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+start_check "Rustfmt" cargo fmt --all -- --check
+start_check "Documentation" cargo doc --workspace --no-deps
+
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
@@ -204,18 +309,15 @@ run_check "Test workspace and integrations" \
     "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
     --exclude hermetic_infra_hermit_flaky-tests
 run_check "Test detcore package" cargo test -p detcore
-run_check "Test workspace documentation" cargo test --workspace --doc
 run_check "Fast concurrency stress suite" \
     "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
     --run-ignored only -E 'test(=fast_chaos_matrix)'
 # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
 run_check "Hermit analyze scenarios" \
     cargo test -p hermit --test analyze -- --ignored
-run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-run_check "Rustfmt" cargo fmt --all -- --check
-run_check "Documentation" cargo doc --workspace --no-deps
 run_check "Schedule search E2E (requires PMU)" \
     ./tests/util/hermit_analyze_e2e.sh
 
+wait_for_background_checks
 print_summary
 ((failures == 0))
