@@ -386,6 +386,7 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let time_from_guest = gr.0.as_nanos();
+        let deregistering = matches!(&gr.1, GlobalRequest::DeregisterThread(_, _, _));
 
         // This portion of the time updates "asynchronously", and we can tick it on every rpc:
         // TODO: eventually the vector clock should be in shared memory, and
@@ -472,7 +473,7 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::GlobalTimeLowerBound => {
-                let global_time = self.global_time.lock().unwrap();
+                let mut global_time = self.global_time.lock().unwrap();
                 // Aggregate work is wall-clock-like only when threads cannot
                 // make progress concurrently.
                 let ns = if self.cfg.sequentialize_threads {
@@ -536,6 +537,11 @@ impl GlobalTool for GlobalState {
                 R::ReleasePort(port)
             }
         };
+
+        if deregistering {
+            self.global_time.lock().unwrap().retire_thread(dtid);
+            return (None, resp);
+        }
 
         let time_from_sched = self.global_time.lock().unwrap().threads_time(dtid);
         let time_update = match time_from_sched.cmp(&time_from_guest) {
@@ -845,15 +851,15 @@ impl GlobalState {
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
     async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
-        // Invariant: will only be called when sequentialize-threads is on.
-        assert!(self.cfg.sequentialize_threads);
-        self.sched
-            .lock()
-            .unwrap()
-            .logically_kill_thread(&dettid, &detpid, mm);
+        if self.cfg.sequentialize_threads {
+            self.sched
+                .lock()
+                .unwrap()
+                .logically_kill_thread(&dettid, &detpid, mm);
+        }
         trace!(
-            "[detcore, dtid {}] thread deregistered, removed from sched structures.",
-            dettid
+            "[detcore, dtid {}] thread deregistered (scheduler cleanup: {}).",
+            dettid, self.cfg.sequentialize_threads,
         );
     }
 
@@ -1418,27 +1424,23 @@ pub async fn create_vfork_child_thread<G, T>(
 pub async fn deregister_thread<R>(
     dettid: DetTid,
     threads_time: DetTime,
-    cfg: &Config,
     reverie: &R,
     detpid: DetPid,
     mm: MmId,
 ) where
-    // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
 {
-    if cfg.sequentialize_threads {
-        // TODO: void_send_rpc
-        let resp = reverie
-            .send_rpc((
-                threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm),
-            ))
-            .await;
-        // We can't update the thread time here.  But it's dead anyway!
-        match resp.1 {
-            GlobalResponse::DeregisterThread(x) => x,
-            _ => unreachable!(),
-        }
+    // TODO: void_send_rpc
+    let resp = reverie
+        .send_rpc((
+            threads_time,
+            GlobalRequest::DeregisterThread(dettid, detpid, mm),
+        ))
+        .await;
+    // We cannot update the thread time here, but the thread is already dead.
+    match resp.1 {
+        GlobalResponse::DeregisterThread(x) => x,
+        _ => unreachable!(),
     }
 }
 
