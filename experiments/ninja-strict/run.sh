@@ -13,9 +13,9 @@ readonly NINJA_REVISION=79feac0f3e3bc9da9effc586cd5fea41e7550051
 readonly GTEST_VERSION=1.16.0
 readonly GTEST_ARCHIVE_URL=https://github.com/google/googletest/archive/refs/tags/v1.16.0.tar.gz
 readonly GTEST_ARCHIVE_SHA256=78c676fc63881529bf97bf9d45948d905a66833fbfa5318ea2cd7478cb98f399
-readonly STRICT_FILTER='-SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLogTest.*'
+readonly STRICT_FILTER='-SubprocessTest.*'
 readonly EXPECTED_NATIVE_TESTS=410
-readonly EXPECTED_STRICT_TESTS=378
+readonly EXPECTED_STRICT_TESTS=397
 
 usage() {
   cat <<'USAGE'
@@ -68,6 +68,7 @@ has_pass_marker() {
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
+ninja_test_patch=$script_dir/ninja-test-in-process-cleanup.patch
 source_input=$repo_root/target/ninja-strict/source
 build_input=$repo_root/target/ninja-strict/build
 gtest_source_input=$repo_root/target/ninja-strict/googletest-$GTEST_VERSION
@@ -162,6 +163,13 @@ fi
 source_revision=$(git -C "$source_dir" rev-parse HEAD)
 [[ $source_revision == "$NINJA_REVISION" ]] ||
   fail "Ninja source must be revision $NINJA_REVISION, found $source_revision"
+if git -C "$source_dir" apply --reverse --check "$ninja_test_patch" 2>/dev/null; then
+  :
+elif git -C "$source_dir" apply --check "$ninja_test_patch"; then
+  git -C "$source_dir" apply "$ninja_test_patch"
+else
+  fail "Ninja test cleanup patch does not apply cleanly: $ninja_test_patch"
+fi
 
 if [[ ! -e $gtest_source_dir ]]; then
   archive_dir=$(dirname "$gtest_source_dir")
@@ -213,6 +221,7 @@ strict_args=(
   --strict
   --base-env=minimal
   --env=LC_ALL=C
+  --env=NINJA_TEST_KEEP_TEMP_DIRS=1
 )
 test_args=(
   --gtest_color=no
@@ -232,6 +241,7 @@ command_line=${command_line% }
   printf 'ninja_revision=%s\n' "$source_revision"
   printf 'ninja_sha256=%s\n' "$(sha256_file "$ninja_bin")"
   printf 'ninja_test_sha256=%s\n' "$(sha256_file "$ninja_test_bin")"
+  printf 'ninja_test_patch_sha256=%s\n' "$(sha256_file "$ninja_test_patch")"
   printf 'gtest_version=%s\n' "$GTEST_VERSION"
   printf 'gtest_archive_sha256=%s\n' "$GTEST_ARCHIVE_SHA256"
   printf 'compiler=%s\n' "$(c++ --version | head -n 1)"

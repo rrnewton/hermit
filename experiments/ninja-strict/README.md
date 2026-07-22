@@ -19,7 +19,14 @@ binaries under `target/ninja-strict/`. It first requires the complete native
 Ninja suite to pass. It then executes the supported strict-mode test set twice
 and compares stdout, stderr, and exit status byte-for-byte.
 
-Use existing build artifacts with:
+The runner applies `ninja-test-in-process-cleanup.patch` before building.
+Ninja's otherwise in-process disk and deps-log fixtures call `system("rm -rf")`
+from their shared teardown helper. Strict runs set
+`NINJA_TEST_KEEP_TEMP_DIRS=1` to skip that subprocess because every execution
+already has a private Hermit `--tmp` tree. The native control leaves upstream
+cleanup behavior enabled.
+
+Use existing patched build artifacts with:
 
 ```sh
 ./experiments/ninja-strict/run.sh \
@@ -35,8 +42,8 @@ The default strict command is equivalent to:
 
 ```text
 hermit --log=error run --strict --base-env=minimal --env=LC_ALL=C \
-  --tmp=<isolated run directory> -- ninja_test --gtest_color=no \
-  --gtest_filter=-SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLogTest.*
+  --env=NINJA_TEST_KEEP_TEMP_DIRS=1 --tmp=<isolated run directory> \
+  -- ninja_test --gtest_color=no --gtest_filter=-SubprocessTest.*
 ```
 
 The default two-run test takes seconds once the binaries exist. The external
@@ -46,25 +53,25 @@ suite.
 
 ## Recorded result
 
-`evidence_20260722/` was collected from Hermit commit
-`d6438c9d5fe1b2076eab3d563b445b96c15f70d7` on an x86-64 AMD EPYC 9D85 host.
-The native control passed all 410 tests. Both strict runs passed 378 tests from
-28 suites, exited zero with empty stderr, and produced the same stdout hash:
+`evidence_20260722/` was collected while revising Hermit commit
+`d23fc497a1fe95b4f3b2233a5ed12424c093b8c1` on an x86-64 AMD EPYC 9D85
+host. The native control passed all 410 tests. Both strict runs passed 397
+tests from 30 suites, exited zero with empty stderr, and produced the same
+stdout hash:
 
 ```text
-56fbdedcdb8a631bb3929a4a17411db489158f32e07d3fb5164f1a798c5a4b00
+1bd17d2bc25c54fba1b44f2cea98ec0b183a11aca589b603da30badb82b266e7
 ```
+
+The strict set includes all 9 `DiskInterfaceTest` cases and all 10
+`BuildWithDepsLogTest` cases. Only the 13 `SubprocessTest` cases are
+excluded.
 
 ## Full-suite blocker
 
-The complete suite does not currently pass under Hermit. Its three
-child-process fixtures contain 32 tests:
-
-- `SubprocessTest` uses `posix_spawn`; glibc enters
-  `clone(CLONE_VM | CLONE_VFORK)`, which Hermit rejects.
-- `DiskInterfaceTest` invokes shell commands while exercising filesystem
-  operations and reaches the same path.
-- `BuildWithDepsLogTest` executes build commands and reaches the same path.
+The complete suite does not currently pass under Hermit. `SubprocessTest`
+uses `posix_spawn`; glibc enters `clone(CLONE_VM | CLONE_VFORK)`, which
+Hermit rejects.
 
 Run the bounded diagnostic with:
 
@@ -73,13 +80,13 @@ Run the bounded diagnostic with:
 ```
 
 The recorded probe times out at `SubprocessTest.BadCommandStderr` after Hermit
-reports unsupported `CLONE_VFORK`. A direct-`fork` Ninja 1.6 control exposed a
-second scheduler issue: the parent can block on the child pipe before the new
+reports unsupported `CLONE_VFORK`. A direct-`fork` Ninja 1.6 control exposed
+a second scheduler issue: the parent can block on the child pipe before the new
 child receives its initial go-ahead. Consequently, merely replacing
 `posix_spawn` does not make the full test suite pass.
 
-The 378-test result is evidence for the parser, graph, build-plan, depfile,
-dyndep, log, and other in-process Ninja logic. It deliberately does not claim
-child-process determinism. The probe remains in the runner so a future
-scheduler fix can convert this limitation into full-suite coverage without
-changing the workload.
+The 397-test result covers parser, graph, build-plan, disk-interface, depfile,
+deps-log, dyndep, log, and other in-process Ninja logic. It deliberately does
+not claim child-process determinism. The probe remains in the runner so a
+future scheduler fix can convert this limitation into full-suite coverage
+without changing the workload.
