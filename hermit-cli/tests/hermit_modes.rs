@@ -32,12 +32,13 @@ struct Workloads {
     default_only: Vec<Workload>,
     hello_race: Workload,
     resource_determinism: Workload,
+    unsupported_syscall: Workload,
+    keyctl_syscall: Workload,
 }
 
 #[derive(Clone, Copy)]
 enum RunMode {
     Default,
-    Strict,
     Chaos,
     Verify,
 }
@@ -46,7 +47,6 @@ impl RunMode {
     fn name(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Strict => "strict",
             Self::Chaos => "chaos",
             Self::Verify => "verify",
         }
@@ -98,6 +98,20 @@ fn compile_c_without_libc(source: &Path, output: &Path) {
         .arg("-o")
         .arg(output);
     command_output(command, "C workload compilation without libc");
+}
+
+fn compile_unsupported_syscall_workload(name: &'static str) -> Workload {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unsupported-syscall-workloads");
+    fs::create_dir_all(&build_root).expect("failed to create unsupported-syscall build directory");
+    let workload = workload(name, build_root.join(name));
+    compile_c_without_libc(
+        &repository.join(format!("tests/c/simple/{name}_nostdlib.c")),
+        &workload.path,
+    );
+    workload
 }
 
 fn compile_rust(source: &Path, output: &Path) {
@@ -313,11 +327,33 @@ fn workloads() -> &'static Workloads {
             &hello_race.path,
         );
 
+        let unsupported_syscall = Workload {
+            name: "unsupported_syscall",
+            path: build_root.join("unsupported_syscall"),
+            args: &[],
+        };
+        compile_c_without_libc(
+            &repository.join("tests/c/simple/unsupported_syscall_nostdlib.c"),
+            &unsupported_syscall.path,
+        );
+
+        let keyctl_syscall = Workload {
+            name: "keyctl_syscall",
+            path: build_root.join("keyctl_syscall"),
+            args: &[],
+        };
+        compile_c_without_libc(
+            &repository.join("tests/c/simple/keyctl_syscall_nostdlib.c"),
+            &keyctl_syscall.path,
+        );
+
         Workloads {
             stable,
             default_only,
             hello_race,
             resource_determinism,
+            unsupported_syscall,
+            keyctl_syscall,
         }
     })
 }
@@ -331,19 +367,24 @@ fn hermit_command(base_env: &str) -> Command {
     command
 }
 
-fn default_hermit_command(base_env: &str) -> Command {
+fn compatibility_hermit_command(base_env: &str) -> Command {
     let mut command = hermit_command(base_env);
+    command.arg("--allow-passthrough");
+    command
+}
+
+fn default_hermit_command(base_env: &str) -> Command {
+    let mut command = compatibility_hermit_command(base_env);
     command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
     command
 }
 
 fn hermit_run(mode: RunMode, workload: &Workload) {
-    let mut command = hermit_command("minimal");
+    let mut command = compatibility_hermit_command("minimal");
     match mode {
         RunMode::Default => {
             command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
         }
-        RunMode::Strict => {}
         RunMode::Chaos => {
             command.arg("--chaos");
         }
@@ -369,7 +410,57 @@ fn run_stable_matrix(mode: RunMode) {
     }
 }
 
+fn assert_unsupported_syscall_panics(workload: &Workload, option: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--base-env=empty",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            option,
+            "--",
+        ])
+        .arg(&workload.path);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "unsupported syscall did not fail: {rendered}\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("unsupported syscall") && stderr.contains("panicked at"),
+        "unsupported syscall did not produce a panic: {rendered}\nstatus: {}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+#[test]
+fn panic_on_unsupported_syscalls_panics() {
+    let _guard = hermit_run_lock();
+    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
+    let keyctl_syscall = compile_unsupported_syscall_workload("keyctl_syscall");
+    assert_unsupported_syscall_panics(&unsupported_syscall, "--panic-on-unsupported-syscalls");
+    assert_unsupported_syscall_panics(&keyctl_syscall, "--panic-on-unsupported-syscalls");
+}
+
+#[test]
+fn strict_panics_on_unsupported_syscalls() {
+    let _guard = hermit_run_lock();
+    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
+    assert_unsupported_syscall_panics(&unsupported_syscall, "--strict");
+}
+
 fn run_buck_chaos_workload(name: &str) {
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: {name} chaos coverage requires accessible PMU hardware counters"
+    );
     let _guard = hermit_run_lock();
     let workload = workloads()
         .stable
@@ -377,9 +468,11 @@ fn run_buck_chaos_workload(name: &str) {
         .chain(&workloads().default_only)
         .find(|workload| workload.name == name)
         .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new("timeout");
     command
         .args([
+            "60s",
+            env!("CARGO_BIN_EXE_hermit"),
             "run",
             "--verify",
             "--chaos",
@@ -397,7 +490,6 @@ macro_rules! buck_chaos_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "requires PMU branch counters and working mount namespaces"]
             fn $test_name() {
                 run_buck_chaos_workload($workload_name);
             }
@@ -459,6 +551,93 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             baseline = Some(stdout);
         }
     }
+}
+
+fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--preemption-timeout=disabled",
+    ]);
+    if strict {
+        command.arg("--strict");
+    }
+    if allow_passthrough {
+        command.arg("--allow-passthrough");
+    }
+    command.arg(&workload.path);
+    command
+        .output()
+        .expect("failed to run unsupported-syscall workload")
+}
+
+#[test]
+fn unsupported_syscall_is_blocked_by_default() {
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, false);
+    assert!(
+        output.status.success(),
+        "fail-closed workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
+        "missing fail-closed warning:\n{stderr}"
+    );
+}
+
+#[test]
+fn allow_passthrough_forwards_unsupported_syscall() {
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, true);
+    assert!(
+        output.status.success(),
+        "passthrough workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "passed\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("passed through"),
+        "missing passthrough warning:\n{stderr}"
+    );
+}
+
+#[test]
+fn keyctl_obeys_unsupported_syscall_policy() {
+    let _guard = hermit_run_lock();
+
+    let blocked = run_unsupported_syscall(&workloads().keyctl_syscall, false, false);
+    assert!(
+        blocked.status.success(),
+        "fail-closed keyctl workload failed: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&blocked.stdout), "blocked\n");
+    let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_stderr.contains("unsupported syscall keyctl")
+            && blocked_stderr.contains("blocked with ENOSYS"),
+        "missing fail-closed keyctl warning:\n{blocked_stderr}"
+    );
+
+    let allowed = run_unsupported_syscall(&workloads().keyctl_syscall, false, true);
+    assert!(
+        allowed.status.success(),
+        "passthrough keyctl workload failed: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allowed.stdout), "passed\n");
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed_stderr.contains("unsupported syscall keyctl")
+            && allowed_stderr.contains("passed through"),
+        "missing keyctl passthrough warning:\n{allowed_stderr}"
+    );
 }
 
 fn run_default_workload(name: &str) {
@@ -530,13 +709,11 @@ default_workload_tests! {
 }
 
 #[test]
-#[ignore = "racy default mode can block in Hermit's connect emulation"]
 fn default_cargo_bind_connect_race() {
     run_default_workload("rustbin_bind_connect_race");
 }
 
 #[test]
-#[ignore = "default mode can block in clock total-order scheduling"]
 fn default_cargo_clock_total_order() {
     run_default_workload("rustbin_clock_total_order");
 }
@@ -736,6 +913,7 @@ fn no_hardware_stacktrace_signal() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--preemption-timeout=disabled",
+        "--allow-passthrough",
         "--",
         "/bin/date",
     ]);
@@ -759,7 +937,19 @@ fn no_hardware_stacktrace_signal() {
 
 #[test]
 fn strict_mode_matrix() {
-    run_stable_matrix(RunMode::Strict);
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, false);
+    assert!(
+        output.status.success(),
+        "strict fail-closed workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
+        "strict mode did not enforce fail-closed behavior:\n{stderr}"
+    );
 }
 
 #[test]
@@ -801,6 +991,7 @@ printf 'configured\n'
             "--env=VERIFY_CONFIGURED=expected",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
+            "--allow-passthrough",
         ])
         .arg(format!("--tmp={}", tmp.path().display()))
         .arg("/tmp/guest")
@@ -822,6 +1013,7 @@ fn hello_race_chaos_verify() {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
+            "--allow-passthrough",
             "--env=HERMIT_MODE=chaos",
         ])
         .arg(&workload.path);

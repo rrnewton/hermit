@@ -70,11 +70,17 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Enable strict deterministic mode. Unsupported syscalls panic instead of passing through to
+    /// the host kernel.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = [
+            "no_sequentialize_threads",
+            "no_deterministic_io",
+            "allow_passthrough",
+            "namespace_only",
+            "strace_only"
+        ]
     )]
     strict: bool,
 
@@ -514,18 +520,37 @@ fn display_runopts4() {
 }
 
 #[test]
+fn allow_passthrough_is_explicit_and_round_trips() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(ro.det_opts.det_config.allow_passthrough);
+    assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");
+}
+
+#[test]
 fn strict_flag_preserves_deterministic_defaults() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    assert!(ro.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
 fn strict_flag_rejects_determinism_opt_outs() {
-    for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
+    for opt_out in [
+        "--no-sequentialize-threads",
+        "--no-deterministic-io",
+        "--allow-passthrough",
+        "--namespace-only",
+        "--strace-only",
+    ] {
         let error =
             RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
 
@@ -543,12 +568,13 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "Unsupported syscalls panic",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
         "Disable deterministic I/O behavior",
+        "--allow-passthrough",
+        "Allow unsupported syscalls to execute on the host kernel",
     ] {
         assert!(
             help.contains(expected),
@@ -784,6 +810,7 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+        config.panic_on_unsupported_syscalls |= self.strict;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -845,6 +872,7 @@ impl RunOpts {
             config.virtualize_metadata = false;
             config.virtualize_time = false;
             config.deterministic_io = false;
+            config.allow_passthrough = true;
             self.network = NetworkingMode::Host;
             config.sequentialize_threads = false;
             config.no_rcb_time = true;

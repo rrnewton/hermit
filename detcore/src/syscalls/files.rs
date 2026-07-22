@@ -8,10 +8,15 @@
 
 //! System calls for dealing with the file system.
 
+use std::fs;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::path::PathBuf;
 
+use futures::future::BoxFuture;
+use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
@@ -23,10 +28,13 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::StatFamily;
 use tracing::info;
@@ -37,6 +45,7 @@ use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::procfs::ProcfsFile;
+use crate::procfs::ProcfsLookup;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -134,22 +143,216 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Openat system call.
-    pub async fn handle_openat<G: Guest<Self>>(
+    async fn with_fd_resource<G, F>(
         &self,
         guest: &mut G,
-        call: syscalls::Openat,
+        resource: Option<ResourceID>,
+        permission: Permission,
+        operation: F,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        F: for<'a> FnOnce(&'a Self, &'a mut G) -> BoxFuture<'a, Result<i64, Error>>,
+    {
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, permission);
+            resource_request(guest, request).await;
+        }
+
+        let result = operation(self, guest).await;
+        resource_release_all(guest).await;
+        result
+    }
+
+    fn procfs_lookup_at<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: RawFd,
+        path: &Path,
+    ) -> ProcfsLookup {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            let base = if dirfd == libc::AT_FDCWD {
+                format!("/proc/{}/cwd", guest.pid())
+            } else {
+                format!("/proc/{}/fd/{dirfd}", guest.pid())
+            };
+            let Ok(base) = fs::read_link(base) else {
+                return ProcfsLookup::NotProcfs;
+            };
+            base.join(path)
+        };
+
+        let lexical = ProcfsLookup::from_path(&path);
+        if lexical != ProcfsLookup::NotProcfs {
+            return lexical;
+        }
+
+        // Resolve the parent separately so a final procfs symlink, notably
+        // /proc/self/exe, is still recognized as a procfs entry.
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(parent) = fs::canonicalize(parent)
+        {
+            let resolved = ProcfsLookup::from_path(&parent.join(name));
+            if resolved != ProcfsLookup::NotProcfs {
+                return resolved;
+            }
+        }
+
+        fs::canonicalize(path).map_or(ProcfsLookup::NotProcfs, |path| {
+            ProcfsLookup::from_path(&path)
+        })
+    }
+
+    fn procfs_self_exe_stat(&self, follow_symlink: bool) -> DetStat {
+        let epoch = Timespec {
+            tv_sec: self.cfg.epoch.timestamp(),
+            tv_nsec: self.cfg.epoch.timestamp_subsec_nanos() as i64,
+        };
+        DetStat {
+            mode: if follow_symlink {
+                libc::S_IFREG | 0o555
+            } else {
+                libc::S_IFLNK | 0o777
+            },
+            dev: 1,
+            inode: 10_007,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: epoch,
+            btime: epoch,
+            ctime: epoch,
+            mtime: epoch,
+            ..DetStat::default()
+        }
+    }
+
+    fn self_exe_target<G: Guest<Self>>(&self, guest: &G) -> Result<Vec<u8>, Errno> {
+        fs::read_link(format!("/proc/{}/exe", guest.pid()))
+            .map(|path| path.as_os_str().as_bytes().to_vec())
+            .map_err(|_| Errno::ENOENT)
+    }
+
+    fn write_self_exe_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buffer: Option<AddrMut<libc::c_char>>,
+        capacity: usize,
     ) -> Result<i64, Error> {
-        let path = call.path().ok_or(Errno::EFAULT)?;
-        let path: PathBuf = path.read(&guest.memory())?;
+        let target = self.self_exe_target(guest)?;
+        let length = target.len().min(capacity);
+        if length != 0 {
+            let buffer = buffer.ok_or(Errno::EFAULT)?;
+            guest
+                .memory()
+                .write_exact(buffer.cast(), &target[..length])?;
+        }
+        Ok(length as i64)
+    }
 
-        let resource = ResourceID::Path(path.clone());
-        // Ask for permission to resolve this path into a file:
-        let request = guest.thread_state().mk_request(resource, Permission::R);
-        resource_request(guest, request).await;
-        let res = self.record_or_replay(guest, Syscall::Openat(call)).await;
+    fn procfs_stat(&self, file: ProcfsFile) -> DetStat {
+        let epoch = Timespec {
+            tv_sec: self.cfg.epoch.timestamp(),
+            tv_nsec: self.cfg.epoch.timestamp_subsec_nanos() as i64,
+        };
+        let contents_len = file.contents().len() as i64;
+        DetStat {
+            mode: libc::S_IFREG | 0o444,
+            dev: 1,
+            inode: file.inode(),
+            size: contents_len,
+            blksize: 4096,
+            blocks: (contents_len + 511) / 512,
+            atime: epoch,
+            btime: epoch,
+            ctime: epoch,
+            mtime: epoch,
+            ..DetStat::default()
+        }
+    }
 
-        match res {
+    async fn open_procfs_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        flags: OFlag,
+        file: ProcfsFile,
+    ) -> Result<i64, Error> {
+        const BACKING_NAME: &[u8; 14] = b"hermit-procfs\0";
+        const MAX_CONTENT_BYTES: usize = 256;
+
+        if flags.intersects(
+            OFlag::O_WRONLY
+                | OFlag::O_RDWR
+                | OFlag::O_CREAT
+                | OFlag::O_TRUNC
+                | OFlag::O_APPEND
+                | OFlag::O_TMPFILE,
+        ) {
+            return Err(Errno::EACCES.into());
+        }
+        if flags.contains(OFlag::O_DIRECTORY) {
+            return Err(Errno::ENOTDIR.into());
+        }
+
+        let contents = file.contents();
+        debug_assert!(contents.len() <= MAX_CONTENT_BYTES);
+        let mut data = [0; MAX_CONTENT_BYTES];
+        data[..contents.len()].copy_from_slice(contents);
+        let mut stack = guest.stack().await;
+        let name = stack.push(*BACKING_NAME);
+        let data = stack.push(data);
+        let name_ptr = PathPtr::from_ptr(name.as_raw() as *const libc::c_char);
+        let data_ptr: Addr<u8> = data.cast();
+        stack.commit()?;
+
+        let mut memfd_flags = libc::MFD_ALLOW_SEALING;
+        if flags.contains(OFlag::O_CLOEXEC) {
+            memfd_flags |= libc::MFD_CLOEXEC;
+        }
+        let fd = guest
+            .inject_with_retry(Syscall::MemfdCreate(
+                syscalls::MemfdCreate::new()
+                    .with_name(name_ptr)
+                    .with_flags(memfd_flags),
+            ))
+            .await? as RawFd;
+
+        let written = guest
+            .inject_with_retry(Syscall::Pwrite64(
+                syscalls::Pwrite64::new()
+                    .with_fd(fd)
+                    .with_buf(Some(data_ptr))
+                    .with_len(contents.len())
+                    .with_offset(0),
+            ))
+            .await?;
+        if written != contents.len() as i64 {
+            return Err(Errno::EIO.into());
+        }
+
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        guest
+            .inject_with_retry(Syscall::Fcntl(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_ADD_SEALS(seals)),
+            ))
+            .await?;
+        self.add_fd(guest, fd, flags, FdType::Regular).await?;
+        Ok(fd as i64)
+    }
+
+    async fn finish_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        flags: OFlag,
+        result: Result<i64, Errno>,
+    ) -> Result<i64, Error> {
+        match result {
             Ok(fd) => {
                 let fd = fd as RawFd;
                 let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
@@ -159,21 +362,103 @@ impl<T: RecordOrReplay> Detcore<T> {
                         FdType::Regular
                     }
                 });
-                self.add_fd(guest, fd, call.flags(), fd_type).await?;
-                if let Some(procfs) = ProcfsFile::from_path(&path) {
-                    guest
-                        .thread_state()
-                        .with_detfd(fd, |detfd| detfd.set_procfs(procfs.clone()))?;
-                }
-                resource_release_all(guest).await;
+                self.add_fd(guest, fd, flags, fd_type).await?;
                 Ok(fd as i64)
             }
-            // TODO: audit for error-nondeterminism:
-            Err(e) => {
-                resource_release_all(guest).await;
-                Err(e.into())
-            }
+            Err(error) => Err(error.into()),
         }
+    }
+
+    /// Openat system call.
+    pub async fn handle_openat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?;
+        let path: PathBuf = path.read(&guest.memory())?;
+        let resource = ResourceID::Path(path.clone());
+        let request = guest.thread_state().mk_request(resource, Permission::R);
+        resource_request(guest, request).await;
+
+        let result = match self.procfs_lookup_at(guest, call.dirfd(), &path) {
+            ProcfsLookup::File(file) => self.open_procfs_file(guest, call.flags(), file).await,
+            ProcfsLookup::SelfExe | ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
+            ProcfsLookup::NotProcfs => {
+                let result = self.record_or_replay(guest, Syscall::Openat(call)).await;
+                self.finish_open(guest, &path, call.flags(), result).await
+            }
+        };
+        resource_release_all(guest).await;
+        result
+    }
+
+    async fn validate_procfs_openat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat2,
+    ) -> Result<OFlag, Error> {
+        // Preserve Linux's versioned open_how and path-resolution checks before synthesis.
+        // The validation descriptor is closed without ever becoming guest-visible.
+        let validation_fd = guest.inject_with_retry(Syscall::Openat2(call)).await? as RawFd;
+        guest
+            .inject_with_retry(Syscall::Close(
+                syscalls::Close::new().with_fd(validation_fd),
+            ))
+            .await?;
+
+        let how = call.how().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let raw_flags = i32::try_from(how.flags).map_err(|_| Errno::EINVAL)?;
+        OFlag::from_bits(raw_flags).ok_or_else(|| Errno::EINVAL.into())
+    }
+
+    /// Openat2 system call.
+    pub async fn handle_openat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat2,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?;
+        let path: PathBuf = path.read(&guest.memory())?;
+        let lookup = self.procfs_lookup_at(guest, call.dirfd(), &path);
+        let non_procfs_flags = if lookup == ProcfsLookup::NotProcfs {
+            let how = call.how().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+            Some(OFlag::from_bits_truncate(how.flags as i32))
+        } else {
+            None
+        };
+        let resource = ResourceID::Path(path.clone());
+        let request = guest.thread_state().mk_request(resource, Permission::R);
+        resource_request(guest, request).await;
+
+        let result = if let Some(flags) = non_procfs_flags {
+            let result = self.record_or_replay(guest, call).await;
+            self.finish_open(guest, &path, flags, result).await
+        } else {
+            match self.validate_procfs_openat2(guest, call).await {
+                Ok(flags) => match lookup {
+                    ProcfsLookup::File(file) => self.open_procfs_file(guest, flags, file).await,
+                    ProcfsLookup::SelfExe | ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
+                    ProcfsLookup::NotProcfs => unreachable!(),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        resource_release_all(guest).await;
+        result
+    }
+
+    /// statfs system call.
+    pub async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Statfs,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if self.procfs_lookup_at(guest, libc::AT_FDCWD, &path) != ProcfsLookup::NotProcfs {
+            return Err(Errno::ENOENT.into());
+        }
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// SYS_close system call.
@@ -191,30 +476,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
-    async fn snapshot_procfs<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Read,
-    ) -> Result<Vec<u8>, Error> {
-        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
-
-        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-        let mut contents = Vec::new();
-        loop {
-            let bytes_read = self.record_or_replay(guest, call).await? as usize;
-            if bytes_read == 0 {
-                return Ok(contents);
-            }
-            if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
-                return Err(Errno::EFBIG.into());
-            }
-
-            let mut chunk = vec![0; bytes_read];
-            guest.memory().read_exact(remote_buf, &mut chunk)?;
-            contents.extend_from_slice(&chunk);
-        }
-    }
-
     /// SYS_read system call (MAYHANG).
     pub async fn handle_read<G: Guest<Self>>(
         &self,
@@ -227,72 +488,78 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(res);
         }
 
-        let needs_procfs_snapshot = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
-        if needs_procfs_snapshot {
-            let contents = self.snapshot_procfs(guest, call).await?;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.initialize_procfs(contents.clone());
-            })?;
-        }
-
-        let procfs_bytes = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.take_procfs(call.len()))?;
-        if let Some(bytes) = procfs_bytes {
-            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-            guest.memory().write_exact(remote_buf, &bytes)?;
-            return Ok(bytes.len() as i64);
-        }
-
         let (fd_type, resource) = guest
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
-            resource_request(guest, request).await;
-        }
-
-        let res = match fd_type {
-            FdType::Rng => {
-                trace!("Read call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                return Ok(n as i64);
-            }
-            FdType::Regular => {
-                if guest.config().deterministic_io {
-                    self.deterministic_read(guest, call).await
-                } else {
-                    Ok(self.record_or_replay(guest, call).await?)
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Rng => {
+                        trace!("Read call RNG fd {}, simulating...", call.fd());
+                        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                        let n = this.fill_random_bytes(
+                            guest,
+                            remote_buf,
+                            call.len(),
+                            "/dev/[u]random",
+                        )?;
+                        Ok(n as i64)
+                    }
+                    FdType::Regular => {
+                        if guest.config().deterministic_io {
+                            this.deterministic_read(guest, call).await
+                        } else {
+                            Ok(this.record_or_replay(guest, call).await?)
+                        }
+                    }
+                    FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+                        trace!(
+                            "Possibly blocking read call on notification fd {}, type {:?}",
+                            call.fd(),
+                            fd_type
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
+                        trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
+                        Ok(this.record_or_replay(guest, call).await?)
+                    }
+                    FdType::Socket | FdType::Pipe => {
+                        trace!(
+                            "Possibly blocking read call on {:?} fd {}",
+                            fd_type,
+                            call.fd()
+                        );
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
                 }
-            }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
-                trace!(
-                    "Possibly blocking read call on notification fd {}, type {:?}",
-                    call.fd(),
-                    fd_type
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
-                trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
-                Ok(self.record_or_replay(guest, call).await?)
-            }
+            })
+        })
+        .await
+    }
 
-            FdType::Socket | FdType::Pipe => {
-                trace!(
-                    "Possibly blocking read call on {:?} fd {}",
-                    fd_type,
-                    call.fd()
-                );
-                self.execute_nonblockable_fd_syscall(guest, call).await
-            }
-        };
-        resource_release_all(guest).await;
-        res
+    /// SYS_readv system call (MAYHANG).
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let (fd_type, resource) = guest
+            .thread_state_mut()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Socket | FdType::Pipe => {
+                        this.execute_nonblockable_fd_syscall(guest, call).await
+                    }
+                    _ => Ok(this.record_or_replay(guest, call).await?),
+                }
+            })
+        })
+        .await
     }
 
     /// SYS_pread64 system call.
@@ -302,38 +569,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pread64,
     ) -> Result<i64, Error> {
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            return Ok(guest.inject(Syscall::from(call)).await?);
         }
 
         let (fd_type, resource) = guest
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
-            resource_request(guest, request).await;
-        }
-
-        let res = match fd_type {
-            FdType::Rng => (|| -> Result<i64, Error> {
-                trace!("Pread64 call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                Ok(n as i64)
-            })(),
-            FdType::Regular if guest.config().deterministic_io => {
-                self.deterministic_pread64(guest, call).await
-            }
-            _ => match self.record_or_replay(guest, call).await {
-                Ok(value) => Ok(value),
-                Err(error) => Err(error.into()),
-            },
-        };
-
-        resource_release_all(guest).await;
-        res
+        self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
+            Box::pin(async move {
+                match fd_type {
+                    FdType::Rng => {
+                        trace!("Pread64 call RNG fd {}, simulating...", call.fd());
+                        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                        let n = this.fill_random_bytes(
+                            guest,
+                            remote_buf,
+                            call.len(),
+                            "/dev/[u]random",
+                        )?;
+                        Ok(n as i64)
+                    }
+                    FdType::Regular if guest.config().deterministic_io => {
+                        this.deterministic_pread64(guest, call).await
+                    }
+                    _ => Ok(this.record_or_replay(guest, call).await?),
+                }
+            })
+        })
+        .await
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its
@@ -427,7 +691,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_write<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: syscalls::Write,
+        call: syscalls::Write,
     ) -> Result<i64, Error> {
         let (fd_type, physically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -445,64 +709,85 @@ impl<T: RecordOrReplay> Detcore<T> {
             touch_file(guest, r).await;
         }
 
-        if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
-            resource_request(guest, request).await;
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move {
+                if physically_nonblocking
+                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+                {
+                    this.execute_nonblockable_fd_syscall(guest, call).await
+                } else if guest.config().deterministic_io {
+                    let mut call = call;
+                    let mut total_written_bytes = 0;
+                    let mut remaining_buf = call.len();
+
+                    trace!(
+                        "[detcore/det_io]: Requested write buffer size: {:?}",
+                        remaining_buf
+                    );
+
+                    loop {
+                        match this.record_or_replay(guest, call).await {
+                            Ok(res) => {
+                                remaining_buf -= res as usize;
+                                total_written_bytes += res;
+
+                                trace!(
+                                    "[detcore/det_io]: Remaining write buffer size: {:?}",
+                                    remaining_buf
+                                );
+
+                                if res == 0 || remaining_buf == 0 {
+                                    break Ok(total_written_bytes);
+                                }
+
+                                // Buf is guaranteed to exist as we already issued a syscall.
+                                let old_ptr = call.buf().unwrap().as_raw();
+                                call = call
+                                    .with_len(remaining_buf)
+                                    .with_buf(Addr::<u8>::from_raw(old_ptr + res as usize));
+                            }
+                            Err(e) => break Err(e.into()),
+                        }
+                    }
+                } else {
+                    Ok(this.record_or_replay(guest, call).await?)
+                }
+            })
+        })
+        .await
+    }
+
+    /// SYS_writev system call (MAYHANG).
+    pub async fn handle_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
+        if guest.config().virtualize_metadata {
+            let inode =
+                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+            touch_file(guest, inode).await;
         }
 
-        // Only route writes through the nonblockable-fd path when the fd is actually
-        // physically nonblocking (the "hermit run" case, where pipe2/eventfd2 injected
-        // O_NONBLOCK and we can nonblockize-and-retry deterministically). On a physically
-        // blocking fd (e.g. record/replay mode, where O_NONBLOCK is intentionally not
-        // injected) that path would treat the write as BlockingExternalIO and deschedule it
-        // to run in the background, which assumes non-interference -- but a pipe/socket write
-        // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
-        // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
-            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
-        {
-            self.execute_nonblockable_fd_syscall(guest, call).await
-        } else if guest.config().deterministic_io {
-            let mut total_written_bytes = 0;
-            let mut remaining_buf = call.len();
-
-            trace!(
-                "[detcore/det_io]: Requested write buffer size: {:?}",
-                remaining_buf
-            );
-
-            loop {
-                match self.record_or_replay(guest, call).await {
-                    Ok(res) => {
-                        remaining_buf -= res as usize;
-                        total_written_bytes += res;
-
-                        trace!(
-                            "[detcore/det_io]: Remaining write buffer size: {:?}",
-                            remaining_buf
-                        );
-
-                        if res == 0 || remaining_buf == 0 {
-                            break Ok(total_written_bytes);
-                        }
-
-                        // Buf is guaranteed to exist as we already issued a syscall.
-                        let old_ptr = call.buf().unwrap().as_raw();
-                        call = call
-                            .with_len(remaining_buf)
-                            .with_buf(Addr::<u8>::from_raw(old_ptr + res as usize));
-                    }
-                    Err(e) => {
-                        break Err(e.into());
-                    }
+        self.with_fd_resource(guest, resource, Permission::W, move |this, guest| {
+            Box::pin(async move {
+                if physically_nonblocking && matches!(fd_type, FdType::Socket | FdType::Pipe) {
+                    this.execute_nonblockable_fd_syscall(guest, call).await
+                } else {
+                    Ok(this.record_or_replay(guest, call).await?)
                 }
-            }
-        } else {
-            Ok(self.record_or_replay(guest, call).await?)
-        };
-
-        resource_release_all(guest).await;
-        res
+            })
+        })
+        .await
     }
 
     /// SYS_mmap system call.
@@ -624,12 +909,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(stat)
     }
 
+    fn stat_procfs_lookup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: StatFamily,
+    ) -> Result<ProcfsLookup, Errno> {
+        let (dirfd, path) = match &call {
+            StatFamily::Stat(call) => (libc::AT_FDCWD, call.path()),
+            StatFamily::Lstat(call) => (libc::AT_FDCWD, call.path()),
+            StatFamily::Fstatat(call) => (call.dirfd(), call.path()),
+            StatFamily::Fstat(_) => return Ok(ProcfsLookup::NotProcfs),
+        };
+        let path = path.ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        Ok(self.procfs_lookup_at(guest, dirfd, &path))
+    }
+
+    fn stat_follows_symlinks(call: &StatFamily) -> bool {
+        match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            StatFamily::Lstat(_) => false,
+            StatFamily::Fstatat(call) => !call.flags().contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+            _ => true,
+        }
+    }
+
     /// Handles all stat syscalls.
     pub async fn handle_stat_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: StatFamily,
     ) -> Result<i64, Error> {
+        let follow_symlink = Self::stat_follows_symlinks(&call);
+        match self.stat_procfs_lookup(guest, call)? {
+            ProcfsLookup::File(file) => {
+                let statptr = call.stat().ok_or(Errno::EFAULT)?;
+                let stat: libc::stat = self.procfs_stat(file).into();
+                guest.memory().write_value(statptr.0, &stat)?;
+                return Ok(0);
+            }
+            ProcfsLookup::SelfExe => {
+                let statptr = call.stat().ok_or(Errno::EFAULT)?;
+                let stat: libc::stat = self.procfs_self_exe_stat(follow_symlink).into();
+                guest.memory().write_value(statptr.0, &stat)?;
+                return Ok(0);
+            }
+            ProcfsLookup::Missing => return Err(Errno::ENOENT.into()),
+            ProcfsLookup::NotProcfs => {}
+        }
+
         if guest.config().virtualize_metadata {
             // NB: let kernel handle error codes, it's not easy to do so without
             // kernel because there're many corner cases. i.e.: even access
@@ -653,6 +980,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Statx,
     ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        match self.procfs_lookup_at(guest, call.dirfd(), &path) {
+            ProcfsLookup::File(file) => {
+                let statptr = call.statx().ok_or(Errno::EFAULT)?;
+                let stat: libc::statx = self.procfs_stat(file).into();
+                guest.memory().write_value(statptr.0, &stat)?;
+                return Ok(0);
+            }
+            ProcfsLookup::SelfExe => {
+                let statptr = call.statx().ok_or(Errno::EFAULT)?;
+                let follow_symlink = !call.flags().contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+                let stat: libc::statx = self.procfs_self_exe_stat(follow_symlink).into();
+                guest.memory().write_value(statptr.0, &stat)?;
+                return Ok(0);
+            }
+            ProcfsLookup::Missing => return Err(Errno::ENOENT.into()),
+            ProcfsLookup::NotProcfs => {}
+        }
+
         if guest.config().virtualize_metadata {
             // NB: let kernel handle error codes, it's not easy to do so without kernel
             // because there're many corner cases. i.e.: even access filepath from tracer
@@ -667,6 +1013,109 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Ok(self.record_or_replay(guest, call).await?)
         }
+    }
+
+    /// readlink system call.
+    pub async fn handle_readlink<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlink,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        match self.procfs_lookup_at(guest, libc::AT_FDCWD, &path) {
+            ProcfsLookup::SelfExe => self.write_self_exe_link(guest, call.buf(), call.bufsize()),
+            ProcfsLookup::File(_) => Err(Errno::EINVAL.into()),
+            ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
+            ProcfsLookup::NotProcfs => Ok(self.record_or_replay(guest, call).await?),
+        }
+    }
+
+    /// readlinkat system call.
+    pub async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlinkat,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        match self.procfs_lookup_at(guest, call.dirfd(), &path) {
+            ProcfsLookup::SelfExe => self.write_self_exe_link(guest, call.buf(), call.buf_len()),
+            ProcfsLookup::File(_) => Err(Errno::EINVAL.into()),
+            ProcfsLookup::Missing => Err(Errno::ENOENT.into()),
+            ProcfsLookup::NotProcfs => Ok(self.record_or_replay(guest, call).await?),
+        }
+    }
+
+    fn procfs_access_result(lookup: ProcfsLookup, mode: i32) -> Option<Result<i64, Error>> {
+        match lookup {
+            ProcfsLookup::File(_) if mode & (libc::W_OK | libc::X_OK) != 0 => {
+                Some(Err(Errno::EACCES.into()))
+            }
+            ProcfsLookup::SelfExe if mode & libc::W_OK != 0 => Some(Err(Errno::EACCES.into())),
+            ProcfsLookup::SelfExe | ProcfsLookup::File(_) => Some(Ok(0)),
+            ProcfsLookup::Missing => Some(Err(Errno::ENOENT.into())),
+            ProcfsLookup::NotProcfs => None,
+        }
+    }
+
+    /// access system call.
+    pub async fn handle_access<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Access,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(result) = Self::procfs_access_result(
+            self.procfs_lookup_at(guest, libc::AT_FDCWD, &path),
+            call.mode().bits() as i32,
+        ) {
+            return result;
+        }
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// faccessat system call.
+    pub async fn handle_faccessat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Faccessat,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(result) = Self::procfs_access_result(
+            self.procfs_lookup_at(guest, call.dirfd(), &path),
+            call.mode().bits() as i32,
+        ) {
+            return result;
+        }
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// faccessat2 system call (represented as a raw syscall by Reverie).
+    pub async fn handle_faccessat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        const VALID_FLAGS: i32 = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+        let mode = args.arg2 as i32;
+        let flags = args.arg3 as i32;
+        if mode & !(libc::R_OK | libc::W_OK | libc::X_OK) != 0 || flags & !VALID_FLAGS != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        if args.arg1 == 0 {
+            return Err(Errno::EFAULT.into());
+        }
+        let path = PathPtr::from_ptr(args.arg1 as *const libc::c_char)
+            .ok_or(Errno::EFAULT)?
+            .read(&guest.memory())?;
+        if let Some(result) =
+            Self::procfs_access_result(self.procfs_lookup_at(guest, args.arg0 as i32, &path), mode)
+        {
+            return result;
+        }
+        Ok(self
+            .record_or_replay(guest, Syscall::Other(Sysno::faccessat2, args))
+            .await?)
     }
 
     /// fcntl system call

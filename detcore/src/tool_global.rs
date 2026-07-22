@@ -88,6 +88,16 @@ struct DetInodeInfo {
     mtime: LogicalTime,
 }
 
+struct ChildRegistration {
+    parent_dettid: DetTid,
+    parent_detpid: DetPid,
+    child_dettid: DetTid,
+    child_tid_addr: usize,
+    flags: Option<CloneFlags>,
+    maybe_priority: Option<Priority>,
+    parent_is_kernel_blocked: bool,
+}
+
 impl Default for InodePool {
     fn default() -> Self {
         InodePool::new()
@@ -370,6 +380,7 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let time_from_guest = gr.0.as_nanos();
+        let deregistering = matches!(&gr.1, GlobalRequest::DeregisterThread(_, _, _));
 
         // This portion of the time updates "asynchronously", and we can tick it on every rpc:
         // TODO: eventually the vector clock should be in shared memory, and
@@ -401,15 +412,41 @@ impl GlobalTool for GlobalState {
                 R::CreateChildThread(
                     self.recv_create_child_thread(
                         from,
-                        parent_detpid,
-                        dettid,
-                        ctid,
-                        flags,
-                        priority,
+                        ChildRegistration {
+                            parent_dettid: DetTid::from_raw(from.into()),
+                            parent_detpid,
+                            child_dettid: dettid,
+                            child_tid_addr: ctid,
+                            flags,
+                            maybe_priority: priority,
+                            parent_is_kernel_blocked: false,
+                        },
                     )
                     .await,
                 )
             }
+            GlobalRequest::CreateVforkChildThread(
+                parent_dettid,
+                parent_detpid,
+                child_dettid,
+                ctid,
+                flags,
+                priority,
+            ) => R::CreateChildThread(
+                self.recv_create_child_thread(
+                    from,
+                    ChildRegistration {
+                        parent_dettid,
+                        parent_detpid,
+                        child_dettid,
+                        child_tid_addr: ctid,
+                        flags: Some(flags),
+                        maybe_priority: priority,
+                        parent_is_kernel_blocked: true,
+                    },
+                )
+                .await,
+            ),
             // Requested by the child thread itself:
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
@@ -429,7 +466,14 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::GlobalTimeLowerBound => {
-                let ns = self.global_time.lock().unwrap().as_nanos();
+                let mut global_time = self.global_time.lock().unwrap();
+                // Aggregate work is wall-clock-like only when threads cannot
+                // make progress concurrently.
+                let ns = if self.cfg.sequentialize_threads {
+                    global_time.as_nanos()
+                } else {
+                    global_time.wall_clock_time()
+                };
                 R::GlobalTimeLowerBound(ns)
             }
             GlobalRequest::TraceSchedEvent(ev, detpid) => {
@@ -486,6 +530,11 @@ impl GlobalTool for GlobalState {
                 R::ReleasePort(port)
             }
         };
+
+        if deregistering {
+            self.global_time.lock().unwrap().retire_thread(dtid);
+            return (None, resp);
+        }
 
         let time_from_sched = self.global_time.lock().unwrap().threads_time(dtid);
         let time_update = match time_from_sched.cmp(&time_from_guest) {
@@ -593,16 +642,17 @@ impl GlobalState {
         trace!("[detcore] All resources held by pid {} released", from);
     }
 
-    /// Global portion of parent-forking-child protocol.  Called by the parent thread.
-    async fn recv_create_child_thread(
-        &self,
-        from_parent: Tid,
-        parent_detpid: DetPid,
-        child_dettid: DetTid,
-        ctid: usize,
-        flags: Option<CloneFlags>,
-        maybe_priority: Option<Priority>,
-    ) {
+    /// Global portion of parent-forking-child protocol.
+    async fn recv_create_child_thread(&self, rpc_sender: Tid, registration: ChildRegistration) {
+        let ChildRegistration {
+            parent_dettid,
+            parent_detpid,
+            child_dettid,
+            child_tid_addr,
+            flags,
+            maybe_priority,
+            parent_is_kernel_blocked,
+        } = registration;
         let initial_priority = if let Some(pr) = &self.preemptions_to_replay {
             assert!(maybe_priority.is_none());
             let prio = pr
@@ -644,13 +694,12 @@ impl GlobalState {
                 .entry(child_dettid)
                 .or_insert_with(|| ThreadNextTurn {
                     dettid: child_dettid,
-                    child_tid_addr: ctid,
+                    child_tid_addr,
                     req: Ivar::new(),
                     resp: Ivar::new(),
                 });
 
             {
-                let parent_dettid = DetTid::from_raw(from_parent.into()); // TODO(T78538674)
                 let is_group_leader = if let Some(f) = flags {
                     !f.contains(CloneFlags::CLONE_THREAD)
                 } else {
@@ -688,16 +737,16 @@ impl GlobalState {
             sched.started_up.try_put(());
         }
         // Parent thread yields so child can run (if it is higher priority).
-        if self.cfg.sequentialize_threads {
+        if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
             let mut rs = Resources::new(parent_detpid);
             rs.insert(
                 ResourceID::ParentContinue {
-                    parent: DetTid::from_raw(from_parent.into()),
+                    parent: parent_dettid,
                     child: child_dettid,
                 },
                 Permission::W,
             );
-            self.recv_request_resources(from_parent, parent_detpid, rs)
+            self.recv_request_resources(rpc_sender, parent_detpid, rs)
                 .await;
         }
     }
@@ -791,15 +840,15 @@ impl GlobalState {
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
     async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
-        // Invariant: will only be called when sequentialize-threads is on.
-        assert!(self.cfg.sequentialize_threads);
-        self.sched
-            .lock()
-            .unwrap()
-            .logically_kill_thread(&dettid, &detpid, mm);
+        if self.cfg.sequentialize_threads {
+            self.sched
+                .lock()
+                .unwrap()
+                .logically_kill_thread(&dettid, &detpid, mm);
+        }
         trace!(
-            "[detcore, dtid {}] thread deregistered, removed from sched structures.",
-            dettid
+            "[detcore, dtid {}] thread deregistered (scheduler cleanup: {}).",
+            dettid, self.cfg.sequentialize_threads,
         );
     }
 
@@ -1064,6 +1113,10 @@ pub enum GlobalRequest {
     /// initial priority.
     CreateChildThread(DetTid, DetPid, usize, Option<CloneFlags>, Option<Priority>),
 
+    /// A vfork child registers itself because its parent cannot run until the
+    /// kernel releases it after child exec or exit.
+    CreateVforkChildThread(DetTid, DetPid, DetTid, usize, CloneFlags, Option<Priority>),
+
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
     StartNewThread(DetTid, DetPid),
@@ -1290,6 +1343,49 @@ pub async fn create_child_thread<G, T>(
     }
 }
 
+/// Register a vfork child while its parent is blocked inside `clone(2)`.
+pub async fn create_vfork_child_thread<G, T>(
+    guest: &mut G,
+    child_dettid: DetTid,
+    vfork: crate::tool_local::PendingVfork,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let starting_priority = if guest.config().replay_preemptions_from.is_some() {
+        None
+    } else if guest.config().replay_schedule_from.is_some() {
+        Some(if child_dettid <= DetTid::from_raw(3) {
+            REPLAY_FOREGROUND_PRIORITY
+        } else {
+            REPLAY_DEFERRED_PRIORITY
+        })
+    } else if guest.config().chaos {
+        Some(entropy_to_priority(vfork.child_priority_entropy.expect(
+            "vfork child priority entropy missing in chaos mode",
+        )))
+    } else {
+        Some(DEFAULT_PRIORITY)
+    };
+
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::CreateVforkChildThread(
+            vfork.parent_dettid,
+            vfork.parent_detpid,
+            child_dettid,
+            vfork.child_tid_addr,
+            vfork.flags,
+            starting_priority,
+        ),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::CreateChildThread(x) => x,
+        _ => unreachable!(),
+    }
+}
+
 /// Remove the thread from the scheduler.
 ///
 /// Nonblocking: the future may return immediately, not guaranteeing the changes to the
@@ -1297,27 +1393,22 @@ pub async fn create_child_thread<G, T>(
 pub async fn deregister_thread<R>(
     dettid: DetTid,
     threads_time: DetTime,
-    cfg: &Config,
     reverie: &R,
     detpid: DetPid,
     mm: MmId,
 ) where
-    // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
 {
-    if cfg.sequentialize_threads {
-        // TODO: void_send_rpc
-        let resp = reverie
-            .send_rpc((
-                threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm),
-            ))
-            .await;
-        // We can't update the thread time here.  But it's dead anyway!
-        match resp.1 {
-            GlobalResponse::DeregisterThread(x) => x,
-            _ => unreachable!(),
-        }
+    // TODO: void_send_rpc
+    let resp = reverie
+        .send_rpc((
+            threads_time,
+            GlobalRequest::DeregisterThread(dettid, detpid, mm),
+        ))
+        .await;
+    match resp.1 {
+        GlobalResponse::DeregisterThread(x) => x,
+        _ => unreachable!(),
     }
 }
 

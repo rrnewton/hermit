@@ -68,7 +68,6 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
-use reverie::syscalls::Fork;
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -80,7 +79,9 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
+use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+use tool_global::thread_observe_time;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 pub use tool_local::ThreadState;
@@ -457,24 +458,55 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
-    /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
-    /// subscriptions specified in recorder/mod.rs.
+    /// Optimized run mode traps all syscalls so unsupported calls cannot bypass this tool.
+    /// Record/replay keeps the selective Detcore subscriptions and composes them with its subtool.
     fn subscriptions(config: &Config) -> Subscription {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;
 
         if cfg!(debug_assertions) {
             Subscription::all()
+        } else if !config.recordreplay_modes {
+            let mut subscription = Subscription::all_syscalls();
+
+            if config.virtualize_time {
+                subscription.rdtsc();
+            }
+            if config.virtualize_cpuid {
+                subscription.cpuid();
+            }
+
+            subscription | T::subscriptions(config)
         } else {
-            let mut subscription = Subscription::none();
+            // The fallback handler cannot enforce panic semantics for syscalls that Reverie never
+            // sends to Detcore. Panic mode therefore needs complete syscall coverage even in
+            // optimized builds.
+            let mut subscription = if config.panic_on_unsupported_syscalls {
+                Subscription::all_syscalls()
+            } else {
+                Subscription::none()
+            };
             subscription.syscalls([
                 Sysno::write,
                 Sysno::openat,
+                Sysno::openat2,
                 Sysno::open,
                 Sysno::creat,
+                Sysno::pread64,
+                Sysno::readlink,
+                Sysno::readlinkat,
+                Sysno::access,
+                Sysno::faccessat,
+                Sysno::faccessat2,
+                Sysno::stat,
+                Sysno::lstat,
+                Sysno::newfstatat,
+                Sysno::statx,
+                Sysno::statfs,
                 Sysno::close,
                 Sysno::read,
-                Sysno::pread64,
+                Sysno::readv,
+                Sysno::writev,
                 Sysno::mmap,
                 Sysno::munmap,
                 Sysno::mremap,
@@ -522,6 +554,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
                 Sysno::poll,
+                Sysno::ppoll,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -530,6 +563,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::epoll_wait_old,
                 Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
+                Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
@@ -538,9 +572,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // TODO(T137258824): add proper Select / PSelect6
-                // Sysno::pselect6,
-                // Sysno::select,
+                Sysno::pselect6,
+                Sysno::select,
             ]);
 
             if do_sched {
@@ -552,15 +585,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
 
             if config.virtualize_metadata {
-                subscription.syscalls([
-                    Sysno::getdents,
-                    Sysno::getdents64,
-                    Sysno::stat,
-                    Sysno::lstat,
-                    Sysno::fstat,
-                    Sysno::newfstatat,
-                    Sysno::statx,
-                ]);
+                subscription.syscalls([Sysno::getdents, Sysno::getdents64, Sysno::fstat]);
             }
 
             if true
@@ -682,13 +707,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // TODO: use global time for rdtsc:
+            let observed_time = thread_observe_time(guest).await;
             Ok(RdtscResult {
-                tsc: guest
-                    .thread_state()
-                    .thread_logical_time
-                    .as_nanos()
-                    .as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
+                // We treat virtual cycles as equivalent to virtual nanoseconds.
+                tsc: observed_time.as_nanos(),
                 aux: None,
             })
         } else {
@@ -813,6 +835,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         }
                     },
                     clone_flags: None,
+                    pending_vfork: pts.1.pending_vfork.clone(),
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -861,6 +884,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.config()
             );
             create_child_thread(guest, new_dettid, 0, None).await;
+        } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+            create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
 
         // Except for the root task, let's block until it's our turn to go:
@@ -987,16 +1012,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Add the syscall to our thread's logical progress, advancing logical time.
             if config.sequentialize_threads {
                 thread_state.thread_logical_time.add_syscall();
-            } else {
-                let bumpit = matches!(
+            } else if virtualize_time {
+                if matches!(
                     call,
-                    Syscall::Gettimeofday(_)
-                        | Syscall::Time(_)
-                        | Syscall::ClockGettime(_)
-                        | Syscall::Write(_)
-                );
-                // TODO(T86591083): remove this conditional to bump logical time unconditionally:
-                if bumpit && virtualize_time {
+                    Syscall::Gettimeofday(_) | Syscall::Time(_) | Syscall::ClockGettime(_)
+                ) {
+                    thread_state.thread_logical_time.add_clock_read();
+                } else if matches!(call, Syscall::Write(_)) {
+                    // TODO(T86591083): remove this conditional to bump logical time
+                    // unconditionally in concurrent mode.
                     thread_state.thread_logical_time.add_syscall();
                 }
             }
@@ -1006,11 +1030,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let res = match call {
             Syscall::Write(w) => self.handle_write(guest, w).await,
             Syscall::Openat(o) => self.handle_openat(guest, o).await,
+            Syscall::Openat2(o) => self.handle_openat2(guest, o).await,
             Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
             Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
             Syscall::Close(s) => self.handle_close(guest, s).await,
             Syscall::Read(s) => self.handle_read(guest, s).await,
             Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+            Syscall::Readv(s) => self.handle_readv(guest, s).await,
+            Syscall::Writev(s) => self.handle_writev(guest, s).await,
             Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
             Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
             Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
@@ -1019,16 +1046,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
             Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
             Syscall::Statx(s) => self.handle_statx(guest, s).await,
+            Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
             Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
             Syscall::Futex(s) => self.handle_futex(guest, s).await,
 
-            // TODO(): fix vfork and handle CLONE_VFORK cases here:
             Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
-
-            // Our child-thread-creation protocol doesn't support vfork blocking the parent thread yet:
-            Syscall::Vfork(_s) => self.handle_clone_family(guest, Fork::new().into()).await,
+            Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
 
             Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
@@ -1088,6 +1113,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
             Syscall::Poll(s) => self.handle_poll(guest, s).await,
+            Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+            Syscall::Select(s) => self.handle_select(guest, s).await,
+            Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
             Syscall::EpollCreate(s) => {
                 self.handle_epoll_create1(guest, EpollCreate1::from(s))
                     .await
@@ -1117,6 +1145,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO: handle timeout behavior:
             // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
             Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
+            Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
 
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
@@ -1130,24 +1159,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // These are to allow execution of a minimal rust executable
             // (namely //hermetic_infra/detcore:get-syscall-support)
             Syscall::Brk(_) => self.passthrough(guest, call).await,
-            Syscall::Readlink(_) => self.passthrough(guest, call).await,
-            Syscall::Access(_) => self.passthrough(guest, call).await,
+            Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
+            Syscall::Access(s) => self.handle_access(guest, s).await,
+            Syscall::Faccessat(s) => self.handle_faccessat(guest, s).await,
+            Syscall::Other(Sysno::faccessat2, args) => self.handle_faccessat2(guest, args).await,
             Syscall::Mprotect(_) => self.passthrough(guest, call).await,
             Syscall::ArchPrctl(_) => self.passthrough(guest, call).await,
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
             Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
             Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
             Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
-            Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
+            Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
             Syscall::Madvise(_) => self.passthrough(guest, call).await,
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
-
-            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
-            Syscall::AddKey(_) => self.passthrough(guest, call).await,
-            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
-            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {
@@ -1158,7 +1184,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     );
                     panic!("unsupported syscall: {:?}", call);
                 }
-                self.passthrough(guest, call).await
+                if config.recordreplay_modes {
+                    self.passthrough(guest, call).await
+                } else if config.allow_passthrough {
+                    warn!(
+                        "unsupported syscall {} ({:?}) passed through because --allow-passthrough is set; execution may not be deterministic",
+                        call.name(),
+                        call.number(),
+                    );
+                    self.passthrough(guest, call).await
+                } else {
+                    warn!(
+                        "unsupported syscall {} ({:?}) blocked with ENOSYS; use --allow-passthrough to run it nondeterministically",
+                        call.name(),
+                        call.number(),
+                    );
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
             }
         };
 
@@ -1205,7 +1247,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         deregister_thread(
             dettid,
             thread_state.thread_logical_time.clone(),
-            &self.cfg,
             global_state,
             detpid,
             mm_id,
@@ -1222,5 +1263,30 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+mod release_subscription_tests {
+    use super::*;
+    use crate::record_or_replay::NoopTool;
+
+    #[test]
+    fn qemu_syscalls_are_in_optimized_subscription() {
+        let subscription = <Detcore<NoopTool> as Tool>::subscriptions(&Config::default());
+        let syscalls: Vec<_> = subscription.iter_syscalls().collect();
+
+        for syscall in [
+            Sysno::ppoll,
+            Sysno::pselect6,
+            Sysno::readv,
+            Sysno::select,
+            Sysno::writev,
+        ] {
+            assert!(
+                syscalls.contains(&syscall),
+                "missing {syscall} subscription"
+            );
+        }
     }
 }

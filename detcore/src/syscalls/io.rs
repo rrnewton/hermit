@@ -15,8 +15,12 @@ use std::time::Duration;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Timespec;
 use tracing::debug;
 use tracing::trace;
 
@@ -27,10 +31,19 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
-use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::ParsedTimeout;
+use crate::syscalls::helpers::execute_internal_io_polling;
+use crate::syscalls::helpers::millis_timeout;
+use crate::syscalls::helpers::relative_timespec_timeout;
+use crate::syscalls::helpers::relative_timeval_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
+
+fn fd_set_exceeds_scratch_capacity(nfds: i32) -> bool {
+    // The raw Linux ABI accepts dynamically sized fd sets, but Reverie's syscall model and our
+    // retry scratch storage use libc's fixed-size fd_set.
+    nfds > libc::FD_SETSIZE as i32
+}
 
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
@@ -74,16 +87,136 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        let timeout_millis = call.timeout();
-        if timeout_millis == 0 {
-            Ok(guest.inject(call).await?) // Already non-blocking.
-        } else {
-            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("poll");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+        let timeout = millis_timeout(guest, call.timeout()).await;
+        execute_internal_io_polling(guest, call, timeout).await
+    }
+
+    /// ppoll syscall (MAYHANG)
+    pub async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+    ) -> Result<i64, Error> {
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || call.sigmask().is_some()
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Ppoll(call))
+                .await;
         }
+
+        let timeout_addr = if let Some(addr) = call.timeout() {
+            // Reverie currently types this ABI-compatible pointer as timeval, while Linux
+            // ppoll interprets it as timespec.
+            Some(AddrMut::<Timespec>::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timespec_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = Timespec {
+                tv_sec: (remaining_nanos / 1_000_000_000) as i64,
+                tv_nsec: (remaining_nanos % 1_000_000_000) as i64,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
+    }
+
+    /// select syscall (MAYHANG)
+    pub async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+    ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || fd_set_exceeds_scratch_capacity(call.nfds())
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .await;
+        }
+
+        let timeout_addr = call.timeout();
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timeval_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = libc::timeval {
+                tv_sec: (remaining_nanos / 1_000_000_000) as libc::time_t,
+                tv_usec: ((remaining_nanos % 1_000_000_000) / 1_000) as libc::suseconds_t,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
+    }
+
+    /// pselect6 syscall (MAYHANG)
+    pub async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        if call.nfds() < 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if !self.cfg.sequentialize_threads
+            || self.cfg.recordreplay_modes
+            || fd_set_exceeds_scratch_capacity(call.nfds())
+        {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                .await;
+        }
+
+        let timeout_addr = if let Some(addr) = call.timeout() {
+            // Reverie types this ABI-compatible pointer as timeval, while Linux
+            // pselect6 interprets it as timespec.
+            Some(AddrMut::<Timespec>::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
+        let timeout = if let Some(addr) = timeout_addr {
+            relative_timespec_timeout(guest, Some(guest.memory().read_value(addr)?)).await?
+        } else {
+            ParsedTimeout::Infinite
+        };
+        let result = execute_internal_io_polling(guest, call, timeout).await;
+
+        if let (Some(addr), ParsedTimeout::Deadline(deadline)) = (timeout_addr, timeout) {
+            let now = thread_observe_time(guest).await;
+            let remaining_nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = Timespec {
+                tv_sec: (remaining_nanos / 1_000_000_000) as i64,
+                tv_nsec: (remaining_nanos % 1_000_000_000) as i64,
+            };
+            guest.memory().write_value(addr, &remaining)?;
+        }
+
+        result
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
@@ -161,16 +294,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollWait,
     ) -> Result<i64, Error> {
-        let timeout_millis = call.timeout();
-        if timeout_millis == 0 {
-            Ok(guest.inject(call).await?) // Already non-blocking.
-        } else {
-            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("epoll_wait");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
-        }
+        let timeout = millis_timeout(guest, call.timeout()).await;
+        execute_internal_io_polling(guest, call, timeout).await
     }
 
     /// Connect system call (MAYHANG)
