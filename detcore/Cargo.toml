@@ -42,7 +42,7 @@ rand_distr = "0.6"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
 raw-cpuid = "10.7.0"
 regex = "1.13.1"
-reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
+reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", rev = "96693397ed60aa07c59ffeed4df3deed89b183e2" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tempfile = "3.27.0"
@@ -51,6 +51,6 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 detcore-testutils = { version = "0.0.0", path = "tests/testutils" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", rev = "96693397ed60aa07c59ffeed4df3deed89b183e2" }
 test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
 test-case = "3.3.1"
