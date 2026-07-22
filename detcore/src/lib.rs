@@ -551,6 +551,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::epoll_wait_old,
                 Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
+                Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
@@ -1137,6 +1138,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO: handle timeout behavior:
             // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
             Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
+            Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
 
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
