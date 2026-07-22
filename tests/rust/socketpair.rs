@@ -14,8 +14,7 @@ use nix::sys::socket::socketpair;
 fn main() {
     if matches!(std::env::var("HERMIT_MODE"), Ok(mode) if mode == "record") {
         // TODO: Record mode currently hangs for this test
-        eprintln!("Skipping test in record mode.");
-        return;
+        panic!("ERROR: socketpair does not support record mode");
     }
 
     let (sock1, sock2) = socketpair(

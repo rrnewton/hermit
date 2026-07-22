@@ -273,7 +273,7 @@ Focused contributions are welcome. Before opening a pull request:
    cargo test --workspace
    ```
 
-5. Document host-dependent skips or failures instead of weakening the test.
+5. Report host-dependent prerequisite failures instead of weakening the test.
 
 Not every x86-64 Linux machine can run every Hermit test: PMU counters, CPUID
 faulting, `perf_event_open` permissions, and user/mount namespaces each gate

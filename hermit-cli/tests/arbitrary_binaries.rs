@@ -175,6 +175,15 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
             marker: "cargo",
         });
     }
+    let missing = allowed
+        .iter()
+        .filter(|name| !tools.iter().any(|tool| tool.name == **name))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "ERROR: required arbitrary-binary tools are missing: {missing:?}"
+    );
     tools
 }
 

@@ -873,7 +873,10 @@ fn vectored_socket_io() {
 #[test]
 
 fn getrandom_intercepted() {
-    reverie_ptrace::ret_without_perf!();
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: getrandom_intercepted requires accessible PMU hardware counters"
+    );
     detcore_testutils::det_test_fn(|| {
         let mut got: u64 = 0;
         assert_eq!(
