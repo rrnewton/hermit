@@ -32,6 +32,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
+use clap::ValueEnum;
 use consts::METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
@@ -41,6 +42,7 @@ pub use error::Error;
 pub use error::SerializableError;
 pub use id::Id;
 use metadata::Metadata;
+use nix::unistd::Uid;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
@@ -64,6 +66,84 @@ pub struct Recording {
     pub exit_status: ExitStatus,
 }
 
+/// Process instrumentation backend used to run a Hermit guest.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub enum Backend {
+    /// Use Reverie's ptrace backend.
+    #[default]
+    Ptrace,
+    /// Use the DynamoRIO backend.
+    Dbi,
+    /// Use the KVM backend.
+    Kvm,
+}
+
+impl Backend {
+    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+
+    /// Returns the command-line spelling for this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ptrace => "ptrace",
+            Self::Dbi => "dbi",
+            Self::Kvm => "kvm",
+        }
+    }
+
+    /// Returns the backends integrated with this Hermit build and host.
+    pub fn available() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|backend| backend.is_available())
+    }
+
+    /// Returns whether this backend can run a Hermit guest on this host.
+    pub fn is_available(self) -> bool {
+        self.unavailable_reason().is_none()
+    }
+
+    /// Returns an actionable error when this backend cannot run a Hermit guest.
+    pub fn ensure_available(self) -> Result<(), Error> {
+        if let Some(reason) = self.unavailable_reason() {
+            Err(anyhow!(
+                "backend `{}` is unavailable: {reason}",
+                self.as_str()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Ptrace => None,
+            Self::Dbi => {
+                Some("the DynamoRIO prototype does not yet expose a Detcore process launcher")
+            }
+            Self::Kvm if !Uid::effective().is_root() => {
+                Some("KVM execution requires root privileges")
+            }
+            Self::Kvm if !Path::new("/dev/kvm").exists() => {
+                Some("the host does not expose /dev/kvm")
+            }
+            Self::Kvm => Some(
+                "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI",
+            ),
+        }
+    }
+}
+
+fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
+    backend.ensure_available()?;
+    if backend != Backend::Ptrace {
+        return Err(anyhow!(
+            "backend `{}` has no Hermit dispatch implementation",
+            backend.as_str()
+        ));
+    }
+    Ok(())
+}
+
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
 // could also be changed to a specific number of threads and that would be
@@ -71,14 +151,33 @@ pub struct Recording {
 // thread count is based off of the number of cores in the machine, then two
 // runs on different machines with a different number of cores will not be the
 // same.
-#[tokio::main(flavor = "current_thread")]
 /// Run the given command as deterministically as possible.
-pub async fn run(
+pub fn run(
     command: Command,
     config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Run the given command using the selected instrumentation backend.
+#[tokio::main(flavor = "current_thread")]
+pub async fn run_with_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    ensure_backend_dispatch(backend)?;
+
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -91,13 +190,32 @@ pub async fn run(
 }
 
 /// Variant of `run` that also captures stdout/stderr.
-#[tokio::main(flavor = "current_thread")]
-pub async fn run_with_output(
-    mut command: Command,
+pub fn run_with_output(
+    command: Command,
     config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<Output, Error> {
+    run_with_output_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Variant of [`run_with_backend`] that also captures stdout/stderr.
+#[tokio::main(flavor = "current_thread")]
+pub async fn run_with_output_backend(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<Output, Error> {
+    ensure_backend_dispatch(backend)?;
+
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -319,4 +437,34 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
         .await?
         .wait_with_output()
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Backend;
+
+    #[test]
+    fn ptrace_is_the_default_and_only_integrated_backend() {
+        assert_eq!(Backend::default(), Backend::Ptrace);
+        assert_eq!(Backend::available().collect::<Vec<_>>(), [Backend::Ptrace]);
+    }
+
+    #[test]
+    fn prototype_backends_fail_closed() {
+        let dbi_error = Backend::Dbi
+            .ensure_available()
+            .expect_err("DBI must fail closed");
+        assert!(dbi_error.to_string().contains("Detcore process launcher"));
+
+        let kvm_error = Backend::Kvm
+            .ensure_available()
+            .expect_err("KVM must fail closed");
+        let message = kvm_error.to_string();
+        assert!(
+            message.contains("root privileges")
+                || message.contains("/dev/kvm")
+                || message.contains("guest-kernel ABI"),
+            "unexpected KVM availability error: {message}"
+        );
+    }
 }
