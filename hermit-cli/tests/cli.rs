@@ -8,6 +8,9 @@
 
 use std::process::Command;
 use std::process::Output;
+use std::sync::Mutex;
+
+static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hermit"))
@@ -70,6 +73,8 @@ fn run_help_exposes_determinism_modes() {
         "--record-preemptions",
         "--replay-preemptions-from",
         "--preemption-timeout",
+        "--no-namespace",
+        "--core-only",
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
     }
@@ -91,6 +96,102 @@ fn incompatible_run_modes_fail_during_argument_parsing() {
         stderr.contains("cannot be used with"),
         "unexpected error:\n{stderr}"
     );
+}
+
+#[test]
+fn no_namespace_rejects_container_only_options() {
+    let cases = [
+        "--namespace-only",
+        "--analyze-networking",
+        "--mount=type=bind,source=/tmp,target=/tmp",
+        "--bind=/tmp",
+        "--network=local",
+        "--network=host",
+        "--tmp=/tmp/custom",
+        "--replay-schedule-from=/tmp/schedule.json",
+        "--replay-preemptions-from=/tmp/preemptions.json",
+    ];
+
+    for incompatible in cases {
+        let args = ["run", "--no-namespace", incompatible, "/bin/true"];
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "hermit {args:?} unexpectedly ran"
+        );
+
+        let stderr = String::from_utf8(output.stderr).expect("hermit stderr should be UTF-8");
+        assert!(
+            stderr.contains("--no-namespace"),
+            "unexpected error:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(incompatible.split_once("=").map_or(incompatible, |x| x.0)),
+            "unexpected error:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("cannot be used with"),
+            "unexpected error:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn no_namespace_runs_without_container_setup() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let args = [
+        "run",
+        "--no-namespace",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/echo",
+        "hello",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+
+    assert_eq!(stdout(&output), "hello\n");
+    let stderr = String::from_utf8(output.stderr).expect("hermit stderr should be UTF-8");
+    assert!(
+        stderr.contains("WARNING: --no-namespace"),
+        "unexpected stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("less deterministic"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn no_namespace_preserves_affinity_for_run_and_verify() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+
+    let run_args = [
+        "run",
+        "--no-namespace",
+        "--pin-threads",
+        "--preemption-timeout=disabled",
+        "--",
+        "/usr/bin/nproc",
+    ];
+    let output = hermit(&run_args);
+    assert_success(&output, &run_args);
+    assert_eq!(stdout(&output), "1\n");
+
+    let verify_args = [
+        "run",
+        "--no-namespace",
+        "--verify",
+        "--pin-threads",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/sh",
+        "-c",
+        "test $(nproc) -eq 1",
+    ];
+    let output = hermit(&verify_args);
+    assert_success(&output, &verify_args);
 }
 
 #[test]
