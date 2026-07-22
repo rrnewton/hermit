@@ -16,6 +16,16 @@ declare -a check_results=()
 declare -a check_durations=()
 failures=0
 
+NEXTEST_PROFILE_NAME=${NEXTEST_PROFILE:-}
+if [[ -z $NEXTEST_PROFILE_NAME && -n ${CI:-} ]]; then
+    NEXTEST_PROFILE_NAME=ci
+fi
+declare -a NEXTEST_RUN=(cargo nextest run)
+if [[ -n $NEXTEST_PROFILE_NAME ]]; then
+    NEXTEST_RUN+=(--profile "$NEXTEST_PROFILE_NAME")
+fi
+readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
+
 COLOR_GREEN=""
 COLOR_RED=""
 COLOR_RESET=""
@@ -76,6 +86,21 @@ function run_check {
 
     check_names+=("$name")
     check_durations+=("$((SECONDS - started_at))")
+}
+
+function ensure_cargo_nextest {
+    if cargo nextest show-config version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local -ar install_command=(cargo install cargo-nextest --locked)
+    if command -v with-proxy >/dev/null 2>&1; then
+        with-proxy "${install_command[@]}"
+    else
+        "${install_command[@]}"
+    fi
+
+    cargo nextest show-config version
 }
 
 function hermit_echo {
@@ -154,16 +179,20 @@ function print_summary {
     fi
 }
 
+run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-# Workspace tests include package unit, documentation, and Cargo integration
-# targets such as hermit-cli/tests/hermit_modes.rs.
+# Nextest runs package unit and Cargo integration targets in parallel. It does
+# not run rustdoc tests, so keep those as a separate Cargo phase.
 run_check "Test workspace and integrations" \
-    cargo test --workspace --exclude hermetic_infra_hermit_flaky-tests
+    "${NEXTEST_RUN[@]}" --workspace \
+    --exclude hermetic_infra_hermit_flaky-tests
+run_check "Test workspace documentation" cargo test --workspace --doc
 run_check "Fast concurrency stress suite" \
-    cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
+    "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
+    --run-ignored only -E 'test(=fast_chaos_matrix)'
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps
