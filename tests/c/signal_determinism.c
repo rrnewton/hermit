@@ -32,6 +32,10 @@ static unsigned char alternate_stack[ALT_STACK_SIZE];
 static volatile sig_atomic_t altstack_deliveries;
 static volatile sig_atomic_t altstack_address_ok = 1;
 
+static int blocking_read_pipe[2];
+static volatile sig_atomic_t blocking_read_deliveries;
+static volatile sig_atomic_t blocking_read_handler_failed;
+
 static void write_message(const char* message, size_t length) {
   (void)write(STDOUT_FILENO, message, length);
 }
@@ -126,6 +130,74 @@ static int test_itimer_delivery(void) {
       was_pending,
       (int)alarm_observed_phase,
       (int)alarm_deliveries);
+  return 0;
+}
+
+static void blocking_read_handler(int signal_number) {
+  (void)signal_number;
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0 ||
+      write(blocking_read_pipe[1], "xx", 2) != 2) {
+    blocking_read_handler_failed = 1;
+    return;
+  }
+  ++blocking_read_deliveries;
+}
+
+static int test_blocking_read_interrupted_by_signal(int restart) {
+  if (pipe(blocking_read_pipe) != 0) {
+    perror("pipe");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = blocking_read_handler;
+  action.sa_flags = restart ? SA_RESTART : 0;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (alarm(1) != 0) {
+    fputs("unexpected pending alarm\n", stderr);
+    return 1;
+  }
+
+  char bytes[2];
+  if (!restart) {
+    errno = 0;
+    if (read(blocking_read_pipe[0], &bytes[0], 1) != -1 || errno != EINTR) {
+      fputs("blocking read was not interrupted with EINTR\n", stderr);
+      return 1;
+    }
+  }
+
+  if (read(blocking_read_pipe[0], &bytes[0], 1) != 1 ||
+      read(blocking_read_pipe[0], &bytes[1], 1) != 1) {
+    perror("read");
+    return 1;
+  }
+  if (blocking_read_handler_failed || blocking_read_deliveries != 1 ||
+      bytes[0] != 'x' || bytes[1] != 'x') {
+    fprintf(
+        stderr,
+        "blocking read signal failed: handler_failed=%d deliveries=%d bytes=%c%c\n",
+        (int)blocking_read_handler_failed,
+        (int)blocking_read_deliveries,
+        bytes[0],
+        bytes[1]);
+    return 1;
+  }
+
+  printf(
+      "blocking read %s deliveries=%d bytes=%c%c\n",
+      restart ? "restarted" : "interrupted",
+      (int)blocking_read_deliveries,
+      bytes[0],
+      bytes[1]);
   return 0;
 }
 
@@ -389,6 +461,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();
+  }
+  if (strcmp(argv[1], "blocking-read-interrupted") == 0) {
+    return test_blocking_read_interrupted_by_signal(0);
+  }
+  if (strcmp(argv[1], "blocking-read-restarted") == 0) {
+    return test_blocking_read_interrupted_by_signal(1);
   }
   if (strcmp(argv[1], "handler-reentrance") == 0) {
     return test_handler_reentrance();

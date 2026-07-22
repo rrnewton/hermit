@@ -121,6 +121,21 @@ fn sigalrm_itimer_delivery_is_deterministic() {
 }
 
 #[test]
+fn signal_interrupts_emulated_blocking_read() {
+    run_signal_scenario(
+        "blocking-read-interrupted",
+        "blocking read interrupted deliveries=1 bytes=xx\n",
+    );
+}
+
+#[test]
+fn signal_restarts_emulated_blocking_read() {
+    run_signal_scenario(
+        "blocking-read-restarted",
+        "blocking read restarted deliveries=1 bytes=xx\n",
+    );
+}
+#[test]
 fn signal_masks_survive_fork_and_clone() {
     run_signal_scenario(
         "masks-fork-clone",

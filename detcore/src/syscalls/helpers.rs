@@ -25,6 +25,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -698,7 +699,13 @@ where
     let mut rsrc = rsrc.clone();
 
     loop {
-        resource_request(guest, rsrc.clone()).await;
+        if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+            tracing::trace!(
+                "retry_nonblocking_syscall: interrupted by signal before retrying {}",
+                call.display(&guest.memory())
+            );
+            return Err(Errno::ERESTARTSYS.into());
+        }
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
             rsrc.poll_attempt += 1;
