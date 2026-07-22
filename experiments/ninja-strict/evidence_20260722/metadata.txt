@@ -1,0 +1,22 @@
+schema_version=1
+host_arch=x86_64
+cpu_model=AMD EPYC 9D85 158-Core Processor
+repository_commit=d6438c9d5fe1b2076eab3d563b445b96c15f70d7
+ninja_repository=https://github.com/ninja-build/ninja.git
+ninja_tag=v1.13.1
+ninja_revision=79feac0f3e3bc9da9effc586cd5fea41e7550051
+ninja_sha256=d3bcba20e79080312aca675ef1e0a988b13321585a615c284b9fee0e6780cb9d
+ninja_test_sha256=c1dcaa0cc94bb2157bc5b96329f4d96149145faa02e6b372c1b61d39a0d11aee
+gtest_version=1.16.0
+gtest_archive_sha256=78c676fc63881529bf97bf9d45948d905a66833fbfa5318ea2cd7478cb98f399
+compiler=c++ (GCC) 11.5.0 20240719 (Red Hat 11.5.0-14)
+hermit=/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/release/hermit
+hermit_sha256=366bf114bc6e612e35043f0c3ef30d527d7fbf3f9017e8a9009a80bbf3c2bcd5
+native_exit_code=0
+native_tests=410
+strict_tests=378
+excluded_tests=32
+strict_filter=-SubprocessTest.*:DiskInterfaceTest.*:BuildWithDepsLogTest.*
+runs=2
+timeout_seconds=20
+command=/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/release/hermit --log=error run --strict --base-env=minimal --env=LC_ALL=C --tmp=\<per-run-directory\> -- /home/newton/work/dev-hermit/worktrees/slot06/hermit/target/ninja-strict/build/ninja_test --gtest_color=no --gtest_filter=-SubprocessTest.\*:DiskInterfaceTest.\*:BuildWithDepsLogTest.\*
