@@ -117,3 +117,23 @@ jobs:
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
+    - name: Backend parity ratchet
+      if: steps.namespaces.outputs.available == 'true'
+      run: |
+        python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
+        if target/debug/hermit run --help | grep -q -- '--backend'; then
+          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+              --backend kvm --require-backend
+          else
+            echo "::notice::KVM parity blocked: /dev/kvm is not readable and writable"
+          fi
+          if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBI_CLIENT:-} ]]; then
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+              --backend dbi --require-backend
+          else
+            echo "::notice::DBI parity blocked: DynamoRIO/client environment is not configured"
+          fi
+        else
+          echo "::notice::DBI/KVM parity blocked: backend selector is not integrated yet"
+        fi
