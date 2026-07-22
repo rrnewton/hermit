@@ -11,9 +11,39 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
+static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
+
+const BASELINE_RECORD_WORKLOADS: [&str; 6] = [
+    "c_getpid",
+    "c_uname",
+    "c_sysinfo",
+    "c_wait_on_child",
+    "c_nanosleep_parallel",
+    "rs_clock_gettime",
+];
+
+const CARGO_RECORD_GUESTS: [&str; 15] = [
+    "rustbin_clock_total_order",
+    "rustbin_exit_group",
+    "rustbin_sched_yield",
+    "rustbin_futex_timeout",
+    "rustbin_futex_wait_child",
+    "rustbin_futex_wake_some",
+    "rustbin_heap_ptrs",
+    "rustbin_print_nanosleep_race",
+    "rustbin_nanosleep",
+    "rustbin_pipe_basics",
+    "rustbin_poll",
+    "rustbin_poll_spin",
+    "rustbin_rdtsc",
+    "rustbin_stack_ptr",
+    "rustbin_thread_random",
+];
 
 #[derive(Debug)]
 struct Workload {
@@ -34,6 +64,12 @@ fn command_output(mut command: Command, label: &str) -> Output {
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn hermit_record_lock() -> MutexGuard<'static, ()> {
+    HERMIT_RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn compile_c(source: &Path, output: &Path) {
@@ -112,6 +148,38 @@ fn compile_rust_clock(source: &Path, output: &Path) {
     );
 }
 
+fn cargo_record_workloads(repository: &Path) -> Vec<Workload> {
+    let binary_directory = Path::new(env!("CARGO_BIN_EXE_hermit"))
+        .parent()
+        .expect("Hermit binary should have a parent directory");
+    if CARGO_RECORD_GUESTS
+        .iter()
+        .any(|name| !binary_directory.join(name).is_file())
+    {
+        let mut command = Command::new(env!("CARGO"));
+        command.current_dir(repository).args([
+            "build",
+            "-p",
+            "hermetic_infra_hermit_tests",
+            "--bins",
+        ]);
+        command_output(command, "Cargo record workload compilation");
+    }
+
+    CARGO_RECORD_GUESTS
+        .iter()
+        .map(|&name| {
+            let path = binary_directory.join(name);
+            assert!(
+                path.is_file(),
+                "missing Cargo record workload: {}",
+                path.display()
+            );
+            Workload { name, path }
+        })
+        .collect()
+}
+
 fn workloads() -> &'static [Workload] {
     WORKLOADS.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -145,38 +213,81 @@ fn workloads() -> &'static [Workload] {
             &clock_gettime.path,
         );
         workloads.push(clock_gettime);
+        workloads.extend(cargo_record_workloads(repository));
         workloads
     })
+}
+
+fn workload(name: &str) -> &Workload {
+    workloads()
+        .iter()
+        .find(|workload| workload.name == name)
+        .unwrap_or_else(|| panic!("unknown record/replay workload: {name}"))
+}
+
+fn record_replay(workload: &Workload) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["record", "start", "--verify"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(&workload.path);
+    let output = command_output(command, &format!("record/replay for {}", workload.name));
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report deterministic replay for {}:\n{}",
+        workload.name,
+        combined_output
+    );
+}
+
+fn run_record_replay(name: &str) {
+    let _guard = hermit_record_lock();
+    record_replay(workload(name));
 }
 
 #[test]
 fn record_replay_matrix() {
     // Record/replay does not enable PMU-backed preemption, so these workloads
     // also run on GitHub-hosted runners without performance-counter access.
-    for workload in workloads() {
-        let data_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("record-replay-data")
-            .join(workload.name);
-        fs::create_dir_all(&data_dir).expect("failed to create Hermit recording directory");
-
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-        command
-            .env("HERMIT_MODE", "record")
-            .args(["record", "start", "--verify"])
-            .arg(format!("--data-dir={}", data_dir.display()))
-            .arg("--")
-            .arg(&workload.path);
-        let output = command_output(command, &format!("record/replay for {}", workload.name));
-        let combined_output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            combined_output.contains("Success: replay matched recording."),
-            "Hermit did not report deterministic replay for {}:\n{}",
-            workload.name,
-            combined_output
-        );
+    let _guard = hermit_record_lock();
+    for name in BASELINE_RECORD_WORKLOADS {
+        record_replay(workload(name));
     }
+}
+
+macro_rules! record_replay_tests {
+    ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
+        $(
+            #[test]
+            fn $test_name() {
+                run_record_replay($workload_name);
+            }
+        )+
+    };
+}
+
+record_replay_tests! {
+    record_rs_clock_total_order => "rustbin_clock_total_order",
+    record_rs_exit_group => "rustbin_exit_group",
+    record_rs_sched_yield => "rustbin_sched_yield",
+    record_rs_futex_timeout => "rustbin_futex_timeout",
+    record_rs_futex_wait_child => "rustbin_futex_wait_child",
+    record_rs_futex_wake_some => "rustbin_futex_wake_some",
+    record_rs_heap_ptrs => "rustbin_heap_ptrs",
+    record_rs_print_nanosleep_race => "rustbin_print_nanosleep_race",
+    record_rs_nanosleep => "rustbin_nanosleep",
+    record_rs_pipe_basics => "rustbin_pipe_basics",
+    record_rs_poll => "rustbin_poll",
+    record_rs_poll_spin => "rustbin_poll_spin",
+    record_rs_rdtsc => "rustbin_rdtsc",
+    record_rs_stack_ptr => "rustbin_stack_ptr",
+    record_rs_thread_random => "rustbin_thread_random",
 }
