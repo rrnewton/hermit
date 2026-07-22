@@ -59,6 +59,25 @@ declare -ar HERMIT_RUN_ARGS=(
     --preemption-timeout=disabled
 )
 
+# Fast determinism tier: guest programs cheap enough to re-run under Hermit's
+# --verify with heap and stack hashing (--detlog-heap/--detlog-stack), which
+# hashes memory maps on every event and catches layout non-determinism that
+# output-only --verify misses. Each guest below completes a hashed --verify run
+# in well under two seconds and was verified deterministic across repeated runs
+# (see validate-super.sh for the slower, exhaustive tier). Keep this list to
+# fast, reliably-deterministic guests; slower guests belong in validate-super.sh.
+readonly HERMIT_DETLOG_TIMEOUT="60s"
+declare -ar FAST_DETLOG_GUESTS=(
+    rustbin_heap_ptrs
+    rustbin_stack_ptr
+    rustbin_nanosleep
+    rustbin_rdtsc
+    rustbin_sched_yield
+    rustbin_futex_timeout
+    rustbin_socketpair
+    rustbin_print_nanosleep_race
+)
+
 function cleanup {
     local pid
     for pid in "${background_pids[@]}"; do
@@ -279,8 +298,38 @@ function hermit_determinism_check {
 
 function hermit_verify_smoke {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" --verify -- \
+        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" \
+        --verify --detlog-heap --detlog-stack -- \
         /bin/echo "$SMOKE_MARKER"
+}
+
+# Re-run each fast guest twice under Hermit and compare exit status, output, and
+# the deterministic execution log including heap and stack memory-map hashes.
+# Fails if any guest is non-deterministic or its binary is missing (build the
+# workspace first). Slower guests are covered by validate-super.sh.
+function hermit_detlog_fast_determinism {
+    local guest
+    local bin
+    local status=0
+
+    for guest in "${FAST_DETLOG_GUESTS[@]}"; do
+        bin="$ROOT_DIR/target/debug/$guest"
+        printf -- "-- %s --\n" "$guest"
+        if [[ ! -x $bin ]]; then
+            printf "Missing guest binary: %s (build the workspace first)\n" \
+                "$bin" >&2
+            status=1
+            continue
+        fi
+        if ! timeout "$HERMIT_DETLOG_TIMEOUT" \
+            "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" \
+            --verify --detlog-heap --detlog-stack -- "$bin"; then
+            printf "Heap/stack determinism check FAILED: %s\n" "$guest" >&2
+            status=1
+        fi
+    done
+
+    return "$status"
 }
 
 function print_summary {
@@ -307,6 +356,8 @@ start_check "Documentation" cargo doc --workspace --no-deps
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
+run_check "Hermit fast heap/stack determinism (--detlog-heap/--detlog-stack)" \
+    hermit_detlog_fast_determinism
 # Nextest runs most package unit and Cargo integration targets in parallel.
 # Detcore's PMU tests depend on same-binary coordination; nextest would launch
 # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
