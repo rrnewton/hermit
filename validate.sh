@@ -22,6 +22,17 @@ fi
 readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
 
+readonly NEXTEST_VERSION=0.9.100
+NEXTEST_PROFILE_NAME=${NEXTEST_PROFILE:-}
+if [[ -z $NEXTEST_PROFILE_NAME && -n ${CI:-} ]]; then
+    NEXTEST_PROFILE_NAME=ci
+fi
+declare -a NEXTEST_RUN=(cargo nextest run)
+if [[ -n $NEXTEST_PROFILE_NAME ]]; then
+    NEXTEST_RUN+=(--profile "$NEXTEST_PROFILE_NAME")
+fi
+readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
+
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
@@ -100,6 +111,22 @@ function run_check {
     checks=$((checks + 1))
 }
 
+function ensure_cargo_nextest {
+    if cargo nextest show-config version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local -ar install_command=(
+        cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+    )
+    if command -v with-proxy >/dev/null 2>&1; then
+        with-proxy "${install_command[@]}"
+    else
+        "${install_command[@]}"
+    fi
+
+    cargo nextest show-config version
+}
 function hermit_echo {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
         "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" -- \
@@ -165,16 +192,22 @@ function print_summary {
     fi
 }
 
+run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-# Workspace tests include package unit, documentation, and Cargo integration
-# targets such as hermit-cli/tests/hermit_modes.rs.
+# Nextest runs most package unit and Cargo integration targets in parallel.
+# Detcore's PMU tests depend on same-binary coordination; nextest would launch
+# them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
 run_check "Test workspace and integrations" \
-    cargo test --workspace --exclude hermetic_infra_hermit_flaky-tests
+    "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
+    --exclude hermetic_infra_hermit_flaky-tests
+run_check "Test detcore package" cargo test -p detcore
+run_check "Test workspace documentation" cargo test --workspace --doc
 run_check "Fast concurrency stress suite" \
-    cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
+    "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
+    --run-ignored only -E 'test(=fast_chaos_matrix)'
 # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
 run_check "Hermit analyze scenarios" \
     cargo test -p hermit --test analyze -- --ignored
