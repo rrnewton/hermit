@@ -100,6 +100,20 @@ fn compile_c_without_libc(source: &Path, output: &Path) {
     command_output(command, "C workload compilation without libc");
 }
 
+fn compile_unsupported_syscall_workload(name: &'static str) -> Workload {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unsupported-syscall-workloads");
+    fs::create_dir_all(&build_root).expect("failed to create unsupported-syscall build directory");
+    let workload = workload(name, build_root.join(name));
+    compile_c_without_libc(
+        &repository.join(format!("tests/c/simple/{name}_nostdlib.c")),
+        &workload.path,
+    );
+    workload
+}
+
 fn compile_rust(source: &Path, output: &Path) {
     let mut command = Command::new("rustc");
     command
@@ -387,6 +401,52 @@ fn run_stable_matrix(mode: RunMode) {
     for workload in &workloads().stable {
         hermit_run(mode, workload);
     }
+}
+
+fn assert_unsupported_syscall_panics(workload: &Workload, option: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--base-env=empty",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            option,
+            "--",
+        ])
+        .arg(&workload.path);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "unsupported syscall did not fail: {rendered}\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("unsupported syscall") && stderr.contains("panicked at"),
+        "unsupported syscall did not produce a panic: {rendered}\nstatus: {}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+#[test]
+fn panic_on_unsupported_syscalls_panics() {
+    let _guard = hermit_run_lock();
+    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
+    let keyctl_syscall = compile_unsupported_syscall_workload("keyctl_syscall");
+    assert_unsupported_syscall_panics(&unsupported_syscall, "--panic-on-unsupported-syscalls");
+    assert_unsupported_syscall_panics(&keyctl_syscall, "--panic-on-unsupported-syscalls");
+}
+
+#[test]
+fn strict_panics_on_unsupported_syscalls() {
+    let _guard = hermit_run_lock();
+    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
+    assert_unsupported_syscall_panics(&unsupported_syscall, "--strict");
 }
 
 fn run_buck_chaos_workload(name: &str) {

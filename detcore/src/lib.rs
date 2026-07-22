@@ -478,7 +478,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             subscription | T::subscriptions(config)
         } else {
-            let mut subscription = Subscription::none();
+            // The fallback handler cannot enforce panic semantics for syscalls that Reverie never
+            // sends to Detcore. Panic mode therefore needs complete syscall coverage even in
+            // optimized builds.
+            let mut subscription = if config.panic_on_unsupported_syscalls {
+                Subscription::all_syscalls()
+            } else {
+                Subscription::none()
+            };
             subscription.syscalls([
                 Sysno::write,
                 Sysno::openat,
