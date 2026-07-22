@@ -410,6 +410,59 @@ fn run_stable_matrix(mode: RunMode) {
     }
 }
 
+/// Run one stable workload under fbsource-equivalent strict determinism and
+/// assert the execution is reproducible.
+///
+/// fbsource's `hermit_run_strict__` targets run every stable workload with full
+/// determinism (sequentialize-threads + deterministic-io, both default-on),
+/// `--base-env=empty`, and deterministic preemptions
+/// (`--preemption-timeout=80000000`), wrapped in `hermit-verify` (record then
+/// replay, assert identical). We reproduce that with `hermit run --verify`,
+/// which runs twice and compares the two executions, and additionally assert on
+/// hermit's `Success: deterministic.` message (L2 determinism verification).
+///
+/// We deliberately do NOT pass the `--strict` CLI flag here. `--strict` upgrades
+/// unsupported syscalls from a graceful `ENOSYS` to a hard panic, and modern
+/// glibc issues startup syscalls hermit does not emulate (e.g. `rseq`), so
+/// `--strict` panics before the workload runs. That fail-closed policy is
+/// covered separately by [`strict_fail_closed_policy`]. Deterministic
+/// preemptions need PMU hardware counters (otherwise `--preemption-timeout` is
+/// silently forced to `disabled`), so this is PMU-gated like the Buck chaos
+/// matrix.
+fn hermit_run_strict(workload: &Workload) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--verify",
+            "--base-env=empty",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=80000000",
+            "--env=HERMIT_MODE=strict",
+            "--",
+        ])
+        .arg(&workload.path)
+        .args(workload.args);
+    let output = command_output(command, &format!("strict mode for {}", workload.name));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Success: deterministic."),
+        "strict verification for {} did not report deterministic success:\nstderr:\n{stderr}",
+        workload.name,
+    );
+}
+
+fn run_strict_matrix() {
+    assert!(
+        reverie_ptrace::is_perf_supported(),
+        "ERROR: strict workload matrix requires accessible PMU hardware counters"
+    );
+    let _guard = hermit_run_lock();
+    for workload in &workloads().stable {
+        hermit_run_strict(workload);
+    }
+}
+
 fn assert_unsupported_syscall_panics(workload: &Workload, option: &str) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -935,21 +988,34 @@ fn no_hardware_stacktrace_signal() {
     );
 }
 
+/// The `--strict` CLI flag is a *fail-closed policy* check: it turns an
+/// unsupported syscall from a graceful `ENOSYS` into a hard panic. This is a
+/// distinct concern from the strict-determinism *workload matrix* (see
+/// [`strict_mode_matrix`]), which exercises full determinism over real
+/// workloads. Keep the two separate: because `--strict` panics on any
+/// unsupported syscall, it cannot run ordinary libc workloads — modern glibc
+/// issues startup syscalls hermit does not emulate (e.g. `rseq`, and even
+/// `getpid`), so `--strict` panics before the workload's own logic runs.
+///
+/// This asserts the fail-closed policy holds across both unsupported-syscall
+/// workloads. It complements [`strict_panics_on_unsupported_syscalls`], which
+/// covers a single workload, by confirming the panic is workload-independent.
+#[test]
+fn strict_fail_closed_policy() {
+    let _guard = hermit_run_lock();
+    let unsupported_syscall = compile_unsupported_syscall_workload("unsupported_syscall");
+    let keyctl_syscall = compile_unsupported_syscall_workload("keyctl_syscall");
+    assert_unsupported_syscall_panics(&unsupported_syscall, "--strict");
+    assert_unsupported_syscall_panics(&keyctl_syscall, "--strict");
+}
+
+/// The strict-determinism workload matrix: closes fbsource coverage gap #2 by
+/// running every stable workload under full determinism with deterministic
+/// preemptions and record/replay verification. See [`run_strict_matrix`] for
+/// why this uses `--verify` rather than the `--strict` CLI flag.
 #[test]
 fn strict_mode_matrix() {
-    let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, false);
-    assert!(
-        output.status.success(),
-        "strict fail-closed workload failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
-        "strict mode did not enforce fail-closed behavior:\n{stderr}"
-    );
+    run_strict_matrix();
 }
 
 #[test]
