@@ -43,10 +43,14 @@ complete under Hermit:
 The committed integration test bypasses the failing `regrtest` invocation.
 It uses `unittest` to load the same five module suites from `Lib/test`, sets
 CPython's optional resource list to empty to match `regrtest` defaults, and
-runs the full 539-case selection twice. Both strict runs exit zero with 17
-expected skips and byte-identical stdout and stderr.
+runs the full 539-case selection twice. The driver reports each module's
+discovered case count and fails immediately if any requested module discovers
+zero tests. The Rust harness independently requires one positive count per
+module and verifies that their sum matches the aggregate count. Both strict
+runs exit zero with 17 expected skips and byte-identical stdout and stderr.
 
-Hermit uses `--no-virtualize-cpuid` and
+Each Hermit execution is bounded to 120 seconds, followed by a 10-second kill
+grace period. Hermit uses `--no-virtualize-cpuid` and
 `--preemption-timeout=disabled` for this host-compatible validation. Strict
 thread serialization and deterministic I/O remain enabled.
 
