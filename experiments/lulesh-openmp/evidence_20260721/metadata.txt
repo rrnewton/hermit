@@ -1,0 +1,20 @@
+schema_version=2
+host_arch=x86_64
+cpu_model=AMD EPYC 9D85 158-Core Processor
+repository_commit=76d8d9550d0dcc37db37f6825e363ee7da4a8efb
+lulesh_repository=https://github.com/LLNL/LULESH.git
+lulesh_tag=2.0.3
+lulesh_revision=46c2a1d6db9171f9637d79f407212e0f176e8194
+instrumentation_sha256=a030390864f418a7a3716ab650fa73a456b74a0e09ed9f1f22c9b1e9279c9ba4
+lulesh_sha256=dfd932212a3cd27c293bb55b430430be6aba456819d272e015ff9c21b7352b9f
+compiler=g++ (GCC) 11.5.0 20240719 (Red Hat 11.5.0-14)
+openmp_runtime=/lib64/libgomp.so.1
+hermit=/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/release/hermit
+hermit_source_commit=d6438c9d5fe1b2076eab3d563b445b96c15f70d7
+hermit_sha256=366bf114bc6e612e35043f0c3ef30d527d7fbf3f9017e8a9009a80bbf3c2bcd5
+runs=2
+threads=4
+mesh_size=10
+iterations=10
+timeout_seconds=180
+command=/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/release/hermit --log=error run --strict --base-env=minimal --env=LC_ALL=C --env=OMP_NUM_THREADS=4 --env=OMP_DYNAMIC=false --env=LULESH_STATE_FILE=/tmp/lulesh-state-RUN.txt --tmp=/tmp/hermit-lulesh-2.0.3 -- /tmp/lulesh2.0 -s 10 -i 10

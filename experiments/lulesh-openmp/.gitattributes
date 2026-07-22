@@ -1,0 +1,2 @@
+evidence_20260721/runs/*/stdout whitespace=-blank-at-eol,-blank-at-eof
+lulesh-instrumentation.patch whitespace=-blank-at-eol,-blank-at-eof
