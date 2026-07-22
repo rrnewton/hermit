@@ -341,6 +341,14 @@ diagnose compatibility problems, not when asserting full reproducibility.
 
 ### File System, Environment, And Network
 
+Hermit exposes a deliberately minimal synthetic `/proc`. The available files
+are `/proc/self/maps`, `/proc/self/stat`, `/proc/self/status`,
+`/proc/self/cmdline`, `/proc/cpuinfo`, and
+`/proc/sys/kernel/random/entropy_avail`; `/proc/self/exe` is available as a
+simulated symlink to the traced executable. File contents and metadata are fixed
+and describe the Hermit model, not the host. Other procfs paths return `ENOENT`;
+programs must not use `/proc` for host discovery while running under Hermit.
+
 Hermit creates an isolated guest `/tmp` by default. A program built under host
 `/tmp` is therefore not visible at the same path in the guest. Prefer building
 outside `/tmp`, or expose only the required path:
