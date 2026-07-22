@@ -10,6 +10,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
@@ -18,6 +19,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
+use crate::event::AcceptEvent;
 use crate::event::PollEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
@@ -105,6 +107,59 @@ impl Recorder {
                 let addr = syscall.buf().ok_or(Errno::EFAULT)?;
                 guest.memory().read_exact(addr, &mut buf)?;
                 Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    /// Records `accept`/`accept4`.
+    ///
+    /// `accept` returns a new connection fd and, when the caller provides
+    /// non-NULL `addr`/`addrlen`, writes the peer socket address plus its length
+    /// into caller memory. We record the returned fd, the (possibly truncated)
+    /// address bytes, and the length value so the connection can be replayed
+    /// without a live peer. `accept` is dispatched here via `Accept4` (a plain
+    /// `accept` is an `accept4` with zero flags).
+    pub(super) async fn handle_accept<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Accept4,
+    ) -> Result<i64, Errno> {
+        // The caller's `addrlen` is an in/out parameter: on input it is the
+        // buffer capacity, on output the (untruncated) peer address length. Read
+        // the capacity before the syscall overwrites it.
+        let capacity: Option<usize> = match syscall.addrlen() {
+            Some(addr) => Some(guest.memory().read_value(addr)?),
+            None => None,
+        };
+
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|fd| {
+                let (sockaddr, addrlen) = match (syscall.sockaddr(), syscall.addrlen(), capacity) {
+                    (Some(addr), Some(len_addr), Some(capacity)) => {
+                        // The kernel wrote the untruncated length here and copied
+                        // at most `capacity` bytes into the address buffer.
+                        let out_len: usize = guest.memory().read_value(len_addr)?;
+                        let copied = out_len.min(capacity);
+                        let mut buf = vec![0u8; copied];
+                        if copied > 0 {
+                            guest.memory().read_exact(addr.cast::<u8>(), &mut buf)?;
+                        }
+                        (buf, out_len)
+                    }
+                    // Caller did not ask for the peer address.
+                    _ => (Vec::new(), 0),
+                };
+
+                Ok(SyscallEvent::Accept(AcceptEvent {
+                    fd,
+                    sockaddr,
+                    addrlen,
+                }))
             }),
         );
 

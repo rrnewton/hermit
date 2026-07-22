@@ -62,6 +62,7 @@ pub enum SyscallEvent {
     Timeofday((Timeval, Timezone)),
     Poll(PollEvent),
     SockOpt(SockOptEvent),
+    Accept(AcceptEvent),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,4 +112,25 @@ pub struct SockOptEvent {
     /// The length of the value. If this is the same as `value.len()`, then
     /// no truncation of the value occurred.
     pub length: libc::socklen_t,
+}
+
+/// The output of an `accept`/`accept4` syscall.
+///
+/// Unlike a "simple" syscall, `accept` has two outputs beyond its return value:
+/// the peer socket address and its length are written back into caller-provided
+/// buffers. Recording all three makes the accepted connection reproducible on
+/// replay without a live peer.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AcceptEvent {
+    /// The accepted connection's file descriptor (the syscall return value).
+    pub fd: i64,
+
+    /// The peer socket address bytes written into the caller's buffer, truncated
+    /// to the caller-provided capacity. Empty when the caller passed a NULL
+    /// `addr`/`addrlen` (i.e. it did not ask for the peer address).
+    pub sockaddr: Vec<u8>,
+
+    /// The value written back to the caller's `addrlen`: the untruncated size of
+    /// the peer address. Zero when no address was requested.
+    pub addrlen: usize,
 }

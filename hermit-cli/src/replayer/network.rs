@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::Recvfrom;
@@ -71,5 +72,37 @@ impl Replayer {
             .write_exact(syscall.buf().unwrap(), &buf)
             .unwrap();
         Ok(buf.len() as i64)
+    }
+
+    /// Replays `accept`/`accept4` from the recorded event.
+    ///
+    /// Writes the recorded peer address and length back into the caller's
+    /// buffers (when it asked for them) and returns the recorded connection fd,
+    /// without executing a real `accept`. Mirrors [`Recorder::handle_accept`].
+    ///
+    /// [`Recorder::handle_accept`]: crate::recorder::Recorder::handle_accept
+    pub(super) async fn handle_accept<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Accept4,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Accept)?;
+
+        // Restore the peer address bytes, if the caller provided a buffer and one
+        // was recorded.
+        if let Some(addr) = syscall.sockaddr() {
+            if !event.sockaddr.is_empty() {
+                guest
+                    .memory()
+                    .write_exact(addr.cast::<u8>(), &event.sockaddr)?;
+            }
+        }
+
+        // Restore the (untruncated) address length.
+        if let Some(len_addr) = syscall.addrlen() {
+            guest.memory().write_value(len_addr, &event.addrlen)?;
+        }
+
+        Ok(event.fd)
     }
 }

@@ -140,6 +140,10 @@ impl Tool for Replayer {
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Bind(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Listen(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Accept(syscall) => self.handle_accept(guest, syscall.into()).await,
+            Syscall::Accept4(syscall) => self.handle_accept(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
