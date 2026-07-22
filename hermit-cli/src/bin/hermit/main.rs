@@ -15,6 +15,7 @@
 )]
 
 mod analyze;
+mod bisect;
 mod bnz;
 mod clean;
 mod container;
@@ -37,6 +38,7 @@ use hermit::Error;
 use hermit::ExitStatus;
 
 use self::analyze::AnalyzeOpts;
+use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
@@ -76,6 +78,10 @@ enum Subcommand {
 
     /// Analyze Pass and failing runs
     Analyze(Box<AnalyzeOpts>),
+
+    /// Bisect passing and failing schedules to localize a race.
+    #[clap(name = "bisect", trailing_var_arg = true)]
+    Bisect(Box<BisectOpts>),
 }
 
 impl Subcommand {
@@ -86,6 +92,7 @@ impl Subcommand {
             Subcommand::Replay(x) => x.main(global),
             Subcommand::LogDiff(x) => Ok(x.main(global)),
             Subcommand::Analyze(x) => x.main(global),
+            Subcommand::Bisect(x) => x.main(global),
         }
     }
 }
@@ -144,5 +151,23 @@ mod tests {
         .unwrap();
 
         assert!(matches!(args.command, Subcommand::Replay(_)));
+    }
+
+    #[test]
+    fn bisect_accepts_schedule_endpoints_and_run_args() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "bisect",
+            "--good",
+            "good.json",
+            "--bad",
+            "bad.json",
+            "--",
+            "--preemption-timeout=disabled",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::Bisect(_)));
     }
 }

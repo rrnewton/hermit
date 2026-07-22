@@ -8,6 +8,7 @@
 
 use std::ops::Range;
 
+use anyhow::bail;
 use colored::Colorize;
 use detcore::types::SchedEvent;
 use edit_distance::NeedlemanWunsch;
@@ -90,15 +91,19 @@ pub fn search_for_critical_schedule<F>(
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
-) -> CriticalSchedule
+) -> anyhow::Result<CriticalSchedule>
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
     eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
     let (passing_endpoint_passes, _) = tester(&initial_passing_schedule);
-    assert!(passing_endpoint_passes);
+    if !passing_endpoint_passes {
+        bail!("the passing schedule endpoint did not reproduce a passing outcome");
+    }
     let (failing_endpoint_passes, _) = tester(&initial_failing_schedule);
-    assert!(!failing_endpoint_passes);
+    if failing_endpoint_passes {
+        bail!("the failing schedule endpoint did not reproduce the target failure");
+    }
 
     // Do the first level search at the event level
     let EventLevelSearchResult {
@@ -127,7 +132,7 @@ where
             failing_schedule.clone(),
         )
     {
-        return critical_schedule;
+        return Ok(critical_schedule);
     }
 
     eprintln!(
@@ -141,11 +146,11 @@ where
         common_prefix.len() + 1
     };
     eprintln!("Critical event index {}", critical_event_index);
-    CriticalSchedule {
+    Ok(CriticalSchedule {
         failing_schedule,
         passing_schedule,
         critical_event_index,
-    }
+    })
 }
 
 // Return edit distance and swap distance.
@@ -790,11 +795,38 @@ mod tests {
             passing.clone(),
             failing.clone(),
             &Config::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(critical.passing_schedule, passing);
         assert_eq!(critical.failing_schedule, failing);
         assert_eq!(critical.critical_event_index, 1);
+    }
+
+    #[test]
+    fn endpoint_outcomes_are_validated() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let good = vec![first.clone(), second.clone()];
+        let bad = vec![second, first];
+
+        let error = search_for_critical_schedule(
+            |schedule| (false, schedule.to_vec()),
+            good.clone(),
+            bad.clone(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("passing schedule endpoint"));
+
+        let error = search_for_critical_schedule(
+            |schedule| (true, schedule.to_vec()),
+            good,
+            bad,
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failing schedule endpoint"));
     }
 
     #[test]
@@ -851,7 +883,7 @@ mod tests {
             ..Default::default()
         };
 
-        let critical = search_for_critical_schedule(tester, passing, failing, &cfg);
+        let critical = search_for_critical_schedule(tester, passing, failing, &cfg).unwrap();
 
         assert_eq!(
             just_distance(&critical.passing_schedule, &critical.failing_schedule),
@@ -921,7 +953,8 @@ mod tests {
             passing_sched,
             failing_sched,
             &Default::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(critical_event_index, 379);
 

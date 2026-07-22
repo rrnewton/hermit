@@ -255,6 +255,94 @@ fn slow_race_matrix() {
     }
 }
 
+fn publish_ordering_schedule_command(seed: u64, schedule: &Path) -> Command {
+    let mut command = timed_hermit_command(COMMAND_TIMEOUT_SECONDS);
+    command
+        .args([
+            "run",
+            "--base-env=minimal",
+            "--chaos",
+            "--sched-heuristic=random",
+            "--preemption-timeout=disabled",
+            "--no-virtualize-cpuid",
+        ])
+        .arg(format!("--seed={seed}"))
+        .arg(format!("--record-preemptions-to={}", schedule.display()))
+        .arg(&stress_binaries().concurrency)
+        .args(["publish-ordering", "2"]);
+    command
+}
+
+#[test]
+fn schedule_bisect_localizes_publish_ordering_race() {
+    let _guard = hermit_run_lock();
+    let schedules = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create schedule-bisection directory");
+    let mut good = None;
+    let mut bad = None;
+
+    for seed in FAST_SEEDS {
+        let schedule = schedules
+            .path()
+            .join(format!("publish-ordering-{seed}.json"));
+        let outcome = run_guest(
+            publish_ordering_schedule_command(seed, &schedule),
+            &format!("publish-ordering schedule seed={seed}"),
+        );
+        match outcome {
+            GuestOutcome::Clean if good.is_none() => good = Some(schedule),
+            GuestOutcome::Exposed if bad.is_none() => bad = Some(schedule),
+            _ => {}
+        }
+        if good.is_some() && bad.is_some() {
+            break;
+        }
+    }
+
+    let good = good.expect("publish-ordering did not produce a passing schedule in 10 seeds");
+    let bad = bad.expect("publish-ordering did not expose its race in 10 seeds");
+    let report = schedules.path().join("bisect-report.json");
+    let mut command = timed_hermit_command(CAS_REPLAY_TIMEOUT_SECONDS);
+    command
+        .arg("bisect")
+        .arg(format!("--good={}", good.display()))
+        .arg(format!("--bad={}", bad.display()))
+        .arg(format!("--report-file={}", report.display()))
+        .arg("--")
+        .args([
+            "--base-env=minimal",
+            "--preemption-timeout=disabled",
+            "--no-virtualize-cpuid",
+        ])
+        .arg(&stress_binaries().concurrency)
+        .args(["publish-ordering", "2"]);
+
+    let output = command_output(command, "publish-ordering schedule bisection");
+    let stdout = String::from_utf8(output.stdout).expect("bisect stdout should be UTF-8");
+    assert!(
+        stdout.contains("Schedule divergence localized at bad event"),
+        "missing localized event in:\n{stdout}"
+    );
+    assert!(
+        stdout.matches("Stack trace for thread").count() >= 2,
+        "missing divergence stack traces in:\n{stdout}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("failed to read schedule-bisection report"),
+    )
+    .expect("schedule-bisection report should be JSON");
+    let first = report["critical_event1"]["event_index"]
+        .as_u64()
+        .expect("first critical event index should be an integer");
+    let second = report["critical_event2"]["event_index"]
+        .as_u64()
+        .expect("second critical event index should be an integer");
+    assert_eq!(second, first + 1);
+    assert!(!report["critical_event1"]["stack"].is_null());
+    assert!(!report["critical_event2"]["stack"].is_null());
+}
+
 fn cas_search_command(seed: u64, schedule: &Path) -> Command {
     let mut command = timed_hermit_command(COMMAND_TIMEOUT_SECONDS);
     command
