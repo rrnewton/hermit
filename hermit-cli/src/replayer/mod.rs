@@ -42,9 +42,6 @@ pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-
-    // Set to true if we should detect desynchronization.
-    verify: bool,
 }
 
 #[reverie::tool]
@@ -55,9 +52,6 @@ impl Tool for Replayer {
     fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            // TODO: Make this part of the configuration instead when global
-            // state composition works.
-            verify: std::env::var_os("HERMIT_VERIFY").is_some(),
         }
     }
 
@@ -85,9 +79,7 @@ impl Tool for Replayer {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        if self.verify {
-            self.expect_syscall(guest, syscall);
-        }
+        self.expect_syscall(guest, syscall);
 
         // NOTE: This match statement should be identical to the one in the
         // recorder. Otherwise, our recorder and replayer will disagree about
@@ -179,7 +171,21 @@ impl Tool for Replayer {
 impl Replayer {
     // Check if we received the expected syscall or not.
     fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
-        let debug_event = guest.thread_state_mut().next_debug_event().unwrap();
+        let thread = guest.tid();
+        let next_count = guest.thread_state().count + 1;
+        let debug_event = guest
+            .thread_state_mut()
+            .next_debug_event()
+            .unwrap_or_else(|source| {
+                panic!(
+                    "Replay syscall stream ended unexpectedly for recording {} on thread {} at event {} while the guest executed {:?}: {}",
+                    self.data.display(),
+                    thread,
+                    next_count,
+                    syscall,
+                    source,
+                )
+            });
 
         if debug_event.syscall() == syscall {
             return;
@@ -197,20 +203,26 @@ impl Replayer {
         }
 
         let error = DesyncError {
-            thread: guest.tid(),
+            thread,
             count: guest.thread_state().count,
             actual: DebugEvent::new(syscall, &guest.memory()),
             expected: debug_event,
         };
-
-        let report = error
-            .generate_report(&self.data)
-            .expect("Failed to generate desync error report");
+        let summary = error.summary(&self.data, 16, 4).to_string();
+        let report = match error.generate_report(&self.data) {
+            Ok(report) => format!("Full desynchronization report: {}", report.display()),
+            Err(report_error) => {
+                format!("Could not write the full desynchronization report: {report_error}")
+            }
+        };
 
         panic!(
-            "{}\nSee the report generated at: {:?}",
-            error.summary(&self.data, 16, 4),
-            report
+            "Replay diverged from recording {} on thread {} at syscall event {}. Re-record the workload with the same Hermit build after diagnosing the mismatch.\n{}\n{}",
+            self.data.display(),
+            thread,
+            error.count,
+            summary,
+            report,
         );
     }
 
