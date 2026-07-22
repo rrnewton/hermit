@@ -221,6 +221,31 @@ fn run_fails_closed_for_unintegrated_backends() {
 }
 
 #[test]
+fn namespace_only_rejects_every_explicit_backend() {
+    for backend in ["ptrace", "dbi", "kvm"] {
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--namespace-only",
+            "--",
+            "/bin/true",
+        ];
+        let output = hermit(&args);
+        assert_eq!(output.status.code(), Some(2));
+        let message = stderr(&output);
+        assert!(
+            message.contains("--backend"),
+            "unexpected error:\n{message}"
+        );
+        assert!(
+            message.contains("--namespace-only"),
+            "unexpected error:\n{message}"
+        );
+    }
+}
+
+#[test]
 fn incompatible_run_modes_fail_during_argument_parsing() {
     let args = ["run", "--namespace-only", "--chaos", "/bin/true"];
     let output = hermit(&args);
