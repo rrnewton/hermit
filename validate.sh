@@ -22,6 +22,7 @@ fi
 readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
 
+readonly NEXTEST_VERSION=0.9.100
 NEXTEST_PROFILE_NAME=${NEXTEST_PROFILE:-}
 if [[ -z $NEXTEST_PROFILE_NAME && -n ${CI:-} ]]; then
     NEXTEST_PROFILE_NAME=ci
@@ -115,7 +116,9 @@ function ensure_cargo_nextest {
         return 0
     fi
 
-    local -ar install_command=(cargo install cargo-nextest --locked)
+    local -ar install_command=(
+        cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+    )
     if command -v with-proxy >/dev/null 2>&1; then
         with-proxy "${install_command[@]}"
     else
