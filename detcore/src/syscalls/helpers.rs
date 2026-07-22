@@ -473,12 +473,31 @@ pub trait NonblockableSyscall: SyscallInfo {
         res == Ok(0)
     }
 
+    /// Whether this result means the current syscall invocation started an asynchronous operation.
+    fn syscall_started_operation(&self, _res: Result<i64, Errno>) -> bool {
+        false
+    }
+
+    /// Whether another invocation currently owns an asynchronous operation on this descriptor.
+    fn operation_in_progress<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) -> bool {
+        false
+    }
+
+    /// Atomically claim ownership of an asynchronous operation started by this invocation.
+    fn try_start_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) -> bool {
+        true
+    }
+
+    /// Release ownership after the asynchronous operation has completed.
+    fn finish_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, _guest: &G) {}
+
     /// Convert a physical nonblocking completion into the result expected by the guest.
-    /// `retried` is true after a prior result was classified as blocked.
+    /// `operation_started` is true only if this invocation started the asynchronous operation.
     fn normalize_nonblocking_result(
         &self,
         res: Result<i64, Errno>,
-        _retried: bool,
+        _operation_started: bool,
+        _operation_contended: bool,
     ) -> Result<i64, Errno> {
         res
     }
@@ -997,14 +1016,41 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
             || res == Err(Errno::EALREADY)
     }
 
+    fn syscall_started_operation(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EINPROGRESS)
+    }
+
+    fn operation_in_progress<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.connect_in_progress())
+            .unwrap()
+    }
+
+    fn try_start_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.try_start_connect())
+            .unwrap()
+    }
+
+    fn finish_operation<T: RecordOrReplay, G: Guest<Detcore<T>>>(&self, guest: &G) {
+        guest
+            .thread_state()
+            .with_detfd(self.fd(), |detfd| detfd.finish_connect())
+            .unwrap();
+    }
+
     fn normalize_nonblocking_result(
         &self,
         res: Result<i64, Errno>,
-        retried: bool,
+        operation_started: bool,
+        operation_contended: bool,
     ) -> Result<i64, Errno> {
-        match (retried, res) {
-            (true, Err(Errno::EISCONN)) => Ok(0),
-            (_, res) => res,
+        match (operation_started, operation_contended, res) {
+            (true, _, Err(Errno::EISCONN)) => Ok(0),
+            (false, true, Ok(0)) => Err(Errno::EISCONN),
+            (_, _, res) => res,
         }
     }
 }
@@ -1059,12 +1105,19 @@ where
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
     let mut rsrc = rsrc.clone();
+    let mut operation_started = false;
+    let mut operation_contended = false;
 
     loop {
         call.prepare_nonblocking(guest, call0)?;
         resource_request(guest, rsrc.clone()).await;
+        operation_contended |= !operation_started && call.operation_in_progress(guest);
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
+            if !operation_started && call.syscall_started_operation(res) {
+                operation_started = call.try_start_operation(guest);
+                operation_contended |= !operation_started;
+            }
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
                 let new_time = thread_observe_time(guest).await;
@@ -1098,8 +1151,11 @@ where
         } else {
             call.finish_nonblocking(guest, call0)?;
             let res = call
-                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .normalize_nonblocking_result(res, operation_started, operation_contended)
                 .map_err(|e| e.into());
+            if operation_started {
+                call.finish_operation(guest);
+            }
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,
@@ -1217,12 +1273,18 @@ mod tests {
         let call = reverie::syscalls::Connect::new();
         assert!(call.syscall_would_have_blocked(Err(Errno::EINPROGRESS)));
         assert!(call.syscall_would_have_blocked(Err(Errno::EALREADY)));
+        assert!(call.syscall_started_operation(Err(Errno::EINPROGRESS)));
+        assert!(!call.syscall_started_operation(Err(Errno::EALREADY)));
         assert_eq!(
-            call.normalize_nonblocking_result(Err(Errno::EISCONN), true),
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), true, false),
             Ok(0)
         );
         assert_eq!(
-            call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), false, true),
+            Err(Errno::EISCONN)
+        );
+        assert_eq!(
+            call.normalize_nonblocking_result(Ok(0), false, true),
             Err(Errno::EISCONN)
         );
     }
