@@ -144,11 +144,49 @@ fn run_help_exposes_determinism_modes() {
         "--record-preemptions",
         "--replay-preemptions-from",
         "--preemption-timeout",
+        "--backend <BACKEND>",
+        "ptrace",
+        "dbi",
+        "kvm",
         "Bare names are resolved using the guest PATH",
         "hidden by Hermit's isolated `/tmp`",
         "without ptrace, seccomp interception, or determinization",
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
+    }
+}
+
+#[test]
+fn run_rejects_unknown_backends_during_argument_parsing() {
+    let args = ["run", "--backend", "unknown", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("invalid value 'unknown'"),
+        "unexpected error:\n{stderr}"
+    );
+    for backend in ["ptrace", "dbi", "kvm"] {
+        assert!(
+            stderr.contains(backend),
+            "missing {backend:?} in:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_fails_closed_for_unintegrated_backends() {
+    for backend in ["dbi", "kvm"] {
+        let args = ["run", "--backend", backend, "--", "/bin/true"];
+        let output = hermit(&args);
+        let expected = format!("backend `{backend}` is unavailable");
+
+        assert_failure_contains(&output, &[&expected]);
+        assert!(
+            !stderr(&output).contains("Hermit cannot use ptrace"),
+            "{backend} should fail before ptrace capability probing"
+        );
     }
 }
 
