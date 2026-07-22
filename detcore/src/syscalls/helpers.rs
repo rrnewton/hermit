@@ -26,6 +26,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -1110,7 +1111,20 @@ where
 
     loop {
         call.prepare_nonblocking(guest, call0)?;
-        resource_request(guest, rsrc.clone()).await;
+        // If the scheduler reports a pending signal for this thread, interrupt the
+        // polling loop so the guest can run its signal handler. Returning
+        // ERESTARTSYS (rather than EINTR) lets the kernel's signal-delivery path
+        // do the right thing based on the handler's flags: restart the syscall
+        // when SA_RESTART is set, or surface EINTR to the guest otherwise.
+        if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+            call.finish_nonblocking(guest, call0)?;
+            tracing::trace!(
+                "retry_nonblocking_syscall: interrupted by signal after {} retries: {}",
+                rsrc.poll_attempt,
+                call.display(&guest.memory())
+            );
+            return Err(Errno::ERESTARTSYS.into());
+        }
         operation_contended |= !operation_started && call.operation_in_progress(guest);
         let res = guest.inject_with_retry(call).await;
         if call.syscall_would_have_blocked(res) {
