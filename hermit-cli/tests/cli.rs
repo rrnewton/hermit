@@ -141,6 +141,7 @@ fn run_help_exposes_determinism_modes() {
         "--sequentialize-threads",
         "--chaos",
         "--verify",
+        "--verify-verbose",
         "--record-preemptions",
         "--replay-preemptions-from",
         "--preemption-timeout",
@@ -150,6 +151,21 @@ fn run_help_exposes_determinism_modes() {
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
     }
+}
+
+#[test]
+fn verify_verbose_requires_verify() {
+    let args = ["run", "--verify-verbose", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("--verify-verbose"),
+        "unexpected error:\n{stderr}"
+    );
+    assert!(stderr.contains("--verify"), "unexpected error:\n{stderr}");
+    assert!(stderr.contains("required"), "unexpected error:\n{stderr}");
 }
 
 #[test]
