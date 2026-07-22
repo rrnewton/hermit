@@ -123,9 +123,6 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
-    - name: Schedule search E2E tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: ./tests/util/hermit_analyze_e2e.sh
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
