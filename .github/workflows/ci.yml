@@ -9,7 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
-  RUSTFLAGS: -C link-arg=-llzma
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   regular:
@@ -44,8 +45,10 @@ jobs:
       run: |
         cargo test -p detcore --lib --bins
         cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-    - name: Documentation tests
-      run: cargo test --workspace --doc
+    - name: Documentation
+      run: |
+        cargo test --workspace --doc
+        cargo doc --workspace --no-deps
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Clippy
