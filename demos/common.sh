@@ -24,6 +24,40 @@ if [ ! -f "$HERMIT_REPO/Cargo.toml" ]; then
   exit 1
 fi
 
+# Verify the native build prerequisites BEFORE attempting a cargo build. The
+# Hermit dependency `unwind-sys` runs `pkg-config --libs --cflags
+# libunwind-ptrace` in its build script and panics if the package is missing,
+# which otherwise surfaces as a confusing mid-build failure on a fresh machine.
+require_prereqs() {
+  local missing=()
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    missing+=("pkg-config")
+  else
+    # unwind-sys's build script runs `pkg-config ... libunwind-ptrace` and panics
+    # if that module is absent, so this is the hard, reproducible requirement.
+    pkg-config --exists libunwind-ptrace 2>/dev/null \
+      || missing+=("libunwind-dev (provides the libunwind-ptrace pkg-config module)")
+  fi
+  # liblzma is a documented build dependency but is linked directly (-llzma)
+  # rather than through pkg-config, so accept any of a pkg-config module, a
+  # shared library, or the dev header to avoid false positives.
+  if ! { pkg-config --exists liblzma 2>/dev/null \
+         || ldconfig -p 2>/dev/null | grep -q 'liblzma\.so' \
+         || [ -e /usr/include/lzma.h ]; }; then
+    missing+=("liblzma-dev")
+  fi
+  if [ "${#missing[@]}" -ne 0 ]; then
+    {
+      echo "ERROR: missing build prerequisites: ${missing[*]}"
+      echo "Install them and re-run this demo:"
+      echo "  Debian/Ubuntu: sudo apt install libunwind-dev liblzma-dev pkg-config"
+      echo "  Fedora/CentOS: sudo dnf install libunwind-devel xz-devel pkgconf-pkg-config"
+    } >&2
+    exit 1
+  fi
+}
+require_prereqs
+
 # Build the debug binaries used for the validated record/replay path and
 # source-resolved analyzer output. The release build remains available for
 # normal use. Set DEMO_SKIP_BUILD=1 to reuse an existing build.
@@ -103,3 +137,23 @@ chaos_run() {
 demo_banner() {
   printf '\n=== %s ===\n' "$*"
 }
+
+# Returns success when the host can virtualize CPUID (CPUID faulting available).
+# Without it CPUID is a host input, which produces "Unable to intercept CPUID"
+# warnings and can desync record/replay; callers should then add
+# --no-virtualize-cpuid. The portable run wrappers above already pass it
+# unconditionally; direct `hermit` invocations (e.g. demo 4's analyze) use this.
+hermit_supports_cpuid_faulting() {
+  ! "$HERMIT" --log=error run --base-env=minimal -- /bin/true 2>&1 \
+    | grep -q "does not support CPUID faulting"
+}
+
+# Clear pass/fail verdict for a demo. The demo sets DEMO_LABEL before sourcing
+# this file; the ERR trap fires on the first failing command under `set -e`, and
+# demo_success prints on clean completion.
+demo_success() { printf '\n=== %s: SUCCESS ===\n' "${DEMO_LABEL:-demo}"; }
+demo_failure() {
+  local rc=$?
+  printf '\n=== %s: FAILURE (exit %d) — see errors above ===\n' "${DEMO_LABEL:-demo}" "$rc" >&2
+}
+trap demo_failure ERR

@@ -7,6 +7,12 @@
 
 set -euo pipefail
 
+demo_suite_failure() {
+  local rc=$?
+  printf '\n=== Demo suite: FAILURE (exit %d) — see errors above ===\n' "$rc" >&2
+}
+trap demo_suite_failure ERR
+
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Build once and share one scratch directory across the demos.
@@ -21,5 +27,4 @@ if [ "${1:-}" = "--with-analyze" ]; then
   bash "$DEMO_DIR/04-schedule-bisection.sh"
 fi
 
-echo
-echo "All requested demos completed."
+printf '\n=== Demo suite: SUCCESS — all requested demos passed ===\n'
