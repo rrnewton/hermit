@@ -1172,7 +1172,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         deregister_thread(
             dettid,
             thread_state.thread_logical_time.clone(),
-            &self.cfg,
             global_state,
             detpid,
             mm_id,

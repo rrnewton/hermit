@@ -299,12 +299,14 @@ fn rdtsc_observes_global_time() {
             .unwrap();
 
             let clock_nanos = monotonic_nanos();
-            let tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
+            let first_tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
+            let second_tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
 
             assert!(
-                tsc >= clock_nanos,
-                "RDTSC time {tsc} did not include global time {clock_nanos}"
+                first_tsc > clock_nanos,
+                "RDTSC time {first_tsc} did not advance past global time {clock_nanos}"
             );
+            assert!(second_tsc > first_tsc, "RDTSC stopped at {first_tsc}");
         },
         config,
         true,
