@@ -294,8 +294,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollWait,
     ) -> Result<i64, Error> {
+        // Capture the output buffer before `call` is consumed by the poll loop.
+        let events = call.events();
         let timeout = millis_timeout(guest, call.timeout()).await;
-        execute_internal_io_polling(guest, call, timeout).await
+        let ready = execute_internal_io_polling(guest, call, timeout).await?;
+        if ready > 0 && let Some(events) = events {
+            Self::determinize_epoll_events(guest, events, ready as usize)?;
+        }
+        Ok(ready)
+    }
+
+    /// Impose a deterministic order on the `epoll_event`s the kernel wrote into
+    /// the guest's output buffer.
+    ///
+    /// The kernel returns ready events in an unspecified order that depends on
+    /// host timing and the internal ready-list state of the epoll instance;
+    /// `epoll_wait(2)` guarantees nothing about ordering, so reordering the
+    /// results is always valid for a conforming program. Hermit must
+    /// nonetheless emit identical bytes on every run, so we sort the returned
+    /// slice by the caller-registered `data` value — the key an application
+    /// attaches with `epoll_ctl`, conventionally the fd — using the event mask
+    /// as a tiebreaker. Sorting on `data` rather than on any host-dependent
+    /// quantity keeps the order stable across runs and hosts.
+    fn determinize_epoll_events<G: Guest<Self>>(
+        guest: &mut G,
+        events: AddrMut<libc::epoll_event>,
+        count: usize,
+    ) -> Result<(), Error> {
+        if count <= 1 {
+            return Ok(());
+        }
+        let mut buf = vec![libc::epoll_event { events: 0, u64: 0 }; count];
+        let mut memory = guest.memory();
+        memory.read_values(events.into(), &mut buf)?;
+        buf.sort_by_key(|event| {
+            // `libc::epoll_event` is `#[repr(packed)]`, so copy the fields out
+            // by value rather than taking references to unaligned storage.
+            let data = event.u64;
+            let mask = event.events;
+            (data, mask)
+        });
+        memory.write_values(events, &buf)?;
+        Ok(())
     }
 
     /// Connect system call (MAYHANG)
