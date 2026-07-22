@@ -31,6 +31,7 @@ struct Workloads {
     stable: Vec<Workload>,
     default_only: Vec<Workload>,
     hello_race: Workload,
+    resource_determinism: Workload,
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +291,15 @@ fn workloads() -> &'static Workloads {
 
         default_only.extend(cargo_guest_workloads(repository));
 
+        let resource_determinism = workload(
+            "resource_determinism",
+            build_root.join("resource_determinism"),
+        );
+        compile_c(
+            &repository.join("tests/c/resource_determinism.c"),
+            &resource_determinism.path,
+        );
+
         let hello_race = workload("hello_race", build_root.join("hello_race"));
         compile_rust(
             &repository.join("flaky-tests/hello_race.rs"),
@@ -300,6 +310,7 @@ fn workloads() -> &'static Workloads {
             stable,
             default_only,
             hello_race,
+            resource_determinism,
         }
     })
 }
@@ -401,6 +412,46 @@ buck_chaos_tests! {
 #[test]
 fn default_mode_matrix() {
     run_stable_matrix(RunMode::Default);
+}
+
+#[test]
+fn resource_syscalls_are_deterministic_across_five_runs() {
+    let _guard = hermit_run_lock();
+    let workload = &workloads().resource_determinism;
+    let mut baseline = None;
+
+    for run in 1..=5 {
+        let mut command = hermit_command("minimal");
+        command.arg("--").arg(&workload.path);
+        let output = command_output(command, &format!("resource determinism run {run}"));
+        let stdout = String::from_utf8(output.stdout).expect("resource output should be UTF-8");
+
+        for expected in [
+            "limit CPU",
+            "limit RTTIME",
+            "setrlimit libc",
+            "setrlimit syscall",
+            "prlimit64",
+            "rusage self zero",
+            "rusage thread zero",
+            "rusage children zero",
+            "sysinfo",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "run {run} missing {expected:?}:\n{stdout}"
+            );
+        }
+
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                &stdout, expected,
+                "resource syscall output changed on run {run}"
+            );
+        } else {
+            baseline = Some(stdout);
+        }
+    }
 }
 
 fn run_default_workload(name: &str) {

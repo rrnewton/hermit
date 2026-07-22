@@ -10,6 +10,7 @@ use procfs::process::Process;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
 use crate::Detcore;
@@ -19,6 +20,25 @@ use crate::tool_global::thread_observe_time;
 const MB: u64 = 1024 * 1024;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Return a deterministic resource-usage snapshot. Host CPU times, page-fault counts, and
+    /// context-switch counts depend on kernel scheduling, so report zero until Detcore models
+    /// those counters using logical execution progress.
+    pub async fn handle_getrusage<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getrusage,
+    ) -> Result<i64, Error> {
+        match call.who() {
+            libc::RUSAGE_SELF | libc::RUSAGE_CHILDREN | libc::RUSAGE_THREAD => {}
+            _ => return Err(Errno::EINVAL.into()),
+        }
+
+        let usage = call.usage().ok_or(Errno::EFAULT)?;
+        let zeroed = [0; std::mem::size_of::<libc::rusage>()];
+        guest.memory().write_exact(usage.cast(), &zeroed)?;
+        Ok(0)
+    }
+
     /// handle sysinfo syscall
     pub async fn handle_sysinfo<G: Guest<Self>>(
         &self,
