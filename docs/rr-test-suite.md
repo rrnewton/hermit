@@ -17,9 +17,10 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
   git submodule update --init third-party/rr
   ```
 - **Harness:** `hermit-cli/tests/rr_suite.rs`. It generates rr's syscall-enum
-  headers with rr's own `generate_syscalls.py`, compiles each `src/test/<name>.c`
-  with rr's `RR_TEST_FLAGS` (`-D_FILE_OFFSET_BITS=64 -pthread -std=gnu11 -g3 -O0`,
-  linked against `-ldl -lrt`), and runs it as:
+  headers with rr's own `generate_syscalls.py`, freshly compiles each
+  `src/test/<name>.c` invocation with rr's `RR_TEST_FLAGS`
+  (`-D_FILE_OFFSET_BITS=64 -pthread -std=gnu11 -g3 -O0`, linked against
+  `-ldl -lrt`), and runs it as:
   ```sh
   hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
   ```
@@ -45,11 +46,12 @@ disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
 programs build against this checkout and **212** pass a one-shot `hermit run`.
 One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
 (intermittently hangs), so the harness enables the remaining **211**. Each run is
-wrapped in `timeout(1)` (`120s`) so any future hang fails that test cleanly
-rather than blocking the serialized suite. Special cases carried over from fbsource:
+wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
+future hang fails that test cleanly rather than blocking the serialized suite.
+Special cases carried over from fbsource:
 
 - `rr_args` runs with `-no --force-syscall-buffer=foo -c 1000 hello` (exit 0).
-- `rr_pause` expects exit code 1.
+- `rr_pause` expects exit code 1 and must print its final `EXIT-SUCCESS` marker.
 
 ## Known failures (not yet enabled) — bugs to file
 
