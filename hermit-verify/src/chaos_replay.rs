@@ -30,6 +30,14 @@ pub struct ChaosReplayOpts {
     #[clap(long)]
     isolate_workdir: bool,
 
+    /// Substring of DETLOG lines to exclude from the determinism comparison
+    /// (repeatable). Use this to drop instrumentation-only records that are not
+    /// guest-visible, such as the bootstrap `execve` whose injected argv/envp
+    /// buffer pointers live in the reverie guest-agent injection region and can
+    /// differ between the record and replay processes.
+    #[clap(long = "ignore-line")]
+    ignore_line: Vec<String>,
+
     /// Additional arguments for hermit run subcommand
     #[clap(long)]
     hermit_arg: Vec<String>,
@@ -100,7 +108,45 @@ impl UseCase for ChaosReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: true,
-            ignore_lines: vec![String::from("CHAOSRAND")],
+            ignore_lines: {
+                let mut lines = vec![String::from("CHAOSRAND")];
+                lines.extend(self.ignore_line.iter().cloned());
+                lines
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::ChaosReplayOpts;
+    use crate::use_case::UseCase;
+
+    fn chaos_replay_opts() -> ChaosReplayOpts {
+        ChaosReplayOpts {
+            keep_temp_dir: false,
+            isolate_workdir: false,
+            ignore_line: Vec::new(),
+            hermit_arg: Vec::new(),
+            guest_program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_ignore_lines_only_drop_chaos_randomness() {
+        let ignore_lines = chaos_replay_opts().options().ignore_lines;
+        assert_eq!(ignore_lines, vec!["CHAOSRAND".to_string()]);
+    }
+
+    #[test]
+    fn ignore_line_is_appended_to_comparison_filters() {
+        let mut opts = chaos_replay_opts();
+        opts.ignore_line = vec!["syscall=execve".to_string()];
+        let ignore_lines = opts.options().ignore_lines;
+        assert!(ignore_lines.iter().any(|line| line == "CHAOSRAND"));
+        assert!(ignore_lines.iter().any(|line| line == "syscall=execve"));
     }
 }

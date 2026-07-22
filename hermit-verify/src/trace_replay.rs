@@ -41,6 +41,14 @@ pub struct TraceReplayOpts {
     #[clap(long)]
     strip_times: bool,
 
+    /// Substring of DETLOG lines to exclude from the determinism comparison
+    /// (repeatable). Use this to drop instrumentation-only records that are not
+    /// guest-visible, such as the bootstrap `execve` whose injected argv/envp
+    /// buffer pointers live in the reverie guest-agent injection region and can
+    /// differ between the record and replay processes.
+    #[clap(long = "ignore-line")]
+    ignore_line: Vec<String>,
+
     /// Additional argument for hermit run subcommand
     #[clap(long)]
     hermit_arg: Vec<String>,
@@ -131,17 +139,21 @@ impl UseCase for TraceReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: if self.chaos {
-                vec![
-                    "CHAOSRAND".to_string(),
-                    "advance global time for scheduler turn".to_string(),
-                    // exit_group has no result, and schedule replay can finish at the end of the
-                    // recorded schedule without re-entering its syscall callback. Exit status is
-                    // compared separately.
-                    "inbound syscall: exit_group".to_string(),
-                ]
-            } else {
-                Vec::new()
+            ignore_lines: {
+                let mut lines = if self.chaos {
+                    vec![
+                        "CHAOSRAND".to_string(),
+                        "advance global time for scheduler turn".to_string(),
+                        // exit_group has no result, and schedule replay can finish at the end of the
+                        // recorded schedule without re-entering its syscall callback. Exit status is
+                        // compared separately.
+                        "inbound syscall: exit_group".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                lines.extend(self.ignore_line.iter().cloned());
+                lines
             },
         }
     }
@@ -189,6 +201,7 @@ mod tests {
             isolate_workdir: false,
             chaos,
             strip_times: false,
+            ignore_line: Vec::new(),
             hermit_arg: Vec::new(),
             guest_program: PathBuf::from("/bin/true"),
             split_branches: false,
@@ -218,5 +231,24 @@ mod tests {
                 .iter()
                 .any(|line| line == "inbound syscall: exit_group")
         );
+    }
+
+    #[test]
+    fn ignore_line_is_appended_to_comparison_filters() {
+        let mut opts = trace_replay_opts(false);
+        opts.ignore_line = vec!["syscall=execve".to_string()];
+        assert!(
+            opts.options()
+                .ignore_lines
+                .iter()
+                .any(|line| line == "syscall=execve")
+        );
+
+        // Chaos exclusions and the user-provided filter coexist.
+        let mut chaos = trace_replay_opts(true);
+        chaos.ignore_line = vec!["syscall=execve".to_string()];
+        let ignore_lines = chaos.options().ignore_lines;
+        assert!(ignore_lines.iter().any(|line| line == "CHAOSRAND"));
+        assert!(ignore_lines.iter().any(|line| line == "syscall=execve"));
     }
 }
