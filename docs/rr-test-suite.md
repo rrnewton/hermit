@@ -24,7 +24,8 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
   ```sh
   hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
   ```
-  asserting the expected exit code.
+  asserting the expected exit code. Each invocation uses a unique temporary
+  working directory that is removed after the test.
 
 ## Running
 
@@ -43,9 +44,10 @@ cargo test -p hermit --test rr_suite -- --ignored rr_hello # one
 
 Starting from the fbsource `RR_TEST_TARGETS` minus the tests fbsource already
 disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
-programs build against this checkout and **212** pass a one-shot `hermit run`.
+programs build against this checkout and **214** pass when each program receives
+a fresh scratch directory.
 One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
-(intermittently hangs), so the harness enables the remaining **211**. Each run is
+(intermittently hangs), so the harness enables the remaining **213**. Each run is
 wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
 future hang fails that test cleanly rather than blocking the serialized suite.
 Special cases carried over from fbsource:
@@ -60,8 +62,6 @@ They are excluded from the harness and tracked here:
 
 | rr test | symptom | likely Hermit gap |
 | --- | --- | --- |
-| `rr_mmap_ro` | guest aborts: `mmap_ro.c:13 !(fd >= 0) errno:17 (File exists)` | `O_CREAT\|O_EXCL` temp-file creation sees a stale file — filesystem/tmp determinism |
-| `rr_mmap_short_file` | guest aborts (SIGABRT) | mmap of a file shorter than the mapping |
 | `rr_rusage` | guest aborts: `rusage.c:10 !(r->ru_maxrss > 0)` | `getrusage` returns `ru_maxrss == 0` (rusage not virtualized) |
 | `rr_sigchld_interrupt_signal` | hangs (>60s timeout) | SIGCHLD interrupt/restart handling |
 | `rr_sigprocmask_in_syscallbuf_sighandler` | hangs (>60s timeout) | signal mask manipulation inside a signal handler |
