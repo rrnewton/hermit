@@ -1,0 +1,918 @@
+[==========] Running 410 tests from 31 test suites.
+[----------] Global test environment set-up.
+[----------] 5 tests from CanonicalizePath
+[ RUN      ] CanonicalizePath.PathSamples
+[       OK ] CanonicalizePath.PathSamples (0 ms)
+[ RUN      ] CanonicalizePath.TooManyComponents
+[       OK ] CanonicalizePath.TooManyComponents (0 ms)
+[ RUN      ] CanonicalizePath.UpDir
+[       OK ] CanonicalizePath.UpDir (0 ms)
+[ RUN      ] CanonicalizePath.AbsolutePath
+[       OK ] CanonicalizePath.AbsolutePath (0 ms)
+[ RUN      ] CanonicalizePath.NotNullTerminated
+[       OK ] CanonicalizePath.NotNullTerminated (0 ms)
+[----------] 5 tests from CanonicalizePath (0 ms total)
+
+[----------] 3 tests from PathEscaping
+[ RUN      ] PathEscaping.TortureTest
+[       OK ] PathEscaping.TortureTest (0 ms)
+[ RUN      ] PathEscaping.SensiblePathsAreNotNeedlesslyEscaped
+[       OK ] PathEscaping.SensiblePathsAreNotNeedlesslyEscaped (0 ms)
+[ RUN      ] PathEscaping.SensibleWin32PathsAreNotNeedlesslyEscaped
+[       OK ] PathEscaping.SensibleWin32PathsAreNotNeedlesslyEscaped (0 ms)
+[----------] 3 tests from PathEscaping (0 ms total)
+
+[----------] 2 tests from StripAnsiEscapeCodes
+[ RUN      ] StripAnsiEscapeCodes.EscapeAtEnd
+[       OK ] StripAnsiEscapeCodes.EscapeAtEnd (0 ms)
+[ RUN      ] StripAnsiEscapeCodes.StripColors
+[       OK ] StripAnsiEscapeCodes.StripColors (0 ms)
+[----------] 2 tests from StripAnsiEscapeCodes (0 ms total)
+
+[----------] 13 tests from SubprocessTest
+[ RUN      ] SubprocessTest.BadCommandStderr
+[       OK ] SubprocessTest.BadCommandStderr (1 ms)
+[ RUN      ] SubprocessTest.NoSuchCommand
+[       OK ] SubprocessTest.NoSuchCommand (1 ms)
+[ RUN      ] SubprocessTest.InterruptChild
+[       OK ] SubprocessTest.InterruptChild (1 ms)
+[ RUN      ] SubprocessTest.InterruptParent
+[       OK ] SubprocessTest.InterruptParent (1 ms)
+[ RUN      ] SubprocessTest.InterruptChildWithSigTerm
+[       OK ] SubprocessTest.InterruptChildWithSigTerm (1 ms)
+[ RUN      ] SubprocessTest.InterruptParentWithSigTerm
+[       OK ] SubprocessTest.InterruptParentWithSigTerm (0 ms)
+[ RUN      ] SubprocessTest.InterruptChildWithSigHup
+[       OK ] SubprocessTest.InterruptChildWithSigHup (0 ms)
+[ RUN      ] SubprocessTest.InterruptParentWithSigHup
+[       OK ] SubprocessTest.InterruptParentWithSigHup (1 ms)
+[ RUN      ] SubprocessTest.Console
+[       OK ] SubprocessTest.Console (0 ms)
+[ RUN      ] SubprocessTest.SetWithSingle
+[       OK ] SubprocessTest.SetWithSingle (2 ms)
+[ RUN      ] SubprocessTest.SetWithMulti
+[       OK ] SubprocessTest.SetWithMulti (2 ms)
+[ RUN      ] SubprocessTest.SetWithLots
+[       OK ] SubprocessTest.SetWithLots (230 ms)
+[ RUN      ] SubprocessTest.ReadStdin
+[       OK ] SubprocessTest.ReadStdin (1 ms)
+[----------] 13 tests from SubprocessTest (246 ms total)
+
+[----------] 4 tests from StringPieceUtilTest
+[ RUN      ] StringPieceUtilTest.SplitStringPiece
+[       OK ] StringPieceUtilTest.SplitStringPiece (0 ms)
+[ RUN      ] StringPieceUtilTest.JoinStringPiece
+[       OK ] StringPieceUtilTest.JoinStringPiece (0 ms)
+[ RUN      ] StringPieceUtilTest.ToLowerASCII
+[       OK ] StringPieceUtilTest.ToLowerASCII (0 ms)
+[ RUN      ] StringPieceUtilTest.EqualsCaseInsensitiveASCII
+[       OK ] StringPieceUtilTest.EqualsCaseInsensitiveASCII (0 ms)
+[----------] 4 tests from StringPieceUtilTest (0 ms total)
+
+[----------] 1 test from State
+[ RUN      ] State.Basic
+[       OK ] State.Basic (0 ms)
+[----------] 1 test from State (0 ms total)
+
+[----------] 7 tests from MissingDependencyScannerTest
+[ RUN      ] MissingDependencyScannerTest.EmptyGraph
+[       OK ] MissingDependencyScannerTest.EmptyGraph (0 ms)
+[ RUN      ] MissingDependencyScannerTest.NoMissingDep
+[       OK ] MissingDependencyScannerTest.NoMissingDep (0 ms)
+[ RUN      ] MissingDependencyScannerTest.MissingDepPresent
+[       OK ] MissingDependencyScannerTest.MissingDepPresent (0 ms)
+[ RUN      ] MissingDependencyScannerTest.MissingDepFixedDirect
+[       OK ] MissingDependencyScannerTest.MissingDepFixedDirect (0 ms)
+[ RUN      ] MissingDependencyScannerTest.MissingDepFixedIndirect
+[       OK ] MissingDependencyScannerTest.MissingDepFixedIndirect (0 ms)
+[ RUN      ] MissingDependencyScannerTest.CyclicMissingDep
+[       OK ] MissingDependencyScannerTest.CyclicMissingDep (0 ms)
+[ RUN      ] MissingDependencyScannerTest.CycleInGraph
+[       OK ] MissingDependencyScannerTest.CycleInGraph (0 ms)
+[----------] 7 tests from MissingDependencyScannerTest (0 ms total)
+
+[----------] 51 tests from ParserTest
+[ RUN      ] ParserTest.Empty
+[       OK ] ParserTest.Empty (0 ms)
+[ RUN      ] ParserTest.Rules
+[       OK ] ParserTest.Rules (0 ms)
+[ RUN      ] ParserTest.RuleAttributes
+[       OK ] ParserTest.RuleAttributes (0 ms)
+[ RUN      ] ParserTest.IgnoreIndentedComments
+[       OK ] ParserTest.IgnoreIndentedComments (0 ms)
+[ RUN      ] ParserTest.IgnoreIndentedBlankLines
+[       OK ] ParserTest.IgnoreIndentedBlankLines (0 ms)
+[ RUN      ] ParserTest.ResponseFiles
+[       OK ] ParserTest.ResponseFiles (0 ms)
+[ RUN      ] ParserTest.InNewline
+[       OK ] ParserTest.InNewline (0 ms)
+[ RUN      ] ParserTest.Variables
+[       OK ] ParserTest.Variables (0 ms)
+[ RUN      ] ParserTest.VariableScope
+[       OK ] ParserTest.VariableScope (0 ms)
+[ RUN      ] ParserTest.Continuation
+[       OK ] ParserTest.Continuation (0 ms)
+[ RUN      ] ParserTest.Backslash
+[       OK ] ParserTest.Backslash (0 ms)
+[ RUN      ] ParserTest.Comment
+[       OK ] ParserTest.Comment (0 ms)
+[ RUN      ] ParserTest.Dollars
+[       OK ] ParserTest.Dollars (0 ms)
+[ RUN      ] ParserTest.EscapeSpaces
+[       OK ] ParserTest.EscapeSpaces (0 ms)
+[ RUN      ] ParserTest.CanonicalizeFile
+[       OK ] ParserTest.CanonicalizeFile (0 ms)
+[ RUN      ] ParserTest.PathVariables
+[       OK ] ParserTest.PathVariables (0 ms)
+[ RUN      ] ParserTest.CanonicalizePaths
+[       OK ] ParserTest.CanonicalizePaths (0 ms)
+[ RUN      ] ParserTest.DuplicateEdgeWithMultipleOutputsError
+[       OK ] ParserTest.DuplicateEdgeWithMultipleOutputsError (0 ms)
+[ RUN      ] ParserTest.DuplicateEdgeInIncludedFile
+[       OK ] ParserTest.DuplicateEdgeInIncludedFile (0 ms)
+[ RUN      ] ParserTest.PhonySelfReferenceIgnored
+[       OK ] ParserTest.PhonySelfReferenceIgnored (0 ms)
+[ RUN      ] ParserTest.PhonySelfReferenceKept
+[       OK ] ParserTest.PhonySelfReferenceKept (0 ms)
+[ RUN      ] ParserTest.ReservedWords
+[       OK ] ParserTest.ReservedWords (0 ms)
+[ RUN      ] ParserTest.Errors
+[       OK ] ParserTest.Errors (0 ms)
+[ RUN      ] ParserTest.MissingInput
+[       OK ] ParserTest.MissingInput (0 ms)
+[ RUN      ] ParserTest.MultipleOutputs
+[       OK ] ParserTest.MultipleOutputs (0 ms)
+[ RUN      ] ParserTest.MultipleOutputsWithDeps
+[       OK ] ParserTest.MultipleOutputsWithDeps (0 ms)
+[ RUN      ] ParserTest.SubNinja
+[       OK ] ParserTest.SubNinja (0 ms)
+[ RUN      ] ParserTest.MissingSubNinja
+[       OK ] ParserTest.MissingSubNinja (0 ms)
+[ RUN      ] ParserTest.DuplicateRuleInDifferentSubninjas
+[       OK ] ParserTest.DuplicateRuleInDifferentSubninjas (0 ms)
+[ RUN      ] ParserTest.DuplicateRuleInDifferentSubninjasWithInclude
+[       OK ] ParserTest.DuplicateRuleInDifferentSubninjasWithInclude (0 ms)
+[ RUN      ] ParserTest.Include
+[       OK ] ParserTest.Include (0 ms)
+[ RUN      ] ParserTest.BrokenInclude
+[       OK ] ParserTest.BrokenInclude (0 ms)
+[ RUN      ] ParserTest.Implicit
+[       OK ] ParserTest.Implicit (0 ms)
+[ RUN      ] ParserTest.OrderOnly
+[       OK ] ParserTest.OrderOnly (0 ms)
+[ RUN      ] ParserTest.Validations
+[       OK ] ParserTest.Validations (0 ms)
+[ RUN      ] ParserTest.ImplicitOutput
+[       OK ] ParserTest.ImplicitOutput (0 ms)
+[ RUN      ] ParserTest.ImplicitOutputEmpty
+[       OK ] ParserTest.ImplicitOutputEmpty (0 ms)
+[ RUN      ] ParserTest.ImplicitOutputDupeError
+[       OK ] ParserTest.ImplicitOutputDupeError (0 ms)
+[ RUN      ] ParserTest.ImplicitOutputDupesError
+[       OK ] ParserTest.ImplicitOutputDupesError (0 ms)
+[ RUN      ] ParserTest.NoExplicitOutput
+[       OK ] ParserTest.NoExplicitOutput (0 ms)
+[ RUN      ] ParserTest.DefaultDefault
+[       OK ] ParserTest.DefaultDefault (0 ms)
+[ RUN      ] ParserTest.DefaultDefaultCycle
+[       OK ] ParserTest.DefaultDefaultCycle (0 ms)
+[ RUN      ] ParserTest.DefaultStatements
+[       OK ] ParserTest.DefaultStatements (0 ms)
+[ RUN      ] ParserTest.UTF8
+[       OK ] ParserTest.UTF8 (0 ms)
+[ RUN      ] ParserTest.CRLF
+[       OK ] ParserTest.CRLF (0 ms)
+[ RUN      ] ParserTest.DyndepNotSpecified
+[       OK ] ParserTest.DyndepNotSpecified (0 ms)
+[ RUN      ] ParserTest.DyndepNotInput
+[       OK ] ParserTest.DyndepNotInput (0 ms)
+[ RUN      ] ParserTest.DyndepExplicitInput
+[       OK ] ParserTest.DyndepExplicitInput (0 ms)
+[ RUN      ] ParserTest.DyndepImplicitInput
+[       OK ] ParserTest.DyndepImplicitInput (0 ms)
+[ RUN      ] ParserTest.DyndepOrderOnlyInput
+[       OK ] ParserTest.DyndepOrderOnlyInput (0 ms)
+[ RUN      ] ParserTest.DyndepRuleInput
+[       OK ] ParserTest.DyndepRuleInput (0 ms)
+[----------] 51 tests from ParserTest (0 ms total)
+
+[----------] 7 tests from Lexer
+[ RUN      ] Lexer.ReadVarValue
+[       OK ] Lexer.ReadVarValue (0 ms)
+[ RUN      ] Lexer.ReadEvalStringEscapes
+[       OK ] Lexer.ReadEvalStringEscapes (0 ms)
+[ RUN      ] Lexer.ReadIdent
+[       OK ] Lexer.ReadIdent (0 ms)
+[ RUN      ] Lexer.ReadIdentCurlies
+[       OK ] Lexer.ReadIdentCurlies (0 ms)
+[ RUN      ] Lexer.Error
+[       OK ] Lexer.Error (0 ms)
+[ RUN      ] Lexer.CommentEOF
+[       OK ] Lexer.CommentEOF (0 ms)
+[ RUN      ] Lexer.Tabs
+[       OK ] Lexer.Tabs (0 ms)
+[----------] 7 tests from Lexer (0 ms total)
+
+[----------] 4 tests from JSONTest
+[ RUN      ] JSONTest.RegularAscii
+[       OK ] JSONTest.RegularAscii (0 ms)
+[ RUN      ] JSONTest.EscapedChars
+[       OK ] JSONTest.EscapedChars (0 ms)
+[ RUN      ] JSONTest.ControlChars
+[       OK ] JSONTest.ControlChars (0 ms)
+[ RUN      ] JSONTest.UTF8
+[       OK ] JSONTest.UTF8 (0 ms)
+[----------] 4 tests from JSONTest (0 ms total)
+
+[----------] 6 tests from Jobserver
+[ RUN      ] Jobserver.SlotTest
+[       OK ] Jobserver.SlotTest (0 ms)
+[ RUN      ] Jobserver.ParseMakeFlagsValue
+[       OK ] Jobserver.ParseMakeFlagsValue (0 ms)
+[ RUN      ] Jobserver.ParseNativeMakeFlagsValue
+[       OK ] Jobserver.ParseNativeMakeFlagsValue (0 ms)
+[ RUN      ] Jobserver.NullJobserver
+[       OK ] Jobserver.NullJobserver (0 ms)
+[ RUN      ] Jobserver.PosixFifoClient
+[       OK ] Jobserver.PosixFifoClient (0 ms)
+[ RUN      ] Jobserver.PosixFifoClientWithWrongPath
+[       OK ] Jobserver.PosixFifoClientWithWrongPath (0 ms)
+[----------] 6 tests from Jobserver (0 ms total)
+
+[----------] 50 tests from GraphTest
+[ RUN      ] GraphTest.MissingImplicit
+[       OK ] GraphTest.MissingImplicit (0 ms)
+[ RUN      ] GraphTest.ModifiedImplicit
+[       OK ] GraphTest.ModifiedImplicit (0 ms)
+[ RUN      ] GraphTest.FunkyMakefilePath
+[       OK ] GraphTest.FunkyMakefilePath (0 ms)
+[ RUN      ] GraphTest.ExplicitImplicit
+[       OK ] GraphTest.ExplicitImplicit (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputParse
+[       OK ] GraphTest.ImplicitOutputParse (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputMissing
+[       OK ] GraphTest.ImplicitOutputMissing (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputOutOfDate
+[       OK ] GraphTest.ImplicitOutputOutOfDate (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputOnlyParse
+[       OK ] GraphTest.ImplicitOutputOnlyParse (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputOnlyMissing
+[       OK ] GraphTest.ImplicitOutputOnlyMissing (0 ms)
+[ RUN      ] GraphTest.ImplicitOutputOnlyOutOfDate
+[       OK ] GraphTest.ImplicitOutputOnlyOutOfDate (0 ms)
+[ RUN      ] GraphTest.PathWithCurrentDirectory
+[       OK ] GraphTest.PathWithCurrentDirectory (0 ms)
+[ RUN      ] GraphTest.RootNodes
+[       OK ] GraphTest.RootNodes (0 ms)
+[ RUN      ] GraphTest.InputsCollector
+[       OK ] GraphTest.InputsCollector (0 ms)
+[ RUN      ] GraphTest.InputsCollectorWithEscapes
+[       OK ] GraphTest.InputsCollectorWithEscapes (0 ms)
+[ RUN      ] GraphTest.CommandCollector
+[       OK ] GraphTest.CommandCollector (0 ms)
+[ RUN      ] GraphTest.VarInOutPathEscaping
+[       OK ] GraphTest.VarInOutPathEscaping (0 ms)
+[ RUN      ] GraphTest.DepfileWithCanonicalizablePath
+[       OK ] GraphTest.DepfileWithCanonicalizablePath (0 ms)
+[ RUN      ] GraphTest.DepfileRemoved
+[       OK ] GraphTest.DepfileRemoved (0 ms)
+[ RUN      ] GraphTest.RuleVariablesInScope
+[       OK ] GraphTest.RuleVariablesInScope (0 ms)
+[ RUN      ] GraphTest.DepfileOverride
+[       OK ] GraphTest.DepfileOverride (0 ms)
+[ RUN      ] GraphTest.DepfileOverrideParent
+[       OK ] GraphTest.DepfileOverrideParent (0 ms)
+[ RUN      ] GraphTest.NestedPhonyPrintsDone
+[       OK ] GraphTest.NestedPhonyPrintsDone (0 ms)
+[ RUN      ] GraphTest.PhonySelfReferenceError
+[       OK ] GraphTest.PhonySelfReferenceError (0 ms)
+[ RUN      ] GraphTest.DependencyCycle
+[       OK ] GraphTest.DependencyCycle (0 ms)
+[ RUN      ] GraphTest.CycleInEdgesButNotInNodes1
+[       OK ] GraphTest.CycleInEdgesButNotInNodes1 (0 ms)
+[ RUN      ] GraphTest.CycleInEdgesButNotInNodes2
+[       OK ] GraphTest.CycleInEdgesButNotInNodes2 (0 ms)
+[ RUN      ] GraphTest.CycleInEdgesButNotInNodes3
+[       OK ] GraphTest.CycleInEdgesButNotInNodes3 (0 ms)
+[ RUN      ] GraphTest.CycleInEdgesButNotInNodes4
+[       OK ] GraphTest.CycleInEdgesButNotInNodes4 (0 ms)
+[ RUN      ] GraphTest.CycleWithLengthZeroFromDepfile
+[       OK ] GraphTest.CycleWithLengthZeroFromDepfile (0 ms)
+[ RUN      ] GraphTest.CycleWithLengthOneFromDepfile
+[       OK ] GraphTest.CycleWithLengthOneFromDepfile (0 ms)
+[ RUN      ] GraphTest.CycleWithLengthOneFromDepfileOneHopAway
+[       OK ] GraphTest.CycleWithLengthOneFromDepfileOneHopAway (0 ms)
+[ RUN      ] GraphTest.DyndepLoadTrivial
+[       OK ] GraphTest.DyndepLoadTrivial (0 ms)
+[ RUN      ] GraphTest.DyndepLoadImplicit
+[       OK ] GraphTest.DyndepLoadImplicit (0 ms)
+[ RUN      ] GraphTest.DyndepLoadMissingFile
+[       OK ] GraphTest.DyndepLoadMissingFile (0 ms)
+[ RUN      ] GraphTest.DyndepLoadMissingEntry
+[       OK ] GraphTest.DyndepLoadMissingEntry (0 ms)
+[ RUN      ] GraphTest.DyndepLoadExtraEntry
+[       OK ] GraphTest.DyndepLoadExtraEntry (0 ms)
+[ RUN      ] GraphTest.DyndepLoadOutputWithMultipleRules1
+[       OK ] GraphTest.DyndepLoadOutputWithMultipleRules1 (0 ms)
+[ RUN      ] GraphTest.DyndepLoadOutputWithMultipleRules2
+[       OK ] GraphTest.DyndepLoadOutputWithMultipleRules2 (0 ms)
+[ RUN      ] GraphTest.DyndepLoadMultiple
+[       OK ] GraphTest.DyndepLoadMultiple (0 ms)
+[ RUN      ] GraphTest.DyndepFileMissing
+[       OK ] GraphTest.DyndepFileMissing (0 ms)
+[ RUN      ] GraphTest.DyndepFileError
+[       OK ] GraphTest.DyndepFileError (0 ms)
+[ RUN      ] GraphTest.DyndepImplicitInputNewer
+[       OK ] GraphTest.DyndepImplicitInputNewer (0 ms)
+[ RUN      ] GraphTest.DyndepFileReady
+[       OK ] GraphTest.DyndepFileReady (0 ms)
+[ RUN      ] GraphTest.DyndepFileNotClean
+[       OK ] GraphTest.DyndepFileNotClean (0 ms)
+[ RUN      ] GraphTest.DyndepFileNotReady
+[       OK ] GraphTest.DyndepFileNotReady (0 ms)
+[ RUN      ] GraphTest.DyndepFileSecondNotReady
+[       OK ] GraphTest.DyndepFileSecondNotReady (0 ms)
+[ RUN      ] GraphTest.DyndepFileCircular
+[       OK ] GraphTest.DyndepFileCircular (0 ms)
+[ RUN      ] GraphTest.Validation
+[       OK ] GraphTest.Validation (0 ms)
+[ RUN      ] GraphTest.PhonyDepsMtimes
+[       OK ] GraphTest.PhonyDepsMtimes (0 ms)
+[ RUN      ] GraphTest.EdgeQueuePriority
+[       OK ] GraphTest.EdgeQueuePriority (0 ms)
+[----------] 50 tests from GraphTest (0 ms total)
+
+[----------] 3 tests from Explanations
+[ RUN      ] Explanations.Explanations
+[       OK ] Explanations.Explanations (0 ms)
+[ RUN      ] Explanations.OptionalExplanationsNonNull
+[       OK ] Explanations.OptionalExplanationsNonNull (0 ms)
+[ RUN      ] Explanations.OptionalExplanationsWithNullPointer
+[       OK ] Explanations.OptionalExplanationsWithNullPointer (0 ms)
+[----------] 3 tests from Explanations (0 ms total)
+
+[----------] 3 tests from ElideMiddle
+[ RUN      ] ElideMiddle.NothingToElide
+[       OK ] ElideMiddle.NothingToElide (0 ms)
+[ RUN      ] ElideMiddle.ElideInTheMiddle
+[       OK ] ElideMiddle.ElideInTheMiddle (0 ms)
+[ RUN      ] ElideMiddle.ElideAnsiEscapeCodes
+[       OK ] ElideMiddle.ElideAnsiEscapeCodes (0 ms)
+[----------] 3 tests from ElideMiddle (0 ms total)
+
+[----------] 4 tests from EditDistanceTest
+[ RUN      ] EditDistanceTest.TestEmpty
+[       OK ] EditDistanceTest.TestEmpty (0 ms)
+[ RUN      ] EditDistanceTest.TestMaxDistance
+[       OK ] EditDistanceTest.TestMaxDistance (0 ms)
+[ RUN      ] EditDistanceTest.TestAllowReplacements
+[       OK ] EditDistanceTest.TestAllowReplacements (0 ms)
+[ RUN      ] EditDistanceTest.TestBasics
+[       OK ] EditDistanceTest.TestBasics (0 ms)
+[----------] 4 tests from EditDistanceTest (0 ms total)
+
+[----------] 42 tests from DyndepParserTest
+[ RUN      ] DyndepParserTest.Empty
+[       OK ] DyndepParserTest.Empty (0 ms)
+[ RUN      ] DyndepParserTest.Version1
+[       OK ] DyndepParserTest.Version1 (0 ms)
+[ RUN      ] DyndepParserTest.Version1Extra
+[       OK ] DyndepParserTest.Version1Extra (0 ms)
+[ RUN      ] DyndepParserTest.Version1_0
+[       OK ] DyndepParserTest.Version1_0 (0 ms)
+[ RUN      ] DyndepParserTest.Version1_0Extra
+[       OK ] DyndepParserTest.Version1_0Extra (0 ms)
+[ RUN      ] DyndepParserTest.CommentVersion
+[       OK ] DyndepParserTest.CommentVersion (0 ms)
+[ RUN      ] DyndepParserTest.BlankLineVersion
+[       OK ] DyndepParserTest.BlankLineVersion (0 ms)
+[ RUN      ] DyndepParserTest.VersionCRLF
+[       OK ] DyndepParserTest.VersionCRLF (0 ms)
+[ RUN      ] DyndepParserTest.CommentVersionCRLF
+[       OK ] DyndepParserTest.CommentVersionCRLF (0 ms)
+[ RUN      ] DyndepParserTest.BlankLineVersionCRLF
+[       OK ] DyndepParserTest.BlankLineVersionCRLF (0 ms)
+[ RUN      ] DyndepParserTest.VersionUnexpectedEOF
+[       OK ] DyndepParserTest.VersionUnexpectedEOF (0 ms)
+[ RUN      ] DyndepParserTest.UnsupportedVersion0
+[       OK ] DyndepParserTest.UnsupportedVersion0 (0 ms)
+[ RUN      ] DyndepParserTest.UnsupportedVersion1_1
+[       OK ] DyndepParserTest.UnsupportedVersion1_1 (0 ms)
+[ RUN      ] DyndepParserTest.DuplicateVersion
+[       OK ] DyndepParserTest.DuplicateVersion (0 ms)
+[ RUN      ] DyndepParserTest.MissingVersionOtherVar
+[       OK ] DyndepParserTest.MissingVersionOtherVar (0 ms)
+[ RUN      ] DyndepParserTest.MissingVersionBuild
+[       OK ] DyndepParserTest.MissingVersionBuild (0 ms)
+[ RUN      ] DyndepParserTest.UnexpectedEqual
+[       OK ] DyndepParserTest.UnexpectedEqual (0 ms)
+[ RUN      ] DyndepParserTest.UnexpectedIndent
+[       OK ] DyndepParserTest.UnexpectedIndent (0 ms)
+[ RUN      ] DyndepParserTest.OutDuplicate
+[       OK ] DyndepParserTest.OutDuplicate (0 ms)
+[ RUN      ] DyndepParserTest.OutDuplicateThroughOther
+[       OK ] DyndepParserTest.OutDuplicateThroughOther (0 ms)
+[ RUN      ] DyndepParserTest.NoOutEOF
+[       OK ] DyndepParserTest.NoOutEOF (0 ms)
+[ RUN      ] DyndepParserTest.NoOutColon
+[       OK ] DyndepParserTest.NoOutColon (0 ms)
+[ RUN      ] DyndepParserTest.OutNoStatement
+[       OK ] DyndepParserTest.OutNoStatement (0 ms)
+[ RUN      ] DyndepParserTest.OutEOF
+[       OK ] DyndepParserTest.OutEOF (0 ms)
+[ RUN      ] DyndepParserTest.OutNoRule
+[       OK ] DyndepParserTest.OutNoRule (0 ms)
+[ RUN      ] DyndepParserTest.OutBadRule
+[       OK ] DyndepParserTest.OutBadRule (0 ms)
+[ RUN      ] DyndepParserTest.BuildEOF
+[       OK ] DyndepParserTest.BuildEOF (0 ms)
+[ RUN      ] DyndepParserTest.ExplicitOut
+[       OK ] DyndepParserTest.ExplicitOut (0 ms)
+[ RUN      ] DyndepParserTest.ExplicitIn
+[       OK ] DyndepParserTest.ExplicitIn (0 ms)
+[ RUN      ] DyndepParserTest.OrderOnlyIn
+[       OK ] DyndepParserTest.OrderOnlyIn (0 ms)
+[ RUN      ] DyndepParserTest.BadBinding
+[       OK ] DyndepParserTest.BadBinding (0 ms)
+[ RUN      ] DyndepParserTest.RestatTwice
+[       OK ] DyndepParserTest.RestatTwice (0 ms)
+[ RUN      ] DyndepParserTest.NoImplicit
+[       OK ] DyndepParserTest.NoImplicit (0 ms)
+[ RUN      ] DyndepParserTest.EmptyImplicit
+[       OK ] DyndepParserTest.EmptyImplicit (0 ms)
+[ RUN      ] DyndepParserTest.ImplicitIn
+[       OK ] DyndepParserTest.ImplicitIn (0 ms)
+[ RUN      ] DyndepParserTest.ImplicitIns
+[       OK ] DyndepParserTest.ImplicitIns (0 ms)
+[ RUN      ] DyndepParserTest.ImplicitOut
+[       OK ] DyndepParserTest.ImplicitOut (0 ms)
+[ RUN      ] DyndepParserTest.ImplicitOuts
+[       OK ] DyndepParserTest.ImplicitOuts (0 ms)
+[ RUN      ] DyndepParserTest.ImplicitInsAndOuts
+[       OK ] DyndepParserTest.ImplicitInsAndOuts (0 ms)
+[ RUN      ] DyndepParserTest.Restat
+[       OK ] DyndepParserTest.Restat (0 ms)
+[ RUN      ] DyndepParserTest.OtherOutput
+[       OK ] DyndepParserTest.OtherOutput (0 ms)
+[ RUN      ] DyndepParserTest.MultipleEdges
+[       OK ] DyndepParserTest.MultipleEdges (0 ms)
+[----------] 42 tests from DyndepParserTest (0 ms total)
+
+[----------] 9 tests from DiskInterfaceTest
+[ RUN      ] DiskInterfaceTest.StatMissingFile
+[       OK ] DiskInterfaceTest.StatMissingFile (1 ms)
+[ RUN      ] DiskInterfaceTest.StatMissingFileWithCache
+[       OK ] DiskInterfaceTest.StatMissingFileWithCache (1 ms)
+[ RUN      ] DiskInterfaceTest.StatBadPath
+[       OK ] DiskInterfaceTest.StatBadPath (1 ms)
+[ RUN      ] DiskInterfaceTest.StatExistingFile
+[       OK ] DiskInterfaceTest.StatExistingFile (1 ms)
+[ RUN      ] DiskInterfaceTest.StatExistingDir
+[       OK ] DiskInterfaceTest.StatExistingDir (1 ms)
+[ RUN      ] DiskInterfaceTest.ReadFile
+[       OK ] DiskInterfaceTest.ReadFile (1 ms)
+[ RUN      ] DiskInterfaceTest.MakeDirs
+[       OK ] DiskInterfaceTest.MakeDirs (2 ms)
+[ RUN      ] DiskInterfaceTest.RemoveFile
+[       OK ] DiskInterfaceTest.RemoveFile (1 ms)
+[ RUN      ] DiskInterfaceTest.RemoveDirectory
+[       OK ] DiskInterfaceTest.RemoveDirectory (1 ms)
+[----------] 9 tests from DiskInterfaceTest (16 ms total)
+
+[----------] 4 tests from StatTest
+[ RUN      ] StatTest.Simple
+[       OK ] StatTest.Simple (0 ms)
+[ RUN      ] StatTest.TwoStep
+[       OK ] StatTest.TwoStep (0 ms)
+[ RUN      ] StatTest.Tree
+[       OK ] StatTest.Tree (0 ms)
+[ RUN      ] StatTest.Middle
+[       OK ] StatTest.Middle (0 ms)
+[----------] 4 tests from StatTest (0 ms total)
+
+[----------] 9 tests from DepsLogTest
+[ RUN      ] DepsLogTest.WriteRead
+[       OK ] DepsLogTest.WriteRead (0 ms)
+[ RUN      ] DepsLogTest.LotsOfDeps
+[       OK ] DepsLogTest.LotsOfDeps (140 ms)
+[ RUN      ] DepsLogTest.DoubleEntry
+[       OK ] DepsLogTest.DoubleEntry (0 ms)
+[ RUN      ] DepsLogTest.Recompact
+[       OK ] DepsLogTest.Recompact (0 ms)
+[ RUN      ] DepsLogTest.InvalidHeader
+[       OK ] DepsLogTest.InvalidHeader (0 ms)
+[ RUN      ] DepsLogTest.Truncated
+[       OK ] DepsLogTest.Truncated (0 ms)
+[ RUN      ] DepsLogTest.TruncatedRecovery
+[       OK ] DepsLogTest.TruncatedRecovery (0 ms)
+[ RUN      ] DepsLogTest.ReverseDepsNodes
+[       OK ] DepsLogTest.ReverseDepsNodes (0 ms)
+[ RUN      ] DepsLogTest.MalformedDepsLog
+[       OK ] DepsLogTest.MalformedDepsLog (0 ms)
+[----------] 9 tests from DepsLogTest (141 ms total)
+
+[----------] 29 tests from DepfileParserTest
+[ RUN      ] DepfileParserTest.Basic
+[       OK ] DepfileParserTest.Basic (0 ms)
+[ RUN      ] DepfileParserTest.EarlyNewlineAndWhitespace
+[       OK ] DepfileParserTest.EarlyNewlineAndWhitespace (0 ms)
+[ RUN      ] DepfileParserTest.Continuation
+[       OK ] DepfileParserTest.Continuation (0 ms)
+[ RUN      ] DepfileParserTest.WindowsDrivePaths
+[       OK ] DepfileParserTest.WindowsDrivePaths (0 ms)
+[ RUN      ] DepfileParserTest.AmpersandsAndQuotes
+[       OK ] DepfileParserTest.AmpersandsAndQuotes (0 ms)
+[ RUN      ] DepfileParserTest.CarriageReturnContinuation
+[       OK ] DepfileParserTest.CarriageReturnContinuation (0 ms)
+[ RUN      ] DepfileParserTest.BackSlashes
+[       OK ] DepfileParserTest.BackSlashes (0 ms)
+[ RUN      ] DepfileParserTest.Spaces
+[       OK ] DepfileParserTest.Spaces (0 ms)
+[ RUN      ] DepfileParserTest.MultipleBackslashes
+[       OK ] DepfileParserTest.MultipleBackslashes (0 ms)
+[ RUN      ] DepfileParserTest.Escapes
+[       OK ] DepfileParserTest.Escapes (0 ms)
+[ RUN      ] DepfileParserTest.EscapedColons
+[       OK ] DepfileParserTest.EscapedColons (0 ms)
+[ RUN      ] DepfileParserTest.EscapedTargetColon
+[       OK ] DepfileParserTest.EscapedTargetColon (0 ms)
+[ RUN      ] DepfileParserTest.SpecialChars
+[       OK ] DepfileParserTest.SpecialChars (0 ms)
+[ RUN      ] DepfileParserTest.UnifyMultipleOutputs
+[       OK ] DepfileParserTest.UnifyMultipleOutputs (0 ms)
+[ RUN      ] DepfileParserTest.MultipleDifferentOutputs
+[       OK ] DepfileParserTest.MultipleDifferentOutputs (0 ms)
+[ RUN      ] DepfileParserTest.MultipleEmptyRules
+[       OK ] DepfileParserTest.MultipleEmptyRules (0 ms)
+[ RUN      ] DepfileParserTest.UnifyMultipleRulesLF
+[       OK ] DepfileParserTest.UnifyMultipleRulesLF (0 ms)
+[ RUN      ] DepfileParserTest.UnifyMultipleRulesCRLF
+[       OK ] DepfileParserTest.UnifyMultipleRulesCRLF (0 ms)
+[ RUN      ] DepfileParserTest.UnifyMixedRulesLF
+[       OK ] DepfileParserTest.UnifyMixedRulesLF (0 ms)
+[ RUN      ] DepfileParserTest.UnifyMixedRulesCRLF
+[       OK ] DepfileParserTest.UnifyMixedRulesCRLF (0 ms)
+[ RUN      ] DepfileParserTest.IndentedRulesLF
+[       OK ] DepfileParserTest.IndentedRulesLF (0 ms)
+[ RUN      ] DepfileParserTest.IndentedRulesCRLF
+[       OK ] DepfileParserTest.IndentedRulesCRLF (0 ms)
+[ RUN      ] DepfileParserTest.TolerateMP
+[       OK ] DepfileParserTest.TolerateMP (0 ms)
+[ RUN      ] DepfileParserTest.MultipleRulesTolerateMP
+[       OK ] DepfileParserTest.MultipleRulesTolerateMP (0 ms)
+[ RUN      ] DepfileParserTest.MultipleRulesDifferentOutputs
+[       OK ] DepfileParserTest.MultipleRulesDifferentOutputs (0 ms)
+[ RUN      ] DepfileParserTest.BuggyMP
+[       OK ] DepfileParserTest.BuggyMP (0 ms)
+[ RUN      ] DepfileParserTest.EmptyFile
+[       OK ] DepfileParserTest.EmptyFile (0 ms)
+[ RUN      ] DepfileParserTest.EmptyLines
+[       OK ] DepfileParserTest.EmptyLines (0 ms)
+[ RUN      ] DepfileParserTest.MissingColon
+[       OK ] DepfileParserTest.MissingColon (0 ms)
+[----------] 29 tests from DepfileParserTest (0 ms total)
+
+[----------] 8 tests from CLParserTest
+[ RUN      ] CLParserTest.ShowIncludes
+[       OK ] CLParserTest.ShowIncludes (0 ms)
+[ RUN      ] CLParserTest.FilterInputFilename
+[       OK ] CLParserTest.FilterInputFilename (0 ms)
+[ RUN      ] CLParserTest.ParseSimple
+[       OK ] CLParserTest.ParseSimple (0 ms)
+[ RUN      ] CLParserTest.ParseFilenameFilter
+[       OK ] CLParserTest.ParseFilenameFilter (0 ms)
+[ RUN      ] CLParserTest.NoFilenameFilterAfterShowIncludes
+[       OK ] CLParserTest.NoFilenameFilterAfterShowIncludes (0 ms)
+[ RUN      ] CLParserTest.ParseSystemInclude
+[       OK ] CLParserTest.ParseSystemInclude (0 ms)
+[ RUN      ] CLParserTest.DuplicatedHeader
+[       OK ] CLParserTest.DuplicatedHeader (0 ms)
+[ RUN      ] CLParserTest.DuplicatedHeaderPathConverted
+[       OK ] CLParserTest.DuplicatedHeaderPathConverted (0 ms)
+[----------] 8 tests from CLParserTest (0 ms total)
+
+[----------] 17 tests from CleanTest
+[ RUN      ] CleanTest.CleanAll
+[       OK ] CleanTest.CleanAll (0 ms)
+[ RUN      ] CleanTest.CleanAllDryRun
+[       OK ] CleanTest.CleanAllDryRun (0 ms)
+[ RUN      ] CleanTest.CleanTarget
+[       OK ] CleanTest.CleanTarget (0 ms)
+[ RUN      ] CleanTest.CleanTargetDryRun
+[       OK ] CleanTest.CleanTargetDryRun (0 ms)
+[ RUN      ] CleanTest.CleanRule
+[       OK ] CleanTest.CleanRule (0 ms)
+[ RUN      ] CleanTest.CleanRuleDryRun
+[       OK ] CleanTest.CleanRuleDryRun (0 ms)
+[ RUN      ] CleanTest.CleanRuleGenerator
+[       OK ] CleanTest.CleanRuleGenerator (0 ms)
+[ RUN      ] CleanTest.CleanDepFile
+[       OK ] CleanTest.CleanDepFile (0 ms)
+[ RUN      ] CleanTest.CleanDepFileOnCleanTarget
+[       OK ] CleanTest.CleanDepFileOnCleanTarget (0 ms)
+[ RUN      ] CleanTest.CleanDepFileOnCleanRule
+[       OK ] CleanTest.CleanDepFileOnCleanRule (0 ms)
+[ RUN      ] CleanTest.CleanDyndep
+[       OK ] CleanTest.CleanDyndep (0 ms)
+[ RUN      ] CleanTest.CleanDyndepMissing
+[       OK ] CleanTest.CleanDyndepMissing (0 ms)
+[ RUN      ] CleanTest.CleanRspFile
+[       OK ] CleanTest.CleanRspFile (0 ms)
+[ RUN      ] CleanTest.CleanRsp
+[       OK ] CleanTest.CleanRsp (0 ms)
+[ RUN      ] CleanTest.CleanFailure
+[       OK ] CleanTest.CleanFailure (0 ms)
+[ RUN      ] CleanTest.CleanPhony
+[       OK ] CleanTest.CleanPhony (0 ms)
+[ RUN      ] CleanTest.CleanDepFileAndRspFileWithSpaces
+[       OK ] CleanTest.CleanDepFileAndRspFileWithSpaces (0 ms)
+[----------] 17 tests from CleanTest (0 ms total)
+
+[----------] 2 tests from CleanDeadTest
+[ RUN      ] CleanDeadTest.CleanDead
+[       OK ] CleanDeadTest.CleanDead (0 ms)
+[ RUN      ] CleanDeadTest.CleanDeadPreservesInputs
+[       OK ] CleanDeadTest.CleanDeadPreservesInputs (0 ms)
+[----------] 2 tests from CleanDeadTest (0 ms total)
+
+[----------] 10 tests from PlanTest
+[ RUN      ] PlanTest.Basic
+[       OK ] PlanTest.Basic (0 ms)
+[ RUN      ] PlanTest.DoubleOutputDirect
+[       OK ] PlanTest.DoubleOutputDirect (0 ms)
+[ RUN      ] PlanTest.DoubleOutputIndirect
+[       OK ] PlanTest.DoubleOutputIndirect (0 ms)
+[ RUN      ] PlanTest.DoubleDependent
+[       OK ] PlanTest.DoubleDependent (0 ms)
+[ RUN      ] PlanTest.PoolWithDepthOne
+[       OK ] PlanTest.PoolWithDepthOne (0 ms)
+[ RUN      ] PlanTest.ConsolePool
+[       OK ] PlanTest.ConsolePool (0 ms)
+[ RUN      ] PlanTest.PoolsWithDepthTwo
+[       OK ] PlanTest.PoolsWithDepthTwo (0 ms)
+[ RUN      ] PlanTest.PoolWithRedundantEdges
+[       OK ] PlanTest.PoolWithRedundantEdges (0 ms)
+[ RUN      ] PlanTest.PoolWithFailingEdge
+[       OK ] PlanTest.PoolWithFailingEdge (0 ms)
+[ RUN      ] PlanTest.PriorityWithoutBuildLog
+[       OK ] PlanTest.PriorityWithoutBuildLog (0 ms)
+[----------] 10 tests from PlanTest (0 ms total)
+
+[----------] 75 tests from BuildTest
+[ RUN      ] BuildTest.NoWork
+[       OK ] BuildTest.NoWork (0 ms)
+[ RUN      ] BuildTest.OneStep
+[       OK ] BuildTest.OneStep (0 ms)
+[ RUN      ] BuildTest.OneStep2
+[       OK ] BuildTest.OneStep2 (0 ms)
+[ RUN      ] BuildTest.TwoStep
+[       OK ] BuildTest.TwoStep (0 ms)
+[ RUN      ] BuildTest.TwoOutputs
+[       OK ] BuildTest.TwoOutputs (0 ms)
+[ RUN      ] BuildTest.ImplicitOutput
+[       OK ] BuildTest.ImplicitOutput (0 ms)
+[ RUN      ] BuildTest.MultiOutIn
+[       OK ] BuildTest.MultiOutIn (0 ms)
+[ RUN      ] BuildTest.Chain
+[       OK ] BuildTest.Chain (0 ms)
+[ RUN      ] BuildTest.MissingInput
+[       OK ] BuildTest.MissingInput (0 ms)
+[ RUN      ] BuildTest.MissingTarget
+[       OK ] BuildTest.MissingTarget (0 ms)
+[ RUN      ] BuildTest.MissingInputTarget
+[       OK ] BuildTest.MissingInputTarget (0 ms)
+[ RUN      ] BuildTest.MakeDirs
+[       OK ] BuildTest.MakeDirs (0 ms)
+[ RUN      ] BuildTest.DepFileMissing
+[       OK ] BuildTest.DepFileMissing (0 ms)
+[ RUN      ] BuildTest.DepFileOK
+[       OK ] BuildTest.DepFileOK (0 ms)
+[ RUN      ] BuildTest.DepFileParseError
+[       OK ] BuildTest.DepFileParseError (0 ms)
+[ RUN      ] BuildTest.EncounterReadyTwice
+[       OK ] BuildTest.EncounterReadyTwice (0 ms)
+[ RUN      ] BuildTest.OrderOnlyDeps
+[       OK ] BuildTest.OrderOnlyDeps (0 ms)
+[ RUN      ] BuildTest.RebuildOrderOnlyDeps
+[       OK ] BuildTest.RebuildOrderOnlyDeps (0 ms)
+[ RUN      ] BuildTest.Phony
+[       OK ] BuildTest.Phony (0 ms)
+[ RUN      ] BuildTest.PhonyNoWork
+[       OK ] BuildTest.PhonyNoWork (0 ms)
+[ RUN      ] BuildTest.PhonySelfReference
+[       OK ] BuildTest.PhonySelfReference (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase1
+[       OK ] BuildTest.PhonyUseCase1 (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase2
+[       OK ] BuildTest.PhonyUseCase2 (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase3
+[       OK ] BuildTest.PhonyUseCase3 (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase4
+[       OK ] BuildTest.PhonyUseCase4 (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase5
+[       OK ] BuildTest.PhonyUseCase5 (0 ms)
+[ RUN      ] BuildTest.PhonyUseCase6
+[       OK ] BuildTest.PhonyUseCase6 (0 ms)
+[ RUN      ] BuildTest.Fail
+[       OK ] BuildTest.Fail (0 ms)
+[ RUN      ] BuildTest.SwallowFailures
+[       OK ] BuildTest.SwallowFailures (0 ms)
+[ RUN      ] BuildTest.SwallowFailuresLimit
+[       OK ] BuildTest.SwallowFailuresLimit (0 ms)
+[ RUN      ] BuildTest.SwallowFailuresPool
+[       OK ] BuildTest.SwallowFailuresPool (0 ms)
+[ RUN      ] BuildTest.PoolEdgesReadyButNotWanted
+[       OK ] BuildTest.PoolEdgesReadyButNotWanted (0 ms)
+[ RUN      ] BuildTest.RspFileSuccess
+[       OK ] BuildTest.RspFileSuccess (0 ms)
+[ RUN      ] BuildTest.RspFileFailure
+[       OK ] BuildTest.RspFileFailure (0 ms)
+[ RUN      ] BuildTest.InterruptCleanup
+[       OK ] BuildTest.InterruptCleanup (0 ms)
+[ RUN      ] BuildTest.StatFailureAbortsBuild
+[       OK ] BuildTest.StatFailureAbortsBuild (0 ms)
+[ RUN      ] BuildTest.PhonyWithNoInputs
+[       OK ] BuildTest.PhonyWithNoInputs (0 ms)
+[ RUN      ] BuildTest.DepsGccWithEmptyDepfileErrorsOut
+[       OK ] BuildTest.DepsGccWithEmptyDepfileErrorsOut (0 ms)
+[ RUN      ] BuildTest.StatusFormatElapsed_e
+[       OK ] BuildTest.StatusFormatElapsed_e (0 ms)
+[ RUN      ] BuildTest.StatusFormatElapsed_w
+[       OK ] BuildTest.StatusFormatElapsed_w (0 ms)
+[ RUN      ] BuildTest.StatusFormatETA
+[       OK ] BuildTest.StatusFormatETA (0 ms)
+[ RUN      ] BuildTest.StatusFormatTimeProgress
+[       OK ] BuildTest.StatusFormatTimeProgress (0 ms)
+[ RUN      ] BuildTest.StatusFormatReplacePlaceholder
+[       OK ] BuildTest.StatusFormatReplacePlaceholder (0 ms)
+[ RUN      ] BuildTest.FailedDepsParse
+[       OK ] BuildTest.FailedDepsParse (0 ms)
+[ RUN      ] BuildTest.RestatDepfileDependency
+[       OK ] BuildTest.RestatDepfileDependency (0 ms)
+[ RUN      ] BuildTest.RestatMissingDepfile
+[       OK ] BuildTest.RestatMissingDepfile (0 ms)
+[ RUN      ] BuildTest.WrongOutputInDepfileCausesRebuild
+[       OK ] BuildTest.WrongOutputInDepfileCausesRebuild (0 ms)
+[ RUN      ] BuildTest.Console
+[       OK ] BuildTest.Console (0 ms)
+[ RUN      ] BuildTest.DyndepMissingAndNoRule
+[       OK ] BuildTest.DyndepMissingAndNoRule (0 ms)
+[ RUN      ] BuildTest.DyndepReadyImplicitConnection
+[       OK ] BuildTest.DyndepReadyImplicitConnection (0 ms)
+[ RUN      ] BuildTest.DyndepReadySyntaxError
+[       OK ] BuildTest.DyndepReadySyntaxError (0 ms)
+[ RUN      ] BuildTest.DyndepReadyCircular
+[       OK ] BuildTest.DyndepReadyCircular (0 ms)
+[ RUN      ] BuildTest.DyndepBuild
+[       OK ] BuildTest.DyndepBuild (0 ms)
+[ RUN      ] BuildTest.DyndepBuildSyntaxError
+[       OK ] BuildTest.DyndepBuildSyntaxError (0 ms)
+[ RUN      ] BuildTest.DyndepBuildUnrelatedOutput
+[       OK ] BuildTest.DyndepBuildUnrelatedOutput (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewOutput
+[       OK ] BuildTest.DyndepBuildDiscoverNewOutput (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewOutputWithMultipleRules1
+[       OK ] BuildTest.DyndepBuildDiscoverNewOutputWithMultipleRules1 (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewOutputWithMultipleRules2
+[       OK ] BuildTest.DyndepBuildDiscoverNewOutputWithMultipleRules2 (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewInput
+[       OK ] BuildTest.DyndepBuildDiscoverNewInput (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewInputWithValidation
+[       OK ] BuildTest.DyndepBuildDiscoverNewInputWithValidation (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNewInputWithTransitiveValidation
+[       OK ] BuildTest.DyndepBuildDiscoverNewInputWithTransitiveValidation (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverImplicitConnection
+[       OK ] BuildTest.DyndepBuildDiscoverImplicitConnection (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverOutputAndDepfileInput
+[       OK ] BuildTest.DyndepBuildDiscoverOutputAndDepfileInput (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNowWantEdge
+[       OK ] BuildTest.DyndepBuildDiscoverNowWantEdge (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverNowWantEdgeAndDependent
+[       OK ] BuildTest.DyndepBuildDiscoverNowWantEdgeAndDependent (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverCircular
+[       OK ] BuildTest.DyndepBuildDiscoverCircular (0 ms)
+[ RUN      ] BuildTest.DyndepBuildDiscoverScheduledEdge
+[       OK ] BuildTest.DyndepBuildDiscoverScheduledEdge (0 ms)
+[ RUN      ] BuildTest.DyndepTwoLevelDirect
+[       OK ] BuildTest.DyndepTwoLevelDirect (0 ms)
+[ RUN      ] BuildTest.DyndepTwoLevelIndirect
+[       OK ] BuildTest.DyndepTwoLevelIndirect (0 ms)
+[ RUN      ] BuildTest.DyndepTwoLevelDiscoveredReady
+[       OK ] BuildTest.DyndepTwoLevelDiscoveredReady (0 ms)
+[ RUN      ] BuildTest.DyndepTwoLevelDiscoveredDirty
+[       OK ] BuildTest.DyndepTwoLevelDiscoveredDirty (0 ms)
+[ RUN      ] BuildTest.Validation
+[       OK ] BuildTest.Validation (0 ms)
+[ RUN      ] BuildTest.ValidationDependsOnOutput
+[       OK ] BuildTest.ValidationDependsOnOutput (0 ms)
+[ RUN      ] BuildTest.ValidationCircular
+[       OK ] BuildTest.ValidationCircular (0 ms)
+[ RUN      ] BuildTest.ValidationWithCircularDependency
+[       OK ] BuildTest.ValidationWithCircularDependency (0 ms)
+[----------] 75 tests from BuildTest (1 ms total)
+
+[----------] 13 tests from BuildWithLogTest
+[ RUN      ] BuildWithLogTest.ImplicitGeneratedOutOfDate
+[       OK ] BuildWithLogTest.ImplicitGeneratedOutOfDate (0 ms)
+[ RUN      ] BuildWithLogTest.ImplicitGeneratedOutOfDate2
+[       OK ] BuildWithLogTest.ImplicitGeneratedOutOfDate2 (0 ms)
+[ RUN      ] BuildWithLogTest.NotInLogButOnDisk
+[       OK ] BuildWithLogTest.NotInLogButOnDisk (0 ms)
+[ RUN      ] BuildWithLogTest.RebuildAfterFailure
+[       OK ] BuildWithLogTest.RebuildAfterFailure (0 ms)
+[ RUN      ] BuildWithLogTest.RebuildWithNoInputs
+[       OK ] BuildWithLogTest.RebuildWithNoInputs (0 ms)
+[ RUN      ] BuildWithLogTest.RestatTest
+[       OK ] BuildWithLogTest.RestatTest (0 ms)
+[ RUN      ] BuildWithLogTest.RestatMissingFile
+[       OK ] BuildWithLogTest.RestatMissingFile (0 ms)
+[ RUN      ] BuildWithLogTest.RestatSingleDependentOutputDirty
+[       OK ] BuildWithLogTest.RestatSingleDependentOutputDirty (0 ms)
+[ RUN      ] BuildWithLogTest.RestatMissingInput
+[       OK ] BuildWithLogTest.RestatMissingInput (0 ms)
+[ RUN      ] BuildWithLogTest.RestatInputChangesDueToRule
+[       OK ] BuildWithLogTest.RestatInputChangesDueToRule (0 ms)
+[ RUN      ] BuildWithLogTest.GeneratedPlainDepfileMtime
+[       OK ] BuildWithLogTest.GeneratedPlainDepfileMtime (0 ms)
+[ RUN      ] BuildWithLogTest.RspFileCmdLineChange
+[       OK ] BuildWithLogTest.RspFileCmdLineChange (0 ms)
+[ RUN      ] BuildWithLogTest.DyndepBuildDiscoverRestat
+[       OK ] BuildWithLogTest.DyndepBuildDiscoverRestat (0 ms)
+[----------] 13 tests from BuildWithLogTest (0 ms total)
+
+[----------] 2 tests from BuildDryRun
+[ RUN      ] BuildDryRun.AllCommandsShown
+[       OK ] BuildDryRun.AllCommandsShown (0 ms)
+[ RUN      ] BuildDryRun.WithDyndep
+[       OK ] BuildDryRun.WithDyndep (0 ms)
+[----------] 2 tests from BuildDryRun (0 ms total)
+
+[----------] 6 tests from BuildWithQueryDepsLogTest
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileMSVC
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileMSVC (0 ms)
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOneLine
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOneLine (0 ms)
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCMultiLineInput
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCMultiLineInput (0 ms)
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCMultiLineOutput
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCMultiLineOutput (0 ms)
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOnlyMainOutput
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOnlyMainOutput (0 ms)
+[ RUN      ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOnlySecondaryOutput
+[       OK ] BuildWithQueryDepsLogTest.TwoOutputsDepFileGCCOnlySecondaryOutput (0 ms)
+[----------] 6 tests from BuildWithQueryDepsLogTest (0 ms total)
+
+[----------] 10 tests from BuildWithDepsLogTest
+[ RUN      ] BuildWithDepsLogTest.Straightforward
+[       OK ] BuildWithDepsLogTest.Straightforward (2 ms)
+[ RUN      ] BuildWithDepsLogTest.ObsoleteDeps
+[       OK ] BuildWithDepsLogTest.ObsoleteDeps (2 ms)
+[ RUN      ] BuildWithDepsLogTest.DepsIgnoredInDryRun
+[       OK ] BuildWithDepsLogTest.DepsIgnoredInDryRun (2 ms)
+[ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceCondition
+[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceCondition (1 ms)
+[ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile
+[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile (2 ms)
+[ RUN      ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog
+[       OK ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog (2 ms)
+[ RUN      ] BuildWithDepsLogTest.DepFileOKDepsLog
+[       OK ] BuildWithDepsLogTest.DepFileOKDepsLog (1 ms)
+[ RUN      ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged
+[       OK ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged (1 ms)
+[ RUN      ] BuildWithDepsLogTest.RestatMissingDepfileDepslog
+[       OK ] BuildWithDepsLogTest.RestatMissingDepfileDepslog (2 ms)
+[ RUN      ] BuildWithDepsLogTest.ValidationThroughDepfile
+[       OK ] BuildWithDepsLogTest.ValidationThroughDepfile (1 ms)
+[----------] 10 tests from BuildWithDepsLogTest (20 ms total)
+
+[----------] 10 tests from BuildLogTest
+[ RUN      ] BuildLogTest.WriteRead
+[       OK ] BuildLogTest.WriteRead (0 ms)
+[ RUN      ] BuildLogTest.FirstWriteAddsSignature
+[       OK ] BuildLogTest.FirstWriteAddsSignature (0 ms)
+[ RUN      ] BuildLogTest.DoubleEntry
+[       OK ] BuildLogTest.DoubleEntry (0 ms)
+[ RUN      ] BuildLogTest.Truncate
+[       OK ] BuildLogTest.Truncate (3 ms)
+[ RUN      ] BuildLogTest.ObsoleteOldVersion
+[       OK ] BuildLogTest.ObsoleteOldVersion (0 ms)
+[ RUN      ] BuildLogTest.SpacesInOutput
+[       OK ] BuildLogTest.SpacesInOutput (0 ms)
+[ RUN      ] BuildLogTest.DuplicateVersionHeader
+[       OK ] BuildLogTest.DuplicateVersionHeader (0 ms)
+[ RUN      ] BuildLogTest.Restat
+[       OK ] BuildLogTest.Restat (0 ms)
+[ RUN      ] BuildLogTest.VeryLongInputLine
+[       OK ] BuildLogTest.VeryLongInputLine (1 ms)
+[ RUN      ] BuildLogTest.MultiTargetEdge
+[       OK ] BuildLogTest.MultiTargetEdge (0 ms)
+[----------] 10 tests from BuildLogTest (5 ms total)
+
+[----------] 1 test from BuildLogRecompactTest
+[ RUN      ] BuildLogRecompactTest.Recompact
+[       OK ] BuildLogRecompactTest.Recompact (0 ms)
+[----------] 1 test from BuildLogRecompactTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 410 tests from 31 test suites ran. (437 ms total)
+[  PASSED  ] 410 tests.
