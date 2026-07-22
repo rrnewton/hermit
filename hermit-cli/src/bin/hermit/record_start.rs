@@ -135,6 +135,7 @@ impl StartOpts {
             log2.into_temp_path(),
             "Success: replay matched recording.",
             "Recording output did not match replay output!",
+            global.log_file.as_deref(),
         )
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.

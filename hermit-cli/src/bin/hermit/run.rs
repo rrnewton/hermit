@@ -1019,6 +1019,7 @@ impl RunOpts {
             log2_path,
             "Success: deterministic. Determinism verified.",
             "Failure: nondeterministic.",
+            global.log_file.as_deref(),
         )
     }
 

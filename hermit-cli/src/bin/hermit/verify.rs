@@ -6,7 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use colored::Colorize;
@@ -55,6 +57,15 @@ pub fn setup_double_run(
     ((global, file1), (global2, file2))
 }
 
+/// Append a suffix to a path's file name (e.g. `/tmp/log` -> `/tmp/log.run2`).
+/// This is used to distinguish the two per-run logs when the user requested a
+/// persistent `--log-file`.
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 pub fn compare_two_runs(
     out1: &Output,
     log1: TempPath,
@@ -62,6 +73,11 @@ pub fn compare_two_runs(
     log2: TempPath,
     success_msg: &str,
     failure_msg: &str,
+    // If the user passed `--log-file`, the per-run logs are copied here so they
+    // survive the temp-file cleanup that otherwise deletes them on success. The
+    // first run is written to this exact path (so `--log-file=X` yields `X`) and
+    // the second run to `X.run2`.
+    keep_log_file: Option<&Path>,
 ) -> Result<ExitStatus, Error> {
     let mut failed = false;
 
@@ -124,10 +140,44 @@ pub fn compare_two_runs(
         );
     }
 
+    // If the user requested a persistent `--log-file`, copy the per-run logs
+    // there before the temporary files are cleaned up. This runs in both the
+    // success and failure cases so `--log-file` is always honored.
+    if let Some(dest) = keep_log_file {
+        let dest1 = dest.to_path_buf();
+        let dest2 = append_suffix(dest, ".run2");
+        let src1: &Path = log1.as_ref();
+        let src2: &Path = log2.as_ref();
+        fs::copy(src1, &dest1).map_err(|e| {
+            Error::msg(format!(
+                "Failed to copy verify log to {}: {}",
+                dest1.display(),
+                e
+            ))
+        })?;
+        fs::copy(src2, &dest2).map_err(|e| {
+            Error::msg(format!(
+                "Failed to copy verify log to {}: {}",
+                dest2.display(),
+                e
+            ))
+        })?;
+        eprintln!(
+            ":: {} {} and {}",
+            "Execution logs written to".green().bold(),
+            dest1.display(),
+            dest2.display()
+        );
+    }
+
     if failed {
         eprintln!(":: {}", failure_msg.red().bold());
-        let _ = log1.keep()?;
-        let _ = log2.keep()?;
+        // On failure, also retain the temp logs at their original locations
+        // (unless the user already has persistent copies via --log-file).
+        if keep_log_file.is_none() {
+            let _ = log1.keep()?;
+            let _ = log2.keep()?;
+        }
         Err(Error::msg(
             "Mismatch between run1 and run2 outputs (logs retained).",
         ))
@@ -180,8 +230,38 @@ mod tests {
         let (log1, log2) = empty_logs();
 
         assert_eq!(
-            compare_two_runs(&left, log1, &right, log2, "verified", "failed").unwrap(),
+            compare_two_runs(&left, log1, &right, log2, "verified", "failed", None).unwrap(),
             ExitStatus::Exited(0)
+        );
+    }
+
+    #[test]
+    fn log_file_destination_receives_both_run_logs() {
+        let left = output(0, b"hello\n", b"");
+        let right = left.clone();
+        let (log1, log2) = empty_logs();
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("keep.log");
+        let dest_run2 = super::append_suffix(&dest, ".run2");
+
+        assert_eq!(
+            compare_two_runs(&left, log1, &right, log2, "verified", "failed", Some(&dest)).unwrap(),
+            ExitStatus::Exited(0)
+        );
+
+        // On success the temp logs are cleaned up, but the requested --log-file
+        // destination (and its .run2 sibling) must persist so `--log-file` is
+        // honored even under `--verify`.
+        assert!(
+            dest.is_file(),
+            "run1 log should be copied to the exact --log-file path: {}",
+            dest.display()
+        );
+        assert!(
+            dest_run2.is_file(),
+            "run2 log should be copied to <--log-file>.run2: {}",
+            dest_run2.display()
         );
     }
 
@@ -200,7 +280,8 @@ mod tests {
             let path2 = log2.to_path_buf();
 
             assert!(
-                compare_two_runs(&baseline, log1, &mismatch, log2, "verified", "failed").is_err()
+                compare_two_runs(&baseline, log1, &mismatch, log2, "verified", "failed", None)
+                    .is_err()
             );
 
             let _ = fs::remove_file(path1);
