@@ -1,0 +1,7 @@
+# Build/scratch artifacts for the MCP-debugger POC (fetched/compiled locally).
+.build/
+# Log directory that mcp-server-gdb writes into its working directory.
+logs/
+# Python bytecode cache.
+__pycache__/
+*.pyc
