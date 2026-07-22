@@ -92,22 +92,40 @@ fn sanitize_stat(contents: &[u8]) -> Vec<u8> {
 }
 
 fn sanitize_status(contents: &[u8]) -> Vec<u8> {
-    const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
-    const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
+    // `/proc/self/status` lines whose value leaks host state that is not
+    // deterministic across runs (scheduler-chosen CPU, host CPU/NUMA topology)
+    // or that counts runtime events. Each is rewritten to a fixed value that is
+    // consistent with the rest of Hermit's virtualization:
+    //
+    // * `Cpus_allowed`/`Cpus_allowed_list` and `Mems_allowed`/`Mems_allowed_list`
+    //   reflect the single virtual CPU 0 / node 0 that `sched_getaffinity`
+    //   already reports, rather than the host's affinity mask which varies run
+    //   to run as the guest is scheduled onto different host CPUs.
+    // * `*_ctxt_switches` count scheduling events and are zeroed.
+    //
+    // Matching is on the `Key:` prefix so the tab/value formatting is replaced
+    // wholesale.
+    const FIXED_FIELDS: &[(&[u8], &[u8])] = &[
+        (b"Cpus_allowed:", b"Cpus_allowed:\t00000001"),
+        (b"Cpus_allowed_list:", b"Cpus_allowed_list:\t0"),
+        (b"Mems_allowed:", b"Mems_allowed:\t00000001"),
+        (b"Mems_allowed_list:", b"Mems_allowed_list:\t0"),
+        (b"voluntary_ctxt_switches:", b"voluntary_ctxt_switches:\t0"),
+        (
+            b"nonvoluntary_ctxt_switches:",
+            b"nonvoluntary_ctxt_switches:\t0",
+        ),
+    ];
 
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(VOLUNTARY) {
-            normalized.extend_from_slice(VOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else if body.starts_with(NONVOLUNTARY) {
-            normalized.extend_from_slice(NONVOLUNTARY);
-            normalized.extend_from_slice(b"\t0");
-        } else {
-            normalized.extend_from_slice(body);
-        }
+        let replacement = FIXED_FIELDS
+            .iter()
+            .find(|(prefix, _)| body.starts_with(prefix))
+            .map(|(_, value)| *value);
+        normalized.extend_from_slice(replacement.unwrap_or(body));
         if has_newline {
             normalized.push(b'\n');
         }
@@ -181,6 +199,38 @@ mod tests {
         assert_eq!(
             sanitize_status(input),
             b"Name:\tcat\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+        );
+    }
+
+    #[test]
+    fn status_normalizes_host_affinity_and_topology() {
+        // Host affinity mask and CPU/NUMA lists vary across runs and hosts; they
+        // must be rewritten to the fixed single virtual CPU 0 / node 0.
+        let input = b"Name:\tcat\n\
+Cpus_allowed:\t2000000,00000000,00000000\n\
+Cpus_allowed_list:\t313\n\
+Mems_allowed:\t00000000,00000003\n\
+Mems_allowed_list:\t0-1\n\
+voluntary_ctxt_switches:\t7\n";
+        assert_eq!(
+            sanitize_status(input),
+            b"Name:\tcat\n\
+Cpus_allowed:\t00000001\n\
+Cpus_allowed_list:\t0\n\
+Mems_allowed:\t00000001\n\
+Mems_allowed_list:\t0\n\
+voluntary_ctxt_switches:\t0\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn status_prefixes_do_not_collide() {
+        // `Cpus_allowed_list:` must not be matched by the `Cpus_allowed:` rule.
+        let input = b"Cpus_allowed_list:\t42\nCpus_allowed:\tdeadbeef\n";
+        assert_eq!(
+            sanitize_status(input),
+            b"Cpus_allowed_list:\t0\nCpus_allowed:\t00000001\n".to_vec()
         );
     }
 

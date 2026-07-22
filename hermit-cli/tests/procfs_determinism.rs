@@ -63,6 +63,53 @@ fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
     }
 }
 
+/// Runs `cat <path>` under `hermit run --strict --verify`, which executes the
+/// guest twice and fails unless the two runs produce bitwise-identical output
+/// (assurance level L2). This is the strongest per-file determinism check: it
+/// catches any host state that leaks into the file's contents.
+fn verify_procfs_l2(path: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "--log=error",
+        "run",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/cat",
+        path,
+    ]);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{path} was not bitwise-deterministic under --strict --verify (L2): {rendered}\n\
+         status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn proc_self_status_is_bitwise_deterministic_under_verify() {
+    let _guard = hermit_run_lock();
+    verify_procfs_l2("/proc/self/status");
+}
+
+#[test]
+fn proc_self_stat_is_bitwise_deterministic_under_verify() {
+    let _guard = hermit_run_lock();
+    verify_procfs_l2("/proc/self/stat");
+}
+
+#[test]
+fn proc_self_maps_is_bitwise_deterministic_under_verify() {
+    let _guard = hermit_run_lock();
+    verify_procfs_l2("/proc/self/maps");
+}
+
 #[test]
 fn proc_self_maps_is_deterministic() {
     assert_deterministic("/proc/self/maps", |contents| {
@@ -106,6 +153,21 @@ fn proc_self_status_is_deterministic() {
         assert!(pid > 0);
         assert!(text.contains("voluntary_ctxt_switches:\t0\n"));
         assert!(text.contains("nonvoluntary_ctxt_switches:\t0\n"));
+        // Host CPU/NUMA affinity is normalized to the single virtual CPU 0 /
+        // node 0 so it does not leak the host's topology or the scheduler's
+        // run-to-run CPU placement.
+        if text.contains("Cpus_allowed_list:") {
+            assert!(
+                text.contains("Cpus_allowed_list:\t0\n"),
+                "Cpus_allowed_list leaks host affinity:\n{text}"
+            );
+        }
+        if text.contains("Mems_allowed_list:") {
+            assert!(
+                text.contains("Mems_allowed_list:\t0\n"),
+                "Mems_allowed_list leaks host NUMA topology:\n{text}"
+            );
+        }
     });
 }
 
