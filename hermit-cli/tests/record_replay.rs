@@ -19,9 +19,10 @@ use std::sync::OnceLock;
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
 
-const BASELINE_RECORD_WORKLOADS: [&str; 7] = [
+const BASELINE_RECORD_WORKLOADS: [&str; 8] = [
     "c_getpid",
     "c_ioctl_fioclex",
+    "c_recvmsg_scm_rights_mmap",
     "c_uname",
     "c_sysinfo",
     "c_wait_on_child",
@@ -193,6 +194,7 @@ fn workloads() -> &'static [Workload] {
         let c_sources = [
             ("c_getpid", "getpid.c"),
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
+            ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_uname", "uname.c"),
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
