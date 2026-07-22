@@ -115,6 +115,7 @@ impl Tool for Replayer {
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
+            Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwrite64(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
