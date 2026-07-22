@@ -16,3 +16,15 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# Redirect all Reverie crates to the rrnewton/reverie fork so the new
+# experimental backends (reverie-dbi, reverie-kvm) share a single Reverie core
+# with reverie/reverie-ptrace. The fork is a descendant of the pinned upstream
+# commit (extend-only), so the core API is unchanged.
+[patch."https://github.com/facebookexperimental/reverie.git"]
+reverie = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
+reverie-memory = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
+reverie-process = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
+reverie-ptrace = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
+reverie-syscalls = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
+safeptrace = { git = "https://github.com/rrnewton/reverie.git", branch = "main" }
