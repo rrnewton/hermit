@@ -16,7 +16,7 @@ usage() {
 Usage: run.sh [OPTIONS]
 
 Build LULESH with OpenMP, execute it repeatedly under Hermit strict mode, and
-compare the complete stdout, stderr, and exit status from every run.
+compare stdout, stderr, exit status, and complete persistent numerical state.
 
 Options:
   --source DIR       LULESH checkout (default: target/lulesh-openmp/source)
@@ -31,7 +31,8 @@ Options:
   -h, --help         Show this help
 
 The runner clones the pinned LULESH 2.0.3 revision when --source does not
-exist. It exits 0 only when all runs succeed and produce byte-identical output.
+exist. At least two runs are required. The runner exits 0 only when every run
+succeeds and all four observations are byte-identical.
 USAGE
 }
 
@@ -46,12 +47,21 @@ require_positive_integer() {
   [[ $value =~ ^[1-9][0-9]*$ ]] || fail "$name must be a positive integer: $value"
 }
 
+has_one_matching_line() {
+  local pattern=$1
+  local file=$2
+  local count
+  count=$(grep -Ec -- "$pattern" "$file" || true)
+  [[ $count == 1 ]]
+}
+
 sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
+instrumentation_patch=$script_dir/lulesh-instrumentation.patch
 source_input=$repo_root/target/lulesh-openmp/source
 hermit_input=$repo_root/target/release/hermit
 output_input=
@@ -119,6 +129,7 @@ while (($# > 0)); do
 done
 
 require_positive_integer runs "$runs"
+((runs >= 2)) || fail "runs must be at least 2: $runs"
 require_positive_integer threads "$threads"
 require_positive_integer size "$size"
 require_positive_integer iterations "$iterations"
@@ -145,24 +156,49 @@ fi
 source_revision=$(git -C "$source_dir" rev-parse HEAD)
 [[ $source_revision == "$LULESH_REVISION" ]] ||
   fail "LULESH source must be revision $LULESH_REVISION, found $source_revision"
+[[ -f $instrumentation_patch ]] || fail "instrumentation patch not found: $instrumentation_patch"
 
 if [[ $skip_build == false ]]; then
   cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit --bin hermit
   build_jobs=${BUILD_JOBS:-4}
   require_positive_integer BUILD_JOBS "$build_jobs"
+
+  tracked_changes=$(git -C "$source_dir" status --short --untracked-files=no)
+  [[ -z $tracked_changes ]] || fail "LULESH checkout has tracked changes: $source_dir"
+  git -C "$source_dir" apply --check "$instrumentation_patch"
+  source_patch_applied=false
+  restore_source_patch() {
+    if [[ $source_patch_applied == true ]]; then
+      git -C "$source_dir" apply --reverse "$instrumentation_patch" ||
+        printf 'error: could not restore instrumented LULESH source: %s\n' "$source_dir" >&2
+    fi
+  }
+  trap restore_source_patch EXIT
+  git -C "$source_dir" apply "$instrumentation_patch"
+  source_patch_applied=true
   make -C "$source_dir" clean
   make -C "$source_dir" -j"$build_jobs" 'CXX=g++ -DUSE_MPI=0'
+  git -C "$source_dir" apply --reverse "$instrumentation_patch"
+  source_patch_applied=false
+  trap - EXIT
 fi
 
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
 lulesh_bin=$source_dir/lulesh2.0
 [[ -x $lulesh_bin ]] || fail "LULESH binary is not executable: $lulesh_bin"
+grep -aFq 'Observed OpenMP team size = %i' "$lulesh_bin" ||
+  fail 'LULESH binary lacks the OpenMP team observer; rebuild without --skip-build'
+grep -aFq 'LULESH_STATE_FILE is required by the determinism test' "$lulesh_bin" ||
+  fail 'LULESH binary lacks full-state output; rebuild without --skip-build'
 openmp_runtime=$(ldd "$lulesh_bin" | awk '/libgomp/{print $3; exit}')
 [[ -n $openmp_runtime ]] || fail 'LULESH binary is not linked with libgomp'
+hermit_source_commit=$(
+  git -C "$(dirname "$hermit_bin")" rev-parse HEAD 2>/dev/null || printf 'unknown\n'
+)
 mkdir -p "$output_dir/runs"
 
 export LC_ALL=C
-hermit_args=(
+hermit_common_args=(
   --log=error
   run
   --strict
@@ -170,27 +206,36 @@ hermit_args=(
   --env=LC_ALL=C
   "--env=OMP_NUM_THREADS=$threads"
   --env=OMP_DYNAMIC=false
-  "--tmp=$source_dir"
+)
+lulesh_args=(
   --
   /tmp/lulesh2.0
   -s "$size"
   -i "$iterations"
 )
-printf -v command_line '%q ' "$hermit_bin" "${hermit_args[@]}"
+metadata_hermit_args=(
+  "${hermit_common_args[@]}"
+  --env=LULESH_STATE_FILE=/tmp/lulesh-state-RUN.txt
+  "--tmp=$source_dir"
+  "${lulesh_args[@]}"
+)
+printf -v command_line '%q ' "$hermit_bin" "${metadata_hermit_args[@]}"
 command_line=${command_line% }
 
 {
-  printf 'schema_version=1\n'
+  printf 'schema_version=2\n'
   printf 'host_arch=%s\n' "$(uname -m)"
   printf 'cpu_model=%s\n' "$(awk -F ': ' '/model name/ {print $2; exit}' /proc/cpuinfo)"
   printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
   printf 'lulesh_repository=%s\n' "$LULESH_REPOSITORY"
   printf 'lulesh_tag=%s\n' "$LULESH_TAG"
   printf 'lulesh_revision=%s\n' "$source_revision"
+  printf 'instrumentation_sha256=%s\n' "$(sha256_file "$instrumentation_patch")"
   printf 'lulesh_sha256=%s\n' "$(sha256_file "$lulesh_bin")"
   printf 'compiler=%s\n' "$(g++ --version | head -n 1)"
   printf 'openmp_runtime=%s\n' "$openmp_runtime"
   printf 'hermit=%s\n' "$hermit_bin"
+  printf 'hermit_source_commit=%s\n' "$hermit_source_commit"
   printf 'hermit_sha256=%s\n' "$(sha256_file "$hermit_bin")"
   printf 'runs=%s\n' "$runs"
   printf 'threads=%s\n' "$threads"
@@ -201,61 +246,97 @@ command_line=${command_line% }
 } >"$output_dir/metadata.txt"
 
 manifest=$output_dir/runs.tsv
-printf 'run\texit_code\tstdout_sha256\tstderr_sha256\tfingerprint_sha256\n' >"$manifest"
+printf 'run\texit_code\tstdout_sha256\tstderr_sha256\tstate_sha256\tfingerprint_sha256\n' >"$manifest"
 reference_stdout=
 reference_stderr=
+reference_state=
+reference_state_hash=
 reference_fingerprint=
 result=DETERMINISTIC
+expected_elements=$((size * size * size))
+expected_nodes=$(((size + 1) * (size + 1) * (size + 1)))
 
 for ((run = 1; run <= runs; run++)); do
   run_name=$(printf 'run-%04d' "$run")
   run_dir=$output_dir/runs/$run_name
   mkdir "$run_dir"
+  state_basename=lulesh-state-$run_name.txt
+  host_state_file=$source_dir/$state_basename
+  state_file=$run_dir/state.txt
+  [[ ! -e $host_state_file ]] || fail "state output already exists: $host_state_file"
+  run_hermit_args=(
+    "${hermit_common_args[@]}"
+    "--env=LULESH_STATE_FILE=/tmp/$state_basename"
+    "--tmp=$source_dir"
+    "${lulesh_args[@]}"
+  )
 
   set +e
   timeout --signal=TERM --kill-after=10s "${timeout_seconds}s" \
-    "$hermit_bin" "${hermit_args[@]}" \
+    "$hermit_bin" "${run_hermit_args[@]}" \
     >"$run_dir/stdout" 2>"$run_dir/stderr"
   exit_code=$?
   set -e
 
   stdout_hash=$(sha256_file "$run_dir/stdout")
   stderr_hash=$(sha256_file "$run_dir/stderr")
+  if [[ -f $host_state_file ]]; then
+    mv "$host_state_file" "$state_file"
+    state_hash=$(sha256_file "$state_file")
+  else
+    state_hash=MISSING
+    result=FAILED
+  fi
   fingerprint=$(
-    printf 'exit_code=%s\nstdout_sha256=%s\nstderr_sha256=%s\n' \
-      "$exit_code" "$stdout_hash" "$stderr_hash" |
+    printf 'exit_code=%s\nstdout_sha256=%s\nstderr_sha256=%s\nstate_sha256=%s\n' \
+      "$exit_code" "$stdout_hash" "$stderr_hash" "$state_hash" |
       sha256sum |
       awk '{print $1}'
   )
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$run_name" "$exit_code" "$stdout_hash" "$stderr_hash" "$fingerprint" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$run_name" "$exit_code" "$stdout_hash" "$stderr_hash" "$state_hash" "$fingerprint" \
     >>"$manifest"
 
   if ((exit_code != 0)); then
     result=FAILED
   fi
-  if ! grep -Fq "Num threads: $threads" "$run_dir/stdout" ||
-    ! grep -Fq "Iteration count     =  $iterations" "$run_dir/stdout" ||
-    ! grep -Fq 'Final Origin Energy =' "$run_dir/stdout"; then
+  if ! has_one_matching_line "^Num threads: ${threads}$" "$run_dir/stdout" ||
+    ! has_one_matching_line "^Observed OpenMP team size = ${threads}$" "$run_dir/stdout" ||
+    ! has_one_matching_line '^Observed OpenMP parallel regions = [1-9][0-9]*$' "$run_dir/stdout" ||
+    ! has_one_matching_line "^   Iteration count     = +${iterations}[[:space:]]*$" "$run_dir/stdout" ||
+    ! has_one_matching_line '^   Final Origin Energy = +[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?[[:space:]]*$' "$run_dir/stdout"; then
+    result=FAILED
+  fi
+  if [[ $state_hash != MISSING ]] &&
+    { ! has_one_matching_line '^schema_version=1$' "$state_file" ||
+      ! has_one_matching_line "^num_nodes=${expected_nodes}$" "$state_file" ||
+      ! has_one_matching_line "^num_elements=${expected_elements}$" "$state_file" ||
+      ! has_one_matching_line "^cycle=${iterations}$" "$state_file"; }; then
     result=FAILED
   fi
 
   if [[ -z $reference_stdout ]]; then
     reference_stdout=$run_dir/stdout
     reference_stderr=$run_dir/stderr
+    reference_state=$state_file
+    reference_state_hash=$state_hash
     reference_fingerprint=$fingerprint
   elif ! cmp -s "$reference_stdout" "$run_dir/stdout" ||
     ! cmp -s "$reference_stderr" "$run_dir/stderr" ||
+    ! cmp -s "$reference_state" "$state_file" ||
     [[ $fingerprint != "$reference_fingerprint" ]]; then
-    result=NON-DETERMINISTIC
+    if [[ $result != FAILED ]]; then
+      result=NON-DETERMINISTIC
+    fi
   fi
 done
 
-unique_fingerprints=$(tail -n +2 "$manifest" | cut -f5 | sort -u | wc -l)
+unique_fingerprints=$(tail -n +2 "$manifest" | cut -f6 | sort -u | wc -l)
 {
   printf 'result=%s\n' "$result"
   printf 'runs=%s\n' "$runs"
   printf 'unique_fingerprints=%s\n' "$unique_fingerprints"
+  printf 'reference_state_sha256=%s\n' "$reference_state_hash"
   printf 'reference_fingerprint=%s\n' "$reference_fingerprint"
   printf 'manifest=runs.tsv\n'
 } >"$output_dir/summary.txt"
