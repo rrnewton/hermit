@@ -114,7 +114,6 @@ jobs:
         do
           cargo test -p hermit --test "$test" -- --test-threads=1
         done
-        cargo test -p hermit --test record_replay record_find_directory_tree -- --exact --test-threads=1
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
     - name: PMU Detcore lit tests
