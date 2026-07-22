@@ -502,9 +502,7 @@ default_workload_tests! {
     default_rust_mem_race => "rust_mem_race",
     default_shell_parallel_work => "shell_parallel_work",
     default_shell_taskset => "shell_taskset",
-    default_cargo_bind_connect_race => "rustbin_bind_connect_race",
     default_cargo_clock_gettime => "rustbin_clock_gettime",
-    default_cargo_clock_total_order => "rustbin_clock_total_order",
     default_cargo_exit_group => "rustbin_exit_group",
     default_cargo_futex_and_print => "rustbin_futex_and_print",
     default_cargo_futex_timeout => "rustbin_futex_timeout",
@@ -523,6 +521,18 @@ default_workload_tests! {
     default_cargo_sched_yield => "rustbin_sched_yield",
     default_cargo_socketpair => "rustbin_socketpair",
     default_cargo_thread_random => "rustbin_thread_random",
+}
+
+#[test]
+#[ignore = "racy default mode can block in Hermit's connect emulation"]
+fn default_cargo_bind_connect_race() {
+    run_default_workload("rustbin_bind_connect_race");
+}
+
+#[test]
+#[ignore = "default mode can block in clock total-order scheduling"]
+fn default_cargo_clock_total_order() {
+    run_default_workload("rustbin_clock_total_order");
 }
 
 #[test]

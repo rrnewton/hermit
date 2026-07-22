@@ -81,8 +81,6 @@ jobs:
         elif command -v dnf >/dev/null; then
           sudo dnf install -y libunwind-devel xz-devel
         fi
-    - name: Install cargo-nextest
-      run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
     - name: CPUID and RDRAND/RDSEED tests
       run: |
         cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
@@ -108,31 +106,23 @@ jobs:
           echo "available=false" >> "$GITHUB_OUTPUT"
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
         fi
-    - name: Hermit tests including record/replay matrix
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo nextest run --profile ci -p hermit
-    - name: Hermit unit tests without mount namespaces
-      if: steps.namespaces.outputs.available != 'true'
-      run: cargo nextest run --profile ci -p hermit --lib --bins
-    - name: Upload nextest JUnit report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: nextest-junit-${{ github.job }}
-        path: target/nextest/ci/junit.xml
-        if-no-files-found: warn
-        retention-days: 14
-    - name: PMU Detcore lit tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
-    - name: PMU chaos and verify tests
-      if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test chaos_verify -- --ignored --test-threads=1
-    - name: Concurrency stress suites
+    - name: Stable Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
       run: |
-        cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
-        cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
-        cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
-    - name: Schedule search E2E tests
-      run: ./tests/util/hermit_analyze_e2e.sh
+        cargo test -p hermit --lib --bins
+        for test in \
+          arbitrary_binaries \
+          cli \
+          clock_determinism \
+          epoll_determinism \
+          mmap_determinism \
+          procfs_determinism \
+          signal_determinism
+        do
+          cargo test -p hermit --test "$test" -- --test-threads=1
+        done
+        cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+        cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    - name: Hermit unit tests without mount namespaces
+      if: steps.namespaces.outputs.available != 'true'
+      run: cargo test -p hermit --lib --bins

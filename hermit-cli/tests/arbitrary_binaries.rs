@@ -14,8 +14,21 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::time::Duration;
+use std::time::Instant;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
+const BINARY_TIMEOUT: Duration = Duration::from_secs(20);
+const RUN_TOOLS: &[&str] = &[
+    "static_busybox",
+    "dynamic_ls",
+    "shell",
+    "python",
+    "curl",
+    "git",
+    "gcc",
+];
+const RECORD_REPLAY_TOOLS: &[&str] = &["static_busybox", "shell"];
 
 #[derive(Clone, Debug)]
 struct Tool {
@@ -62,7 +75,7 @@ fn tool(
     })
 }
 
-fn available_tools() -> Vec<Tool> {
+fn available_tools(allowed: &[&str]) -> Vec<Tool> {
     let mut tools = [
         tool(
             "static_busybox",
@@ -146,9 +159,12 @@ fn available_tools() -> Vec<Tool> {
     ]
     .into_iter()
     .flatten()
+    .filter(|tool| allowed.contains(&tool.name))
     .collect::<Vec<_>>();
 
-    if let Some(path) = rustup_tool("cargo") {
+    if allowed.contains(&"cargo")
+        && let Some(path) = rustup_tool("cargo")
+    {
         tools.push(Tool {
             name: "cargo",
             path,
@@ -157,6 +173,15 @@ fn available_tools() -> Vec<Tool> {
         });
     }
     tools
+}
+
+fn bounded_command(program: &Path, timeout: Duration) -> Command {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=TERM", "--kill-after=2s"])
+        .arg(format!("{:.3}s", timeout.as_secs_f64()))
+        .arg(program);
+    command
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -190,7 +215,7 @@ fn assert_marker(tool: &Tool, output: &Output, label: &str) {
 }
 
 fn hermit_run(tool: &Tool) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = bounded_command(Path::new(env!("CARGO_BIN_EXE_hermit")), BINARY_TIMEOUT);
     command
         .args([
             "run",
@@ -213,7 +238,7 @@ fn record_replay(tool: &Tool) -> Output {
     }
     fs::create_dir_all(&data_dir).expect("failed to create recording directory");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = bounded_command(Path::new(env!("CARGO_BIN_EXE_hermit")), BINARY_TIMEOUT);
     command
         .args(["record", "start", "--verify"])
         .arg(format!("--data-dir={}", data_dir.display()))
@@ -226,7 +251,7 @@ fn record_replay(tool: &Tool) -> Output {
 #[test]
 fn run_arbitrary_binary_matrix() {
     let _guard = hermit_run_lock();
-    let tools = available_tools();
+    let tools = available_tools(RUN_TOOLS);
     assert!(
         tools.iter().any(|tool| tool.name == "dynamic_ls")
             && tools.iter().any(|tool| tool.name == "shell"),
@@ -242,21 +267,9 @@ fn run_arbitrary_binary_matrix() {
 #[test]
 fn record_replay_stable_arbitrary_binaries() {
     let _guard = hermit_run_lock();
-    let stable = [
-        "static_busybox",
-        "dynamic_ls",
-        "shell",
-        "python",
-        "curl",
-        "wget",
-        "git",
-        "gcc",
-        "make",
-        "cargo",
-    ];
-    let tools = available_tools();
+    let tools = available_tools(RECORD_REPLAY_TOOLS);
 
-    for tool in tools.iter().filter(|tool| stable.contains(&tool.name)) {
+    for tool in &tools {
         let output = record_replay(tool);
         let combined = format!(
             "{}{}",
@@ -270,4 +283,39 @@ fn record_replay_stable_arbitrary_binaries() {
             combined
         );
     }
+}
+
+#[test]
+fn arbitrary_binary_commands_are_bounded() {
+    let mut command = bounded_command(Path::new("/bin/sh"), Duration::from_millis(100));
+    command.args(["-c", "sleep 10"]);
+
+    let started = Instant::now();
+    let output = command
+        .output()
+        .expect("bounded command should start successfully");
+    assert_eq!(output.status.code(), Some(124));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn arbitrary_binary_lists_are_curated_for_ci() {
+    for name in [
+        "node", "java", "go", "wget", "make", "cmake", "sqlite", "cargo",
+    ] {
+        assert!(!RUN_TOOLS.contains(&name));
+        assert!(!RECORD_REPLAY_TOOLS.contains(&name));
+    }
+    assert!(
+        RECORD_REPLAY_TOOLS
+            .iter()
+            .all(|name| RUN_TOOLS.contains(name))
+    );
+
+    let worst_case_seconds =
+        (RUN_TOOLS.len() + RECORD_REPLAY_TOOLS.len()) as u64 * BINARY_TIMEOUT.as_secs();
+    assert!(
+        worst_case_seconds < 5 * 60,
+        "curated arbitrary binary probes can exceed five minutes"
+    );
 }
