@@ -7,6 +7,7 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -31,6 +33,15 @@ static volatile sig_atomic_t reentrant_max_depth;
 static unsigned char alternate_stack[ALT_STACK_SIZE];
 static volatile sig_atomic_t altstack_deliveries;
 static volatile sig_atomic_t altstack_address_ok = 1;
+
+static int blocking_read_pipe[2];
+static volatile sig_atomic_t blocking_read_deliveries;
+static volatile sig_atomic_t blocking_read_handler_failed;
+
+static int nonrestartable_write_fd = -1;
+static int nonrestartable_signal;
+static volatile sig_atomic_t nonrestartable_deliveries;
+static volatile sig_atomic_t nonrestartable_handler_failed;
 
 static void write_message(const char* message, size_t length) {
   (void)write(STDOUT_FILENO, message, length);
@@ -126,6 +137,267 @@ static int test_itimer_delivery(void) {
       was_pending,
       (int)alarm_observed_phase,
       (int)alarm_deliveries);
+  return 0;
+}
+
+static void blocking_read_handler(int signal_number) {
+  (void)signal_number;
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0 ||
+      write(blocking_read_pipe[1], "xx", 2) != 2) {
+    blocking_read_handler_failed = 1;
+    return;
+  }
+  ++blocking_read_deliveries;
+}
+
+static int test_blocking_read_interrupted_by_signal(int restart) {
+  if (pipe(blocking_read_pipe) != 0) {
+    perror("pipe");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = blocking_read_handler;
+  action.sa_flags = restart ? SA_RESTART : 0;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (alarm(1) != 0) {
+    fputs("unexpected pending alarm\n", stderr);
+    return 1;
+  }
+
+  char bytes[2];
+  if (!restart) {
+    errno = 0;
+    if (read(blocking_read_pipe[0], &bytes[0], 1) != -1 || errno != EINTR) {
+      fputs("blocking read was not interrupted with EINTR\n", stderr);
+      return 1;
+    }
+  }
+
+  if (read(blocking_read_pipe[0], &bytes[0], 1) != 1 ||
+      read(blocking_read_pipe[0], &bytes[1], 1) != 1) {
+    perror("read");
+    return 1;
+  }
+  if (blocking_read_handler_failed || blocking_read_deliveries != 1 ||
+      bytes[0] != 'x' || bytes[1] != 'x') {
+    fprintf(
+        stderr,
+        "blocking read signal failed: handler_failed=%d deliveries=%d bytes=%c%c\n",
+        (int)blocking_read_handler_failed,
+        (int)blocking_read_deliveries,
+        bytes[0],
+        bytes[1]);
+    return 1;
+  }
+
+  printf(
+      "blocking read %s deliveries=%d bytes=%c%c\n",
+      restart ? "restarted" : "interrupted",
+      (int)blocking_read_deliveries,
+      bytes[0],
+      bytes[1]);
+  return 0;
+}
+
+static void nonrestartable_wait_handler(int signal_number) {
+  (void)signal_number;
+  ++nonrestartable_deliveries;
+  if (nonrestartable_write_fd >= 0 &&
+      write(nonrestartable_write_fd, "x", 1) != 1) {
+    nonrestartable_handler_failed = 1;
+  }
+  if (nonrestartable_signal != 0 &&
+      kill(getpid(), nonrestartable_signal) != 0) {
+    nonrestartable_handler_failed = 1;
+  }
+}
+
+static int arm_nonrestartable_wait(int write_fd, int queued_signal) {
+  nonrestartable_write_fd = write_fd;
+  nonrestartable_signal = queued_signal;
+  nonrestartable_deliveries = 0;
+  nonrestartable_handler_failed = 0;
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = nonrestartable_wait_handler;
+  action.sa_flags = SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    perror("sigaction");
+    return -1;
+  }
+  if (alarm(1) != 0) {
+    fputs("unexpected pending alarm\n", stderr);
+    return -1;
+  }
+  return 0;
+}
+
+static int check_nonrestartable_result(const char* syscall_name, int result,
+                                       int saved_errno) {
+  if (result != -1 || saved_errno != EINTR) {
+    fprintf(
+        stderr,
+        "%s was restarted despite SA_RESTART: result=%d errno=%d\n",
+        syscall_name,
+        result,
+        saved_errno);
+    return -1;
+  }
+  if (nonrestartable_handler_failed || nonrestartable_deliveries != 1) {
+    fprintf(
+        stderr,
+        "%s signal handler failed: handler_failed=%d deliveries=%d\n",
+        syscall_name,
+        (int)nonrestartable_handler_failed,
+        (int)nonrestartable_deliveries);
+    return -1;
+  }
+  return 0;
+}
+
+static int test_poll_interrupted_despite_sa_restart(void) {
+  int descriptors[2];
+  if (pipe(descriptors) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  if (arm_nonrestartable_wait(descriptors[1], 0) != 0) {
+    return 1;
+  }
+
+  struct pollfd descriptor = {
+      .fd = descriptors[0],
+      .events = POLLIN,
+  };
+  errno = 0;
+  const int result = poll(&descriptor, 1, -1);
+  const int saved_errno = errno;
+  if (check_nonrestartable_result("poll", result, saved_errno) != 0) {
+    return 1;
+  }
+
+  char byte = 0;
+  if (read(descriptors[0], &byte, 1) != 1 || byte != 'x') {
+    fputs("poll handler did not make its descriptor readable\n", stderr);
+    return 1;
+  }
+  close(descriptors[0]);
+  close(descriptors[1]);
+  printf(
+      "poll interrupted deliveries=%d\n",
+      (int)nonrestartable_deliveries);
+  return 0;
+}
+
+static int test_epoll_wait_interrupted_despite_sa_restart(void) {
+  int descriptors[2];
+  if (pipe(descriptors) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  const int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd < 0) {
+    perror("epoll_create1");
+    return 1;
+  }
+  struct epoll_event registration = {
+      .events = EPOLLIN,
+      .data.fd = descriptors[0],
+  };
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, descriptors[0], &registration) != 0) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  if (arm_nonrestartable_wait(descriptors[1], 0) != 0) {
+    return 1;
+  }
+
+  struct epoll_event event;
+  errno = 0;
+  const int result = epoll_wait(epoll_fd, &event, 1, -1);
+  const int saved_errno = errno;
+  if (check_nonrestartable_result("epoll_wait", result, saved_errno) != 0) {
+    return 1;
+  }
+
+  char byte = 0;
+  if (read(descriptors[0], &byte, 1) != 1 || byte != 'x') {
+    fputs("epoll_wait handler did not make its descriptor readable\n", stderr);
+    return 1;
+  }
+  close(epoll_fd);
+  close(descriptors[0]);
+  close(descriptors[1]);
+  printf(
+      "epoll_wait interrupted deliveries=%d\n",
+      (int)nonrestartable_deliveries);
+  return 0;
+}
+
+static int test_sigtimedwait_interrupted_despite_sa_restart(void) {
+  sigset_t wait_set;
+  sigset_t previous;
+  sigemptyset(&wait_set);
+  sigaddset(&wait_set, SIGUSR2);
+  if (sigprocmask(SIG_BLOCK, &wait_set, &previous) != 0) {
+    perror("sigprocmask");
+    return 1;
+  }
+  if (arm_nonrestartable_wait(-1, SIGUSR2) != 0) {
+    return 1;
+  }
+
+  const struct timespec timeout = {
+      .tv_sec = 5,
+      .tv_nsec = 0,
+  };
+  errno = 0;
+  const int result = sigtimedwait(&wait_set, NULL, &timeout);
+  const int saved_errno = errno;
+  const int interruption_failed =
+      check_nonrestartable_result("rt_sigtimedwait", result, saved_errno);
+
+  sigset_t pending;
+  if (sigpending(&pending) != 0) {
+    perror("sigpending");
+    return 1;
+  }
+  const int signal_was_pending = sigismember(&pending, SIGUSR2);
+  if (signal_was_pending == 1) {
+    const struct timespec no_wait = {
+        .tv_sec = 0,
+        .tv_nsec = 0,
+    };
+    if (sigtimedwait(&wait_set, NULL, &no_wait) != SIGUSR2) {
+      fputs("rt_sigtimedwait did not consume pending SIGUSR2\n", stderr);
+      return 1;
+    }
+  }
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    perror("sigprocmask restore");
+    return 1;
+  }
+  if (interruption_failed != 0) {
+    return 1;
+  }
+  if (signal_was_pending != 1) {
+    fputs("SIGUSR2 was not pending after rt_sigtimedwait interruption\n", stderr);
+    return 1;
+  }
+  printf(
+      "rt_sigtimedwait interrupted deliveries=%d pending=SIGUSR2\n",
+      (int)nonrestartable_deliveries);
   return 0;
 }
 
@@ -389,6 +661,21 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();
+  }
+  if (strcmp(argv[1], "blocking-read-interrupted") == 0) {
+    return test_blocking_read_interrupted_by_signal(0);
+  }
+  if (strcmp(argv[1], "blocking-read-restarted") == 0) {
+    return test_blocking_read_interrupted_by_signal(1);
+  }
+  if (strcmp(argv[1], "poll-sa-restart") == 0) {
+    return test_poll_interrupted_despite_sa_restart();
+  }
+  if (strcmp(argv[1], "epoll-wait-sa-restart") == 0) {
+    return test_epoll_wait_interrupted_despite_sa_restart();
+  }
+  if (strcmp(argv[1], "sigtimedwait-sa-restart") == 0) {
+    return test_sigtimedwait_interrupted_despite_sa_restart();
   }
   if (strcmp(argv[1], "handler-reentrance") == 0) {
     return test_handler_reentrance();

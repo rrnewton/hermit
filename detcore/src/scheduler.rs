@@ -1291,7 +1291,26 @@ impl Scheduler {
                 );
             }
             ThreadStatus::Running => {
-                // TODO(T137242449): could reprioritize to run it sooner, but for now we leave the priorities alone.
+                let is_internal_io_polling = self
+                    .next_turns
+                    .get(&dettid)
+                    .and_then(|next_turn| next_turn.req.try_read())
+                    .is_some_and(|request| {
+                        request.is_ok_and(|resources| {
+                            resources
+                                .resources
+                                .contains_key(&ResourceID::InternalIOPolling)
+                        })
+                    });
+
+                if is_internal_io_polling {
+                    assert!(self.run_queue.remove_tid(dettid));
+                    let mut rsrcs = Resources::new(dettid);
+                    rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+                    self.force_unblock_thread(dettid, rsrcs);
+                }
+                // TODO(T137242449): other runnable requests could be reprioritized to run
+                // sooner, but for now we leave their priorities alone.
             }
             ThreadStatus::NotRunning => {
                 let mut rsrcs = Resources::new(dettid);
