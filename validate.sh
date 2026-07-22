@@ -81,6 +81,8 @@ run_check "Build workspace" cargo build --workspace
 # targets such as hermit-cli/tests/hermit_modes.rs.
 run_check "Test workspace and integrations" \
     cargo test --workspace --exclude hermetic_infra_hermit_flaky-tests
+run_check "Fast concurrency stress suite" \
+    cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps
