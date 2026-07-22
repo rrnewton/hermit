@@ -129,14 +129,14 @@ impl LogicalTime {
     /// This method does not return the length of the duration when represented by microseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one million).
     pub fn subsec_micros(&self) -> u32 {
-        (self.0 % MICROS_PER_SEC) as u32
+        ((self.0 / NANOS_PER_MICRO) % MICROS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in milliseconds.
     /// This method does not return the length of the duration when represented by milliseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one thousand).
     pub fn subsec_millis(&self) -> u32 {
-        (self.0 % MILLIS_PER_SEC) as u32
+        ((self.0 / NANOS_PER_MILLI) % MILLIS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in nanoseconds.
@@ -257,6 +257,19 @@ fn print_nanoseconds() {
     assert_eq!(format!("{}", ns1), "946_684_799.000_000_000s");
     assert_eq!(format!("{}", ns1 + ns2), "946_684_799.729_860_000s");
     assert_eq!(format!("{}", ns2), "729_860_000ns");
+}
+
+#[test]
+fn subsecond_units_are_converted_from_nanoseconds() {
+    let time = LogicalTime::from_secs(2) + LogicalTime::from_nanos(345_678_901);
+
+    assert_eq!(time.subsec_millis(), 345);
+    assert_eq!(time.subsec_micros(), 345_678);
+    assert_eq!(time.subsec_nanos(), 345_678_901);
+
+    let timeval: Timeval = time.into();
+    assert_eq!(timeval.tv_sec, 2);
+    assert_eq!(timeval.tv_usec, 345_678);
 }
 
 /// The same basic type alias as nanoseconds. Just for clarity/readability.
