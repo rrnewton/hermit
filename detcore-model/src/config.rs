@@ -277,6 +277,17 @@ pub struct Config {
     #[clap(long)]
     pub no_rcb_time: bool,
 
+    /// **Internal:** Disable causal wakeup for notification file descriptors (eventfd and
+    /// pipe), falling back to the older internal-polling strategy for their blocking reads.
+    ///
+    /// By default a blocking reader on an eventfd/pipe is parked and woken precisely when a
+    /// writer makes data available (or when the object is closed), analogous to how futexes
+    /// are modeled.  This avoids the blind poll/backoff loop that can livelock and deadlock
+    /// guest runtimes which coordinate threads through such fds (for example Ruby's GVL)
+    /// under deterministic scheduling.
+    #[clap(long)]
+    pub no_causal_notify_fds: bool,
+
     /// An option to enable logging the hash of heap memory maps for the purpose of determinism checking
     #[clap(long)]
     pub detlog_heap: bool,
@@ -403,6 +414,13 @@ impl Config {
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
+    }
+
+    /// Should blocking reads on notification fds (eventfd/pipe) use precise causal wakeup
+    /// (park-and-wake) rather than the internal-polling fallback?  Only meaningful when the
+    /// scheduler is sequentializing threads; the polling path is always used otherwise.
+    pub fn use_causal_notify_fds(&self) -> bool {
+        self.sequentialize_threads && !self.no_causal_notify_fds
     }
 
     /// Should we call trace_schedevent to trace each SchedEvent?

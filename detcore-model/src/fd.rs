@@ -89,3 +89,27 @@ impl OpenFileId {
         Self { creator, sequence }
     }
 }
+
+/// Stable identity of a notification file object (an eventfd or a pipe) used to link a
+/// blocking reader to the writer whose write should wake it.
+///
+/// For an eventfd, the reader and writer share a single open file description, so the id is
+/// simply that `OpenFileId`. For a pipe, the read and write ends are distinct open file
+/// descriptions that are nonetheless created together; both ends record the *read end's*
+/// `OpenFileId` as their shared notification id, so a write on the write end and a read on
+/// the read end resolve to the same key. Because the id is intrinsic to the underlying
+/// object (established once, at creation) it is stable across `dup`/`fork` aliasing and does
+/// not depend on nondeterministic kernel inode numbers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub struct NotificationFdId(pub OpenFileId);

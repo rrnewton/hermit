@@ -421,6 +421,9 @@ impl GlobalTool for GlobalState {
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
                     .await,
             ),
+            GlobalRequest::NotifFdAction(dettid, action, notifid) => {
+                R::NotifFdAction(self.recv_notif_action(from, dettid, action, notifid).await)
+            }
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
             }
@@ -854,6 +857,51 @@ impl GlobalState {
         }
     }
 
+    async fn recv_notif_action(
+        &self,
+        _from: Tid,
+        dettid: DetTid,
+        action: NotifFdAction,
+        notifid: NotificationFdId,
+    ) -> NotifFdActionResult {
+        trace!(
+            "[detcore, dtid {}] notification-fd action: {:?} on {:?}",
+            &dettid, action, notifid
+        );
+        let response_iv = {
+            let mut sched = self.sched.lock().unwrap();
+            let resp_iv = sched
+                .next_turns
+                .get(&dettid)
+                .expect("Missing next_turns entry")
+                .resp
+                .clone();
+            match action {
+                NotifFdAction::WaitRequest => {
+                    sched.sleep_notif_waiter(&dettid, notifid);
+                    // Blocking on the read here, remove ourselves from the run queue:
+                    assert!(sched.run_queue.remove_tid(dettid));
+                    resp_iv
+                }
+                NotifFdAction::WakeRequest => {
+                    let n = sched.wake_notif_waiters(notifid);
+                    return NotifFdActionResult::Woke(n);
+                }
+            }
+        };
+        // Wait for a waker (a write, a close, or exit cleanup) plus the scheduler's response.
+        match response_iv.get().await {
+            SchedResponse::Go(_) => {
+                trace!(
+                    "[detcore, dtid {}] Unblocked from notification-fd read!",
+                    &dettid
+                );
+                NotifFdActionResult::Woken
+            }
+            SchedResponse::Signaled() => NotifFdActionResult::Signaled,
+        }
+    }
+
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
         // Here we establish a policy that when we first see a file its mtime is epoch.
         let nanos = self
@@ -1076,6 +1124,9 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
+    /// Park or wake around a notification-fd (eventfd/pipe) read/write for causal wakeup.
+    NotifFdAction(DetTid, NotifFdAction, NotificationFdId),
+
     /// Translate nondeterministic to deterministic inode.
     DeterminizeInode(RawInode),
 
@@ -1119,6 +1170,7 @@ pub enum GlobalResponse {
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
     FutexAction(Option<SchedValue>),
+    NotifFdAction(NotifFdActionResult),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
     UnlinkInode(()),
@@ -1359,6 +1411,55 @@ where
     match resp.1 {
         GlobalResponse::FutexAction(answer) => {
             trace!("UNBLOCKING after futex_action. Request was: {:?}", req);
+            answer
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Actions we can take, in coordination with the scheduler, around a notification-fd
+/// (eventfd/pipe) read or write in order to implement causal reader/writer wakeup.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum NotifFdAction {
+    /// A blocking reader parks itself until a writer/closer wakes it.  Blocks until woken.
+    WaitRequest,
+    /// A writer (or a close) wakes every reader parked on this notification object.
+    WakeRequest,
+}
+
+/// Outcome of a [`NotifFdAction`].
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum NotifFdActionResult {
+    /// A parked reader was woken normally and should retry its read.
+    Woken,
+    /// A parked reader was interrupted by a signal and should return `EINTR`.
+    Signaled,
+    /// A wake released this many parked readers.
+    Woke(u64),
+}
+
+/// Ask the scheduler to park (or wake) around a notification-fd operation.
+pub async fn notif_action<G, T>(
+    guest: &mut G,
+    action: NotifFdAction,
+    notifid: NotificationFdId,
+) -> NotifFdActionResult
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    assert!(guest.config().sequentialize_threads);
+    let dettid = guest.thread_state().dettid;
+    let req = GlobalRequest::NotifFdAction(dettid, action, notifid);
+    trace!(
+        "BLOCKING on notif_action: sending request to scheduler: {:?}",
+        req
+    );
+    // Update local time from potentially blocking operation:
+    let resp = send_and_update_time(guest, req.clone()).await;
+    match resp.1 {
+        GlobalResponse::NotifFdAction(answer) => {
+            trace!("UNBLOCKING after notif_action. Request was: {:?}", req);
             answer
         }
         _ => unreachable!(),

@@ -43,6 +43,9 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
+use crate::syscalls::helpers::IOAction;
+use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::ioaction_based_on_fd_status;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::*;
@@ -183,9 +186,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // Capture the notification identity before the fd is removed, so we can wake any
+        // parked readers once the close takes effect (they may now observe EOF).
+        let notif_id = if self.cfg.use_causal_notify_fds() && !self.cfg.recordreplay_modes {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| {
+                    if matches!(detfd.ty(), FdType::Pipe | FdType::Eventfd) {
+                        detfd.notification_fd_id()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(None)
+        } else {
+            None
+        };
         let res = self.record_or_replay(guest, call).await?;
         if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
             self.release_port_for_open_file(guest, open_file_id).await;
+        }
+        if let Some(id) = notif_id {
+            notif_action(guest, NotifFdAction::WakeRequest, id).await;
         }
         trace!("Closed {}", fd);
         Ok(res)
@@ -269,7 +291,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Eventfd | FdType::Pipe => {
+                trace!(
+                    "Possibly blocking read call on notification fd {}, type {:?}",
+                    call.fd(),
+                    fd_type
+                );
+                self.execute_notification_fd_read(guest, call).await
+            }
+            FdType::Signalfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -282,7 +312,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(self.record_or_replay(guest, call).await?)
             }
 
-            FdType::Socket | FdType::Pipe => {
+            FdType::Socket => {
                 trace!(
                     "Possibly blocking read call on {:?} fd {}",
                     fd_type,
@@ -338,19 +368,89 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Read from a notification fd (eventfd/pipe), using precise causal wakeup when
+    /// applicable and otherwise falling back to the internal-polling path.
+    async fn execute_notification_fd_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<i64, Error> {
+        // Causal wakeup applies only when the feature is enabled, we are deterministically
+        // scheduling in run mode, and the fd is one we nonblockize-and-retry (i.e. it is
+        // physically nonblocking but the guest expects blocking semantics).  A fd the guest
+        // itself made nonblocking (PassThru) must still return EAGAIN rather than parking.
+        if self.cfg.use_causal_notify_fds()
+            && !self.cfg.recordreplay_modes
+            && ioaction_based_on_fd_status(guest, call) == IOAction::NonblockizeRetry
+            && let Some(notif_id) = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.notification_fd_id())?
+        {
+            return self
+                .causal_notification_fd_read(guest, call, notif_id)
+                .await;
+        }
+        self.execute_nonblockable_fd_syscall(guest, call).await
+    }
+
+    /// Perform a blocking read on a notification fd by parking the reader until a writer (or a
+    /// close) wakes it, rather than polling.
+    ///
+    /// Correctness note: because the scheduler sequentializes guest threads, no other thread
+    /// runs between the point where the injected nonblocking read reports EAGAIN and the point
+    /// where we park (`WaitRequest`).  A writer therefore cannot issue its wake before we are
+    /// parked, so there is no lost-wakeup race.  This is the same invariant that makes the
+    /// precise futex implementation correct.
+    async fn causal_notification_fd_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        notif_id: NotificationFdId,
+    ) -> Result<i64, Error> {
+        // The fd is already physically nonblocking (NonblockizeRetry), so the injected read
+        // never actually blocks in the kernel; an empty pipe/eventfd yields EAGAIN.
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("notif_fd_read");
+
+        loop {
+            resource_request(guest, rsrc.clone()).await;
+            let res = guest.inject_with_retry(call).await;
+            if call.syscall_would_have_blocked(res) {
+                match notif_action(guest, NotifFdAction::WaitRequest, notif_id).await {
+                    NotifFdActionResult::Woken => {
+                        // A writer made data available, or the object was closed (EOF); retry.
+                        continue;
+                    }
+                    NotifFdActionResult::Signaled => {
+                        return Err(Error::Errno(Errno::EINTR));
+                    }
+                    NotifFdActionResult::Woke(_) => {
+                        unreachable!("WaitRequest never returns a wake count")
+                    }
+                }
+            } else {
+                return call
+                    .normalize_nonblocking_result(res, false)
+                    .map_err(|e| e.into());
+            }
+        }
+    }
+
     /// SYS_write system call.
     pub async fn handle_write<G: Guest<Self>>(
         &self,
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, resource, raw_ino) =
+        let (fd_type, physically_nonblocking, resource, raw_ino, notif_id) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
                     detfd.resource(),
                     detfd.stat().map(|x| x.inode),
+                    detfd.notification_fd_id(),
                 )
             })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
@@ -415,6 +515,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Ok(self.record_or_replay(guest, call).await?)
         };
+
+        // Having (possibly) placed data in the pipe/eventfd, wake any readers parked on it via
+        // causal wakeup so they retry their reads.  A wake with no waiters simply fizzles.
+        if self.cfg.use_causal_notify_fds()
+            && !self.cfg.recordreplay_modes
+            && matches!(fd_type, FdType::Pipe | FdType::Eventfd)
+            && let (Ok(written), Some(id)) = (&res, notif_id)
+            && *written > 0
+        {
+            notif_action(guest, NotifFdAction::WakeRequest, id).await;
+        }
 
         resource_release_all(guest).await;
         res
@@ -734,6 +845,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
+            }
+            if self.cfg.use_causal_notify_fds() {
+                // The read and write ends are distinct open file descriptions.  Key both on
+                // the read end's OpenFileId so that a write on fds[1] and a read on fds[0]
+                // resolve to the same notification object.
+                let read_id = guest
+                    .thread_state()
+                    .with_detfd(fds[0], |detfd| detfd.open_file_id())?;
+                let notif = NotificationFdId(read_id);
+                guest
+                    .thread_state()
+                    .with_detfd(fds[0], |detfd| detfd.set_notification_fd_id(notif))?;
+                guest
+                    .thread_state()
+                    .with_detfd(fds[1], |detfd| detfd.set_notification_fd_id(notif))?;
             }
         }
 
@@ -1056,6 +1182,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await?;
         if internally_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
+        }
+        if self.cfg.use_causal_notify_fds() {
+            // An eventfd has a single open file description shared by its reader and writer,
+            // so its own OpenFileId is the notification key.
+            guest.thread_state().with_detfd(fd, |detfd| {
+                let id = NotificationFdId(detfd.open_file_id());
+                detfd.set_notification_fd_id(id);
+            })?;
         }
         Ok(fd as i64)
     }

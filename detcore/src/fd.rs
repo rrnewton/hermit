@@ -115,6 +115,9 @@ struct OpenFileDescription {
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
     procfs: Option<ProcfsFile>,
+    /// Stable notification-object identity, set for eventfd and pipe descriptions that
+    /// participate in causal reader/writer wakeup.  See [`NotificationFdId`].
+    notification_fd_id: Option<NotificationFdId>,
 }
 
 impl PartialEq for DetFd {
@@ -155,6 +158,7 @@ impl DetFd {
                 stat: None,
                 resource: None,
                 procfs: None,
+                notification_fd_id: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -224,6 +228,17 @@ impl DetFd {
     /// Stable identity shared by dup and fork aliases.
     pub fn open_file_id(&self) -> OpenFileId {
         self.description().id
+    }
+
+    /// Notification-object identity for causal reader/writer wakeup, if this open file
+    /// description participates (eventfd or pipe).  Shared by every dup/fork alias.
+    pub fn notification_fd_id(&self) -> Option<NotificationFdId> {
+        self.description().notification_fd_id
+    }
+
+    /// Record the notification-object identity for every alias of this open file description.
+    pub fn set_notification_fd_id(&self, id: NotificationFdId) {
+        self.description().notification_fd_id = Some(id);
     }
 
     /// Number of modeled descriptor slots that retain this open file description.

@@ -68,6 +68,7 @@ use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::NotificationFdId;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -154,6 +155,17 @@ pub struct FutexWaiter {
     bitset: u32,
 }
 
+/// A thread parked on a blocking read of a notification fd (eventfd/pipe), waiting for a
+/// writer to make data available or for the object to be closed.
+///
+/// Unlike `FutexWaiter` we do not stash the response `Ivar` here: the woken thread's response
+/// is written through its `next_turns` entry by the scheduler's normal turn, exactly as for a
+/// requeued futex waiter.
+#[derive(Debug, Clone)]
+pub struct NotifWaiter {
+    dettid: DetTid,
+}
+
 fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -> Vec<FutexWaiter> {
     let (matching, remaining) = std::mem::take(waiters)
         .into_iter()
@@ -196,12 +208,21 @@ pub struct BlockedPool {
     /// waiting for permission to resume.  The request will stay empty while the thread is
     /// doing the blocking action.  This is different than the normal relationship
     pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
+
+    /// BLOCKED notification-fd reads (eventfd/pipe), waiting for a writer to make data
+    /// available or for the object to be closed.  Multiple threads may be blocked on the same
+    /// notification object.
+    ///
+    /// INVARIANT: like futex waiters, a thread parked here has a request filled in
+    /// `next_turns` for the single resource `NotificationFdWait`.
+    pub notif_waiters: HashMap<NotificationFdId, Vec<NotifWaiter>>,
 }
 
 impl BlockedPool {
     /// Returns true if there are NO blocked threads waiting outside the run-queue.
     fn is_empty(&self) -> bool {
         self.no_futex_waiters()
+            && self.no_notif_waiters()
             && self.timed_waiters.is_empty()
             && self.external_io_blockers.is_empty()
     }
@@ -209,6 +230,7 @@ impl BlockedPool {
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
     fn only_external_blocked(&self) -> bool {
         self.no_futex_waiters()
+            && self.no_notif_waiters()
             && self.timed_waiters.is_empty()
             && !self.external_io_blockers.is_empty()
     }
@@ -216,6 +238,11 @@ impl BlockedPool {
     /// Returns true if there are zero threads blocked on futexes.
     fn no_futex_waiters(&self) -> bool {
         self.futex_waiters.iter().all(|(_, v)| v.is_empty())
+    }
+
+    /// Returns true if there are zero threads blocked on notification-fd reads.
+    fn no_notif_waiters(&self) -> bool {
+        self.notif_waiters.iter().all(|(_, v)| v.is_empty())
     }
 }
 
@@ -724,6 +751,26 @@ fn assert_futex_request(nextturn: &ThreadNextTurn) {
     }
 }
 
+// A parked notification-fd reader has exactly one resource request, for NotificationFdWait.
+fn assert_notif_request(nextturn: &ThreadNextTurn) {
+    match nextturn.req.try_read() {
+        Some(Ok(req)) => {
+            if !(req.resources.contains_key(&ResourceID::NotificationFdWait)
+                && req.resources.len() == 1)
+            {
+                panic!(
+                    "assert_notif_request({}): internal invariant broken, expected a single NotificationFdWait request, found: {:?}",
+                    nextturn.dettid, req
+                )
+            }
+        }
+        _ => panic!(
+            "assert_notif_request({}): internal invariant broken, expected a NotificationFdWait request, instead found no request.",
+            nextturn.dettid
+        ),
+    }
+}
+
 // Test if the request was from a futex_wait call.
 fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
     match nextturn.req.try_read() {
@@ -1004,6 +1051,15 @@ impl Scheduler {
                 );
             }
         }
+
+        // A thread's exit closes its file descriptors, which may deliver EOF to notification-fd
+        // readers parked on a pipe/eventfd whose last write end this thread held.  We do not
+        // track that fd ownership precisely, so conservatively nudge every parked reader to
+        // re-check by retrying its (now EOF-returning) read.  Spurious wakeups are harmless:
+        // a reader whose read would still block simply re-parks.
+        if !self.blocked.no_notif_waiters() {
+            self.wake_all_notif_waiters();
+        }
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.
@@ -1012,6 +1068,7 @@ impl Scheduler {
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
+        let _ = self.remove_notif_waiter(dtid);
     }
 
     fn remove_futex_waiter(&mut self, dettid: &DetTid) -> bool {
@@ -1170,6 +1227,104 @@ impl Scheduler {
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
         self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+    }
+
+    /// Park a thread that is blocked reading a notification fd, to be awoken by
+    /// `wake_notif_waiters` (a writer, a close, or thread-exit cleanup).
+    pub fn sleep_notif_waiter(&mut self, dettid: &DetTid, notifid: NotificationFdId) {
+        let nxt = self
+            .next_turns
+            .get(dettid)
+            .expect("Missing next_turns entry");
+        let entry: &mut Vec<_> = self.blocked.notif_waiters.entry(notifid).or_default();
+        entry.push(NotifWaiter { dettid: *dettid });
+        // Like a futex WAIT, this "park" request signals what we are blocking on, but the
+        // scheduler will not grant it until a waker requeues us into the run queue.
+        let mut rsrc = Resources::new(*dettid);
+        rsrc.insert(ResourceID::NotificationFdWait, Permission::R);
+        nxt.req.put(Ok(rsrc));
+        trace!(
+            "[dtid {}] reader blocking on notification fd {:?}, now {} waiters, on {}",
+            &dettid,
+            &notifid,
+            entry.len(),
+            nxt.resp,
+        );
+    }
+
+    /// Reschedule a single thread that has been parked on a notification-fd read.
+    fn wake_notif_waiter(&mut self, waiter: NotifWaiter) {
+        let waiterid = waiter.dettid;
+        debug_assert!(!self.run_queue.contains_tid(waiterid));
+        let pos = self.runqueue_push_back(waiterid);
+        trace!(
+            "[detcore] Woke one notification-fd reader, dtid: {}, scheduled at position {}",
+            &waiterid, pos,
+        );
+        let nxt = self
+            .next_turns
+            .get_mut(&waiterid)
+            .expect("Thread must have an entry in next_turns");
+        assert_notif_request(nxt);
+        // N.B. As with futexes, we don't write the response here; that's for the scheduler's
+        // normal turn to do, once this thread reaches the front of the queue.
+    }
+
+    /// Wake ALL threads parked on a particular notification object and requeue them.  Returns
+    /// the number of threads woken.
+    ///
+    /// Unlike a futex wake (which knows exactly how many waiters a wake should release), a
+    /// single write to an eventfd/pipe may satisfy any number of pending readers, so we wake
+    /// every waiter and let each re-check by retrying its nonblocking read; a reader that
+    /// still would block simply re-parks.
+    pub fn wake_notif_waiters(&mut self, notifid: NotificationFdId) -> u64 {
+        let vec: Vec<NotifWaiter> = match self.blocked.notif_waiters.get_mut(&notifid) {
+            None => return 0,
+            Some(r) => std::mem::take(r),
+        };
+        let num = vec.len() as u64;
+        if num > 0 {
+            trace!(
+                "[detcore] Waking {} notification-fd reader(s) on {:?}",
+                num, notifid
+            );
+        }
+        for waiter in vec {
+            self.wake_notif_waiter(waiter);
+        }
+        num
+    }
+
+    /// Wake every parked notification-fd reader, regardless of which object it is waiting on.
+    /// Used as a conservative "re-check for EOF / new data" nudge when the set of open notify
+    /// objects may have changed in a way we do not otherwise track (for example, a writer
+    /// thread exiting and thereby closing the last write end of a pipe).
+    pub fn wake_all_notif_waiters(&mut self) -> u64 {
+        // Sort the keys so the woken readers enter the run queue in a deterministic order,
+        // independent of `HashMap` iteration order.
+        let mut keys: Vec<NotificationFdId> = self.blocked.notif_waiters.keys().copied().collect();
+        keys.sort();
+        let mut woken = 0;
+        for k in keys {
+            woken += self.wake_notif_waiters(k);
+        }
+        woken
+    }
+
+    /// Remove a thread from the notification-fd waiter pool, if present.
+    fn remove_notif_waiter(&mut self, dettid: &DetTid) -> bool {
+        let mut removed = 0;
+        self.blocked.notif_waiters.retain(|_, waiters| {
+            let before = waiters.len();
+            waiters.retain(|waiter| &waiter.dettid != dettid);
+            removed += before - waiters.len();
+            !waiters.is_empty()
+        });
+        assert!(
+            removed <= 1,
+            "thread was registered on multiple notification fds"
+        );
+        removed == 1
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
@@ -1434,15 +1589,20 @@ impl Scheduler {
         let timed_empty = self.blocked.timed_waiters.is_empty();
         let blockers_empty = self.blocked.external_io_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
+        let notif_empty = self.blocked.no_notif_waiters();
 
         if self.run_queue.is_empty() {
             // When the run queue is empty, we sometimes need to give things a kick.
-            if futex_empty && timed_empty && blockers_empty {
+            if futex_empty && notif_empty && timed_empty && blockers_empty {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
-            } else if !futex_empty && timed_empty && blockers_empty {
+            } else if (!futex_empty || !notif_empty) && timed_empty && blockers_empty {
+                // Parked futex waiters and notification-fd readers are both threads that can
+                // only be released by another guest thread acting (a futex wake, or a write /
+                // close on the fd).  With nothing runnable left to perform that action, the
+                // guest can make no further progress.
                 panic!(
-                    "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n \
+                    "Deadlock detected: thread(s) waiting on a futex or notification fd, but no runnable threads left.\n \
                  queue: {:?}\n  next_turns: {:?}\n  blocked: {:?} \n",
                     self.run_queue, self.next_turns, self.blocked
                 )
@@ -1697,6 +1857,7 @@ impl Scheduler {
             ResourceID::ParentContinue { .. } => Ok(()),
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
+            ResourceID::NotificationFdWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
             ResourceID::InboundSignal(_) => Ok(()),
         }
@@ -2054,6 +2215,13 @@ impl Scheduler {
             // Check all the places a blocked thread could be hiding.
             // TODO: this O(N) search could be made more efficient with more indexing structures.
             for v in self.blocked.futex_waiters.values() {
+                for waiter in v {
+                    if waiter.dettid == dtid {
+                        return ThreadStatus::NotRunning;
+                    }
+                }
+            }
+            for v in self.blocked.notif_waiters.values() {
                 for waiter in v {
                     if waiter.dettid == dtid {
                         return ThreadStatus::NotRunning;

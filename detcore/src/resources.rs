@@ -223,6 +223,13 @@ pub enum ResourceID {
     /// A guest is blocking on a futex wait, which means it's out of the runqueue.
     FutexWait,
 
+    /// A guest is blocking on a read of a notification fd (eventfd/pipe), parked out of the
+    /// runqueue until a writer makes data available or the object is closed.  Like
+    /// `FutexWait`, this is a "park" marker rather than a resource the scheduler grants: the
+    /// thread waits in the `notif_waiters` pool for a waker, not for the scheduler to hand it
+    /// the resource.
+    NotificationFdWait,
+
     /// Permission to perform blocking IO with an endpoint outside the deterministic container.
     /// In general these should be recorded if strict reproducibility is to be achieved.
     BlockingExternalIO(ExternalOpId),

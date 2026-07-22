@@ -16,6 +16,10 @@ fn run_five_times(guest: fn()) {
         preemption_timeout: None,
         ..Default::default()
     };
+    run_five_times_with_config(guest, config);
+}
+
+fn run_five_times_with_config(guest: fn(), config: Config) {
     let mut expected = None;
 
     for run in 1..=RUNS {
@@ -295,6 +299,103 @@ fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
+/// A blocking (from the guest's point of view) read on a pipe should park until a peer thread
+/// writes, then complete with the written bytes -- exercising the causal reader/writer wakeup
+/// rather than the older poll/backoff loop.
+fn pipe_causal_wakeup_guest() {
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "pipe2 failed: {}",
+        errno()
+    );
+    let [read_fd, write_fd] = fds;
+
+    let writer = std::thread::spawn(move || {
+        let payload: [u8; 4] = [1, 2, 3, 4];
+        let mut written = 0;
+        while written < payload.len() {
+            let n = unsafe {
+                libc::write(
+                    write_fd,
+                    payload.as_ptr().add(written).cast(),
+                    payload.len() - written,
+                )
+            };
+            assert!(n > 0, "pipe write failed: {}", errno());
+            written += n as usize;
+        }
+        close(write_fd);
+    });
+
+    // Note: no O_NONBLOCK and no EAGAIN loop -- this is a genuinely blocking read.
+    let mut buf = [0_u8; 4];
+    let mut read = 0;
+    while read < buf.len() {
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().add(read).cast(), buf.len() - read) };
+        assert!(n > 0, "pipe read failed: n={} errno={}", n, errno());
+        read += n as usize;
+    }
+    writer.join().unwrap();
+    close(read_fd);
+    println!("pipe={buf:?}");
+}
+
+/// A blocking read on an eventfd should park until a peer thread writes a counter value.
+fn eventfd_causal_wakeup_guest() {
+    let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    assert!(efd >= 0, "eventfd failed: {}", errno());
+
+    let writer = std::thread::spawn(move || {
+        let value = 7_u64;
+        assert_eq!(
+            unsafe { libc::write(efd, ptr::from_ref(&value).cast(), size_of::<u64>()) },
+            size_of::<u64>() as isize,
+            "eventfd write failed: {}",
+            errno()
+        );
+    });
+
+    let mut got = 0_u64;
+    let n = unsafe { libc::read(efd, ptr::from_mut(&mut got).cast(), size_of::<u64>()) };
+    assert_eq!(
+        n,
+        size_of::<u64>() as isize,
+        "eventfd read failed: n={} errno={}",
+        n,
+        errno()
+    );
+    writer.join().unwrap();
+    close(efd);
+    println!("eventfd={got}");
+}
+
+/// A reader parked on an empty pipe must observe EOF when the last write end is closed, even
+/// though no data was ever written -- exercising the close-triggered wakeup.
+fn pipe_eof_on_close_guest() {
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "pipe2 failed: {}",
+        errno()
+    );
+    let [read_fd, write_fd] = fds;
+
+    let writer = std::thread::spawn(move || {
+        // Close the write end without writing anything.
+        close(write_fd);
+    });
+
+    let mut buf = [0_u8; 8];
+    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+    assert_eq!(n, 0, "expected EOF, got n={} errno={}", n, errno());
+    writer.join().unwrap();
+    close(read_fd);
+    println!("eof-read={n}");
+}
+
 #[test]
 fn timerfd_expiry_is_deterministic() {
     run_five_times(timerfd_guest);
@@ -313,4 +414,32 @@ fn inotify_order_is_deterministic() {
 #[test]
 fn mixed_epoll_sources_are_deterministic() {
     run_five_times(mixed_epoll_guest);
+}
+
+#[test]
+fn pipe_blocking_read_wakes_on_write() {
+    run_five_times(pipe_causal_wakeup_guest);
+}
+
+#[test]
+fn eventfd_blocking_read_wakes_on_write() {
+    run_five_times(eventfd_causal_wakeup_guest);
+}
+
+#[test]
+fn pipe_blocking_read_sees_eof_on_close() {
+    run_five_times(pipe_eof_on_close_guest);
+}
+
+/// The same coordination must also work (deterministically) with causal wakeup disabled, i.e.
+/// on the internal-polling fallback path selected by `--no-causal-notify-fds`.
+#[test]
+fn pipe_blocking_read_wakes_on_write_polling_fallback() {
+    let config = Config {
+        sequentialize_threads: true,
+        preemption_timeout: None,
+        no_causal_notify_fds: true,
+        ..Default::default()
+    };
+    run_five_times_with_config(pipe_causal_wakeup_guest, config);
 }
