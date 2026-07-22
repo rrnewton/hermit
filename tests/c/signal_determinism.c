@@ -38,6 +38,8 @@ static int blocking_read_pipe[2];
 static volatile sig_atomic_t blocking_read_deliveries;
 static volatile sig_atomic_t blocking_read_handler_failed;
 
+static volatile sig_atomic_t suspend_deliveries;
+
 static int nonrestartable_write_fd = -1;
 static int nonrestartable_signal;
 static volatile sig_atomic_t nonrestartable_deliveries;
@@ -651,6 +653,97 @@ static int test_pending_across_exec(const char* executable) {
   return 1;
 }
 
+static void suspend_handler(int signal_number) {
+  (void)signal_number;
+  ++suspend_deliveries;
+  static const char message[] = "sigsuspend delivered\n";
+  write_message(message, sizeof(message) - 1);
+}
+
+static int test_blocking_sigsuspend(void) {
+  suspend_deliveries = 0;
+
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
+    perror("sigprocmask");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = suspend_handler;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+
+  const pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    struct timespec remaining = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000,
+    };
+    while (nanosleep(&remaining, &remaining) != 0) {
+      if (errno != EINTR) {
+        _exit(1);
+      }
+    }
+    if (kill(getppid(), SIGUSR1) != 0) {
+      _exit(1);
+    }
+    _exit(0);
+  }
+
+  sigset_t wait_mask = previous;
+  sigdelset(&wait_mask, SIGUSR1);
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  const int suspend_errno = errno;
+  const int restored = signal_is_blocked(SIGUSR1);
+
+  int status = 0;
+  const pid_t waited = waitpid(child, &status, 0);
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    perror("sigprocmask restore");
+    return 1;
+  }
+
+  if (suspend_result != -1 || suspend_errno != EINTR) {
+    fprintf(
+        stderr,
+        "sigsuspend returned result=%d errno=%d\n",
+        suspend_result,
+        suspend_errno);
+    return 1;
+  }
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fputs("signal child failed\n", stderr);
+    return 1;
+  }
+  if (suspend_deliveries != 1 || restored != 1) {
+    fprintf(
+        stderr,
+        "unexpected sigsuspend state: deliveries=%d restored=%d\n",
+        (int)suspend_deliveries,
+        restored);
+    return 1;
+  }
+
+  printf(
+      "sigsuspend restored=%d deliveries=%d\n",
+      restored,
+      (int)suspend_deliveries);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
@@ -676,6 +769,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "sigtimedwait-sa-restart") == 0) {
     return test_sigtimedwait_interrupted_despite_sa_restart();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend") == 0) {
+    return test_blocking_sigsuspend();
   }
   if (strcmp(argv[1], "handler-reentrance") == 0) {
     return test_handler_reentrance();
