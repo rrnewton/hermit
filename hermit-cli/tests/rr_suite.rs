@@ -54,6 +54,9 @@ static GENERATED_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Per-test wall-clock cap (argument to `timeout(1)`).
 const RR_TEST_TIMEOUT: &str = "120s";
 
+/// Grace period before `timeout(1)` escalates from SIGTERM to SIGKILL.
+const RR_TEST_KILL_AFTER: &str = "10s";
+
 /// rr's test harness includes these generated headers (guarded by target arch).
 const GENERATED_HEADERS: [&str; 3] = [
     "SyscallEnumsForTestsX64.generated",
@@ -115,43 +118,43 @@ fn generated_dir() -> &'static Path {
 }
 
 /// Compiles the rr `src/test/<basename>.c` program (matching rr's own
-/// `RR_TEST_FLAGS`) and returns the resulting binary path, reusing it if present.
+/// `RR_TEST_FLAGS`) and returns the resulting binary path.
 fn compile_test(basename: &str) -> PathBuf {
     let rr = rr_root();
     let generated = generated_dir();
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-workloads");
     fs::create_dir_all(&build_root).expect("failed to create rr workload directory");
     let binary = build_root.join(basename);
-    if !binary.is_file() {
-        let mut command = Command::new("cc");
-        command
-            .args([
-                "-D_FILE_OFFSET_BITS=64",
-                "-pthread",
-                "-std=gnu11",
-                "-g3",
-                "-O0",
-                "-Wno-error",
-            ])
-            .arg("-I")
-            .arg(rr.join("src/test"))
-            .arg("-I")
-            .arg(rr.join("src/preload"))
-            .arg("-I")
-            .arg(rr.join("include"))
-            .arg("-I")
-            .arg(generated)
-            .arg(rr.join("src/test").join(format!("{basename}.c")))
-            .arg("-o")
-            .arg(&binary)
-            .args(["-ldl", "-lrt"]);
-        command_output(command, &format!("compile rr test {basename}"));
-    }
+    // Always rebuild so cached target directories cannot preserve a binary
+    // after any input changes.
+    let mut command = Command::new("cc");
+    command
+        .args([
+            "-D_FILE_OFFSET_BITS=64",
+            "-pthread",
+            "-std=gnu11",
+            "-g3",
+            "-O0",
+            "-Wno-error",
+        ])
+        .arg("-I")
+        .arg(rr.join("src/test"))
+        .arg("-I")
+        .arg(rr.join("src/preload"))
+        .arg("-I")
+        .arg(rr.join("include"))
+        .arg("-I")
+        .arg(generated)
+        .arg(rr.join("src/test").join(format!("{basename}.c")))
+        .arg("-o")
+        .arg(&binary)
+        .args(["-ldl", "-lrt"]);
+    command_output(command, &format!("compile rr test {basename}"));
     binary
 }
 
 /// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
-fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
+fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker: Option<&str>) {
     let binary = compile_test(basename);
     // Give the guest a private working directory (under target/, not /tmp, which
     // Hermit isolates) so file-creating tests don't collide or dirty the tree.
@@ -162,12 +165,12 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
     fs::create_dir_all(&scratch).expect("failed to create rr scratch directory");
 
     let _guard = hermit_run_lock();
-    // Wrap in `timeout` so a single hang fails that test cleanly instead of
-    // blocking the whole (serialized) suite forever.
+    // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
     let mut command = Command::new("timeout");
     command
         .current_dir(&scratch)
-        .args([RR_TEST_TIMEOUT, env!("CARGO_BIN_EXE_hermit")])
+        .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "run",
             "--base-env=minimal",
@@ -183,11 +186,19 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str]) {
     assert_eq!(
         output.status.code(),
         Some(expected_exit),
-        "rr test {basename} exited unexpectedly (124 == timeout): {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        "rr test {basename} exited unexpectedly (124/137 == timeout/forced kill): {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    if let Some(marker) = success_marker {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().any(|line| line == marker),
+            "rr test {basename} did not print success marker {marker:?}: {rendered}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
 
 macro_rules! rr_test {
@@ -195,7 +206,7 @@ macro_rules! rr_test {
         #[test]
         #[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
         fn $name() {
-            run_rr_test($base, $exit, $args);
+            run_rr_test($base, $exit, $args, None);
         }
     };
 }
@@ -329,7 +340,11 @@ rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
 rr_test!(rr_no_mask_timeslice, "no_mask_timeslice", 0, &[]);
 rr_test!(rr_numa, "numa", 0, &[]);
-rr_test!(rr_pause, "pause", 1, &[]);
+#[test]
+#[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
+fn rr_pause() {
+    run_rr_test("pause", 1, &[], Some("EXIT-SUCCESS"));
+}
 rr_test!(rr_personality, "personality", 0, &[]);
 rr_test!(rr_poll_sig_race, "poll_sig_race", 0, &[]);
 rr_test!(rr_ppoll, "ppoll", 0, &[]);
