@@ -81,10 +81,17 @@ done < "$allowed_ignore_manifest"
 # Detcore unsupported-syscall policy.
 declare -A mode_na_targets=(
   [cli]=1
+  [leveldb]=1
+  [no_silent_skips]=1
   [record_replay]=1
+  [rr_suite]=1
+  [stress_suite]=1
 )
 declare -A mode_na_tests=(
   [arbitrary_binaries/record_replay_stable_arbitrary_binaries]="record/replay path"
+  [hermit_modes/allow_passthrough_forwards_unsupported_syscall]="explicit compatibility opt-out"
+  [hermit_modes/keyctl_obeys_unsupported_syscall_policy]="tests ENOSYS and compatibility policies"
+  [hermit_modes/unsupported_syscall_is_blocked_by_default]="tests ENOSYS policy rather than panic mode"
 )
 
 declare -A seen_tests=()
