@@ -69,3 +69,12 @@ jobs:
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
           cargo test -p hermit --lib --bins
         fi
+    - name: Concurrency stress suites
+      run: |
+        if unshare --user --map-root-user --pid --fork --uts --mount sh -c 'mount -t proc proc /proc && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
+          cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
+          cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
+          cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
+        else
+          echo "::notice::Mount namespaces unavailable; skipping concurrency stress suites."
+        fi
