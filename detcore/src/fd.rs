@@ -21,7 +21,6 @@ use nix::fcntl::OFlag;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::procfs::ProcfsFile;
 use crate::resources::ResourceID;
 use crate::stat::*;
 use crate::types::RawFd;
@@ -117,8 +116,6 @@ struct OpenFileDescription {
     stat: Option<DetStat>,
     /// resource
     resource: Option<ResourceID>,
-    /// Deterministic snapshot state for selected procfs files.
-    procfs: Option<ProcfsFile>,
 }
 
 impl PartialEq for DetFd {
@@ -158,7 +155,6 @@ impl DetFd {
                 dirty: false,
                 stat: None,
                 resource: None,
-                procfs: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
                 connect_in_progress: false,
@@ -244,36 +240,6 @@ impl DetFd {
     /// Resource attached to the open file description.
     pub fn resource(&self) -> Option<ResourceID> {
         self.description().resource.clone()
-    }
-
-    /// Attach deterministic procfs snapshot state to this open file description.
-    pub(crate) fn set_procfs(&self, procfs: ProcfsFile) {
-        self.description().procfs = Some(procfs);
-    }
-
-    /// Whether this procfs open file description still needs its initial snapshot.
-    pub(crate) fn procfs_needs_snapshot(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_snapshot)
-    }
-
-    /// Initialize the deterministic snapshot shared by all aliases.
-    pub(crate) fn initialize_procfs(&self, contents: Vec<u8>) {
-        self.description()
-            .procfs
-            .as_mut()
-            .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents);
-    }
-
-    /// Read from the deterministic procfs snapshot at its shared offset.
-    pub(crate) fn take_procfs(&self, maximum: usize) -> Option<Vec<u8>> {
-        self.description()
-            .procfs
-            .as_mut()
-            .and_then(|procfs| procfs.take(maximum))
     }
 
     /// Cached stat data attached to the backing object.
