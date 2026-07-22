@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rand::Rng;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
@@ -26,13 +27,13 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::trace;
 
 use crate::config::BlockingMode;
 use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -45,6 +46,7 @@ use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
+use crate::tool_local::PendingVfork;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
@@ -141,24 +143,77 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let flags = clone_family.flags(&guest.memory());
         let ctid = clone_family.child_tid(&guest.memory());
+        let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
+        assert!(ts.pending_vfork.is_none());
         ts.clone_flags = Some(flags);
 
-        // TODO(T94530014):
-        if flags.contains(CloneFlags::CLONE_VFORK) {
-            error!(
-                "hermit: clone() with CLONE_VFORK argument.  This is not currently supported and will not work."
-            )
+        let parent_dettid = ts.dettid;
+        let child_priority_entropy = if is_vfork
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+        {
+            let mut parent_chaos_prng = ts.chaos_prng.clone();
+            Some(parent_chaos_prng.next_u64())
+        } else {
+            None
+        };
+        if is_vfork {
+            ts.pending_vfork = Some(PendingVfork {
+                parent_dettid,
+                parent_detpid: ts.detpid.expect("detpid unset"),
+                child_tid_addr: ctid,
+                flags,
+                child_priority_entropy,
+            });
         }
 
-        let parent_dettid = ts.dettid;
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
+        let vfork_op_id =
+            ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
+
+        // The kernel blocks a CLONE_VFORK parent until its child execs or exits.
+        // Remove it from Detcore's run queue before entering that blocking call.
+        if is_vfork && self.cfg.sequentialize_threads {
+            let mut resources = Resources::new(parent_dettid);
+            resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
+            resources.fyi("clone_vfork");
+            resource_request(guest, resources).await;
+        }
+
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
-        guest.thread_state_mut().clone_flags = None; // Unset, now that it has been read by the child.
+
+        if is_vfork && self.cfg.sequentialize_threads {
+            let mut resources = Resources::new(parent_dettid);
+            resources.insert(
+                ResourceID::BlockedExternalContinue(vfork_op_id),
+                Permission::RW,
+            );
+            resources.fyi("clone_vfork");
+            resource_request(guest, resources).await;
+        }
+
+        let ts = guest.thread_state_mut();
+        ts.clone_flags = None; // Unset, now that it has been read by the child.
+        ts.pending_vfork = None;
 
         let res = maybe_res?;
+
+        // Match ordinary clone: the parent consumes the priority entropy after
+        // the child has inherited the parent state.
+        if is_vfork
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+        {
+            let _ = guest
+                .thread_state_mut()
+                .chaos_prng_next_u64("child_priority");
+        }
+
         let child_tid = Pid::from_raw(res as i32);
         let child_dettid = DetTid::from_raw(child_tid.into()); // TODO(T78538674), virtualized tid/pid
         trace!(
@@ -166,7 +221,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             child_dettid
         );
 
-        create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+        if !is_vfork {
+            create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+        }
 
         {
             // The child will have updated their pedigree, we update ours before continuing.
