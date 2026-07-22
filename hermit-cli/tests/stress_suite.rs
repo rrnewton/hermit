@@ -27,9 +27,11 @@ const SLOW_SEEDS: std::ops::Range<u64> = 0..SLOW_SEED_COUNT;
 const THREAD_COUNTS: [usize; 4] = [2, 4, 8, 16];
 const COMMAND_TIMEOUT_SECONDS: u64 = 10;
 const CAS_REPLAY_TIMEOUT_SECONDS: u64 = 60;
+const CHAOS_DEMO_FAILING_SEED: u64 = 9;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static STRESS_BINARIES: OnceLock<StressBinaries> = OnceLock::new();
+static CHAOS_DEMO_BINARY: OnceLock<PathBuf> = OnceLock::new();
 
 struct StressBinaries {
     concurrency: PathBuf,
@@ -123,6 +125,31 @@ fn compile_rust(source: &Path, output: &Path) {
     command_output(command, "stress guest compilation");
 }
 
+fn compile_c(source: &Path, output: &Path) {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).expect("failed to create chaos demo build directory");
+    }
+    let mut command = Command::new("cc");
+    command
+        .args(["-std=c11", "-O2", "-g", "-pthread"])
+        .arg(source)
+        .arg("-o")
+        .arg(output);
+    command_output(command, "chaos demo guest compilation");
+}
+
+fn chaos_demo_binary() -> &'static Path {
+    CHAOS_DEMO_BINARY.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let output =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermit-stress-workloads/order-violation");
+        compile_c(&repository.join("tests/chaos/order_violation.c"), &output);
+        output
+    })
+}
+
 fn stress_binaries() -> &'static StressBinaries {
     STRESS_BINARIES.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -166,6 +193,43 @@ fn stress_command(category: &str, threads: usize, seed: u64) -> Command {
     command
 }
 
+fn chaos_demo_command(seed: Option<u64>) -> Command {
+    let mut command = timed_hermit_command(COMMAND_TIMEOUT_SECONDS);
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--preemption-timeout=disabled",
+        "--no-virtualize-cpuid",
+    ]);
+    if let Some(seed) = seed {
+        command
+            .args(["--chaos", "--sched-heuristic=random"])
+            .arg(format!("--seed={seed}"));
+    }
+    command.arg(chaos_demo_binary());
+    command
+}
+
+fn run_chaos_demo(seed: Option<u64>) -> Output {
+    let label = seed.map_or_else(
+        || "default chaos demonstration".to_owned(),
+        |seed| format!("chaos demonstration seed={seed}"),
+    );
+    let mut command = chaos_demo_command(seed);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "{label} failed unexpectedly: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
 fn run_guest(mut command: Command, label: &str) -> GuestOutcome {
     let rendered = format!("{command:?}");
     let output = command
@@ -198,6 +262,35 @@ fn count_exposures(category: &str, threads: usize, seeds: std::ops::Range<u64>) 
         })
         .filter(|outcome| *outcome == GuestOutcome::Exposed)
         .count()
+}
+
+#[test]
+fn chaos_finds_and_reproduces_order_violation() {
+    let _guard = hermit_run_lock();
+
+    let first_default = run_chaos_demo(None);
+    let second_default = run_chaos_demo(None);
+    assert!(first_default.status.success());
+    assert!(second_default.status.success());
+    assert_eq!(first_default.stdout, b"Hello world!\n");
+    assert_eq!(second_default.stdout, first_default.stdout);
+
+    let first_failing_seed = (0..=15).find(|seed| {
+        let output = run_chaos_demo(Some(*seed));
+        output.status.code() == Some(1)
+    });
+    assert_eq!(
+        first_failing_seed,
+        Some(CHAOS_DEMO_FAILING_SEED),
+        "documented seed no longer identifies the first failing schedule"
+    );
+
+    let first_replay = run_chaos_demo(Some(CHAOS_DEMO_FAILING_SEED));
+    let second_replay = run_chaos_demo(Some(CHAOS_DEMO_FAILING_SEED));
+    assert_eq!(first_replay.status.code(), Some(1));
+    assert_eq!(second_replay.status, first_replay.status);
+    assert_eq!(first_replay.stdout, b"ERROR! global_str is null at use.\n");
+    assert_eq!(second_replay.stdout, first_replay.stdout);
 }
 
 #[test]
