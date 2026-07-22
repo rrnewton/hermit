@@ -769,6 +769,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    mm_id: MmId::for_clone(
+                        pts.1.mm_id,
+                        dettid,
+                        clone_flags.contains(CloneFlags::CLONE_VM),
+                    ),
                     pedigree: child_pedigree,
                     stats: ThreadStats::new(),
                     file_metadata: {
@@ -779,7 +784,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         if clone_flags.contains(CloneFlags::CLONE_FILES) {
                             pts.1.file_metadata.clone()
                         } else {
-                            Arc::new(Mutex::new(pts.1.file_metadata.lock().unwrap().clone()))
+                            Arc::new(Mutex::new(
+                                pts.1.file_metadata.lock().unwrap().fork_for(dettid),
+                            ))
                         }
                     },
                     clone_flags: None,
@@ -1161,12 +1168,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             dettid
         );
         let detpid = thread_state.detpid.expect("Missing DetPid");
+        let mm_id = thread_state.mm_id;
         deregister_thread(
             dettid,
             thread_state.thread_logical_time.clone(),
             &self.cfg,
             global_state,
             detpid,
+            mm_id,
         )
         .await;
 

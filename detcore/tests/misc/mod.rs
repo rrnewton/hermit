@@ -57,6 +57,90 @@ where
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
 }
 
+fn det_test_fn_sequential_without_pmu<F>(f: F)
+where
+    F: Fn(),
+{
+    let config = detcore::Config {
+        preemption_timeout: None,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+#[test]
+fn dup_shares_status_flags_but_not_cloexec() {
+    det_test_fn_sequential_without_pmu(|| {
+        let mut sockets = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+
+        let duplicate = unsafe { libc::fcntl(sockets[0], libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicate >= 0);
+        assert_ne!(
+            unsafe { libc::fcntl(duplicate, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(sockets[0], libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(duplicate, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        let mut byte = 0_u8;
+        assert_eq!(
+            unsafe { libc::read(duplicate, (&mut byte as *mut u8).cast(), 1) },
+            -1
+        );
+        assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EAGAIN);
+
+        assert_eq!(unsafe { libc::close(duplicate) }, 0);
+        assert_eq!(unsafe { libc::close(sockets[0]) }, 0);
+        assert_eq!(unsafe { libc::close(sockets[1]) }, 0);
+    });
+}
+
+#[test]
+fn unsupported_futex_keys_fail_explicitly() {
+    det_test_fn_sequential_without_pmu(|| {
+        let futex = 0_u32;
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_futex, &futex, libc::FUTEX_WAKE, 1) },
+            -1
+        );
+        assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EOPNOTSUPP);
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    &futex,
+                    libc::FUTEX_WAKE_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    1,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EINVAL);
+    });
+}
+
 #[test]
 fn ppoll_ready_and_timeout() {
     det_test_fn_without_pmu(|| {
