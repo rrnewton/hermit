@@ -537,6 +537,46 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
+fn gdbserver_forces_host_networking() {
+    // Without --gdbserver the default networking stays local.
+    let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    plain.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(plain.network, NetworkingMode::Local);
+
+    // With --gdbserver the isolated network namespace would hide the gdbserver
+    // port from a host gdb client, so networking is forced to host.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "fakeprog"]);
+    assert_eq!(opts.network, NetworkingMode::Local);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.gdbserver);
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
+fn gdbserver_respects_explicit_host_networking() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "--network=host", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
+fn gdbserver_conflicts_with_analyze_networking() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--gdbserver",
+        "--analyze-networking",
+        "fakeprog",
+    ]);
+    let error = opts.validate_args_with_perf_support(true).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--gdbserver"), "message: {message}");
+    assert!(
+        message.contains("--analyze-networking"),
+        "message: {message}"
+    );
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -851,6 +891,32 @@ impl RunOpts {
             if self.tmp.is_none() {
                 self.tmp = Some(PathBuf::from("/tmp"));
             }
+        }
+
+        // The gdbserver listens on a TCP port that is bound inside the guest's
+        // network namespace. With the default isolated (`local`) networking, that
+        // port lives in the guest's unshared netns and is unreachable from a host
+        // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
+        // connection that can never arrive. Fall back to host networking so the
+        // debugger can attach. This mirrors how replay-mode gdbserver already
+        // works: replay never unshares the network namespace, which is exactly why
+        // its gdbserver is reachable from the host.
+        if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
+            if self.analyze_networking {
+                anyhow::bail!(
+                    "--gdbserver requires host networking so a host gdb client can reach the \
+                     gdbserver port, but --analyze-networking forces an isolated network \
+                     namespace. Run these two modes separately."
+                );
+            }
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            eprintln!(
+                "WARNING: --gdbserver requires host networking so a host gdb client can reach \
+                 the gdbserver port; overriding --network=local with --network=host for this \
+                 debug session. Network isolation and deterministic networking are disabled \
+                 while the gdbserver is attached."
+            );
+            self.network = NetworkingMode::Host;
         }
 
         Ok(())

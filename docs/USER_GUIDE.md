@@ -321,6 +321,14 @@ Network modes are:
 - `--network=host`: host networking. External responses and port state become
   nondeterministic inputs.
 
+`hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
+Because `--network=local` binds that port inside the guest's isolated network
+namespace, run mode forces host networking (printing a warning) whenever
+`--gdbserver` is set so the debugger can attach. Attach from another terminal
+with `gdb -ex 'target remote :PORT'` (default port 1234, override with
+`--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
+`--analyze-networking`, which requires the isolated namespace.
+
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.
 
