@@ -112,9 +112,23 @@ fn top_level_help_lists_user_facing_commands() {
     let help = stdout(&output);
 
     assert!(help.contains("Usage: hermit [OPTIONS] <COMMAND>"));
-    for command in ["run", "record", "replay", "log-diff", "analyze"] {
+    for command in ["run", "record", "replay", "log-diff", "analyze", "bisect"] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
+}
+
+#[test]
+fn bisect_help_describes_schedule_endpoints() {
+    let args = ["bisect", "--help"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let help = stdout(&output);
+
+    assert!(help.contains("--good <SCHEDULE>"));
+    assert!(help.contains("--bad <SCHEDULE>"));
+    assert!(help.contains("--target-exit-code"));
+    assert!(help.contains("--report-file"));
+    assert!(help.contains("<RUN_ARGS>..."));
 }
 
 #[test]
