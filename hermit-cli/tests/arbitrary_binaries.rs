@@ -140,8 +140,11 @@ fn available_tools() -> Vec<Tool> {
         tool(
             "sqlite",
             &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"],
-            &[":memory:", "select 'sqlite-ok';"],
-            "sqlite-ok",
+            &[
+                ":memory:",
+                "CREATE TABLE t(x); INSERT INTO t VALUES (3),(1),(2); SELECT group_concat(x, ',') FROM (SELECT x FROM t ORDER BY x);",
+            ],
+            "1,2,3",
         ),
     ]
     .into_iter()
@@ -253,6 +256,7 @@ fn record_replay_stable_arbitrary_binaries() {
         "gcc",
         "make",
         "cargo",
+        "sqlite",
     ];
     let tools = available_tools();
 
