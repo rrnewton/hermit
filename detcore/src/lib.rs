@@ -23,6 +23,7 @@ pub mod logdiff;
 mod memory;
 #[allow(unused)]
 mod mvar;
+mod procfs;
 mod procmaps;
 mod record_or_replay;
 mod resources;
