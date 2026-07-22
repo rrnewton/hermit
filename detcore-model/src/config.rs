@@ -18,11 +18,58 @@ use std::str::FromStr;
 use chrono::DateTime;
 use chrono::Utc;
 use clap::Parser;
+use clap::ValueEnum;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
+
+/// Policy applied when Detcore intercepts a syscall it does not implement.
+#[derive(
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    Clone,
+    Copy,
+    ValueEnum,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UnsupportedSyscallAction {
+    /// Log a diagnostic at error level and return ENOSYS.
+    #[default]
+    Error,
+    /// Log a diagnostic at warning level and return ENOSYS.
+    Warn,
+    /// Log a diagnostic and pass the syscall through to the host kernel.
+    Trace,
+}
+
+impl UnsupportedSyscallAction {
+    /// Describe how this policy handles the intercepted syscall.
+    pub fn disposition(self) -> &'static str {
+        match self {
+            Self::Error => "blocked with ENOSYS",
+            Self::Warn => "blocked with ENOSYS after warning",
+            Self::Trace => "passed through by trace mode; execution may not be deterministic",
+        }
+    }
+}
+
+impl fmt::Display for UnsupportedSyscallAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Error => write!(f, "error"),
+            Self::Warn => write!(f, "warn"),
+            Self::Trace => write!(f, "trace"),
+        }
+    }
+}
 
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
@@ -170,17 +217,18 @@ pub struct Config {
 
     /// DANGEROUS: Panic on unsupported syscalls, this is useful for
     /// debugging detcore itself, not recommended otherwise.
-    #[clap(long, conflicts_with = "allow_passthrough")]
+    #[clap(long, conflicts_with = "unsupported_syscall_action")]
     pub panic_on_unsupported_syscalls: bool,
 
-    /// Allow unsupported syscalls to execute on the host kernel.
+    /// Choose how unsupported syscalls are diagnosed and handled.
     ///
-    /// By default, unsupported syscalls are blocked with ENOSYS so that a
-    /// deterministic run cannot silently use nondeterministic host behavior.
-    /// This compatibility option logs a warning and passes the syscall through.
-    #[clap(long)]
+    /// `error` (the default) logs at error level and returns ENOSYS. `warn`
+    /// logs at warning level and returns ENOSYS. `trace` logs the same
+    /// diagnostic but passes the call through to the host kernel, which may
+    /// make execution nondeterministic.
+    #[clap(long, value_enum, default_value_t)]
     #[serde(default)]
-    pub allow_passthrough: bool,
+    pub unsupported_syscall_action: UnsupportedSyscallAction,
 
     /// [Internal] Set to `true` if we're inside a UTS namespace.
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
@@ -508,8 +556,12 @@ impl fmt::Display for Config {
         if self.panic_on_unsupported_syscalls {
             write!(f, " --panic-on-unsupported-syscalls")?;
         }
-        if self.allow_passthrough {
-            write!(f, " --allow-passthrough")?;
+        if self.unsupported_syscall_action != UnsupportedSyscallAction::Error {
+            write!(
+                f,
+                " --unsupported-syscall-action={}",
+                self.unsupported_syscall_action
+            )?;
         }
         if self.kill_daemons {
             write!(f, " --kill-daemons")?;

@@ -44,6 +44,7 @@ use std::time::Duration;
 pub use config::BlockingMode;
 pub use config::Config;
 pub use config::SchedHeuristic;
+pub use config::UnsupportedSyscallAction;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
@@ -96,6 +97,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+use crate::tool_global::register_unsupported_syscall;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -113,6 +115,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    async fn report_unsupported_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        name: &str,
+        number: i32,
+        action: UnsupportedSyscallAction,
+        disposition: &str,
+    ) {
+        let rip = guest.regs().await.rip;
+        let stack = guest
+            .backtrace()
+            .map(|backtrace| backtrace.force_pretty().to_string())
+            .unwrap_or_else(|| "Stack trace unavailable for this guest thread.\n".to_owned());
+        register_unsupported_syscall(guest, number, name.to_owned()).await;
+
+        let diagnostic = format!(
+            "unsupported syscall {name} ({number}) at RIP {rip:#x}: {disposition}\n{stack}"
+        );
+        match action {
+            UnsupportedSyscallAction::Error => error!("{diagnostic}"),
+            UnsupportedSyscallAction::Warn | UnsupportedSyscallAction::Trace => {
+                warn!("{diagnostic}")
+            }
+        }
+    }
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
     /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
     ///
@@ -1113,30 +1140,36 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
 
             _ => {
-                if config.panic_on_unsupported_syscalls {
-                    error!(
-                        "[detcore, dtid {}] inbound syscall: {} = ?",
-                        dettid,
-                        call.display(&guest.memory()),
-                    );
-                    panic!("unsupported syscall: {:?}", call);
-                }
                 if config.recordreplay_modes {
                     self.passthrough(guest, call).await
-                } else if config.allow_passthrough {
-                    warn!(
-                        "unsupported syscall {} ({:?}) passed through because --allow-passthrough is set; execution may not be deterministic",
-                        call.name(),
-                        call.number(),
-                    );
-                    self.passthrough(guest, call).await
                 } else {
-                    warn!(
-                        "unsupported syscall {} ({:?}) blocked with ENOSYS; use --allow-passthrough to run it nondeterministically",
+                    if config.panic_on_unsupported_syscalls {
+                        self.report_unsupported_syscall(
+                            guest,
+                            call.name(),
+                            call.number().id(),
+                            UnsupportedSyscallAction::Error,
+                            "configured to panic",
+                        )
+                        .await;
+                        panic!("unsupported syscall: {:?}", call);
+                    }
+
+                    let action = config.unsupported_syscall_action;
+                    self.report_unsupported_syscall(
+                        guest,
                         call.name(),
-                        call.number(),
-                    );
-                    Err(Error::Errno(Errno::ENOSYS))
+                        call.number().id(),
+                        action,
+                        action.disposition(),
+                    )
+                    .await;
+                    match action {
+                        UnsupportedSyscallAction::Error | UnsupportedSyscallAction::Warn => {
+                            Err(Error::Errno(Errno::ENOSYS))
+                        }
+                        UnsupportedSyscallAction::Trace => self.passthrough(guest, call).await,
+                    }
                 }
             }
         };

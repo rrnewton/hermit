@@ -337,7 +337,7 @@ fn hermit_command(base_env: &str) -> Command {
 
 fn compatibility_hermit_command(base_env: &str) -> Command {
     let mut command = hermit_command(base_env);
-    command.arg("--allow-passthrough");
+    command.arg("--unsupported-syscall-action=trace");
     command
 }
 
@@ -383,7 +383,7 @@ fn default_mode_matrix() {
     run_stable_matrix(RunMode::Default);
 }
 
-fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough: bool) -> Output {
+fn run_unsupported_syscall(workload: &Workload, strict: bool, action: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "run",
@@ -394,8 +394,8 @@ fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough:
     if strict {
         command.arg("--strict");
     }
-    if allow_passthrough {
-        command.arg("--allow-passthrough");
+    if let Some(action) = action {
+        command.arg(format!("--unsupported-syscall-action={action}"));
     }
     command.arg(&workload.path);
     command
@@ -403,10 +403,32 @@ fn run_unsupported_syscall(workload: &Workload, strict: bool, allow_passthrough:
         .expect("failed to run unsupported-syscall workload")
 }
 
+fn assert_unsupported_diagnostic(stderr: &str, name: &str, number: i32, count: usize) {
+    for expected in [
+        format!("unsupported syscall {name} ({number})"),
+        "at RIP 0x".to_owned(),
+        "Stack trace".to_owned(),
+    ] {
+        assert!(
+            stderr.contains(&expected),
+            "missing {expected:?} in diagnostic:\n{stderr}"
+        );
+    }
+    let noun = if count == 1 { "syscall" } else { "syscalls" };
+    let count_suffix = if count == 1 {
+        String::new()
+    } else {
+        format!(" x{count}")
+    };
+    let summary =
+        format!("{count} unsupported {noun} encountered: [{name} ({number}){count_suffix}]");
+    assert!(stderr.contains(&summary), "missing {summary:?}:\n{stderr}");
+}
+
 #[test]
 fn unsupported_syscall_is_blocked_by_default() {
     let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, false);
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, None);
     assert!(
         output.status.success(),
         "fail-closed workload failed: {}",
@@ -414,16 +436,35 @@ fn unsupported_syscall_is_blocked_by_default() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
     assert!(
-        stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
-        "missing fail-closed warning:\n{stderr}"
+        stderr.contains("blocked with ENOSYS"),
+        "missing fail-closed disposition:\n{stderr}"
     );
 }
 
 #[test]
-fn allow_passthrough_forwards_unsupported_syscall() {
+fn warn_action_remains_fail_closed() {
     let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, true);
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, Some("warn"));
+    assert!(
+        output.status.success(),
+        "warn workload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
+    assert!(
+        stderr.contains("blocked with ENOSYS after warning"),
+        "missing warn disposition:\n{stderr}"
+    );
+}
+
+#[test]
+fn trace_action_forwards_unsupported_syscall() {
+    let _guard = hermit_run_lock();
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, false, Some("trace"));
     assert!(
         output.status.success(),
         "passthrough workload failed: {}",
@@ -431,9 +472,10 @@ fn allow_passthrough_forwards_unsupported_syscall() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "passed\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
     assert!(
-        stderr.contains("unsupported syscall getpid") && stderr.contains("passed through"),
-        "missing passthrough warning:\n{stderr}"
+        stderr.contains("passed through by trace mode"),
+        "missing trace disposition:\n{stderr}"
     );
 }
 
@@ -441,7 +483,7 @@ fn allow_passthrough_forwards_unsupported_syscall() {
 fn keyctl_obeys_unsupported_syscall_policy() {
     let _guard = hermit_run_lock();
 
-    let blocked = run_unsupported_syscall(&workloads().keyctl_syscall, false, false);
+    let blocked = run_unsupported_syscall(&workloads().keyctl_syscall, false, None);
     assert!(
         blocked.status.success(),
         "fail-closed keyctl workload failed: {}",
@@ -449,13 +491,14 @@ fn keyctl_obeys_unsupported_syscall_policy() {
     );
     assert_eq!(String::from_utf8_lossy(&blocked.stdout), "blocked\n");
     let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert_unsupported_diagnostic(&blocked_stderr, "keyctl", 250, 1);
     assert!(
         blocked_stderr.contains("unsupported syscall keyctl")
             && blocked_stderr.contains("blocked with ENOSYS"),
         "missing fail-closed keyctl warning:\n{blocked_stderr}"
     );
 
-    let allowed = run_unsupported_syscall(&workloads().keyctl_syscall, false, true);
+    let allowed = run_unsupported_syscall(&workloads().keyctl_syscall, false, Some("trace"));
     assert!(
         allowed.status.success(),
         "passthrough keyctl workload failed: {}",
@@ -463,6 +506,7 @@ fn keyctl_obeys_unsupported_syscall_policy() {
     );
     assert_eq!(String::from_utf8_lossy(&allowed.stdout), "passed\n");
     let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert_unsupported_diagnostic(&allowed_stderr, "keyctl", 250, 1);
     assert!(
         allowed_stderr.contains("unsupported syscall keyctl")
             && allowed_stderr.contains("passed through"),
@@ -730,7 +774,7 @@ fn no_hardware_stacktrace_signal() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--preemption-timeout=disabled",
-        "--allow-passthrough",
+        "--unsupported-syscall-action=trace",
         "--",
         "/bin/date",
     ]);
@@ -755,7 +799,7 @@ fn no_hardware_stacktrace_signal() {
 #[test]
 fn strict_mode_matrix() {
     let _guard = hermit_run_lock();
-    let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, false);
+    let output = run_unsupported_syscall(&workloads().unsupported_syscall, true, None);
     assert!(
         output.status.success(),
         "strict fail-closed workload failed: {}",
@@ -763,6 +807,7 @@ fn strict_mode_matrix() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "blocked\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_unsupported_diagnostic(&stderr, "getpid", 39, 2);
     assert!(
         stderr.contains("unsupported syscall getpid") && stderr.contains("blocked with ENOSYS"),
         "strict mode did not enforce fail-closed behavior:\n{stderr}"
@@ -808,7 +853,7 @@ printf 'configured\n'
             "--env=VERIFY_CONFIGURED=expected",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
-            "--allow-passthrough",
+            "--unsupported-syscall-action=trace",
         ])
         .arg(format!("--tmp={}", tmp.path().display()))
         .arg("/tmp/guest")
@@ -830,7 +875,7 @@ fn hello_race_chaos_verify() {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
-            "--allow-passthrough",
+            "--unsupported-syscall-action=trace",
             "--env=HERMIT_MODE=chaos",
         ])
         .arg(&workload.path);

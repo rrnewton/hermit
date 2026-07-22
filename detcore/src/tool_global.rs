@@ -10,6 +10,7 @@
 //! the Detcore tool.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
@@ -186,6 +187,9 @@ pub struct GlobalState {
 
     /// The start is when we construct the global state.  Close enough.
     realtime_start: SystemTime,
+
+    /// Unsupported calls keyed by their stable numeric ID and name.
+    unsupported_syscalls: Mutex<BTreeMap<(i32, String), u64>>,
 }
 
 impl Default for GlobalState {
@@ -203,6 +207,28 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    fn unsupported_syscall_summary(&self) -> Option<String> {
+        let calls = self.unsupported_syscalls.lock().unwrap();
+        let total: u64 = calls.values().sum();
+        if total == 0 {
+            return None;
+        }
+
+        let list = calls
+            .iter()
+            .map(|((number, name), count)| {
+                if *count == 1 {
+                    format!("{name} ({number})")
+                } else {
+                    format!("{name} ({number}) x{count}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if total == 1 { "syscall" } else { "syscalls" };
+        Some(format!("{total} unsupported {noun} encountered: [{list}]"))
+    }
+
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
     /// possible.
     pub fn force_shutdown_with_error(&self) {
@@ -248,6 +274,9 @@ impl GlobalState {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
+        }
+        if let Some(summary) = self.unsupported_syscall_summary() {
+            eprintln!("{summary}");
         }
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
@@ -361,6 +390,7 @@ impl GlobalTool for GlobalState {
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
+            unsupported_syscalls: Mutex::new(BTreeMap::new()),
             global_time,
             preemptions_to_replay,
         }
@@ -421,6 +451,15 @@ impl GlobalTool for GlobalState {
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
                     .await,
             ),
+            GlobalRequest::UnsupportedSyscall(number, name) => {
+                *self
+                    .unsupported_syscalls
+                    .lock()
+                    .unwrap()
+                    .entry((number, name))
+                    .or_default() += 1;
+                R::UnsupportedSyscall(())
+            }
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
             }
@@ -1075,6 +1114,9 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, i32),
 
+    /// Record one unsupported syscall for the exit summary.
+    UnsupportedSyscall(i32, String),
+
     /// Translate nondeterministic to deterministic inode.
     DeterminizeInode(RawInode),
 
@@ -1120,6 +1162,7 @@ pub enum GlobalResponse {
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
     FutexAction(Option<SchedValue>),
+    UnsupportedSyscall(()),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
     UnlinkInode(()),
@@ -1361,6 +1404,20 @@ where
             trace!("UNBLOCKING after futex_action. Request was: {:?}", req);
             answer
         }
+        _ => unreachable!(),
+    }
+}
+
+/// Record one unsupported syscall in the global exit summary.
+pub async fn register_unsupported_syscall<G, T>(guest: &mut G, number: i32, name: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::UnsupportedSyscall(number, name)).await;
+    match response.1 {
+        GlobalResponse::UnsupportedSyscall(()) => {}
         _ => unreachable!(),
     }
 }
