@@ -9,6 +9,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -516,6 +517,133 @@ fn record_timeout_terminates_descendant_processes() {
         0,
         "timed-out recording left partial data"
     );
+}
+
+/// Records `program` without asserting anything about replay and returns the
+/// recording directory plus its ID. Used by desync tests that then tamper with
+/// or directly replay the recording.
+fn record_only(program: &Path, args: &[&OsStr]) -> (tempfile::TempDir, String) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["record", "start"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    command_output(command, &format!("recording for {}", program.display()));
+    let id = fs::read_to_string(data_dir.path().join("last"))
+        .expect("recording did not create a last pointer")
+        .trim()
+        .to_string();
+    (data_dir, id)
+}
+
+/// Runs `hermit replay --autopilot` against a recording directory and captures
+/// its output, without asserting success (replay may legitimately diverge).
+fn replay_output(data_dir: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.display()));
+    command.output().expect("failed to start hermit replay")
+}
+
+/// Asserts that a replay terminated cleanly: it exited with a status code rather
+/// than being killed by a signal, and its output contains none of the markers
+/// left behind when a panic unwinds across Reverie's non-unwinding container
+/// trampoline (the secondary SIGSEGV crash from issue #31).
+fn assert_replay_did_not_crash(context: &str, output: &Output) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.code().is_some(),
+        "{context}: replay was killed by signal {:?} instead of exiting cleanly:\n{combined}",
+        output.status.signal(),
+    );
+    for marker in [
+        "SIGSEGV",
+        "non-unwinding panic",
+        "cannot unwind",
+        "Sandbox container exited unexpectedly",
+    ] {
+        assert!(
+            !combined.contains(marker),
+            "{context}: replay crashed instead of failing gracefully (found {marker:?}):\n{combined}"
+        );
+    }
+}
+
+/// Regression test for <https://github.com/rrnewton/hermit/issues/31>.
+///
+/// When replay diverges from the recording, the replayer must fail with a
+/// concise diagnostic and a clean, signal-free exit status. Previously it
+/// `panic!`ed deep inside the tool callback; that panic unwound across the
+/// non-unwinding `clone` trampoline used to enter the guest container and
+/// aborted the process, surfacing as a spurious `SIGSEGV`.
+///
+/// We force a divergence deterministically (no reliance on a naturally
+/// non-deterministic guest) by truncating the recorded debug-event stream so
+/// the replayer runs out of recorded syscalls immediately.
+#[test]
+fn replay_desync_exits_cleanly_without_crashing() {
+    let _guard = hermit_record_lock();
+    let (data_dir, id) = record_only(Path::new("/bin/echo"), &[OsStr::new("hello")]);
+
+    let thread_dir = data_dir.path().join(&id).join("thread");
+    let mut truncated = 0;
+    for entry in fs::read_dir(&thread_dir).expect("recording has no thread directory") {
+        let path = entry.expect("failed to read thread directory entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("debug") {
+            // Truncate to zero length so the first replayed syscall desyncs.
+            fs::File::create(&path).expect("failed to truncate debug stream");
+            truncated += 1;
+        }
+    }
+    assert!(truncated > 0, "no debug streams were found to truncate");
+
+    let output = replay_output(data_dir.path());
+    assert_replay_did_not_crash("truncated-recording replay", &output);
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "expected the dedicated desync exit status (42)"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Replay syscall stream ended unexpectedly")
+            || combined.contains("Replay diverged from recording"),
+        "missing concise desync diagnostic:\n{combined}"
+    );
+}
+
+/// Issue #31 was reported against `go version`. Go derives GOROOT from its own
+/// executable path, which differs inside the replay chroot, so replay may
+/// diverge -- but it must fail gracefully rather than crash. Skipped when Go is
+/// not installed (mirrors `record_curl_version`).
+#[test]
+fn replay_go_version_is_graceful() {
+    let _guard = hermit_record_lock();
+    let go = ["/usr/bin/go", "/usr/local/bin/go", "/bin/go"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file());
+    let Some(go) = go else {
+        eprintln!("go is not installed; skipping issue #31 Go replay coverage");
+        return;
+    };
+
+    let (data_dir, _id) = record_only(go, &[OsStr::new("version")]);
+    let output = replay_output(data_dir.path());
+    assert_replay_did_not_crash("go version replay", &output);
 }
 
 macro_rules! record_replay_tests {
