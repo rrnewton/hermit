@@ -295,9 +295,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|x| x.inode))
-        })?;
+        let (fd_type, physically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
@@ -310,7 +316,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = if guest.config().deterministic_io {
+        // Only route writes through the nonblockable-fd path when the fd is actually
+        // physically nonblocking (the "hermit run" case, where pipe2/eventfd2 injected
+        // O_NONBLOCK and we can nonblockize-and-retry deterministically). On a physically
+        // blocking fd (e.g. record/replay mode, where O_NONBLOCK is intentionally not
+        // injected) that path would treat the write as BlockingExternalIO and deschedule it
+        // to run in the background, which assumes non-interference -- but a pipe/socket write
+        // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
+        // writes therefore use the original synchronous path, as before this feature.
+        let res = if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        {
+            self.execute_nonblockable_fd_syscall(guest, call).await
+        } else if guest.config().deterministic_io {
             let mut total_written_bytes = 0;
             let mut remaining_buf = call.len();
 
@@ -529,6 +547,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => OFlag::empty(),
         };
         match call.cmd() {
+            F_GETFL => {
+                let physical_flags = self.record_or_replay(guest, call).await?;
+                let logical_nonblocking = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
+                let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
+                if logical_nonblocking {
+                    Ok(physical_flags | nonblocking)
+                } else {
+                    Ok(physical_flags & !nonblocking)
+                }
+            }
+            F_SETFL(flags) => {
+                let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
+                let force_nonblocking = self.cfg.use_nonblocking_sockets()
+                    && !self.cfg.recordreplay_modes
+                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
+                let physical_flags = if force_nonblocking {
+                    flags | OFlag::O_NONBLOCK.bits()
+                } else {
+                    flags
+                };
+                let result = self
+                    .record_or_replay(guest, call.with_cmd(F_SETFL(physical_flags)))
+                    .await?;
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    // Record the guest's *logical* status flags (derives logical
+                    // nonblocking); when we forced O_NONBLOCK physically without the
+                    // guest asking, mark the description physically nonblocking too.
+                    detfd.set_status_flags(flags);
+                    if force_nonblocking {
+                        detfd.set_physically_nonblocking();
+                    }
+                })?;
+                Ok(result)
+            }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
                 let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
@@ -536,13 +590,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.release_port_for_open_file(guest, open_file_id).await;
                 }
                 Ok(newfd as i64)
-            }
-            F_SETFL(flags) => {
-                let result = self.record_or_replay(guest, call).await?;
-                guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.set_status_flags(flags))?;
-                Ok(result)
             }
             F_SETFD(flags) => {
                 let result = self.record_or_replay(guest, call).await?;
@@ -619,7 +666,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pipe2,
     ) -> Result<i64, Errno> {
-        let res = self.record_or_replay(guest, call).await?;
+        let internally_nonblocking =
+            self.cfg.use_nonblocking_sockets() && !self.cfg.recordreplay_modes;
+        let injected = if internally_nonblocking {
+            call.with_flags(call.flags() | OFlag::O_NONBLOCK)
+        } else {
+            call
+        };
+        let res = self.record_or_replay(guest, injected).await?;
         let memory = guest.memory();
 
         if let Some(pipefd) = call.pipefd() {
@@ -628,6 +682,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
                 .await?;
+            if internally_nonblocking {
+                self.maybe_set_nonblocking_fd(guest, fds[0]);
+                self.maybe_set_nonblocking_fd(guest, fds[1]);
+            }
         }
 
         Ok(res)
@@ -930,7 +988,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Eventfd2,
     ) -> Result<i64, Error> {
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        let internally_nonblocking =
+            self.cfg.use_nonblocking_sockets() && !self.cfg.recordreplay_modes;
+        let injected = if internally_nonblocking {
+            call.with_flags(call.flags() | syscalls::EfdFlags::EFD_NONBLOCK)
+        } else {
+            call
+        };
+        let fd = self.record_or_replay(guest, injected).await? as RawFd;
         self.add_fd(
             guest,
             fd,
@@ -940,6 +1005,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Eventfd,
         )
         .await?;
+        if internally_nonblocking {
+            self.maybe_set_nonblocking_fd(guest, fd);
+        }
         Ok(fd as i64)
     }
 
