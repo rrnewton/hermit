@@ -63,7 +63,6 @@ use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
-use crate::scheduler::Seconds;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
 use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
@@ -1032,13 +1031,13 @@ impl GlobalState {
         &self,
         detpid: DetPid,
         dettid: DetTid,
-        seconds: Seconds,
+        duration: LogicalTime,
         sig: SigWrapper,
-    ) -> Seconds {
+    ) -> LogicalTime {
         self.sched
             .lock()
             .unwrap()
-            .register_alarm(detpid, dettid, seconds, sig.0)
+            .register_alarm(detpid, dettid, duration, sig.0)
     }
 }
 
@@ -1091,8 +1090,8 @@ pub enum GlobalRequest {
     /// Record scheduling event in a total order.
     TraceSchedEvent(SchedEvent, DetPid),
 
-    /// Basically performs an alarm syscall, takes seconds.
-    RegisterAlarm(DetPid, DetTid, Seconds, SigWrapper),
+    /// Basically performs an alarm syscall, takes a logical duration.
+    RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -1125,7 +1124,7 @@ pub enum GlobalResponse {
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
-    RegisterAlarm(Seconds),
+    RegisterAlarm(LogicalTime),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -1535,8 +1534,8 @@ where
 }
 
 /// Register an alarm (delayed signal delivery) with the global scheduler.
-/// Returns the number of seconds remaining until any previously scheduled alarm.
-pub async fn register_alarm<G, T>(guest: &mut G, seconds: Seconds, sig: Signal) -> Seconds
+/// Returns the logical duration remaining until any previously scheduled alarm.
+pub async fn register_alarm<G, T>(guest: &mut G, duration: LogicalTime, sig: Signal) -> LogicalTime
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1545,7 +1544,7 @@ where
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::RegisterAlarm(detpid, dettid, seconds, SigWrapper(sig)),
+        GlobalRequest::RegisterAlarm(detpid, dettid, duration, SigWrapper(sig)),
     )
     .await;
     match resp.1 {
