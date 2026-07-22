@@ -35,22 +35,46 @@ TSX/AVX-512 masked). Requires `/dev/kvm` (usable by non-root here).
 ## dbi (experimental) — DynamoRIO instrumentation
 
 ```bash
-# Requires the DynamoRIO SDK + the reverie-dbi native client:
-export HERMIT_DRRUN=<dynamorio>/bin64/drrun
-export HERMIT_DBI_CLIENT=<...>/libreverie_dbi_client.so   # from reverie-dbi/scripts/build-client.sh
-hermit run --backend dbi -- ./experiments/hello/hello
+$ export HERMIT_DRRUN=$HOME/dynamorio/install/bin64/drrun
+$ export HERMIT_DBI_CLIENT=<reverie>/target/debug/reverie-dbi-native/libreverie_dbi_client.so
+$ hermit run --backend dbi -- ./experiments/hello/hello
+hello world
 ```
 
 `reverie-dbi` is an in-process DynamoRIO client (built outside Cargo because
 DynamoRIO's CMake package supplies the client linker flags). `hermit run
---backend dbi` shells out to `drrun` with that client. Without the two env vars
-it prints an actionable error.
+--backend dbi` shells out to `drrun` with that client, which rewrites the guest
+in-process, counts branches, replaces `CPUID` with the deterministic identity,
+and forwards `write` through a Reverie `Tool`. Without the two env vars it prints
+an actionable error.
 
-Status: the DBI toolchain builds end to end (Rust runtime cdylib + native
-client link, and `drrun` launches the client), but running the Rust runtime
-inside DynamoRIO's **private loader** currently fails with
-`<ERROR: using undefined symbol!>` when using a prebuilt DynamoRIO release —
-DynamoRIO's private loader cannot satisfy the Rust std runtime's symbol/TLS
-needs. Fully running DBI needs a source-built DynamoRIO matching the reverie
-team's configuration (and/or a slimmer runtime). The `--backend dbi` wiring is
-in place for when that lands.
+### Build recipe (required — use a source build, not a prebuilt release)
+
+A **prebuilt** DynamoRIO release (e.g. 10.0.0) does **not** work: its private
+loader cannot satisfy the Rust std runtime's symbol/TLS needs and `drrun` fails
+with `<ERROR: using undefined symbol!>`. A **source build of DynamoRIO main**
+(verified at 11.91) fixes this. Recipe:
+
+```bash
+# 1. Build + INSTALL DynamoRIO from source (the install tree is required: the
+#    build-tree CMake package omits the Release-config imported locations for
+#    the drx/drmgr/drreg extensions the client links against).
+with-proxy git clone --recursive --depth 1 https://github.com/DynamoRIO/dynamorio.git ~/dynamorio
+cmake -S ~/dynamorio -B ~/dynamorio/build \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_SAMPLES=ON
+cmake --build ~/dynamorio/build --parallel
+cmake --install ~/dynamorio/build --prefix ~/dynamorio/install
+
+# 2. Build the reverie-dbi native client against that install tree.
+cd <reverie checkout>
+DYNAMORIO_HOME=~/dynamorio PROFILE=debug bash reverie-dbi/scripts/build-client.sh
+# -> <reverie>/target/debug/reverie-dbi-native/libreverie_dbi_client.so
+
+# 3. Point hermit at them (see the exports above) and run --backend dbi.
+```
+
+Validation with the source build: `reverie-dbi/scripts/test-echo.sh` and
+`test-cpuid.sh` both pass (the latter prints
+`CPUID-SUCCESS vendor=GenuineIntel signature=00000663`, confirming the
+deterministic CPU identity with RDRAND/RDSEED/TSX/AVX-512 masked), and the client
+reports non-zero `branches`/`syscalls`/`rewritten_writes`.
