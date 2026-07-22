@@ -286,6 +286,9 @@ fn rdtsc_observes_global_time() {
     let config = detcore::Config {
         sequentialize_threads: false,
         virtualize_time: true,
+        // spawn_fn begins after the parent glibc has registered rseq. New
+        // pthreads must preserve that inherited runtime contract.
+        allow_passthrough: true,
         ..Default::default()
     };
     check_fn_with_config::<Detcore, _>(
