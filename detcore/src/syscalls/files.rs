@@ -88,7 +88,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // helper function to track a new file descriptor.
-    async fn add_fd<G: Guest<Self>>(
+    pub(crate) async fn add_fd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
@@ -277,7 +277,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 self.execute_nonblockable_fd_syscall(guest, call).await
             }
-            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd => {
+            FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
                 Ok(self.record_or_replay(guest, call).await?)
             }

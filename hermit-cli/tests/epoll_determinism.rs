@@ -132,3 +132,22 @@ fn mixed_fd_readiness_is_deterministic() {
 fn nested_epoll_delivery_is_deterministic() {
     assert_scenario_is_deterministic("nested");
 }
+
+/// Regression test: descriptor-table operations on an epoll fd (F_GETFL,
+/// F_SETFD, dup, F_DUPFD, F_DUPFD_CLOEXEC) used to fail with EBADF under Hermit
+/// because the epoll fd was never registered in Detcore's fd table. This broke
+/// the rustup proxies (cargo/rustc), whose tokio runtime dups its epoll fd at
+/// startup. The guest aborts with a nonzero status if any operation fails, so a
+/// successful run (asserted by `run_scenario`) is the regression check.
+#[test]
+fn epoll_fd_supports_descriptor_table_ops() {
+    let _guard = hermit_run_lock();
+    let output = run_scenario("dupfd", 1);
+    assert!(
+        output
+            .windows(b"dupfd ops-ok".len())
+            .any(|window| window == b"dupfd ops-ok"),
+        "dupfd scenario did not report ops-ok:\n{}",
+        String::from_utf8_lossy(&output),
+    );
+}

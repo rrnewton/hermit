@@ -322,9 +322,63 @@ static void run_nested(void) {
   close(inner_epoll);
 }
 
+// Regression test for an epoll fd that was never registered in Detcore's
+// descriptor table. Descriptor-table operations (F_GETFL, F_SETFD, dup,
+// F_DUPFD, F_DUPFD_CLOEXEC) used to fail with EBADF under Hermit even though
+// the underlying kernel fd was perfectly valid. This broke the rustup proxies
+// (cargo/rustc), whose tokio runtime dups its epoll fd at startup.
+static void run_dupfd(void) {
+  const int epoll_fd = create_epoll();
+
+  // Status flags must be readable from the descriptor table.
+  if (fcntl(epoll_fd, F_GETFL) < 0) {
+    fail_errno("fcntl(F_GETFL) on epoll fd");
+  }
+
+  // Descriptor flags must be settable.
+  if (fcntl(epoll_fd, F_SETFD, FD_CLOEXEC) < 0) {
+    fail_errno("fcntl(F_SETFD) on epoll fd");
+  }
+
+  // Plain dup of the epoll fd.
+  const int dup_fd = dup(epoll_fd);
+  if (dup_fd < 0) {
+    fail_errno("dup(epoll fd)");
+  }
+
+  // F_DUPFD returns the lowest free fd >= the requested minimum.
+  const int dupfd_fd = fcntl(epoll_fd, F_DUPFD, 3);
+  if (dupfd_fd < 0) {
+    fail_errno("fcntl(F_DUPFD) on epoll fd");
+  }
+
+  // F_DUPFD_CLOEXEC does the same but sets close-on-exec on the new fd; this
+  // is the exact call rustup's tokio runtime makes.
+  const int cloexec_fd = fcntl(epoll_fd, F_DUPFD_CLOEXEC, 3);
+  if (cloexec_fd < 0) {
+    fail_errno("fcntl(F_DUPFD_CLOEXEC) on epoll fd");
+  }
+  const int cloexec_flags = fcntl(cloexec_fd, F_GETFD);
+  if (cloexec_flags < 0) {
+    fail_errno("fcntl(F_GETFD) on duplicated epoll fd");
+  }
+  if ((cloexec_flags & FD_CLOEXEC) == 0) {
+    fail("F_DUPFD_CLOEXEC did not set close-on-exec on the new fd");
+  }
+
+  close(cloexec_fd);
+  close(dupfd_fd);
+  close(dup_fd);
+  close(epoll_fd);
+  printf("dupfd ops-ok\n");
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
-    fprintf(stderr, "usage: %s <multi|edge|oneshot|mixed|nested>\n", argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s <multi|edge|oneshot|mixed|nested|dupfd>\n",
+        argv[0]);
     return 2;
   }
 
@@ -338,6 +392,8 @@ int main(int argc, char** argv) {
     run_mixed();
   } else if (strcmp(argv[1], "nested") == 0) {
     run_nested();
+  } else if (strcmp(argv[1], "dupfd") == 0) {
+    run_dupfd();
   } else {
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return 2;
