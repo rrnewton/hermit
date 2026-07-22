@@ -29,15 +29,5 @@ path = "junit.xml"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = '''
-package(=hermit) & kind(=test) & (
-    binary(=arbitrary_binaries) |
-    binary(=clock_determinism) |
-    binary(=epoll_determinism) |
-    binary(=hermit_modes) |
-    binary(=mmap_determinism) |
-    binary(=record_replay) |
-    binary(=signal_determinism) |
-    binary(=stress_suite)
-)'''
+filter = "package(=hermit) & kind(=test)"
 test-group = "hermit-serialized"

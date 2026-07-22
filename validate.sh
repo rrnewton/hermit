@@ -197,11 +197,13 @@ run_check "Build workspace" cargo build --workspace
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-# Nextest runs package unit and Cargo integration targets in parallel. It does
-# not run rustdoc tests, so keep those as a separate Cargo phase.
+# Nextest runs most package unit and Cargo integration targets in parallel.
+# Detcore's PMU tests depend on same-binary coordination; nextest would launch
+# them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
 run_check "Test workspace and integrations" \
-    "${NEXTEST_RUN[@]}" --workspace \
+    "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
     --exclude hermetic_infra_hermit_flaky-tests
+run_check "Test detcore package" cargo test -p detcore
 run_check "Test workspace documentation" cargo test --workspace --doc
 run_check "Fast concurrency stress suite" \
     "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
