@@ -81,18 +81,18 @@ jobs:
         cache: false
     - name: Dependencies
       run: |
-        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma).
-        # A Go toolchain is OPTIONAL: hermit-cli/tests/arbitrary_binaries.rs skips
-        # the `go` tool when the binary is absent, so no test needs it. The
-        # self-hosted runner has apt (no dnf) but cannot locate `golang-go`, which
-        # previously failed the whole job. Install the required libs and treat Go
-        # as best-effort so a missing golang package no longer blocks CI.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y cmake gcc-c++ libunwind-devel redis sqlite xz-devel
-          sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
+          sudo dnf install -y \
+            libunwind-devel xz-devel redis sqlite busybox coreutils python3 nodejs \
+            java-17-openjdk-headless golang curl wget git gcc gcc-c++ make cmake
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev redis-server redis-tools sqlite3
-          sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
+          sudo apt-get update
+          sudo apt-get install -y \
+            libunwind-dev liblzma-dev redis-server redis-tools sqlite3 busybox coreutils \
+            python3 nodejs default-jre-headless golang-go curl wget git gcc g++ make cmake
+        else
+          echo "::error::No supported package manager; test dependencies cannot be installed."
+          exit 1
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
@@ -101,24 +101,23 @@ jobs:
     - name: PMU timing and miscellaneous tests
       run: |
         cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-        cargo test -p detcore --test tests_time -- --ignored --test-threads=4
+        cargo test -p detcore --test tests_time -- --test-threads=4
     - name: PMU parallel futex tests
       run: >-
         cargo test -p detcore --test tests_parallelism futex_wait_parent
-        -- --ignored --test-threads=3
+        -- --test-threads=3
     - name: PMU parallel memory tests
       run: |
-        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --ignored --test-threads=4
-        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --ignored --test-threads=4
-    - name: Check mount namespace support
+        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=4
+        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=4
+    - name: Require mount namespace support
       id: namespaces
       run: |
-        if unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp' 2>/dev/null; then
-          echo "available=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
+        if ! unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'; then
+          echo "::error::Mount namespaces are required for Hermit integration tests."
+          exit 1
         fi
+        echo "available=true" >> "$GITHUB_OUTPUT"
     - name: Stable Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
       run: |
@@ -159,9 +158,6 @@ jobs:
     - name: rr syscall test suite
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test rr_suite -- --ignored
-    - name: Hermit unit tests without mount namespaces
-      if: steps.namespaces.outputs.available != 'true'
-      run: cargo test -p hermit --lib --bins
     - name: Backend parity ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: |

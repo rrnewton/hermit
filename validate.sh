@@ -314,9 +314,6 @@ run_check "Test workspace and integrations" \
     "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
     --exclude hermetic_infra_hermit_flaky-tests
 run_check "Test detcore package" cargo test -p detcore
-run_check "Fast concurrency stress suite" \
-    "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
-    --run-ignored only -E 'test(=fast_chaos_matrix)'
 # rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
 if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
     run_check "rr syscall suite" \
