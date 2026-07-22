@@ -270,7 +270,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let (fd_type, resource) = guest
             .thread_state_mut()
-            .with_detfd(call.fd(), |detfd| (detfd.ty, detfd.resource.clone()))?;
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
         self.with_fd_resource(guest, resource, Permission::R, move |this, guest| {
             Box::pin(async move {
@@ -397,11 +397,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Writev,
     ) -> Result<i64, Error> {
         let (fd_type, resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty,
-                detfd.resource.clone(),
-                detfd.stat.map(|x| x.inode),
-            )
+            (detfd.ty(), detfd.resource(), detfd.stat().map(|x| x.inode))
         })?;
         if guest.config().virtualize_metadata {
             let inode =

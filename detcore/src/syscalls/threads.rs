@@ -29,6 +29,7 @@ use tracing::trace;
 use crate::FileMetadata;
 use crate::config::BlockingMode;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -45,7 +46,6 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
-use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::FutexID;
 use crate::types::LogicalTime;
@@ -85,6 +85,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
+        let vfork_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         let child_priority_entropy = if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
@@ -111,7 +112,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Remove it from Detcore's run queue before entering that blocking call.
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockingExternalIO, Permission::RW);
+            resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
             resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }
@@ -120,7 +121,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockedExternalContinue, Permission::RW);
+            resources.insert(
+                ResourceID::BlockedExternalContinue(vfork_op_id),
+                Permission::RW,
+            );
             resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }
