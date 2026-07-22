@@ -553,8 +553,15 @@ impl TimeoutableSyscall for reverie::syscalls::Ppoll {
     }
 }
 
+fn select_fd_set_len(nfds: i32) -> Result<usize, Errno> {
+    let nfds = usize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+    let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
+    Ok(nfds.div_ceil(bits_per_word) * std::mem::size_of::<libc::c_ulong>())
+}
+
 fn copy_select_fd_sets<T, G>(
     guest: &mut G,
+    nfds: i32,
     sources: [Option<AddrMut<'_, libc::fd_set>>; 3],
     destinations: [Option<AddrMut<'_, libc::fd_set>>; 3],
 ) -> Result<(), Error>
@@ -562,11 +569,17 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    let len = select_fd_set_len(nfds)?;
+    if len == 0 {
+        return Ok(());
+    }
+
     let mut memory = guest.memory();
     for (source, destination) in sources.into_iter().zip(destinations) {
         if let (Some(source), Some(destination)) = (source, destination) {
-            let value = memory.read_value(source)?;
-            memory.write_value(destination, &value)?;
+            let mut bytes = vec![0; len];
+            memory.read_exact(source.cast::<u8>(), &mut bytes)?;
+            memory.write_exact(destination.cast::<u8>(), &bytes)?;
         }
     }
     Ok(())
@@ -600,6 +613,7 @@ impl NonblockableSyscall for reverie::syscalls::Select {
     ) -> Result<(), Error> {
         copy_select_fd_sets(
             guest,
+            self.nfds(),
             [
                 original.readfds(),
                 original.writefds(),
@@ -616,6 +630,7 @@ impl NonblockableSyscall for reverie::syscalls::Select {
     ) -> Result<(), Error> {
         copy_select_fd_sets(
             guest,
+            self.nfds(),
             [self.readfds(), self.writefds(), self.exceptfds()],
             [
                 original.readfds(),
@@ -660,6 +675,7 @@ impl NonblockableSyscall for reverie::syscalls::Pselect6 {
     ) -> Result<(), Error> {
         copy_select_fd_sets(
             guest,
+            self.nfds(),
             [
                 original.readfds(),
                 original.writefds(),
@@ -676,6 +692,7 @@ impl NonblockableSyscall for reverie::syscalls::Pselect6 {
     ) -> Result<(), Error> {
         copy_select_fd_sets(
             guest,
+            self.nfds(),
             [self.readfds(), self.writefds(), self.exceptfds()],
             [
                 original.readfds(),
@@ -1142,6 +1159,10 @@ mod tests {
             })),
             Ok(ParsedTimeout::Deadline(LogicalTime::MAX))
         );
+        assert_eq!(select_fd_set_len(-1), Err(Errno::EINVAL));
+        assert_eq!(select_fd_set_len(0), Ok(0));
+        assert_eq!(select_fd_set_len(1), Ok(8));
+        assert_eq!(select_fd_set_len(65), Ok(16));
         assert_eq!(
             checked_timeval_to_nanos(libc::timeval {
                 tv_sec: 1,
