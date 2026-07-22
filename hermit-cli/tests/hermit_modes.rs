@@ -331,6 +331,37 @@ fn hermit_command(base_env: &str) -> Command {
     command
 }
 
+fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Command {
+    let guest = tmp.join("guest");
+    fs::write(&guest, script).expect("failed to write verify guest");
+    let mut permissions = fs::metadata(&guest)
+        .expect("failed to stat verify guest")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&guest, permissions).expect("failed to make verify guest executable");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["run", "--verify"])
+        .args(extra_options)
+        .args([
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+        ])
+        .arg(format!("--tmp={}", tmp.display()))
+        .arg("/tmp/guest");
+    command
+}
+
+fn remove_retained_verify_logs(stderr: &str) {
+    for word in stderr.split_whitespace() {
+        if word.starts_with("/tmp/run") && word.contains("_log_") {
+            let _ = fs::remove_file(word);
+        }
+    }
+}
+
 fn default_hermit_command(base_env: &str) -> Command {
     let mut command = hermit_command(base_env);
     command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
@@ -770,6 +801,113 @@ fn chaos_mode_matrix() {
 #[test]
 fn verify_mode_matrix() {
     run_stable_matrix(RunMode::Verify);
+}
+
+#[test]
+fn verify_captures_debug_logs_when_a_lower_level_is_requested() {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "--log=error",
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--preemption-timeout=disabled",
+        "--",
+        "/bin/true",
+    ]);
+
+    let output = command_output(command, "verify minimum log level");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Logs contain "),
+        "missing log counts:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Logs contain 0 | 0 messages total"),
+        "verify compared empty logs:\n{stderr}"
+    );
+}
+
+#[test]
+fn verify_reports_stdout_divergence() {
+    let _guard = hermit_run_lock();
+    let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let mut command = verify_guest_command(
+        tmp.path(),
+        "#!/bin/sh\nif [ -e /tmp/state ]; then printf second; else printf first; fi\n: > /tmp/state\n",
+        &[],
+    );
+
+    let output = command.output().expect("failed to run stdout verification");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected status:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Mismatch in stdout between run 1 and run 2"),
+        "missing stdout diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Failure: nondeterministic."),
+        "missing verification failure:\n{stderr}"
+    );
+    remove_retained_verify_logs(&stderr);
+}
+
+#[test]
+fn verify_reports_exit_status_divergence() {
+    let _guard = hermit_run_lock();
+    let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let mut command = verify_guest_command(
+        tmp.path(),
+        "#!/bin/sh\nif [ -e /tmp/state ]; then exit 17; fi\n: > /tmp/state\nexit 0\n",
+        &["--verify-allow=both"],
+    );
+
+    let output = command
+        .output()
+        .expect("failed to run exit-status verification");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected status:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Mismatch in exit status between run 1 and run 2"),
+        "missing exit-status diagnostic:\n{stderr}"
+    );
+    remove_retained_verify_logs(&stderr);
+}
+
+#[test]
+fn verify_verbose_compares_the_full_trace() {
+    let _guard = hermit_run_lock();
+    let mut command = hermit_command("minimal");
+    command.args(["--verify", "--verify-verbose", "--", "/bin/true"]);
+
+    let output = command
+        .output()
+        .expect("failed to run verbose verification");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected status:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Comparing full trace messages"),
+        "missing full-trace comparison:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Failure: nondeterministic."),
+        "missing verification failure:\n{stderr}"
+    );
+    remove_retained_verify_logs(&stderr);
 }
 
 #[test]

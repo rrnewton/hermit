@@ -20,6 +20,8 @@ use reverie::process::ExitStatus;
 
 use super::container::default_container;
 use super::global_opts::GlobalOpts;
+use super::verify::ComparedRun;
+use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 
@@ -129,12 +131,19 @@ impl StartOpts {
             .context("Container exited unexpectedly")??;
 
         compare_two_runs(
-            &recording,
-            log1.into_temp_path(),
-            &replay,
-            log2.into_temp_path(),
-            "Success: replay matched recording.",
-            "Recording output did not match replay output!",
+            ComparedRun {
+                output: &recording,
+                log: log1.into_temp_path(),
+            },
+            ComparedRun {
+                output: &replay,
+                log: log2.into_temp_path(),
+            },
+            ComparisonOptions {
+                success_message: "Success: replay matched recording.",
+                failure_message: "Recording output did not match replay output!",
+                verbose: false,
+            },
         )
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.

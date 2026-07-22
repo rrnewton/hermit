@@ -41,6 +41,8 @@ use super::container::default_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
+use super::verify::ComparedRun;
+use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 
@@ -167,6 +169,12 @@ pub struct RunOpts {
     /// execution of the second run.
     #[clap(long)]
     verify: bool,
+
+    /// Compare complete, unnormalized TRACE logs and show detailed differences.
+    /// This detects internal timing and other trace-only divergence at the cost
+    /// of substantially larger logs and stricter comparison.
+    #[clap(long, requires = "verify")]
+    verify_verbose: bool,
 
     /// If --verify is specified, indicates what guest exit status is required for
     /// hermit to consider the verification successful.  Both runs must satisfy this criteria,
@@ -388,6 +396,9 @@ impl fmt::Display for RunOpts {
         }
         if self.verify {
             write!(f, " --verify")?;
+        }
+        if self.verify_verbose {
+            write!(f, " --verify-verbose")?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -1013,12 +1024,19 @@ impl RunOpts {
         let out2 = self.run_verify(log2_file, global)?;
 
         compare_two_runs(
-            &out1,
-            log1_path,
-            &out2,
-            log2_path,
-            "Success: deterministic. Determinism verified.",
-            "Failure: nondeterministic.",
+            ComparedRun {
+                output: &out1,
+                log: log1_path,
+            },
+            ComparedRun {
+                output: &out2,
+                log: log2_path,
+            },
+            ComparisonOptions {
+                success_message: "Success: deterministic. Determinism verified.",
+                failure_message: "Failure: nondeterministic.",
+                verbose: self.verify_verbose,
+            },
         )
     }
 
@@ -1182,12 +1200,12 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        // Ensure at least a minimum DEBUG level.
-        let level = if let Some(requested) = global.log {
-            requested
+        let minimum_level = if self.verify_verbose {
+            LevelFilter::TRACE
         } else {
             LevelFilter::DEBUG
         };
+        let level = global.log.unwrap_or(minimum_level).max(minimum_level);
 
         let _guard = init_file_tracing(Some(level), log_file);
 
