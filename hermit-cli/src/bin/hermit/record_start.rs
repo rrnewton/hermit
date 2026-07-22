@@ -6,7 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::ptr;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use clap::Parser;
 use colored::Colorize;
@@ -15,6 +21,12 @@ use hermit::Error;
 use hermit::HermitData;
 use hermit::SerializableError;
 use hermit::Shebang;
+use nix::sys::signal::SaFlags;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::Signal;
+use nix::sys::signal::sigaction;
 use reverie::process::Command;
 use reverie::process::ExitStatus;
 
@@ -22,6 +34,80 @@ use super::container::default_container;
 use super::global_opts::GlobalOpts;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
+
+static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+static TIMEOUT_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn recording_timeout_handler(_signal: libc::c_int) {
+    let len = TIMEOUT_MESSAGE_LEN.load(Ordering::Acquire);
+    let message = TIMEOUT_MESSAGE.load(Ordering::Acquire);
+    if !message.is_null() && len != 0 {
+        // SAFETY: `message` is leaked before the timer is armed, and write(2) and
+        // _exit(2) are async-signal-safe.
+        unsafe {
+            libc::write(libc::STDERR_FILENO, message.cast(), len);
+        }
+    }
+
+    // Exiting PID 1 tears down the isolated recording namespace and its tracees.
+    // SAFETY: _exit(2) is async-signal-safe and does not run Rust destructors.
+    unsafe { libc::_exit(124) }
+}
+
+struct RecordingDeadline {
+    previous_handler: SigAction,
+}
+
+impl RecordingDeadline {
+    fn arm(timeout: Duration) -> Result<Self, Error> {
+        let seconds: libc::c_uint = timeout
+            .as_secs()
+            .try_into()
+            .map_err(|_| Error::msg("record timeout exceeds the platform alarm limit"))?;
+        let message = Box::leak(
+            format!(
+                "Error: Recording timed out after {} seconds; the recording container was terminated\n",
+                timeout.as_secs()
+            )
+            .into_boxed_str(),
+        );
+        TIMEOUT_MESSAGE.store(message.as_mut_ptr(), Ordering::Release);
+        TIMEOUT_MESSAGE_LEN.store(message.len(), Ordering::Release);
+
+        let action = SigAction::new(
+            SigHandler::Handler(recording_timeout_handler),
+            SaFlags::SA_RESETHAND,
+            SigSet::empty(),
+        );
+        // SAFETY: the handler uses only async-signal-safe operations and remains
+        // installed until this guard disarms the alarm.
+        let previous_handler = unsafe { sigaction(Signal::SIGALRM, &action) }?;
+        // SAFETY: the timeout is nonzero and fits c_uint.
+        unsafe { libc::alarm(seconds) };
+
+        Ok(Self { previous_handler })
+    }
+}
+
+impl Drop for RecordingDeadline {
+    fn drop(&mut self) {
+        // SAFETY: disarm the process-local alarm before restoring its handler.
+        unsafe {
+            libc::alarm(0);
+            let _ = sigaction(Signal::SIGALRM, &self.previous_handler);
+        }
+        TIMEOUT_MESSAGE_LEN.store(0, Ordering::Release);
+        TIMEOUT_MESSAGE.store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+fn with_recording_deadline<T>(
+    timeout: Duration,
+    record: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let _deadline = RecordingDeadline::arm(timeout)?;
+    record()
+}
 
 #[derive(Debug, Parser)]
 pub struct StartOpts {
@@ -36,6 +122,10 @@ pub struct StartOpts {
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Kill the recording if the guest does not finish within this many seconds.
+    #[clap(long, value_name = "SECONDS")]
+    record_timeout: Option<NonZeroU64>,
 
     /// After recording, immediately replays the command to verify that it works.
     /// This is useful for testing purposes where we often want to verify that
@@ -54,7 +144,12 @@ pub struct StartOpts {
     #[clap(long = "verify-with-gdbex", value_delimiter = ';')]
     gdbex: Vec<String>,
 }
+
 impl StartOpts {
+    fn record_timeout(&self) -> Option<Duration> {
+        self.record_timeout
+            .map(|seconds| Duration::from_secs(seconds.get()))
+    }
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
             self.record_verify(global)
@@ -62,19 +157,36 @@ impl StartOpts {
             self.record_verify_debug(global)
         } else {
             let hermit = HermitData::from(self.data_dir.as_ref());
+            let record_timeout = self.record_timeout();
 
             let mut container = default_container(true);
 
-            let recording = container
-                .run(|| {
-                    let _guard = global.init_tracing();
-
-                    let mut command = Command::new(&self.program);
-                    command.args(&self.args);
-
-                    hermit.record(command).map_err(SerializableError::from)
-                })
-                .context("Container exited unexpectedly")??;
+            let recording = match record_timeout {
+                Some(timeout) => {
+                    let data = hermit.create_recording_dir()?;
+                    let data_path = data.path().to_path_buf();
+                    let exit_status = container
+                        .run(|| {
+                            let _guard = global.init_tracing();
+                            let mut command = Command::new(&self.program);
+                            command.args(&self.args);
+                            with_recording_deadline(timeout, || {
+                                hermit::record_to(command, &data_path)
+                            })
+                            .map_err(SerializableError::from)
+                        })
+                        .context("Container exited unexpectedly")??;
+                    hermit.commit_recording(data, exit_status)?
+                }
+                None => container
+                    .run(|| {
+                        let _guard = global.init_tracing();
+                        let mut command = Command::new(&self.program);
+                        command.args(&self.args);
+                        hermit.record(command).map_err(SerializableError::from)
+                    })
+                    .context("Container exited unexpectedly")??,
+            };
 
             eprintln!(
                 "\n{message}:\n\n    {command} {id}\n",
@@ -97,6 +209,7 @@ impl StartOpts {
 
         let temp_data_dir = tempfile::tempdir()?;
         let data_dir = temp_data_dir.path();
+        let record_timeout = self.record_timeout();
 
         let recording = container
             .run(|| {
@@ -105,20 +218,17 @@ impl StartOpts {
                 let mut command = Command::new(&self.program);
                 command.args(&self.args);
 
-                hermit::record_with_output(command, data_dir).map_err(SerializableError::from)
+                match record_timeout {
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_with_output(command, data_dir)
+                    }),
+                    None => hermit::record_with_output(command, data_dir),
+                }
+                .map_err(SerializableError::from)
             })
             .context("Container exited unexpectedly")??;
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
-
-        // Set this var to make sure we detect desynchronization errors upon
-        // replay.
-        //
-        // FIXME: This is a little hacky. This should be configured via a config
-        // value instead. That's not done because there is no nesting of global
-        // state yet.
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("HERMIT_VERIFY", "1") };
 
         // Replay the recording.
         let replay = container
@@ -145,6 +255,7 @@ impl StartOpts {
 
         let temp_data_dir = tempfile::tempdir()?;
         let data_dir = temp_data_dir.path();
+        let record_timeout = self.record_timeout();
 
         let _result = container
             .run(|| {
@@ -153,20 +264,17 @@ impl StartOpts {
                 let mut command = Command::new(&self.program);
                 command.args(&self.args);
 
-                hermit::record_to(command, data_dir).map_err(SerializableError::from)
+                match record_timeout {
+                    Some(timeout) => {
+                        with_recording_deadline(timeout, || hermit::record_to(command, data_dir))
+                    }
+                    None => hermit::record_to(command, data_dir),
+                }
+                .map_err(SerializableError::from)
             })
             .context("Container exited unexpectedly")??;
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
-
-        // Set this var to make sure we detect desynchronization errors upon
-        // replay.
-        //
-        // FIXME: This is a little hacky. This should be configured via a config
-        // value instead. That's not done because there is no nesting of global
-        // state yet.
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("HERMIT_VERIFY", "1") };
 
         // Find the path to the executable so that GDB can use it to resolve
         // symbols.

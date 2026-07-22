@@ -156,6 +156,13 @@ impl HermitData {
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        let data = self.create_recording_dir()?;
+        let exit_status = record_to(command, data.path())?;
+        self.commit_recording(data, exit_status)
+    }
+
+    /// Creates a temporary directory for a recording that has not been committed yet.
+    pub fn create_recording_dir(&self) -> Result<tempfile::TempDir, Error> {
         let tmp_data_dir = self.data_dir.join("tmp");
 
         fs::create_dir_all(&tmp_data_dir).with_context(|| {
@@ -165,17 +172,18 @@ impl HermitData {
             )
         })?;
 
-        // Create a temporary location to store all the recorded data. This will get
-        // renamed later upon a successful recording.
-        let data = tempfile::TempDir::new_in(tmp_data_dir)?;
+        Ok(tempfile::TempDir::new_in(tmp_data_dir)?)
+    }
 
-        let exit_status = record_to(command, data.path())?;
-
+    /// Commits a completed temporary recording to the recording store.
+    pub fn commit_recording(
+        &self,
+        data: tempfile::TempDir,
+        exit_status: ExitStatus,
+    ) -> Result<Recording, Error> {
         let id = Id::unique();
 
-        // Do an atomic rename from the temporary recording directory to the final
-        // location. This is the final resting place for our data that will be used
-        // during replay.
+        // Atomically move the temporary recording to its final location.
         fs::rename(data.keep(), self.data_dir.join(id.to_string()))?;
 
         self.update_last_id(&id)
