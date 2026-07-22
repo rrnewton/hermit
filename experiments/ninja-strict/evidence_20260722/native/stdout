@@ -35,28 +35,28 @@
 [ RUN      ] SubprocessTest.NoSuchCommand
 [       OK ] SubprocessTest.NoSuchCommand (1 ms)
 [ RUN      ] SubprocessTest.InterruptChild
-[       OK ] SubprocessTest.InterruptChild (0 ms)
+[       OK ] SubprocessTest.InterruptChild (1 ms)
 [ RUN      ] SubprocessTest.InterruptParent
-[       OK ] SubprocessTest.InterruptParent (0 ms)
+[       OK ] SubprocessTest.InterruptParent (1 ms)
 [ RUN      ] SubprocessTest.InterruptChildWithSigTerm
-[       OK ] SubprocessTest.InterruptChildWithSigTerm (0 ms)
+[       OK ] SubprocessTest.InterruptChildWithSigTerm (1 ms)
 [ RUN      ] SubprocessTest.InterruptParentWithSigTerm
 [       OK ] SubprocessTest.InterruptParentWithSigTerm (0 ms)
 [ RUN      ] SubprocessTest.InterruptChildWithSigHup
-[       OK ] SubprocessTest.InterruptChildWithSigHup (1 ms)
+[       OK ] SubprocessTest.InterruptChildWithSigHup (0 ms)
 [ RUN      ] SubprocessTest.InterruptParentWithSigHup
-[       OK ] SubprocessTest.InterruptParentWithSigHup (0 ms)
+[       OK ] SubprocessTest.InterruptParentWithSigHup (1 ms)
 [ RUN      ] SubprocessTest.Console
 [       OK ] SubprocessTest.Console (0 ms)
 [ RUN      ] SubprocessTest.SetWithSingle
-[       OK ] SubprocessTest.SetWithSingle (1 ms)
+[       OK ] SubprocessTest.SetWithSingle (2 ms)
 [ RUN      ] SubprocessTest.SetWithMulti
 [       OK ] SubprocessTest.SetWithMulti (2 ms)
 [ RUN      ] SubprocessTest.SetWithLots
-[       OK ] SubprocessTest.SetWithLots (256 ms)
+[       OK ] SubprocessTest.SetWithLots (230 ms)
 [ RUN      ] SubprocessTest.ReadStdin
 [       OK ] SubprocessTest.ReadStdin (1 ms)
-[----------] 13 tests from SubprocessTest (270 ms total)
+[----------] 13 tests from SubprocessTest (246 ms total)
 
 [----------] 4 tests from StringPieceUtilTest
 [ RUN      ] StringPieceUtilTest.SplitStringPiece
@@ -472,7 +472,7 @@
 [ RUN      ] DiskInterfaceTest.ReadFile
 [       OK ] DiskInterfaceTest.ReadFile (1 ms)
 [ RUN      ] DiskInterfaceTest.MakeDirs
-[       OK ] DiskInterfaceTest.MakeDirs (1 ms)
+[       OK ] DiskInterfaceTest.MakeDirs (2 ms)
 [ RUN      ] DiskInterfaceTest.RemoveFile
 [       OK ] DiskInterfaceTest.RemoveFile (1 ms)
 [ RUN      ] DiskInterfaceTest.RemoveDirectory
@@ -494,7 +494,7 @@
 [ RUN      ] DepsLogTest.WriteRead
 [       OK ] DepsLogTest.WriteRead (0 ms)
 [ RUN      ] DepsLogTest.LotsOfDeps
-[       OK ] DepsLogTest.LotsOfDeps (136 ms)
+[       OK ] DepsLogTest.LotsOfDeps (140 ms)
 [ RUN      ] DepsLogTest.DoubleEntry
 [       OK ] DepsLogTest.DoubleEntry (0 ms)
 [ RUN      ] DepsLogTest.Recompact
@@ -508,8 +508,8 @@
 [ RUN      ] DepsLogTest.ReverseDepsNodes
 [       OK ] DepsLogTest.ReverseDepsNodes (0 ms)
 [ RUN      ] DepsLogTest.MalformedDepsLog
-[       OK ] DepsLogTest.MalformedDepsLog (1 ms)
-[----------] 9 tests from DepsLogTest (139 ms total)
+[       OK ] DepsLogTest.MalformedDepsLog (0 ms)
+[----------] 9 tests from DepsLogTest (141 ms total)
 
 [----------] 29 tests from DepfileParserTest
 [ RUN      ] DepfileParserTest.Basic
@@ -866,19 +866,19 @@
 [ RUN      ] BuildWithDepsLogTest.Straightforward
 [       OK ] BuildWithDepsLogTest.Straightforward (2 ms)
 [ RUN      ] BuildWithDepsLogTest.ObsoleteDeps
-[       OK ] BuildWithDepsLogTest.ObsoleteDeps (1 ms)
+[       OK ] BuildWithDepsLogTest.ObsoleteDeps (2 ms)
 [ RUN      ] BuildWithDepsLogTest.DepsIgnoredInDryRun
 [       OK ] BuildWithDepsLogTest.DepsIgnoredInDryRun (2 ms)
 [ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceCondition
 [       OK ] BuildWithDepsLogTest.TestInputMtimeRaceCondition (1 ms)
 [ RUN      ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile
-[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile (1 ms)
+[       OK ] BuildWithDepsLogTest.TestInputMtimeRaceConditionWithDepFile (2 ms)
 [ RUN      ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog
 [       OK ] BuildWithDepsLogTest.RestatDepfileDependencyDepsLog (2 ms)
 [ RUN      ] BuildWithDepsLogTest.DepFileOKDepsLog
 [       OK ] BuildWithDepsLogTest.DepFileOKDepsLog (1 ms)
 [ RUN      ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged
-[       OK ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged (2 ms)
+[       OK ] BuildWithDepsLogTest.DiscoveredDepDuringBuildChanged (1 ms)
 [ RUN      ] BuildWithDepsLogTest.RestatMissingDepfileDepslog
 [       OK ] BuildWithDepsLogTest.RestatMissingDepfileDepslog (2 ms)
 [ RUN      ] BuildWithDepsLogTest.ValidationThroughDepfile
@@ -914,5 +914,5 @@
 [----------] 1 test from BuildLogRecompactTest (0 ms total)
 
 [----------] Global test environment tear-down
-[==========] 410 tests from 31 test suites ran. (458 ms total)
+[==========] 410 tests from 31 test suites ran. (437 ms total)
 [  PASSED  ] 410 tests.
