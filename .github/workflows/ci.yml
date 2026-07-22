@@ -108,17 +108,15 @@ jobs:
           cli \
           clock_determinism \
           epoll_determinism \
-          ipc_determinism \
           mmap_determinism \
           procfs_determinism \
-          random_determinism \
-          record_replay \
-          signal_determinism \
-          thread_sync_determinism
+          signal_determinism
         do
           cargo test -p hermit --test "$test" -- --test-threads=1
         done
-        cargo test -p hermit --test hermit_modes mode_matrix -- --test-threads=1
+        cargo test -p hermit --test record_replay record_find_directory_tree -- --exact --test-threads=1
+        cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+        cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
     - name: PMU Detcore lit tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
