@@ -144,12 +144,115 @@ fn run_help_exposes_determinism_modes() {
         "--record-preemptions",
         "--replay-preemptions-from",
         "--preemption-timeout",
+        "--backend <BACKEND>",
+        "ptrace",
+        "dbi",
+        "kvm",
         "Bare names are resolved using the guest PATH",
         "hidden by Hermit's isolated `/tmp`",
         "without ptrace, seccomp interception, or determinization",
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
     }
+}
+
+#[test]
+fn run_rejects_unknown_backends_during_argument_parsing() {
+    let args = ["run", "--backend", "unknown", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("invalid value 'unknown'"),
+        "unexpected error:\n{stderr}"
+    );
+    for backend in ["ptrace", "dbi", "kvm"] {
+        assert!(
+            stderr.contains(backend),
+            "missing {backend:?} in:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_fails_closed_for_unavailable_kvm_backend() {
+    let args = ["run", "--backend", "kvm", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_failure_contains(&output, &["backend `kvm` is unavailable"]);
+    assert!(
+        !stderr(&output).contains("Hermit cannot use ptrace"),
+        "KVM should fail before ptrace capability probing"
+    );
+}
+
+#[test]
+fn namespace_only_rejects_every_explicit_backend() {
+    for backend in ["ptrace", "dbi", "kvm"] {
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--namespace-only",
+            "--",
+            "/bin/true",
+        ];
+        let output = hermit(&args);
+        assert_eq!(output.status.code(), Some(2));
+        let message = stderr(&output);
+        assert!(
+            message.contains("--backend"),
+            "unexpected error:\n{message}"
+        );
+        assert!(
+            message.contains("--namespace-only"),
+            "unexpected error:\n{message}"
+        );
+    }
+}
+
+#[test]
+fn backend_accepted_in_global_position() {
+    // KVM is unavailable independent of ptrace or DBI host configuration, so
+    // its error demonstrates that the global value reached `run`.
+    let args = ["--backend", "kvm", "run", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_failure_contains(&output, &["backend `kvm` is unavailable"]);
+}
+
+#[test]
+fn global_position_rejects_unknown_backends() {
+    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("invalid value 'unknown'"),
+        "unexpected error:\n{stderr}"
+    );
+}
+
+#[test]
+fn namespace_only_rejects_global_position_backend() {
+    let args = [
+        "--backend",
+        "ptrace",
+        "run",
+        "--namespace-only",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    let message = stderr(&output);
+    assert!(
+        message.contains("--backend"),
+        "unexpected error:\n{message}"
+    );
+    assert!(
+        message.contains("--namespace-only"),
+        "unexpected error:\n{message}"
+    );
 }
 
 #[test]
@@ -302,6 +405,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command.args([
             "run",
+            "--backend=ptrace",
             "--preemption-timeout=disabled",
             "--no-virtualize-cpuid",
             "--",

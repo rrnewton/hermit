@@ -78,6 +78,35 @@ stronger mode:
 hermit run --strict -- /bin/echo hello
 ```
 
+### Execution Backends
+
+Hermit accepts `--backend=ptrace|dbi|kvm` as a global option, before the
+subcommand, since the backend applies to how any subcommand instruments the
+guest. Omitting the option selects `ptrace`, preserving the existing behavior:
+
+```bash
+hermit --backend=ptrace run -- /bin/echo hello
+```
+
+For backwards compatibility, `run` still accepts `--backend` after the
+subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
+
+Backend selection fails closed: Hermit never substitutes ptrace after an
+explicit `dbi` or `kvm` request. The DBI prototype can execute basic binaries
+through Reverie's DynamoRIO client. Build the native client, then identify the
+SDK source/build tree and client library when launching Hermit:
+
+```bash
+DYNAMORIO_HOME=/path/to/dynamorio \
+REVERIE_DBI_CLIENT=/path/to/libreverie_dbi_client.so \
+  hermit run --backend=dbi -- /bin/echo hello
+```
+
+This prototype instruments execution but does not yet connect the full Detcore
+deterministic syscall policy. The bare KVM prototype requires read-write
+`/dev/kvm` access (commonly through the `kvm` group or root) and a guest-kernel
+Linux ABI; it remains unavailable until that adapter is integrated.
+
 A quick determinism check is to run the same virtual random-data read twice:
 
 ```bash
