@@ -137,6 +137,16 @@ jobs:
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: ./scripts/test-fail-closed.sh
+    - name: Working-envelope measurement and monotonicity gate
+      if: steps.namespaces.outputs.available == 'true'
+      # Runs the IDENTICAL measurement code path as `./validate.sh` (same probes,
+      # same --strict/--verify/--detlog modes, same L4 stress reps, same
+      # record/replay probe) so CI and local numbers match exactly. Emits the
+      # {l1_pass,l2_pass,l3_pass,l4_pass,rr_pass,total} vector as JSON + human
+      # summary and fails if any count regressed below the committed baseline
+      # (envelope-baseline.json). To grow the envelope, a PR raises the baseline;
+      # a PR that shrinks any count turns this step red.
+      run: ./validate.sh --envelope-compare envelope-baseline.json
     - name: Debugger (gdb/lldb) integration tests
       if: steps.namespaces.outputs.available == 'true'
       run: ./tests/debugger/run_debugger_tests.sh
@@ -163,3 +173,11 @@ jobs:
         else
           echo "::notice::DBI/KVM parity blocked: backend selector is not integrated yet"
         fi
+    - name: Upload working-envelope JSON
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: working-envelope-${{ github.job }}
+        path: envelope.json
+        if-no-files-found: warn
+        retention-days: 14
