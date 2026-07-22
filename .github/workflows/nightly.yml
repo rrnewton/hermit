@@ -1,0 +1,93 @@
+name: Nightly chaos stress
+
+# Proactively hunts nondeterminism and scheduler regressions by running the
+# chaos stress guests across many random seeds every night, plus a record/replay
+# determinism check. Produces a machine-readable JSON report (and a Markdown
+# summary) uploaded as an artifact for trend tracking over time.
+#
+# Chaos preemption and record/replay rely on PMU retired-conditional-branch
+# counters, so this runs on the self-hosted PMU runner (same pool as the
+# host-dependent CI job). It can also be launched by hand via workflow_dispatch.
+
+on:
+  schedule:
+    # 07:15 UTC daily (after most timezones' end-of-day pushes have settled).
+    - cron: "15 7 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds_per_cell:
+        description: "Random chaos seeds per (category, thread-count) cell"
+        required: false
+        default: "10"
+      cas_seeds:
+        description: "Seeds searched for a CAS race to record/replay"
+        required: false
+        default: "60"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  nightly-stress:
+    name: Nightly chaos stress (self-hosted, PMU)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 180
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
+      NIGHTLY_SEEDS: ${{ github.event.inputs.seeds_per_cell || '10' }}
+      NIGHTLY_CAS_SEEDS: ${{ github.event.inputs.cas_seeds || '60' }}
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Dependencies
+      run: |
+        if command -v apt-get >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y g++ gcc git jq liblzma-dev libunwind-dev make
+        elif command -v dnf >/dev/null; then
+          sudo dnf install -y gcc gcc-c++ git jq libunwind-devel make xz-devel
+        else
+          echo "::error::No supported package manager; dependencies cannot be installed."
+          exit 1
+        fi
+
+    - name: Build hermit (release)
+      run: cargo build --release --bin hermit
+
+    - name: Run nightly chaos stress
+      id: stress
+      env:
+        HERMIT_BIN: ${{ github.workspace }}/target/release/hermit
+        NIGHTLY_OUT_DIR: ${{ github.workspace }}/target/nightly-stress
+      # Do not fail the whole job here; we always want to upload the report.
+      # The final gate step re-reads the JSON status and fails if needed.
+      run: |
+        set +e
+        ./scripts/nightly-stress.sh
+        echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+    - name: Upload JSON report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nightly-stress-report-${{ github.run_id }}
+        path: |
+          target/nightly-stress/results.json
+          target/nightly-stress/summary.md
+        if-no-files-found: warn
+        retention-days: 90
+
+    - name: Gate on stress result
+      if: always()
+      run: |
+        code="${{ steps.stress.outputs.exit_code }}"
+        echo "nightly-stress.sh exit code: ${code}"
+        if [ "${code}" != "0" ]; then
+          echo "::error::Nightly chaos stress detected regressions or determinism failures (see the uploaded report)."
+          exit 1
+        fi
