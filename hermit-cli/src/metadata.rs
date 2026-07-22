@@ -149,6 +149,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
+        allow_passthrough: true,
         sequentialize_threads: true,
         deterministic_io: false,
         virtualize_time: false,
