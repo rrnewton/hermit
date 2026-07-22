@@ -36,6 +36,7 @@ use tracing::warn;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::ProcfsFile;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -159,6 +160,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                if let Some(procfs) = ProcfsFile::from_path(&path) {
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.set_procfs(procfs.clone()))?;
+                }
                 resource_release_all(guest).await;
                 Ok(fd as i64)
             }
@@ -185,6 +191,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
+    async fn snapshot_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<Vec<u8>, Error> {
+        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+        let mut contents = Vec::new();
+        loop {
+            let bytes_read = self.record_or_replay(guest, call).await? as usize;
+            if bytes_read == 0 {
+                return Ok(contents);
+            }
+            if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
+                return Err(Errno::EFBIG.into());
+            }
+
+            let mut chunk = vec![0; bytes_read];
+            guest.memory().read_exact(remote_buf, &mut chunk)?;
+            contents.extend_from_slice(&chunk);
+        }
+    }
+
     /// SYS_read system call (MAYHANG).
     pub async fn handle_read<G: Guest<Self>>(
         &self,
@@ -195,6 +225,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Zero-count reads only serve to detect errors.
             let res = guest.inject(Syscall::from(call)).await?;
             return Ok(res);
+        }
+
+        let needs_procfs_snapshot = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
+        if needs_procfs_snapshot {
+            let contents = self.snapshot_procfs(guest, call).await?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.initialize_procfs(contents.clone());
+            })?;
+        }
+
+        let procfs_bytes = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.take_procfs(call.len()))?;
+        if let Some(bytes) = procfs_bytes {
+            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(remote_buf, &bytes)?;
+            return Ok(bytes.len() as i64);
         }
 
         let (fd_type, resource) = guest
