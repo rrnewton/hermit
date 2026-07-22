@@ -14,14 +14,24 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #define MAPS_CONTENT "00400000-00401000 r-xp 00000000 00:00 0 [hermit]\n"
+
+#ifndef RESOLVE_BENEATH
+#define RESOLVE_BENEATH 0x08
+#endif
 
 struct open_how_compat {
   uint64_t flags;
   uint64_t mode;
   uint64_t resolve;
+};
+
+struct open_how_large {
+  struct open_how_compat how;
+  uint64_t extra;
 };
 
 static void fail(const char *operation) {
@@ -33,6 +43,15 @@ static void require_errno(const char *operation, long result, int expected) {
   if (result != -1 || errno != expected) {
     fprintf(stderr, "%s: result=%ld errno=%d expected=%d\n", operation, result,
             errno, expected);
+    exit(1);
+  }
+}
+
+static void require_file_type(const char *operation, int result, mode_t actual,
+                              mode_t expected) {
+  if (result != 0 || (actual & S_IFMT) != expected) {
+    fprintf(stderr, "%s: result=%d errno=%d mode=%o expected=%o\n", operation,
+            result, errno, actual, expected);
     exit(1);
   }
 }
@@ -138,6 +157,24 @@ int main(void) {
   require_errno("fstatat hidden",
                 fstatat(AT_FDCWD, "/proc/self/environ", &metadata, 0), ENOENT);
 
+  int metadata_result = stat("/proc/self/exe", &metadata);
+  require_file_type("stat self exe", metadata_result, metadata.st_mode, S_IFREG);
+  metadata_result = lstat("/proc/self/exe", &metadata);
+  require_file_type("lstat self exe", metadata_result, metadata.st_mode, S_IFLNK);
+  metadata_result = fstatat(AT_FDCWD, "/proc/self/exe", &metadata, 0);
+  require_file_type(
+      "fstatat follow self exe", metadata_result, metadata.st_mode, S_IFREG);
+  metadata_result = fstatat(AT_FDCWD, "/proc/self/exe", &metadata,
+                            AT_SYMLINK_NOFOLLOW);
+  require_file_type(
+      "fstatat nofollow self exe", metadata_result, metadata.st_mode, S_IFLNK);
+
+  struct statfs statfs_buffer;
+  errno = 0;
+  require_errno("statfs hidden", statfs("/proc/meminfo", &statfs_buffer), ENOENT);
+  errno = 0;
+  require_errno("statfs virtual", statfs("/proc/self/maps", &statfs_buffer), ENOENT);
+
   char link_buffer[4096];
   ssize_t link_size =
       readlink("/proc/self/exe", link_buffer, sizeof(link_buffer) - 1);
@@ -166,6 +203,20 @@ int main(void) {
                 syscall(SYS_faccessat, AT_FDCWD, "/proc/meminfo", F_OK),
                 ENOENT);
 
+#ifdef SYS_faccessat2
+  if (syscall(SYS_faccessat2, AT_FDCWD, "/proc/cpuinfo", R_OK, 0) != 0) {
+    fail("faccessat2 virtual file");
+  }
+  errno = 0;
+  require_errno("faccessat2 hidden",
+                syscall(SYS_faccessat2, AT_FDCWD, "/proc/meminfo", F_OK, 0),
+                ENOENT);
+  errno = 0;
+  require_errno("faccessat2 invalid flags",
+                syscall(SYS_faccessat2, AT_FDCWD, "/proc/cpuinfo", F_OK, 1 << 30),
+                EINVAL);
+#endif
+
 #ifdef SYS_statx
   struct statx statx_buffer;
   if (syscall(SYS_statx, AT_FDCWD, "/proc/cpuinfo", 0, STATX_BASIC_STATS,
@@ -177,10 +228,57 @@ int main(void) {
                 syscall(SYS_statx, AT_FDCWD, "/proc/meminfo", 0,
                         STATX_BASIC_STATS, &statx_buffer),
                 ENOENT);
+
+  int statx_result = syscall(SYS_statx, AT_FDCWD, "/proc/self/exe", 0,
+                             STATX_TYPE, &statx_buffer);
+  require_file_type("statx follow self exe", statx_result, statx_buffer.stx_mode,
+                    S_IFREG);
+  statx_result = syscall(SYS_statx, AT_FDCWD, "/proc/self/exe",
+                         AT_SYMLINK_NOFOLLOW, STATX_TYPE, &statx_buffer);
+  require_file_type("statx nofollow self exe", statx_result,
+                    statx_buffer.stx_mode, S_IFLNK);
 #endif
 
 #ifdef SYS_openat2
   struct open_how_compat how = {.flags = O_RDONLY | O_CLOEXEC};
+  errno = 0;
+  require_errno("openat2 size zero",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how, 0),
+                EINVAL);
+  how.flags = UINT64_C(1) << 63;
+  errno = 0;
+  require_errno("openat2 unknown flags",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how,
+                        sizeof(how)),
+                EINVAL);
+  how.flags = O_RDONLY | O_CLOEXEC;
+  how.mode = 0600;
+  errno = 0;
+  require_errno("openat2 mode without create",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how,
+                        sizeof(how)),
+                EINVAL);
+  how.mode = 0;
+  how.resolve = RESOLVE_BENEATH;
+  errno = 0;
+  require_errno("openat2 resolve beneath",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how,
+                        sizeof(how)),
+                EXDEV);
+  how.resolve = UINT64_C(1) << 63;
+  errno = 0;
+  require_errno("openat2 unknown resolve",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how,
+                        sizeof(how)),
+                EINVAL);
+  how.resolve = 0;
+  struct open_how_large too_large = {.how = how, .extra = 1};
+  errno = 0;
+  require_errno("openat2 nonzero extension",
+                syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &too_large,
+                        sizeof(too_large)),
+                E2BIG);
+
   fd = syscall(SYS_openat2, AT_FDCWD, "/proc/self/maps", &how, sizeof(how));
   if (fd < 0) {
     fail("openat2 maps");
