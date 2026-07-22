@@ -164,6 +164,9 @@ run_check "Test workspace and integrations" \
     cargo test --workspace --exclude hermetic_infra_hermit_flaky-tests
 run_check "Fast concurrency stress suite" \
     cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
+# `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
+run_check "Hermit analyze scenarios" \
+    cargo test -p hermit --test analyze -- --ignored
 run_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_check "Rustfmt" cargo fmt --all -- --check
 run_check "Documentation" cargo doc --workspace --no-deps
