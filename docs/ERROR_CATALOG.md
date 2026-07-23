@@ -66,6 +66,7 @@ scheduling. Options beginning with `--no-` similarly weaken reproducibility.
 | `run without any --filter arguments, so accepting ALL runs` | Configuration | Analyze has no target predicate. | Add an exit, stdout, stderr, or other target filter. |
 | `performing --search with system randomness` | Configuration | Analyze search has no reproducible seed. | Re-run with the printed `--analyze-seed=N`. |
 | `WARNING: DESYNCs found` | Configuration | Verification found replay events that diverged. | Treat the recording, binary, filesystem, environment, and Hermit revision as one immutable set; inspect the desync details. |
+| `WARNING: ... looks like a hardware emulator (VMM). Hermit's host-time virtualization exposes mutually inconsistent clock sources ...` | Configuration | A `qemu-system-*` program was launched with Hermit's virtual clock enabled. Its emulated guest derives TSC from a synthetic RDTSC but PIT/PM/APIC/RTC from virtualized `clock_gettime`, and those bases are not mutually coherent. | If the nested guest reports `Unable to calibrate against PIT`, `Marking TSC unstable`, or `No current clocksource`, re-run with `--no-virtualize-time --no-virtualize-metadata`, or make QEMU use one instruction-derived clock via `-icount shift=0,sleep=off`. See `docs/QEMU_BOOT.md`. |
 
 ## Unsupported Guest Behavior
 
