@@ -848,6 +848,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .clone_flags
                     .expect("clone_flags must be set by parent");
                 let dettid = DetPid::from_raw(tid.into());
+                let reset_vfork_priority_on_exec = pts.1.pending_vfork.is_some()
+                    && !self.cfg.chaos
+                    && self.cfg.replay_preemptions_from.is_none()
+                    && self.cfg.replay_schedule_from.is_none();
 
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
@@ -898,6 +902,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
+                    reset_vfork_priority_on_exec,
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -975,8 +980,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
-        guest.thread_state_mut().past_global_first_execve = true;
+        let reset_vfork_priority = {
+            let thread_state = guest.thread_state_mut();
+            thread_state.past_global_first_execve = true;
+            std::mem::take(&mut thread_state.reset_vfork_priority_on_exec)
+        };
         self.pre_handler_hook(guest, false).await;
+
+        if reset_vfork_priority && self.cfg.sequentialize_threads {
+            let change_time = guest.thread_state().thread_logical_time.as_nanos();
+            let request = Self::priority_changepoint_request(guest, change_time, DEFAULT_PRIORITY);
+            resource_request(guest, request).await;
+            debug!(
+                "[post_exec, dtid {}] reset temporary vfork priority to {}",
+                guest.thread_state().dettid,
+                DEFAULT_PRIORITY
+            );
+        }
 
         if let Some(ptr) = guest.auxv().at_random() {
             // It is safe to mutate this address since libc has not yet had a

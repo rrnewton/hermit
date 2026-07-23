@@ -728,6 +728,10 @@ pub struct ThreadState<T> {
     /// `handle_thread_start`; the parent clears its copy when vfork returns.
     pub pending_vfork: Option<PendingVfork>,
 
+    /// Whether this thread received the temporary non-chaos vfork priority
+    /// boost, which must be reset after a successful exec.
+    pub(crate) reset_vfork_priority_on_exec: bool,
+
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
@@ -782,6 +786,10 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("memory_metadata", &self.memory_metadata)
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
+            .field(
+                "reset_vfork_priority_on_exec",
+                &self.reset_vfork_priority_on_exec,
+            )
             .field("file_metadata", &self.file_metadata)
             .field("posix_timers", &self.posix_timers)
             .field("prng", &self.prng)
@@ -857,6 +865,7 @@ impl<T> ThreadState<T> {
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             clone_flags: None,
             pending_vfork: None,
+            reset_vfork_priority_on_exec: false,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),

@@ -730,6 +730,12 @@ impl GlobalState {
                 "[detcore] CreateChildThread with dtid {}: Added child to back of queue, position {}.",
                 child_dettid, pos,
             );
+            // The vfork child has now registered itself in the run queue. Release
+            // the scheduler's wait on this parent so the child (higher priority)
+            // is dispatched next. See `Scheduler::pending_vfork_children`.
+            if parent_is_kernel_blocked {
+                sched.pending_vfork_children.remove(&parent_dettid);
+            }
             sched.started_up.try_put(());
         }
         // Parent thread yields so child can run (if it is higher priority).

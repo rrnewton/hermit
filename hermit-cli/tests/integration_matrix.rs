@@ -281,10 +281,10 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             false,
         ),
         // `git --version` (the Meta git wrapper) is futex- and clone3-heavy. It
-        // previously timed out because private `FUTEX_WAIT_BITSET` waits with an
-        // absolute deadline were misclassified as relative, advancing virtual
-        // time by roughly a full epoch. With that classification fixed it now
-        // runs deterministically to completion, so it is a passing case.
+        // enters through vfork and later waits for a telemetry worker with
+        // sched_yield plus finite epoll polling. The temporary vfork priority
+        // must not outlive exec, and internal polling must advance virtual time
+        // fast enough to complete this bounded command.
         case(
             "threaded",
             "git",
@@ -310,6 +310,9 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             false,
         ),
     ];
+
+    let git = cases.iter_mut().find(|case| case.name == "git").unwrap();
+    git.timeout_seconds = 10;
 
     let mut java = case(
         "threaded",
