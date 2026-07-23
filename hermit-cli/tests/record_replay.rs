@@ -198,6 +198,7 @@ fn workloads() -> &'static [Workload] {
         let c_sources = [
             ("c_getpid", "getpid.c"),
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
+            ("c_replay_console_cloexec", "replay_console_cloexec.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -358,6 +359,45 @@ fn record_shell_pipeline_no_stdout_leak() {
         shell,
         &[OsStr::new("-c"), OsStr::new("echo hello | cat")],
     );
+}
+
+/// Console aliases must retain their stdout/stderr destination during replay.
+/// Replay substitutes dup operations, so it rewrites alias writes to the stable
+/// physical console sink rather than injecting the possibly-unmaterialized
+/// logical descriptor.
+#[test]
+fn record_shell_console_alias_preserves_stream() {
+    let _guard = hermit_record_lock();
+
+    let shell = [Path::new("/bin/bash"), Path::new("/usr/bin/bash")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(shell) = shell else {
+        eprintln!("bash is not installed; skipping shell console alias coverage");
+        return;
+    };
+
+    for (name, script) in [
+        (
+            "shell-stdout-redirected-to-stderr",
+            "exec 1>&2; echo direct-stderr",
+        ),
+        (
+            "shell-high-fd-aliased-to-stderr",
+            "exec 3>&2; echo aliased-stderr >&3",
+        ),
+        (
+            "shell-high-fd-aliased-to-stdout",
+            "exec 3>&1; echo aliased-stdout >&3",
+        ),
+    ] {
+        record_replay_command(name, shell, &[OsStr::new("-c"), OsStr::new(script)]);
+    }
+}
+
+#[test]
+fn record_console_alias_closes_on_exec() {
+    run_record_replay("c_replay_console_cloexec");
 }
 
 #[test]

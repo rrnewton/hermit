@@ -72,7 +72,7 @@ impl Tool for Replayer {
         // the redirections the parent already performed (e.g. a shell setting up
         // a pipeline before forking) carry over to the child.
         if let Some((_, parent_state)) = parent {
-            reader.inherit_console_fds(parent_state);
+            reader.inherit_console_targets(parent_state);
         }
         reader
     }
@@ -99,8 +99,8 @@ impl Tool for Replayer {
             // We must let through execve without any modification. Recording
             // events for these is hard because execve only returns upon
             // failure.
-            Syscall::Execve(_) => guest.inject(syscall).await,
-            Syscall::Execveat(_) => guest.inject(syscall).await,
+            Syscall::Execve(_) => self.handle_exec(guest, syscall).await,
+            Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
             Syscall::ArchPrctl(_) => {
@@ -204,6 +204,21 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    async fn handle_exec<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let closed = guest.thread_state_mut().remove_cloexec_console_targets();
+        let result = guest.inject(syscall).await;
+        if result.is_err() {
+            guest
+                .thread_state_mut()
+                .restore_cloexec_console_targets(closed);
+        }
+        result
+    }
+
     // Check if we received the expected syscall or not.
     fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let thread = guest.tid();

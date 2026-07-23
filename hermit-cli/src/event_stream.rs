@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -135,22 +135,24 @@ pub struct EventReader {
     // The number of events read so far. Useful for debugging purposes.
     pub count: u64,
 
-    // The set of file descriptors that currently refer to the inherited console
-    // (the stdout/stderr this replay should echo). Writes are only let through
-    // to the real console when their fd is in this set.
-    //
-    // This is tracked logically from the recorded syscall stream rather than
-    // from the guest's real file-descriptor table, because during replay most
-    // fd-manipulating syscalls (open, dup2, close, …) are substituted rather
-    // than executed, so the real table does not reflect the recorded topology.
-    // A redirected fd (e.g. a shell pipeline's stdout dup2'd onto a pipe) is
-    // thereby correctly excluded, so its writes are not echoed to the console.
+    // Maps each logical guest fd that refers to an inherited console stream to
+    // the stable physical fd (stdin/stdout/stderr) that replay should use.
+    // Replay substitutes most fd-manipulating syscalls, so the real table does
+    // not reflect the recorded topology. A redirected fd is excluded, while a
+    // console alias is rewritten to its stable sink before injection. Keeping
+    // the sink identity also preserves stderr versus stdout across dup calls.
     //
     // NOTE: This models a per-process fd table inherited across fork. Threads
     // that share a table via CLONE_FILES are not modeled; each replay thread
-    // keeps its own copy. This matches how detcore serializes guests and is
-    // sufficient for the process-level redirection that pipelines rely on.
-    console_fds: BTreeSet<i32>,
+    // keeps its own copy. That is a broader replay fd-table limitation; this
+    // map covers the process-level redirections used by shell pipelines.
+    console_targets: BTreeMap<i32, ConsoleTarget>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct ConsoleTarget {
+    physical_fd: i32,
+    close_on_exec: bool,
 }
 
 fn default_reader() -> io::BufReader<fs::File> {
@@ -169,33 +171,92 @@ impl EventReader {
             )?),
             count: 0,
             // stdin/stdout/stderr are inherited from the console at startup.
-            console_fds: BTreeSet::from([
-                libc::STDIN_FILENO,
-                libc::STDOUT_FILENO,
-                libc::STDERR_FILENO,
+            console_targets: BTreeMap::from([
+                (
+                    libc::STDIN_FILENO,
+                    ConsoleTarget {
+                        physical_fd: libc::STDIN_FILENO,
+                        close_on_exec: false,
+                    },
+                ),
+                (
+                    libc::STDOUT_FILENO,
+                    ConsoleTarget {
+                        physical_fd: libc::STDOUT_FILENO,
+                        close_on_exec: false,
+                    },
+                ),
+                (
+                    libc::STDERR_FILENO,
+                    ConsoleTarget {
+                        physical_fd: libc::STDERR_FILENO,
+                        close_on_exec: false,
+                    },
+                ),
             ]),
         })
     }
 
-    /// Returns whether `fd` currently refers to the inherited console.
-    pub fn is_console(&self, fd: i32) -> bool {
-        self.console_fds.contains(&fd)
+    /// Returns the stable physical console fd targeted by logical `fd`.
+    pub fn console_target(&self, fd: i32) -> Option<i32> {
+        self.console_targets
+            .get(&fd)
+            .map(|target| target.physical_fd)
     }
 
-    /// Marks `fd` as referring to the console (or not), e.g. after a `dup2`,
-    /// `dup`, or `close`.
-    pub fn set_console(&mut self, fd: i32, console: bool) {
-        if console {
-            self.console_fds.insert(fd);
+    /// Updates the console target of `fd` after a dup or close operation.
+    pub fn set_console_target(&mut self, fd: i32, target: Option<i32>, close_on_exec: bool) {
+        if let Some(physical_fd) = target {
+            self.console_targets.insert(
+                fd,
+                ConsoleTarget {
+                    physical_fd,
+                    close_on_exec,
+                },
+            );
         } else {
-            self.console_fds.remove(&fd);
+            self.console_targets.remove(&fd);
         }
     }
 
-    /// Replaces this reader's console fd set. Used to inherit the parent's fd
-    /// table when a new thread/process is created.
-    pub fn inherit_console_fds(&mut self, parent: &EventReader) {
-        self.console_fds = parent.console_fds.clone();
+    /// Changes the close-on-exec flag when `fd` is a tracked console alias.
+    pub fn set_console_cloexec(&mut self, fd: i32, close_on_exec: bool) {
+        if let Some(target) = self.console_targets.get_mut(&fd) {
+            target.close_on_exec = close_on_exec;
+        }
+    }
+
+    /// Removes console aliases closed by a successful exec and returns enough
+    /// state to restore them if the exec fails.
+    pub fn remove_cloexec_console_targets(&mut self) -> Vec<(i32, i32)> {
+        let removed = self
+            .console_targets
+            .iter()
+            .filter(|(_, target)| target.close_on_exec)
+            .map(|(&fd, target)| (fd, target.physical_fd))
+            .collect::<Vec<_>>();
+        for (fd, _) in &removed {
+            self.console_targets.remove(fd);
+        }
+        removed
+    }
+
+    /// Restores close-on-exec aliases after a failed exec.
+    pub fn restore_cloexec_console_targets(&mut self, targets: Vec<(i32, i32)>) {
+        for (fd, physical_fd) in targets {
+            self.console_targets.insert(
+                fd,
+                ConsoleTarget {
+                    physical_fd,
+                    close_on_exec: true,
+                },
+            );
+        }
+    }
+
+    /// Replaces this reader's console map with the parent's at fork/clone.
+    pub fn inherit_console_targets(&mut self, parent: &EventReader) {
+        self.console_targets = parent.console_targets.clone();
     }
 
     /// Reads the next event from the stream. Returns an error if there are no
