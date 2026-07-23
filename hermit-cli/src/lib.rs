@@ -684,4 +684,118 @@ mod tests {
         );
         assert!(!message.contains("requires root privileges"));
     }
+
+    /// KVM endgame: drive the real Detcore Tool over a *loaded static ELF* via
+    /// reverie-kvm's `run_static_elf_with_tool::<Detcore>()` (M2b). The guest is
+    /// a minimal x86-64 `ET_EXEC` that issues `getpid`, `write(1,"hello\n",6)`,
+    /// `exit_group(0)` through real `SYSCALL`s; each traps through the long-mode
+    /// ring0 trampoline to Detcore's `handle_syscall_event` (debug builds
+    /// subscribe to all syscalls), and Detcore's injections are serviced by the
+    /// ELF guest kernel. Running it twice must produce the same exit code,
+    /// demonstrating deterministic execution. Preemption is disabled so
+    /// Detcore's RCB path (read_clock/set_timer, Unsupported on KvmGuest) is not
+    /// exercised. Requires /dev/kvm; skips cleanly otherwise.
+    #[test]
+    fn detcore_drives_kvm_guest_for_loaded_elf() {
+        use clap::Parser;
+
+        const MEMORY_SIZE: usize = 16 * 1024 * 1024;
+        const LOAD_ADDRESS: u64 = 0x20_0000;
+        const CODE_OFFSET: usize = 0x1000;
+
+        // Builds a fixed-address ET_EXEC image whose single PT_LOAD maps `code`
+        // at LOAD_ADDRESS with the entry point at its first instruction.
+        fn static_elf(code: &[u8]) -> Vec<u8> {
+            fn put_u16(image: &mut [u8], off: usize, v: u16) {
+                image[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            fn put_u32(image: &mut [u8], off: usize, v: u32) {
+                image[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            fn put_u64(image: &mut [u8], off: usize, v: u64) {
+                image[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            let mut image = vec![0u8; CODE_OFFSET + code.len()];
+            image[..4].copy_from_slice(b"\x7fELF");
+            image[4] = 2; // ELFCLASS64
+            image[5] = 1; // ELFDATA2LSB
+            image[6] = 1; // EV_CURRENT
+            put_u16(&mut image, 16, 2); // ET_EXEC
+            put_u16(&mut image, 18, 62); // EM_X86_64
+            put_u32(&mut image, 20, 1); // e_version
+            put_u64(&mut image, 24, LOAD_ADDRESS); // e_entry
+            put_u64(&mut image, 32, 64); // e_phoff
+            put_u16(&mut image, 52, 64); // e_ehsize
+            put_u16(&mut image, 54, 56); // e_phentsize
+            put_u16(&mut image, 56, 1); // e_phnum
+            put_u32(&mut image, 64, 1); // p_type = PT_LOAD
+            put_u32(&mut image, 68, 5); // p_flags = R|X
+            put_u64(&mut image, 72, CODE_OFFSET as u64); // p_offset
+            put_u64(&mut image, 80, LOAD_ADDRESS); // p_vaddr
+            put_u64(&mut image, 88, LOAD_ADDRESS); // p_paddr
+            put_u64(&mut image, 96, code.len() as u64); // p_filesz
+            put_u64(&mut image, 104, 0x2000); // p_memsz
+            put_u64(&mut image, 112, 0x1000); // p_align
+            image[CODE_OFFSET..].copy_from_slice(code);
+            image
+        }
+
+        let message = b"hello\n";
+        let mut code: Vec<u8> = Vec::new();
+        code.extend_from_slice(&[0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05]); // mov eax,SYS_getpid; syscall
+        code.extend_from_slice(&[0xbf, 0x01, 0x00, 0x00, 0x00]); // mov edi, 1
+        let movabs_operand = code.len() + 2;
+        code.extend_from_slice(&[0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0]); // movabs rsi, <message vaddr>
+        code.push(0xba);
+        code.extend_from_slice(&(message.len() as u32).to_le_bytes()); // mov edx, len
+        code.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x05]); // mov eax,SYS_write; syscall
+        code.extend_from_slice(&[
+            0xb8, 0xe7, 0x00, 0x00, 0x00, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b,
+        ]); // mov eax,SYS_exit_group; xor edi,edi; syscall; ud2
+        let message_offset = code.len();
+        code.extend_from_slice(message);
+        let message_vaddr = LOAD_ADDRESS + message_offset as u64;
+        code[movabs_operand..movabs_operand + 8].copy_from_slice(&message_vaddr.to_le_bytes());
+        let image = static_elf(&code);
+
+        // One Detcore-over-ELF run; returns the guest exit code, or None if KVM
+        // is unavailable on this host.
+        let run_once = |image: &[u8]| -> Option<i32> {
+            let mut backend = match reverie_kvm::KvmBackend::new(MEMORY_SIZE) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    eprintln!("skipping KVM Detcore-over-ELF test: cannot init VM: {error}");
+                    return None;
+                }
+            };
+            backend
+                .install_static_elf_with_args(image, &["hello"], &[])
+                .expect("load static hello ELF");
+
+            let mut config =
+                super::DetConfig::parse_from(["hermit-kvm-test", "--preemption-timeout=disabled"]);
+            config.validate();
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            let (_global_state, exit_code) = runtime
+                .block_on(backend.run_static_elf_with_tool::<super::Detcore>(config))
+                .expect("Detcore drove the loaded ELF guest to completion");
+            Some(exit_code)
+        };
+
+        let Some(first) = run_once(&image) else {
+            return;
+        };
+        assert_eq!(first, 0, "guest should exit_group(0)");
+
+        // Deterministic: a second identical run produces the same exit code.
+        let second = run_once(&image).expect("second KVM run");
+        assert_eq!(
+            first, second,
+            "Detcore-over-KVM output was not deterministic"
+        );
+    }
 }
