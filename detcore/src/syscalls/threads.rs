@@ -56,7 +56,7 @@ enum FutexTimeout {
     Absolute(LogicalTime),
 }
 
-fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout, Errno> {
+fn parse_futex_timeout(futex_flags: i32, timeout: Timespec) -> Result<FutexTimeout, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
     let nanoseconds = u64::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
     if nanoseconds >= 1_000_000_000 {
@@ -67,6 +67,7 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
         .checked_mul(1_000_000_000)
         .and_then(|nanos| nanos.checked_add(nanoseconds))
         .ok_or(Errno::EINVAL)?;
+    let futex_op = futex_flags & libc::FUTEX_CMD_MASK;
     if futex_op == libc::FUTEX_WAIT_BITSET {
         Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
             timeout_nanos,
@@ -76,6 +77,11 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED: JVM record/replay fix. FUTEX_WAIT_BITSET carries
+// an *absolute* deadline on the guest clock's epoch; comparing it directly with
+// Detcore's logical scheduler time makes the wait effectively never expire (the
+// JVM then hangs on startup). Rebase the deadline into logical time using a
+// recorded/replayed clock sample. TODO-HUMAN-REVIEW(PR #212).
 fn rebase_absolute_timeout(
     deadline: LogicalTime,
     clock_now: LogicalTime,
@@ -663,12 +669,20 @@ mod tests {
             parse_futex_timeout(libc::FUTEX_WAIT, timeout),
             Ok(FutexTimeout::Relative(2_000_000_003))
         );
-        assert_eq!(
-            parse_futex_timeout(libc::FUTEX_WAIT_BITSET, timeout),
-            Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
-                2_000_000_003
-            )))
-        );
+        for flags in [
+            0,
+            libc::FUTEX_PRIVATE_FLAG,
+            libc::FUTEX_CLOCK_REALTIME,
+            libc::FUTEX_PRIVATE_FLAG | libc::FUTEX_CLOCK_REALTIME,
+        ] {
+            assert_eq!(
+                parse_futex_timeout(libc::FUTEX_WAIT_BITSET | flags, timeout),
+                Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                    2_000_000_003
+                ))),
+                "flags={flags:#x}"
+            );
+        }
     }
 
     #[test]

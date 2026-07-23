@@ -28,7 +28,10 @@ const RUN_TOOLS: &[&str] = &[
     "git",
     "gcc",
 ];
-const RECORD_REPLAY_TOOLS: &[&str] = &["static_busybox", "shell"];
+// AUTONOMOUS-BOT-IMPLEMENTED: "java" added to exercise the JVM record/replay
+// fix (futex absolute-timeout rebasing). TODO-HUMAN-REVIEW(PR #212): confirm
+// java record/replay stays within BINARY_TIMEOUT on CI hosts with a JDK.
+const RECORD_REPLAY_TOOLS: &[&str] = &["static_busybox", "shell", "java"];
 
 #[derive(Clone, Debug)]
 struct Tool {
