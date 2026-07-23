@@ -335,6 +335,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#251)
     /// Yield when accumulated logical time has consumed the current slice.
     async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G) {
         let thread_state = guest.thread_state();
