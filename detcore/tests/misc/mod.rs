@@ -78,6 +78,66 @@ where
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
 }
 
+fn det_test_fn_deterministic_io_without_pmu<F>(f: F)
+where
+    F: Fn(),
+{
+    let config = detcore::Config {
+        preemption_timeout: None,
+        deterministic_io: true,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+#[test]
+fn deterministic_io_rejects_host_nscd_socket() {
+    det_test_fn_deterministic_io_without_pmu(|| {
+        use std::os::fd::AsRawFd;
+
+        let path = b"/var/run/nscd/socket";
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, &byte) in addr.sun_path.iter_mut().zip(path) {
+            *slot = byte as libc::c_char;
+        }
+        let addr_ptr = (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>();
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let result = unsafe {
+            libc::connect(
+                file.as_raw_fd(),
+                addr_ptr,
+                std::mem::size_of_val(&addr) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
+
+        let socket = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(socket >= 0);
+        let result = unsafe {
+            libc::connect(
+                socket,
+                addr_ptr,
+                (std::mem::size_of_val(&addr) + 1) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, -1);
+        let error = std::io::Error::last_os_error();
+        assert_eq!(unsafe { libc::close(socket) }, 0);
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+
+        let error = std::os::unix::net::UnixStream::connect("/var/run/nscd/socket")
+            .expect_err("the host nscd cache must be unavailable to a deterministic guest");
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+    });
+}
+
 #[test]
 fn ordinary_clone_child_starts_before_parent_resumes() {
     det_test_fn_sequential_without_pmu(|| {
