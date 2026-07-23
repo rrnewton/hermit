@@ -130,6 +130,7 @@ jobs:
           epoll_determinism \
           mmap_determinism \
           no_silent_skips \
+          pid_determinism \
           procfs_determinism \
           signal_determinism
         do

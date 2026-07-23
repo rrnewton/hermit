@@ -568,6 +568,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::execve,
                 Sysno::execveat,
                 Sysno::getcpu,
+                Sysno::kill,
+                Sysno::tkill,
+                Sysno::tgkill,
+                Sysno::rt_sigqueueinfo,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
@@ -1146,6 +1150,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
             Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
             Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+            // Guest-visible IDs are kernel PID-namespace IDs, so signal targets
+            // are already translated at this boundary. Signal delivery remains
+            // serialized by Detcore's inbound-signal scheduling path.
+            Syscall::Kill(s) => self.passthrough(guest, Syscall::Kill(s)).await,
+            Syscall::Tkill(s) => self.passthrough(guest, Syscall::Tkill(s)).await,
+            Syscall::Tgkill(s) => self.passthrough(guest, Syscall::Tgkill(s)).await,
+            Syscall::RtSigqueueinfo(s) => self.passthrough(guest, Syscall::RtSigqueueinfo(s)).await,
 
             Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
