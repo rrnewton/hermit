@@ -1005,6 +1005,16 @@ impl<T> ThreadState<T> {
         &mut self.prng
     }
 
+    /// Whether this thread has consumed its current logical timeslice.
+    ///
+    /// The comparison is in virtual nanoseconds, after all deterministic
+    /// execution costs accumulated in `thread_logical_time`.
+    pub(crate) fn timeslice_expired(&self) -> bool {
+        let current_time = self.thread_logical_time.as_nanos();
+        self.end_of_timeslice
+            .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
     /// Choose an amount of time (RCBs) for our next timeslice based on various settings.
     ///
     /// Effects:
@@ -1124,6 +1134,29 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeslice_expiry_is_inclusive() {
+        let cfg = Config::default();
+        let mut state = ThreadState::new(DetPid::from_raw(1), &cfg, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.end_of_timeslice = Some(now + Duration::from_nanos(1));
+        assert!(!state.timeslice_expired());
+
+        state.end_of_timeslice = Some(now);
+        assert!(state.timeslice_expired());
+
+        state.end_of_timeslice = Some(LogicalTime::from_nanos(
+            now.as_nanos().checked_sub(1).unwrap(),
+        ));
+        assert!(state.timeslice_expired());
     }
 }
 

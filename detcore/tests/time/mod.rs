@@ -9,7 +9,12 @@
 //! Tests time-related functionality of detcore.
 
 use std::mem::MaybeUninit;
+use std::num::NonZeroU64;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::time;
 
 use chrono::DateTime;
@@ -183,6 +188,61 @@ fn tod_clock_gettime() {
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
             assert!(diff_millis(dt, epoch) < 100);
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+fn syscall_timeslice_expiry_yields_to_peer() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        preemption_timeout: NonZeroU64::new(1_000_000),
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        // Cancel no_rcb_time's 500x fallback so the deadline below is in
+        // literal virtual nanoseconds while still excluding PMU progress.
+        clock_multiplier: Some(1.0 / 500.0),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let read_time = || {
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_clock_gettime,
+                        libc::CLOCK_MONOTONIC,
+                        now.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(result, 0);
+                unsafe { now.assume_init() }
+            };
+            let start = read_time();
+            let start_ns = i128::from(start.tv_sec) * 1_000_000_000 + i128::from(start.tv_nsec);
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_done = Arc::clone(&done);
+            let worker = thread::spawn(move || {
+                thread::sleep(time::Duration::from_millis(1));
+                worker_done.store(true, Ordering::Release);
+            });
+
+            let mut calls = 0;
+            let mut elapsed_ns = 0;
+            while !done.load(Ordering::Acquire) && elapsed_ns < 5_000_000 && calls < 1_000 {
+                let now = read_time();
+                let now_ns = i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec);
+                elapsed_ns = now_ns - start_ns;
+                calls += 1;
+            }
+
+            assert!(
+                done.load(Ordering::Acquire),
+                "clock_gettime loop starved its peer for {elapsed_ns} virtual ns ({calls} calls)"
+            );
+            worker.join().unwrap();
         },
         config,
         true,

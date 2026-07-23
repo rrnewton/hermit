@@ -335,47 +335,78 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#251)
+    /// Yield when accumulated logical time has consumed the current slice.
+    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G) {
+        let thread_state = guest.thread_state();
+        let Some(slice_end) = thread_state.end_of_timeslice else {
+            return;
+        };
+        let dettid = thread_state.dettid;
+        let current_time = thread_state.thread_logical_time.as_nanos();
+
+        if !thread_state.timeslice_expired() {
+            return;
+        }
+
+        trace!(
+            "[dtid {}] logical time {} reached slice end {}",
+            dettid, current_time, slice_end
+        );
+        let current_slice = thread_state.stats.timeslice_count;
+        self.end_timeslice(guest).await;
+        trace!(
+            "[dtid {}] after ending timeslice T{}, next end is {}, current time {}",
+            dettid,
+            current_slice,
+            guest
+                .thread_state()
+                .end_of_timeslice
+                .expect("ending a timeslice must install the next deadline"),
+            guest.thread_state().thread_logical_time.as_nanos(),
+        );
+    }
+
     /// A common hook called at the end of *every* handler, just before returning control
     /// to the guest. This resets the preemption timeout for the next timeslice.
     ///
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
-    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
+    async fn post_handler_hook<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        timeslice_already_checked: bool,
+    ) {
+        if !timeslice_already_checked {
+            self.end_timeslice_if_needed(guest).await;
+        }
+
         let dettid = guest.thread_state().dettid;
         let timeout_delta_ns = guest.config().preemption_timeout;
-        let current_time = guest.thread_state_mut().thread_logical_time.as_nanos();
+        let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
 
         // If the preemption timeout is set, then end_of_timeslice must always be.
-        if let Some(slice_end) = guest.thread_state().end_of_timeslice {
-            let mut slice_end = slice_end;
+        if let Some(mut slice_end) = guest.thread_state().end_of_timeslice {
             assert!(timeout_delta_ns.is_some());
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
             let epsilon = Duration::from_nanos(NANOS_PER_RCB as u64);
 
-            // If there is less than a single RCB worth of time left... we call it.
-            if current_time + epsilon > slice_end {
-                // Our timeslice wasn't over yet at the start of the handler.  But the
-                // elapse of time during the handler (e.g. executing a logical syscall)
-                // has pushed us over the threshold to where our time is used up.
-                // Therefore, we don't let the guest/mutator proceed executing more code yet.
-                // Rather, we go back to the scheduler and wait for our turn again.
+            // Preserve the existing sub-epsilon PMU timer policy separately
+            // from the exact logical-time expiry check above.
+            if current_time < slice_end && current_time + epsilon > slice_end {
                 trace!(
-                    "posthook [dtid {}] Time {} beyond (or close enough to) end of slice {}! Ending slice.",
-                    dettid, current_time, slice_end
+                    "posthook [dtid {}] sub-epsilon logical time remains before slice end {}; ending slice",
+                    dettid, slice_end
                 );
-                let current_slice = guest.thread_state().stats.timeslice_count;
                 self.end_timeslice(guest).await;
-                // After ending time slice, need to reread this:
                 slice_end = guest
                     .thread_state()
                     .end_of_timeslice
-                    .expect("internal invariant");
-                let current_time = guest.thread_state().thread_logical_time.as_nanos();
-                trace!(
-                    "posthook [dtid {}] after ending timeslice T{}, next end is {}, current time {}",
-                    dettid, current_slice, slice_end, current_time,
-                );
+                    .expect("ending a timeslice must install the next deadline");
+                current_time = guest.thread_state().thread_logical_time.as_nanos();
             }
+
             if current_time + epsilon > slice_end {
                 panic!(
                     "Unhandled! Ended time slice, but current time {} is still beyond (or too near) timeslice end {}",
@@ -729,7 +760,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             cpuid!(eax, ecx)
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, false).await;
         Ok(res)
     }
 
@@ -776,7 +807,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .handle_rdtsc_event(&mut guest.into_guest(), request)
                 .await
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, false).await;
         result
     }
 
@@ -828,7 +859,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid, mycount, signal
             );
 
-            self.post_handler_hook(guest).await;
+            self.post_handler_hook(guest, false).await;
             Ok(Some(signal))
         }
     }
@@ -975,7 +1006,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_thread_start(&mut guest.into_guest())
             .await?;
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, false).await;
         Ok(())
     }
 
@@ -996,7 +1027,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             guest.memory().write_value(ptr, &bytes)?;
         }
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, false).await;
         Ok(())
     }
 
@@ -1036,7 +1067,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
         // to this prehook.
         self.pre_handler_hook(guest, true).await;
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, false).await;
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -1323,7 +1354,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
-        self.post_handler_hook(guest).await;
+        // Syscall time is charged independently of RCB-based PMU preemption.
+        // Once the post event is globally ordered, enforce the logical deadline.
+        let timeslice_checked = config.replay_schedule_from.is_none();
+        if timeslice_checked {
+            self.end_timeslice_if_needed(guest).await;
+        }
+
+        self.post_handler_hook(guest, timeslice_checked).await;
 
         // Defense-in-depth: before returning to the guest, force the
         // syscall-clobbered registers (%rcx/%r11 on x86-64) to deterministic
