@@ -120,6 +120,52 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
+    /// membarrier (system call).
+    ///
+    /// `membarrier(2)` issues process-wide memory barriers so that userspace can
+    /// use asymmetric fences (e.g. CPython's QSBR, RCU-style reclamation).
+    /// Detcore serializes all guest threads onto a single logical CPU with a
+    /// total memory order, so any requested barrier is *already* satisfied and
+    /// every command is a deterministic no-op. For `MEMBARRIER_CMD_QUERY` we
+    /// report the set of commands we emulate so the guest stays on this
+    /// controlled path instead of a host-dependent fallback; every other command
+    /// returns success without doing anything.
+    pub async fn handle_membarrier<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Membarrier,
+    ) -> Result<i64, Error> {
+        // Values from <linux/membarrier.h>.
+        const MEMBARRIER_CMD_QUERY: i32 = 0;
+        const MEMBARRIER_CMD_GLOBAL: i32 = 1 << 0;
+        const MEMBARRIER_CMD_GLOBAL_EXPEDITED: i32 = 1 << 1;
+        const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
+        const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
+        const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+        const SUPPORTED: i32 = MEMBARRIER_CMD_GLOBAL
+            | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+
+        let cmd = call.cmd();
+        if cmd == MEMBARRIER_CMD_QUERY {
+            detlog!(
+                "[dtid {}] membarrier(QUERY) => reporting emulated commands {:#x}",
+                guest.thread_state().dettid,
+                SUPPORTED,
+            );
+            Ok(SUPPORTED as i64)
+        } else {
+            detlog!(
+                "[dtid {}] membarrier(cmd={}) no-op (threads are serialized on one CPU)",
+                guest.thread_state().dettid,
+                cmd,
+            );
+            Ok(0)
+        }
+    }
+
     /// getcpu system call
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,

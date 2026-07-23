@@ -107,6 +107,7 @@ use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
 pub use tool_local::thread_rng_from_parent;
@@ -845,6 +846,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
+                    // POSIX timers are shared among threads of a process but are
+                    // NOT inherited across fork(2). Share the table for a new
+                    // thread (CLONE_THREAD); give a new process a fresh, empty
+                    // one.
+                    posix_timers: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.posix_timers)
+                    } else {
+                        Arc::new(Mutex::new(PosixTimers::default()))
+                    },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -1200,6 +1210,33 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::AddKey(_) => self.passthrough(guest, call).await,
             Syscall::Keyctl(_) => self.passthrough(guest, call).await,
             Syscall::RequestKey(_) => self.passthrough(guest, call).await,
+
+            // POSIX per-process timers. Arming is tracked against the virtual
+            // clock so these verify deterministically under --strict; timer
+            // expiration signals are not delivered (see handle_timer_create).
+            Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
+            Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
+            Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
+            Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
+            Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
+
+            // Serialized threads share a total memory order, so process-wide
+            // memory barriers are trivially satisfied and can be no-ops.
+            Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
+
+            // Process credentials are constant for the container's lifetime.
+            // Passthrough is record/replay-aware, so the value is captured on
+            // record and reproduced on replay (matches the Getpid/Gettid arms).
+            Syscall::Getuid(_) => self.passthrough(guest, call).await,
+            Syscall::Geteuid(_) => self.passthrough(guest, call).await,
+            Syscall::Getgid(_) => self.passthrough(guest, call).await,
+            Syscall::Getegid(_) => self.passthrough(guest, call).await,
+            // The working directory is fixed for the container's lifetime.
+            Syscall::Getcwd(_) => self.passthrough(guest, call).await,
+            // Filesystem statistics: passthrough is record/replay-aware so the
+            // (otherwise host-dependent) result is captured and reproduced.
+            Syscall::Statfs(_) => self.passthrough(guest, call).await,
+            Syscall::Fstatfs(_) => self.passthrough(guest, call).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {
