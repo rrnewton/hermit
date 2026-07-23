@@ -65,12 +65,14 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
     steps:
     - uses: actions/checkout@v3
+      with:
+        submodules: recursive
     - uses: actions/setup-go@v5
       with:
         go-version: stable
@@ -148,6 +150,9 @@ jobs:
     - name: Debugger (gdb/lldb) integration tests
       if: steps.namespaces.outputs.available == 'true'
       run: ./tests/debugger/run_debugger_tests.sh
+    - name: rr syscall test suite
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit --test rr_suite -- --ignored
     - name: Hermit unit tests without mount namespaces
       if: steps.namespaces.outputs.available != 'true'
       run: cargo test -p hermit --lib --bins
