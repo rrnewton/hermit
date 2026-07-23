@@ -54,7 +54,7 @@ use tracing::info;
 use tracing::trace;
 
 use crate::config::Config;
-use crate::config::RunsPostFork;
+use crate::config::RunPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -2185,11 +2185,11 @@ impl Scheduler {
     }
 
     /// Decide which side gets the first post-fork turn for an ordinary clone.
-    pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
+    pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunPostFork) -> bool {
         match mode {
-            RunsPostFork::Child => true,
-            RunsPostFork::Parent => false,
-            RunsPostFork::Random => self.post_fork_prng.random(),
+            RunPostFork::Child => true,
+            RunPostFork::Parent => false,
+            RunPostFork::Random => self.post_fork_prng.random(),
         }
     }
 
@@ -2500,16 +2500,16 @@ mod test {
             ..Default::default()
         };
         let mut fixed = Scheduler::new(&config);
-        assert!(fixed.child_runs_first_post_fork(RunsPostFork::Child));
-        assert!(!fixed.child_runs_first_post_fork(RunsPostFork::Parent));
+        assert!(fixed.child_runs_first_post_fork(RunPostFork::Child));
+        assert!(!fixed.child_runs_first_post_fork(RunPostFork::Parent));
 
         let mut first = Scheduler::new(&config);
         let mut second = Scheduler::new(&config);
         let first_sequence = (0..64)
-            .map(|_| first.child_runs_first_post_fork(RunsPostFork::Random))
+            .map(|_| first.child_runs_first_post_fork(RunPostFork::Random))
             .collect::<Vec<_>>();
         let second_sequence = (0..64)
-            .map(|_| second.child_runs_first_post_fork(RunsPostFork::Random))
+            .map(|_| second.child_runs_first_post_fork(RunPostFork::Random))
             .collect::<Vec<_>>();
 
         assert_eq!(first_sequence, second_sequence);
