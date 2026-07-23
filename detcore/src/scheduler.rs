@@ -2162,9 +2162,11 @@ impl Scheduler {
         self.run_queue.push_back(dettid, priority)
     }
 
-    /// Push_front a thread onto the runqueue, respecting its persistent priority
-    /// value. This should be the ordinary way threads are pushed onto the queue.
-    fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
+    /// Push a thread to the front of its persistent priority band.
+    ///
+    /// This is reserved for protocol handoffs where the queued thread must run
+    /// before an equal-priority peer, such as ordinary clone child startup.
+    pub(crate) fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
         let priority = self.get_priority(dettid);
         self.run_queue.push_front(dettid, priority)
     }
