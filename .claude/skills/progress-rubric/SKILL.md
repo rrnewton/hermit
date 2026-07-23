@@ -5,100 +5,121 @@ description: "Create evidence-based Hermit progress reports from live measuremen
 
 # Progress Report Rubric
 
-Reusable template and procedure for Hermit progress reports
-(`ai_docs/progress-reports/vN-YYYY-MM-DD.md`). The governing rule: **every number
-is a live measurement**. Never estimate. If a suite cannot run, record the
-exact reason (missing target, missing submodule, host capability gap, compile
-error) instead of a number.
+Use this procedure for dated reports in `ai_docs/progress-reports/YYYY-MM-DD.md`.
+The primary question is not how many tests exist; it is **which real programs
+work in each execution mode, and where support drops as users move from the
+leading mode to trailing modes**.
 
-`scripts/progress-report.sh` automates this rubric end-to-end and writes a dated
-report. Use it first; fall back to the manual steps below when you need to
-investigate a specific suite.
+## Non-negotiable evidence rules
 
-## Required sections
+1. Measure one exact `origin/main` SHA in a clean checkout. If main moves and
+   product code changed, update and rerun affected measurements.
+2. Run the same app probes through `--strict --verify`, record/replay, DBI, and
+   KVM. Do not substitute old task notes for live results.
+3. Use only code and artifacts available from main. Unlanded work belongs in a
+   final footnote, never in the coverage totals.
+4. Mark unavailable or interrupted measurements honestly. `BLOCKED`, `NOT RUN`,
+   and `INCOMPLETE` are not failures, but none count as passes.
+5. State backend, log level, relaxations, command, exit status, and material
+   output for every Hermit measurement.
 
-1. **Test context** — commit SHA (full + short), branch, pull result, date
-   (UTC), backend (`ptrace`/`DBI`/`KVM`), host CPU, kernel,
-   `perf_event_paranoid`, toolchain versions, guest runtimes present.
-2. **Host limitations encountered** — CPUID faulting availability, PMU access,
-   missing runtimes/submodules. State each as an observed fact (quote the WARN
-   or error).
-3. **Summary table** — one row per suite: command, passed, failed, ignored,
-   status.
-4. **Per-suite detail** — one subsection per suite (below), each stating
-   backend, log level, and relaxations (per AGENTS.md "Required Run Context").
-5. **Recently landed PRs** — from `git log` on `main`.
-6. **Known blockers / follow-ups** — root cause per failure, with file:line and
-   verbatim error.
+## Required report shape
 
-## How to gather each number
+1. **Snapshot**: full SHA, UTC time, host/kernel, PMU policy, toolchain, and
+   guest binaries used.
+2. **Coverage slope**: one compact row per mode showing `passed / probes`, the
+   first unsupported workload class, and the current blocking layer.
+3. **App matrix**: one row per identical program/workload, columns for strict
+   verify, R/R, DBI, and KVM. Include at least a trivial ELF, a file-processing
+   tool, an interpreter, a concurrent pipeline, and a toolchain frontend.
+4. **Repository health**: `cargo test`, `validate.sh`, the working-envelope
+   vector, focused R/R suite, and live main CI. Preserve incomplete-run status.
+5. **Gaps and next actions**: order by the first mode where support drops.
+6. **Unlanded footnote**: at most three bullets with links; no unlanded result
+   may alter a main-branch cell.
 
-### Test context
+## Measurement procedure
+
+### Freeze main and context
+
 ```bash
-git rev-parse HEAD; git rev-parse --short HEAD
-with-proxy git pull origin main            # record "Already up to date" or the error
-uname -r; grep -m1 'model name' /proc/cpuinfo
+with-proxy git fetch origin main
+git switch -c report-YYYY-MM-DD origin/main   # in a clean assigned worktree
+git rev-parse HEAD
+date -u +%Y-%m-%dT%H:%M:%SZ
+uname -r
+grep -m1 'model name' /proc/cpuinfo
 cat /proc/sys/kernel/perf_event_paranoid
 rustc --version; cargo --version; cargo nextest --version
-for t in python3 node redis-server sqlite3 java; do command -v "$t" || echo "$t MISSING"; done
+cargo build -p hermit
 ```
 
-### Strict / fail-closed ratchet
+Re-fetch before writing. If only docs moved, record that fact; if product code
+moved, rerun the affected cells at the new SHA.
+
+### Cross-mode app matrix
+
+Choose a small, stable probe list and keep it identical across modes. A useful
+minimum is:
+
+```text
+/bin/echo hello
+/usr/bin/sha256sum /etc/hostname
+/usr/bin/python3 -c 'print(sum(range(100)))'
+/bin/bash -c '/bin/echo hello | /usr/bin/wc -c'
+/usr/bin/gcc --version
+```
+
+For each probe, run:
+
 ```bash
-./scripts/test-fail-closed.sh 2>&1 | tee /tmp/progress-strict.log
+./target/debug/hermit run --strict --verify -- PROGRAM ARGS...
+./target/debug/hermit record start --verify --record-timeout 90 \
+  --data-dir "$(mktemp -d /tmp/hermit-report-rr.XXXXXX)" -- PROGRAM ARGS...
+./target/debug/hermit run --backend dbi -- PROGRAM ARGS...
+./target/debug/hermit run --backend kvm -- PROGRAM ARGS...
 ```
-- Sets `HERMIT_FAIL_CLOSED=1`; strictest mode, relaxations = none.
-- **Fail-fast** (`set -e`): a single failure aborts before later targets. If it
-  aborts, report the tests that ran (grep `==> Fail-closed:` and `test result:`)
-  and note that the final ratchet line is absent.
-- Green run ends with: `Fail-closed ratchet passed: N enabled, K known failures,
-  I ignored, M mode N/A.` — copy those exact counts.
-- Known-failure allowlist: `hermit-cli/tests/fail_closed_known_failures.tsv`;
-  allowed ignores: `hermit-cli/tests/fail_closed_allowed_ignores.tsv`. A failure
-  absent from the first is unexpected.
 
-### Working-envelope vector (L1–L4 + rr) — canonical assurance measurement
+If DBI or KVM has a backend-wide preflight failure, run one representative
+probe, quote the error, and mark the remaining cells `BLOCKED*` with one shared
+footnote. Do not use a client, SDK, pin, or proof branch that is not supplied by
+main. For R/R, distinguish record timeout, replay divergence, output mismatch,
+and successful round trip.
+
+### Repository health
+
 ```bash
-./validate.sh --envelope-only 2>&1 | tee /tmp/progress-envelope.log
-cat envelope.json     # gitignored; do NOT commit
+cargo test 2>&1 | tee /tmp/progress-cargo-test.log
+cargo test -p hermit --test record_replay -- --test-threads=1
+./validate.sh 2>&1 | tee /tmp/progress-validate.log
+ENVELOPE_JSON=/tmp/progress-envelope.json ./validate.sh --envelope-only
+with-proxy gh run list -R rrnewton/hermit --branch main --limit 6
 ```
-Reports `l1_pass..l4_pass`, `rr_pass`, `total` over the `ENVELOPE_PROBES` list.
-Assurance ladder (AGENTS.md): L1 `--strict`; L2 `--strict --verify`; L3 adds
-`--detlog-heap --detlog-stack`; L4 = L2 ×`L4_REPS` (default 20); rr =
-`record start --verify` end-to-end. Monotonicity can be gated with
-`./validate.sh --envelope-compare baseline.json`.
 
-### rr suite
-- **There is no `rr_suite` Cargo target and no `third-party/rr` submodule** in
-  the OSS repo. Meta's Buck rr matrix is not ported (AGENTS.md → "Test"). Report
-  this explicitly; do not invent numbers. OSS rr coverage = envelope `rr` probes
-  + the `record_replay` target.
+Bound commands that can hang and report the bound. Aggregate only completed
+`test result:` lines. If a process is killed or interrupted, name the last
+completed step and state that no final summary was produced. The `rr_suite`
+target may exist but have ignored PMU/mount-namespace cases; report executed and
+ignored counts separately.
 
-### Record / replay
-```bash
-cargo test -p hermit --test record_replay 2>&1 | tee /tmp/progress-record.log
-```
-The target is `record_replay` (not `record`). Copy the `test result:` line.
+## Cell vocabulary
 
-### App end-to-end suites
-- **There is no `app_strict_verify` target.** Run the per-app targets that
-  exist:
-```bash
-for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinism; do
-  cargo test -p hermit --test "$t"
-done
-```
-- Default run = non-ignored only. Ignored tests need `-- --ignored` plus
-  optional downloads/toolchains (SQLite/Redis source builds, CPython Lib/test,
-  go/jvm/node/ocaml/python/ruby). Record passed/failed/ignored per target and
-  name the active passing tests.
+- `PASS L2`: strict verify completed and reported deterministic output.
+- `PASS R/R`: record completed, replay completed, and outputs/logs matched.
+- `FAIL`: the mode ran the guest and produced a mismatch, divergence, crash, or
+  nonzero result attributable to that workload.
+- `BLOCKED`: a backend-wide dependency or implementation gate prevented guest
+  execution; quote it once.
+- `NOT RUN`: no command was attempted. State why.
 
-## Rules
+## Accounting and writing rules
 
-- Report backend, log level, and relaxations for every Hermit run.
-- Quote verbatim errors with `file:line`. Separate host limitation from product
-  regression; if you cannot tell, say so and say what host would decide it.
-- Do not stage generated artifacts (`envelope.json`, `target/`) or unrelated
-  concurrent changes.
-- Reuse existing paths: reports in `ai_docs/progress-reports/`, this rubric in
-  `.llms/skills/`, automation in `scripts/progress-report.sh`.
+- Use one denominator for the same-app matrix. Broader historical matrices may
+  be linked as context but must not be added to fresh probe counts.
+- Present the support slope explicitly, for example `5/5 -> 4/5 -> blocked ->
+  blocked`, then explain the first lost workload.
+- Separate product gaps from changing host state, missing privileges, and test
+  harness interruption. Say `unknown` when attribution is not established.
+- Never call main green unless the exact-SHA gate completed successfully.
+- Do not stage generated logs, recordings, `envelope.json`, `target/`, or
+  unrelated concurrent changes.
