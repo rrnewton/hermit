@@ -69,6 +69,7 @@ use std::time::Duration;
 
 pub use config::BlockingMode;
 pub use config::Config;
+pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
