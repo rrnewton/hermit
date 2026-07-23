@@ -308,9 +308,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// timer_create: allocate a per-process POSIX timer and hand back a
-    /// deterministic id. The timer's arming is tracked (see
-    /// [`crate::tool_local::PosixTimers`]) but expiration signals are not
-    /// delivered.
+    /// deterministic id. The timer's arming is tracked (in the process-local
+    /// `PosixTimers` table) but expiration signals are not delivered.
     pub async fn handle_timer_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
