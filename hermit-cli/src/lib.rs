@@ -261,12 +261,14 @@ impl Backend {
             Self::Dbi => Some(
                 "the DynamoRIO prototype does not yet expose a Detcore process launcher".to_owned(),
             ),
-            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
-                Some(
-                    "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
-                        .to_owned(),
-                )
-            }),
+            Self::Kvm => Some(
+                kvm_device_unavailable_reason(Path::new("/dev/kvm"))
+                    .map(|reason| format!("{reason}; and, more fundamentally, "))
+                    .unwrap_or_default()
+                    + "the KVM backend is not yet functional: it cannot execute Linux programs \
+                       without an ELF loader, protected-mode setup, and a guest-kernel ABI. See \
+                       https://github.com/rrnewton/hermit/issues/198",
+            ),
         }
     }
 }

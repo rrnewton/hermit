@@ -9,17 +9,14 @@
 //! Execution-backend selection for `hermit run`.
 //!
 //! Hermit's production backend is `reverie-ptrace`, which runs an arbitrary ELF
-//! guest under seccomp + ptrace. Two experimental Reverie backends are also
-//! wired here so the same Detcore/Reverie contracts can be exercised over
-//! alternative execution mechanisms:
+//! guest under seccomp + ptrace. Two additional Reverie backends are wired here:
 //!
-//! * [`hermit::Backend::Dbi`] — in-process DynamoRIO instrumentation (`reverie-dbi`).
-//! * [`hermit::Backend::Kvm`] — a small KVM guest (`reverie-kvm`).
-//!
-//! Both are prototypes and do not yet load and execute arbitrary Linux ELF
-//! programs the way the ptrace backend does (see each crate's README). To keep
-//! `hermit run --backend {dbi,kvm}` useful for kicking the tires, they run a
-//! minimal "hello world" demonstration through their real interception path.
+//! * [`hermit::Backend::Dbi`] — in-process DynamoRIO instrumentation
+//!   (`reverie-dbi`); shells out to `drrun` to run the real guest program.
+//! * [`hermit::Backend::Kvm`] — a KVM prototype (`reverie-kvm`) that is **not
+//!   yet functional**: it cannot load or execute a Linux ELF program. It is
+//!   held unavailable/fail-closed (see [`hermit::Backend::ensure_available`]).
+//!   Tracked by <https://github.com/rrnewton/hermit/issues/198>.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -27,73 +24,26 @@ use std::process::Command as StdCommand;
 use hermit::Error;
 use hermit::ExitStatus;
 
-/// Runs a "hello world" through the experimental KVM backend.
+/// The KVM backend is not yet a working execution backend.
 ///
-/// `reverie-kvm` is not yet a Linux ELF execution backend, so this cannot exec
-/// `program`. Instead it builds a tiny real-mode guest that issues a single
-/// `write` syscall via `vmcall`; the host handler performs the actual write, so
-/// the message reaches the real stdout. This exercises the genuine
-/// VM-exit → Reverie syscall interception path (with the deterministic CPUID
-/// policy applied to the vCPU).
+/// `reverie-kvm` cannot load or execute an arbitrary Linux ELF program: it has
+/// no ELF loader, no protected/long-mode setup, and no guest-kernel/syscall
+/// ABI. Rather than silently ignore `program` and run a hardcoded "hello world"
+/// demo (fake functionality that misleads users and agents into thinking the
+/// backend works), this returns a clear error naming the program it refused to
+/// run.
+///
+/// `Backend::Kvm` already fails closed in `Backend::unavailable_reason`, so this
+/// is normally unreachable; it exists as honest defense-in-depth in case that
+/// gate is ever removed. Progress toward a real backend is tracked in the issue
+/// referenced below.
 pub fn run_kvm(program: &Path) -> Result<ExitStatus, Error> {
-    use reverie_kvm::KvmBackend;
-    use reverie_kvm::SyscallInfo;
-    use reverie_kvm::SyscallRequest;
-
-    const MEMORY_SIZE: usize = 0x1_0000;
-    const ENTRY_POINT: u64 = 0x1000;
-    const FRAME_ADDRESS: u64 = 0x2000;
-    const MESSAGE_ADDRESS: u64 = 0x3000;
-
-    eprintln!(
-        "hermit: [kvm backend] {program:?} is not executed as an ELF; the reverie-kvm prototype \
-         runs a built-in hello-world guest that issues write(2) via vmcall."
-    );
-
-    let message = b"hello world\n";
-
-    let mut backend = KvmBackend::new(MEMORY_SIZE)
-        .map_err(|e| Error::msg(format!("failed to create KVM backend (need /dev/kvm): {e}")))?;
-    backend
-        .memory_mut()
-        .write(MESSAGE_ADDRESS, message)
-        .map_err(|e| Error::msg(format!("failed to stage guest message: {e}")))?;
-    backend
-        .install_syscall(
-            ENTRY_POINT,
-            FRAME_ADDRESS,
-            SyscallRequest::new(
-                libc::SYS_write as u64,
-                [1, MESSAGE_ADDRESS, message.len() as u64, 0, 0, 0],
-            ),
-        )
-        .map_err(|e| Error::msg(format!("failed to install guest syscall: {e}")))?;
-
-    let mut result: i64 = -1;
-    backend
-        .run(|syscall, memory| {
-            // Perform the intercepted write on the host so its bytes reach the
-            // real fd, mirroring what a full backend's Tool would delegate. The
-            // KVM backend now hands us a decoded Reverie `Syscall`; recover the
-            // raw ABI arguments via `SyscallInfo::into_parts`.
-            let (_number, args) = syscall.into_parts();
-            let len = args.arg2 as usize;
-            let mut buf = vec![0u8; len];
-            if memory.read(args.arg1 as u64, &mut buf).is_err() {
-                return -(libc::EFAULT as i64);
-            }
-            let fd = args.arg0 as i32;
-            let written =
-                unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, len) } as i64;
-            result = written;
-            written
-        })
-        .map_err(|e| Error::msg(format!("KVM guest run failed: {e}")))?;
-
-    if result < 0 {
-        return Ok(ExitStatus::Exited(1));
-    }
-    Ok(ExitStatus::Exited(0))
+    Err(Error::msg(format!(
+        "KVM backend is not yet functional: it cannot execute {program:?} (or any real ELF \
+         program). It lacks an ELF loader, protected-mode setup, and a guest-kernel/syscall ABI. \
+         See https://github.com/rrnewton/hermit/issues/198 for tracking and use `--backend ptrace` \
+         (the default) to run programs."
+    )))
 }
 
 /// Runs `program`/`args` through the experimental DynamoRIO backend.
