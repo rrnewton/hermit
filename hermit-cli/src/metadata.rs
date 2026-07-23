@@ -150,6 +150,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
         sequentialize_threads: true,
+        runs_post_fork: default_config.runs_post_fork,
         // Record/replay has its own exact subscription set and format. Preserve the
         // existing partial Detcore set so this run-mode default does not change v0x101
         // event streams.

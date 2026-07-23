@@ -725,7 +725,9 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
-            let child_first = self.cfg.sequentialize_threads && !parent_is_kernel_blocked;
+            let child_first = self.cfg.sequentialize_threads
+                && !parent_is_kernel_blocked
+                && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
             let pos = if child_first {
                 sched.runqueue_push_front(child_dettid)
             } else {
@@ -739,8 +741,8 @@ impl GlobalState {
             );
             sched.started_up.try_put(());
         }
-        // The ordinary clone child is now ahead of an equal-priority parent, so
-        // this request cannot complete until the child gets one startup turn.
+        // The child queue position above determines which equal-priority side
+        // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
         // queue, so it must not issue a ParentContinue request here.
         if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {

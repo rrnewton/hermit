@@ -27,6 +27,7 @@ use detcore_model::summary::RunSummary;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
@@ -52,6 +53,7 @@ use tracing::info;
 use tracing::trace;
 
 use crate::config::Config;
+use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -323,6 +325,9 @@ pub struct Scheduler {
 
     /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
     fuzz_prng: Pcg64Mcg,
+
+    /// Independent scheduler-seeded stream for post-fork ordering choices.
+    post_fork_prng: Pcg64Mcg,
 
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
@@ -847,6 +852,7 @@ impl Scheduler {
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
+            post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
         }
     }
 
@@ -2171,6 +2177,15 @@ impl Scheduler {
         self.run_queue.push_front(dettid, priority)
     }
 
+    /// Decide which side gets the first post-fork turn for an ordinary clone.
+    pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
+        match mode {
+            RunsPostFork::Child => true,
+            RunsPostFork::Parent => false,
+            RunsPostFork::Random => self.post_fork_prng.random(),
+        }
+    }
+
     /// Check if a thread is alive, but removed from run queue.
     fn thread_status(&self, dtid: DetTid) -> ThreadStatus {
         if self.run_queue.contains_tid(dtid) {
@@ -2441,6 +2456,30 @@ mod test {
             both.insert(chaos_pick(&mut prng, &[true, false]).unwrap());
         }
         assert_eq!(both, [false, true].into_iter().collect());
+    }
+
+    #[test]
+    fn post_fork_modes_are_selectable_and_random_is_seed_deterministic() {
+        let config = Config {
+            sched_seed: Some(1234),
+            ..Default::default()
+        };
+        let mut fixed = Scheduler::new(&config);
+        assert!(fixed.child_runs_first_post_fork(RunsPostFork::Child));
+        assert!(!fixed.child_runs_first_post_fork(RunsPostFork::Parent));
+
+        let mut first = Scheduler::new(&config);
+        let mut second = Scheduler::new(&config);
+        let first_sequence = (0..64)
+            .map(|_| first.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+        let second_sequence = (0..64)
+            .map(|_| second.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_sequence, second_sequence);
+        assert!(first_sequence.contains(&true));
+        assert!(first_sequence.contains(&false));
     }
 
     #[test]
