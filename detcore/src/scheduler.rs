@@ -76,6 +76,10 @@ use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
 use crate::util::truncated;
 
+// A nonblocking internal poll represents substantially more waiting than an
+// ordinary scheduler handoff; charge enough virtual time to bound retry loops.
+const INTERNAL_IO_POLL_TIME_SCALE: usize = 200;
+
 /// Unique identifier for an action.
 pub type ActionID = u64;
 
@@ -2067,7 +2071,13 @@ impl Scheduler {
                     "[scheduler] skipping scheduler time advance because just-finished turn was an internal book-keeping one"
                 );
             } else {
-                let newtime = gtime.add_scheduler_time();
+                let scheduler_ticks = if last_turn_was_polling {
+                    INTERNAL_IO_POLL_TIME_SCALE
+                } else {
+                    1
+                };
+                let newtime =
+                    (0..scheduler_ticks).fold(gtime.as_nanos(), |_, _| gtime.add_scheduler_time());
                 if last_turn_was_polling {
                     // Advance time (needed for timeout enforcement) but keep it off the DETLOG.
                     trace!(
