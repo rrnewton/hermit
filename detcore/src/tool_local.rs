@@ -17,6 +17,7 @@ use std::sync::MutexGuard;
 use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
+use detcore_model::summary::TimesliceStats;
 use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
@@ -647,6 +648,16 @@ pub struct ThreadStats {
     /// The timeslice_count for the timeslice which was the last one that had a recorded end time in
     /// the `--replay-preemptions-from` log.
     pub last_recorded_slice: Option<u64>,
+
+    /// Distribution (min/max/sum/count) of completed timeslice durations for this
+    /// thread, in virtual nanoseconds. A slice's duration is the delta of
+    /// `thread_logical_time` between two consecutive `next_timeslice` resets.
+    pub timeslice_stats: TimesliceStats,
+
+    /// The per-thread logical time (virtual ns) at which the current timeslice
+    /// began. `None` until the first slice is opened. Used to compute the
+    /// duration of a slice when the next reset occurs.
+    pub timeslice_start_ns: Option<LogicalTime>,
 }
 
 impl ThreadStats {
@@ -674,6 +685,18 @@ impl ThreadStats {
         self.timeslice_syscall_count = 0;
         self.timeslice_signal_count = 0;
         self.timeslice_count += 1;
+    }
+
+    /// Close the final, in-progress timeslice at thread exit, recording its
+    /// virtual-ns duration. This captures short-lived or I/O-bound threads that
+    /// exit (or block until exit) before ever exhausting a slice, so they still
+    /// contribute one sample. Idempotent: consumes `timeslice_start_ns`.
+    pub fn close_final_timeslice(&mut self, now: LogicalTime) {
+        if let Some(start) = self.timeslice_start_ns.take()
+            && now >= start
+        {
+            self.timeslice_stats.record((now - start).as_nanos());
+        }
     }
 }
 
@@ -1016,6 +1039,20 @@ impl<T> ThreadState<T> {
         // If the preemption feature is disabled, this fizzles:
         if let Some(timeout_ns) = cfg.preemption_timeout {
             let current_ns = self.thread_logical_time.as_nanos();
+
+            // Close out the previous timeslice by recording its virtual-ns
+            // duration (the delta of this thread's logical time since the slice
+            // began), then mark the start of the new slice. The first call has
+            // no prior slice to record.
+            if let Some(start) = self.stats.timeslice_start_ns
+                && current_ns >= start
+            {
+                self.stats
+                    .timeslice_stats
+                    .record((current_ns - start).as_nanos());
+            }
+            self.stats.timeslice_start_ns = Some(current_ns);
+
             let mut result = None;
 
             // Preemption-point replay from recorded --chaos configuration.
