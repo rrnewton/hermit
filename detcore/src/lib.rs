@@ -1051,6 +1051,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_clock_gettime(guest, s).await
             }
             Syscall::ClockGetres(s) if virtualize_time => self.handle_clock_getres(guest, s).await,
+            // When time virtualization is disabled (e.g. `--strace-only`), these
+            // clock reads are not subscribed in release builds and run in the
+            // kernel. Debug builds subscribe to everything via `Subscription::all()`,
+            // so route them through passthrough to preserve that behavior instead of
+            // hitting the fail-closed panic arm.
+            Syscall::Gettimeofday(_)
+            | Syscall::Time(_)
+            | Syscall::ClockGettime(_)
+            | Syscall::ClockGetres(_) => self.passthrough(guest, call).await,
             Syscall::Uname(s) => self.handle_uname(guest, s).await,
             Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
             Syscall::Exit(s) => self.handle_exit(guest, s).await,
@@ -1172,6 +1181,127 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::AddKey(_) => self.passthrough(guest, call).await,
             Syscall::Keyctl(_) => self.passthrough(guest, call).await,
             Syscall::RequestKey(_) => self.passthrough(guest, call).await,
+
+            // ----------------------------------------------------------------
+            // Deterministic dispositions for syscalls that debug builds trap via
+            // `Subscription::all()`. In release builds these are unsubscribed and
+            // execute directly in the kernel; giving them explicit arms means a
+            // fail-closed run (`--panic-on-unsupported-syscalls`) no longer aborts
+            // on them while preserving that same kernel-backed behavior. Each is
+            // routed through `passthrough` (which records/replays the result) unless
+            // a stronger deterministic model is required.
+            // ----------------------------------------------------------------
+
+            // Process, thread, and user identity. The PID and user namespaces give
+            // the container stable IDs, so these are deterministic passthroughs,
+            // exactly like the Getpid/Gettid arms above.
+            Syscall::Getuid(_)
+            | Syscall::Geteuid(_)
+            | Syscall::Getgid(_)
+            | Syscall::Getegid(_)
+            | Syscall::Getresuid(_)
+            | Syscall::Getresgid(_)
+            | Syscall::Getgroups(_)
+            | Syscall::Getppid(_)
+            | Syscall::Getpgrp(_)
+            | Syscall::Getpgid(_)
+            | Syscall::Getsid(_)
+            | Syscall::Getcwd(_)
+            | Syscall::Capget(_)
+            | Syscall::Capset(_) => self.passthrough(guest, call).await,
+
+            // Resource limits. Deterministic within the container; mirrors the
+            // existing Prlimit64 passthrough.
+            Syscall::Getrlimit(_) | Syscall::Setrlimit(_) => self.passthrough(guest, call).await,
+
+            // Scheduling priority (nice values). Detcore's own scheduler ignores
+            // guest priority, so these are guest-visible no-ops backed by the host.
+            Syscall::Getpriority(_) | Syscall::Setpriority(_) => {
+                self.passthrough(guest, call).await
+            }
+
+            // Advisory memory / synchronization hints with no guest-visible
+            // nondeterminism; mirrors the existing Madvise passthrough.
+            // `process_madvise` has no dedicated variant in this reverie revision,
+            // so it is matched by number like the `rseq` arm below.
+            Syscall::Membarrier(_) => self.passthrough(guest, call).await,
+            _ if call.number() == Sysno::process_madvise => self.passthrough(guest, call).await,
+
+            // Filesystem mutations and introspection. Hermit does not determinize
+            // the filesystem, so these pass through like the other file syscalls.
+            Syscall::Mkdir(_)
+            | Syscall::Mkdirat(_)
+            | Syscall::Rmdir(_)
+            | Syscall::Unlink(_)
+            | Syscall::Unlinkat(_)
+            | Syscall::Statfs(_)
+            | Syscall::Fstatfs(_)
+            | Syscall::Chdir(_)
+            | Syscall::Fchdir(_)
+            | Syscall::Chown(_)
+            | Syscall::Fchown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Fchownat(_)
+            | Syscall::Chmod(_)
+            | Syscall::Fchmod(_)
+            | Syscall::Fchmodat(_)
+            | Syscall::Umask(_)
+            | Syscall::Rename(_)
+            | Syscall::Renameat(_)
+            | Syscall::Renameat2(_)
+            | Syscall::Link(_)
+            | Syscall::Linkat(_)
+            | Syscall::Symlink(_)
+            | Syscall::Symlinkat(_)
+            | Syscall::Truncate(_)
+            | Syscall::Ftruncate(_)
+            | Syscall::Fsync(_)
+            | Syscall::Fdatasync(_)
+            | Syscall::Sync(_)
+            | Syscall::Syncfs(_)
+            | Syscall::Fallocate(_)
+            | Syscall::Flock(_) => self.passthrough(guest, call).await,
+
+            // Signal generation, query, and wait. Actual signal delivery is
+            // mediated deterministically by Reverie plus Detcore's scheduler; the
+            // syscalls themselves only enqueue/inspect signals. Passthrough matches
+            // release behavior and the signal_determinism suite is stable across
+            // repeated runs with it.
+            Syscall::Kill(_)
+            | Syscall::Tgkill(_)
+            | Syscall::Tkill(_)
+            | Syscall::RtSigpending(_)
+            | Syscall::RtSigsuspend(_) => self.passthrough(guest, call).await,
+
+            // Interval and POSIX timers. Passthrough preserves the kernel's
+            // delivery of SIGALRM/SIGVTALRM; under sequentialized scheduling the
+            // observable delivery order is stable (see signal_determinism).
+            // TODO: route ITIMER_REAL through the virtual-time alarm machinery
+            // (see handle_alarm) for full L2 scheduler-log determinism.
+            Syscall::Setitimer(_)
+            | Syscall::Getitimer(_)
+            | Syscall::TimerCreate(_)
+            | Syscall::TimerSettime(_)
+            | Syscall::TimerGettime(_)
+            | Syscall::TimerGetoverrun(_)
+            | Syscall::TimerDelete(_) => self.passthrough(guest, call).await,
+
+            // Setting the wall clock must never reach the host while time is
+            // virtualized: it would corrupt the shared host clock and break
+            // virtual-time determinism. Emulate a guest without the privilege to
+            // change the (virtual) clock. When time virtualization is off, defer to
+            // the kernel like the non-virtualized clock reads above.
+            Syscall::ClockSettime(_) if virtualize_time => Err(Error::Errno(Errno::EPERM)),
+            Syscall::ClockSettime(_) => self.passthrough(guest, call).await,
+
+            // Socket configuration and introspection for the isolated local
+            // network; passthrough matches the other socket syscalls (bind/connect).
+            Syscall::Setsockopt(_)
+            | Syscall::Getsockopt(_)
+            | Syscall::Getsockname(_)
+            | Syscall::Getpeername(_)
+            | Syscall::Listen(_)
+            | Syscall::Shutdown(_) => self.passthrough(guest, call).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {
