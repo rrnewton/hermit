@@ -108,7 +108,9 @@ impl LogDiffOpts {
     fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         v.iter()
             .filter_map(|(i, s)| {
-                if (is_detlog(s) && !self.skip_detlog(s)) || (is_commit(s) && !self.skip_commit) {
+                if (is_detlog(s) && !self.skip_detlog(s) && !is_scheduler_committed_time(s))
+                    || (is_commit(s) && !self.skip_commit && !is_internal_io_poll_commit(s))
+                {
                     Some((*i, *s))
                 } else {
                     None
@@ -238,6 +240,38 @@ fn is_commit(line: &str) -> bool {
 
 fn is_detlog(line: &str) -> bool {
     line.contains(" DETLOG ")
+}
+
+/// A scheduler COMMIT turn that only grants the `InternalIOPolling` resource, i.e. a
+/// granted retry of a nonblocking poll (poll/epoll_wait/wait4/futex/recv/send...). These
+/// grants are internal bookkeeping of Hermit's blocking-via-polling mechanism: how many
+/// times a thread is re-granted permission to re-attempt a nonblocking syscall before it
+/// stops returning would-block depends on when a concurrent external-IO action (e.g. a
+/// child linker process writing to a pipe) becomes ready on the host, which is wall-clock
+/// dependent and not tied to the (RCB-deterministic) logical schedule. The corresponding
+/// `NONCOMMIT ... polling resource` skips are already excluded from comparison (they are
+/// not tagged `COMMIT`); excluding the matching grant-COMMITs keeps the deterministic
+/// comparison consistent and focused on guest-observable events (the actual syscall
+/// results, still compared via their DETLOG entries).
+///
+/// The scheduler additionally suppresses the per-retry "advance global time for scheduler
+/// turn" DETLOG line for these turns at the source (see `Scheduler::bump_global_time`), so
+/// the two mechanisms together make the deterministic comparison insensitive to how many
+/// times a would-block syscall was retried.
+fn is_internal_io_poll_commit(line: &str) -> bool {
+    is_commit(line) && line.contains("{InternalIOPolling: ")
+}
+
+/// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
+/// the global logical clock, which still moves forward when an `InternalIOPolling` retry
+/// (see `is_internal_io_poll_commit`) advances time -- and the number of those retries is
+/// host-timing nondeterministic. That makes the *presence* of this line on a given turn
+/// retry-count sensitive, so we exclude it from the deterministic comparison. No
+/// guest-observable signal is lost: the value is redundant with the (retained,
+/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
+/// the per-turn committed time echoed on each COMMIT line.
+fn is_scheduler_committed_time(line: &str) -> bool {
+    line.contains("advancing committed_time from ")
 }
 
 fn is_detcore(line: &str) -> bool {
@@ -884,6 +918,88 @@ mod test {
             ],
         );
         assert_eq!(v, vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]);
+    }
+
+    /// Regression: the deterministic comparison must ignore the scheduler bookkeeping emitted
+    /// by nonblocking-IO poll retries, whose count is host-timing nondeterministic (e.g. how
+    /// many times a thread re-polls a pipe before a child process makes it ready). Only the
+    /// `{InternalIOPolling: ...}` COMMIT turn and the `advancing committed_time` clock line
+    /// should be dropped; ordinary COMMIT turns and DETLOG entries must be retained.
+    #[test]
+    fn test_filter_deterministic_drops_io_polling_bookkeeping() {
+        let opts = super::LogDiffOpts::default();
+        let v = opts.filter_deterministic(&[
+            (
+                0,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s",
+            ),
+            (
+                1,
+                "DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2",
+            ),
+            (
+                2,
+                "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)",
+            ),
+            (
+                3,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s",
+            ),
+        ]);
+        // The InternalIOPolling COMMIT (0) and the committed_time line (1) are dropped; the
+        // guest-observable syscall (2) and the ordinary COMMIT turn (3) survive.
+        assert_eq!(
+            v,
+            vec![
+                (
+                    2,
+                    "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)"
+                ),
+                (
+                    3,
+                    "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
+                ),
+            ]
+        );
+    }
+
+    /// Regression: two runs that differ only in how many nonblocking-IO poll retries occurred
+    /// must compare as deterministic, while a genuine guest-observable divergence must still be
+    /// reported. `run_b` below performs one extra poll retry (an extra InternalIOPolling COMMIT
+    /// plus its committed_time advance) but the guest syscalls are identical.
+    #[test]
+    fn test_log_diff_ignores_extra_io_poll_retries() -> std::io::Result<()> {
+        let common_head = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] inbound syscall: poll(0x1000, 1, -1) = ?";
+        let common_tail = "2022-09-06T14:15:47.100000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: poll(0x1000, 1, -1) = Ok(1)";
+        let poll_retry = "2022-09-06T14:15:47.050000Z  INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s\n2022-09-06T14:15:47.050000Z DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2";
+
+        let run_a = format!("{common_head}\n{poll_retry}\n{common_tail}");
+        // run_b polls one extra time before the fd is ready:
+        let run_b = format!("{common_head}\n{poll_retry}\n{poll_retry}\n{common_tail}");
+
+        let opts = super::LogDiffOpts {
+            no_color: true,
+            strip_lines: true,
+            ..Default::default()
+        };
+        // Differ only in retry count -> deterministic (no diff reported):
+        assert!(!super::log_diff_from_strs(
+            &run_a,
+            &run_b,
+            &opts,
+            &mut Vec::new()
+        )?);
+
+        // But a real divergence in the guest-observable syscall result is still caught. (Use a
+        // non-numeric change: numeric-only differences are erased by `strip_lines` normalization.)
+        let run_c = run_a.replace("= Ok(1)", "= Err(Errno(EBADF))");
+        assert!(super::log_diff_from_strs(
+            &run_a,
+            &run_c,
+            &opts,
+            &mut Vec::new()
+        )?);
+        Ok(())
     }
 
     #[test]

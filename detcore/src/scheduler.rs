@@ -1866,6 +1866,16 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::TraceReplay)
     }
 
+    /// A turn that only grants `InternalIOPolling`, i.e. a retry of a nonblocking
+    /// poll/epoll/select/futex/recv/... injected by the blocking-via-polling machinery
+    /// (see `retry_nonblocking_syscall_helper`). The *number* of such retries before a
+    /// file descriptor becomes ready is wall-clock dependent when the readiness is driven
+    /// by an external actor (e.g. a child linker process draining a pipe), so it varies
+    /// between otherwise-identical runs.
+    fn is_polling_turn(rsrcs: &Resources) -> bool {
+        Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -1888,6 +1898,20 @@ impl Scheduler {
         global_time: &Mutex<GlobalTime>,
         last_turn: &Result<Resources, SkipTurn>,
     ) {
+        // An internal IO-polling retry (see `is_polling_turn`) must still advance logical
+        // time -- finite poll/epoll/select/futex timeouts are enforced by comparing observed
+        // logical time against the deadline in `retry_nonblocking_syscall_helper`, so freezing
+        // time here would turn a timed wait into an infinite spin. But because the *count* of
+        // these retries is host-timing nondeterministic, we keep their time-advance out of the
+        // determinism log (DETLOG). This makes the `--verify` deterministic comparison
+        // insensitive to retry count; the matching `{InternalIOPolling: ...}` COMMIT turn is
+        // likewise excluded in `logdiff::is_internal_io_poll_commit`. Time values still shift
+        // between runs, but those are numerically normalized before comparison.
+        let last_turn_was_polling = last_turn
+            .as_ref()
+            .map(Self::is_polling_turn)
+            .unwrap_or(false);
+
         // At this moment, when threads are parked, we know that the global_time is
         // frozen and we can read it without any race.
         let snapshot: LogicalTime = {
@@ -1917,10 +1941,18 @@ impl Scheduler {
                 );
             } else {
                 let newtime = gtime.add_scheduler_time();
-                detlog_debug!(
-                    "[sched] advance global time for scheduler turn, new time {:?}",
-                    newtime,
-                );
+                if last_turn_was_polling {
+                    // Advance time (needed for timeout enforcement) but keep it off the DETLOG.
+                    trace!(
+                        "[sched] advance global time for internal IO-polling retry (suppressed from detlog), new time {:?}",
+                        newtime,
+                    );
+                } else {
+                    detlog_debug!(
+                        "[sched] advance global time for scheduler turn, new time {:?}",
+                        newtime,
+                    );
+                }
             }
             gtime.as_nanos()
         };
@@ -1934,6 +1966,11 @@ impl Scheduler {
             }
             std::cmp::Ordering::Equal => {}
             std::cmp::Ordering::Greater => {
+                // NB: `committed_time` still tracks the (host-timing-perturbed) global clock,
+                // including the time advanced by suppressed IO-polling retries above, so this
+                // line's presence is retry-count sensitive. It is therefore excluded from the
+                // deterministic `--verify` comparison in `logdiff::is_scheduler_committed_time`
+                // (it is redundant with the per-turn "advance global time" DETLOG anyway).
                 detlog_debug!(
                     "[sched-step1] advancing committed_time from {} to {}",
                     self.committed_time,
