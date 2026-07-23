@@ -148,7 +148,7 @@ impl Tool for Replayer {
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Close(syscall) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
@@ -276,6 +276,24 @@ impl Replayer {
         // introducing non-determinism into the replay and popping multiple
         // syscall events.
         guest.inject_with_retry(syscall).await
+    }
+
+    /// Replays a successful `close` in the kernel so live fd-creating syscalls
+    /// observe the same free descriptor slots as the recording.
+    async fn handle_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Close,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+
+        // A replayed open may not have a physical backing fd, so the injected
+        // close can report EBADF even though the recorded close succeeded. The
+        // side effect matters for live objects such as pipes and epoll fds; the
+        // guest must still observe the recorded result.
+        let _ = guest.inject_with_retry(Syscall::Close(syscall)).await;
+
+        Ok(ret)
     }
 
     /// Handles a syscall whose only value we care about is the return value
