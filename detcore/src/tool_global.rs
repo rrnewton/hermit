@@ -32,6 +32,7 @@ use detcore_model::summary::RunSummary;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use reverie::Errno;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
@@ -483,6 +484,15 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RegisterAlarm(dpid, dtid, secs, sig) => {
                 let remaining = self.recv_register_alarm(dpid, dtid, secs, sig).await;
                 R::RegisterAlarm(remaining)
+            }
+            GlobalRequest::SendSignal(target, sig) => {
+                let res = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .send_signal(target, sig.0)
+                    .map_err(|errno| errno as i32);
+                R::SendSignal(res)
             }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
@@ -1147,6 +1157,10 @@ pub enum GlobalRequest {
     /// Basically performs an alarm syscall, takes seconds.
     RegisterAlarm(DetPid, DetTid, Seconds, SigWrapper),
 
+    /// Deliver a signal from a guest `kill(2)` to a target thread, waking it if
+    /// it is parked in the scheduler. Carries the target `DetTid` and signal.
+    SendSignal(DetTid, SigWrapper),
+
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
@@ -1179,6 +1193,8 @@ pub enum GlobalResponse {
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
     RegisterAlarm(Seconds),
+    /// Ok(()) on success, or the raw `kill(2)` errno on failure.
+    SendSignal(Result<(), i32>),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -1641,6 +1657,22 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Deliver a signal from a guest `kill(2)` to `target`, routing through the
+/// global scheduler so a target parked in the scheduler is woken to receive it.
+/// Returns `Ok(())` on success or the corresponding [`Errno`] on failure.
+pub async fn send_signal<G, T>(guest: &mut G, target: DetTid, sig: Signal) -> Result<(), Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::SendSignal(target, SigWrapper(sig))).await;
+    match resp.1 {
+        GlobalResponse::SendSignal(Ok(())) => Ok(()),
+        GlobalResponse::SendSignal(Err(errno)) => Err(Errno::new(errno)),
         _ => unreachable!(),
     }
 }
