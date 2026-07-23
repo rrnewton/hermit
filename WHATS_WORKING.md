@@ -22,6 +22,10 @@ yourself.
 > Recurring engine gaps include **multithreaded wall-clock reads**, heavy compiler process
 > trees, and blocking FIFO rendezvous. The clock gap is strongly **load-sensitive** (see the
 > box in §3); NSS and `/proc` mismatches additionally expose non-hermetic host state.
+> **New this session:** Hermit wraps a full **QEMU** VMM and boots Linux to userspace with
+> **byte-identical** serial output across two runs under relaxed flags (§3r), and a
+> consolidated **9-language L2 matrix** (C, C++, Rust, Go, Perl, Lua, Node.js, Java, gawk)
+> verifies clean (§3s).
 
 > ⚠️ **Run conditions matter.** This matrix was captured on a **heavily loaded** host
 > (`load average ≈ 33`, dozens of concurrent agents). The multithreaded-clock divergence is
@@ -402,6 +406,57 @@ Notable results and honest caveats:
 - The real-app pipelines pass under `run --verify` even though the **same pipelines deadlock
   under `hermit record`** (record-only pipe issue; see §5).
 
+### 3r. Nested VMM: QEMU Linux boot — deterministic under relaxed Hermit
+
+Hermit can wrap a full hardware emulator: `hermit run` launches `qemu-system-x86_64` (TCG,
+software emulation) which boots a real Linux kernel to userspace. Measured 2026-07-23 on
+`main`, `target/release/hermit`, host kernel `/boot/vmlinuz` 6.17.13 + a busybox static
+initramfs (`rdinit=/init`).
+
+| Mode | Command flags | Result |
+|---|---|---|
+| **Relaxed (working)** | `--no-sequentialize-threads --preemption-timeout disabled --no-virtualize-cpuid` + QEMU `-accel tcg,thread=single -smp 1 -icount shift=0,sleep=off` | **BOOTS TO USERSPACE** — kernel comes up (e820/ACPI/`smpboot CPU0`/clocksource tsc/btrfs/ima) → `Run /init` → busybox shell; `exit 0` with an auto-`poweroff` init |
+| Relaxed, **repeated ×2** | same, `hermit_autotest` on cmdline (auto-poweroff) | **BYTE-IDENTICAL** — two independent boots produced identical 22908-byte serial logs, `sha256 564e1ba4…` (kernel printk timestamps included). Determinism confirmed by direct 2-run comparison |
+| `--strict` / `--strict --verify` | strict re-enables sequentialize-threads + PMU-preemption single-stepping + cpuid virtualization | **DOES NOT COMPLETE** — QEMU launches but the guest kernel emits **zero** serial output within 240s (no `[0.000000] Linux version`); timeout SIGKILL. Not a crash/syscall gap — precise-preemption single-stepping is catastrophically slow for a CPU-bound emulator |
+
+Notes:
+- Determinism here is established by a **manual two-run byte comparison**, not by `--strict
+  --verify` (which cannot complete in-window). The relaxations are documented **requirements**,
+  not conveniences — see [`docs/QEMU_BOOT.md`](docs/QEMU_BOOT.md): `--no-sequentialize-threads`
+  (QEMU needs concurrent host threads), `--preemption-timeout disabled` (no PMU single-step),
+  `--no-virtualize-cpuid` (CPUID faulting on this host), `-icount shift=0,sleep=off` (single
+  instruction-derived guest clock; the alternative is Hermit-side `--no-virtualize-time
+  --no-virtualize-metadata`).
+- Corroborated by the preserved experiment `experiments/qemu-boot-debug/results.csv`, row
+  `virtual_minimal_fixed_icount` → `complete_boot`, `exit 0`, coherent `1000.031MHz` clock.
+- Under strict, Hermit prints an explicit VMM warning (mutually-inconsistent RDTSC vs
+  virtualized `clock_gettime` can corrupt guest clock calibration).
+
+### 3s. Language-runtime summary — 9 languages verify at L2
+
+Consolidated from §3l and batches 36/37/38/40/41, plus a Go check added 2026-07-23. `PASS L2`
+= `hermit run --strict --verify` reports `:: Success: deterministic. Determinism verified.`
+Sources/binaries kept outside the Hermit-isolated `/tmp`.
+
+| Language | Witness command | Result |
+|---|---|---|
+| C | `gcc hello.c` build + run; batch 37 mini-apps | **PASS L2** |
+| C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS L2** (5/5) |
+| Rust | batch 41 + `rustc -O` integer-sum binary | **PASS L2** (3/3 this session) |
+| Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS L2** (3/3 this session) — Go's multithreaded runtime verifies for this compute workload |
+| Perl | `perl -e 'print 6*7'`; batch 38 (strftime/hash/map/line-count) | **PASS L2** |
+| Lua | `lua -e 'print(6*7)'` | **PASS L2** |
+| Node.js | `node -e 'console.log(6*7)'` | **PASS L2** |
+| Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS L2** |
+| gawk | `gawk 'BEGIN{print 6*7}'` | **PASS L2** |
+| Python 3 | `python3 -c 'print(sum(range(100)))'` | **CONDITIONAL** — PASS on a lightly-loaded host; **flaky under load** (multi-thread `clock_gettime` sub-second divergence, §6.1) |
+| Ruby | `ruby -e 'puts 6*7'` | **N/A** — host RubyGems broken (fails outside Hermit too), not a determinism result |
+| PHP | `php -r 'echo 6*7;'` | **N/A** — HHVM JIT, too slow to finish twice under load (timeout), not a determinism result |
+
+The 9 solidly-verifying languages are **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
+#223), and gawk**. Python verifies only on an idle host; Ruby and PHP are excluded for
+host/runtime reasons that are not Hermit determinism failures.
+
 ---
 
 ## 4. Backend status
@@ -466,7 +521,8 @@ pipeline-hangs boundary:
 | I/O & files | open/write/read/close temp file; `stat("/etc/passwd")`; `bash -c 'wc -l FILE'`; python3.9 `os.stat` | **PASS** (4/4; python stable 3/3) |
 | Readiness / notify | `epoll_wait`; `poll`; `timerfd` blocking read (stable 3/3); `eventfd` | **PASS** (4/4) |
 | Filter apps, **file input** | `bc`/`awk`/`sort`/`sed FILE` (single-process) | **PASS** (4/4) |
-| Filter apps, **shell pipe** | `echo … \| bc`/`awk`/`sort`/`sed` | **HANG** — record pipeline deadlock |
+| Compiled languages | `rustc -O` and `go build` integer-sum binaries (single-process) | **PASS** (2/2, added 2026-07-23) — `:: Success: replay matched recording.` — extends the compute-R/R envelope (C/Python/Perl/Bash) to Rust and Go |
+| Filter apps, **shell pipe** | `echo … \| bc`/`awk`/`sort`/`sed` | **HANG** — record pipeline deadlock (record-deadlock since **fixed** by PR #230/#235; a replay stdout-doubling gap remains, so pipe R/R is not yet `--verify`-clean) |
 | fork + cross-process signal | `fork()` + parent `write()` + `kill(child)` + `waitpid` | **HANG** — scheduler deadlock |
 
 Two reproducible R/R-record gaps were pinned:
@@ -517,21 +573,26 @@ that path.
   a benign benchmark-output mismatch (it prints measured ops/sec, which is inherently
   timing-derived) rather than a SIGSEGV. The syscall DETLOG shows "no substantive differences."
 
-- **PRs landed (2026-07-23).** Eight PRs merged across the two repos this session:
+- **PRs landed (2026-07-23).** Eleven PRs merged across the two repos this session:
 
   | Repo | PR | Title |
   |---|---:|---|
   | hermit | [#211](https://github.com/rrnewton/hermit/pull/211) | validate: auto-apply `locally-validated` PR label on a green run |
   | hermit | [#225](https://github.com/rrnewton/hermit/pull/225) | DBI M2a: add `reverie-dbi` dependency to `hermit-cli` |
   | hermit | [#229](https://github.com/rrnewton/hermit/pull/229) | KVM M3: prove Detcore drives `KvmGuest` via `run_with_tool` |
+  | hermit | [#230](https://github.com/rrnewton/hermit/pull/230) | detcore: classify internal pipes as `InternalIOPolling` (fix R/R pipe record deadlock) |
+  | hermit | [#233](https://github.com/rrnewton/hermit/pull/233) | Fix KVM backend dispatch and private-flag futex timeout classification |
   | hermit | [#234](https://github.com/rrnewton/hermit/pull/234) | DBI M2b: route DBI backend through `reverie_dbi::DbiRunner` |
+  | hermit | [#235](https://github.com/rrnewton/hermit/pull/235) | detcore: record internal-pipe read data on the `InternalIOPolling` path (R/R replay ordering) |
   | reverie | [#23](https://github.com/rrnewton/reverie/pull/23) | Document and formalize the Reverie backend contract |
   | reverie | [#32](https://github.com/rrnewton/reverie/pull/32) | reverie-dbi: Guest stack + `tail_inject` (M2); simple observation tools |
   | reverie | [#39](https://github.com/rrnewton/reverie/pull/39) | reverie-kvm: `StraceTool` over `KvmGuest` (KVM M2) |
   | reverie | [#40](https://github.com/rrnewton/reverie/pull/40) | reverie-dbi: park/unpark executor so DBI handlers can suspend (async FFI bridge) |
 
-  These advance the DBI (DynamoRIO) and KVM backends behind the still-default ptrace backend;
-  the DBI/KVM E2E paths remain gated/in-progress as described in §4.
+  These advance the DBI (DynamoRIO) and KVM backends behind the still-default ptrace backend
+  (#225/#233/#234 + reverie #23/#32/#39/#40) and the record/replay pipe path (#230/#235); the
+  DBI/KVM E2E paths remain gated/in-progress as described in §4, and pipe R/R is not yet
+  `--verify`-clean (see §5).
 
 **Not Hermit issues (documented so they aren't mis-filed):**
 
