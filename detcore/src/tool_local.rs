@@ -1040,19 +1040,6 @@ impl<T> ThreadState<T> {
         if let Some(timeout_ns) = cfg.preemption_timeout {
             let current_ns = self.thread_logical_time.as_nanos();
 
-            // Close out the previous timeslice by recording its virtual-ns
-            // duration (the delta of this thread's logical time since the slice
-            // began), then mark the start of the new slice. The first call has
-            // no prior slice to record.
-            if let Some(start) = self.stats.timeslice_start_ns
-                && current_ns >= start
-            {
-                self.stats
-                    .timeslice_stats
-                    .record((current_ns - start).as_nanos());
-            }
-            self.stats.timeslice_start_ns = Some(current_ns);
-
             let mut result = None;
 
             // Preemption-point replay from recorded --chaos configuration.
@@ -1147,11 +1134,31 @@ impl<T> ThreadState<T> {
                     current_ns
                 );
             }
-            self.stats.reset_timeslice();
+            self.reset_timeslice_stats(current_ns);
             result
         } else {
             None
         }
+    }
+
+    /// Close the current logical-timeslice statistics without selecting a new
+    /// preemption point. Used when preemption replay reaches a deterministic
+    /// guest sched_yield boundary.
+    pub fn reset_timeslice_for_explicit_yield(&mut self) {
+        let current_ns = self.thread_logical_time.as_nanos();
+        self.reset_timeslice_stats(current_ns);
+    }
+
+    fn reset_timeslice_stats(&mut self, current_ns: LogicalTime) {
+        if let Some(start) = self.stats.timeslice_start_ns
+            && current_ns >= start
+        {
+            self.stats
+                .timeslice_stats
+                .record((current_ns - start).as_nanos());
+        }
+        self.stats.timeslice_start_ns = Some(current_ns);
+        self.stats.reset_timeslice();
     }
 
     /// Are we within the execution of the (first) guest binary or any child processes called by it?

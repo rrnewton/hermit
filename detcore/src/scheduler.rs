@@ -722,7 +722,8 @@ pub async fn do_a_turn_blocking(
         // The logical COMMIT point for the turn is during step4:
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        mg.step6_reenquue(next_dtid);
+        let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+        mg.step6_reenquue(next_dtid, sched_yield);
         if let Some(call) = rsrcs.as_exit_syscall() {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -1761,6 +1762,7 @@ impl Scheduler {
                 // scheduler commits, and thus it leans on an assumption of
                 // non-interference, or on interference *only* affecting the external
                 // actions that will be recorded anyway.
+                self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp);
 
                 // Only once the ivars are cleared, and the guest is officially past the
@@ -1797,6 +1799,7 @@ impl Scheduler {
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
+            ResourceID::SchedYield => Ok(()),
             ResourceID::InboundSignal(_) => Ok(()),
         }
     }
@@ -2100,12 +2103,19 @@ impl Scheduler {
     }
 
     /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid) {
+    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
-        let dt2 = self.run_queue.commit_tentative_pop();
+        let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
         assert_eq!(next_dtid, dt2);
-        let pos = self.runqueue_push_back(next_dtid);
+        // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
+        // queue placement is transient, so persistent priorities remain unchanged.
+        let pos = if sched_yield {
+            let priority = self.get_priority(next_dtid);
+            self.run_queue.push_yielded(next_dtid, priority)
+        } else {
+            self.runqueue_push_back(next_dtid)
+        };
         debug!(
             "[sched-step6] dettid {} going back into queue at position {}.",
             next_dtid, pos

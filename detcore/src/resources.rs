@@ -243,6 +243,10 @@ pub enum ResourceID {
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.
     InboundSignal(SigWrapper),
+
+    /// Relinquish the current scheduler turn without changing the thread's
+    /// persistent priority.
+    SchedYield,
 }
 
 /// Permission to a device, which behaves like a predefined "inode".

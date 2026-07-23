@@ -452,6 +452,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///  - ends timeslice (mutating thread stats, end_of_timeslice)
     ///  - priority change / yield RPC
     async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, false).await;
+    }
+
+    async fn end_timeslice_for_sched_yield<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, true).await;
+    }
+
+    async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        explicit_sched_yield: bool,
+    ) {
         let thread_state = guest.thread_state();
         let dettid = thread_state.dettid;
         let chaos = guest.config().chaos;
@@ -470,6 +482,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Self::priority_changepoint_request(guest, end_time, prio)
         } else if chaos {
             Self::random_priority_changepoint_request(guest, end_time)
+        } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
+            Self::sched_yield_request(guest)
         } else {
             Self::yield_request(guest)
         };
