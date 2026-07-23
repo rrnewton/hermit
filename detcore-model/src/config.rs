@@ -92,9 +92,11 @@ pub struct Config {
     #[clap(long)]
     pub passthru_opt: bool,
 
-    /// In chaos mode, uses much cheaper approximate preemption timers.  Only makes sense
-    /// when recording preemptions for later (precise) replay.
-    #[clap(long)]
+    /// Accept PMU interrupt skid instead of single-stepping to the exact retired conditional
+    /// branch count. This avoids the potentially severe cost of precise timer correction, but
+    /// makes PMU preemption points nondeterministic. `--imprecise-timers` is retained as a
+    /// compatibility alias.
+    #[clap(long = "allow-nondet-skid", visible_alias = "imprecise-timers")]
     pub imprecise_timers: bool,
 
     /// Schedule threads chaotically.
@@ -405,9 +407,13 @@ impl Config {
             self.sequentialize_threads = true;
         }
 
+        if self.imprecise_timers {
+            eprintln!("WARNING: Nondeterministic preemption — skid may vary");
+        }
+
         if self.replay_preemptions_from.is_some() && self.imprecise_timers {
             eprintln!(
-                "WARNING: Setting --imprecise timers with --replay-preemptions-from is probably not what you want. They won't replay precisely."
+                "WARNING: Setting --allow-nondet-skid with --replay-preemptions-from is probably not what you want. They won't replay precisely."
             );
         }
 
@@ -518,7 +524,7 @@ impl fmt::Display for Config {
             write!(f, " --clock-multiplier={}", m)?;
         }
         if self.imprecise_timers {
-            write!(f, " --imprecise-timers")?;
+            write!(f, " --allow-nondet-skid")?;
         }
         if self.chaos {
             write!(f, " --chaos")?;
@@ -831,6 +837,12 @@ impl Config {
     /// parameter if former isn't specified
     pub fn sched_seed(&self) -> u64 {
         self.sched_seed.unwrap_or(self.seed)
+    }
+
+    /// Whether PMU alarms may be delivered at their observed, skid-affected RCB count instead of
+    /// single-stepping to the exact requested count.
+    pub fn allow_nondet_skid(&self) -> bool {
+        self.imprecise_timers
     }
 }
 

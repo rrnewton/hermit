@@ -714,6 +714,25 @@ fn timeslice_flags_parse_and_round_trip() {
 }
 
 #[test]
+fn nondet_skid_flag_is_allowed_with_strict_and_round_trips() {
+    let mut opts =
+        RunOpts::parse_from(["fakehermit", "--strict", "--allow-nondet-skid", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert!(opts.det_opts.det_config.allow_nondet_skid());
+    assert_eq!(format!("{}", opts), " --allow-nondet-skid -- fakeprog");
+}
+
+#[test]
+fn deprecated_imprecise_timers_alias_round_trips_canonically() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--imprecise-timers", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert!(opts.det_opts.det_config.allow_nondet_skid());
+    assert_eq!(format!("{}", opts), " --allow-nondet-skid -- fakeprog");
+}
+
+#[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
@@ -858,6 +877,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--preemption-timeout",
         "--target-timeslice",
         "syscall boundaries",
+        "--allow-nondet-skid",
+        "--imprecise-timers",
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",

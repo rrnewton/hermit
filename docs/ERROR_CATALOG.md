@@ -57,7 +57,8 @@ scheduling. Options beginning with `--no-` similarly weaken reproducibility.
 
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
-| `--imprecise timers with --replay-preemptions-from ... won't replay precisely` | Configuration | Approximate timers were enabled during precise preemption replay. | Remove `--imprecise-timers`. |
+| `Nondeterministic preemption — skid may vary` | Configuration | `--allow-nondet-skid` accepts the PMU alarm delivery point without precise single-step correction. | Remove `--allow-nondet-skid` when exact preemption determinism is required. |
+| `--allow-nondet-skid with --replay-preemptions-from ... won't replay precisely` | Configuration | PMU skid acceptance was enabled during precise preemption replay. | Remove `--allow-nondet-skid`. |
 | `--stop-after-turn will have no effect if --no-sequentialize-threads is enabled` | Configuration | A scheduler stop condition was combined with no scheduler. | Remove `--no-sequentialize-threads` or the ineffective stop option. |
 | `--stop-after-iter will have no effect if --no-sequentialize-threads is enabled` | Configuration | An iteration stop condition was combined with no scheduler. | Remove `--no-sequentialize-threads` or the ineffective stop option. |
 | `--debug-externalize-sockets will have no effect if --no-sequentialize-threads is enabled` | Configuration | Socket externalization needs the deterministic scheduler. | Re-enable thread sequentialization or remove the debug option. |
@@ -129,7 +130,7 @@ the first passthrough candidate.
 | `FAILED. The run did not match the target criteria. Try --search.` | Configuration | A single analyze execution did not satisfy its target predicate. | Correct the predicate/input or add `--search`. |
 | `First run matched criteria but second run did not` | Configuration | A supposed target execution is not reproducible. | Fix external inputs and unsupported calls before minimizing. Pin `--analyze-seed` and workload inputs. |
 | `--selfcheck requires perfect reproducibility` | Configuration | Repeated logs differed during analyzer self-check. | Stabilize the workload. Removing `--selfcheck` only disables the diagnostic. |
-| `preemptions recorded ... did not match replayed ... (no fixed point)` | Configuration | Recorded preemption points could not be replayed exactly. | Disable `--imprecise-timers`, use the same binary/inputs/host PMU setup, and record again. |
+| `preemptions recorded ... did not match replayed ... (no fixed point)` | Configuration | Recorded preemption points could not be replayed exactly. | Disable `--allow-nondet-skid`, use the same binary/inputs/host PMU setup, and record again. |
 | `Expectations not met ... baseline run matched target criteria` | Configuration | The target filter also accepts the baseline, so search has no opposite outcomes. | Tighten or correct the target predicate. |
 | `Final run expected match=..., observed opposite` | Internal bug | Analyze's final replay contradicted its chosen pole. | Preserve report/log/preemption artifacts and report the reproducer. |
 | `--run1-schedule` or `--run2-schedule` ends in `not implemented` | Unsupported | These accepted analyzer inputs have no implementation. | Use `--run1-preemptions`, `--run2-preemptions`, or seed-based runs instead. |

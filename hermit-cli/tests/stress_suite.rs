@@ -518,7 +518,7 @@ fn cas_search_command(seed: u64, schedule: &Path) -> Command {
             "run",
             "--base-env=minimal",
             "--chaos",
-            "--imprecise-timers",
+            "--allow-nondet-skid",
             "--max-timeslice=10000000",
             "--no-virtualize-cpuid",
         ])
