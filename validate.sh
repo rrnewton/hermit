@@ -23,8 +23,18 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
+#   ./validate.sh --label-pr                 # on a fully-green full run, tag the
+#                                            # current branch's PR
+#                                            # 'locally-validated' (opt-in; env
+#                                            # VALIDATE_LABEL_PR=1 is equivalent,
+#                                            # PR_NUMBER=N overrides detection)
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
+# Opt-in PR auto-labeling. Off unless --label-pr or VALIDATE_LABEL_PR is set;
+# never mutate a live PR as a silent side effect of a routine local run.
+LABEL_PR=0
+[[ -n ${VALIDATE_LABEL_PR:-} ]] && LABEL_PR=1
+PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
@@ -32,6 +42,7 @@ while [[ $# -gt 0 ]]; do
             ENVELOPE_MODE="only"; ENVELOPE_BASELINE=${2:-}
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
+        --label-pr) LABEL_PR=1; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
@@ -425,6 +436,47 @@ function envelope_compare {
     return "$regressed"
 }
 
+# Auto-apply the `locally-validated` PR label after a fully-green full run.
+# Landing gate policy is: validate.sh passes locally -> PR carries the
+# `locally-validated` label. Agents kept forgetting the manual `gh pr edit`, so
+# this automates it -- but only when opted in via --label-pr / VALIDATE_LABEL_PR.
+# The PR is taken from $PR_NUMBER when set, else detected from the current branch
+# via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
+# never changes validation's exit status.
+readonly LOCALLY_VALIDATED_LABEL="locally-validated"
+
+function apply_locally_validated_label {
+    local pr=$PR_NUMBER
+    local -a gh_cmd=(gh)
+
+    if ! command -v gh >/dev/null 2>&1; then
+        printf "⚠️  --label-pr: gh CLI not found; skipping '%s' label\n" \
+            "$LOCALLY_VALIDATED_LABEL" >&2
+        return 0
+    fi
+    # gh on Meta devservers needs the forward proxy; mirror ensure_cargo_nextest.
+    if command -v with-proxy >/dev/null 2>&1; then
+        gh_cmd=(with-proxy gh)
+    fi
+
+    if [[ -z $pr ]]; then
+        pr=$("${gh_cmd[@]}" pr view --json number -q .number 2>/dev/null) || true
+    fi
+    if [[ -z $pr ]]; then
+        printf "⚠️  --label-pr: no PR found for the current branch; skipping '%s' label\n" \
+            "$LOCALLY_VALIDATED_LABEL" >&2
+        return 0
+    fi
+
+    if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
+        >>"$LOG_FILE" 2>&1; then
+        printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
+    else
+        printf "⚠️  --label-pr: failed to add '%s' label to PR #%s (full log: %s)\n" \
+            "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
+    fi
+}
+
 function print_summary {
     local passed=$((checks - failures))
     if ((failures == 0)); then
@@ -494,4 +546,11 @@ wait_for_background_checks
 run_envelope
 
 print_summary
+
+# On a fully-green full run, optionally tag the PR as locally validated. Guarded
+# so it runs only when opted in; it must not affect the final exit status below.
+if ((failures == 0)) && ((LABEL_PR == 1)); then
+    apply_locally_validated_label
+fi
+
 ((failures == 0))
