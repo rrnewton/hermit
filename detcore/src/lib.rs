@@ -84,6 +84,7 @@ use tool_global::deregister_thread;
 use tool_global::thread_observe_time;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
 pub use tool_local::thread_rng_from_parent;
@@ -834,6 +835,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
+                    // POSIX timers are shared among threads of a process but are
+                    // NOT inherited across fork(2). Share the table for a new
+                    // thread (CLONE_THREAD); give a new process a fresh, empty
+                    // one.
+                    posix_timers: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.posix_timers)
+                    } else {
+                        Arc::new(Mutex::new(PosixTimers::default()))
+                    },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -1215,6 +1225,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+
+            // POSIX per-process timers. Arming is tracked against the virtual
+            // clock so these verify deterministically under --strict; timer
+            // expiration signals are not delivered (see handle_timer_create).
+            Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
+            Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
+            Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
+            Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
+            Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
+
+            // Serialized threads share a total memory order, so process-wide
+            // memory barriers are trivially satisfied and can be no-ops.
+            Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {
