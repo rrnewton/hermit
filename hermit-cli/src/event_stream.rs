@@ -81,12 +81,12 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
         close | fchdir | dup | time | unlink => 1,
         access | stat | fstat | lstat | dup2 | clock_gettime | gettimeofday | settimeofday
         | mkdir | statfs | fstatfs => 2,
-        mprotect | read | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
+        mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
         | readlink | unlinkat | open | execve => 3,
         pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
-        statx | pwritev | setsockopt | getsockopt | execveat => 5,
-        recvfrom | sendto | pwritev2 | mmap => 6,
+        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat => 5,
+        recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
     })
 }

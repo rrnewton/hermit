@@ -48,6 +48,11 @@ pub struct Event {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SyscallEvent {
     Bytes(Vec<u8>),
+    /// The flattened output bytes of a vectored read (`readv`/`preadv`/
+    /// `preadv2`). The bytes are stored contiguously in read order; on replay
+    /// they are scattered back across the guest's `iovec` buffers. The length of
+    /// the vector is exactly the return value of the syscall.
+    Readv(Vec<u8>),
     Write(i64),
     Mmap(MmapEvent),
     Recvmsg(RecvmsgEvent),
@@ -98,6 +103,12 @@ pub struct TimespecEvent {
     pub timespec: Timespec,
 }
 
+/// Records the guest-visible outputs of a `poll` or `ppoll` call. Both syscalls
+/// have identical output semantics (the updated `pollfd` array plus a return
+/// count), so they share this event. `ppoll`'s temporary signal mask only
+/// affects which signals can interrupt the wait; a resulting `EINTR` (or a
+/// timeout returning 0) is captured by the enclosing `Event`'s `Result` and
+/// return count respectively, so no extra fields are needed here.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PollEvent {
     /// The complete list of file descriptors. Note that only the `revents` field

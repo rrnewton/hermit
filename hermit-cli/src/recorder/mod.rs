@@ -84,6 +84,9 @@ impl Tool for Recorder {
             //Sysno::arch_prctl,
             Sysno::read,
             Sysno::pread64,
+            Sysno::readv,
+            Sysno::preadv,
+            Sysno::preadv2,
             Sysno::recvfrom,
             Sysno::recvmsg,
             Sysno::write,
@@ -126,6 +129,7 @@ impl Tool for Recorder {
             Sysno::sendto,
             Sysno::sendmsg,
             Sysno::poll,
+            Sysno::ppoll,
             Sysno::epoll_wait,
             Sysno::getsockopt,
             Sysno::getpeername,
@@ -165,6 +169,33 @@ impl Tool for Recorder {
             }
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
+            Syscall::Readv(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.len(),
+                    syscall.into(),
+                )
+                .await
+            }
+            Syscall::Preadv(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len(),
+                    syscall.into(),
+                )
+                .await
+            }
+            Syscall::Preadv2(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len() as usize,
+                    syscall.into(),
+                )
+                .await
+            }
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
             Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
@@ -214,6 +245,7 @@ impl Tool for Recorder {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {

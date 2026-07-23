@@ -13,6 +13,8 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
+use reverie::syscalls::PollFd;
+use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::family::SockOptFamily;
@@ -85,6 +87,33 @@ impl Replayer {
         // Write out the recorded fds (if any).
         if let Some(addr) = syscall.fds() {
             guest.memory().write_values(addr, &event.fds)?;
+        }
+
+        Ok(event.updated as i64)
+    }
+
+    pub(super) async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Ppoll,
+    ) -> Result<i64, Errno> {
+        // `ppoll` shares `poll`'s recorded output (the updated pollfd array and
+        // return count), so it reuses the `Poll` event. We restore every
+        // recorded `revents` field without consulting live descriptors, and we
+        // never inject the call, so the recorded temporary signal mask has no
+        // replay effect (a recorded `EINTR` is reproduced via the event's
+        // `Result`, handled before we get here).
+        let event = next_event!(guest, Poll)?;
+
+        let nfds = syscall.nfds() as usize;
+        assert_eq!(event.fds.len(), nfds);
+
+        // Write out the recorded fds (if any). `Ppoll::fds()` is typed as
+        // `AddrMut<libc::pollfd>`; cast to the layout-compatible `PollFd`.
+        if let Some(addr) = syscall.fds() {
+            guest
+                .memory()
+                .write_values(addr.cast::<PollFd>(), &event.fds)?;
         }
 
         Ok(event.updated as i64)

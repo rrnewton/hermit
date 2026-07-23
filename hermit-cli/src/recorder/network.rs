@@ -15,6 +15,7 @@ use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
+use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Syscall;
@@ -98,6 +99,39 @@ impl Recorder {
             // `sleep` call and will always return 0 after a "timeout".
             if let Some(addr) = syscall.fds() {
                 guest.memory().read_values(addr.into(), &mut fds)?;
+            }
+
+            let updated = ret as usize;
+            Ok(SyscallEvent::Poll(PollEvent { fds, updated }))
+        });
+
+        self.record_event(guest, event);
+
+        result
+    }
+
+    pub(super) async fn handle_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Ppoll,
+    ) -> Result<i64, Errno> {
+        let len = syscall.nfds() as usize;
+        let result = guest.inject(syscall).await;
+
+        let event = result.and_then(|ret| {
+            let mut fds = vec![PollFd::default(); len];
+
+            // `ppoll` shares `poll`'s output semantics: the kernel writes the
+            // `revents` field of each pollfd. `Ppoll::fds()` is typed as
+            // `AddrMut<libc::pollfd>`, which is layout-compatible with the
+            // `PollFd` we store, so we cast the address and read the whole array.
+            //
+            // A NULL fds pointer (a pure `ppoll` sleep) leaves `fds` empty and
+            // records `updated == 0` on timeout.
+            if let Some(addr) = syscall.fds() {
+                guest
+                    .memory()
+                    .read_values(addr.cast::<PollFd>().into(), &mut fds)?;
             }
 
             let updated = ret as usize;
