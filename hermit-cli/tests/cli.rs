@@ -271,6 +271,84 @@ fn run_kvm_executes_dynamic_guest() {
 }
 
 #[test]
+fn run_kvm_resolves_bare_program_from_guest_path() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "echo",
+        "from-kvm-path",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "from-kvm-path\n");
+}
+
+#[test]
+fn run_kvm_propagates_explicit_environment() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=empty",
+        "--env=KVM_M3C=passed",
+        "--",
+        "/usr/bin/env",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "KVM_M3C=passed\n");
+}
+
+#[test]
+fn run_kvm_respects_workdir_for_relative_paths() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create KVM cwd fixture");
+    fs::write(temp.path().join("message.txt"), b"from-kvm-cwd\n")
+        .expect("failed to write KVM cwd fixture");
+    let workdir = temp
+        .path()
+        .to_str()
+        .expect("temporary path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--tmp=/tmp",
+        "--workdir",
+        workdir,
+        "--",
+        "/bin/cat",
+        "message.txt",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "from-kvm-cwd\n");
+}
+
+#[test]
 fn namespace_only_rejects_every_explicit_backend() {
     for backend in ["ptrace", "dbi", "kvm"] {
         let args = [

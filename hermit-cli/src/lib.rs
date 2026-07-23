@@ -292,29 +292,75 @@ async fn run_kvm(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let image = fs::read(&program)
-        .map_err(|error| anyhow!("failed to read KVM guest executable {program:?}: {error}"))?;
-
-    let argv = std::iter::once(program.clone())
-        .chain(
-            command
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned()),
+    let requested_cwd = command
+        .get_current_dir()
+        .map(Path::to_owned)
+        .unwrap_or(std::env::current_dir()?);
+    let cwd = fs::canonicalize(&requested_cwd).map_err(|error| {
+        anyhow!(
+            "failed to resolve KVM guest working directory {:?}: {error}",
+            requested_cwd
         )
-        .collect::<Vec<_>>();
+    })?;
+    let program = command
+        .get_program()
+        .to_str()
+        .ok_or_else(|| anyhow!("KVM guest executable path is not valid UTF-8"))?
+        .to_owned();
+    if !cwd.is_dir() {
+        return Err(anyhow!(
+            "KVM guest working directory is not a directory: {:?}",
+            cwd
+        ));
+    }
+    let resolved_program = command.find_program().map_err(|error| {
+        anyhow!("failed to resolve KVM guest executable {program:?} in the guest PATH: {error}")
+    })?;
+    let image = fs::read(&resolved_program).map_err(|error| {
+        anyhow!(
+            "failed to read KVM guest executable {:?}: {error}",
+            resolved_program
+        )
+    })?;
+
+    let mut argv = Vec::with_capacity(1 + command.get_args().count());
+    argv.push(program.clone());
+    for argument in command.get_args() {
+        argv.push(
+            argument
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest argument is not valid UTF-8"))?
+                .to_owned(),
+        );
+    }
+    let envp = command
+        .get_captured_envs()
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest environment key is not valid UTF-8"))?;
+            let value = value
+                .to_str()
+                .ok_or_else(|| anyhow!("KVM guest environment value is not valid UTF-8"))?;
+            Ok(format!("{key}={value}"))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     tracing::info!(
         target: "hermit::kvm",
         program = %program,
         argv = ?argv,
+        cwd = %cwd.display(),
+        env_count = envp.len(),
         "launching guest through reverie-kvm",
     );
     let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
     let mut backend = reverie_kvm::KvmBackend::new(KVM_GUEST_MEMORY_BYTES)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     backend
-        .install_static_elf_with_args(&image, &argv, &[])
+        .install_static_elf_with_context(&image, &argv, &envp, &cwd)
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
 
     let (global_state, code, stdout, stderr) = backend

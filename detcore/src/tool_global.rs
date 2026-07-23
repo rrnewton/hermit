@@ -412,6 +412,10 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
             }
+            GlobalRequest::MarkPastFirstExecve => {
+                self.past_first_execve.store(true, SeqCst);
+                R::MarkPastFirstExecve(())
+            }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
                 R::CreateChildThread(
@@ -1104,6 +1108,9 @@ pub enum GlobalRequest {
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
 
+    /// Mark the initial image transition complete for backends that begin post-exec.
+    MarkPastFirstExecve,
+
     /// The parent is adding a child-thread to the round-robin pool.  Contains the dettid
     /// of the new child and it's starting scheduler priority IF it is available to the caller.
     /// The only scenario where the Priority will be missing is when we're replaying preemptions.
@@ -1167,6 +1174,7 @@ pub enum GlobalResponse {
     RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
+    MarkPastFirstExecve(()),
     CreateChildThread(()),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
@@ -1186,6 +1194,15 @@ pub enum GlobalResponse {
     AddUsedPort,
     ReleasePort(Option<u16>),
     PortFull,
+}
+
+pub async fn mark_past_first_execve<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve).await;
+    assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
 }
 
 pub async fn send_and_update_time<G, T>(
