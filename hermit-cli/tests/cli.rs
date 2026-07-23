@@ -152,6 +152,7 @@ fn run_help_exposes_determinism_modes() {
     let help = stdout(&output);
 
     for option in [
+        "--strict",
         "--sequentialize-threads",
         "--chaos",
         "--verify",
@@ -165,6 +166,26 @@ fn run_help_exposes_determinism_modes() {
     ] {
         assert!(help.contains(option), "missing {option:?} in run help");
     }
+}
+
+#[test]
+fn run_strict_flag_is_accepted_and_runs() {
+    // Regression test for GH #12: `docs/Users.md` documents
+    // `hermit run --strict ...`, and the CLI must accept that spelling and run
+    // the guest to completion. Strict determinism is the default, so `--strict`
+    // is a compatibility no-op over the defaults. `--preemption-timeout=disabled`
+    // and `--no-virtualize-cpuid` keep this runnable on hosts without accessible
+    // PMU counters or CPUID faulting; neither weakens what `--strict` controls.
+    let args = [
+        "run",
+        "--strict",
+        "--preemption-timeout=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
 }
 
 #[test]
