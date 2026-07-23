@@ -1278,7 +1278,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
 
-
             // POSIX per-process timers. Arming is tracked against the virtual
             // clock so these verify deterministically under --strict; timer
             // expiration signals are not delivered (see handle_timer_create).
@@ -1303,7 +1302,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getcwd(_) => self.passthrough(guest, call).await,
             // Filesystem statistics: passthrough is record/replay-aware so the
             // (otherwise host-dependent) result is captured and reproduced.
-            Syscall::Statfs(_) => self.passthrough(guest, call).await,
             Syscall::Fstatfs(_) => self.passthrough(guest, call).await,
 
             _ => {
