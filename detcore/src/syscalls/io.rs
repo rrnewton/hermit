@@ -10,8 +10,10 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::os::unix::io::RawFd;
 use std::time::Duration;
 
+use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -21,6 +23,7 @@ use tracing::debug;
 use tracing::trace;
 
 use crate::config::SchedHeuristic;
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -120,7 +123,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        // Register the epoll fd in the DetFd table like every other
+        // fd-creating syscall (openat, eventfd2, pipe2, socket, ...). Without
+        // this, later operations that consult the table via `with_detfd` /
+        // `dup_fd` (F_GETFL, F_SETFD, F_DUPFD[_CLOEXEC], dup, ...) would fail
+        // with EBADF even though the underlying kernel fd is valid. This broke,
+        // for example, running rustup proxies (cargo/rustc) under hermit, whose
+        // tokio runtime dups its epoll fd at startup.
+        //
+        // EPOLL_CLOEXEC shares the same bit value as O_CLOEXEC, so we can carry
+        // the cloexec flag straight across.
+        self.add_fd(
+            guest,
+            fd,
+            OFlag::from_bits_truncate(call.flags().bits()),
+            FdType::Epoll,
+        )
+        .await?;
+        Ok(fd as i64)
     }
 
     /// epoll_ctl syscall
