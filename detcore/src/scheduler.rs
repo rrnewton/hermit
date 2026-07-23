@@ -1413,36 +1413,55 @@ impl Scheduler {
             // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
             // the meantime, use a deterministic eager policy once there is no other runnable work.
             if self.recordreplay_modes {
-                // Waiting here while deterministic work is runnable can deadlock thread creation:
-                // the parent and new child cannot complete clone while an existing worker blocks
-                // indefinitely in epoll_wait.
-                if !self.run_queue.is_empty() {
+                // Only *real* deterministic work should defer external-IO harvesting.
+                // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
+                // the very result an external-IO blocker will produce (e.g. the reader
+                // side of `echo hi | cat`, where one stage uses InternalIOPolling while
+                // its peer is backgrounded on BlockingExternalIO). Treat a run queue
+                // that holds only pollers as "no deterministic work" so we still harvest
+                // completed IO below; a queued poller must not starve a ready blocker.
+                let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
+                    fp >= LAST_PRIORITY
+                } else {
+                    true
+                };
+
+                // Deterministic work is runnable: let it proceed. Waiting here while such
+                // work exists can deadlock thread creation -- the parent and new child
+                // cannot complete clone while an existing worker blocks indefinitely in
+                // epoll_wait.
+                if !self.run_queue.is_empty() && !only_pollers {
                     return Ok(());
                 }
 
-                let first_dtid: DetTid = *self
-                    .blocked
-                    .external_io_blockers
-                    .keys()
-                    .next()
-                    .expect("internal logic error"); // See above blockers_empty check.
-                if ready.contains(&first_dtid) {
-                    info!(
-                        "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
-                        first_dtid
-                    );
-                    self.blocked.external_io_blockers.remove(&first_dtid);
-                    self.run_queue.push_eager_io_repoll(first_dtid);
+                // Reschedule every blocker whose IO has completed so its continuation can
+                // consume the recorded result. Harvesting all ready blockers (not just the
+                // first) and doing so even when pollers are queued is what breaks the
+                // record-mode pipe livelock: previously a queued poller made this branch
+                // return early forever, so the completed read/write was never rescheduled
+                // and the poller spun on data that never arrived.
+                if !ready.is_empty() {
+                    for ready_dtid in &ready {
+                        info!(
+                            "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
+                            ready_dtid
+                        );
+                        self.blocked.external_io_blockers.remove(ready_dtid);
+                        self.run_queue.push_eager_io_repoll(*ready_dtid);
+                    }
                     return Ok(());
-                } else {
-                    // FIXME TODO (T137183027): We implement a busy-wait by going around the scheduler loop again.
-                    trace!(
-                        "[step2] TEMPORARY1: eagerly blocking on external IO for dtid {:?}.  SPINNING!",
-                        first_dtid
-                    );
-                    std::thread::yield_now();
-                    return Err(SkipTurn);
                 }
+
+                // No completed IO yet, and nothing but pollers (or nothing) to run. The
+                // blocking syscalls are executing in the host kernel; go around the loop
+                // and re-check readiness. (Still a busy-wait; see T137183027 for the
+                // record-the-nondeterministic-event fix.)
+                trace!(
+                    "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
+                    &self.blocked.external_io_blockers
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
             } // End region which should be deleted.
 
             // Nondeterminsitic algorithm: the unblocked background action jumps back in randomly.
