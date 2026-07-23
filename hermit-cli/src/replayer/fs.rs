@@ -24,6 +24,7 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Replayer;
+use crate::event::deterministic_ioctl_error;
 
 /// Scatter the recorded flat output `bytes` of a vectored read back into the
 /// guest's `iovec` array, filling each buffer in order until the bytes are
@@ -185,6 +186,10 @@ impl Replayer {
         syscall: Ioctl,
     ) -> Result<i64, Errno> {
         let request = syscall.request();
+
+        if deterministic_ioctl_error(&request).is_some() {
+            return next_event!(guest, Return);
+        }
 
         if matches!(
             request,
