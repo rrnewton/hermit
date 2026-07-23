@@ -28,6 +28,7 @@ use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use rand::SeedableRng;
+use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
 use reverie::syscalls::Syscall;
@@ -152,6 +153,14 @@ pub struct FutexWaiter {
     dettid: DetTid,
     response: Ivar<SchedResponse>,
     bitset: u32,
+}
+
+/// Deterministically pick one element from `choices` using the supplied PRNG,
+/// returning `None` for an empty slice. This is the single random-selection
+/// primitive used by the targeted-chaos scheduling points, so their choices stay
+/// reproducible under a fixed `--fuzz-seed`.
+fn chaos_pick<T: Copy>(prng: &mut Pcg64Mcg, choices: &[T]) -> Option<T> {
+    choices.choose(prng).copied()
 }
 
 fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -> Vec<FutexWaiter> {
@@ -323,6 +332,10 @@ pub struct Scheduler {
     recordreplay_modes: bool,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
+    /// A cached copy of the same (immutable) field in Config. When set (and only
+    /// meaningful in chaos mode) the scheduler biases its nondeterminism points
+    /// toward known race patterns rather than exploring uniformly.
+    chaos_target_races: bool,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -832,6 +845,7 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
+            chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
         }
     }
@@ -1212,8 +1226,26 @@ impl Scheduler {
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
     // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
-    fn select_signal_target(&self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
-        // TODO(T137242449): chaos selection point for fuzzing all nondeterministic semantics:
+    fn select_signal_target(&mut self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
+        // Targeted chaos (T137242449): a process-directed signal may legally be
+        // handled by any thread in the group that does not block it. Instead of
+        // always steering it to the hinted/leader thread, pick a random eligible
+        // thread to surface signal-timing races. This stays reproducible under a
+        // fixed `--fuzz-seed`.
+        if self.chaos_target_races {
+            let group = self.thread_tree.my_thread_group(&detpid);
+            let eligible: Vec<DetTid> = group
+                .into_iter()
+                .filter(|t| !matches!(self.thread_status(*t), ThreadStatus::Gone))
+                .collect();
+            if let Some(chosen) = chaos_pick(&mut self.fuzz_prng, &eligible) {
+                info!(
+                    "[targeted-chaos] delivering process-directed signal to random group thread {} (of {:?})",
+                    chosen, eligible
+                );
+                return chosen;
+            }
+        }
 
         if let Some(dettid) = m_dettid {
             match self.thread_status(dettid) {
@@ -1333,8 +1365,19 @@ impl Scheduler {
             nxt.req = Ivar::full(Ok(rsrcs));
         }
 
-        // TODO(T137242449): randomize choice of front/back and priority under --chaos:
-        self.runqueue_push_back(dettid);
+        // Targeted chaos (T137242449): a force-unblocked thread (e.g. woken by a
+        // signal or ready I/O) is normally requeued at the back of its priority
+        // level, so it runs after everything already queued. Randomizing whether
+        // it jumps to the front instead varies the order in which a just-woken
+        // thread races the threads it was contending with -- surfacing
+        // lock-ordering / wakeup-ordering races. Reproducible under `--fuzz-seed`.
+        let to_front = self.chaos_target_races
+            && chaos_pick(&mut self.fuzz_prng, &[true, false]).unwrap_or(false);
+        if to_front {
+            self.runqueue_push_front(dettid);
+        } else {
+            self.runqueue_push_back(dettid);
+        }
     }
 
     /// Check on threads that were backgrounded performing external IO.
@@ -2303,6 +2346,43 @@ mod test {
             response: Ivar::new(),
             bitset,
         }
+    }
+
+    #[test]
+    fn chaos_pick_is_seed_deterministic_and_covers_all_choices() {
+        let choices = [10, 20, 30, 40];
+
+        // Same seed => identical sequence of picks (the reproducibility that
+        // targeted chaos relies on).
+        let mut a = Pcg64Mcg::seed_from_u64(1234);
+        let mut b = Pcg64Mcg::seed_from_u64(1234);
+        for _ in 0..64 {
+            assert_eq!(chaos_pick(&mut a, &choices), chaos_pick(&mut b, &choices));
+        }
+
+        // Over enough draws every choice is reachable (the bias actually explores
+        // the space rather than pinning one option).
+        let mut prng = Pcg64Mcg::seed_from_u64(9);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            seen.insert(chaos_pick(&mut prng, &choices).unwrap());
+        }
+        assert_eq!(
+            seen,
+            choices.iter().copied().collect(),
+            "chaos_pick should be able to return every choice"
+        );
+
+        // An empty slice yields None rather than panicking.
+        assert_eq!(chaos_pick(&mut prng, &[] as &[i32]), None);
+
+        // The front/back coin flip used by force_unblock_thread reaches both.
+        let mut prng = Pcg64Mcg::seed_from_u64(7);
+        let mut both = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            both.insert(chaos_pick(&mut prng, &[true, false]).unwrap());
+        }
+        assert_eq!(both, [false, true].into_iter().collect());
     }
 
     #[test]

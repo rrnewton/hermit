@@ -210,6 +210,43 @@ fn chaos_demo_command(seed: Option<u64>) -> Command {
     command
 }
 
+/// Like [`chaos_demo_command`] but always in chaos mode, optionally enabling
+/// targeted chaos (`--chaos-target-races`).
+fn chaos_demo_command_targeted(seed: u64, targeted: bool) -> Command {
+    let mut command = timed_hermit_command(COMMAND_TIMEOUT_SECONDS);
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--preemption-timeout=disabled",
+        "--no-virtualize-cpuid",
+        "--chaos",
+        "--sched-heuristic=random",
+    ]);
+    if targeted {
+        command.arg("--chaos-target-races");
+    }
+    command.arg(format!("--seed={seed}"));
+    command.arg(chaos_demo_binary());
+    command
+}
+
+fn run_chaos_demo_targeted(seed: u64, targeted: bool) -> Output {
+    let mut command = chaos_demo_command_targeted(seed, targeted);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "chaos demo (seed={seed}, targeted={targeted}) failed unexpectedly: {rendered}\n\
+         status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
 fn run_chaos_demo(seed: Option<u64>) -> Output {
     let label = seed.map_or_else(
         || "default chaos demonstration".to_owned(),
@@ -291,6 +328,44 @@ fn chaos_finds_and_reproduces_order_violation() {
     assert_eq!(second_replay.status, first_replay.status);
     assert_eq!(first_replay.stdout, b"ERROR! global_str is null at use.\n");
     assert_eq!(second_replay.stdout, first_replay.stdout);
+}
+
+/// Targeted chaos (`--chaos-target-races`) biases scheduling toward race
+/// patterns, so within a fixed seed budget it should expose the known
+/// order-violation race in at least as many seeds as uniform chaos, while
+/// remaining reproducible under a fixed seed.
+#[test]
+#[ignore = "explicit fast stress tier"]
+fn targeted_chaos_finds_order_violation_at_least_as_often() {
+    let _guard = hermit_run_lock();
+
+    let exposes_bug = |output: &Output| output.status.code() == Some(1);
+
+    let baseline_seeds: Vec<u64> = (0..=15)
+        .filter(|seed| exposes_bug(&run_chaos_demo_targeted(*seed, false)))
+        .collect();
+    let targeted_seeds: Vec<u64> = (0..=15)
+        .filter(|seed| exposes_bug(&run_chaos_demo_targeted(*seed, true)))
+        .collect();
+
+    assert!(
+        !targeted_seeds.is_empty(),
+        "targeted chaos should still expose the order-violation race within seeds 0..=15"
+    );
+    assert!(
+        targeted_seeds.len() >= baseline_seeds.len(),
+        "targeted chaos should expose the race in at least as many seeds as uniform chaos \
+         (targeted={targeted_seeds:?}, baseline={baseline_seeds:?})"
+    );
+
+    // The exposed failure remains reproducible under a fixed seed.
+    let seed = targeted_seeds[0];
+    let first = run_chaos_demo_targeted(seed, true);
+    let second = run_chaos_demo_targeted(seed, true);
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(first.stdout, b"ERROR! global_str is null at use.\n");
+    assert_eq!(second.status, first.status);
+    assert_eq!(second.stdout, first.stdout);
 }
 
 #[test]

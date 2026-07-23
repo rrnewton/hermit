@@ -116,6 +116,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// Standardized test config: common options on.
@@ -167,6 +168,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// Standardized test config: all options on.
@@ -218,6 +220,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// A basic oracle, which expects a success exit code.

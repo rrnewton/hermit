@@ -103,6 +103,16 @@ pub struct Config {
     #[clap(long)]
     pub fuzz_futexes: bool,
 
+    /// Targeted chaos: bias scheduling toward known concurrency race patterns
+    /// instead of exploring interleavings uniformly. At the scheduler's existing
+    /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
+    /// process-directed signal to a randomly chosen thread in the group (signal
+    /// timing races) and (b) randomize the requeue position of a force-unblocked
+    /// thread (lock-ordering / wakeup races). Only takes effect with `--chaos`;
+    /// like the rest of chaos mode it remains reproducible under a fixed seed.
+    #[clap(long)]
+    pub chaos_target_races: bool,
+
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
     #[clap(long)]
@@ -454,6 +464,9 @@ impl fmt::Display for Config {
 
         if self.fuzz_futexes {
             write!(f, " --fuzz-futexes")?;
+        }
+        if self.chaos_target_races {
+            write!(f, " --chaos-target-races")?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
