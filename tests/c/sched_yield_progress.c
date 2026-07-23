@@ -29,6 +29,9 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static atomic_int g_ready = 0;
 static atomic_ullong g_value = 0;
@@ -46,7 +49,7 @@ static void* worker(void* arg) {
   return NULL;
 }
 
-int main(void) {
+static int run_progress(void) {
   pthread_t t;
   if (pthread_create(&t, NULL, worker, NULL) != 0) {
     fprintf(stderr, "pthread_create failed\n");
@@ -65,5 +68,38 @@ int main(void) {
 
   unsigned long long value = atomic_load_explicit(&g_value, memory_order_seq_cst);
   printf("sched-yield-progress-ok %llu\n", value);
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 1 || (argc == 2 && strcmp(argv[1], "--vfork-child") == 0)) {
+    return run_progress();
+  }
+  if (argc != 2 || strcmp(argv[1], "--vfork") != 0) {
+    fprintf(stderr, "usage: %s [--vfork|--vfork-child]\n", argv[0]);
+    return 4;
+  }
+
+  pid_t child = vfork();
+  if (child < 0) {
+    perror("vfork");
+    return 5;
+  }
+  if (child == 0) {
+    execl(argv[0], argv[0], "--vfork-child", NULL);
+    _exit(127);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 6;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "vfork child failed: status=%d\n", status);
+    return 7;
+  }
+
+  printf("vfork-sched-yield-progress-ok\n");
   return 0;
 }
