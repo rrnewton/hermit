@@ -1383,7 +1383,12 @@ pub async fn create_vfork_child_thread<G, T>(
             "vfork child priority entropy missing in chaos mode",
         )))
     } else {
-        Some(DEFAULT_PRIORITY)
+        // POSIX vfork suspends the parent until the child execs or _exits. Give
+        // the vfork child a strictly higher priority (lower number) than the
+        // parent's DEFAULT_PRIORITY so the deterministic scheduler always runs
+        // the child first, rather than round-robining the parent and child at
+        // equal priority (which leaves fork/exec ordering nondeterministic).
+        Some(DEFAULT_PRIORITY - 1)
     };
 
     let resp = send_and_update_time(
