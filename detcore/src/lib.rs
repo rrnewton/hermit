@@ -210,7 +210,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         precise_branch: bool,
     ) -> Option<Vec<SchedEvent>> {
         if self.cfg.max_timeslice.is_some() {
-            let precise_timers = !guest.config().imprecise_timers;
+            let precise_timers = !guest.config().allow_nondet_skid();
             // TODO(T86591083): we might need to not always increment as a hack fix
             // for deterministic virtual time without sequentialize threads.
             let clock_value = guest.read_clock().expect("Couldn't read clock");
@@ -450,7 +450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.last_rcb_timer_is_max = timer_is_max;
             }
 
-            if guest.config().imprecise_timers {
+            if guest.config().allow_nondet_skid() {
                 guest
                     .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
                     .expect("Failed to set timer");

@@ -85,7 +85,7 @@ pub struct AnalyzeOpts {
     )]
     pub minimize: bool,
 
-    /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
+    /// Use `--allow-nondet-skid` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
     #[clap(long)]
     pub imprecise_search: bool,
