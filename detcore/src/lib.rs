@@ -1185,6 +1185,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getgid(s) => self.passthrough(guest, Syscall::Getgid(s)).await,
             Syscall::Geteuid(s) => self.passthrough(guest, Syscall::Geteuid(s)).await,
             Syscall::Getegid(s) => self.passthrough(guest, Syscall::Getegid(s)).await,
+            // getresuid/getresgid read the (constant) real/effective/saved ids;
+            // deterministic for the same reason as getuid/getgid above.
+            Syscall::Getresuid(s) => self.passthrough(guest, Syscall::Getresuid(s)).await,
+            Syscall::Getresgid(s) => self.passthrough(guest, Syscall::Getresgid(s)).await,
             // Process/thread ids are deterministic: the guest runs in a fresh PID
             // namespace, so its namespaced ids are assigned identically each run
             // and are consistent with the ids fork/clone/wait report to it.
@@ -1194,8 +1198,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getpgrp(s) => self.passthrough(guest, Syscall::Getpgrp(s)).await,
             Syscall::Getpgid(s) => self.passthrough(guest, Syscall::Getpgid(s)).await,
             Syscall::Getsid(s) => self.passthrough(guest, Syscall::Getsid(s)).await,
+            // setpgid changes the (namespaced, deterministic) process-group id;
+            // success/failure is a function of the fixed PID namespace layout.
+            Syscall::Setpgid(s) => self.passthrough(guest, Syscall::Setpgid(s)).await,
             // Supplementary group list is constant for the guest.
             Syscall::Getgroups(s) => self.passthrough(guest, Syscall::Getgroups(s)).await,
+            // umask sets the file-mode creation mask and returns the previous
+            // value. The guest inherits a fixed umask from the container, so the
+            // returned prior mask and the resulting state are deterministic.
+            Syscall::Umask(s) => self.passthrough(guest, Syscall::Umask(s)).await,
             // chdir/fchdir change the (deterministic) working directory.
             Syscall::Chdir(s) => self.passthrough(guest, Syscall::Chdir(s)).await,
             Syscall::Fchdir(s) => self.passthrough(guest, Syscall::Fchdir(s)).await,
