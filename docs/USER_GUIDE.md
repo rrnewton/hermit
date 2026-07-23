@@ -294,6 +294,7 @@ reproducible target condition.
 | Option | Effect |
 | --- | --- |
 | `--strict` | Compatibility spelling for the current deterministic defaults. |
+| `--passthru-opt` | Use the reduced syscall subscription set for performance. Unlisted syscalls bypass Detcore, weakening deterministic accounting. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |

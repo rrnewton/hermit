@@ -662,7 +662,17 @@ fn strict_flag_preserves_deterministic_defaults() {
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
+    assert!(!ro.det_opts.det_config.passthru_opt);
     assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn passthru_optimization_requires_explicit_opt_in() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(ro.det_opts.det_config.passthru_opt);
+    assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
 }
 
 #[test]
@@ -747,6 +757,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
         "Disable deterministic I/O behavior",
+        "--passthru-opt",
+        "optimized partial syscall subscription set",
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",

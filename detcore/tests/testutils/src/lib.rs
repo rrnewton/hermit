@@ -74,6 +74,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,
@@ -126,6 +127,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,
@@ -178,6 +180,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,

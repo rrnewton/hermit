@@ -529,9 +529,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;
 
-        if cfg!(debug_assertions) {
+        if !config.passthru_opt {
+            // Fail closed by default in every build profile. Besides allowing syscall-specific
+            // handlers to run, interception is what charges generic syscall logical time.
             Subscription::all()
         } else {
+            // Explicit performance opt-in: unlisted syscalls bypass Detcore entirely. Keep this
+            // path separate so its allow-list can be tightened without weakening the default.
             let mut subscription = Subscription::none();
             subscription.syscalls([
                 Sysno::write,
@@ -1363,5 +1367,48 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    fn strict_config(passthru_opt: bool) -> Config {
+        Config {
+            sequentialize_threads: true,
+            deterministic_io: true,
+            passthru_opt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strict_subscriptions_intercept_every_event_by_default() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
+
+        assert_eq!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
+    }
+
+    #[test]
+    fn passthru_opt_uses_the_partial_subscription_set() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        assert_ne!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::clock_gettime)
+        );
+        assert!(
+            !subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
     }
 }
