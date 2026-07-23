@@ -84,6 +84,13 @@ pub struct Config {
     #[clap(long)]
     pub sequentialize_threads: bool,
 
+    /// Use the optimized partial syscall subscription set instead of intercepting every syscall.
+    /// This permits unlisted syscalls to bypass Detcore and therefore weakens deterministic
+    /// accounting; leave it disabled for fail-closed execution.
+    #[serde(default)]
+    #[clap(long)]
+    pub passthru_opt: bool,
+
     /// In chaos mode, uses much cheaper approximate preemption timers.  Only makes sense
     /// when recording preemptions for later (precise) replay.
     #[clap(long)]
@@ -446,6 +453,9 @@ impl fmt::Display for Config {
         }
         if !self.virtualize_metadata {
             write!(f, " --no-virtualize-metadata")?;
+        }
+        if self.passthru_opt {
+            write!(f, " --passthru-opt")?;
         }
         let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         if self.epoch != default_epoch {
