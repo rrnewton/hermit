@@ -42,7 +42,7 @@ notices rather than gating the whole tier.
 | `test-suite.sh --hardware`     | CI self-hosted     | capability-gated tiers; **fails loudly** if a required capability is gone |
 | `test-suite.sh --ci`           | full self-hosted   | `--portable` + `--hardware`, fail-loud                                    |
 | `test-suite.sh --local`        | (aggregate) local  | everything the host can run; missing capabilities **skip with a notice** |
-| `test-suite.sh --quick`        | inner-loop         | build + clippy + fmt + unit-regular + smoke                              |
+| `test-suite.sh --quick`        | inner-loop         | build + Hermit smoke/determinism/verify (fast smoke check)               |
 | `test-suite.sh --list [MODE]`  | humans / validate  | list tiers; `--plain` emits `<fg|bg>\t<tier>` for capability-present tiers |
 
 The fail-loud-in-CI / skip-with-notice-locally split follows the repository's

@@ -27,7 +27,7 @@
 #   test-suite.sh --ci                  Run the full suite (portable + hardware)
 #                                        and FAIL LOUDLY if a required capability
 #                                        is missing.
-#   test-suite.sh --quick               Fast subset for inner-loop iteration.
+#   test-suite.sh --quick               Fast smoke check (build + Hermit smoke).
 #   test-suite.sh --list [MODE] [--plain]
 #                                        List the tiers (optionally for a mode).
 #                                        --plain prints "<fg|bg> <tier>" lines
@@ -423,8 +423,10 @@ function main {
             ts_run_tiers "${_tiers[@]}"
             ;;
         --quick)
+            # Fast smoke check for inner-loop iteration: build just enough to run
+            # the Hermit smoke/determinism/verify probes.
             TS_MODE=local
-            ts_run_tiers build clippy fmt unit-regular smoke
+            ts_run_tiers build smoke
             ;;
         --*)
             echo "test-suite.sh: unknown option '$1'" >&2
