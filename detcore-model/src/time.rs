@@ -212,8 +212,14 @@ impl Add for LogicalTime {
 impl Add<Duration> for LogicalTime {
     type Output = Self;
     fn add(self, rhs: Duration) -> Self {
-        // Cast will be unsafe if rhs ever exceeds u64::MAX nanosecs
-        LogicalTime(self.0 + rhs.as_nanos() as u64)
+        // Saturate rather than panic on overflow. Large `Duration` values (e.g.
+        // the effectively-infinite timeouts the JVM passes to futex/nanosleep,
+        // GH #219) can push the nanosecond sum past u64::MAX; saturating keeps
+        // logical time monotonic and clamped at the maximum instead of aborting.
+        // The `as u64` cast also saturates a `u128` nanos value that exceeds
+        // u64::MAX down to u64::MAX before the add.
+        let rhs_nanos = u64::try_from(rhs.as_nanos()).unwrap_or(u64::MAX);
+        LogicalTime(self.0.saturating_add(rhs_nanos))
     }
 }
 
@@ -270,6 +276,25 @@ fn subsecond_units_are_converted_from_nanoseconds() {
     let timeval: Timeval = time.into();
     assert_eq!(timeval.tv_sec, 2);
     assert_eq!(timeval.tv_usec, 345_678);
+}
+
+#[test]
+fn add_duration_saturates_instead_of_overflowing() {
+    // Regression for GH #219: the JVM passes very large timeouts; adding such a
+    // Duration to an already-large LogicalTime used to overflow u64 and panic.
+    let near_max = LogicalTime(u64::MAX - 5);
+
+    // Nanoseconds that fit in u64 but overflow the sum -> clamp to u64::MAX.
+    let sum = near_max + Duration::from_nanos(1_000);
+    assert_eq!(sum, LogicalTime(u64::MAX));
+
+    // A Duration whose nanos exceed u64::MAX (as u128) also clamps, no panic.
+    let huge = near_max + Duration::from_secs(u64::MAX);
+    assert_eq!(huge, LogicalTime(u64::MAX));
+
+    // Non-overflowing adds are unchanged.
+    let normal = LogicalTime::from_secs(1) + Duration::from_nanos(500);
+    assert_eq!(normal, LogicalTime(1_000_000_500));
 }
 
 /// The same basic type alias as nanoseconds. Just for clarity/readability.
