@@ -543,6 +543,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#258): Confirm one-turn exclusion semantics across scheduler modes.
     /// End the current logical timeslice for a sequentialized sched_yield.
     pub async fn handle_sched_yield<G: Guest<Self>>(
         &self,
