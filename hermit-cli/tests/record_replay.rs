@@ -345,6 +345,37 @@ fn record_curl_version() {
     record_replay_command("curl", curl, &[OsStr::new("--version")]);
 }
 
+/// Regression test for the SQLite record/replay Mmap-event panic.
+///
+/// SQLite (via glibc's NSS/dynamic-linker path) issues a `recvmsg` carrying
+/// `SCM_RIGHTS`. Before recvmsg was recorded/replayed symmetrically, the
+/// `SyscallEvent` stream offset by one, so a later handler's `next_event!`
+/// consumed the large file-backed `libsqlite3.so` `MmapEvent` (~650 KiB) and
+/// panicked with "expected <X>, found Mmap(..)". The recvmsg record/replay fix
+/// realigned the stream; this test exercises the real `sqlite3` binary
+/// end-to-end so that regression is caught with the actual workload (the
+/// synthetic `c_recvmsg_scm_rights_mmap` guest covers only the mechanism).
+#[test]
+fn record_sqlite_memory_query() {
+    let _guard = hermit_record_lock();
+    let sqlite3 = [
+        Path::new("/usr/bin/sqlite3"),
+        Path::new("/usr/local/bin/sqlite3"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let Some(sqlite3) = sqlite3 else {
+        eprintln!("sqlite3 is not installed; skipping record/replay coverage");
+        return;
+    };
+
+    record_replay_command(
+        "sqlite",
+        sqlite3,
+        &[OsStr::new(":memory:"), OsStr::new("SELECT 1+1;")],
+    );
+}
+
 #[test]
 fn record_timeout_kills_guest_without_committing_partial_data() {
     let _guard = hermit_record_lock();
