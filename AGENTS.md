@@ -1,294 +1,8 @@
 # AGENTS.md
 
-This file applies to the entire repository.
-
-## Workspace Discipline
-
-All mutating agent work must happen in an assigned private worktree. Never let
-two agents modify the same checkout, and never do feature development in the
-primary checkout.
-
-### Vocabulary And Layout
-
-- **Parent**: `~/work/dev-hermit/`, the local multi-agent development root.
-- **Primary checkouts**: coordinator-owned integration surfaces that ordinary
-  agents read but never edit. There are two per product:
-  - `~/work/dev-hermit/hermit/` on `frontier` and
-    `~/work/dev-hermit/main/hermit/` on `main` for Hermit.
-  - `~/work/dev-hermit/reverie/` on `frontier` and
-    `~/work/dev-hermit/main/reverie/` on `main` for Reverie.
-  The primaries donate their warm `target/` caches to new slots.
-- **Slot**: a numbered feature worktree, `slotNN`. Each slot is a **direct**
-  Git worktree — the checkout root itself, not a subdirectory. Hermit slots
-  live at `~/work/dev-hermit/worktrees/slotNN`; Reverie slots live at the
-  parallel path `~/work/dev-hermit/worktrees_reverie/slotNN`.
-- **Feature branch**: a descriptive, task-specific branch checked out in one
-  slot. Slot directory names stay opaque and stable even as branches change.
-- **Primary branch**: `main` in `rrnewton/hermit`, the continuously tested
-  development branch checked out in `main/hermit/`.
-- **Upstream**: `facebookexperimental/hermit`, which receives periodic bulk
-  pull requests from tested fork `main` rather than day-to-day feature work.
-
-Expected layout:
-
-```text
-~/work/dev-hermit/
-|-- hermit/                     # Hermit primary; frontier; coordinator only
-|-- reverie/                    # Reverie primary; frontier; coordinator only
-|-- main/
-|   |-- hermit/                 # Hermit primary; main; rebase base
-|   `-- reverie/                # Reverie primary; main; rebase base
-|-- worktrees/                  # Hermit worktree tree, self-contained
-|   |-- ACTIVE.md               # Hermit slot assignments (source of truth)
-|   |-- ARCHIVED.md             # Hermit completed-slot history (append-only)
-|   |-- slot01                  # direct Hermit worktree (feature branch)
-|   |-- slot02
-|   `-- slotNN
-`-- worktrees_reverie/          # Reverie worktree tree, self-contained
-    |-- ACTIVE.md               # Reverie slot assignments
-    |-- ARCHIVED.md             # Reverie completed-slot history (append-only)
-    |-- slot01                  # direct Reverie worktree (feature branch)
-    |-- slot02
-    `-- slotNN
-```
-
-Each `worktrees*` directory is self-contained: its own `ACTIVE.md` and
-`ARCHIVED.md` track the slots beside them.
-
-Hermit and Reverie worktrees are independent: a Hermit-only task uses a
-`worktrees/slotNN` checkout and leaves any matching `worktrees_reverie/slotNN`
-untouched. A coordinated change uses the same slot number in both trees. Do not
-use branch names as worktree directory names. Do not create ad hoc checkouts
-elsewhere for normal work. If a requested slot contains unexpected changes,
-treat it as occupied: do not reset, clean, overwrite, or reuse it. Select
-another free slot and report the conflict to the coordinator.
-
-### Slot Pool
-
-Reuse existing numbered slots instead of removing and recreating worktrees.
-Keeping the worktree and its ignored `target/` directory avoids repeated
-dependency downloads and full rebuilds.
-
-A slot is in one of two states:
-
-- **Active**: checked out on a feature branch, owned by one agent/task, and
-  listed in its `ACTIVE.md` (`worktrees/ACTIVE.md` for Hermit,
-  `worktrees_reverie/ACTIVE.md` for Reverie).
-- **Parked**: clean, detached at a recorded commit, absent from that `ACTIVE.md`,
-  and available for reuse.
-
-Parking happens in place; do not `git worktree move` a slot. A detached slot is
-not abandoned work: its completed feature branch and commit SHA must already be
-recorded in the handoff and in the sibling `ARCHIVED.md`.
-
-Creating slots is a coordinator operation. From the parent root, create a
-Hermit and/or Reverie slot from the primaries with the helper:
-
-```bash
-./slot-init.sh slot0X            # Hermit + Reverie worktrees for slot0X
-./slot-init.sh slot0X hermit     # Hermit worktree only
-./slot-init.sh slot0X reverie    # Reverie worktree only
-```
-
-The helper runs `git -C <primary> worktree add` against the owning repository
-(`hermit` for `worktrees/slotNN`, `reverie` for `worktrees_reverie/slotNN`),
-never `git worktree add` from the parent. The primary is the build-cache donor.
-When a new or refreshed slot has no `target/`, seed it with a copy-on-write
-copy when the filesystem supports reflinks:
-
-```bash
-cp -a --reflink=auto ~/work/dev-hermit/hermit/target \
-  ~/work/dev-hermit/worktrees/slot0X/
-```
-
-Never symlink `target/` between checkouts: concurrent Cargo processes must not
-write to the same target directory. Cache seeding is optional when the donor
-does not exist or is stale; correctness must not depend on cached artifacts.
-
-### Starting Work In A Slot
-
-The coordinator assigns one free slot to exactly one agent. Before editing:
-
-1. Confirm the slot is a registered worktree and inspect its state:
-
-   ```bash
-   git -C ~/work/dev-hermit/hermit worktree list
-   git -C ~/work/dev-hermit/worktrees/slot0X status --short --branch
-   ```
-
-2. Require a clean worktree. Do not discard or absorb changes left by another
-   task.
-3. Fetch fork refs, then create a descriptive branch from current fork `main`:
-
-   ```bash
-   git -C ~/work/dev-hermit/worktrees/slot0X fetch origin
-   git -C ~/work/dev-hermit/worktrees/slot0X switch \
-     -c <feature-branch> origin/main
-   ```
-
-4. Record the slot, branch, task, and owner in the slot's `ACTIVE.md`
-   (`worktrees/ACTIVE.md` or `worktrees_reverie/ACTIVE.md`) and in the
-   coordinator's task state before the first edit.
-
-Agents may read the primary checkouts, including their build artifacts, but
-they must run edits, formatting, builds, tests, and commits from their assigned
-slot.
-
-### Parking And Reusing A Slot
-
-Park a slot only after all intended work is committed and handed off:
-
-```bash
-git -C ~/work/dev-hermit/worktrees/slot0X status --short
-git -C ~/work/dev-hermit/worktrees/slot0X switch --detach HEAD
-```
-
-The first command must produce no output. Record the feature branch name, exact
-HEAD SHA, validation performed, and landing status in the sibling `ARCHIVED.md`
-and remove the slot's row from its `ACTIVE.md` before marking it free. Do not
-delete a feature
-branch until its commit is reachable from fork `main` or the coordinator
-explicitly archives it.
-
-To reuse a parked slot, re-run the starting-work checks and create the next
-feature branch from the latest `origin/main`. A slot that is not clean remains
-active regardless of whether an agent is currently responding.
-
-### Branch And Integration Strategy
-
-The branch flow is:
-
-```text
-feature branches -> rrnewton/hermit main -> periodic upstream pull request
-```
-
-- Agents branch from `origin/main` in the `rrnewton/hermit` fork and never
-  develop directly on `main`.
-- Each feature branch contains one coherent task or tightly coupled change.
-- The agent validates and commits the feature branch, pushes it to `origin`,
-  and opens a pull request against fork `main`.
-- The landing coordinator reviews the diff, local test evidence, and fork CI
-  before merging it.
-- Direct emergency landing onto `main`, when explicitly authorized, uses a
-  fast-forward merge from the clean primary checkout:
-
-  ```bash
-  git status --short --branch
-  git merge --ff-only <feature-branch>
-  ```
-
-- If the fast-forward check fails, do not create a convenience merge commit.
-  Return the branch to its owner to update it against current `origin/main`,
-  rerun affected tests, and provide a new SHA.
-- Keep fork `main` green; repair a regression before accepting more feature
-  work.
-- Periodically submit a reviewed, green batch from fork `main` to
-  `facebookexperimental/hermit` as one upstream pull request. Do not use the
-  upstream repository for routine feature branches or CI iteration.
-
-Only the coordinator mutates the primary checkout. It must be clean before a
-merge or promotion. Unrelated primary-checkout changes are a blocker to that
-landing operation and must be attributed and resolved without destructive
-cleanup.
-
-### Commit Methodology
-
-Agents prepare clean, reviewable commits rather than leaving uncommitted files
-for the coordinator:
-
-- Inspect `git status` and the complete diff before staging.
-- Stage only task-owned paths. Keep generated artifacts, caches, debug output,
-  and unrelated concurrent changes out of commits.
-- Run focused tests while iterating, then the formatting, lint, and test gates
-  required by the change before handoff.
-- Prefer one logical commit per task. Split commits only when each commit is
-  independently coherent and useful to reviewers.
-- Write an imperative, descriptive subject that states what changed. Explain
-  the reason and non-obvious constraints in the body when needed.
-- Never use placeholder subjects such as `wip`, `tmp`, `checkpoint`,
-  `validate`, or `fix stuff`.
-- Do not create empty bookkeeping commits. Do not hide test failures or missing
-  validation in a commit message; report them explicitly in the handoff.
-- Rewrite or amend only commits that are still private to the agent's own
-  feature branch. Never rewrite a shared branch or a commit already integrated.
-- Do not push, force-push, merge, rebase, or delete branches unless the task or
-  coordinator explicitly authorizes that repository-side operation.
-
-Every handoff includes:
-
-- slot path and feature branch,
-- exact commit SHA and concise change summary,
-- commands run and their results,
-- known failures or environment limitations,
-- whether the branch is ready for a pull request or authorized fast-forward.
-
-## Precise Communication
-
-Agent reports drive coordinator decisions, so every claim must be precise and
-independently verifiable. Vague status language is a defect: it hides what was
-and was not actually checked.
-
-### Banned Vague Terms
-
-Do not describe results with unquantified words. In particular, never report
-that something is "working", "demonstrated", "audited", or that features are
-"present together" without stating exactly what was run and observed. Replace
-each with a concrete claim: the command, the backend, the assurance level, and
-the observed output. If you cannot ground a word in evidence, do not use it.
-
-### Assurance Levels
-
-State the exact assurance level whenever you claim a run passes. The ladder is
-cumulative; each level presupposes the ones below it:
-
-| Level | Meaning | How it is established |
-| --- | --- | --- |
-| L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
-| L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
-| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
-| L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
-
-A claim of "passing" with no level is meaningless. Write "passes at L2 (ptrace
-backend)" rather than "verified" or "works".
-
-### Required Run Context
-
-Every result about a Hermit run states, explicitly:
-
-- **Backend**: `ptrace`, `DBI`, or `KVM`.
-- **Log level**: the `--log`/`RUST_LOG` level, or "default" when unset.
-- **Relaxations**: any flag that weakens determinism, for example
-  `--no-strict` or `--no-sequentialize-threads`. State "none" when there are
-  none.
-
-A non-strict result never counts as "passing" on its own. If a run used
-`--no-strict` or any other relaxation, label it as such and do not present it
-as a determinism guarantee.
-
-### Completion Reports
-
-Every completion report includes:
-
-- the PR number as a full hyperlink, for example
-  `https://github.com/rrnewton/hermit/pull/<n>`;
-- the worktree slot path and current working directory;
-- the feature branch name;
-- the assurance level reached, with backend, log level, and relaxations;
-- the exact commands run and their observed output, not a paraphrase.
-
-### Evidence, Not Assertion
-
-Ground every claim in evidence a reader can re-check: file paths with line
-numbers, the exact command, and its output. Separate what you verified from
-what you assume. Under-claiming beats false closure: if a check did not run,
-say so and say why.
-
-### No Dirty State
-
-Commit and push each change immediately; never leave a checkout dirty or claim
-"done" without a pushed commit behind it. A report that work is complete
-implies a clean `git status` and a pushed branch.
+This file is the developer guide for the Hermit project. It covers what Hermit
+is, how to build and test it, its architecture, how to debug determinism
+problems, and how changes reach the repository.
 
 ## Project Overview
 
@@ -414,6 +128,12 @@ preemption. Its implementation is split between `tool_local`, which handles
 events near each guest task, and `tool_global`, which owns shared deterministic
 state; the two communicate through RPC.
 
+Hermit can drive the guest through more than one instrumentation backend. The
+`ptrace` backend is the default and best-tested path. Alternative backends
+(dynamic binary instrumentation and KVM) exist at varying maturity; always state
+which backend a result came from, because behavior and coverage differ between
+them.
+
 Start investigations in these locations:
 
 - `detcore/src/syscalls/` for syscall-specific behavior.
@@ -428,6 +148,53 @@ Start investigations in these locations:
 - `docs/Developers/Architecture.md` for the architecture overview and
   `docs/Users.md` for user-facing behavior.
 
+## Determinism And Assurance Levels
+
+Hermit's whole purpose is reproducible execution, so describe a run by the
+strongest guarantee you actually observed. The ladder is cumulative; each level
+presupposes the ones below it:
+
+| Level | Meaning | How it is established |
+| --- | --- | --- |
+| L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
+| L1 | Runs deterministically under strict mode | `hermit run --strict` |
+| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
+| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
+
+A claim that a run "passes" is meaningless without a level. Write, for example,
+"passes at L2 (ptrace backend)". When reporting a run, also state:
+
+- **Backend**: `ptrace`, `DBI`, or `KVM`.
+- **Log level**: the `--log`/`RUST_LOG` level, or "default" when unset.
+- **Relaxations**: any flag that weakens determinism, for example
+  `--no-strict` or `--no-sequentialize-threads`. State "none" when there are
+  none. A non-strict result is not a determinism guarantee; label the relaxation
+  and do not present it as one.
+
+## Debugging
+
+Diagnose determinism problems with Hermit's own logging and comparison tooling
+before reading source:
+
+- Raise the log level to see the event stream and Detcore's decisions:
+  `hermit --log info run -- <program>` (or `debug` / `trace` for more detail).
+  The `DETLOG` lines record syscalls, scheduling, and virtualized time.
+- Reproduce nondeterminism with `hermit run --strict --verify`, which runs the
+  guest twice and reports the first divergence.
+- For record/replay problems use `hermit record start --verify -- <program>`,
+  which records then replays and diffs the two logs; a divergence names the
+  thread and syscall event where the runs parted.
+- Use `hermit-verify` for stress, trace, schedule, and replay checks, and the
+  CLI's `log-diff`/`analyze` subcommands to compare two runs' logs.
+- Prefer the smallest guest that reproduces the issue; the `tests` and
+  `flaky-tests` members already contain minimal time, futex, pipe, signal, and
+  scheduling programs to start from.
+
+When a symptom depends on PMU access, CPUID interception, or specific CPU
+features, capture the host environment in the report; those are host
+limitations, not necessarily product bugs.
+
 ## Change Guidelines
 
 - First reproduce a bug with the smallest applicable test or guest program.
@@ -439,17 +206,29 @@ Start investigations in these locations:
   `tests` or `flaky-tests`; Detcore unit and integration behavior belongs under
   `detcore`.
 - Run the focused test while iterating, then the workspace test, format, and
-  Clippy checks before handing off. Clearly document checks that the current
+  Clippy checks before finishing. Clearly document checks that the current
   hardware cannot execute.
-- Keep unrelated changes and generated artifacts out of the patch. Do not
-  overwrite concurrent work in a dirty checkout.
+- Keep unrelated changes and generated artifacts out of the patch.
 
-## Repository And Issues
+## Contributing And Pull Requests
 
 Primary development happens in the `rrnewton/hermit` fork. Configure `origin`
 for that fork and `upstream` for `facebookexperimental/hermit`. Meta's internal
 source uses Buck and is exported upstream; this team develops and runs CI on
-fork `main`, then periodically submits a tested bulk pull request upstream.
+fork `main`, then periodically submits a tested bulk pull request upstream. Do
+not use the upstream repository for routine feature branches or CI iteration.
+
+Typical flow for a change:
+
+- Branch from `origin/main`, make one coherent change per branch, and write an
+  imperative, descriptive commit subject that states what changed. Explain the
+  reason and any non-obvious constraints in the body.
+- Run the workspace test, format, and Clippy gates relevant to the change, and
+  report the assurance level reached along with the backend, log level, and any
+  relaxations.
+- Push the branch and open a pull request against fork `main`. Keep fork `main`
+  green; repair a regression before landing more work.
+
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
 
