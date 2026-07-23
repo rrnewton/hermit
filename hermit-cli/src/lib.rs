@@ -278,11 +278,44 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     if backend == Backend::Ptrace {
         return Ok(());
     }
+    // The KVM backend has its own dispatch (`run_kvm`); it must not reach here.
     backend.ensure_available()?;
     Err(anyhow!(
         "backend `{}` has no Hermit dispatch implementation",
         backend.as_str()
     ))
+}
+
+/// Amount of guest-physical memory used when probing the KVM backend.
+const KVM_PROBE_MEMORY_BYTES: usize = 64 * 1024;
+
+/// Dispatch a run onto the reverie-kvm backend.
+///
+/// `hermit-cli` is the only workspace crate that links the instrumentation
+/// backends; `detcore` never depends on `reverie-kvm`. This entry point exists
+/// so that `--backend kvm` reaches real reverie-kvm code instead of failing at a
+/// generic availability probe.
+///
+/// reverie-kvm can create a VM and route a syscall transport, but it does not
+/// yet implement a Linux execution personality (ELF loader, virtual memory, and
+/// a guest-kernel ABI), so it cannot execute an arbitrary guest program. This
+/// constructs a `KvmBackend` to exercise the integration, then returns an
+/// accurate error rather than pretending to run the program. See
+/// <https://github.com/rrnewton/hermit/issues/198>.
+fn run_kvm(command: &Command) -> Error {
+    let program = command.get_program().to_string_lossy().into_owned();
+    match reverie_kvm::KvmBackend::new(KVM_PROBE_MEMORY_BYTES) {
+        Ok(_backend) => anyhow!(
+            "the KVM backend cannot run `{program}`: reverie-kvm initialized a VM but does not \
+             yet implement the Linux execution personality (ELF loader, virtual memory, and \
+             guest-kernel ABI) required to execute a guest program; see \
+             https://github.com/rrnewton/hermit/issues/198"
+        ),
+        Err(error) => anyhow!(
+            "the KVM backend cannot run `{program}`: reverie-kvm could not initialize a VM \
+             ({error}); see https://github.com/rrnewton/hermit/issues/198"
+        ),
+    }
 }
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
@@ -317,6 +350,9 @@ pub async fn run_with_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
 ) -> Result<ExitStatus, Error> {
+    if backend == Backend::Kvm {
+        return Err(run_kvm(&command));
+    }
     ensure_backend_dispatch(backend)?;
 
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
@@ -355,6 +391,9 @@ pub async fn run_with_output_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
 ) -> Result<Output, Error> {
+    if backend == Backend::Kvm {
+        return Err(run_kvm(&command));
+    }
     ensure_backend_dispatch(backend)?;
 
     command.stdin(Stdio::null());
