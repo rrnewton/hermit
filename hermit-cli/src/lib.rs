@@ -684,4 +684,74 @@ mod tests {
         );
         assert!(!message.contains("requires root privileges"));
     }
+
+    // KVM M3 experiment: drive the real Detcore Tool through reverie-kvm's
+    // `KvmGuest<T>: Guest<T>` via `run_with_tool::<Detcore>()`, using a synthetic
+    // real-mode `vmcall` guest (there is no ELF loader yet, so a real program like
+    // `echo` cannot be executed under KVM). Preemption is disabled so Detcore's
+    // RCB path (`read_clock`/`set_timer`, which KvmGuest reports Unsupported) is
+    // not exercised. Requires /dev/kvm; skips cleanly otherwise.
+    #[test]
+    fn detcore_drives_kvm_guest_for_synthetic_syscall() {
+        use clap::Parser;
+
+        const MEMORY_SIZE: usize = 0x10_000;
+        const ENTRY_POINT: u64 = 0x1000;
+        const FRAME_ADDRESS: u64 = 0x2000;
+
+        let mut backend = match reverie_kvm::KvmBackend::new(MEMORY_SIZE) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping KVM Detcore experiment: cannot init VM: {error}");
+                return;
+            }
+        };
+
+        // A guest that issues one `getpid` through the vmcall transport, then HLTs.
+        backend
+            .install_syscall(
+                ENTRY_POINT,
+                FRAME_ADDRESS,
+                reverie_kvm::SyscallRequest::new(libc::SYS_getpid as u64, [0; 6]),
+            )
+            .expect("install synthetic getpid guest");
+
+        // Minimal deterministic Detcore config with RCB preemption disabled.
+        let mut config =
+            super::DetConfig::parse_from(["hermit-kvm-test", "--preemption-timeout=disabled"]);
+        config.validate();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let outcome = runtime.block_on(async {
+            backend
+                .run_with_tool::<super::Detcore, _>(
+                    config,
+                    // Executor: forward anything Detcore injects to the host.
+                    |request: &reverie_kvm::SyscallRequest, _memory: &reverie_kvm::GuestMemory| {
+                        // SAFETY: forwarding a register-only syscall (getpid) to the
+                        // host; no guest pointers are dereferenced by the kernel.
+                        unsafe {
+                            libc::syscall(
+                                request.number() as libc::c_long,
+                                request.args()[0],
+                                request.args()[1],
+                                request.args()[2],
+                                request.args()[3],
+                                request.args()[4],
+                                request.args()[5],
+                            ) as i64
+                        }
+                    },
+                )
+                .await
+        });
+
+        // The point of the experiment is to observe whether Detcore can be driven
+        // to completion over KvmGuest at all; assert it did not error.
+        outcome.expect("Detcore drove the synthetic KVM guest to completion");
+    }
 }
