@@ -331,6 +331,35 @@ fn record_shell_forked_external_command() {
     );
 }
 
+/// Regression test for the replay stdout writer-leak: in a two-process pipeline
+/// the upstream process dup2's its stdout onto the pipe, so its bytes belong in
+/// the pipe, not on the console. The replayer must echo a write to the real
+/// console only when its fd logically refers to the inherited console (tracked
+/// across dup2/close), not merely when the fd number is 1/2. Before the console
+/// fd tracking fix, `echo hello | cat` replayed "hello" twice and `--verify`
+/// failed with "Recording output did not match replay output".
+#[test]
+fn record_shell_pipeline_no_stdout_leak() {
+    let _guard = hermit_record_lock();
+
+    let shell = [Path::new("/bin/bash"), Path::new("/usr/bin/bash")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(shell) = shell else {
+        eprintln!("bash is not installed; skipping shell pipeline record coverage");
+        return;
+    };
+
+    // A minimal two-process pipe: `echo` (builtin) writes into the pipe and
+    // `cat` copies it to the real stdout. Replay must not also echo echo's
+    // pipe-bound bytes to the console.
+    record_replay_command(
+        "shell-pipeline-echo-cat",
+        shell,
+        &[OsStr::new("-c"), OsStr::new("echo hello | cat")],
+    );
+}
+
 #[test]
 fn record_curl_version() {
     let _guard = hermit_record_lock();

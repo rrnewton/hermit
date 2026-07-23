@@ -59,15 +59,22 @@ impl Tool for Replayer {
     fn init_thread_state(
         &self,
         child: Tid,
-        _parent: Option<(Tid, &Self::ThreadState)>,
+        parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
         // We have to unwrap because there is now way to handle errors here.
-        EventReader::open(&self.data, child).unwrap_or_else(|err| {
+        let mut reader = EventReader::open(&self.data, child).unwrap_or_else(|err| {
             panic!(
                 "Failed to open {:?} for thread {}: {}",
                 self.data, child, err
             )
-        })
+        });
+        // A new process/thread inherits its parent's file-descriptor table, so
+        // the redirections the parent already performed (e.g. a shell setting up
+        // a pipeline before forking) carry over to the child.
+        if let Some((_, parent_state)) = parent {
+            reader.inherit_console_fds(parent_state);
+        }
+        reader
     }
 
     fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
@@ -148,14 +155,14 @@ impl Tool for Replayer {
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Close(syscall) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup(syscall) => self.handle_dup(guest, syscall).await,
+            Syscall::Dup2(syscall) => self.handle_dup2(guest, syscall).await,
+            Syscall::Dup3(syscall) => self.handle_dup3(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
@@ -164,7 +171,7 @@ impl Tool for Replayer {
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
             // FIXME: Not all fcntl cases are simple.
-            Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Fcntl(syscall) => self.handle_fcntl(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,

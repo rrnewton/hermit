@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -133,6 +134,23 @@ pub struct EventReader {
 
     // The number of events read so far. Useful for debugging purposes.
     pub count: u64,
+
+    // The set of file descriptors that currently refer to the inherited console
+    // (the stdout/stderr this replay should echo). Writes are only let through
+    // to the real console when their fd is in this set.
+    //
+    // This is tracked logically from the recorded syscall stream rather than
+    // from the guest's real file-descriptor table, because during replay most
+    // fd-manipulating syscalls (open, dup2, close, …) are substituted rather
+    // than executed, so the real table does not reflect the recorded topology.
+    // A redirected fd (e.g. a shell pipeline's stdout dup2'd onto a pipe) is
+    // thereby correctly excluded, so its writes are not echoed to the console.
+    //
+    // NOTE: This models a per-process fd table inherited across fork. Threads
+    // that share a table via CLONE_FILES are not modeled; each replay thread
+    // keeps its own copy. This matches how detcore serializes guests and is
+    // sufficient for the process-level redirection that pipelines rely on.
+    console_fds: BTreeSet<i32>,
 }
 
 fn default_reader() -> io::BufReader<fs::File> {
@@ -150,7 +168,34 @@ impl EventReader {
                 path.join("thread").join(format!("{}.debug", thread_id)),
             )?),
             count: 0,
+            // stdin/stdout/stderr are inherited from the console at startup.
+            console_fds: BTreeSet::from([
+                libc::STDIN_FILENO,
+                libc::STDOUT_FILENO,
+                libc::STDERR_FILENO,
+            ]),
         })
+    }
+
+    /// Returns whether `fd` currently refers to the inherited console.
+    pub fn is_console(&self, fd: i32) -> bool {
+        self.console_fds.contains(&fd)
+    }
+
+    /// Marks `fd` as referring to the console (or not), e.g. after a `dup2`,
+    /// `dup`, or `close`.
+    pub fn set_console(&mut self, fd: i32, console: bool) {
+        if console {
+            self.console_fds.insert(fd);
+        } else {
+            self.console_fds.remove(&fd);
+        }
+    }
+
+    /// Replaces this reader's console fd set. Used to inherit the parent's fd
+    /// table when a new thread/process is created.
+    pub fn inherit_console_fds(&mut self, parent: &EventReader) {
+        self.console_fds = parent.console_fds.clone();
     }
 
     /// Reads the next event from the stream. Returns an error if there are no

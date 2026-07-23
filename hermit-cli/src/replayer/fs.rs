@@ -126,18 +126,100 @@ impl Replayer {
 
         let fd = syscall.fd();
 
-        if fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO {
-            // Always let these through since they affect what we get to see.
-            //
-            // TODO: It would be better to do correct file descriptor tracking
-            // to avoid edge cases where a program may close the stderr/stdout
-            // file descriptors and immediately open a file. In that case,
-            // output would go to a file instead (which should *not* be let
-            // through).
+        // Only let a write through to the real console when its fd actually
+        // refers to the inherited console in the recorded fd topology. Tracking
+        // fds (see `handle_dup2`/`handle_close`) instead of hard-coding fd 1/2
+        // is what keeps a redirected fd — e.g. a shell pipeline whose stdout was
+        // dup2'd onto a pipe — from leaking its bytes to the console during
+        // replay, and conversely lets through a console fd that was dup'd to a
+        // higher number.
+        if guest.thread_state().is_console(fd) {
             guest.inject_with_retry(Syscall::from(syscall)).await
         } else {
             Ok(count)
         }
+    }
+
+    /// Replays a `close`, dropping the fd from the console set so a later syscall
+    /// that reuses the number does not inherit its console status.
+    pub(super) async fn handle_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Close,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        // Reaching here means `close` succeeded during recording.
+        guest.thread_state_mut().set_console(syscall.fd(), false);
+        Ok(ret)
+    }
+
+    /// Replays a `dup`, propagating the source fd's console status to the newly
+    /// allocated descriptor (returned as the recorded value).
+    pub(super) async fn handle_dup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            let console = guest.thread_state().is_console(syscall.oldfd());
+            guest.thread_state_mut().set_console(ret as i32, console);
+        }
+        Ok(ret)
+    }
+
+    /// Replays a `dup2`, making `newfd` mirror `oldfd`'s console status.
+    pub(super) async fn handle_dup2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup2,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            let console = guest.thread_state().is_console(syscall.oldfd());
+            guest
+                .thread_state_mut()
+                .set_console(syscall.newfd(), console);
+        }
+        Ok(ret)
+    }
+
+    /// Replays a `dup3`. The `O_CLOEXEC` flag only affects behavior across an
+    /// `execve`, so for console tracking it is equivalent to `dup2`.
+    pub(super) async fn handle_dup3<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup3,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            let console = guest.thread_state().is_console(syscall.oldfd());
+            guest
+                .thread_state_mut()
+                .set_console(syscall.newfd(), console);
+        }
+        Ok(ret)
+    }
+
+    /// Replays an `fcntl`. Only the fd-duplicating commands affect console
+    /// tracking; every other command behaves like a simple return-value syscall.
+    pub(super) async fn handle_fcntl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Fcntl,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0
+            && matches!(
+                syscall.cmd(),
+                reverie::syscalls::FcntlCmd::F_DUPFD(_)
+                    | reverie::syscalls::FcntlCmd::F_DUPFD_CLOEXEC(_)
+            )
+        {
+            let console = guest.thread_state().is_console(syscall.fd());
+            guest.thread_state_mut().set_console(ret as i32, console);
+        }
+        Ok(ret)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(
