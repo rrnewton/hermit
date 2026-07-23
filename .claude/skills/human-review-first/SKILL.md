@@ -1,13 +1,19 @@
+---
+name: human-review-first
+description: "Gate key Hermit changes on adversarial review and explicit human approval. Use only when the user explicitly requests human-review-first mode."
+---
+
 # Human-Review-First Mode
 
-A landing discipline for autonomous multi-agent work in which **no substantive
-change reaches `main` until a human has approved it.** This is the *cautious*
-counterpart to [post-facto-review](./post-facto-review.md), which is the
+A landing discipline for autonomous multi-agent work in which **no KEY
+change reaches `main` until a human has approved it.** (Key changes
+defined below.) This is the *cautious* counterpart to
+[post-facto-review](../post-facto-review/SKILL.md), which is the
 currently-active default.
 
 > **Status: OFF by default.** This mode is dormant institutional knowledge.
 > Only activate it when a human explicitly asks for it (see below). While it is
-> off, the repository runs under [post-facto-review](./post-facto-review.md).
+> off, the repository runs under [post-facto-review](../post-facto-review/SKILL.md).
 
 ## When to activate
 
@@ -38,7 +44,8 @@ still land under the lighter path, but when in doubt treat a change as key.
 - Small, additive extensions to an existing Reverie API that preserve existing
   behavior (e.g. one new optional method with a default, a new enum variant
   behind a match arm).
-- Tests, docs, comments, benchmarks, CI wiring, non-behavioral refactors.
+- Bugfixes
+- Tests, docs, comments, benchmarks, CI wiring, refactors.
 
 ## Protocol: adversarial review → human approval → THEN land
 
@@ -53,7 +60,7 @@ order:
 2. **Human approval.** Present the diff, the adversarial-review findings, and
    local test evidence to the human. Landing waits for an explicit human
    approval. Apply the `human-approved` label **only when the human has actually
-   approved** — never self-apply it (see [post-facto-review](./post-facto-review.md)).
+   approved** — never self-apply it (see [post-facto-review](../post-facto-review/SKILL.md)).
 3. **Land.** Only after 1 and 2, land the PR (squash), then rebase dependents
    (see PR DAG below).
 
@@ -94,7 +101,7 @@ feature branch depends on it). Managing it:
 
 ## Deactivation
 
-Switch back to [post-facto-review](./post-facto-review.md) when the user says so
+Switch back to [post-facto-review](../post-facto-review/SKILL.md) when the user says so
 (e.g. "back to post-facto", "autonomous landing on"). Announce the switch. From
 that point, key changes still get adversarial review but land immediately after
 review + CI green, with post-facto human review and fix-forward.

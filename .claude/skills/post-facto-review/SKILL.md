@@ -1,14 +1,19 @@
+---
+name: post-facto-review
+description: "Land reviewed, CI-green Hermit changes before human review and mark them for follow-up. Use as the default autonomous landing discipline."
+---
+
 # Post-Facto-Review Mode
 
 The **currently-active** landing discipline for autonomous multi-agent work.
 Changes land as soon as they are reviewed and CI-green; the human reviews them
 *after* they are on `main` and fixes forward. This is the fast counterpart to
-[human-review-first](./human-review-first.md), which is dormant and gated on an
+[human-review-first](../human-review-first/SKILL.md), which is dormant and gated on an
 explicit human request.
 
 > **Status: ON (default).** This is how the repo runs today. To switch to the
 > cautious gate, the user must explicitly ask for
-> [human-review-first](./human-review-first.md) mode.
+> [human-review-first](../human-review-first/SKILL.md) mode.
 
 ## The trade being made
 
@@ -21,7 +26,7 @@ blocking the queue.
 ## 1. Key changes still get adversarial review (multiple rounds)
 
 The "key change" definition is identical to
-[human-review-first](./human-review-first.md): new syscalls, major Reverie API
+[human-review-first](../human-review-first/SKILL.md): new syscalls, major Reverie API
 changes (small additive extensions are OK), scheduler/determinism-model changes,
 record/replay format changes.
 
@@ -72,7 +77,7 @@ squash-merge to `main`. Do not wait for a human.
   only be bypassing the known-environmental self-hosted lane, not a genuine
   red on GitHub-hosted or on a meaningful check.
 - After landing, rebase dependent PRs onto the new `main` (see the PR DAG
-  section of [human-review-first](./human-review-first.md)).
+  section of [human-review-first](../human-review-first/SKILL.md)).
 
 ## 5. Human reviews post-facto, fix-forward
 
@@ -83,6 +88,6 @@ fix PR that removes the relevant `// TODO-HUMAN-REVIEW` marker once addressed.
 
 ## Deactivation
 
-Switch to [human-review-first](./human-review-first.md) when the user explicitly
+Switch to [human-review-first](../human-review-first/SKILL.md) when the user explicitly
 asks for it. Announce the switch; from that point every key change waits for
 human approval *before* landing.
