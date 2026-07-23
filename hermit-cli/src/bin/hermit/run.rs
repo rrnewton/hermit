@@ -84,7 +84,7 @@ pub struct RunOpts {
         conflicts_with_all = [
             "no_sequentialize_threads",
             "no_deterministic_io",
-            "allow_passthrough"
+            "allow_passthrough",
             "namespace_only",
             "strace_only"
         ]
@@ -664,7 +664,7 @@ fn display_runopts4() {
 #[test]
 fn allow_passthrough_is_explicit_and_round_trips() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--allow-passthrough", "fakeprog"]);
-    ro.validate_args_with_perf_support(true);
+    ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.allow_passthrough);
     assert_eq!(format!("{}", ro), " --allow-passthrough -- fakeprog");

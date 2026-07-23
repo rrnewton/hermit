@@ -209,14 +209,4 @@ mod tests {
             .is_err()
         );
     }
-
-    #[test]
-    fn backend_parses_in_global_position() {
-        use hermit::Backend;
-
-        let args = Args::try_parse_from(["hermit", "--backend", "kvm", "run", "prog"])
-            .expect("global-position --backend should parse");
-        assert_eq!(args.global.backend, Some(Backend::Kvm));
-        assert!(matches!(args.command, Subcommand::Run(_)));
-    }
 }

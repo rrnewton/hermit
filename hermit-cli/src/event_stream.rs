@@ -75,6 +75,7 @@ impl fmt::Display for DebugEvent {
 /// `fcntl` fold meaningful arguments into typed enums). Using the kernel arity
 /// -- not the typed field count -- guarantees we never zero a meaningful
 /// argument and therefore never mask a genuine divergence.
+#[cfg(test)]
 fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     use reverie::syscalls::Sysno::*;
     Some(match sysno {
@@ -96,6 +97,7 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
 /// are not part of the syscall and may legitimately differ between record and
 /// replay. Syscalls without a known arity are returned unchanged (all six
 /// registers still compared).
+#[cfg(test)]
 pub(crate) fn normalize_unused_args(syscall: Syscall) -> Syscall {
     let (sysno, args) = syscall.into_parts();
     let Some(used) = kernel_arg_count(sysno) else {

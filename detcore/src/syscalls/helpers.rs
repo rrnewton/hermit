@@ -207,6 +207,7 @@ where
     Ok(relative_nanos_timeout(guest, timeout_nanos).await)
 }
 
+#[cfg(test)]
 pub fn absolute_timespec_timeout(timeout: Option<Timespec>) -> Result<ParsedTimeout, Errno> {
     let Some(timeout) = timeout else {
         return Ok(ParsedTimeout::Infinite);
@@ -1302,7 +1303,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod nonblocking_tests {
     use super::*;
 
     #[test]
