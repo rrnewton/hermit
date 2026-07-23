@@ -203,6 +203,7 @@ are exclusively **wall-clock reads from worker threads**, not scheduling.
 | perl | `perl -e 'print 6*7'` | PASS |
 | lua | `lua -e 'print(6*7)'` | PASS |
 | node | `node -e 'console.log(6*7)'` | PASS |
+| java | `java -version` | PASS (OpenJDK 1.8.0_492 Temurin, 5/5 runs) — **requires PR #223** (`saturating_add` fix for `LogicalTime` overflow, #219) |
 | gawk | `gawk 'BEGIN{print 6*7}'` | PASS |
 | python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **FLAKY (2/10 PASS under load)** — worker-thread `clock_gettime(CLOCK_MONOTONIC_COARSE)` sub-second divergence (dtid 3). Passes on a lightly-loaded host. |
 | python3 threading | see §3j | **FAIL** — same clock divergence |
@@ -217,6 +218,43 @@ are exclusively **wall-clock reads from worker threads**, not scheduling.
 | Python `socket.bind(("127.0.0.1",0))` + `getsockname()` | **FLAKY (0/8 under load)** — the *port* virtualizes to `32768`, but CPython's worker-thread `clock_gettime` diverges (same root cause as `python3`); passes on a lightly-loaded host |
 
 > Loopback only. Hermit does **not** make *external* network traffic deterministic (by design).
+
+### 3n. Servers — 1/1 PASS
+
+| Test | Result |
+|------|--------|
+| Redis: `redis-server` + `redis-cli SET foo bar` / `GET foo` / `SHUTDOWN NOSAVE` (wrapped in one shell script) | PASS — full server workflow is bit-for-bit deterministic, stable across 2 runs |
+
+Because `hermit run` takes a single program, multi-step workflows (like the Redis one) are
+wrapped in a shell script and run as `$HERMIT run --strict --verify -- /bin/bash script.sh`.
+
+### 3o. Deterministic builds (the core use case)
+
+Two **independent** `--strict` compiles of the same source produce **byte-identical** binaries
+(same SHA-256), i.e. reproducible builds:
+
+| Compiler | Test | Native | Under Hermit (2 independent `--strict` runs) |
+|----------|------|--------|---------------------------------------------|
+| gcc 11 | `hello.c` → binary | identical | **IDENTICAL** (`sha256 508f2b57…`, both exit 0, runs) |
+| clang | `hello.c` → binary | — | **IDENTICAL** (`sha256 4e298afe…`) |
+| gcc 11 | program embedding `__DATE__`/`__TIME__` | **DIFFERENT** (bakes wall-clock into the binary) | **IDENTICAL** (`sha256 55f52fc2…`) |
+
+The `__DATE__`/`__TIME__` case is the decisive demonstration: a program that compiles to
+*different* bytes natively (the compiler embeds the wall-clock compile time) compiles to
+*identical* bytes under Hermit, because the virtualized clock resolves `__TIME__` to the same
+fixed value every run.
+
+```sh
+printf '#include <stdio.h>\nint main(){printf("hi\\n");return 0;}\n' > hello.c
+$HERMIT run --strict -- /usr/bin/gcc -o hello1 hello.c
+$HERMIT run --strict -- /usr/bin/gcc -o hello2 hello.c
+cmp hello1 hello2 && echo IDENTICAL   # -> IDENTICAL
+```
+
+Note: this is the build *artifact* being reproducible across independent runs. `gcc` still
+fails `--strict --verify` (that checks internal syscall-trace determinism across a multi-process
+`cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory: the emitted
+binary is deterministic even though the internal syscall interleaving is not.
 
 ---
 
