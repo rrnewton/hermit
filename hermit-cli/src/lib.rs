@@ -262,12 +262,7 @@ impl Backend {
             // missing client is reported at launch time with an actionable error,
             // so ungating here does not affect the default ptrace path.
             Self::Dbi => None,
-            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
-                Some(
-                    "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
-                        .to_owned(),
-                )
-            }),
+            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }
 }
@@ -286,36 +281,60 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     ))
 }
 
-/// Amount of guest-physical memory used when probing the KVM backend.
-const KVM_PROBE_MEMORY_BYTES: usize = 64 * 1024;
+/// Guest-physical memory available to the single-process KVM personality.
+const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Dispatch a run onto the reverie-kvm backend.
-///
-/// `hermit-cli` is the only workspace crate that links the instrumentation
-/// backends; `detcore` never depends on `reverie-kvm`. This entry point exists
-/// so that `--backend kvm` reaches real reverie-kvm code instead of failing at a
-/// generic availability probe.
-///
-/// reverie-kvm can create a VM and route a syscall transport, but it does not
-/// yet implement a Linux execution personality (ELF loader, virtual memory, and
-/// a guest-kernel ABI), so it cannot execute an arbitrary guest program. This
-/// constructs a `KvmBackend` to exercise the integration, then returns an
-/// accurate error rather than pretending to run the program. See
-/// <https://github.com/rrnewton/hermit/issues/198>.
-fn run_kvm(command: &Command) -> Error {
+/// Dispatch a command onto the real reverie-kvm Tool runtime.
+async fn run_kvm(
+    command: &Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
     let program = command.get_program().to_string_lossy().into_owned();
-    match reverie_kvm::KvmBackend::new(KVM_PROBE_MEMORY_BYTES) {
-        Ok(_backend) => anyhow!(
-            "the KVM backend cannot run `{program}`: reverie-kvm initialized a VM but does not \
-             yet implement the Linux execution personality (ELF loader, virtual memory, and \
-             guest-kernel ABI) required to execute a guest program; see \
-             https://github.com/rrnewton/hermit/issues/198"
-        ),
-        Err(error) => anyhow!(
-            "the KVM backend cannot run `{program}`: reverie-kvm could not initialize a VM \
-             ({error}); see https://github.com/rrnewton/hermit/issues/198"
-        ),
+    let image = fs::read(&program)
+        .map_err(|error| anyhow!("failed to read KVM guest executable {program:?}: {error}"))?;
+
+    let argv = std::iter::once(program.clone())
+        .chain(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned()),
+        )
+        .collect::<Vec<_>>();
+    tracing::info!(
+        target: "hermit::kvm",
+        program = %program,
+        argv = ?argv,
+        "launching guest through reverie-kvm",
+    );
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let mut backend = reverie_kvm::KvmBackend::new(KVM_GUEST_MEMORY_BYTES)
+        .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    backend
+        .install_static_elf_with_args(&image, &argv, &[])
+        .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
+
+    let (global_state, code, stdout, stderr) = backend
+        .run_static_elf_with_tool::<Detcore>(config, capture_output)
+        .await
+        .map_err(|error| anyhow!("KVM guest execution failed: {error}"))?;
+    global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+
+    if !capture_output {
+        std::io::stdout().write_all(&stdout)?;
+        std::io::stderr().write_all(&stderr)?;
     }
+
+    Ok(Output {
+        status: ExitStatus::Exited(code),
+        stdout,
+        stderr,
+    })
 }
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
@@ -351,7 +370,15 @@ pub async fn run_with_backend(
     backend: Backend,
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Kvm {
-        return Err(run_kvm(&command));
+        return Ok(run_kvm(
+            &command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            false,
+        )
+        .await?
+        .status);
     }
     ensure_backend_dispatch(backend)?;
 
@@ -392,7 +419,14 @@ pub async fn run_with_output_backend(
     backend: Backend,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
-        return Err(run_kvm(&command));
+        return run_kvm(
+            &command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            true,
+        )
+        .await;
     }
     ensure_backend_dispatch(backend)?;
 
@@ -639,7 +673,10 @@ mod tests {
         // DBI is available iff the DynamoRIO SDK is present on this host
         // (passes both on CI runners without the SDK and on dev hosts with it).
         assert_eq!(available.contains(&Backend::Dbi), dynamorio_sdk_available());
-        assert!(!available.contains(&Backend::Kvm));
+        assert_eq!(
+            available.contains(&Backend::Kvm),
+            kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
+        );
     }
 
     #[test]
@@ -656,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn prototype_backends_fail_closed() {
+    fn optional_backends_report_accurate_availability() {
         // Without the SDK, DBI must fail closed with an actionable message. With
         // the SDK present it is available (a missing client is reported later, at
         // launch time), so only assert the fail-closed path when the SDK is absent.
@@ -674,23 +711,44 @@ mod tests {
             }
         }
 
-        let kvm_error = Backend::Kvm
-            .ensure_available()
-            .expect_err("KVM must fail closed");
-        let message = kvm_error.to_string();
-        assert!(
-            message.contains("/dev/kvm") || message.contains("guest-kernel ABI"),
-            "unexpected KVM availability error: {message}"
-        );
-        assert!(!message.contains("requires root privileges"));
+        match Backend::Kvm.ensure_available() {
+            Ok(()) => assert!(
+                kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
+                "KVM reported available without a usable /dev/kvm",
+            ),
+            Err(kvm_error) => {
+                let message = kvm_error.to_string();
+                assert!(
+                    message.contains("/dev/kvm"),
+                    "unexpected KVM availability error: {message}",
+                );
+                assert!(!message.contains("requires root privileges"));
+            }
+        }
     }
 
-    // KVM M3 experiment: drive the real Detcore Tool through reverie-kvm's
-    // `KvmGuest<T>: Guest<T>` via `run_with_tool::<Detcore>()`, using a synthetic
-    // real-mode `vmcall` guest (there is no ELF loader yet, so a real program like
-    // `echo` cannot be executed under KVM). Preemption is disabled so Detcore's
-    // RCB path (`read_clock`/`set_timer`, which KvmGuest reports Unsupported) is
-    // not exercised. Requires /dev/kvm; skips cleanly otherwise.
+    #[test]
+    fn kvm_runs_dynamic_echo_through_detcore() {
+        use clap::Parser;
+
+        if kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_some() {
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let mut config = super::DetConfig::parse_from(["hermit-kvm-test"]);
+        config.validate();
+        let output = super::run_with_output_backend(command, config, false, &None, Backend::Kvm)
+            .expect("run dynamic /bin/echo through KvmGuest<Detcore>");
+
+        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        assert_eq!(output.stdout, b"hello\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    // Keep the low-level vmcall transport covered independently from the ELF
+    // process personality. Requires /dev/kvm; skips cleanly otherwise.
     #[test]
     fn detcore_drives_kvm_guest_for_synthetic_syscall() {
         use clap::Parser;

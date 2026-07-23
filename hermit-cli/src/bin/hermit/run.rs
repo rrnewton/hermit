@@ -1220,7 +1220,7 @@ impl RunOpts {
         eprintln!(":: {}", "Run2...".yellow().bold());
         let out2 = self.run_verify(log2_file, global)?;
 
-        compare_two_runs(
+        let status = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -1234,7 +1234,14 @@ impl RunOpts {
                 failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
             },
-        )
+        )?;
+
+        if self.selected_backend() == Backend::Kvm {
+            eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
+            std::io::stdout().write_all(&out1.stdout)?;
+            std::io::stderr().write_all(&out1.stderr)?;
+        }
+        Ok(status)
     }
 
     /// Returns the mounts to be used with the container.

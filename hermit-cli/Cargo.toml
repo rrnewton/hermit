@@ -29,7 +29,7 @@ regex = "1.13.1"
 # sync across all crates and bump it via docs/updating-reverie.md.
 reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6981ac0" }
 reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6981ac0" }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6981ac0" }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "58e513192f08bb314fe082d952dc6502accd5a15" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6981ac0" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
