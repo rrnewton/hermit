@@ -255,6 +255,14 @@ Focused contributions are welcome. Before opening a pull request:
 
 5. Document host-dependent skips or failures instead of weakening the test.
 
+Not every x86-64 Linux machine can run every Hermit test: PMU counters, CPUID
+faulting, `perf_event_open` permissions, and user/mount namespaces each gate
+different test groups, so results differ across bare metal, VMs, containers, and
+WSL. Before reporting an environment-related failure, see
+[Testing Environments](docs/TESTING_ENVIRONMENTS.md) for the support matrix, the
+list of hardware-sensitive tests, expected failure signatures, and a copy-paste
+diagnostic and bug-report procedure.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the pull-request, CLA, issue, style,
 and licensing guidelines.
 
