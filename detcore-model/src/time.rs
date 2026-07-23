@@ -205,23 +205,29 @@ impl std::fmt::Display for LogicalTime {
 impl Add for LogicalTime {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        LogicalTime(self.0 + rhs.0)
+        // Saturate at LogicalTime::MAX rather than panicking on overflow: a
+        // far-future logical time is clamped to "the end of time".
+        LogicalTime(self.0.saturating_add(rhs.0))
     }
 }
 
 impl Add<Duration> for LogicalTime {
     type Output = Self;
     fn add(self, rhs: Duration) -> Self {
-        // Cast will be unsafe if rhs ever exceeds u64::MAX nanosecs
-        LogicalTime(self.0 + rhs.as_nanos() as u64)
+        // A `Duration` can hold more nanoseconds than fit in u64, and the sum
+        // can exceed u64::MAX (e.g. Java arms a far-future timer, issue #219).
+        // Saturate the u128->u64 conversion and the addition instead of
+        // overflowing/truncating.
+        let nanos = u64::try_from(rhs.as_nanos()).unwrap_or(u64::MAX);
+        LogicalTime(self.0.saturating_add(nanos))
     }
 }
 
 impl Add<u128> for LogicalTime {
     type Output = Self;
     fn add(self, rhs: u128) -> Self {
-        // Maybe this will be total in the future, but for now it can fail:
-        LogicalTime(self.0 + rhs as u64)
+        // Saturate both the u128->u64 clamp and the addition.
+        LogicalTime(self.0.saturating_add(rhs.min(u64::MAX as u128) as u64))
     }
 }
 
@@ -270,6 +276,37 @@ fn subsecond_units_are_converted_from_nanoseconds() {
     let timeval: Timeval = time.into();
     assert_eq!(timeval.tv_sec, 2);
     assert_eq!(timeval.tv_usec, 345_678);
+}
+
+#[test]
+fn add_saturates_instead_of_overflowing() {
+    // Regression for issue #219: Java arms a far-future timer whose deadline
+    // overflows u64. All three `Add` impls must saturate at LogicalTime::MAX
+    // rather than panic.
+    let near_max = LogicalTime(u64::MAX - 10);
+
+    // Add<LogicalTime>
+    assert_eq!(near_max + LogicalTime::from_secs(1), LogicalTime::MAX);
+
+    // Add<Duration>, including a Duration whose nanos exceed u64::MAX.
+    assert_eq!(near_max + Duration::from_secs(1), LogicalTime::MAX);
+    assert_eq!(
+        LogicalTime::ZERO + Duration::from_secs(u64::MAX / 1_000_000_000 + 1),
+        LogicalTime::MAX
+    );
+
+    // Add<u128>, including an rhs larger than u64::MAX.
+    assert_eq!(near_max + 100u128, LogicalTime::MAX);
+    assert_eq!(
+        LogicalTime::ZERO + (u128::from(u64::MAX) + 5),
+        LogicalTime::MAX
+    );
+
+    // A non-overflowing add still produces the exact sum.
+    assert_eq!(
+        LogicalTime::from_secs(2) + Duration::from_secs(3),
+        LogicalTime::from_secs(5)
+    );
 }
 
 /// The same basic type alias as nanoseconds. Just for clarity/readability.
