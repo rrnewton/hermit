@@ -81,7 +81,7 @@ fn parse_futex_timeout(futex_flags: i32, timeout: Timespec) -> Result<FutexTimeo
 // an *absolute* deadline on the guest clock's epoch; comparing it directly with
 // Detcore's logical scheduler time makes the wait effectively never expire (the
 // JVM then hangs on startup). Rebase the deadline into logical time using a
-// recorded/replayed clock sample. TODO-HUMAN-REVIEW(PR #212).
+// recorded/replayed clock sample. TODO-HUMAN-REVIEW(PR #216).
 fn rebase_absolute_timeout(
     deadline: LogicalTime,
     clock_now: LogicalTime,

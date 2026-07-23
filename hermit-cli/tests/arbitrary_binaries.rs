@@ -29,7 +29,7 @@ const RUN_TOOLS: &[&str] = &[
     "gcc",
 ];
 // AUTONOMOUS-BOT-IMPLEMENTED: "java" added to exercise the JVM record/replay
-// fix (futex absolute-timeout rebasing). TODO-HUMAN-REVIEW(PR #212): confirm
+// fix (futex absolute-timeout rebasing). TODO-HUMAN-REVIEW(PR #216): confirm
 // java record/replay stays within BINARY_TIMEOUT on CI hosts with a JDK.
 const RECORD_REPLAY_TOOLS: &[&str] = &["static_busybox", "shell", "java"];
 
