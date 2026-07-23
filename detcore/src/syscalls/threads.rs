@@ -604,7 +604,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             Ok(guest.inject_with_retry(call).await?)
         } else {
-            retry_nonblocking_syscall(guest, call, rsrc).await
+            // wait4 is a scheduler poll, not a record/replay data read (see doc above),
+            // so it is not routed through the record/replay subtool.
+            retry_nonblocking_syscall(guest, call, rsrc, None).await
         }
     }
 
