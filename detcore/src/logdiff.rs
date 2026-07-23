@@ -108,7 +108,9 @@ impl LogDiffOpts {
     fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         v.iter()
             .filter_map(|(i, s)| {
-                if (is_detlog(s) && !self.skip_detlog(s)) || (is_commit(s) && !self.skip_commit) {
+                if (is_detlog(s) && !self.skip_detlog(s))
+                    || (is_commit(s) && !self.skip_commit && !is_internal_io_poll_commit(s))
+                {
                     Some((*i, *s))
                 } else {
                     None
@@ -238,6 +240,21 @@ fn is_commit(line: &str) -> bool {
 
 fn is_detlog(line: &str) -> bool {
     line.contains(" DETLOG ")
+}
+
+/// A scheduler COMMIT turn that only grants the `InternalIOPolling` resource, i.e. a
+/// granted retry of a nonblocking poll (poll/epoll_wait/wait4/futex/recv/send...). These
+/// grants are internal bookkeeping of Hermit's blocking-via-polling mechanism: how many
+/// times a thread is re-granted permission to re-attempt a nonblocking syscall before it
+/// stops returning would-block depends on when a concurrent external-IO action (e.g. a
+/// child linker process writing to a pipe) becomes ready on the host, which is wall-clock
+/// dependent and not tied to the (RCB-deterministic) logical schedule. The corresponding
+/// `NONCOMMIT ... polling resource` skips are already excluded from comparison (they are
+/// not tagged `COMMIT`); excluding the matching grant-COMMITs keeps the deterministic
+/// comparison consistent and focused on guest-observable events (the actual syscall
+/// results, still compared via their DETLOG entries).
+fn is_internal_io_poll_commit(line: &str) -> bool {
+    is_commit(line) && line.contains("{InternalIOPolling: ")
 }
 
 fn is_detcore(line: &str) -> bool {
