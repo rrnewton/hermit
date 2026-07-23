@@ -67,7 +67,13 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
         .checked_mul(1_000_000_000)
         .and_then(|nanos| nanos.checked_add(nanoseconds))
         .ok_or(Errno::EINVAL)?;
-    if futex_op == libc::FUTEX_WAIT_BITSET {
+    // Mask off FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME before matching the
+    // command: FUTEX_WAIT_BITSET measures its timeout as an *absolute* deadline,
+    // whereas plain FUTEX_WAIT uses a *relative* one. A private-flagged
+    // FUTEX_WAIT_BITSET (e.g. 0x89) must still be recognized as the BITSET
+    // command; comparing the raw op would misclassify it as relative and add
+    // the absolute deadline to the current time (leaking the epoch).
+    if futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_WAIT_BITSET {
         Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
             timeout_nanos,
         )))
@@ -668,6 +674,19 @@ mod tests {
             Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
                 2_000_000_003
             )))
+        );
+        // The command bits must be matched after masking off FUTEX_PRIVATE_FLAG
+        // (and FUTEX_CLOCK_REALTIME): a private FUTEX_WAIT_BITSET still uses an
+        // absolute deadline, and a private FUTEX_WAIT still uses a relative one.
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG, timeout),
+            Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                2_000_000_003
+            )))
+        );
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, timeout),
+            Ok(FutexTimeout::Relative(2_000_000_003))
         );
     }
 

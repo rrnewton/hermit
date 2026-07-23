@@ -280,13 +280,18 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             Expectation::Pass,
             false,
         ),
+        // `git --version` (the Meta git wrapper) is futex- and clone3-heavy. It
+        // previously timed out because private `FUTEX_WAIT_BITSET` waits with an
+        // absolute deadline were misclassified as relative, advancing virtual
+        // time by roughly a full epoch. With that classification fixed it now
+        // runs deterministically to completion, so it is a passing case.
         case(
-            "expected-fail",
+            "threaded",
             "git",
             &["/usr/local/bin/git"],
             &["--version"],
-            None,
-            Expectation::ExpectedFail,
+            Some("git version"),
+            Expectation::Pass,
             false,
         ),
         case(

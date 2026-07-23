@@ -892,17 +892,15 @@ impl RunOpts {
         self.validate_program()?;
         // });
 
-        // AUTONOMOUS-BOT-IMPLEMENTED (recreate of PR #181, which conflicted on rebase)
         // Dispatch to an alternative Reverie backend if one was requested. The
         // DBI prototype is handled entirely outside the ptrace container
-        // machinery below. KVM remains fail-closed via `ensure_available()`
-        // above and cannot reach this point.
+        // machinery below. KVM falls through to the normal run/verify path: it
+        // skips `ensure_available()` above and reaches `hermit::run_with_backend`
+        // (via `run_in_container`), whose own dispatch routes it to `run_kvm`
+        // and returns an accurate, program-specific error.
         match backend {
-            Backend::Ptrace => {}
+            Backend::Ptrace | Backend::Kvm => {}
             Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
-            Backend::Kvm => {
-                anyhow::bail!("backend `kvm` has no Hermit dispatch implementation")
-            }
         }
 
         if self.no_namespace {
