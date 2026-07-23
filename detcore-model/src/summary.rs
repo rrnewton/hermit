@@ -17,6 +17,8 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::time::LogicalTime;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#252): Confirm the overflow and rounding policy for long-running guests.
 /// Running distribution statistics over timeslice durations, measured in virtual
 /// nanoseconds. A "timeslice" is the span of virtual time a thread runs between
 /// two consecutive scheduler yields (i.e. between `end_of_timeslice` resets).

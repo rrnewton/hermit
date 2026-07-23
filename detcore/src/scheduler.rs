@@ -2207,10 +2207,8 @@ impl Scheduler {
         }
     }
 
-    /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
-    /// doesn't have all the necessary information.
-    ///
-    /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#252): Confirm completed and final partial slices belong in one distribution.
     /// Fold an exiting thread's completed-timeslice distribution into the
     /// scheduler's per-thread record, to be reported in the final run summary.
     pub fn record_timeslice_stats(&mut self, dettid: DetTid, stats: TimesliceStats) {
@@ -2223,6 +2221,10 @@ impl Scheduler {
             .merge(&stats);
     }
 
+    /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
+    /// does not have all the necessary information.
+    ///
+    /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
     pub fn generate_partial_run_summary(
         &mut self,
         preemptions_to: Option<&PathBuf>,
