@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -34,6 +35,7 @@ use rand_pcg::Pcg64Mcg;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
+use runqueue::FIRST_PRIORITY;
 use runqueue::LAST_PRIORITY;
 use runqueue::PrioritizedOrder;
 pub use runqueue::Priority;
@@ -327,6 +329,23 @@ pub struct Scheduler {
     /// For a vfork parent we instead re-queue at its ordinary priority so the
     /// child (given DEFAULT_PRIORITY - 1) deterministically runs first.
     pub vfork_parent_blockers: HashSet<DetTid>,
+
+    /// Exit turns removed from the run queue but still physically executing the
+    /// tail-injected exit syscall. Quiescence waits for their exit hooks before
+    /// scheduling another thread, eliminating host-timing races with a vfork
+    /// parent becoming runnable.
+    pub exiting_threads: BTreeSet<DetTid>,
+
+    /// Vfork parents temporarily moved off `FIRST_PRIORITY` while their child
+    /// owns that priority. The original priority is restored before the
+    /// parent's first post-vfork turn is requeued, so preemption histories do
+    /// not observe a synthetic persistent priority change.
+    pub vfork_parent_priority_restore: BTreeMap<DetTid, Priority>,
+
+    /// Vfork child priorities adjusted during registration. Preemption replay
+    /// normally restores the recorded initial priority after the child's first
+    /// scheduler grant; these entries preserve the stricter vfork ordering.
+    pub vfork_child_start_priorities: BTreeMap<DetTid, Priority>,
 
     /// Tracks explicit optional timeslices to run for each thread.
     /// If a guest is to be unblocked on a thread the guest will receive this
@@ -638,7 +657,10 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
         // If there are NO threads left in the system, then we're truly done:
         {
             let sched = sched.lock().unwrap();
-            if sched.run_queue.is_empty() && sched.blocked.is_empty() {
+            if sched.run_queue.is_empty()
+                && sched.blocked.is_empty()
+                && sched.exiting_threads.is_empty()
+            {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 return;
             } else if let Some(stop) = sched.stop_after_turn
@@ -738,9 +760,10 @@ pub async fn do_a_turn_blocking(
 
         // The logical COMMIT point for the turn is during step4:
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
+        let exit_call = rsrcs.as_exit_syscall();
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        mg.step6_reenquue(next_dtid);
-        if let Some(call) = rsrcs.as_exit_syscall() {
+        mg.step6_finish_turn(next_dtid, exit_call.is_none());
+        if let Some(call) = exit_call {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
     }
@@ -873,6 +896,9 @@ impl Scheduler {
             priorities: Default::default(),
             pending_vfork_children: Default::default(),
             vfork_parent_blockers: Default::default(),
+            exiting_threads: Default::default(),
+            vfork_parent_priority_restore: Default::default(),
+            vfork_child_start_priorities: Default::default(),
             timeslices: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
@@ -909,7 +935,10 @@ impl Scheduler {
 
     /// Returns None if all are parked, otherwise the unfilled request of the next we're waiting on.
     fn are_all_quiesced(&self) -> Option<Ivar<SchedRequest>> {
-        self.run_queue.tids().find_map(|dt| self.check_request(dt))
+        self.run_queue
+            .tids()
+            .chain(self.exiting_threads.iter())
+            .find_map(|dt| self.check_request(dt))
     }
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
@@ -1026,6 +1055,9 @@ impl Scheduler {
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
 
+        self.exiting_threads.remove(dtid);
+        self.vfork_child_start_priorities.remove(dtid);
+        self.vfork_parent_priority_restore.remove(dtid);
         let _ = self.priorities.remove(dtid);
         match self.next_turns.remove(dtid) {
             None => {
@@ -1056,9 +1088,10 @@ impl Scheduler {
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
-        // A vfork parent that is being torn down will never be harvested normally;
-        // drop its markers so the scheduler neither waits for a child that will
-        // not come nor mis-classifies a future blocker for this dtid.
+        // A force-unblocked vfork parent is no longer an external blocker, but
+        // its temporary priority displacement remains until its first resumed
+        // turn. Restoring it here would let a signal put the parent ahead of
+        // the child whose exec/exit is releasing it.
         self.pending_vfork_children.remove(dtid);
         self.vfork_parent_blockers.remove(dtid);
     }
@@ -1230,12 +1263,8 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
-        // A vfork parent is backgrounded but its child has not yet registered in
-        // the run queue (it does so asynchronously, on its own tracer thread).
-        // Do not dispatch any other thread until the child appears, so the child
-        // is deterministically scheduled next regardless of registration timing.
-        // step2c above still harvests ready IO blockers (including a failed
-        // vfork's parent, which clears its entry there), so this cannot deadlock.
+        // step2c performs failed-vfork cleanup before enforcing this gate. Keep a
+        // defensive check so future I/O paths cannot dispatch a peer first.
         if !self.pending_vfork_children.is_empty() {
             trace!(
                 "[step2] waiting for vfork child registration; parents pending: {:?}",
@@ -1458,6 +1487,25 @@ impl Scheduler {
                 ready
             );
 
+            // A ready blocker whose parent is still pending means clone returned
+            // without a child registration (for example, an invalid vfork failed).
+            // Harvest those parents before record/replay's ordinary-work deferral;
+            // otherwise a runnable peer and the pending-child gate deadlock.
+            self.requeue_ready_pending_vfork_parents(&ready);
+            let ready: Vec<_> = ready
+                .into_iter()
+                .filter(|dtid| self.blocked.external_io_blockers.contains_key(dtid))
+                .collect();
+
+            if !self.pending_vfork_children.is_empty() {
+                trace!(
+                    "[step2] waiting for vfork child registration; parents pending: {:?}",
+                    &self.pending_vfork_children
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
+
             // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
             // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
             // the meantime, use a deterministic eager policy once there is no other runnable work.
@@ -1496,10 +1544,6 @@ impl Scheduler {
                             ready_dtid
                         );
                         self.blocked.external_io_blockers.remove(ready_dtid);
-                        // Defensive: if a vfork's blocker completed without the
-                        // child ever registering (e.g. vfork failed), stop waiting
-                        // for that never-arriving child.
-                        self.pending_vfork_children.remove(ready_dtid);
                         self.requeue_completed_io_blocker(*ready_dtid);
                     }
                     return Ok(());
@@ -1529,9 +1573,6 @@ impl Scheduler {
                         ready_dtid
                     );
                     self.blocked.external_io_blockers.remove(ready_dtid);
-                    // Defensive: clear a pending vfork whose child never registered
-                    // (e.g. vfork failed) so the scheduler does not wait forever.
-                    self.pending_vfork_children.remove(ready_dtid);
                     self.requeue_completed_io_blocker(*ready_dtid);
                 }
                 let empty_but_for_pollers = if let Some(fp) = self.run_queue.first_priority() {
@@ -2153,17 +2194,36 @@ impl Scheduler {
         nextturn.resp = Ivar::new();
     }
 
-    /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid) {
+    /// Step: finish removing the selected thread, then optionally reenqueue it.
+    ///
+    /// Exit turns are not requeued. The next scheduler iteration therefore waits
+    /// in quiescence until the asynchronous exit hook removes the thread's
+    /// `next_turns` entry. For a vfork child this guarantees deregistration
+    /// completes before the kernel-unblocked parent can be requeued.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#239)
+    fn step6_finish_turn(&mut self, next_dtid: DetTid, reenqueue: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
-        // thread from the front to the back of the queue.
+        // thread out of the selected position.
         let dt2 = self.run_queue.commit_tentative_pop();
         assert_eq!(next_dtid, dt2);
-        let pos = self.runqueue_push_back(next_dtid);
-        debug!(
-            "[sched-step6] dettid {} going back into queue at position {}.",
-            next_dtid, pos
-        );
+        if let Some(original_priority) = self.vfork_parent_priority_restore.remove(&next_dtid) {
+            let displaced_priority = self.priorities.insert(next_dtid, original_priority);
+            assert_eq!(displaced_priority, Some(FIRST_PRIORITY + 1));
+        }
+        if reenqueue {
+            let pos = self.runqueue_push_back(next_dtid);
+            debug!(
+                "[sched-step6] dettid {} going back into queue at position {}.",
+                next_dtid, pos
+            );
+        } else {
+            assert!(self.exiting_threads.insert(next_dtid));
+            debug!(
+                "[sched-step6] exiting dettid {} removed from queue.",
+                next_dtid
+            );
+        }
     }
 
     /// Add a simulated "post hook" for exit calls which we're about to let through.
@@ -2222,6 +2282,62 @@ impl Scheduler {
             .expect("get_priority: all threads should have a persistent priority")
     }
 
+    /// Give a vfork child a priority strictly ahead of its actual parent.
+    ///
+    /// A nested vfork parent may already be above `DEFAULT_PRIORITY`, and chaos
+    /// or replay modes can assign any ordinary priority. If the parent already
+    /// occupies `FIRST_PRIORITY`, move the blocked parent down one level until
+    /// its first post-vfork turn completes. This temporary displacement is not
+    /// a guest preemption and therefore must not alter its recorded history.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#239)
+    pub(crate) fn ensure_vfork_child_priority(
+        &mut self,
+        parent_dettid: DetTid,
+        requested_child_priority: Priority,
+    ) -> Priority {
+        let parent_priority = self.get_priority(parent_dettid);
+        if requested_child_priority < parent_priority {
+            return requested_child_priority;
+        }
+
+        if parent_priority > FIRST_PRIORITY {
+            parent_priority - 1
+        } else {
+            let displaced_parent_priority = FIRST_PRIORITY + 1;
+            let old_restore = self
+                .vfork_parent_priority_restore
+                .insert(parent_dettid, parent_priority);
+            assert!(old_restore.is_none());
+            let old_priority = self
+                .priorities
+                .insert(parent_dettid, displaced_parent_priority);
+            assert_eq!(old_priority, Some(parent_priority));
+            FIRST_PRIORITY
+        }
+    }
+
+    /// Requeue ready vfork parents whose clone returned without registering a child.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#239)
+    fn requeue_ready_pending_vfork_parents(&mut self, ready: &[DetTid]) {
+        let failed_vfork_parents: Vec<_> = ready
+            .iter()
+            .copied()
+            .filter(|dtid| self.pending_vfork_children.contains(dtid))
+            .collect();
+
+        for parent_dettid in failed_vfork_parents {
+            info!(
+                "[step2] vfork parent {:?} completed without child registration; rescheduling",
+                parent_dettid
+            );
+            let blocker = self.blocked.external_io_blockers.remove(&parent_dettid);
+            assert!(blocker.is_some());
+            self.requeue_completed_io_blocker(parent_dettid);
+        }
+    }
+
     /// Re-queue a thread whose backgrounded external IO has completed.
     ///
     /// Ordinary blockers go to the absolute front (`push_eager_io_repoll`) so the
@@ -2233,6 +2349,9 @@ impl Scheduler {
     /// deterministically runs before the parent resumes.
     fn requeue_completed_io_blocker(&mut self, dettid: DetTid) {
         if self.vfork_parent_blockers.remove(&dettid) {
+            // Clear the registration gate before making the parent runnable. This
+            // ordering covers failed-vfork and child-_exit completion paths.
+            self.pending_vfork_children.remove(&dettid);
             self.runqueue_push_front(dettid);
         } else {
             self.run_queue.push_eager_io_repoll(dettid);
@@ -2523,6 +2642,158 @@ mod test {
             both.insert(chaos_pick(&mut prng, &[true, false]).unwrap());
         }
         assert_eq!(both, [false, true].into_iter().collect());
+    }
+
+    #[test]
+    fn failed_vfork_is_requeued_before_pending_gate() {
+        let cfg = Config {
+            recordreplay_modes: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&cfg);
+        let parent = DetTid::from_raw(10);
+        let peer = DetTid::from_raw(11);
+        sched.priorities.insert(parent, DEFAULT_PRIORITY);
+        sched.priorities.insert(peer, DEFAULT_PRIORITY);
+        sched.runqueue_push_back(peer);
+        sched.pending_vfork_children.insert(parent);
+        sched.vfork_parent_blockers.insert(parent);
+        let op_id = ExternalOpId::new(parent, 7);
+        sched.blocked.external_io_blockers.insert(parent, op_id);
+        let mut ready_request = Resources::new(parent);
+        ready_request.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        sched.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(ready_request)),
+                resp: Ivar::new(),
+            },
+        );
+
+        sched.step2c_process_io_blockers().unwrap();
+
+        assert!(!sched.pending_vfork_children.contains(&parent));
+        assert!(!sched.vfork_parent_blockers.contains(&parent));
+        assert!(!sched.blocked.external_io_blockers.contains_key(&parent));
+        assert!(sched.run_queue.contains_tid(parent));
+        assert!(sched.run_queue.contains_tid(peer));
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(parent));
+        sched.run_queue.undo_tentative_pop();
+    }
+
+    #[test]
+    fn exiting_turn_is_removed_instead_of_requeued() {
+        let mut sched = Scheduler::new(&Config::default());
+        let child = DetTid::from_raw(12);
+        let peer = DetTid::from_raw(16);
+        sched.priorities.insert(child, DEFAULT_PRIORITY - 1);
+        sched.priorities.insert(peer, DEFAULT_PRIORITY);
+        sched.next_turns.insert(
+            child,
+            ThreadNextTurn {
+                dettid: child,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        sched.next_turns.insert(
+            peer,
+            ThreadNextTurn {
+                dettid: peer,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(Resources::new(peer))),
+                resp: Ivar::new(),
+            },
+        );
+        sched.runqueue_push_back(child);
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(child));
+
+        sched.step6_finish_turn(child, false);
+        sched.runqueue_push_back(peer);
+
+        assert!(!sched.run_queue.contains_tid(child));
+        assert!(sched.exiting_threads.contains(&child));
+        assert!(
+            sched.are_all_quiesced().is_some(),
+            "the ready peer must remain behind the exiting child's hook"
+        );
+        sched.logically_kill_thread(&child, &child, MmId::initial(child));
+        assert!(!sched.exiting_threads.contains(&child));
+        assert!(sched.are_all_quiesced().is_none());
+    }
+
+    #[test]
+    fn nested_vfork_child_priority_stays_strictly_ahead_of_parent() {
+        let mut sched = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(13);
+        let child = DetTid::from_raw(14);
+        let nested_parent_priority = DEFAULT_PRIORITY - 1;
+        sched.priorities.insert(parent, nested_parent_priority);
+
+        let child_priority = sched.ensure_vfork_child_priority(parent, nested_parent_priority);
+        assert_eq!(child_priority, nested_parent_priority - 1);
+        assert!(child_priority < sched.get_priority(parent));
+
+        sched.priorities.insert(child, child_priority);
+        sched.runqueue_push_back(child);
+        sched.vfork_parent_blockers.insert(parent);
+        sched.requeue_completed_io_blocker(parent);
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(child));
+        sched.run_queue.undo_tentative_pop();
+    }
+
+    #[test]
+    fn vfork_priority_floor_is_restored_before_next_changepoint() {
+        let cfg = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&cfg);
+        let parent = DetTid::from_raw(15);
+        sched.priorities.insert(parent, FIRST_PRIORITY);
+        sched
+            .preemption_writer
+            .as_mut()
+            .unwrap()
+            .register_thread(parent, FIRST_PRIORITY);
+        sched.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+
+        let child_priority = sched.ensure_vfork_child_priority(parent, LAST_PRIORITY);
+
+        assert_eq!(child_priority, FIRST_PRIORITY);
+        assert_eq!(sched.get_priority(parent), FIRST_PRIORITY + 1);
+        assert!(child_priority < sched.get_priority(parent));
+
+        // Generic signal/force-unblock cleanup must not restore the parent
+        // before its first resumed turn.
+        sched.remove_blocking_entries(&parent);
+        assert_eq!(sched.get_priority(parent), FIRST_PRIORITY + 1);
+        assert_eq!(
+            sched.vfork_parent_priority_restore.get(&parent),
+            Some(&FIRST_PRIORITY)
+        );
+
+        sched.runqueue_push_back(parent);
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(parent));
+        sched.step6_finish_turn(parent, true);
+        assert_eq!(sched.get_priority(parent), FIRST_PRIORITY);
+        assert!(!sched.vfork_parent_priority_restore.contains_key(&parent));
+
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(parent));
+        sched
+            .perform_priority_changepoint(parent, FIRST_PRIORITY + 2, LogicalTime::from_nanos(1))
+            .unwrap_err();
     }
 
     #[test]

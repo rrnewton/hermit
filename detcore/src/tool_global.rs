@@ -649,7 +649,7 @@ impl GlobalState {
             maybe_priority,
             parent_is_kernel_blocked,
         } = registration;
-        let initial_priority = if let Some(pr) = &self.preemptions_to_replay {
+        let mut initial_priority = if let Some(pr) = &self.preemptions_to_replay {
             assert!(maybe_priority.is_none());
             let prio = pr
                 .thread_initial_priority(&child_dettid)
@@ -706,6 +706,19 @@ impl GlobalState {
                     .add_child(parent_dettid, child_dettid, is_group_leader);
             }
 
+            if parent_is_kernel_blocked {
+                if let Some(replayed_priority) = sched.priorities.get(&child_dettid) {
+                    initial_priority = *replayed_priority;
+                }
+                initial_priority =
+                    sched.ensure_vfork_child_priority(parent_dettid, initial_priority);
+                debug_assert!(initial_priority < sched.priorities[&parent_dettid]);
+                let old_start_priority = sched
+                    .vfork_child_start_priorities
+                    .insert(child_dettid, initial_priority);
+                assert!(old_start_priority.is_none());
+            }
+
             if self.cfg.replay_schedule_from.is_none() {
                 // Give the thread an initial priority
                 let old_prio = sched.priorities.insert(child_dettid, initial_priority);
@@ -713,11 +726,16 @@ impl GlobalState {
             } else {
                 // In replay mode, the context switch point will already have initialized the priority.
                 // UNLESS this is the root thread, in which case we need to fill it in:
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    sched.priorities.entry(child_dettid)
-                {
-                    assert_eq!(parent_detpid, ROOT_DETPID);
-                    entry.insert(initial_priority);
+                match sched.priorities.entry(child_dettid) {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if parent_is_kernel_blocked {
+                            entry.insert(initial_priority);
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        assert_eq!(parent_detpid, ROOT_DETPID);
+                        entry.insert(initial_priority);
+                    }
                 }
             }
 
@@ -824,19 +842,24 @@ impl GlobalState {
                 );
                 ThreadHistory::new()
             });
-            let old_prio = self
-                .sched
-                .lock()
-                .unwrap()
-                .priorities
-                .insert(dettid, history.initial_priority());
+            let mut sched = self.sched.lock().unwrap();
+            let start_priority = sched
+                .vfork_child_start_priorities
+                .remove(&dettid)
+                .unwrap_or_else(|| history.initial_priority());
+            let old_prio = sched.priorities.insert(dettid, start_priority);
             debug!(
                 "[replay-preemption] Enqueing new thread at priority {:?} (changed from {:?})",
-                history.initial_priority(),
-                old_prio,
+                start_priority, old_prio,
             );
+            drop(sched);
             Some(history)
         } else {
+            self.sched
+                .lock()
+                .unwrap()
+                .vfork_child_start_priorities
+                .remove(&dettid);
             None
         }
     }
@@ -1389,11 +1412,8 @@ pub async fn create_vfork_child_thread<G, T>(
             "vfork child priority entropy missing in chaos mode",
         )))
     } else {
-        // POSIX vfork suspends the parent until the child execs or _exits. Give
-        // the vfork child a strictly higher priority (lower number) than the
-        // parent's DEFAULT_PRIORITY so the deterministic scheduler always runs
-        // the child first, rather than round-robining the parent and child at
-        // equal priority (which leaves fork/exec ordering nondeterministic).
+        // Propose a high priority; global registration clamps this against the
+        // actual parent priority so nested vfork is strictly ordered as well.
         Some(DEFAULT_PRIORITY - 1)
     };
 
