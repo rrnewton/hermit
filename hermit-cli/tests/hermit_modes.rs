@@ -506,6 +506,32 @@ buck_chaos_tests! {
     chaos_buck_clone => "clone",
     chaos_buck_hello_alarm => "hello_alarm",
     chaos_buck_mem_race => "rust_mem_race",
+    // Expanded chaos coverage: default_only workloads confirmed to pass
+    // `run --verify --chaos --preemption-timeout=1000000` across repeated runs
+    // of the real test harness (3/3). See
+    // ai_docs/transient/rr-chaos-coverage-matrix.md.
+    chaos_buck_getcpu => "getcpu",
+    chaos_buck_memory_pressure => "memory_pressure",
+    chaos_buck_print_memaddrs => "print_memaddrs",
+    chaos_buck_printf_with_threads => "printf_with_threads",
+    chaos_buck_sigtimedwait_no_timeout => "sigtimedwait_no_timeout",
+    chaos_buck_sigtimedwait_timeout_0s => "sigtimedwait_timeout_0s",
+    chaos_buck_sigtimedwait_timeout_1s => "sigtimedwait_timeout_1s",
+    chaos_buck_sysinfo_uptime => "sysinfo_uptime",
+    chaos_buck_thread_exhaustion => "thread_exhaustion",
+    chaos_buck_lit_hello_world_c => "lit_hello_world_c",
+    chaos_buck_lit_networking => "lit_networking",
+    chaos_buck_lit_hello_world_rust => "lit_hello_world_rust",
+    chaos_buck_rust_stack_ptr => "rust_stack_ptr",
+    chaos_buck_rust_heap_ptrs => "rust_heap_ptrs",
+    chaos_buck_rust_rdtsc => "rust_rdtsc",
+    chaos_buck_rustbin_clock_gettime => "rustbin_clock_gettime",
+    chaos_buck_rustbin_exit_group => "rustbin_exit_group",
+    chaos_buck_rustbin_futex_timeout => "rustbin_futex_timeout",
+    chaos_buck_rustbin_futex_wait_child => "rustbin_futex_wait_child",
+    chaos_buck_rustbin_nanosleep => "rustbin_nanosleep",
+    chaos_buck_rustbin_socketpair => "rustbin_socketpair",
+    chaos_buck_rustbin_thread_random => "rustbin_thread_random",
 }
 
 #[test]

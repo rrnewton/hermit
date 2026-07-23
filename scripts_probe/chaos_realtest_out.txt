@@ -1,0 +1,26 @@
+iter 1 done
+iter 2 done
+iter 3 done
+=== CHAOS REAL-TEST RELIABILITY (3 iters) ===
+chaos_buck_getcpu                        KEEP  3/3
+chaos_buck_memory_pressure               KEEP  3/3
+chaos_buck_print_memaddrs                KEEP  3/3
+chaos_buck_printf_with_threads           KEEP  3/3
+chaos_buck_sigtimedwait_no_timeout       KEEP  3/3
+chaos_buck_sigtimedwait_timeout_0s       KEEP  3/3
+chaos_buck_sigtimedwait_timeout_1s       KEEP  3/3
+chaos_buck_sysinfo_uptime                KEEP  3/3
+chaos_buck_thread_exhaustion             KEEP  3/3
+chaos_buck_lit_hello_world_c             KEEP  3/3
+chaos_buck_lit_networking                KEEP  3/3
+chaos_buck_lit_hello_world_rust          KEEP  3/3
+chaos_buck_rust_stack_ptr                KEEP  3/3
+chaos_buck_rust_heap_ptrs                KEEP  3/3
+chaos_buck_rust_rdtsc                    KEEP  3/3
+chaos_buck_rustbin_clock_gettime         KEEP  3/3
+chaos_buck_rustbin_exit_group            KEEP  3/3
+chaos_buck_rustbin_futex_timeout         KEEP  3/3
+chaos_buck_rustbin_futex_wait_child      KEEP  3/3
+chaos_buck_rustbin_nanosleep             KEEP  3/3
+chaos_buck_rustbin_socketpair            KEEP  3/3
+chaos_buck_rustbin_thread_random         KEEP  3/3

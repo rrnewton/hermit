@@ -1,0 +1,11 @@
+iter 1 done
+iter 2 done
+iter 3 done
+=== RECORD REAL-TEST RELIABILITY (3 iters) ===
+expanded_c_record_replay_matrix    KEEP  3/3
+record_rs_clock_gettime            KEEP  3/3
+record_rs_futex_and_print          KEEP  3/3
+record_rs_socketpair               DROP  0/3
+record_rs_bind_connect_race        DROP  0/3
+record_rs_network_hello_world      DROP  0/3
+record_rs_interrogate_tty          DROP  0/3

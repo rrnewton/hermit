@@ -31,7 +31,20 @@ const BASELINE_RECORD_WORKLOADS: [&str; 6] = [
     "rs_clock_gettime",
 ];
 
-const CARGO_RECORD_GUESTS: [&str; 15] = [
+/// Expanded C record/replay coverage. Like [`BASELINE_RECORD_WORKLOADS`] these
+/// need no PMU (record/replay does not enable preemption), so they are safe on
+/// GitHub-hosted runners. Confirmed 3/3 stable in the real test harness; see
+/// ai_docs/transient/rr-chaos-coverage-matrix.md.
+const EXPANDED_C_RECORD_WORKLOADS: [&str; 6] = [
+    "c_getcpu",
+    "c_hello_alarm",
+    "c_memory_pressure",
+    "c_sigtimedwait_no_timeout",
+    "c_sysinfo_uptime",
+    "c_thread_exhaustion",
+];
+
+const CARGO_RECORD_GUESTS: [&str; 17] = [
     "rustbin_clock_total_order",
     "rustbin_exit_group",
     "rustbin_sched_yield",
@@ -47,6 +60,14 @@ const CARGO_RECORD_GUESTS: [&str; 15] = [
     "rustbin_rdtsc",
     "rustbin_stack_ptr",
     "rustbin_thread_random",
+    // Expanded record/replay coverage: Cargo guests confirmed to record and
+    // replay --verify cleanly across repeated runs of the real test harness
+    // (3/3). Socket/network/tty guests were evaluated but rejected: they print
+    // "Success: replay matched recording" yet flakily SIGSEGV on teardown via
+    // reverie clone_with_stack (reverie rev e3e2c96). See
+    // ai_docs/transient/rr-chaos-coverage-matrix.md.
+    "rustbin_clock_gettime",
+    "rustbin_futex_and_print",
 ];
 
 #[derive(Debug)]
@@ -198,6 +219,15 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            // Expanded record/replay coverage: C guests confirmed to record and
+            // replay --verify cleanly across repeated runs of the real test
+            // harness (3/3). See ai_docs/transient/rr-chaos-coverage-matrix.md.
+            ("c_getcpu", "getCpu.c"),
+            ("c_hello_alarm", "hello_alarm.c"),
+            ("c_memory_pressure", "memoryPress.c"),
+            ("c_sigtimedwait_no_timeout", "sigtimedwait-no-timeout.c"),
+            ("c_sysinfo_uptime", "sysinfo_uptime.c"),
+            ("c_thread_exhaustion", "threadExhaustion.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -266,6 +296,17 @@ fn record_replay_matrix() {
     // also run on GitHub-hosted runners without performance-counter access.
     let _guard = hermit_record_lock();
     for name in BASELINE_RECORD_WORKLOADS {
+        record_replay(workload(name));
+    }
+}
+
+#[test]
+fn expanded_c_record_replay_matrix() {
+    // Like record_replay_matrix, record/replay does not enable PMU-backed
+    // preemption, so these workloads also run on GitHub-hosted runners without
+    // performance-counter access.
+    let _guard = hermit_record_lock();
+    for name in EXPANDED_C_RECORD_WORKLOADS {
         record_replay(workload(name));
     }
 }
@@ -545,4 +586,8 @@ record_replay_tests! {
     record_rs_rdtsc => "rustbin_rdtsc",
     record_rs_stack_ptr => "rustbin_stack_ptr",
     record_rs_thread_random => "rustbin_thread_random",
+    // Expanded record/replay coverage (3/3 stable in the real harness). See
+    // ai_docs/transient/rr-chaos-coverage-matrix.md.
+    record_rs_clock_gettime => "rustbin_clock_gettime",
+    record_rs_futex_and_print => "rustbin_futex_and_print",
 }
