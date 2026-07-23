@@ -923,8 +923,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pipe2,
     ) -> Result<i64, Errno> {
-        let internally_nonblocking =
-            self.cfg.use_nonblocking_sockets() && !self.cfg.recordreplay_modes;
+        // Pipes are unambiguously container-internal: both endpoints are owned by
+        // guest processes. Make them physically nonblocking whenever we sequentialize
+        // threads -- INCLUDING record/replay modes. This lets a potentially-blocking
+        // pipe read follow the deterministic nonblockize-and-retry (InternalIOPolling)
+        // path instead of being descheduled as BlockingExternalIO. A pipe reader and
+        // its paired writer are NOT independent, so treating an internal pipe as
+        // "external blocking IO" (safe to run in the background and rejoin whenever)
+        // deadlocks the sequentialized scheduler in R/R (the documented pipe hang). The
+        // physical O_NONBLOCK is Detcore-internal and invisible to the guest (F_GETFL is
+        // virtualized), and mirrors what `hermit run --strict` already does for pipes.
+        let internally_nonblocking = self.cfg.use_nonblocking_sockets();
         let injected = if internally_nonblocking {
             call.with_flags(call.flags() | OFlag::O_NONBLOCK)
         } else {
