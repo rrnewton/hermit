@@ -37,6 +37,7 @@ use reverie::process::Mount;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
@@ -130,6 +131,26 @@ pub struct RunOpts {
         conflicts_with = "backend"
     )]
     namespace_only: bool,
+
+    /// Run syscall interception directly on the host without creating Linux namespaces or
+    /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
+    /// guests. Host process, filesystem, and network state are shared, reducing determinism.
+    /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    #[clap(
+        long,
+        visible_alias = "core-only",
+        conflicts_with_all = [
+            "mount",
+            "bind",
+            "network",
+            "tmp",
+            "namespace_only",
+            "analyze_networking",
+            "replay_schedule_from",
+            "replay_preemptions_from"
+        ]
+    )]
+    no_namespace: bool,
 
     /// Run in a minimally invasive syscall-interception mode. Combine with `hermit --log=info` to
     /// print intercepted syscalls.
@@ -391,6 +412,9 @@ impl fmt::Display for RunOpts {
         }
         if self.namespace_only {
             write!(f, " --namespace-only")?;
+        }
+        if self.no_namespace {
+            write!(f, " --no-namespace")?;
         }
         if self.summary {
             write!(f, " --summary")?;
@@ -695,6 +719,22 @@ fn gdbserver_conflicts_with_analyze_networking() {
 }
 
 #[test]
+fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert!(opts.no_namespace);
+    assert_eq!(opts.network, NetworkingMode::Host);
+    assert_eq!(opts.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+    assert!(!opts.det_opts.det_config.has_uts_namespace);
+    assert!(opts.pin_threads);
+    assert_eq!(
+        format!("{}", opts),
+        " --network=host --no-namespace --tmp=/tmp -- fakeprog"
+    );
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -849,6 +889,15 @@ impl RunOpts {
         self.validate_program()?;
         // });
 
+        if self.no_namespace {
+            eprintln!(
+                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
+                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
+                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
+                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
+            );
+        }
+
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
@@ -872,7 +921,12 @@ impl RunOpts {
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let config = &mut self.det_opts.det_config;
 
-        config.has_uts_namespace = true;
+        config.has_uts_namespace = !self.no_namespace;
+
+        if self.no_namespace {
+            self.network = NetworkingMode::Host;
+            self.tmp = Some(PathBuf::from(TMP_DIR));
+        }
 
         if self.analyze_networking {
             config.warn_non_zero_binds = true;
@@ -1081,6 +1135,14 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        if self.no_namespace {
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            return with_container(&mut process, || {
+                self.run_in_container(global, capture_output)
+            });
+        }
+
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
@@ -1222,6 +1284,17 @@ impl RunOpts {
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
+        if self.no_namespace {
+            // Verify initializes a process-global tracing subscriber for each run. Keep a plain
+            // child-process boundary between runs, but do not configure any namespaces or mounts.
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            let mut log_file = Some(log_file);
+            return with_container(&mut process, || {
+                self.run_verify_in_container(&mut log_file, global)
+            });
+        }
+
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
