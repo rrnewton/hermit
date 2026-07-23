@@ -138,4 +138,56 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         Ok(0)
     }
+
+    /// timer_settime system call.
+    ///
+    /// POSIX per-process timers deliver signals at wall-/CPU-clock moments,
+    /// which is nondeterministic: an armed timer's signal lands at a different
+    /// instruction boundary on each run and perturbs the RCB-derived logical
+    /// clock. We therefore never arm the underlying host timer. The timer object
+    /// itself (created via a real `timer_create`) still exists, so callers such
+    /// as folly's `Singleton` watchdog -- which require `timer_create` to
+    /// succeed -- proceed; the watchdog simply never fires during a run.
+    ///
+    /// We report the previous state as disarmed (all-zero `itimerspec`), which
+    /// is accurate because we never arm the timer.
+    pub async fn handle_timer_settime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerSettime,
+    ) -> Result<i64, Error> {
+        if let Some(old_value) = call.old_value() {
+            guest
+                .memory()
+                .write_value(old_value, &zeroed_itimerspec())?;
+        }
+        Ok(0)
+    }
+
+    /// timer_gettime system call. Our timers are never armed (see
+    /// [`Self::handle_timer_settime`]), so we always report them as disarmed.
+    pub async fn handle_timer_gettime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerGettime,
+    ) -> Result<i64, Error> {
+        if let Some(value) = call.value() {
+            guest.memory().write_value(value, &zeroed_itimerspec())?;
+        }
+        Ok(0)
+    }
+}
+
+/// A zeroed `itimerspec` representing a disarmed timer.
+fn zeroed_itimerspec() -> libc::itimerspec {
+    libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    }
 }

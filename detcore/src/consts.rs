@@ -26,5 +26,11 @@ pub static DET_INODE_OFFSET: DetInode = 9000;
 
 pub const DEFAULT_HOSTNAME: &str = "hermetic-container.local";
 
+/// Deterministic user and group id reported to the guest by the identity
+/// syscalls (getuid/geteuid/getgid/getegid). Returning a fixed value keeps the
+/// container reproducible across machines instead of leaking the host account.
+pub const DEFAULT_UID: u32 = 1000;
+pub const DEFAULT_GID: u32 = 1000;
+
 /// A convention of how we set up our PID namespace leaves us with a starting pid of 3.
 pub const ROOT_DETPID: DetPid = DetPid::from_raw(3);

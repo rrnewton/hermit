@@ -1174,6 +1174,36 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getpid(_) => self.passthrough(guest, call).await,
             Syscall::Gettid(_) => self.passthrough(guest, call).await,
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+
+            // Report a fixed deterministic account so the identity syscalls do
+            // not leak the host uid/gid and stay reproducible across machines.
+            Syscall::Getuid(_) | Syscall::Geteuid(_) => Ok(i64::from(consts::DEFAULT_UID)),
+            Syscall::Getgid(_) | Syscall::Getegid(_) => Ok(i64::from(consts::DEFAULT_GID)),
+
+            // The working directory is stable across a run, so passthrough is
+            // deterministic and fills the guest buffer with the real path.
+            Syscall::Getcwd(_) => self.passthrough(guest, call).await,
+
+            // Filesystem statistics. Passthrough is deterministic across repeat
+            // runs on the same host. TODO: sanitize volatile free-space fields
+            // (f_bfree/f_bavail/f_ffree) for cross-run reproducibility.
+            Syscall::Statfs(_) | Syscall::Fstatfs(_) => self.passthrough(guest, call).await,
+
+            // membarrier is effectively a no-op under sequentialized single-CPU
+            // execution; passthrough preserves its query semantics.
+            Syscall::Membarrier(_) => self.passthrough(guest, call).await,
+
+            // POSIX per-process timers. Some runtimes (e.g. folly's Singleton
+            // watchdog inside fbpython) hard-require timer_create to succeed, so
+            // we create a real (never-armed) timer object via passthrough, but
+            // neutralize arming so no nondeterministic signal is ever delivered.
+            // See handle_timer_settime for the determinism rationale.
+            Syscall::TimerCreate(_) => self.passthrough(guest, call).await,
+            Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
+            Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
+            Syscall::TimerGetoverrun(_) => Ok(0),
+            Syscall::TimerDelete(_) => self.passthrough(guest, call).await,
+
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
             Syscall::Alarm(s) => self.handle_alarm(guest, s).await,

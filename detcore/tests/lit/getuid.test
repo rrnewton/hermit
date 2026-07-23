@@ -1,0 +1,8 @@
+# The identity syscalls (getuid/geteuid/getgid/getegid) return a fixed
+# deterministic account id instead of leaking the host uid/gid, so a
+# container is reproducible across machines. `id -u`/`id -g` read only
+# getuid()/getgid() and do not trigger an NSS passwd/group lookup.
+RUN: %hermit run -- id -u | FileCheck %s
+RUN: %hermit run -- id -g | FileCheck %s
+CHECK: 1000
+CHECK-EMPTY:
