@@ -120,6 +120,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
+    /// rseq (restartable sequences) system call.
+    ///
+    /// glibc >= 2.35 registers an rseq area at startup so that per-CPU fast
+    /// paths (e.g. tcache/malloc arena selection and `sched_getcpu`) can read
+    /// the current CPU from userspace without a syscall. That mechanism exposes
+    /// the raw host CPU id and races on kernel-driven restarts, both of which
+    /// are sources of nondeterminism that Detcore cannot sanitize.
+    ///
+    /// Returning `-ENOSYS` tells glibc that the kernel does not support rseq. It
+    /// then leaves the rseq area unregistered (`__rseq_size == 0`) and falls
+    /// back to the slower-but-correct `getcpu`/`sched_getcpu` syscall path,
+    /// which Detcore already virtualizes deterministically (always CPU 0). This
+    /// is the safest determinization strategy and is exercised by every real
+    /// application that links against a modern glibc.
+    pub async fn handle_rseq<G: Guest<Self>>(&self, guest: &mut G) -> Result<i64, Error> {
+        detlog!(
+            "[dtid {}] rseq disabled: returning -ENOSYS so glibc uses the deterministic fallback path",
+            guest.thread_state().dettid,
+        );
+        Err(Errno::ENOSYS.into())
+    }
+
     /// getcpu system call
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,

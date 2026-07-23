@@ -1163,6 +1163,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Access(s) => self.handle_access(guest, s).await,
             Syscall::Faccessat(s) => self.handle_faccessat(guest, s).await,
             Syscall::Other(Sysno::faccessat2, args) => self.handle_faccessat2(guest, args).await,
+            // rseq has no typed variant in reverie-syscalls; disable it by
+            // returning -ENOSYS so glibc uses its deterministic fallback path.
+            Syscall::Other(Sysno::rseq, _) => self.handle_rseq(guest).await,
             Syscall::Mprotect(_) => self.passthrough(guest, call).await,
             Syscall::ArchPrctl(_) => self.passthrough(guest, call).await,
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
