@@ -1021,6 +1021,10 @@ impl GlobalState {
                 timeslice: end_of_timeslice,
             }
         } else {
+            // Normal timeslice expiry is enforced by Detcore's local pre/post
+            // handler hooks. This RPC only runs when schedule-event tracing is
+            // enabled, so yielding here would miss default runs and double-yield
+            // traced runs.
             TraceSchedEventResponse {
                 print_stack_strace: self.record_event(&ev),
                 timeslice: None,
