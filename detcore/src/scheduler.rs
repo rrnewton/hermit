@@ -1445,32 +1445,44 @@ impl Scheduler {
                 }
             } // End region which should be deleted.
 
-            // Nondeterminsitic algorithm: the unblocked background action jumps back in randomly.
-            if !ready.is_empty() {
-                // Policy: our heuristic to mitigate nondeterminism (even with nondeterministic external
-                // blocking IO) is to only poll it when there is nothing deterministic that is runnable.
-                // TODO: we need to take into account internal polling, which may spin forever.
+            // Policy (determinism mitigation): a completed external-IO action must only be
+            // spliced back into the schedule when there is no *deterministic* runnable work
+            // pending -- i.e. the run queue is empty or holds only internal-IO pollers. The
+            // set and completion-timing of `ready` external actions is a nondeterministic,
+            // host-timing-dependent snapshot; if we reschedule an external-IO continuation
+            // while deterministic turns are still runnable, that continuation commits at a
+            // nondeterministic point relative to the deterministic COMMIT stream, desyncing
+            // the DETLOG across runs (e.g. rustc's linker-pipeline poll on GH determinism).
+            // By deferring the reschedule until deterministic work has drained to pollers-only,
+            // the splice point becomes a deterministic function of the (RCB-deterministic)
+            // schedule, not of wall-clock I/O readiness. `external_io_blockers` is a BTreeMap
+            // so `ready` is already in deterministic DetTid order.
+            //
+            // TODO (T137183027): the fully general fix records/replays these scheduler events;
+            // this gate is a determinism mitigation for the plain-`run` case.
+            let empty_but_for_pollers = if let Some(fp) = self.run_queue.first_priority() {
+                fp >= LAST_PRIORITY
+            } else {
+                true
+            };
+            if empty_but_for_pollers && !ready.is_empty() {
                 for ready_dtid in &ready {
-                    // TODO: instead record a nondeterministic scheduler event if something is ready.
                     info!(
-                        "[step2] NONDET: Reschedule formerly (external IO) blocked dtid {:?}",
+                        "[step2] Reschedule formerly (external IO) blocked dtid {:?} (deterministic work drained)",
                         ready_dtid
                     );
                     self.blocked.external_io_blockers.remove(ready_dtid);
                     self.run_queue.push_eager_io_repoll(*ready_dtid);
                 }
-                let empty_but_for_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                    fp >= LAST_PRIORITY
-                } else {
-                    true
-                };
-                if !empty_but_for_pollers {
-                    tracing::warn!(
-                        "Nondeterministic external actions {:?} jumped in the middle of runnable work ({} tasks). Need to record this for reproducibility.",
-                        &ready,
-                        self.run_queue.len()
-                    );
-                }
+            } else if !ready.is_empty() {
+                // Deterministic work is still runnable; keep the completed external IO parked
+                // and let the deterministic turns proceed first. It will be rescheduled above
+                // on a later pass once the run queue drains to pollers-only.
+                debug!(
+                    "[step2] Deferring reschedule of ready external-IO dtids {:?}: {} deterministic task(s) still runnable.",
+                    &ready,
+                    self.run_queue.len()
+                );
             }
             if self.run_queue.is_empty()
                 && self.blocked.timed_waiters.is_empty()
