@@ -349,6 +349,84 @@ fn run_kvm_respects_workdir_for_relative_paths() {
 }
 
 #[test]
+fn run_kvm_lists_host_directory_metadata() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create KVM directory fixture");
+    fs::write(temp.path().join("alpha.txt"), b"alpha\n")
+        .expect("failed to write KVM directory fixture");
+    fs::create_dir(temp.path().join("subdir")).expect("failed to create KVM subdirectory");
+    std::os::unix::fs::symlink("alpha.txt", temp.path().join("alpha-link"))
+        .expect("failed to create KVM symlink fixture");
+    let workdir = temp
+        .path()
+        .to_str()
+        .expect("temporary path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--tmp=/tmp",
+        "--workdir",
+        workdir,
+        "--",
+        "/bin/ls",
+        "-ln",
+        ".",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let listing = stdout(&output);
+    let alpha = listing
+        .lines()
+        .find(|line| line.ends_with(" alpha.txt") && !line.contains(" -> "))
+        .unwrap_or_else(|| panic!("missing file in:\n{listing}"));
+    let alpha_fields: Vec<_> = alpha.split_whitespace().collect();
+    assert!(alpha_fields[0].starts_with("-rw"), "bad file mode: {alpha}");
+    assert_eq!(alpha_fields[4], "6", "bad file size: {alpha}");
+    let subdir = listing
+        .lines()
+        .find(|line| line.ends_with(" subdir"))
+        .unwrap_or_else(|| panic!("missing directory in:\n{listing}"));
+    assert!(subdir.starts_with("d"), "bad directory type: {subdir}");
+    let link = listing
+        .lines()
+        .find(|line| line.ends_with(" alpha-link -> alpha.txt"))
+        .unwrap_or_else(|| panic!("missing symlink in:\n{listing}"));
+    assert!(link.starts_with("l"), "bad symlink type: {link}");
+}
+
+#[test]
+fn run_kvm_reads_host_file() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let expected = fs::read_to_string("/etc/hostname").expect("failed to read host hostname");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+        "/etc/hostname",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected);
+}
+
+#[test]
 fn namespace_only_rejects_every_explicit_backend() {
     for backend in ["ptrace", "dbi", "kvm"] {
         let args = [
