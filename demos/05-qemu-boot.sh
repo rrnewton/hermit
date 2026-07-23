@@ -24,22 +24,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 export QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
 export QEMU_TIMEOUT="${QEMU_TIMEOUT:-180}"
 export HERMIT_RELEASE="${HERMIT_RELEASE:-$HERMIT_REPO/target/release/hermit}"
+export QEMU_ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 
-# The QEMU images are intentionally git-ignored. Prefer a path supplied by the
-# caller, then check the product checkout, this parent checkout, and the shared
-# dev-hermit root used by numbered worktrees.
-if [ -z "${QEMU_ASSETS:-}" ]; then
-  for candidate in \
-    "$HERMIT_REPO/ignored/qemu-linux" \
-    "$ROOT/ignored/qemu-linux" \
-    "$ROOT/../../ignored/qemu-linux"; do
-    if [ -r "$candidate/bzImage" ] && [ -r "$candidate/initramfs.cpio.gz" ]; then
-      QEMU_ASSETS="$candidate"
-      break
-    fi
-  done
+# Build the ignored artifacts on first use, then reuse the cache. This keeps a
+# clean checkout self-contained without committing a kernel or initramfs.
+if [ ! -r "$QEMU_ASSETS/bzImage" ] || \
+   [ ! -r "$QEMU_ASSETS/initramfs.cpio.gz" ]; then
+  demo_banner "Provision QEMU kernel and initramfs"
+  "$DEMO_DIR/05-qemu-assets.sh"
 fi
-QEMU_ASSETS="${QEMU_ASSETS:-$HERMIT_REPO/ignored/qemu-linux}"
 
 test -x "$HERMIT_RELEASE" || {
   echo "missing release Hermit binary: $HERMIT_RELEASE" >&2
