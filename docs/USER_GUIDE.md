@@ -128,11 +128,16 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 #### Backend Selection
 
 Use `--backend=ptrace|dbi|kvm` to select the process instrumentation backend.
-The default is `ptrace`, so existing commands are unchanged:
+It is a global option and belongs before the subcommand, because the backend
+governs how any subcommand instruments the guest. The default is `ptrace`, so
+existing commands are unchanged:
 
 ```bash
-hermit run --backend=ptrace -- /bin/echo hello
+hermit --backend=ptrace run -- /bin/echo hello
 ```
+
+For backwards compatibility, `run` also accepts `--backend` after the
+subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend. The

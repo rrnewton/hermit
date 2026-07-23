@@ -823,6 +823,12 @@ impl RunOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
+        // The backend may be given in the preferred global position
+        // (`hermit --backend X run ...`) or, for backwards compatibility, after the
+        // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
+        // value wins; otherwise fall back to the global one.
+        self.backend = self.backend.or(global.backend);
+
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {

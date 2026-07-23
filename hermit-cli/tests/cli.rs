@@ -267,6 +267,53 @@ fn namespace_only_rejects_every_explicit_backend() {
 }
 
 #[test]
+fn backend_accepted_in_global_position() {
+    // The global-position `--backend` (before the subcommand) must be threaded
+    // through to `run`. Probe with an unintegrated backend so the value's effect
+    // is observable without depending on ptrace capabilities being available.
+    for backend in ["dbi", "kvm"] {
+        let args = ["--backend", backend, "run", "--", "/bin/true"];
+        let output = hermit(&args);
+        let expected = format!("backend `{backend}` is unavailable");
+        assert_failure_contains(&output, &[&expected]);
+    }
+}
+
+#[test]
+fn global_position_rejects_unknown_backends() {
+    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("invalid value 'unknown'"),
+        "unexpected error:\n{stderr}"
+    );
+}
+
+#[test]
+fn namespace_only_rejects_global_position_backend() {
+    let args = [
+        "--backend",
+        "ptrace",
+        "run",
+        "--namespace-only",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    let message = stderr(&output);
+    assert!(
+        message.contains("--backend"),
+        "unexpected error:\n{message}"
+    );
+    assert!(
+        message.contains("--namespace-only"),
+        "unexpected error:\n{message}"
+    );
+}
+
+#[test]
 fn incompatible_run_modes_fail_during_argument_parsing() {
     let args = ["run", "--namespace-only", "--chaos", "/bin/true"];
     let output = hermit(&args);
