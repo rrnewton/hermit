@@ -300,6 +300,34 @@ pub struct Scheduler {
     /// NB: BTreeMap over HashMap for deterministic printing.
     pub priorities: BTreeMap<DetTid, Priority>,
 
+    /// Parent dtids currently blocked inside `clone(CLONE_VFORK)` whose child
+    /// thread has not yet registered itself with the scheduler.
+    ///
+    /// A vfork child is created asynchronously by the kernel while its parent is
+    /// backgrounded on `BlockingExternalIO`; it only enters the run queue later,
+    /// from `create_vfork_child_thread` on its own tracer thread. While this set
+    /// is non-empty the scheduler must not dispatch any *other* thread: doing so
+    /// races the child's registration and makes the post-vfork schedule
+    /// nondeterministic (e.g. a concurrently-runnable peer at DEFAULT_PRIORITY
+    /// jumping ahead of the child, which is given DEFAULT_PRIORITY - 1). Waiting
+    /// for registration is bounded and deadlock-free: the child registers before
+    /// it waits for a scheduler turn, and a failed vfork (no child) is cleared
+    /// when the parent's blocker is harvested in `step2c_process_io_blockers`.
+    pub pending_vfork_children: HashSet<DetTid>,
+
+    /// Parent dtids currently backgrounded on the `BlockingExternalIO` step of a
+    /// `clone(CLONE_VFORK)`. Unlike `pending_vfork_children` (cleared once the
+    /// child registers), this persists until the parent's blocker is harvested,
+    /// i.e. until the child execs/exits and the parent's `vfork(2)` returns.
+    ///
+    /// A completed external-IO blocker is normally re-queued at
+    /// `EAGER_IO_REPOLL_PRIORITY` (the absolute front), which would let the
+    /// resuming vfork parent jump ahead of its own child's post-exec
+    /// continuation. That ordering is timing-dependent and thus nondeterministic.
+    /// For a vfork parent we instead re-queue at its ordinary priority so the
+    /// child (given DEFAULT_PRIORITY - 1) deterministically runs first.
+    pub vfork_parent_blockers: HashSet<DetTid>,
+
     /// Tracks explicit optional timeslices to run for each thread.
     /// If a guest is to be unblocked on a thread the guest will receive this
     /// information and needs to "cooperate" and setup it's preemption for the amount
@@ -843,6 +871,8 @@ impl Scheduler {
             started_up: Default::default(),
             thread_tree: Default::default(),
             priorities: Default::default(),
+            pending_vfork_children: Default::default(),
+            vfork_parent_blockers: Default::default(),
             timeslices: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
@@ -1026,6 +1056,11 @@ impl Scheduler {
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
+        // A vfork parent that is being torn down will never be harvested normally;
+        // drop its markers so the scheduler neither waits for a child that will
+        // not come nor mis-classifies a future blocker for this dtid.
+        self.pending_vfork_children.remove(dtid);
+        self.vfork_parent_blockers.remove(dtid);
     }
 
     fn remove_futex_waiter(&mut self, dettid: &DetTid) -> bool {
@@ -1195,6 +1230,20 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
+        // A vfork parent is backgrounded but its child has not yet registered in
+        // the run queue (it does so asynchronously, on its own tracer thread).
+        // Do not dispatch any other thread until the child appears, so the child
+        // is deterministically scheduled next regardless of registration timing.
+        // step2c above still harvests ready IO blockers (including a failed
+        // vfork's parent, which clears its entry there), so this cannot deadlock.
+        if !self.pending_vfork_children.is_empty() {
+            trace!(
+                "[step2] waiting for vfork child registration; parents pending: {:?}",
+                &self.pending_vfork_children
+            );
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
         self.step2d_handle_empty_queue(global_time)?;
         Ok(())
     }
@@ -1447,7 +1496,11 @@ impl Scheduler {
                             ready_dtid
                         );
                         self.blocked.external_io_blockers.remove(ready_dtid);
-                        self.run_queue.push_eager_io_repoll(*ready_dtid);
+                        // Defensive: if a vfork's blocker completed without the
+                        // child ever registering (e.g. vfork failed), stop waiting
+                        // for that never-arriving child.
+                        self.pending_vfork_children.remove(ready_dtid);
+                        self.requeue_completed_io_blocker(*ready_dtid);
                     }
                     return Ok(());
                 }
@@ -1476,7 +1529,10 @@ impl Scheduler {
                         ready_dtid
                     );
                     self.blocked.external_io_blockers.remove(ready_dtid);
-                    self.run_queue.push_eager_io_repoll(*ready_dtid);
+                    // Defensive: clear a pending vfork whose child never registered
+                    // (e.g. vfork failed) so the scheduler does not wait forever.
+                    self.pending_vfork_children.remove(ready_dtid);
+                    self.requeue_completed_io_blocker(*ready_dtid);
                 }
                 let empty_but_for_pollers = if let Some(fp) = self.run_queue.first_priority() {
                     fp >= LAST_PRIORITY
@@ -1662,7 +1718,8 @@ impl Scheduler {
                 0 => Ok(()),
                 1 => {
                     let (rid, perm) = rs.resources.iter().next().unwrap();
-                    self.block_for_one_resource(dettid, rid, perm, resp)
+                    let is_vfork = rs.fyi == "clone_vfork";
+                    self.block_for_one_resource(dettid, rid, perm, resp, is_vfork)
                 }
                 _ => {
                     panic!(
@@ -1703,6 +1760,7 @@ impl Scheduler {
         rid: &ResourceID,
         _perm: &Permission,
         resp: &Ivar<SchedResponse>,
+        is_vfork: bool,
     ) -> Result<(), SkipTurn> {
         match rid {
             ResourceID::SleepUntil(target_ns) => {
@@ -1738,6 +1796,15 @@ impl Scheduler {
                 //   (2) Request a BlockedExternalContinue as the first thing after the external IO is complete.
                 self.run_queue.undo_tentative_pop(); // Begun in step3
                 assert!(self.run_queue.remove_tid(dettid)); // Deschedule while in background.
+
+                // A CLONE_VFORK parent blocks here until its child execs/exits.
+                // Record that a vfork child is pending so the scheduler waits for
+                // the child to register (see `pending_vfork_children`) rather than
+                // racing another runnable thread ahead of it.
+                if is_vfork {
+                    self.pending_vfork_children.insert(dettid);
+                    self.vfork_parent_blockers.insert(dettid);
+                }
 
                 // TODO: Register the action that is occuring in the background:
                 // let act = self.new_action(Ivar::new());
@@ -2153,6 +2220,23 @@ impl Scheduler {
             .priorities
             .get(&dettid)
             .expect("get_priority: all threads should have a persistent priority")
+    }
+
+    /// Re-queue a thread whose backgrounded external IO has completed.
+    ///
+    /// Ordinary blockers go to the absolute front (`push_eager_io_repoll`) so the
+    /// completed IO's continuation is serviced promptly. A resuming `vfork`
+    /// parent is the exception: sending it to the front lets it jump ahead of its
+    /// own child's post-exec continuation, and whether that happens depends on
+    /// the nondeterministic real-time completion of `vfork(2)`. Re-queue such a
+    /// parent at its ordinary priority instead, so the child (DEFAULT_PRIORITY-1)
+    /// deterministically runs before the parent resumes.
+    fn requeue_completed_io_blocker(&mut self, dettid: DetTid) {
+        if self.vfork_parent_blockers.remove(&dettid) {
+            self.runqueue_push_front(dettid);
+        } else {
+            self.run_queue.push_eager_io_repoll(dettid);
+        }
     }
 
     /// Push_back a thread onto the runqueue, respecting its persistent priority
