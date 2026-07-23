@@ -154,6 +154,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGettime,
     ) -> Result<i64, Error> {
+        // Make clock_gettime a scheduling point. Normally a clock read is a pure
+        // read-only time observation (`thread_observe_time` issues a non-blocking
+        // time-query RPC) that does NOT relinquish the caller's turn, so a thread
+        // spinning on clock_gettime holds the (sequentialized) CPU until an RCB
+        // preemption fires. Issuing a yield here — like `handle_sched_yield` — lets
+        // the scheduler run other runnable threads (or advance logical time via the
+        // empty-run-queue deadlock-avoidance path) at every clock read.
+        if self.cfg.sequentialize_threads {
+            let resource = ResourceID::SleepUntil(LogicalTime::from_nanos(0));
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
         let time_ns = thread_observe_time(guest).await;
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
