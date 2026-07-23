@@ -130,6 +130,49 @@ spawn real threads with racy output ordering and come out bit-identical across r
 Because `hermit run` takes a single program, multi-step workflows (like the Redis one) are
 wrapped in a shell script and run as `$HERMIT run --strict --verify -- /bin/bash script.sh`.
 
+### 3f. Language runtimes
+
+| Runtime | Example command | Result |
+|---------|-----------------|--------|
+| Python (stock) | `$HERMIT run --strict --verify -- /usr/bin/python3 -c 'print(42)'` | PASS |
+| Perl | `$HERMIT run --strict --verify -- /usr/bin/perl -e 'print 6*7'` | PASS |
+| Node | `$HERMIT run --strict --verify -- /usr/local/bin/node -e 'console.log(42)'` | PASS |
+| Lua | `$HERMIT run --strict --verify -- /usr/bin/lua -e 'print(42)'` | PASS |
+| Java | `$HERMIT run --strict --verify -- /usr/local/bin/java -version` | PASS (OpenJDK 1.8.0_492 Temurin, 5/5 runs) — **requires PR #223** (`saturating_add` fix for `LogicalTime` overflow, issue #219) |
+| PHP | `$HERMIT run --strict --verify -- /usr/local/bin/php -r 'echo 42;'` | FAIL — hangs under Hermit (also non-`--strict`); not yet root-caused |
+| Ruby | `$HERMIT run --strict --verify -- /usr/bin/ruby -e 'puts 42'` | N/A — host Ruby install is broken (fails identically without Hermit) |
+
+Use the stock `/usr/bin/python3`, not `fbpython` — the `fbpython` launcher is nondeterministic
+under `--verify` independent of Hermit.
+
+### 3g. Deterministic builds (the core use case)
+
+Two **independent** `--strict` compiles of the same source produce **byte-identical** binaries
+(same SHA-256), i.e. reproducible builds:
+
+| Compiler | Test | Native | Under Hermit (2 independent `--strict` runs) |
+|----------|------|--------|---------------------------------------------|
+| gcc 11 | `hello.c` → binary | identical | **IDENTICAL** (`sha256 508f2b57…`, both exit 0, runs) |
+| clang | `hello.c` → binary | — | **IDENTICAL** (`sha256 4e298afe…`) |
+| gcc 11 | program embedding `__DATE__`/`__TIME__` | **DIFFERENT** (bakes wall-clock into the binary) | **IDENTICAL** (`sha256 55f52fc2…`) |
+
+The `__DATE__`/`__TIME__` case is the decisive demonstration: a program that compiles to
+*different* bytes natively (the compiler embeds the wall-clock compile time) compiles to
+*identical* bytes under Hermit, because the virtualized clock resolves `__TIME__` to the same
+fixed value every run.
+
+```sh
+printf '#include <stdio.h>\nint main(){printf("hi\\n");return 0;}\n' > hello.c
+$HERMIT run --strict -- /usr/bin/gcc -o hello1 hello.c
+$HERMIT run --strict -- /usr/bin/gcc -o hello2 hello.c
+cmp hello1 hello2 && echo IDENTICAL   # -> IDENTICAL
+```
+
+Note: this is the build *artifact* being reproducible across independent runs. `gcc` still
+fails `--strict --verify` (that checks internal syscall-trace determinism across a multi-process
+`cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory: the emitted
+binary is deterministic even though the internal syscall interleaving is not.
+
 ---
 
 ## 4. Backend status
