@@ -141,6 +141,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    /// Defense-in-depth determinism for the registers the syscall instruction
+    /// clobbers.
+    ///
+    /// On x86-64 the `syscall` instruction destroys `%rcx` (which the CPU loads
+    /// with the return instruction pointer) and `%r11` (the saved `RFLAGS`).
+    /// After a syscall these are architecturally "undefined", so hermit must not
+    /// assume a well-behaved guest ignores them: a misbehaving guest that reads
+    /// `%rcx`/`%r11` must still observe deterministic values. Reverie's
+    /// injected-syscall path can otherwise leave its *private trampoline page's*
+    /// RIP/RFLAGS in these registers, which is both nondeterministic and an
+    /// information leak of tracer internals.
+    ///
+    /// This forces both registers to the guest's own (deterministic) RIP and
+    /// RFLAGS, which is exactly what a faithful `SYSRET` would leave there. It is
+    /// a no-op when they already hold the canonical values (the common path), so
+    /// it only writes registers when something diverged. Register-preserved
+    /// arguments (`%rdi`..`%r9`, callee-saved) are deliberately left untouched:
+    /// the Linux ABI preserves them, so zeroing them would break faithful,
+    /// well-behaved programs.
+    #[cfg(target_arch = "x86_64")]
+    async fn canonicalize_syscall_clobbers<G: Guest<Self>>(&self, guest: &mut G) {
+        let mut regs = guest.regs().await;
+        // A faithful SYSRET leaves the return RIP in %rcx and RFLAGS in %r11.
+        if regs.rcx != regs.rip || regs.r11 != regs.eflags {
+            regs.rcx = regs.rip;
+            regs.r11 = regs.eflags;
+            if let Err(err) = guest.set_regs(regs).await {
+                // Best-effort: some backends cannot write registers. Do not fail
+                // the syscall over a defense-in-depth hardening step.
+                debug!(
+                    "canonicalize_syscall_clobbers: set_regs unsupported/failed: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    /// No-op on architectures without the x86-64 `%rcx`/`%r11` syscall clobber.
+    #[cfg(not(target_arch = "x86_64"))]
+    async fn canonicalize_syscall_clobbers<G: Guest<Self>>(&self, _guest: &mut G) {}
+
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
     /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
     ///
@@ -1274,6 +1315,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         self.post_handler_hook(guest).await;
+
+        // Defense-in-depth: before returning to the guest, force the
+        // syscall-clobbered registers (%rcx/%r11 on x86-64) to deterministic
+        // values so that even a misbehaving guest cannot observe nondeterminism
+        // (or Reverie's private trampoline address) through them.
+        self.canonicalize_syscall_clobbers(guest).await;
+
         res
     }
 
