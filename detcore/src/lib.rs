@@ -568,6 +568,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::execve,
                 Sysno::execveat,
                 Sysno::getcpu,
+                Sysno::getpid,
+                Sysno::gettid,
+                Sysno::getppid,
+                Sysno::kill,
+                Sysno::tkill,
+                Sysno::tgkill,
+                Sysno::rt_sigqueueinfo,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
@@ -1151,6 +1158,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+
+            // Process/thread identity and pid-targeted signals. Deterministic
+            // because the guest runs in its own PID namespace; see
+            // `detcore::syscalls::pid`.
+            Syscall::Getpid(s) => self.handle_getpid(guest, s).await,
+            Syscall::Gettid(s) => self.handle_gettid(guest, s).await,
+            Syscall::Getppid(s) => self.handle_getppid(guest, s).await,
+            Syscall::Kill(s) => self.handle_kill(guest, s).await,
+            Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
+            Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
+            Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
+
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
             Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
