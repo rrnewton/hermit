@@ -126,6 +126,10 @@ impl Replayer {
 
         let fd = syscall.fd();
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#236): console-fd tracking (this write gate plus the
+        // handle_close/dup/dup2/dup3/fcntl handlers below and EventReader's
+        // console_fds set) replaces the previous `fd == 1 || fd == 2` check.
         // Only let a write through to the real console when its fd actually
         // refers to the inherited console in the recorded fd topology. Tracking
         // fds (see `handle_dup2`/`handle_close`) instead of hard-coding fd 1/2
