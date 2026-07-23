@@ -3,6 +3,7 @@
 # Removing a row enables that test in the ratchet; adding a row requires debt review.
 arbitrary_binaries	run_arbitrary_binary_matrix	unsupported-syscall	Ioctl
 epoll_determinism	mixed_fd_readiness_is_deterministic	unsupported-syscall	Kill
+fp_reduction_determinism	strict_parallel_fp_reduction_is_bit_identical	host-pmu-bug	CI runner AMD errata AmdSpecLockMapShouldBeDisabled causes strict-mode SIGSEGV
 hermit_modes	default_bind_mounts	unsupported-syscall	Ioctl
 hermit_modes	default_cargo_bind_connect_race	unsupported-syscall	Mkdir
 hermit_modes	default_cargo_clock_gettime	unsupported-syscall	ClockSettime
