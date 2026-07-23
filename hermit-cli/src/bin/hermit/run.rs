@@ -882,7 +882,10 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else {
+        } else if backend != Backend::Kvm {
+            // The KVM backend reaches real reverie-kvm code from its dispatch
+            // path and reports an accurate, program-specific error there, so it
+            // is not pre-empted by the generic availability probe here.
             backend.ensure_available()?;
         }
         self.validate_mount_sources()?;

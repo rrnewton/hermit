@@ -233,17 +233,38 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
 
 #[test]
 fn run_fails_closed_for_unintegrated_backends() {
-    for backend in ["dbi", "kvm"] {
-        let args = ["run", "--backend", backend, "--", "/bin/true"];
-        let output = hermit(&args);
-        let expected = format!("backend `{backend}` is unavailable");
+    // DBI has no Hermit dispatch, so it must fail closed at the availability
+    // probe. (KVM is now integrated; see `run_kvm_reaches_backend_then_fails_execution`.)
+    let output = hermit(&["run", "--backend", "dbi", "--", "/bin/true"]);
+    assert_failure_contains(&output, &["backend `dbi` is unavailable"]);
+    assert!(
+        !stderr(&output).contains("Hermit cannot use ptrace"),
+        "dbi should fail before ptrace capability probing"
+    );
+}
 
-        assert_failure_contains(&output, &[&expected]);
-        assert!(
-            !stderr(&output).contains("Hermit cannot use ptrace"),
-            "{backend} should fail before ptrace capability probing"
-        );
-    }
+#[test]
+fn run_kvm_reaches_backend_then_fails_execution() {
+    // The KVM backend is wired into hermit-cli via reverie-kvm, but reverie-kvm
+    // does not yet implement a Linux execution personality, so an explicit
+    // `--backend kvm` reaches the backend dispatch and then fails with an
+    // accurate, program-specific error instead of the generic availability
+    // message used for unintegrated backends. The exact wording depends on
+    // whether /dev/kvm is accessible on the test host, so assert on the stable
+    // prefix common to both outcomes.
+    let args = ["run", "--backend", "kvm", "--", "/bin/true"];
+    let output = hermit(&args);
+
+    assert_failure_contains(&output, &["the KVM backend cannot run"]);
+    let stderr = stderr(&output);
+    assert!(
+        !stderr.contains("is unavailable"),
+        "kvm should reach its dispatch, not the generic availability probe:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Hermit cannot use ptrace"),
+        "kvm must not fall through to the ptrace backend:\n{stderr}"
+    );
 }
 
 #[test]
@@ -274,14 +295,22 @@ fn namespace_only_rejects_every_explicit_backend() {
 #[test]
 fn backend_accepted_in_global_position() {
     // The global-position `--backend` (before the subcommand) must be threaded
-    // through to `run`. Probe with an unintegrated backend so the value's effect
-    // is observable without depending on ptrace capabilities being available.
-    for backend in ["dbi", "kvm"] {
-        let args = ["--backend", backend, "run", "--", "/bin/true"];
-        let output = hermit(&args);
-        let expected = format!("backend `{backend}` is unavailable");
-        assert_failure_contains(&output, &[&expected]);
-    }
+    // through to `run`. Probe with the unintegrated DBI backend so the value's
+    // effect is observable without depending on ptrace capabilities being
+    // available.
+    let dbi = hermit(&["--backend", "dbi", "run", "--", "/bin/true"]);
+    assert_failure_contains(&dbi, &["backend `dbi` is unavailable"]);
+
+    // KVM is integrated (via reverie-kvm) but has no Linux execution personality
+    // yet, so the global-position value must still reach the KVM dispatch and
+    // produce its accurate, program-specific error.
+    let kvm = hermit(&["--backend", "kvm", "run", "--", "/bin/true"]);
+    assert_failure_contains(&kvm, &["the KVM backend cannot run"]);
+    assert!(
+        !stderr(&kvm).contains("is unavailable"),
+        "global-position kvm should reach its dispatch:\n{}",
+        stderr(&kvm)
+    );
 }
 
 #[test]
