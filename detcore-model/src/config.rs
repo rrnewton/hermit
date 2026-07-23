@@ -867,8 +867,10 @@ mod tests {
 
     #[test]
     fn config_display_preserves_nondefault_post_fork_modes() {
-        let mut config = Config::default();
-        config.runs_post_fork = RunsPostFork::Parent;
+        let mut config = Config {
+            runs_post_fork: RunsPostFork::Parent,
+            ..Config::default()
+        };
         assert!(config.to_string().contains(" --runs-post-fork=parent"));
 
         config.runs_post_fork = RunsPostFork::Random;
