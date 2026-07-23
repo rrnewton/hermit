@@ -892,6 +892,19 @@ impl RunOpts {
         self.validate_program()?;
         // });
 
+        // AUTONOMOUS-BOT-IMPLEMENTED (recreate of PR #181, which conflicted on rebase)
+        // Dispatch to an alternative Reverie backend if one was requested. The
+        // DBI prototype is handled entirely outside the ptrace container
+        // machinery below. KVM remains fail-closed via `ensure_available()`
+        // above and cannot reach this point.
+        match backend {
+            Backend::Ptrace => {}
+            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Kvm => {
+                anyhow::bail!("backend `kvm` has no Hermit dispatch implementation")
+            }
+        }
+
         if self.no_namespace {
             eprintln!(
                 "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \

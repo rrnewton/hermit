@@ -15,6 +15,7 @@
 )]
 
 mod analyze;
+mod backends;
 mod bisect;
 mod bnz;
 mod clean;
