@@ -52,7 +52,7 @@ where
     F: Fn(),
 {
     let config = detcore::Config {
-        preemption_timeout: None,
+        max_timeslice: None,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
@@ -63,7 +63,7 @@ where
     F: Fn(),
 {
     let config = detcore::Config {
-        preemption_timeout: None,
+        max_timeslice: None,
         sequentialize_threads: true,
         ..Default::default()
     };
@@ -482,7 +482,7 @@ fn network_syscalls_are_deterministic_across_five_runs() {
     let config = detcore::Config {
         sequentialize_threads: true,
         deterministic_io: true,
-        preemption_timeout: None,
+        max_timeslice: None,
         ..Default::default()
     };
 

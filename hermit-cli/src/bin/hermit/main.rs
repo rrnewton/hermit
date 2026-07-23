@@ -164,7 +164,7 @@ mod tests {
             "--bad",
             "bad.json",
             "--",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "/bin/true",
         ])
         .unwrap();

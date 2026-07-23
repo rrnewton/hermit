@@ -552,7 +552,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // In chaos mode, thread-interleaving diversity (and thus fairness)
             // comes entirely from re-randomizing thread priorities at
             // preemption-timer expirations. When timer preemption is disabled
-            // (`--preemption-timeout disabled`), priorities are fixed at thread
+            // (`--max-timeslice disabled`), priorities are fixed at thread
             // creation and never change. A plain yield only re-enqueues the
             // caller at the back of its own (fixed) priority level, so a thread
             // that spins on sched_yield while holding the numerically-lowest
@@ -562,7 +562,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // caller so it cedes the CPU and other runnable threads can make
             // progress. This mirrors what `end_timeslice` does at a timer-driven
             // preemption point, and is recorded for chaos replay.
-            if self.cfg.chaos && self.cfg.preemption_timeout.is_none() {
+            if self.cfg.chaos && self.cfg.max_timeslice.is_none() {
                 let change_time = guest.thread_state().thread_logical_time.as_nanos();
                 let request = Self::random_priority_changepoint_request(guest, change_time);
                 resource_request(guest, request).await;

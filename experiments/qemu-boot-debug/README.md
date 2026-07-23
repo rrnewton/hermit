@@ -139,7 +139,7 @@ Successful virtual-time boot:
 ```bash
 timeout 90s target/release/hermit --log error run \
   --no-sequentialize-threads \
-  --preemption-timeout disabled \
+  --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   qemu-system-x86_64 \
   -m 256M \
@@ -159,7 +159,7 @@ Matched clock-failure control: omit only QEMU's `-icount` option from the
 successful command. It reaches the Linux console but loses its TSC clocksource.
 
 Default-scheduler control: omit Hermit's `--no-sequentialize-threads` and
-`--preemption-timeout disabled`. Use a hard host kill for a bounded negative
+`--max-timeslice disabled`. Use a hard host kill for a bounded negative
 test because the stopped tracee may not process `SIGTERM`:
 
 ```bash

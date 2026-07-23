@@ -1645,6 +1645,9 @@ where
                     end_of_timeslice
                 );
                 guest.thread_state_mut().end_of_timeslice = Some(end_of_timeslice);
+                if guest.config().max_timeslice.is_some() {
+                    guest.thread_state_mut().max_timeslice_end = Some(end_of_timeslice);
+                }
             }
         }
         _ => {
