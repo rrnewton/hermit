@@ -25,6 +25,16 @@ use reverie::syscalls::ioctl;
 
 use super::Replayer;
 
+fn write_family_with_fd(syscall: WriteFamily, fd: i32) -> WriteFamily {
+    match syscall {
+        WriteFamily::Write(call) => call.with_fd(fd).into(),
+        WriteFamily::Pwrite64(call) => call.with_fd(fd).into(),
+        WriteFamily::Writev(call) => call.with_fd(fd).into(),
+        WriteFamily::Pwritev(call) => call.with_fd(fd).into(),
+        WriteFamily::Pwritev2(call) => call.with_fd(fd).into(),
+    }
+}
+
 /// Scatter the recorded flat output `bytes` of a vectored read back into the
 /// guest's `iovec` array, filling each buffer in order until the bytes are
 /// exhausted. Returns the number of bytes written (the syscall return value).
@@ -126,18 +136,112 @@ impl Replayer {
 
         let fd = syscall.fd();
 
-        if fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO {
-            // Always let these through since they affect what we get to see.
-            //
-            // TODO: It would be better to do correct file descriptor tracking
-            // to avoid edge cases where a program may close the stderr/stdout
-            // file descriptors and immediately open a file. In that case,
-            // output would go to a file instead (which should *not* be let
-            // through).
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#236): console-target tracking (this write gate plus
+        // the fd lifecycle handlers below and EventReader console_targets map)
+        // replaces the previous `fd == 1 || fd == 2` check. A redirected fd is
+        // suppressed, while a console alias is rewritten to its stable physical
+        // sink. This preserves stdout/stderr identity and does not depend on
+        // replay materializing the guest duplicate.
+        if let Some(target) = guest.thread_state().console_target(fd) {
+            let syscall = write_family_with_fd(syscall, target);
             guest.inject_with_retry(Syscall::from(syscall)).await
         } else {
             Ok(count)
         }
+    }
+
+    /// Replays a `close`, dropping the fd from the console map so a later syscall
+    /// that reuses the number does not inherit its console target.
+    pub(super) async fn handle_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Close,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        // Reaching here means `close` succeeded during recording.
+        guest
+            .thread_state_mut()
+            .set_console_target(syscall.fd(), None, false);
+        Ok(ret)
+    }
+
+    /// Replays a `dup`, propagating the source fd's console status to the newly
+    /// allocated descriptor (returned as the recorded value).
+    pub(super) async fn handle_dup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            let target = guest.thread_state().console_target(syscall.oldfd());
+            guest
+                .thread_state_mut()
+                .set_console_target(ret as i32, target, false);
+        }
+        Ok(ret)
+    }
+
+    /// Replays a `dup2`, making `newfd` mirror `oldfd`'s console status.
+    pub(super) async fn handle_dup2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup2,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 && syscall.oldfd() != syscall.newfd() {
+            let target = guest.thread_state().console_target(syscall.oldfd());
+            guest
+                .thread_state_mut()
+                .set_console_target(syscall.newfd(), target, false);
+        }
+        Ok(ret)
+    }
+
+    /// Replays a `dup3`, including the new descriptor's close-on-exec state.
+    pub(super) async fn handle_dup3<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Dup3,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            let target = guest.thread_state().console_target(syscall.oldfd());
+            let close_on_exec = syscall.flags().bits() & libc::O_CLOEXEC != 0;
+            guest
+                .thread_state_mut()
+                .set_console_target(syscall.newfd(), target, close_on_exec);
+        }
+        Ok(ret)
+    }
+
+    /// Replays an `fcntl`, tracking duplicate and close-on-exec operations that
+    /// change the logical console descriptor table.
+    pub(super) async fn handle_fcntl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Fcntl,
+    ) -> Result<i64, Errno> {
+        let ret = next_event!(guest, Return)?;
+        if ret >= 0 {
+            use reverie::syscalls::FcntlCmd::*;
+
+            match syscall.cmd() {
+                F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
+                    let target = guest.thread_state().console_target(syscall.fd());
+                    let close_on_exec = matches!(syscall.cmd(), F_DUPFD_CLOEXEC(_));
+                    guest
+                        .thread_state_mut()
+                        .set_console_target(ret as i32, target, close_on_exec);
+                }
+                F_SETFD(flags) => guest
+                    .thread_state_mut()
+                    .set_console_cloexec(syscall.fd(), flags & libc::FD_CLOEXEC != 0),
+                _ => {}
+            }
+        }
+        Ok(ret)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(
@@ -192,7 +296,21 @@ impl Replayer {
         ) {
             // Replayed opens do not necessarily create host file descriptors.
             // Detcore updates the logical descriptor metadata after this returns.
-            next_event!(guest, Return)
+            let ret = next_event!(guest, Return)?;
+            match request {
+                ioctl::Request::FIOCLEX => {
+                    guest
+                        .thread_state_mut()
+                        .set_console_cloexec(syscall.fd(), true);
+                }
+                ioctl::Request::FIONCLEX => {
+                    guest
+                        .thread_state_mut()
+                        .set_console_cloexec(syscall.fd(), false);
+                }
+                _ => {}
+            }
+            Ok(ret)
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
