@@ -29,6 +29,7 @@ use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::summary::RunSummary;
+use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -457,8 +458,11 @@ impl GlobalTool for GlobalState {
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid, mm) => {
-                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid, mm).await)
+            GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats) => {
+                R::DeregisterThread(
+                    self.recv_deregister_thread(from, dettid, detpid, mm, timeslice_stats)
+                        .await,
+                )
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -837,13 +841,20 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
+    async fn recv_deregister_thread(
+        &self,
+        _from: Tid,
+        dettid: DetTid,
+        detpid: DetPid,
+        mm: MmId,
+        timeslice_stats: TimesliceStats,
+    ) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
-        self.sched
-            .lock()
-            .unwrap()
-            .logically_kill_thread(&dettid, &detpid, mm);
+        let mut sched = self.sched.lock().unwrap();
+        sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched.logically_kill_thread(&dettid, &detpid, mm);
+        drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -1122,8 +1133,9 @@ pub enum GlobalRequest {
     StartNewThread(DetTid, DetPid),
 
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
-    /// further turns.
-    DeregisterThread(DetTid, DetPid, MmId),
+    /// further turns. Carries the exiting thread's completed-timeslice distribution
+    /// so the scheduler can aggregate it into the final run report.
+    DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1420,6 +1432,7 @@ pub async fn deregister_thread<R>(
     reverie: &R,
     detpid: DetPid,
     mm: MmId,
+    timeslice_stats: TimesliceStats,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1429,7 +1442,7 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm),
+                GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!

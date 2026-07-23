@@ -24,6 +24,7 @@ use std::time::Duration;
 use std::vec::IntoIter;
 
 use detcore_model::summary::RunSummary;
+use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -304,6 +305,11 @@ pub struct Scheduler {
     /// If a guest is to be unblocked on a thread the guest will receive this
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
+
+    /// Per-thread distribution of completed timeslice durations (virtual ns),
+    /// collected from each thread as it deregisters at exit. Aggregated into the
+    /// final run report. BTreeMap for deterministic iteration order.
+    pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -844,6 +850,7 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            per_thread_timeslice: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -2204,6 +2211,18 @@ impl Scheduler {
     /// doesn't have all the necessary information.
     ///
     /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
+    /// Fold an exiting thread's completed-timeslice distribution into the
+    /// scheduler's per-thread record, to be reported in the final run summary.
+    pub fn record_timeslice_stats(&mut self, dettid: DetTid, stats: TimesliceStats) {
+        if stats.is_empty() {
+            return;
+        }
+        self.per_thread_timeslice
+            .entry(dettid)
+            .or_default()
+            .merge(&stats);
+    }
+
     pub fn generate_partial_run_summary(
         &mut self,
         preemptions_to: Option<&PathBuf>,
@@ -2280,6 +2299,18 @@ impl Scheduler {
         let num_threads = self.thread_tree.size() as u64;
         let threads_descrip = format!("{}", self.thread_tree);
 
+        // Aggregate the per-thread timeslice distributions collected at thread
+        // exit. BTreeMap gives a deterministic (dettid-sorted) ordering.
+        let per_thread_timeslice: Vec<(DetTid, TimesliceStats)> = self
+            .per_thread_timeslice
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let mut timeslice_stats = TimesliceStats::default();
+        for (_, st) in &per_thread_timeslice {
+            timeslice_stats.merge(st);
+        }
+
         Ok(RunSummary {
             sched_turns: self.turn,
             schedevent_replayed,
@@ -2294,6 +2325,8 @@ impl Scheduler {
             virttime_elapsed: 0, // Cannot fill.
             virttime_final: 0,   // Cannot fill.
             realtime_elapsed: None,
+            timeslice_stats,
+            per_thread_timeslice,
         })
     }
 

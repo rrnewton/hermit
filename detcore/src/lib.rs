@@ -1337,7 +1337,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         &self,
         tid: Tid,
         global_state: &G,
-        thread_state: Self::ThreadState,
+        mut thread_state: Self::ThreadState,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
@@ -1345,6 +1345,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
         );
+        // Close the final in-progress timeslice so this thread contributes its
+        // last (partial) slice to the run report, even if it never exhausted a
+        // full slice.
+        let now = thread_state.thread_logical_time.as_nanos();
+        thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
         let mm_id = thread_state.mm_id;
         deregister_thread(
@@ -1354,6 +1359,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             global_state,
             detpid,
             mm_id,
+            thread_state.stats.timeslice_stats,
         )
         .await;
 
