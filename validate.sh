@@ -38,26 +38,9 @@ fi
 readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
 
+# cargo-nextest version pinned by ensure_cargo_nextest (the actual nextest
+# invocations live in scripts/test-suite.sh).
 readonly NEXTEST_VERSION=0.9.100
-NEXTEST_PROFILE_NAME=${NEXTEST_PROFILE:-}
-if [[ -z $NEXTEST_PROFILE_NAME && -n ${CI:-} ]]; then
-    NEXTEST_PROFILE_NAME=ci
-fi
-declare -a NEXTEST_RUN=(cargo nextest run)
-if [[ -n $NEXTEST_PROFILE_NAME ]]; then
-    NEXTEST_RUN+=(--profile "$NEXTEST_PROFILE_NAME")
-fi
-readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
-
-readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
-readonly HERMIT_SMOKE_TIMEOUT="30s"
-readonly SMOKE_MARKER="hermit-validation-smoke"
-declare -ar HERMIT_RUN_ARGS=(
-    run
-    --base-env=minimal
-    --no-virtualize-cpuid
-    --preemption-timeout=disabled
-)
 
 function cleanup {
     local pid
@@ -229,59 +212,6 @@ function ensure_cargo_nextest {
 
     cargo nextest show-config version
 }
-function hermit_echo {
-    timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" -- \
-        /bin/echo "$SMOKE_MARKER"
-}
-
-function hermit_run_smoke {
-    local output
-    local status
-
-    output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    if [[ "$output" != "$SMOKE_MARKER" ]]; then
-        printf "Unexpected Hermit stdout: %q\n" "$output" >&2
-        return 1
-    fi
-}
-
-function hermit_determinism_check {
-    local first_output
-    local second_output
-    local status
-
-    first_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    second_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    if [[ "$first_output" != "$second_output" ]]; then
-        echo "Hermit stdout differed between identical runs:" >&2
-        diff -u \
-            <(printf "%s\n" "$first_output") \
-            <(printf "%s\n" "$second_output") >&2 || true
-        return 1
-    fi
-}
-
-function hermit_verify_smoke {
-    timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" --verify -- \
-        /bin/echo "$SMOKE_MARKER"
-}
 
 function print_summary {
     local passed=$((checks - failures))
@@ -295,37 +225,30 @@ function print_summary {
 }
 
 run_check "cargo-nextest available" ensure_cargo_nextest
-run_check "Build workspace" cargo build --workspace
 
-# Cargo supports concurrent commands in one target directory. Run checks that
-# do not execute Hermit guests alongside the ordered runtime and PMU gates.
-start_check "Test workspace documentation" cargo test --workspace --doc
-start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-start_check "Rustfmt" cargo fmt --all -- --check
-start_check "Documentation" cargo doc --workspace --no-deps
-
-run_check "Hermit run smoke test" hermit_run_smoke
-run_check "Hermit output determinism" hermit_determinism_check
-run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-# Nextest runs most package unit and Cargo integration targets in parallel.
-# Detcore's PMU tests depend on same-binary coordination; nextest would launch
-# them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
-run_check "Test workspace and integrations" \
-    "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
-    --exclude hermetic_infra_hermit_flaky-tests
-run_check "Test detcore package" cargo test -p detcore
-# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
-if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-    run_check "rr syscall suite" \
-        cargo test -p hermit --test rr_suite -- --ignored
-else
-    echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
+# The test matrix itself lives in scripts/test-suite.sh, the single source of
+# truth shared with CI (.github/workflows/ci.yml). We ask that script which
+# tiers make up the local matrix and run each through the logging harness above:
+#   validate.sh ──> scripts/test-suite.sh <── ci.yml
+# Parallel-safe tiers (lint/docs) run in the background. Capability-gated tiers
+# (PMU, mount namespaces, the rr submodule) are omitted from the local list with
+# a notice when this host lacks the capability, so local validation still gives
+# useful signal without falsely failing. CI runs the same tiers via `--portable`
+# / `--hardware` and fails loudly when a required capability is missing.
+readonly TEST_SUITE="$ROOT_DIR/scripts/test-suite.sh"
+if [[ ! -x $TEST_SUITE ]]; then
+    echo "❌ Missing shared test runner: $TEST_SUITE" >&2
+    exit 1
 fi
-# `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
-run_check "Hermit analyze scenarios" \
-    cargo test -p hermit --test analyze -- --ignored
-run_check "Schedule search E2E (requires PMU)" \
-    ./tests/util/hermit_analyze_e2e.sh
+
+while IFS=$'\t' read -r schedule tier; do
+    [[ -z ${tier:-} ]] && continue
+    if [[ $schedule == bg ]]; then
+        start_check "$tier" "$TEST_SUITE" "$tier"
+    else
+        run_check "$tier" "$TEST_SUITE" "$tier"
+    fi
+done < <(TS_MODE=local "$TEST_SUITE" --list local --plain)
 
 wait_for_background_checks
 print_summary

@@ -12,6 +12,12 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
 
+# The test matrix is defined once in scripts/test-suite.sh and shared with the
+# local validator (validate.sh). CI invokes named tiers from that script so the
+# two can never drift:  validate.sh ──> scripts/test-suite.sh <── this workflow.
+# The GitHub-hosted job runs the "portable" tiers; the self-hosted job runs the
+# capability-gated "hardware" tiers.
+
 jobs:
   regular:
     name: Regular tests (GitHub-hosted)
@@ -24,13 +30,9 @@ jobs:
     - name: Install cargo-nextest
       run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
     - name: Build
-      run: cargo build --workspace
+      run: ./scripts/test-suite.sh build
     - name: Test regular workspace crates
-      run: >-
-        cargo nextest run --profile ci --workspace
-        --exclude detcore
-        --exclude hermit
-        --exclude hermetic_infra_hermit_flaky-tests
+      run: ./scripts/test-suite.sh unit-regular
     - name: Upload nextest JUnit report
       if: always()
       uses: actions/upload-artifact@v4
@@ -40,21 +42,17 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
     - name: Test Hermit without namespace-dependent integration tests
-      run: cargo test -p hermit --lib --bins
+      run: ./scripts/test-suite.sh unit-hermit-bins
     - name: Test Detcore without hardware-dependent integration tests
-      run: |
-        cargo test -p detcore --lib --bins
-        cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
+      run: ./scripts/test-suite.sh unit-detcore-bins
     - name: Documentation
-      run: |
-        cargo test --workspace --doc
-        cargo doc --workspace --no-deps
+      run: ./scripts/test-suite.sh doctest doc
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Clippy
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: ./scripts/test-suite.sh clippy
     - name: Format
-      run: cargo fmt --all -- --check
+      run: ./scripts/test-suite.sh fmt
 
   hardware:
     name: Host-dependent tests (self-hosted)
@@ -95,21 +93,11 @@ jobs:
           exit 1
         fi
     - name: CPUID and RDRAND/RDSEED tests
-      run: |
-        cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
-        cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
+      run: ./scripts/test-suite.sh detcore-cpuid
     - name: PMU timing and miscellaneous tests
-      run: |
-        cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
-        cargo test -p detcore --test tests_time -- --test-threads=4
-    - name: PMU parallel futex tests
-      run: >-
-        cargo test -p detcore --test tests_parallelism futex_wait_parent
-        -- --test-threads=3
-    - name: PMU parallel memory tests
-      run: |
-        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=4
-        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=4
+      run: ./scripts/test-suite.sh detcore-pmu
+    - name: PMU parallel futex and memory tests
+      run: ./scripts/test-suite.sh detcore-parallel
     - name: Require mount namespace support
       id: namespaces
       run: |
@@ -120,61 +108,19 @@ jobs:
         echo "available=true" >> "$GITHUB_OUTPUT"
     - name: Stable Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
-      run: |
-        cargo test -p hermit --lib --bins
-        for test in \
-          arbitrary_binaries \
-          cli \
-          clock_determinism \
-          epoll_determinism \
-          mmap_determinism \
-          procfs_determinism \
-          signal_determinism
-        do
-          cargo test -p hermit --test "$test" -- --test-threads=1
-        done
-        cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
-        cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
-    - name: Build pinned LevelDB integration fixture
-      if: steps.namespaces.outputs.available == 'true'
-      run: >-
-        ./hermit-cli/tests/prepare_leveldb.sh
-        "${GITHUB_WORKSPACE}/target/hermit-leveldb-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        "${GITHUB_WORKSPACE}/target/hermit-leveldb-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      run: ./scripts/test-suite.sh hermit-determinism hermit-matrices
     - name: Focused LevelDB strict determinism test
       if: steps.namespaces.outputs.available == 'true'
-      env:
-        HERMIT_LEVELDB_BUILD_DIR: ${{ github.workspace }}/target/hermit-leveldb-build-${{ github.run_id }}-${{ github.run_attempt }}
-      run: >-
-        cargo test -p hermit --release --test leveldb
-        focused_leveldb_tests_are_deterministic_under_strict
-        -- --exact --test-threads=1
+      run: ./scripts/test-suite.sh leveldb
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
-      run: ./scripts/test-fail-closed.sh
+      run: ./scripts/test-suite.sh ratchet
     - name: Debugger (gdb/lldb) integration tests
       if: steps.namespaces.outputs.available == 'true'
-      run: ./tests/debugger/run_debugger_tests.sh
+      run: ./scripts/test-suite.sh debugger
     - name: rr syscall test suite
       if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit --test rr_suite -- --ignored
+      run: ./scripts/test-suite.sh rr-suite
     - name: Backend parity ratchet
       if: steps.namespaces.outputs.available == 'true'
-      run: |
-        python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
-        if target/debug/hermit run --help | grep -q -- '--backend'; then
-          if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-              --backend kvm --require-backend
-          else
-            echo "::notice::KVM parity blocked: /dev/kvm is not readable and writable"
-          fi
-          if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBI_CLIENT:-} ]]; then
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-              --backend dbi --require-backend
-          else
-            echo "::notice::DBI parity blocked: DynamoRIO/client environment is not configured"
-          fi
-        else
-          echo "::notice::DBI/KVM parity blocked: backend selector is not integrated yet"
-        fi
+      run: ./scripts/test-suite.sh backend-parity
