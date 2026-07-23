@@ -87,8 +87,8 @@ pub struct Config {
     /// Choose which side of an ordinary fork/clone runs first after the child is registered.
     /// Random choices are deterministic under `--sched-seed`.
     #[serde(default)]
-    #[clap(long, default_value = "child", value_name = "child|parent|random")]
-    pub runs_post_fork: RunsPostFork,
+    #[clap(long, default_value = "random", value_name = "child|parent|random")]
+    pub run_post_fork: RunPostFork,
 
     /// Use the optimized partial syscall subscription set instead of intercepting every syscall.
     /// This permits unlisted syscalls to bypass Detcore and therefore weakens deterministic
@@ -463,10 +463,10 @@ impl fmt::Display for Config {
         if self.passthru_opt {
             write!(f, " --passthru-opt")?;
         }
-        match self.runs_post_fork {
-            RunsPostFork::Child => {}
-            RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
-            RunsPostFork::Random => write!(f, " --runs-post-fork=random")?,
+        match self.run_post_fork {
+            RunPostFork::Child => write!(f, " --run-post-fork=child")?,
+            RunPostFork::Parent => write!(f, " --run-post-fork=parent")?,
+            RunPostFork::Random => {}
         }
         let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         if self.epoch != default_epoch {
@@ -632,17 +632,17 @@ impl fmt::Display for Config {
     PartialEq,
     Eq
 )]
-pub enum RunsPostFork {
+pub enum RunPostFork {
     /// Run the newly registered child before its parent resumes.
-    #[default]
     Child,
     /// Allow the parent to resume before the newly registered child starts.
     Parent,
     /// Deterministically choose child-first or parent-first from the scheduler seed.
+    #[default]
     Random,
 }
 
-impl FromStr for RunsPostFork {
+impl FromStr for RunPostFork {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -852,28 +852,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runs_post_fork_parses_all_modes_and_defaults_to_child() {
-        assert_eq!(Config::default().runs_post_fork, RunsPostFork::Child);
+    fn run_post_fork_parses_all_modes_and_defaults_to_random() {
+        assert_eq!(Config::default().run_post_fork, RunPostFork::Random);
         assert_eq!(
-            Config::parse_from(["detcore", "--runs-post-fork=parent"]).runs_post_fork,
-            RunsPostFork::Parent
+            Config::parse_from(["detcore", "--run-post-fork=child"]).run_post_fork,
+            RunPostFork::Child
         );
         assert_eq!(
-            Config::parse_from(["detcore", "--runs-post-fork=random"]).runs_post_fork,
-            RunsPostFork::Random
+            Config::parse_from(["detcore", "--run-post-fork=parent"]).run_post_fork,
+            RunPostFork::Parent
         );
-        assert!(Config::try_parse_from(["detcore", "--runs-post-fork=invalid"]).is_err());
+        assert_eq!(
+            Config::parse_from(["detcore", "--run-post-fork=random"]).run_post_fork,
+            RunPostFork::Random
+        );
+        assert!(Config::try_parse_from(["detcore", "--run-post-fork=invalid"]).is_err());
     }
 
     #[test]
     fn config_display_preserves_nondefault_post_fork_modes() {
-        let mut config = Config {
-            runs_post_fork: RunsPostFork::Parent,
-            ..Config::default()
-        };
-        assert!(config.to_string().contains(" --runs-post-fork=parent"));
+        let mut config = Config::default();
+        assert!(!config.to_string().contains(" --run-post-fork="));
 
-        config.runs_post_fork = RunsPostFork::Random;
-        assert!(config.to_string().contains(" --runs-post-fork=random"));
+        config.run_post_fork = RunPostFork::Child;
+        assert!(config.to_string().contains(" --run-post-fork=child"));
+
+        config.run_post_fork = RunPostFork::Parent;
+        assert!(config.to_string().contains(" --run-post-fork=parent"));
     }
 }

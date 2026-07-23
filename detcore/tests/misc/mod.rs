@@ -62,17 +62,22 @@ fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
     F: Fn(),
 {
-    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
+    let config = detcore::Config {
+        preemption_timeout: None,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
 }
 
-fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
+fn det_test_fn_sequential_without_pmu_with_post_fork<F>(run_post_fork: detcore::RunPostFork, f: F)
 where
     F: Fn(),
 {
     let config = detcore::Config {
         preemption_timeout: None,
         sequentialize_threads: true,
-        runs_post_fork,
+        run_post_fork,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
@@ -80,7 +85,7 @@ where
 
 #[test]
 fn ordinary_clone_child_starts_before_parent_resumes() {
-    det_test_fn_sequential_without_pmu(|| {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunPostFork::Child, || {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
@@ -103,7 +108,7 @@ fn ordinary_clone_child_starts_before_parent_resumes() {
 
 #[test]
 fn ordinary_clone_parent_mode_can_resume_before_child() {
-    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Parent, || {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunPostFork::Parent, || {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
