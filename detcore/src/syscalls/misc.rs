@@ -142,6 +142,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         Err(Errno::ENOSYS.into())
     }
 
+    /// mincore (system call).
+    ///
+    /// mincore reports which pages of a mapping are currently resident in the
+    /// page cache. That is host-state-dependent (memory pressure, prior I/O) and
+    /// therefore nondeterministic, so we cannot pass it through. Tools such as
+    /// grep/awk only use it as an optimization hint over an mmap'd file and fall
+    /// back to ordinary reads when it is unavailable. Reporting `-ENOSYS` (which
+    /// the kernel may legitimately return) gives that deterministic fallback.
+    pub async fn handle_mincore<G: Guest<Self>>(&self, guest: &mut G) -> Result<i64, Error> {
+        detlog!(
+            "[dtid {}] mincore disabled: returning -ENOSYS (residency is nondeterministic)",
+            guest.thread_state().dettid,
+        );
+        Err(Errno::ENOSYS.into())
+    }
+
     /// getcpu system call
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,

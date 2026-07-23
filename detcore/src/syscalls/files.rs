@@ -1089,6 +1089,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    /// ioctl system call.
+    ///
+    /// Terminal-control ioctls (the `TC*`/`TIOC*` family that reads or writes
+    /// host termios state or the terminal window size) expose nondeterministic,
+    /// host-specific terminal configuration. We report `ENOTTY` for these so the
+    /// guest behaves as though its descriptors are not attached to a terminal:
+    /// the deterministic, non-interactive code path (no colorized output, no
+    /// tty-dependent buffering, no window-size probing). This is exactly what the
+    /// kernel already returns for a non-tty fd, so it is transparent to callers
+    /// such as `isatty(3)`.
+    ///
+    /// All other ioctls (e.g. `FIONREAD`, `FIONBIO`, `FICLONE`) are passed
+    /// through unchanged; record/replay captures their results deterministically.
+    pub async fn handle_ioctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ioctl,
+    ) -> Result<i64, Error> {
+        use syscalls::ioctl::Request;
+        match call.request() {
+            Request::TCGETS(_)
+            | Request::TCSETS(_)
+            | Request::TCSETSW(_)
+            | Request::TCSETSF(_)
+            | Request::TCGETA(_)
+            | Request::TCSETA(_)
+            | Request::TCSETAW(_)
+            | Request::TCSETAF(_)
+            | Request::TIOCGWINSZ(_)
+            | Request::TIOCSWINSZ(_)
+            | Request::TIOCGPGRP(_)
+            | Request::TIOCSPGRP(_) => Err(Errno::ENOTTY.into()),
+            _ => self.passthrough(guest, Syscall::Ioctl(call)).await,
+        }
+    }
+
     /// faccessat2 system call (represented as a raw syscall by Reverie).
     pub async fn handle_faccessat2<G: Guest<Self>>(
         &self,

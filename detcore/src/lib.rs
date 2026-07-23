@@ -1166,6 +1166,44 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // rseq has no typed variant in reverie-syscalls; disable it by
             // returning -ENOSYS so glibc uses its deterministic fallback path.
             Syscall::Other(Sysno::rseq, _) => self.handle_rseq(guest).await,
+
+            // Ubiquitous syscalls that glibc and common tools issue at startup.
+            // Each is deterministic for a given container: the values are stable
+            // across a run and, under record/replay, captured deterministically
+            // by record_or_replay. Handling them explicitly is what lets them
+            // survive --strict (panic_on_unsupported_syscalls) instead of
+            // aborting the guest.
+            //
+            // lseek only repositions the (deterministic) file offset.
+            Syscall::Lseek(s) => self.passthrough(guest, Syscall::Lseek(s)).await,
+            // Terminal ioctls report ENOTTY (non-tty); others pass through.
+            Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
+            // Working directory is fixed for the container's lifetime.
+            Syscall::Getcwd(s) => self.passthrough(guest, Syscall::Getcwd(s)).await,
+            // Process credentials are constant for the guest.
+            Syscall::Getuid(s) => self.passthrough(guest, Syscall::Getuid(s)).await,
+            Syscall::Getgid(s) => self.passthrough(guest, Syscall::Getgid(s)).await,
+            Syscall::Geteuid(s) => self.passthrough(guest, Syscall::Geteuid(s)).await,
+            Syscall::Getegid(s) => self.passthrough(guest, Syscall::Getegid(s)).await,
+            // Process/thread ids are deterministic: the guest runs in a fresh PID
+            // namespace, so its namespaced ids are assigned identically each run
+            // and are consistent with the ids fork/clone/wait report to it.
+            Syscall::Getpid(s) => self.passthrough(guest, Syscall::Getpid(s)).await,
+            Syscall::Getppid(s) => self.passthrough(guest, Syscall::Getppid(s)).await,
+            Syscall::Gettid(s) => self.passthrough(guest, Syscall::Gettid(s)).await,
+            Syscall::Getpgrp(s) => self.passthrough(guest, Syscall::Getpgrp(s)).await,
+            Syscall::Getpgid(s) => self.passthrough(guest, Syscall::Getpgid(s)).await,
+            Syscall::Getsid(s) => self.passthrough(guest, Syscall::Getsid(s)).await,
+            // Supplementary group list is constant for the guest.
+            Syscall::Getgroups(s) => self.passthrough(guest, Syscall::Getgroups(s)).await,
+            // chdir/fchdir change the (deterministic) working directory.
+            Syscall::Chdir(s) => self.passthrough(guest, Syscall::Chdir(s)).await,
+            Syscall::Fchdir(s) => self.passthrough(guest, Syscall::Fchdir(s)).await,
+            // fadvise64 is a purely advisory page-cache hint with no observable
+            // effect on results; passing it through is deterministic.
+            Syscall::Fadvise64(s) => self.passthrough(guest, Syscall::Fadvise64(s)).await,
+            // mincore residency is host-dependent; report ENOSYS (see handler).
+            Syscall::Mincore(_) => self.handle_mincore(guest).await,
             Syscall::Mprotect(_) => self.passthrough(guest, call).await,
             Syscall::ArchPrctl(_) => self.passthrough(guest, call).await,
             Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
