@@ -31,6 +31,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
+use clap::ValueEnum;
 use consts::METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
@@ -63,6 +64,225 @@ pub struct Recording {
     pub exit_status: ExitStatus,
 }
 
+#[derive(Clone, Copy)]
+enum CapabilityProbe {
+    Namespaces,
+    Ptrace,
+    Seccomp,
+}
+
+fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
+    // SAFETY: The child calls only async-signal-safe syscalls and exits immediately.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(std::io::Error::last_os_error()).context("Failed to fork capability probe");
+    }
+    if pid == 0 {
+        let supported = match probe {
+            CapabilityProbe::Namespaces => unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
+            },
+            CapabilityProbe::Ptrace => {
+                // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_TRACEME,
+                        0,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    ) != -1
+                }
+            }
+            CapabilityProbe::Seccomp => {
+                let mut filter = libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff0000, // SECCOMP_RET_ALLOW
+                };
+                let program = libc::sock_fprog {
+                    len: 1,
+                    filter: &mut filter,
+                };
+                // SAFETY: The filter is an allow-all program with a valid one-element lifetime.
+                unsafe {
+                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                        && libc::syscall(
+                            libc::SYS_seccomp,
+                            1, // SECCOMP_SET_MODE_FILTER
+                            0,
+                            &program,
+                        ) == 0
+                }
+            }
+        };
+        // SAFETY: Avoid running Rust destructors after fork.
+        unsafe { libc::_exit(i32::from(!supported)) }
+    }
+
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is the child created above and status points to valid storage.
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("Failed to wait for capability probe");
+        }
+    }
+}
+
+fn validate_tracing_environment() -> Result<(), Error> {
+    if !run_capability_probe(CapabilityProbe::Namespaces)? {
+        anyhow::bail!(
+            "Hermit cannot create its required user and PID namespaces: \
+             unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
+             and the unshare syscall in the host/container policy."
+        );
+    }
+    if !run_capability_probe(CapabilityProbe::Ptrace)? {
+        anyhow::bail!(
+            "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
+             denied. Allow same-UID parent-child ptrace in the container seccomp and host \
+             Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
+             a sandbox smoke test without syscall interception."
+        );
+    }
+    if !run_capability_probe(CapabilityProbe::Seccomp)? {
+        anyhow::bail!(
+            "Hermit cannot install its tracee seccomp filter: \
+             seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
+             prctl(PR_SET_NO_NEW_PRIVS) in the container policy, or use --namespace-only for a \
+             sandbox smoke test without syscall interception."
+        );
+    }
+    Ok(())
+}
+
+fn is_dynamorio_sdk(path: &Path) -> bool {
+    path.join("include/dr_api.h").is_file()
+        || path.join("DynamoRIOConfig.cmake").is_file()
+        || path.join("cmake/DynamoRIOConfig.cmake").is_file()
+}
+
+fn dynamorio_sdk_available() -> bool {
+    const DEFAULT_ROOTS: [&str; 3] = [
+        "/usr/lib/cmake/DynamoRIO",
+        "/usr/local/lib/cmake/DynamoRIO",
+        "/opt/dynamorio",
+    ];
+
+    ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
+        .any(|path| is_dynamorio_sdk(&path))
+}
+
+fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .err()
+        .map(|error| {
+            format!(
+                "cannot open {} read-write: {error}; grant access through the device owner/group \
+                 or root",
+                path.display()
+            )
+        })
+}
+
+/// Process instrumentation backend used to run a Hermit guest.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub enum Backend {
+    /// Use Reverie's ptrace backend.
+    #[default]
+    Ptrace,
+    /// Use the DynamoRIO backend.
+    Dbi,
+    /// Use the KVM backend.
+    Kvm,
+}
+
+impl Backend {
+    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+
+    /// Returns the command-line spelling for this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ptrace => "ptrace",
+            Self::Dbi => "dbi",
+            Self::Kvm => "kvm",
+        }
+    }
+
+    /// Returns the backends integrated with this Hermit build and host.
+    pub fn available() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|backend| backend.is_available())
+    }
+
+    /// Returns whether this backend can run a Hermit guest on this host.
+    pub fn is_available(self) -> bool {
+        self.unavailable_reason().is_none()
+    }
+
+    /// Returns an actionable error when this backend cannot run a Hermit guest.
+    pub fn ensure_available(self) -> Result<(), Error> {
+        if let Some(reason) = self.unavailable_reason() {
+            Err(anyhow!(
+                "backend `{}` is unavailable: {reason}",
+                self.as_str()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn unavailable_reason(self) -> Option<String> {
+        match self {
+            Self::Ptrace => validate_tracing_environment()
+                .err()
+                .map(|error| error.to_string()),
+            Self::Dbi if !dynamorio_sdk_available() => Some(
+                "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
+                    .to_owned(),
+            ),
+            Self::Dbi => Some(
+                "the DynamoRIO prototype does not yet expose a Detcore process launcher".to_owned(),
+            ),
+            Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
+                Some(
+                    "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
+                        .to_owned(),
+                )
+            }),
+        }
+    }
+}
+
+fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
+    // The CLI probes ptrace readiness before entering its container; repeating
+    // the namespace probe here would test nested namespaces instead of the host.
+    if backend == Backend::Ptrace {
+        return Ok(());
+    }
+    backend.ensure_available()?;
+    Err(anyhow!(
+        "backend `{}` has no Hermit dispatch implementation",
+        backend.as_str()
+    ))
+}
+
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
 // could also be changed to a specific number of threads and that would be
@@ -70,14 +290,33 @@ pub struct Recording {
 // thread count is based off of the number of cores in the machine, then two
 // runs on different machines with a different number of cores will not be the
 // same.
-#[tokio::main(flavor = "current_thread")]
 /// Run the given command as deterministically as possible.
-pub async fn run(
+pub fn run(
     command: Command,
     config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Run the given command using the selected instrumentation backend.
+#[tokio::main(flavor = "current_thread")]
+pub async fn run_with_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    ensure_backend_dispatch(backend)?;
+
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -90,13 +329,32 @@ pub async fn run(
 }
 
 /// Variant of `run` that also captures stdout/stderr.
-#[tokio::main(flavor = "current_thread")]
-pub async fn run_with_output(
-    mut command: Command,
+pub fn run_with_output(
+    command: Command,
     config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<Output, Error> {
+    run_with_output_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        Backend::Ptrace,
+    )
+}
+
+/// Variant of [`run_with_backend`] that also captures stdout/stderr.
+#[tokio::main(flavor = "current_thread")]
+pub async fn run_with_output_backend(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<Output, Error> {
+    ensure_backend_dispatch(backend)?;
+
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -310,4 +568,60 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
         .await?
         .wait_with_output()
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::Backend;
+    use super::is_dynamorio_sdk;
+    use super::kvm_device_unavailable_reason;
+
+    #[test]
+    fn default_and_available_backends_reflect_host_probes() {
+        assert_eq!(Backend::default(), Backend::Ptrace);
+        let available = Backend::available().collect::<Vec<_>>();
+        assert_eq!(
+            available.contains(&Backend::Ptrace),
+            Backend::Ptrace.is_available()
+        );
+        assert!(!available.contains(&Backend::Dbi));
+        assert!(!available.contains(&Backend::Kvm));
+    }
+
+    #[test]
+    fn dependency_probes_require_usable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!is_dynamorio_sdk(temp.path()));
+        fs::create_dir(temp.path().join("include")).unwrap();
+        fs::write(temp.path().join("include/dr_api.h"), b"/* marker */").unwrap();
+        assert!(is_dynamorio_sdk(temp.path()));
+
+        let reason = kvm_device_unavailable_reason(temp.path())
+            .expect("a directory must not pass the read-write KVM device probe");
+        assert!(reason.contains("read-write"));
+    }
+
+    #[test]
+    fn prototype_backends_fail_closed() {
+        let dbi_error = Backend::Dbi
+            .ensure_available()
+            .expect_err("DBI must fail closed");
+        let message = dbi_error.to_string();
+        assert!(
+            message.contains("DynamoRIO SDK") || message.contains("Detcore process launcher"),
+            "unexpected DBI availability error: {message}"
+        );
+
+        let kvm_error = Backend::Kvm
+            .ensure_available()
+            .expect_err("KVM must fail closed");
+        let message = kvm_error.to_string();
+        assert!(
+            message.contains("/dev/kvm") || message.contains("guest-kernel ABI"),
+            "unexpected KVM availability error: {message}"
+        );
+        assert!(!message.contains("requires root privileges"));
+    }
 }
