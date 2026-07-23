@@ -88,10 +88,10 @@ jobs:
         # previously failed the whole job. Install the required libs and treat Go
         # as best-effort so a missing golang package no longer blocks CI.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y libunwind-devel redis sqlite xz-devel
+          sudo dnf install -y cmake gcc-c++ libunwind-devel redis sqlite xz-devel
           sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y libunwind-dev liblzma-dev redis-server redis-tools sqlite3
+          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev redis-server redis-tools sqlite3
           sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
         fi
     - name: CPUID and RDRAND/RDSEED tests
@@ -139,6 +139,20 @@ jobs:
     - name: Application e2e strict-verify tests (curl, nginx, redis, JVM, Go)
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
+    - name: Build pinned LevelDB integration fixture
+      if: steps.namespaces.outputs.available == 'true'
+      run: >-
+        ./hermit-cli/tests/prepare_leveldb.sh
+        "${GITHUB_WORKSPACE}/target/hermit-leveldb-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        "${GITHUB_WORKSPACE}/target/hermit-leveldb-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+    - name: Focused LevelDB strict determinism test
+      if: steps.namespaces.outputs.available == 'true'
+      env:
+        HERMIT_LEVELDB_BUILD_DIR: ${{ github.workspace }}/target/hermit-leveldb-build-${{ github.run_id }}-${{ github.run_attempt }}
+      run: >-
+        cargo test -p hermit --release --test leveldb
+        focused_leveldb_tests_are_deterministic_under_strict
+        -- --exact --test-threads=1
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: ./scripts/test-fail-closed.sh
