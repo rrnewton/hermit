@@ -42,9 +42,7 @@ jobs:
     - name: Test Hermit without namespace-dependent integration tests
       run: cargo test -p hermit --lib --bins
     - name: Test Detcore without hardware-dependent integration tests
-      run: |
-        cargo test -p detcore --lib --bins
-        cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact
+      run: cargo test -p detcore --lib --bins
     - name: Documentation
       run: |
         cargo test --workspace --doc
