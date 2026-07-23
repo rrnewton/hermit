@@ -815,7 +815,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(ret)
     }
 
-    /// fstatfs: same determinization as [`handle_statfs`], keyed on an fd.
+    /// fstatfs: same determinization as [`Self::handle_statfs`], keyed on an fd.
     pub async fn handle_fstatfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
