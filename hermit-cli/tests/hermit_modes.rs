@@ -471,8 +471,8 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "setrlimit libc",
             "setrlimit syscall",
             "prlimit64",
-            "rusage self zero",
-            "rusage thread zero",
+            "rusage self maxrss",
+            "rusage thread maxrss",
             "rusage children zero",
             "sysinfo",
         ] {

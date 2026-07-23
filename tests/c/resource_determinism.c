@@ -177,11 +177,28 @@ static void check_limit_mutations(void) {
   }
 }
 
-static void check_rusage(int who, const char* name) {
+// Every rusage field except ru_maxrss must be a deterministic zero. When
+// expect_maxrss is set, ru_maxrss must be positive (the guest's peak RSS);
+// otherwise it must also be zero (e.g. RUSAGE_CHILDREN with no children).
+static void check_rusage(int who, const char* name, int expect_maxrss) {
   struct rusage usage;
   memset(&usage, 0xa5, sizeof(usage));
   if (getrusage(who, &usage) != 0) {
     fail("getrusage");
+  }
+
+  if (expect_maxrss) {
+    if (usage.ru_maxrss <= 0) {
+      fprintf(
+          stderr,
+          "getrusage %s reported non-positive ru_maxrss %ld\n",
+          name,
+          (long)usage.ru_maxrss);
+      exit(1);
+    }
+    // Clear the field we allow to be nonzero so the byte scan below can prove
+    // everything else is a deterministic zero.
+    usage.ru_maxrss = 0;
   }
 
   const unsigned char* bytes = (const unsigned char*)&usage;
@@ -195,7 +212,7 @@ static void check_rusage(int who, const char* name) {
       exit(1);
     }
   }
-  printf("rusage %s zero\n", name);
+  printf("rusage %s %s\n", name, expect_maxrss ? "maxrss" : "zero");
 }
 
 static void check_rusage_errors(void) {
@@ -239,9 +256,9 @@ static void check_sysinfo(void) {
 int main(void) {
   check_limit_queries();
   check_limit_mutations();
-  check_rusage(RUSAGE_SELF, "self");
-  check_rusage(RUSAGE_THREAD, "thread");
-  check_rusage(RUSAGE_CHILDREN, "children");
+  check_rusage(RUSAGE_SELF, "self", 1);
+  check_rusage(RUSAGE_THREAD, "thread", 1);
+  check_rusage(RUSAGE_CHILDREN, "children", 0);
   check_rusage_errors();
   check_sysinfo();
   return 0;
