@@ -136,6 +136,9 @@ jobs:
         done
         cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    - name: Application e2e strict-verify tests (curl, nginx, redis, java)
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
     - name: Fail-closed Hermit test ratchet
       if: steps.namespaces.outputs.available == 'true'
       run: ./scripts/test-fail-closed.sh
