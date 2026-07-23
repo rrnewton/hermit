@@ -80,6 +80,102 @@ pub struct FileMetadata {
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
 }
 
+/// A single POSIX per-process interval timer created by `timer_create(2)`.
+///
+/// Detcore tracks enough state to make the `timer_*` syscalls deterministic
+/// under `--strict`, but it does **not** deliver timer-expiration signals: an
+/// armed timer is recorded and its remaining time reported against the
+/// deterministic virtual clock, yet it never actually fires. This is sufficient
+/// for programs that merely arm a long watchdog timer at startup (e.g. CPython
+/// arms a 300s `CLOCK_MONOTONIC`/`SIGRTMIN` watchdog and lets the process exit
+/// long before it could expire), but a program that depends on receiving the
+/// timer signal will not observe it. Deterministic timer-signal delivery is
+/// future work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PosixTimer {
+    /// Reload interval for periodic timers, in nanoseconds (0 => one-shot).
+    interval_ns: u64,
+    /// Absolute virtual-time deadline of the next expiration, or `None` when the
+    /// timer is disarmed (`it_value == 0`).
+    deadline: Option<LogicalTime>,
+}
+
+/// The set of POSIX timers owned by a *process*.
+///
+/// Timers are shared among all threads of a process and, per POSIX, are **not**
+/// inherited across `fork(2)`. Detcore therefore shares this table on
+/// `CLONE_THREAD` and starts a fresh, empty table for every new process (see
+/// `init_thread_state`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PosixTimers {
+    /// Deterministic id allocator. Kernel `timer_t`s are opaque, so we hand out
+    /// ids as 0, 1, 2, ... in creation order to keep them reproducible.
+    next_id: i32,
+    timers: HashMap<i32, PosixTimer>,
+}
+
+impl PosixTimers {
+    /// Allocate a new (disarmed) timer, returning its deterministic id.
+    pub(crate) fn create(&mut self) -> i32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.timers.insert(
+            id,
+            PosixTimer {
+                interval_ns: 0,
+                deadline: None,
+            },
+        );
+        id
+    }
+
+    /// Arm or disarm timer `id`. `interval_ns` is the periodic reload and
+    /// `deadline` the absolute virtual-time expiration (the caller derives it
+    /// from the request flags and the current virtual clock; `None` disarms).
+    /// Returns the previous `(remaining_ns, interval_ns)` for `old_value`, or
+    /// `None` if the id is unknown.
+    pub(crate) fn settime(
+        &mut self,
+        id: i32,
+        interval_ns: u64,
+        deadline: Option<LogicalTime>,
+        now: LogicalTime,
+    ) -> Option<(u64, u64)> {
+        let timer = self.timers.get_mut(&id)?;
+        let old = (remaining_ns(timer.deadline, now), timer.interval_ns);
+        timer.interval_ns = interval_ns;
+        timer.deadline = deadline;
+        Some(old)
+    }
+
+    /// Report the current `(remaining_ns, interval_ns)` for `timer_gettime`, or
+    /// `None` if the id is unknown.
+    pub(crate) fn gettime(&self, id: i32, now: LogicalTime) -> Option<(u64, u64)> {
+        let timer = self.timers.get(&id)?;
+        Some((remaining_ns(timer.deadline, now), timer.interval_ns))
+    }
+
+    /// Whether a timer with this id currently exists.
+    pub(crate) fn contains(&self, id: i32) -> bool {
+        self.timers.contains_key(&id)
+    }
+
+    /// Remove a timer; returns whether it existed.
+    pub(crate) fn remove(&mut self, id: i32) -> bool {
+        self.timers.remove(&id).is_some()
+    }
+}
+
+/// Nanoseconds remaining until `deadline` relative to `now`, saturating at 0.
+/// A disarmed timer (`None`) or an already-elapsed deadline reports 0, which is
+/// how the kernel reports an expired/disarmed timer via `timer_gettime`.
+fn remaining_ns(deadline: Option<LogicalTime>, now: LogicalTime) -> u64 {
+    match deadline {
+        Some(d) => d.as_nanos().saturating_sub(now.as_nanos()),
+        None => 0,
+    }
+}
+
 impl<T> Default for Detcore<T> {
     fn default() -> Self {
         // TODO(T77816673): eventually we want to remove this requirement.
@@ -290,6 +386,78 @@ impl FileMetadata {
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+    }
+}
+
+#[cfg(test)]
+mod posix_timers_tests {
+    use super::*;
+
+    fn t(ns: u64) -> LogicalTime {
+        LogicalTime::from_nanos(ns)
+    }
+
+    #[test]
+    fn ids_are_deterministic_and_sequential() {
+        let mut timers = PosixTimers::default();
+        assert_eq!(timers.create(), 0);
+        assert_eq!(timers.create(), 1);
+        assert_eq!(timers.create(), 2);
+    }
+
+    #[test]
+    fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create();
+
+        // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
+        // disarmed, so the reported old value is zero.
+        let old = timers.settime(id, 0, Some(t(100)), t(0)).expect("known id");
+        assert_eq!(old, (0, 0));
+
+        // At t=40 there should be 60ns remaining and no interval.
+        assert_eq!(timers.gettime(id, t(40)), Some((60, 0)));
+        // Past the deadline the remaining time saturates at 0.
+        assert_eq!(timers.gettime(id, t(150)), Some((0, 0)));
+    }
+
+    #[test]
+    fn resetting_reports_old_remaining() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create();
+        timers.settime(id, 0, Some(t(100)), t(0));
+        // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
+        let old = timers
+            .settime(id, 50, Some(t(200)), t(30))
+            .expect("known id");
+        assert_eq!(old, (70, 0));
+        assert_eq!(timers.gettime(id, t(30)), Some((170, 50)));
+    }
+
+    #[test]
+    fn disarm_and_unknown_ids() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create();
+        timers.settime(id, 0, Some(t(100)), t(0));
+        // Disarm: value of 0 -> deadline None -> remaining 0.
+        timers.settime(id, 0, None, t(10));
+        assert_eq!(timers.gettime(id, t(10)), Some((0, 0)));
+
+        // Unknown ids are rejected.
+        assert_eq!(timers.settime(99, 0, Some(t(1)), t(0)), None);
+        assert_eq!(timers.gettime(99, t(0)), None);
+        assert!(!timers.contains(99));
+    }
+
+    #[test]
+    fn delete_removes_timer() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create();
+        assert!(timers.contains(id));
+        assert!(timers.remove(id));
+        assert!(!timers.contains(id));
+        // Deleting again fails.
+        assert!(!timers.remove(id));
     }
 }
 
@@ -564,6 +732,10 @@ pub struct ThreadState<T> {
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
 
+    /// POSIX per-process timers created via `timer_create(2)`. Shared among the
+    /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
+    pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
+
     /// pseudo random number state
     pub prng: Pcg64Mcg,
 
@@ -611,6 +783,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
+            .field("posix_timers", &self.posix_timers)
             .field("prng", &self.prng)
             .field("chaos_prng", &self.chaos_prng)
             .field("thread_logical_time", &self.thread_logical_time)
@@ -681,6 +854,7 @@ impl<T> ThreadState<T> {
             file_metadata: Arc::new(Mutex::new(
                 FileMetadata::new(pid).setup_stdio(pid.into(), pid),
             )),
+            posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:
