@@ -126,11 +126,14 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, SockOpt)?;
 
-        // Write out the value.
-        guest.memory().write_exact(
-            syscall.value().ok_or(Errno::EFAULT)?.cast::<u8>(),
-            &event.value,
-        )?;
+        // A NULL value buffer is valid when the recorded value is empty.
+        if let Some(address) = syscall.value() {
+            guest
+                .memory()
+                .write_exact(address.cast::<u8>(), &event.value)?;
+        } else if !event.value.is_empty() {
+            return Err(Errno::EFAULT);
+        }
 
         // Write out the length parameter.
         guest

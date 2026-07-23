@@ -161,12 +161,16 @@ impl Recorder {
         let event = result.and_then(|ret| {
             debug_assert_eq!(ret, 0);
 
-            // FIXME: There are cases where optval can be NULL.
-            let mut value = vec![0u8; buflen as usize];
-            guest.memory().read_exact(
-                syscall.value().ok_or(Errno::EFAULT).unwrap().cast::<u8>(),
-                &mut value,
-            )?;
+            // Linux permits a NULL value buffer when its input length is zero.
+            let value = if let Some(address) = syscall.value() {
+                let mut value = vec![0u8; buflen as usize];
+                guest
+                    .memory()
+                    .read_exact(address.cast::<u8>(), &mut value)?;
+                value
+            } else {
+                Vec::new()
+            };
 
             // Need to read the (new) length. This might not have been updated,
             // but we don't know until we check it.

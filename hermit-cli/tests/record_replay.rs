@@ -197,6 +197,7 @@ fn workloads() -> &'static [Workload] {
 
         let c_sources = [
             ("c_getpid", "getpid.c"),
+            ("c_getsockopt_null", "getsockopt_null.c"),
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
@@ -599,6 +600,7 @@ macro_rules! record_replay_tests {
 }
 
 record_replay_tests! {
+    record_c_getsockopt_null => "c_getsockopt_null",
     record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",
