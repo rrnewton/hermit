@@ -1276,8 +1276,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getcwd(_) => self.passthrough(guest, call).await,
             // Filesystem statistics: passthrough is record/replay-aware so the
             // (otherwise host-dependent) result is captured and reproduced.
-            Syscall::Statfs(_) => self.passthrough(guest, call).await,
-            Syscall::Fstatfs(_) => self.passthrough(guest, call).await,
+            // statfs/fstatfs run the real syscall, then canonicalize the
+            // host-varying fields (free blocks/inodes, fsid) so the result is
+            // deterministic under --verify (a bare passthrough diverged, e.g.
+            // for tar).
+            Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
+            Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {

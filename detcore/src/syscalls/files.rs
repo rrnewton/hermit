@@ -795,6 +795,76 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
+    /// statfs: report deterministic filesystem statistics.
+    ///
+    /// The kernel's `statfs` reflects live host state: the free-block counts
+    /// (`f_bfree`, `f_bavail`), the free-inode count (`f_ffree`) and the device
+    /// id (`f_fsid`) all vary between runs as the underlying host filesystem
+    /// fills and drains, which makes a bare passthrough diverge under `--verify`
+    /// (e.g. `tar` calls statfs on its target filesystem). The static geometry
+    /// of the mount (`f_type`, `f_bsize`, `f_blocks`, `f_namelen`, ...) is
+    /// reproducible, so we run the real syscall and then canonicalize only the
+    /// volatile fields.
+    pub async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Statfs,
+    ) -> Result<i64, Error> {
+        let ret = self.record_or_replay(guest, call).await?;
+        self.canonicalize_statfs_buf(guest, call.buf())?;
+        Ok(ret)
+    }
+
+    /// fstatfs: same determinization as [`Self::handle_statfs`], keyed on an fd.
+    pub async fn handle_fstatfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Fstatfs,
+    ) -> Result<i64, Error> {
+        let ret = self.record_or_replay(guest, call).await?;
+        self.canonicalize_statfs_buf(guest, call.buf())?;
+        Ok(ret)
+    }
+
+    /// Overwrite the host-varying fields of a `statfs` result buffer with fixed
+    /// values, leaving the static per-mount geometry intact. Shared by statfs
+    /// and fstatfs. A null buffer (only possible on an error return, which the
+    /// caller has already propagated) is a no-op.
+    fn canonicalize_statfs_buf<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<AddrMut<libc::statfs>>,
+    ) -> Result<(), Error> {
+        // Fixed *caps* for the volatile counters. The exact values are
+        // arbitrary; they only need to be constant so repeated runs agree. We
+        // clamp each free count to the mount's (static) total so we never report
+        // the impossible "free > total": a filesystem may be smaller than the
+        // cap, and some (e.g. overlayfs) report no inode accounting at all
+        // (`f_files == 0`).
+        const FREE_BLOCKS_CAP: libc::fsblkcnt_t = 1_000_000;
+        const FREE_INODES_CAP: libc::fsfilcnt_t = 500_000;
+
+        if let Some(buf) = buf {
+            let mut sf = guest.memory().read_value(buf)?;
+            let free_blocks = FREE_BLOCKS_CAP.min(sf.f_blocks);
+            sf.f_bfree = free_blocks;
+            sf.f_bavail = free_blocks;
+            // `f_files == 0` means the filesystem does not track inodes; keep the
+            // free count at 0 rather than inventing free inodes on a mount that
+            // reports none.
+            sf.f_ffree = if sf.f_files == 0 {
+                0
+            } else {
+                FREE_INODES_CAP.min(sf.f_files)
+            };
+            // f_fsid is a device-dependent filesystem identifier; zero it. An
+            // all-zero bit pattern is a valid `fsid_t` (a POD id pair).
+            sf.f_fsid = unsafe { std::mem::zeroed() };
+            guest.memory().write_value(buf, &sf)?;
+        }
+        Ok(())
+    }
+
     /// dup system call.
     pub async fn handle_dup<G: Guest<Self>>(
         &self,
