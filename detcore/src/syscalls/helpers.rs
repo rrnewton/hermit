@@ -140,7 +140,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
+            // In record/replay mode, route an internal-fd (pipe) read/write through the
+            // record/replay subtool so its data is captured on record and reproduced on
+            // replay (see retry_nonblocking_syscall). In plain `hermit run` there is no
+            // recorder, so execute directly (subtool = None).
+            let subtool = (self.cfg.recordreplay_modes && internal_fd).then_some(self);
+            Ok(retry_nonblocking_syscall(guest, call, rsrc, subtool).await?)
         } else {
             assert!(action == IOAction::PassThru);
             tracing::trace!(
@@ -725,18 +730,29 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
 }
 
 /// Transform a syscall to nonblocking, then retry it until it returns a successful result.
+/// Retry a nonblockizable syscall (e.g. a pipe/socket read or write) until it succeeds.
+///
+/// `subtool` selects how each poll iteration executes the underlying syscall. Pass
+/// `Some(detcore)` in record/replay mode for a container-INTERNAL fd (currently pipes):
+/// each iteration is then routed through `Detcore::record_or_replay`, so the read's
+/// bytes (and every intervening `EAGAIN`) are captured in the recording and reproduced
+/// verbatim on replay. Without this, an internal-pipe read on the InternalIOPolling path
+/// bypasses the recorder and replay reads live from a pipe whose cross-process writer
+/// schedule is not reproduced -- the reader sees EOF instead of the recorded data and
+/// replay desyncs. Pass `None` for plain `hermit run` (no recording) or for external fds.
 pub async fn retry_nonblocking_syscall<T, G, C>(
     guest: &mut G,
     call: C,
     rsrc: Resources,
+    subtool: Option<&Detcore<T>>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall,
+    C: NonblockableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     // Bogus 99 return value is dead code below:
-    retry_nonblocking_syscall_helper(guest, call, rsrc, None).await
+    retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool).await
 }
 
 /// Retry a non-blocking syscall until it succeeds. Set the timeout to zero for the actual
@@ -750,12 +766,15 @@ pub async fn retry_nonblocking_syscall_with_timeout<T, G, C>(
     maybe_timeout: Option<LogicalTime>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall + TimeoutableSyscall,
+    C: NonblockableSyscall + TimeoutableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
-    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup).await
+    // poll/epoll_wait/futex/rt_sigtimedwait keep their existing execution (raw
+    // inject_with_retry): their record/replay handling is out of scope for the internal
+    // pipe data-ordering fix, and their fds are not necessarily internal pipes.
+    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
 }
 
 // Private helper.
@@ -764,9 +783,10 @@ async fn retry_nonblocking_syscall_helper<T, G, C>(
     call0: C,
     rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
+    subtool: Option<&Detcore<T>>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall,
+    C: NonblockableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
@@ -785,7 +805,13 @@ where
             );
             return Err(errno.into());
         }
-        let res = guest.inject_with_retry(call).await;
+        // Route through the record/replay subtool for internal pipes so each poll (an
+        // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
+        // reproduces deterministically; otherwise execute the syscall directly.
+        let res = match subtool {
+            Some(detcore) => detcore.record_or_replay(guest, call).await,
+            None => guest.inject_with_retry(call).await,
+        };
         if call.syscall_would_have_blocked(res) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
