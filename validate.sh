@@ -25,17 +25,13 @@ cd "$ROOT_DIR" || exit 1
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
-#   ./validate.sh --label-pr                 # on a fully-green full run, tag the
-#                                            # current branch's PR
-#                                            # 'locally-validated' (opt-in; env
-#                                            # VALIDATE_LABEL_PR=1 is equivalent,
-#                                            # PR_NUMBER=N overrides detection)
+# A fully-green full run labels the current PR `locally-validated` by default.
+# PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
+# VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
-# Opt-in PR auto-labeling. Off unless --label-pr or VALIDATE_LABEL_PR is set;
-# never mutate a live PR as a silent side effect of a routine local run.
-LABEL_PR=0
-[[ -n ${VALIDATE_LABEL_PR:-} ]] && LABEL_PR=1
+LABEL_PR=1
+[[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
 [[ ${VALIDATE_VERBOSE:-0} == 1 ]] && VERBOSE=1
 PR_NUMBER=${PR_NUMBER:-}
@@ -48,6 +44,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
+        --no-label-pr) LABEL_PR=0; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
@@ -581,8 +578,8 @@ function envelope_compare {
 
 # Auto-apply the `locally-validated` PR label after a fully-green full run.
 # Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Agents kept forgetting the manual `gh pr edit`, so
-# this automates it -- but only when opted in via --label-pr / VALIDATE_LABEL_PR.
+# `locally-validated` label. Label creation and application are best-effort so
+# GitHub or proxy failures never change the validation result.
 # The PR is taken from $PR_NUMBER when set, else detected from the current branch
 # via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
 # never changes validation's exit status.
@@ -590,10 +587,12 @@ readonly LOCALLY_VALIDATED_LABEL="locally-validated"
 
 function apply_locally_validated_label {
     local pr=$PR_NUMBER
+    local pr_head=""
+    local local_head
     local -a gh_cmd=(gh)
 
     if ! command -v gh >/dev/null 2>&1; then
-        printf "⚠️  --label-pr: gh CLI not found; skipping '%s' label\n" \
+        printf "⚠️  gh CLI not found; skipping '%s' label\n" \
             "$LOCALLY_VALIDATED_LABEL" >&2
         return 0
     fi
@@ -606,16 +605,36 @@ function apply_locally_validated_label {
         pr=$("${gh_cmd[@]}" pr view --json number -q .number 2>/dev/null) || true
     fi
     if [[ -z $pr ]]; then
-        printf "⚠️  --label-pr: no PR found for the current branch; skipping '%s' label\n" \
+        printf "⚠️  no PR found for the current branch; skipping '%s' label\n" \
             "$LOCALLY_VALIDATED_LABEL" >&2
         return 0
     fi
+    pr_head=$("${gh_cmd[@]}" pr view "$pr" --json headRefOid \
+        -q .headRefOid 2>/dev/null) || true
+    if [[ -z $pr_head ]]; then
+        printf "⚠️  could not read PR #%s head; skipping '%s' label\n" \
+            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
+        return 0
+    fi
+    local_head=$(git rev-parse HEAD)
+    if [[ $pr_head != "$local_head" ]]; then
+        printf "⚠️  PR #%s advanced from %s to %s; skipping '%s' label\n" \
+            "$pr" "$local_head" "$pr_head" "$LOCALLY_VALIDATED_LABEL" >&2
+        return 0
+    fi
+
+    # Ensure a fresh repository can accept the label. Failure is harmless here:
+    # the edit below reports the actionable warning and validation remains green.
+    "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
+        --color 1d76db \
+        --description "Full local validation passed for the current PR head" \
+        --force >>"$LOG_FILE" 2>&1 || true
 
     if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
         >>"$LOG_FILE" 2>&1; then
         printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
     else
-        printf "⚠️  --label-pr: failed to add '%s' label to PR #%s (full log: %s)\n" \
+        printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
             "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
     fi
 }
@@ -689,8 +708,8 @@ run_envelope
 
 print_summary
 
-# On a fully-green full run, optionally tag the PR as locally validated. Guarded
-# so it runs only when opted in; it must not affect the final exit status below.
+# On a fully-green full run, tag the PR unless explicitly disabled. GitHub
+# failures are warnings and never affect the final validation exit status.
 if ((failures == 0)) && ((LABEL_PR == 1)); then
     apply_locally_validated_label
 fi
