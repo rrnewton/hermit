@@ -485,6 +485,56 @@ fn run_kvm_reads_standard_input() {
 }
 
 #[test]
+fn run_kvm_f_getfl_and_reads_standard_input() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/perl",
+        "-MFcntl=F_GETFL",
+        "-e",
+        r#"defined(fcntl(STDIN, F_GETFL, 0)) or die "fcntl failed: $!\n"; my $line = <STDIN>; defined($line) && $line eq "hello\n" or die "stdin mismatch\n"; print "fcntl-stdin-ok\n";"#,
+    ];
+    let output = hermit_with_stdin(&args, b"hello\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "fcntl-stdin-ok\n");
+}
+
+#[test]
+fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/perl",
+        "-MFcntl=F_GETFL",
+        "-e",
+        r#"defined(fcntl(STDIN, F_GETFL, 0)) or die "fcntl failed: $!\n"; my $line = <STDIN>; !defined($line) or die "verify stdin was not isolated\n"; print "fcntl-verify-ok\n";"#,
+    ];
+    let output = hermit_with_stdin(&args, b"not-visible-during-capture\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "fcntl-verify-ok\n");
+    assert!(stderr(&output).contains("Determinism verified"));
+}
+
+#[test]
 fn run_kvm_verify_isolates_standard_input() {
     if !Path::new("/dev/kvm").exists() {
         return;
