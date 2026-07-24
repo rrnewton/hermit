@@ -594,6 +594,9 @@ function run_strict_compatibility_envelope {
     strict_compatibility_probe cut bash -c \
         'printf "alpha:beta\n" | cut -d: -f2' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe tee bash -c \
+        'printf "tee-through-hermit\n" | tee /dev/null' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe paste bash -c \
         'paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n")' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -609,6 +612,17 @@ function run_strict_compatibility_envelope {
     strict_compatibility_probe stat stat -c '%n %s %f' /etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe file file /bin/sh \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe basename /usr/bin/basename /usr/local/bin/hermit \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe dirname /usr/bin/dirname /usr/local/bin/hermit \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe env /usr/bin/env -i HERMIT_COMPAT=env /usr/bin/env \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe printenv /usr/bin/env -i HERMIT_COMPAT=printenv \
+        /usr/bin/printenv HERMIT_COMPAT \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe uname /usr/bin/uname -sr \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe factor factor 42 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
