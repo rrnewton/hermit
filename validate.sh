@@ -875,6 +875,7 @@ function run_compatibility_corpus {
     local passed=0
     local failed=0
     local total=0
+    local promotion_label
 
     case "$COMPATIBILITY_MODE" in
         rr)
@@ -1301,6 +1302,15 @@ function run_compatibility_corpus {
                 "${BACKEND_COMPAT_FAILED_LABELS[*]:-(none)}"
             printf "  newly passing labels (%s): %s\n" "${#BACKEND_COMPAT_NEW_LABELS[@]}" \
                 "${BACKEND_COMPAT_NEW_LABELS[*]:-(none)}"
+            printf "  add to %s_COMPAT_PASSING_LABELS:" "${COMPATIBILITY_MODE^^}"
+            if ((${#BACKEND_COMPAT_NEW_LABELS[@]} == 0)); then
+                printf " (none)"
+            else
+                for promotion_label in "${BACKEND_COMPAT_NEW_LABELS[@]}"; do
+                    printf " [%s]=1" "$promotion_label"
+                done
+            fi
+            printf "\n"
             return 0
         fi
         if ((BACKEND_COMPAT_TOTAL != expected)); then
