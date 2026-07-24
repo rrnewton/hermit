@@ -27,6 +27,7 @@ use reverie::syscalls::ioctl;
 use super::Recorder;
 use crate::event::StatEvent;
 use crate::event::SyscallEvent;
+use crate::event::deterministic_ioctl_error;
 
 /// Read the first `length` output bytes of a vectored read from the guest's
 /// `iovec` array, flattened in read order. `length` is the syscall return value,
@@ -218,6 +219,11 @@ impl Recorder {
         syscall: Ioctl,
     ) -> Result<i64, Errno> {
         let request = syscall.request();
+
+        if let Some(error) = deterministic_ioctl_error(&request) {
+            self.record_event(guest, Err(error));
+            return Err(error);
+        }
 
         let ret = guest.inject(syscall).await.inspect_err(|&err| {
             self.record_event(guest, Err(err));

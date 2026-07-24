@@ -69,6 +69,7 @@ use std::time::Duration;
 
 pub use config::BlockingMode;
 pub use config::Config;
+pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
@@ -451,6 +452,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///  - ends timeslice (mutating thread stats, end_of_timeslice)
     ///  - priority change / yield RPC
     async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, false).await;
+    }
+
+    async fn end_timeslice_for_sched_yield<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, true).await;
+    }
+
+    async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        explicit_sched_yield: bool,
+    ) {
         let thread_state = guest.thread_state();
         let dettid = thread_state.dettid;
         let chaos = guest.config().chaos;
@@ -469,6 +482,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Self::priority_changepoint_request(guest, end_time, prio)
         } else if chaos {
             Self::random_priority_changepoint_request(guest, end_time)
+        } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
+            Self::sched_yield_request(guest)
         } else {
             Self::yield_request(guest)
         };
@@ -529,9 +544,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;
 
-        if cfg!(debug_assertions) {
+        if !config.passthru_opt {
+            // Fail closed by default in every build profile. Besides allowing syscall-specific
+            // handlers to run, interception is what charges generic syscall logical time.
             Subscription::all()
         } else {
+            // Explicit performance opt-in: unlisted syscalls bypass Detcore entirely. Keep this
+            // path separate so its allow-list can be tightened without weakening the default.
             let mut subscription = Subscription::none();
             subscription.syscalls([
                 Sysno::write,
@@ -1333,7 +1352,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         &self,
         tid: Tid,
         global_state: &G,
-        thread_state: Self::ThreadState,
+        mut thread_state: Self::ThreadState,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
@@ -1341,6 +1360,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
         );
+        // Close the final in-progress timeslice so this thread contributes its
+        // last (partial) slice to the run report, even if it never exhausted a
+        // full slice.
+        let now = thread_state.thread_logical_time.as_nanos();
+        thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
         let mm_id = thread_state.mm_id;
         deregister_thread(
@@ -1350,6 +1374,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             global_state,
             detpid,
             mm_id,
+            thread_state.stats.timeslice_stats,
         )
         .await;
 
@@ -1363,5 +1388,48 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    fn strict_config(passthru_opt: bool) -> Config {
+        Config {
+            sequentialize_threads: true,
+            deterministic_io: true,
+            passthru_opt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strict_subscriptions_intercept_every_event_by_default() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
+
+        assert_eq!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
+    }
+
+    #[test]
+    fn passthru_opt_uses_the_partial_subscription_set() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        assert_ne!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::clock_gettime)
+        );
+        assert!(
+            !subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
     }
 }

@@ -62,12 +62,66 @@ fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
     F: Fn(),
 {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
+}
+
+fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
+where
+    F: Fn(),
+{
     let config = detcore::Config {
         preemption_timeout: None,
         sequentialize_threads: true,
+        runs_post_fork,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+#[test]
+fn ordinary_clone_child_starts_before_parent_resumes() {
+    det_test_fn_sequential_without_pmu(|| {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let child_started = Arc::new(AtomicBool::new(false));
+        let child_flag = Arc::clone(&child_started);
+
+        let child = std::thread::spawn(move || {
+            child_flag.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            child_started.load(Ordering::SeqCst),
+            "an ordinary clone child must receive its startup turn before the parent resumes"
+        );
+
+        child.join().expect("child thread should exit cleanly");
+    });
+}
+
+#[test]
+fn ordinary_clone_parent_mode_can_resume_before_child() {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Parent, || {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let child_started = Arc::new(AtomicBool::new(false));
+        let child_flag = Arc::clone(&child_started);
+
+        let child = std::thread::spawn(move || {
+            child_flag.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            !child_started.load(Ordering::SeqCst),
+            "parent mode must permit the parent to resume before child startup"
+        );
+
+        child.join().expect("child thread should exit cleanly");
+    });
 }
 
 #[test]

@@ -139,6 +139,9 @@ jobs:
     - name: Application e2e strict-verify tests (curl, nginx, redis, JVM, Go)
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
+    - name: Standard command strict-verify compatibility tests
+      if: steps.namespaces.outputs.available == 'true'
+      run: cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
     - name: Build pinned LevelDB integration fixture
       if: steps.namespaces.outputs.available == 'true'
       run: >-

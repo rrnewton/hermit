@@ -542,41 +542,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         Err(errno.into())
     }
 
-    /// sched_yield system call
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#258): Confirm one-turn exclusion semantics across scheduler modes.
+    /// End the current logical timeslice for a sequentialized sched_yield.
     pub async fn handle_sched_yield<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedYield,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads {
-            // In chaos mode, thread-interleaving diversity (and thus fairness)
-            // comes entirely from re-randomizing thread priorities at
-            // preemption-timer expirations. When timer preemption is disabled
-            // (`--preemption-timeout disabled`), priorities are fixed at thread
-            // creation and never change. A plain yield only re-enqueues the
-            // caller at the back of its own (fixed) priority level, so a thread
-            // that spins on sched_yield while holding the numerically-lowest
-            // priority is always reselected first and starves every thread it is
-            // waiting on (GH #81). Treat sched_yield as an explicit chaos
-            // reprioritization point: draw a fresh random priority for the
-            // caller so it cedes the CPU and other runnable threads can make
-            // progress. This mirrors what `end_timeslice` does at a timer-driven
-            // preemption point, and is recorded for chaos replay.
             if self.cfg.chaos && self.cfg.preemption_timeout.is_none() {
                 let change_time = guest.thread_state().thread_logical_time.as_nanos();
                 let request = Self::random_priority_changepoint_request(guest, change_time);
                 resource_request(guest, request).await;
-                trace!(
-                    "sched_yield: chaos reprioritization applied (timer preemption disabled); NOT performing actual syscall",
-                );
-            } else {
-                let resource = ResourceID::SleepUntil(LogicalTime::from_nanos(0));
-                let request = guest.thread_state().mk_request(resource, Permission::W);
+            } else if !self.cfg.chaos && self.cfg.replay_preemptions_from.is_some() {
+                if self.cfg.preemption_timeout.is_some() {
+                    guest
+                        .thread_state_mut()
+                        .reset_timeslice_for_explicit_yield();
+                }
+                let request = Self::sched_yield_request(guest);
                 resource_request(guest, request).await;
-                trace!(
-                    "sched_yield resources granted from scheduler; NOT performing actual syscall",
-                );
+            } else if self.cfg.chaos || self.cfg.replay_schedule_from.is_some() {
+                let request = Self::yield_request(guest);
+                resource_request(guest, request).await;
+            } else {
+                self.end_timeslice_for_sched_yield(guest).await;
             }
+            trace!("sched_yield yielded to the scheduler; NOT performing actual syscall");
             Ok(0)
         } else {
             Ok(self.record_or_replay(guest, call).await?)
