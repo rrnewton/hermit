@@ -126,6 +126,7 @@ jobs:
     - name: Stable Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
       run: |
+        cargo build -p hermit
         cargo test -p hermit --lib --bins
         for test in \
           arbitrary_binaries \
