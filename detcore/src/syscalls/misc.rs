@@ -60,6 +60,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
     /// Preserve thread-local bases while hiding host CPU feature controls.
     pub async fn handle_arch_prctl<G: Guest<Self>>(
         &self,
