@@ -22,6 +22,8 @@ use goblin::elf::program_header;
 const ELF_HEADER_SIZE: usize = 64;
 const MAX_INTERP_SIZE: usize = libc::PATH_MAX as usize;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#552)
 /// Get the right ld.so from elf's interp section.
 pub fn elf_get_interp<P: AsRef<Path>>(elf: P) -> Option<PathBuf> {
     let mut file = fs::File::open(elf).ok()?;
