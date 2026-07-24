@@ -30,6 +30,7 @@ pub(crate) enum SyscallClassification {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#275): Review syscall policy categories and fail-closed boundaries.
 /// Classifies every syscall in the pinned x86_64 `Sysno` table.
 pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
     match sysno {
