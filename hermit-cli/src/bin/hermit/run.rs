@@ -936,9 +936,14 @@ impl RunOpts {
                     global.log,
                 );
             }
-            Backend::Sabre => anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre strace`"
-            ),
+            Backend::Sabre => {
+                return super::backends::run_sabre(
+                    &self.program,
+                    &self.args,
+                    self.verify,
+                    global.log,
+                );
+            }
         }
 
         if self.no_namespace {
