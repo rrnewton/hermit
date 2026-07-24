@@ -1323,6 +1323,29 @@ if [[ $ENVELOPE_MODE == only ]]; then
     exit 0
 fi
 
+# fbsource import lints require the Meta copyright header on every imported Rust
+# source file. experiments/ is durable local research and is NOT imported to
+# fbsource (see fbcode/hermetic_infra/hermit), so it is exempt. `head -n 8`
+# allows a leading shebang line before the /* */ header on rust-script tools.
+function check_copyright_headers {
+    local missing=0 f
+    while IFS= read -r f; do
+        case "$f" in
+            experiments/*) continue ;;
+        esac
+        if ! head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms'; then
+            printf '  missing Meta copyright header: %s\n' "$f"
+            missing=$((missing + 1))
+        fi
+    done < <(git ls-files '*.rs')
+    if ((missing > 0)); then
+        printf 'validate.sh: %d Rust file(s) missing the Meta copyright header required for fbsource import.\n' \
+            "$missing" >&2
+        return 1
+    fi
+    return 0
+}
+
 run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
 run_check "Build release Hermit for strict compatibility" \
@@ -1333,6 +1356,7 @@ run_check "Build release Hermit for strict compatibility" \
 start_check "Test workspace documentation" cargo test --workspace --doc
 start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 start_check "Rustfmt" cargo fmt --all -- --check
+start_check "Copyright headers (fbsource lint)" check_copyright_headers
 start_check "Documentation" cargo doc --workspace --no-deps
 
 run_check "Hermit run smoke test" hermit_run_smoke
