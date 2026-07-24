@@ -127,7 +127,8 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm` to select the process instrumentation backend.
+Use `--backend=ptrace|dbi|liteinst|kvm` to select the process instrumentation
+backend.
 It is a global option and belongs before the subcommand, because the backend
 governs how any subcommand instruments the guest. The default is `ptrace`, so
 existing commands are unchanged:
@@ -141,7 +142,16 @@ subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend. The
-current DynamoRIO prototype requires a discoverable SDK and has no Detcore
+experimental LiteInst backend requires the workspace-built
+`libdetcore_liteinst.so` beside Hermit. It supports dynamically linked,
+single-threaded Linux x86-64 guests and compares output, exit status, and
+syscall-number events during `--verify`. It does not run the Detcore Tool;
+exec, thread creation, nondeterministic CPU instructions, and complete signal
+virtualization remain unsupported. Treat `--backend liteinst --strict
+--verify` as a compatibility repeat check, not the ptrace backend's production
+determinism guarantee.
+
+The current DynamoRIO prototype requires a discoverable SDK and has no Detcore
 process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
 commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
 those prototypes therefore fail before the guest starts and explain the missing
