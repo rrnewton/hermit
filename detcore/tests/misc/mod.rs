@@ -131,6 +131,11 @@ fn run_madvise_policy_test(passthru_opt: bool) {
                 Err(libc::EINVAL),
                 "ignored advice must still validate page alignment"
             );
+            assert_eq!(
+                madvise_result(unsafe { byte.add(1) }.cast(), 0, libc::MADV_FREE),
+                Err(libc::EINVAL),
+                "zero length does not waive address alignment"
+            );
             assert_eq!(madvise_result(mapping, page_size, libc::MADV_FREE), Ok(()));
             assert_eq!(madvise_result(mapping, page_size, libc::MADV_COLD), Ok(()));
             assert_eq!(
@@ -186,8 +191,8 @@ fn run_madvise_policy_test(passthru_opt: bool) {
 
             assert_eq!(
                 madvise_result(mapping, page_size, libc::MADV_FREE),
-                Err(libc::ENOMEM),
-                "ignored advice must reject an unmapped range"
+                Ok(()),
+                "normalized advice does not consult backend-specific mapping state"
             );
 
             let shared = unsafe {

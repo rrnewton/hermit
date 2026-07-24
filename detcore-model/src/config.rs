@@ -24,6 +24,10 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -39,6 +43,11 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub cpuid_virtualized_by_backend: bool,
+
+    /// The execution backend implements guest-visible madvise semantics.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_supports_madvise: bool,
 
     /// Epoch of the logical time.
     ///

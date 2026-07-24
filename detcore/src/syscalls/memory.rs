@@ -16,7 +16,6 @@ use reverie::syscalls::Errno;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
-use crate::procmaps;
 
 const PAGE_SIZE: usize = 4096;
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
@@ -25,7 +24,8 @@ const MADV_GUARD_REMOVE: i32 = 103;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MadviseAction {
-    Forward,
+    ForwardHint,
+    ForwardSemantic,
     Ignore,
     Reject(Errno),
     Unknown,
@@ -33,14 +33,15 @@ enum MadviseAction {
 
 const fn madvise_action(advice: i32) -> MadviseAction {
     match advice {
-        // Conventional advice and operations with guest-visible memory, fork,
-        // backing-store, dump, or guard semantics must reach the kernel.
-        libc::MADV_NORMAL
-        | libc::MADV_RANDOM
-        | libc::MADV_SEQUENTIAL
-        | libc::MADV_WILLNEED
-        | libc::MADV_DONTNEED
-        | libc::MADV_REMOVE
+        // Pure access-pattern and prefetch hints have no required memory-content
+        // side effect. Backends without native madvise support accept them as no-ops.
+        libc::MADV_NORMAL | libc::MADV_RANDOM | libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED => {
+            MadviseAction::ForwardHint
+        }
+
+        // Operations with guest-visible memory, fork, backing-store, dump, or guard
+        // semantics must reach a backend that implements native madvise behavior.
+        libc::MADV_DONTNEED
         | libc::MADV_DONTFORK
         | libc::MADV_DOFORK
         | libc::MADV_DONTDUMP
@@ -49,12 +50,12 @@ const fn madvise_action(advice: i32) -> MadviseAction {
         | libc::MADV_KEEPONFORK
         | libc::MADV_DONTNEED_LOCKED
         | MADV_GUARD_INSTALL
-        | MADV_GUARD_REMOVE => MadviseAction::Forward,
+        | MADV_GUARD_REMOVE => MadviseAction::ForwardSemantic,
 
         // These are optional reclaim or asynchronous VM-policy controls. Their host
         // effects depend on memory pressure, KSM, and THP activity. Hermit accepts
-        // them as fixed no-ops after common range validation; it deliberately does
-        // not reproduce each advice's host- and mapping-specific EINVAL cases.
+        // them as fixed no-ops after deterministic argument validation; it deliberately
+        // does not reproduce each advice's host- and mapping-specific EINVAL cases.
         libc::MADV_FREE
         | libc::MADV_MERGEABLE
         | libc::MADV_UNMERGEABLE
@@ -62,6 +63,10 @@ const fn madvise_action(advice: i32) -> MadviseAction {
         | libc::MADV_NOHUGEPAGE
         | libc::MADV_COLD
         | libc::MADV_PAGEOUT => MadviseAction::Ignore,
+
+        // Hole punching mutates backing storage and every mapping alias. Refuse it
+        // until Detcore can update file resources and replay all affected aliases.
+        libc::MADV_REMOVE => MadviseAction::Reject(Errno::EINVAL),
 
         // Successful population and collapse promise synchronous, resource-
         // dependent work. Report the same deterministic error Linux uses when
@@ -78,48 +83,30 @@ const fn madvise_action(advice: i32) -> MadviseAction {
     }
 }
 
-fn validate_common_range<G, T>(guest: &G, call: syscalls::Madvise) -> Result<(), Error>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    if call.len() == 0 {
-        return Ok(());
-    }
-
+fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
     let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
     if !start.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL.into());
     }
-    let end = start.checked_add(call.len()).ok_or(Errno::ENOMEM)?;
-    let start = u64::try_from(start).map_err(|_| Errno::ENOMEM)?;
-    let end = u64::try_from(end).map_err(|_| Errno::ENOMEM)?;
-    let maps = procmaps::from_pid(guest.pid(), |map| {
-        map.address.1 > start && map.address.0 < end
-    })?;
-
-    let mut covered_through = start;
-    for map in maps {
-        if map.address.0 > covered_through {
-            return Err(Errno::ENOMEM.into());
-        }
-        covered_through = covered_through.max(map.address.1);
-        if covered_through >= end {
-            return Ok(());
-        }
+    if call.len() == 0 {
+        return Ok(());
     }
-    Err(Errno::ENOMEM.into())
+
+    let end = start.checked_add(call.len()).ok_or(Errno::EINVAL)?;
+    end.checked_add(PAGE_SIZE - 1).ok_or(Errno::EINVAL)?;
+    Ok(())
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Apply a deterministic policy to `madvise(2)`.
+    /// Apply a deterministic policy to madvise(2).
     ///
-    /// Advice with guest-visible semantics is record/replay-aware passthrough.
-    /// Reclaim and asynchronous VM-policy advice receives fixed success after
-    /// non-mutating common range validation, without exposing host memory pressure.
-    /// Resource-dependent synchronous operations and hardware-failure injection are
-    /// refused with fixed errors after the same validation. As on Linux, a zero-length
-    /// call succeeds for every known advice value and probes whether it is recognized.
+    /// Ptrace/DBI forward hints and supported advice with guest-visible semantics.
+    /// Record/replay rejects discard advice because replay replaces file mappings
+    /// with anonymous mappings. Reclaim and asynchronous VM-policy
+    /// advice receives fixed success without exposing host memory pressure. Resource-
+    /// dependent, backing-store, and hardware-failure operations receive fixed errors.
+    /// KVM accepts pure hints as no-ops and reports ENOSYS for guest-visible semantics
+    /// its executor cannot provide.
     // AUTONOMOUS-BOT-IMPLEMENTED
     pub async fn handle_madvise<G: Guest<Self>>(
         &self,
@@ -127,10 +114,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Madvise,
     ) -> Result<i64, Error> {
         let advice = call.advice();
-        match madvise_action(advice) {
-            MadviseAction::Forward => Ok(self.record_or_replay(guest, call).await?),
+        let action = madvise_action(advice);
+        validate_common_args(call)?;
+
+        if call.len() == 0 {
+            return match action {
+                MadviseAction::Unknown => Err(Errno::EINVAL.into()),
+                _ => Ok(0),
+            };
+        }
+        if self.cfg.recordreplay_modes
+            && matches!(advice, libc::MADV_DONTNEED | libc::MADV_DONTNEED_LOCKED)
+        {
+            crate::detlog!(
+                "[dtid {}] madvise discard advice {} unsupported in record/replay",
+                guest.thread_state().dettid,
+                advice,
+            );
+            return Err(Errno::ENOSYS.into());
+        }
+
+        match action {
+            MadviseAction::ForwardHint if self.cfg.backend_supports_madvise => {
+                Ok(self.record_or_replay(guest, call).await?)
+            }
+            MadviseAction::ForwardHint => {
+                crate::detlog!(
+                    "[dtid {}] madvise hint {} accepted as backend no-op",
+                    guest.thread_state().dettid,
+                    advice,
+                );
+                Ok(0)
+            }
+            MadviseAction::ForwardSemantic if self.cfg.backend_supports_madvise => {
+                Ok(self.record_or_replay(guest, call).await?)
+            }
+            MadviseAction::ForwardSemantic => {
+                crate::detlog!(
+                    "[dtid {}] madvise advice {} is unsupported by this backend",
+                    guest.thread_state().dettid,
+                    advice,
+                );
+                Err(Errno::ENOSYS.into())
+            }
             MadviseAction::Ignore => {
-                validate_common_range(guest, call)?;
                 crate::detlog!(
                     "[dtid {}] madvise advice {} accepted as deterministic no-op",
                     guest.thread_state().dettid,
@@ -139,10 +166,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(0)
             }
             MadviseAction::Reject(errno) => {
-                validate_common_range(guest, call)?;
-                if call.len() == 0 {
-                    return Ok(0);
-                }
                 crate::detlog!(
                     "[dtid {}] madvise advice {} rejected with {}",
                     guest.thread_state().dettid,
@@ -174,8 +197,12 @@ mod tests {
             libc::MADV_RANDOM,
             libc::MADV_SEQUENTIAL,
             libc::MADV_WILLNEED,
+        ] {
+            assert_eq!(madvise_action(advice), MadviseAction::ForwardHint);
+        }
+
+        for advice in [
             libc::MADV_DONTNEED,
-            libc::MADV_REMOVE,
             libc::MADV_DONTFORK,
             libc::MADV_DOFORK,
             libc::MADV_DONTDUMP,
@@ -186,7 +213,7 @@ mod tests {
             MADV_GUARD_INSTALL,
             MADV_GUARD_REMOVE,
         ] {
-            assert_eq!(madvise_action(advice), MadviseAction::Forward);
+            assert_eq!(madvise_action(advice), MadviseAction::ForwardSemantic);
         }
 
         for advice in [
@@ -202,6 +229,7 @@ mod tests {
         }
 
         for advice in [
+            libc::MADV_REMOVE,
             libc::MADV_POPULATE_READ,
             libc::MADV_POPULATE_WRITE,
             libc::MADV_COLLAPSE,
@@ -212,5 +240,42 @@ mod tests {
             assert_eq!(madvise_action(advice), MadviseAction::Reject(Errno::EPERM));
         }
         assert_eq!(madvise_action(i32::MAX), MadviseAction::Unknown);
+    }
+
+    #[test]
+    fn common_argument_validation_is_host_independent() {
+        let aligned = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(0x1000) };
+        assert!(
+            validate_common_args(
+                syscalls::Madvise::new()
+                    .with_addr(Some(aligned))
+                    .with_len(0)
+                    .with_advice(libc::MADV_FREE),
+            )
+            .is_ok()
+        );
+
+        let unaligned = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(0x1001) };
+        assert!(
+            validate_common_args(
+                syscalls::Madvise::new()
+                    .with_addr(Some(unaligned))
+                    .with_len(0)
+                    .with_advice(libc::MADV_FREE),
+            )
+            .is_err()
+        );
+
+        let near_end =
+            unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(usize::MAX & !(PAGE_SIZE - 1)) };
+        assert!(
+            validate_common_args(
+                syscalls::Madvise::new()
+                    .with_addr(Some(near_end))
+                    .with_len(PAGE_SIZE)
+                    .with_advice(libc::MADV_FREE),
+            )
+            .is_err()
+        );
     }
 }

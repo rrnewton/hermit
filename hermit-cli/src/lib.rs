@@ -449,6 +449,7 @@ async fn run_kvm(
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
     config.cpuid_virtualized_by_backend = true;
+    config.backend_supports_madvise = false;
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     backend

@@ -1573,6 +1573,5 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::arch_prctl)
         );
-
     }
 }
