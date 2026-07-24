@@ -109,6 +109,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// KVM accepts pure hints as no-ops and reports ENOSYS for guest-visible semantics
     /// its executor cannot provide.
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#548): Recheck advice policy and record/replay boundaries.
     pub async fn handle_madvise<G: Guest<Self>>(
         &self,
         guest: &mut G,
