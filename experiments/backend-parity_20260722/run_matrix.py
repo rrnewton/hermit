@@ -220,16 +220,16 @@ def hermit_command(
     backend: str,
     guest: list[str],
     name: str,
-    strict_verify: bool,
-    expected_status: int,
+    strict: bool,
+    verify: bool,
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
         command.extend(["--backend", backend])
-    if strict_verify:
+    if strict:
         command.append("--strict")
-        if expected_status == 0:
-            command.append("--verify")
+    if verify:
+        command.append("--verify")
     command.extend(
         [
             "--base-env=minimal",
@@ -241,6 +241,17 @@ def hermit_command(
         command.append("--no-virtualize-cpuid")
     command.extend(["--", *guest])
     return command
+
+
+def cpuid_blocked(backend: str, name: str, diagnostic: str) -> bool:
+    return (
+        backend == "ptrace"
+        and name == "cpuid_policy"
+        and (
+            "continuing without CPUID interception" in diagnostic
+            or "CPUID faulting is unavailable" in diagnostic
+        )
+    )
 
 
 def run_case(
@@ -255,8 +266,40 @@ def run_case(
     assurance = "L2" if strict_verify and expected_status == 0 else "L1"
     started = time.monotonic()
     for iteration in range(RUNS):
+        if strict_verify and expected_status == 0:
+            verify_command = hermit_command(
+                hermit, backend, guest, name, strict=True, verify=True
+            )
+            try:
+                verify_result = run_subprocess(verify_command)
+            except subprocess.TimeoutExpired:
+                return (
+                    "FAIL",
+                    f"verify {iteration + 1} timed out",
+                    time.monotonic() - started,
+                )
+            if verify_result.returncode != 0:
+                diagnostic = verify_result.stderr.decode(errors="replace").strip()
+                if cpuid_blocked(backend, name, diagnostic):
+                    return (
+                        "BLOCKED",
+                        "host kernel/CPU lacks CPUID faulting",
+                        time.monotonic() - started,
+                    )
+                return (
+                    "FAIL",
+                    f"verify {iteration + 1} exited {verify_result.returncode}: "
+                    f"{diagnostic[-300:]}",
+                    time.monotonic() - started,
+                )
+
         command = hermit_command(
-            hermit, backend, guest, name, strict_verify, expected_status
+            hermit,
+            backend,
+            guest,
+            name,
+            strict=strict_verify,
+            verify=False,
         )
         try:
             result = run_subprocess(command)
@@ -265,14 +308,7 @@ def run_case(
 
         if result.returncode != expected_status:
             diagnostic = result.stderr.decode(errors="replace").strip()
-            if (
-                backend == "ptrace"
-                and name == "cpuid_policy"
-                and (
-                    "continuing without CPUID interception" in diagnostic
-                    or "CPUID faulting is unavailable" in diagnostic
-                )
-            ):
+            if cpuid_blocked(backend, name, diagnostic):
                 return (
                     "BLOCKED",
                     "host kernel/CPU lacks CPUID faulting",
@@ -311,11 +347,12 @@ def run_case(
                     f"run {iteration + 1} output differed from run 1",
                     time.monotonic() - started,
                 )
-    return (
-        "PASS",
-        f"{assurance} {RUNS}/{RUNS} invocations matched",
-        time.monotonic() - started,
+    detail = (
+        f"{assurance} {RUNS}/{RUNS} verify and functional invocations matched"
+        if assurance == "L2"
+        else f"{assurance} {RUNS}/{RUNS} functional invocations matched"
     )
+    return "PASS", detail, time.monotonic() - started
 
 
 def write_results(path: Path, results: list[dict[str, str]]) -> None:
@@ -367,8 +404,8 @@ def parse_args() -> argparse.Namespace:
         "--strict-verify",
         action="store_true",
         help=(
-            "run zero-exit cases with --strict --verify; expected nonzero exits "
-            "run with --strict"
+            "run zero-exit cases with strict functional and verify invocations; "
+            "expected nonzero exits run with --strict"
         ),
     )
     parser.add_argument(

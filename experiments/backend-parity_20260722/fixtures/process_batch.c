@@ -15,9 +15,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern char** environ;
+extern char **environ;
 
-static void fail(const char* operation) {
+static void fail(const char *operation) {
   perror(operation);
   exit(1);
 }
@@ -60,8 +60,7 @@ int main(void) {
     return 3;
   }
 
-  pid_t clone_child =
-      (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0);
+  pid_t clone_child = (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0);
   if (clone_child < 0) {
     fail("clone");
   }
@@ -76,7 +75,7 @@ int main(void) {
     fail("fork for execve");
   }
   if (exec_child == 0) {
-    char* const arguments[] = {"/bin/true", NULL};
+    char *const arguments[] = {"/bin/true", NULL};
     syscall(SYS_execve, arguments[0], arguments, environ);
     syscall(SYS_exit_group, 127);
     __builtin_unreachable();

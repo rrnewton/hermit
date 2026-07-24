@@ -21,7 +21,7 @@ static void handle_signal(int signal_number) {
   ++deliveries;
 }
 
-static void fail(const char* operation) {
+static void fail(const char *operation) {
   perror(operation);
   exit(1);
 }

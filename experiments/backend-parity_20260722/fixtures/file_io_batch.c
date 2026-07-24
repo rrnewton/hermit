@@ -16,12 +16,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static void fail(const char* operation) {
+static void fail(const char *operation) {
   perror(operation);
   exit(1);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   static const char expected[] = "backend parity fixture\n";
   static const char success[] = "file-io-ok\n";
   struct stat fd_stat;

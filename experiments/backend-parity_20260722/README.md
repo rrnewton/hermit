@@ -50,7 +50,10 @@ inside `reverie-kvm`, but it cannot yet execute this suite's CPUID probe ELF.
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
-status and stdout. `--strict-verify` runs zero-exit cases at L2; the expected
+status and stdout. `--strict-verify` pairs every zero-exit functional
+invocation with an
+L2 verification invocation; ptrace verification intentionally suppresses guest
+stdout, so keeping both phases prevents a false behavioral pass. The expected
 nonzero `exit_status` case runs three strict L1 invocations because Hermit
 verification intentionally stops after a nonzero first run.
 
