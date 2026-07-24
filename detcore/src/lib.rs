@@ -108,6 +108,7 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+use tool_global::report_unsupported_syscall;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 use tool_local::PosixTimers;
@@ -178,8 +179,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    /// Applies the legacy policy to an explicitly listed but unclassified syscall.
-    async fn handle_unclassified_syscall<G: Guest<Self>>(
+    /// Applies the legacy policy to an explicitly listed but unsupported syscall.
+    async fn handle_unsupported_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
@@ -194,6 +195,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             panic!("unsupported syscall: {:?}", call);
         }
+        report_unsupported_syscall(guest, call.number()).await;
         self.passthrough(guest, call).await
     }
 
@@ -1292,7 +1294,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_gettimeofday(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1305,7 +1307,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_time(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1318,7 +1320,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_clock_gettime(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1331,7 +1333,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_clock_getres(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1467,7 +1469,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
 
                 unexpected => {
-                    self.handle_unclassified_syscall(
+                    self.handle_unsupported_syscall(
                         guest,
                         unexpected,
                         dettid,
@@ -1590,7 +1592,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Unlink(_)
                 | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
                 unexpected => {
-                    self.handle_unclassified_syscall(
+                    self.handle_unsupported_syscall(
                         guest,
                         unexpected,
                         dettid,
@@ -1599,12 +1601,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
-            SyscallClassification::Unclassified => match call {
+            SyscallClassification::Unsupported => match call {
                 Syscall::Prctl(s) if syscalls::is_supported_prctl_option(s.option()) => {
                     self.handle_prctl(guest, s).await
                 }
                 unexpected => {
-                    self.handle_unclassified_syscall(
+                    self.handle_unsupported_syscall(
                         guest,
                         unexpected,
                         dettid,
