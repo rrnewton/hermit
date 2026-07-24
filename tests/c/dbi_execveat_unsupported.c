@@ -6,25 +6,25 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
-#include <time.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 extern char **environ;
 
 int main(void) {
-  char *const arguments[] = {"/definitely/missing", NULL};
+  char *const arguments[] = {"/bin/true", NULL};
 
   errno = 0;
-  if (execve(arguments[0], arguments, environ) != -1)
+  if (syscall(SYS_execveat, AT_FDCWD, arguments[0], arguments, environ, 0) !=
+      -1)
     return 2;
-  if (errno != ENOENT)
+  if (errno != ENOSYS)
     return 3;
-  const struct timespec delay = {.tv_nsec = 1000000};
-  if (nanosleep(&delay, NULL) != 0)
+  if (puts("execveat unsupported") == EOF)
     return 4;
-  if (puts("recovered after failed exec") == EOF)
-    return 5;
   return 0;
 }
