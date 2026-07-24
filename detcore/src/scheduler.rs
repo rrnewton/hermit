@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -336,6 +337,10 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
+
+    /// Threads temporarily placed at the back of the run queue by a yield.
+    /// Their normal priorities are restored after another turn commits.
+    yield_deferred: BTreeSet<DetTid>,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -844,6 +849,7 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            yield_deferred: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -1696,6 +1702,28 @@ impl Scheduler {
         *req = runnable_req;
     }
 
+    /// Move a yielding thread behind every other ordinary-priority thread for
+    /// one scheduler turn. Its original priority remains in `priorities` and
+    /// is restored by `step6_reenquue` after another thread commits.
+    fn defer_yield(&mut self, dettid: DetTid) -> Result<(), SkipTurn> {
+        let popped = self.run_queue.commit_tentative_pop();
+        assert_eq!(dettid, popped);
+        self.run_queue.push_back(dettid, LAST_PRIORITY);
+        assert!(self.yield_deferred.insert(dettid));
+
+        // The yield request has already been handled. Leave an empty request
+        // so the caller returns from sched_yield when it is selected again.
+        self.next_turns
+            .get_mut(&dettid)
+            .expect("nextturn present")
+            .req = Ivar::full(Ok(Resources::new(dettid)));
+        info!(
+            "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, DEFER dettid {} after yield",
+            self.turn, dettid
+        );
+        self.skip_turn()
+    }
+
     /// Helper function. Same postcondition as step4_resource_block
     fn block_for_one_resource(
         &mut self,
@@ -1706,6 +1734,10 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         match rid {
             ResourceID::SleepUntil(target_ns) => {
+                if target_ns.as_nanos() == 0 && self.run_queue.len() > 1 {
+                    return self.defer_yield(dettid);
+                }
+
                 if *target_ns <= self.committed_time {
                     trace!(
                         "[dtid {}] time-based action ready to execute, target time {} is before committed global time {}",
@@ -2097,6 +2129,18 @@ impl Scheduler {
             "[sched-step6] dettid {} going back into queue at position {}.",
             next_dtid, pos
         );
+        // A committed turn satisfies every outstanding one-turn yield. The
+        // selected thread is already back at its normal priority; restore the
+        // remaining yielded threads deterministically by tid.
+        for dettid in std::mem::take(&mut self.yield_deferred) {
+            if dettid != next_dtid && self.run_queue.remove_tid(dettid) {
+                let pos = self.runqueue_push_back(dettid);
+                trace!(
+                    "[sched-step6] restored yielded dettid {} at position {}",
+                    dettid, pos
+                );
+            }
+        }
     }
 
     /// Add a simulated "post hook" for exit calls which we're about to let through.

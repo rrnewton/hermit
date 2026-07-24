@@ -6,7 +6,7 @@ description: "Create evidence-based Hermit progress reports from live measuremen
 # Progress Report Rubric
 
 Reusable template and procedure for Hermit progress reports
-(`ai_docs/progress-reports/vN-YYYY-MM-DD.md`). The governing rule: **every number
+(`docs/progress-reports/vN-YYYY-MM-DD.md`). The governing rule: **every number
 is a live measurement**. Never estimate. If a suite cannot run, record the
 exact reason (missing target, missing submodule, host capability gap, compile
 error) instead of a number.
@@ -100,5 +100,5 @@ done
   regression; if you cannot tell, say so and say what host would decide it.
 - Do not stage generated artifacts (`envelope.json`, `target/`) or unrelated
   concurrent changes.
-- Reuse existing paths: reports in `ai_docs/progress-reports/`, this rubric in
+- Reuse existing paths: reports in `docs/progress-reports/`, this rubric in
   `.llms/skills/`, automation in `scripts/progress-report.sh`.
