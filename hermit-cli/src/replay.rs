@@ -85,13 +85,24 @@ impl Replay {
         // shared libraries. This path only exists on Meta hosts; skip it elsewhere
         // (e.g. generic self-hosted CI runners) where the missing source would make
         // mount(2) fail with ENOENT.
+        //
+        // The bind-mount target directory is created here, in the parent process,
+        // rather than via `Mount::touch_target()`. `touch_target` defers directory
+        // creation to the cloned child immediately before `execve`, where
+        // reverie-process runs it on a fixed 4 KiB clone stack (see
+        // reverie-process `clone.rs`). Its `create_dir_all`/`touch_path` helpers
+        // each place a `[0; PATH_MAX]` (4 KiB) buffer on that stack, overflowing
+        // it and corrupting the `envp` pointer that the child then passes to
+        // `execve`. That made the guest's initial `execve` fail with `EFAULT` on
+        // every Meta-host replay (recording spawns without mounts, so it was
+        // unaffected), so replay diverged from the recording at syscall #1.
+        // Pre-creating the target keeps the child's pre-exec path allocation-free.
         let fbcode = Path::new("/usr/local/fbcode");
         if fbcode.exists() {
-            command.mount(
-                Mount::bind(fbcode, chroot.path().join("usr/local/fbcode"))
-                    .recursive()
-                    .touch_target(),
-            );
+            chroot
+                .create_dir_all(fbcode)
+                .context("Failed to create fbcode bind-mount target in chroot")?;
+            command.mount(Mount::bind(fbcode, chroot.path().join("usr/local/fbcode")).recursive());
         }
 
         command.chroot(chroot.path());

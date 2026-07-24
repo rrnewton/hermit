@@ -90,6 +90,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().mk_request(resource, Permission::W)
     }
 
+    /// Construct a request for a strong, one-turn scheduler yield.
+    pub fn sched_yield_request<G: Guest<Self>>(guest: &mut G) -> Resources {
+        guest
+            .thread_state()
+            .mk_request(ResourceID::SchedYield, Permission::W)
+    }
+
     /// Construct a random PriorityChangePoint request using the local PRNG.
     pub fn random_priority_changepoint_request<G: Guest<Self>>(
         guest: &mut G,

@@ -18,6 +18,20 @@ use reverie::syscalls::ioctl;
 use serde::Deserialize;
 use serde::Serialize;
 
+const SIOCETHTOOL: usize = 0x8946;
+
+/// Returns the stable error used for legacy ioctls whose nested output cannot
+/// be represented by the currently pinned Reverie decoder.
+pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<Errno> {
+    match request {
+        // SIOCETHTOOL stores its output behind the data pointer nested in an
+        // ifreq. Treating it as an opaque request would lose guest-visible
+        // memory updates, so reject it identically during record and replay.
+        ioctl::Request::Other(SIOCETHTOOL, _) => Some(Errno::ENODEV),
+        _ => None,
+    }
+}
+
 /// An event. This contains everything needed to verify and reproduce the
 /// execution of a syscall.
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,4 +158,23 @@ pub struct SockOptEvent {
     /// The length of the value. If this is the same as `value.len()`, then
     /// no truncation of the value occurred.
     pub length: libc::socklen_t,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn siocethtool_has_a_deterministic_error() {
+        let request = ioctl::Request::Other(SIOCETHTOOL, 0x1234);
+
+        assert_eq!(deterministic_ioctl_error(&request), Some(Errno::ENODEV));
+    }
+
+    #[test]
+    fn neighboring_unknown_ioctl_is_not_rejected() {
+        let request = ioctl::Request::Other(SIOCETHTOOL - 1, 0x1234);
+
+        assert_eq!(deterministic_ioctl_error(&request), None);
+    }
 }

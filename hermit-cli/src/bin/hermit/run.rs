@@ -662,7 +662,17 @@ fn strict_flag_preserves_deterministic_defaults() {
 
     assert!(ro.det_opts.det_config.sequentialize_threads);
     assert!(ro.det_opts.det_config.deterministic_io);
+    assert!(!ro.det_opts.det_config.passthru_opt);
     assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn passthru_optimization_requires_explicit_opt_in() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(ro.det_opts.det_config.passthru_opt);
+    assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
 }
 
 #[test]
@@ -747,6 +757,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
         "Disable deterministic I/O behavior",
+        "--passthru-opt",
+        "optimized partial syscall subscription set",
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",
@@ -868,6 +880,9 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        if self.selected_backend() == Backend::Kvm {
+            hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+        }
 
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
         // subsequent tracing_subscriber::fmt::init() call.
@@ -900,7 +915,14 @@ impl RunOpts {
         // and returns an accurate, program-specific error.
         match backend {
             Backend::Ptrace | Backend::Kvm => {}
-            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Dbi => {
+                return super::backends::run_dbi(
+                    &self.program,
+                    &self.args,
+                    self.verify,
+                    global.log,
+                );
+            }
         }
 
         if self.no_namespace {
@@ -1220,7 +1242,7 @@ impl RunOpts {
         eprintln!(":: {}", "Run2...".yellow().bold());
         let out2 = self.run_verify(log2_file, global)?;
 
-        compare_two_runs(
+        let status = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -1234,7 +1256,14 @@ impl RunOpts {
                 failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
             },
-        )
+        )?;
+
+        if self.selected_backend() == Backend::Kvm {
+            eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
+            std::io::stdout().write_all(&out1.stdout)?;
+            std::io::stderr().write_all(&out1.stderr)?;
+        }
+        Ok(status)
     }
 
     /// Returns the mounts to be used with the container.

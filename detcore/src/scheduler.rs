@@ -25,9 +25,11 @@ use std::time::Duration;
 use std::vec::IntoIter;
 
 use detcore_model::summary::RunSummary;
+use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
@@ -54,6 +56,7 @@ use tracing::info;
 use tracing::trace;
 
 use crate::config::Config;
+use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -352,6 +355,11 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// Per-thread distribution of completed timeslice durations (virtual ns),
+    /// collected from each thread as it deregisters at exit. Aggregated into the
+    /// final run report. BTreeMap for deterministic iteration order.
+    pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -370,6 +378,9 @@ pub struct Scheduler {
 
     /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
     fuzz_prng: Pcg64Mcg,
+
+    /// Independent scheduler-seeded stream for post-fork ordering choices.
+    post_fork_prng: Pcg64Mcg,
 
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
@@ -595,10 +606,18 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
-    async fn further(&mut self) {
+    async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
-        if self.count <= YIELDS_FIRST {
+        if blocking {
+            if self.count <= YIELDS_FIRST {
+                std::thread::yield_now();
+            } else {
+                let round = self.count - YIELDS_FIRST;
+                let micros = if round > 13 { 10_000 } else { 2 ^ round };
+                std::thread::sleep(Duration::from_micros(micros));
+            }
+        } else if self.count <= YIELDS_FIRST {
             tokio::task::yield_now().await;
         } else {
             let round = self.count - YIELDS_FIRST;
@@ -618,8 +637,30 @@ impl Default for Backoff {
     }
 }
 
+pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
+    sched_loop_inner(sched, timer, false, None).await;
+}
+
+pub(crate) async fn sched_loop_external(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    observer: SchedulerObserver,
+) {
+    sched_loop_inner(sched, timer, true, Some(observer)).await;
+}
+
+async fn sched_loop_inner(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    blocking_backoff: bool,
+    observer: Option<SchedulerObserver>,
+) {
     info!("[scheduler] daemon task starting up, waiting for guest thread start..");
+    if let Some(observer) = &observer {
+        observer("daemon task starting; waiting for guest thread");
+    }
     let (iv, stop_after_iter) = {
         // Block until queue is populated.
         let sched = sched.lock().unwrap();
@@ -627,17 +668,21 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
     };
     iv.get().await;
     info!("[scheduler] guest in queue, scheduler proceeding..",);
+    if let Some(observer) = &observer {
+        observer("guest registered; deterministic scheduler proceeding");
+    }
     let mut iter: u64 = 0;
     // We keep track of whether the last turn was a SKIP:
     let mut last_res = Err(SkipTurn);
     let mut backoff = Backoff::new();
+    let mut observed_turn = false;
 
     loop {
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
         // SPINNING below), we need to make sure that other threads can progress so we don't
         // busy-wait too tightly.
         if last_res.is_err() {
-            backoff.further().await;
+            backoff.further(blocking_backoff).await;
         } else {
             backoff.reset();
         }
@@ -662,6 +707,9 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
                 && sched.exiting_threads.is_empty()
             {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
+                if let Some(observer) = &observer {
+                    observer("run queue empty; scheduler completed");
+                }
                 return;
             } else if let Some(stop) = sched.stop_after_turn
                 && sched.turn > stop
@@ -678,6 +726,12 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+        if last_res.is_ok() && !observed_turn {
+            if let Some(observer) = &observer {
+                observer("completed a deterministic scheduling turn");
+            }
+            observed_turn = true;
+        }
     }
 }
 
@@ -762,7 +816,8 @@ pub async fn do_a_turn_blocking(
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         let exit_call = rsrcs.as_exit_syscall();
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        mg.step6_finish_turn(next_dtid, exit_call.is_none());
+        let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+        mg.step6_finish_turn(next_dtid, exit_call.is_none(), sched_yield);
         if let Some(call) = exit_call {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -900,9 +955,11 @@ impl Scheduler {
             vfork_parent_priority_restore: Default::default(),
             vfork_child_start_priorities: Default::default(),
             timeslices: Default::default(),
+            per_thread_timeslice: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
+            post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
         }
     }
 
@@ -1856,6 +1913,7 @@ impl Scheduler {
                 // scheduler commits, and thus it leans on an assumption of
                 // non-interference, or on interference *only* affecting the external
                 // actions that will be recorded anyway.
+                self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp);
 
                 // Only once the ivars are cleared, and the guest is officially past the
@@ -1892,6 +1950,7 @@ impl Scheduler {
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
+            ResourceID::SchedYield => Ok(()),
             ResourceID::InboundSignal(_) => Ok(()),
         }
     }
@@ -2202,17 +2261,24 @@ impl Scheduler {
     /// completes before the kernel-unblocked parent can be requeued.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#239)
-    fn step6_finish_turn(&mut self, next_dtid: DetTid, reenqueue: bool) {
+    fn step6_finish_turn(&mut self, next_dtid: DetTid, reenqueue: bool, sched_yield: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread out of the selected position.
-        let dt2 = self.run_queue.commit_tentative_pop();
+        let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
         assert_eq!(next_dtid, dt2);
         if let Some(original_priority) = self.vfork_parent_priority_restore.remove(&next_dtid) {
             let displaced_priority = self.priorities.insert(next_dtid, original_priority);
             assert_eq!(displaced_priority, Some(FIRST_PRIORITY + 1));
         }
         if reenqueue {
-            let pos = self.runqueue_push_back(next_dtid);
+            // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
+            // queue placement is transient, so persistent priorities remain unchanged.
+            let pos = if sched_yield {
+                let priority = self.get_priority(next_dtid);
+                self.run_queue.push_yielded(next_dtid, priority)
+            } else {
+                self.runqueue_push_back(next_dtid)
+            };
             debug!(
                 "[sched-step6] dettid {} going back into queue at position {}.",
                 next_dtid, pos
@@ -2365,11 +2431,22 @@ impl Scheduler {
         self.run_queue.push_back(dettid, priority)
     }
 
-    /// Push_front a thread onto the runqueue, respecting its persistent priority
-    /// value. This should be the ordinary way threads are pushed onto the queue.
-    fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
+    /// Push a thread to the front of its persistent priority band.
+    ///
+    /// This is reserved for protocol handoffs where the queued thread must run
+    /// before an equal-priority peer, such as ordinary clone child startup.
+    pub(crate) fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
         let priority = self.get_priority(dettid);
         self.run_queue.push_front(dettid, priority)
+    }
+
+    /// Decide which side gets the first post-fork turn for an ordinary clone.
+    pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
+        match mode {
+            RunsPostFork::Child => true,
+            RunsPostFork::Parent => false,
+            RunsPostFork::Random => self.post_fork_prng.random(),
+        }
     }
 
     /// Check if a thread is alive, but removed from run queue.
@@ -2403,8 +2480,22 @@ impl Scheduler {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#252): Confirm completed and final partial slices belong in one distribution.
+    /// Fold an exiting thread's completed-timeslice distribution into the
+    /// scheduler's per-thread record, to be reported in the final run summary.
+    pub fn record_timeslice_stats(&mut self, dettid: DetTid, stats: TimesliceStats) {
+        if stats.is_empty() {
+            return;
+        }
+        self.per_thread_timeslice
+            .entry(dettid)
+            .or_default()
+            .merge(&stats);
+    }
+
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
-    /// doesn't have all the necessary information.
+    /// does not have all the necessary information.
     ///
     /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
     pub fn generate_partial_run_summary(
@@ -2483,6 +2574,18 @@ impl Scheduler {
         let num_threads = self.thread_tree.size() as u64;
         let threads_descrip = format!("{}", self.thread_tree);
 
+        // Aggregate the per-thread timeslice distributions collected at thread
+        // exit. BTreeMap gives a deterministic (dettid-sorted) ordering.
+        let per_thread_timeslice: Vec<(DetTid, TimesliceStats)> = self
+            .per_thread_timeslice
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let mut timeslice_stats = TimesliceStats::default();
+        for (_, st) in &per_thread_timeslice {
+            timeslice_stats.merge(st);
+        }
+
         Ok(RunSummary {
             sched_turns: self.turn,
             schedevent_replayed,
@@ -2497,6 +2600,8 @@ impl Scheduler {
             virttime_elapsed: 0, // Cannot fill.
             virttime_final: 0,   // Cannot fill.
             realtime_elapsed: None,
+            timeslice_stats,
+            per_thread_timeslice,
         })
     }
 
@@ -2645,6 +2750,30 @@ mod test {
     }
 
     #[test]
+    fn post_fork_modes_are_selectable_and_random_is_seed_deterministic() {
+        let config = Config {
+            sched_seed: Some(1234),
+            ..Default::default()
+        };
+        let mut fixed = Scheduler::new(&config);
+        assert!(fixed.child_runs_first_post_fork(RunsPostFork::Child));
+        assert!(!fixed.child_runs_first_post_fork(RunsPostFork::Parent));
+
+        let mut first = Scheduler::new(&config);
+        let mut second = Scheduler::new(&config);
+        let first_sequence = (0..64)
+            .map(|_| first.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+        let second_sequence = (0..64)
+            .map(|_| second.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_sequence, second_sequence);
+        assert!(first_sequence.contains(&true));
+        assert!(first_sequence.contains(&false));
+    }
+
+    #[test]
     fn failed_vfork_is_requeued_before_pending_gate() {
         let cfg = Config {
             recordreplay_modes: true,
@@ -2711,7 +2840,7 @@ mod test {
         sched.runqueue_push_back(child);
         assert_eq!(sched.run_queue.tentative_pop_next(), Some(child));
 
-        sched.step6_finish_turn(child, false);
+        sched.step6_finish_turn(child, false, false);
         sched.runqueue_push_back(peer);
 
         assert!(!sched.run_queue.contains_tid(child));
@@ -2786,7 +2915,7 @@ mod test {
 
         sched.runqueue_push_back(parent);
         assert_eq!(sched.run_queue.tentative_pop_next(), Some(parent));
-        sched.step6_finish_turn(parent, true);
+        sched.step6_finish_turn(parent, true, false);
         assert_eq!(sched.get_priority(parent), FIRST_PRIORITY);
         assert!(!sched.vfork_parent_priority_restore.contains_key(&parent));
 

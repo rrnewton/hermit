@@ -22,9 +22,10 @@ use std::time::Instant;
 static HERMIT_RECORD_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Vec<Workload>> = OnceLock::new();
 
-const BASELINE_RECORD_WORKLOADS: [&str; 9] = [
+const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
     "c_getpid",
     "c_ioctl_fioclex",
+    "c_ioctl_siocethtool",
     "c_recvmsg_scm_rights_mmap",
     "c_ppoll_readv",
     "c_uname",
@@ -197,7 +198,9 @@ fn workloads() -> &'static [Workload] {
 
         let c_sources = [
             ("c_getpid", "getpid.c"),
+            ("c_getsockopt_null", "getsockopt_null.c"),
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
+            ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -599,6 +602,7 @@ macro_rules! record_replay_tests {
 }
 
 record_replay_tests! {
+    record_c_getsockopt_null => "c_getsockopt_null",
     record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",

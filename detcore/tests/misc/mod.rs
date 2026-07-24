@@ -62,12 +62,235 @@ fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
     F: Fn(),
 {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
+}
+
+fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
+where
+    F: Fn(),
+{
     let config = detcore::Config {
         preemption_timeout: None,
         sequentialize_threads: true,
+        runs_post_fork,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
+#[test]
+fn waitid_polls_until_child_exit_and_supports_wnohang() {
+    det_test_fn_sequential_without_pmu(|| {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork should succeed");
+        if child == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0_u8;
+                let read = libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::close(pipe[0]);
+                libc::_exit(if read == 1 { 42 } else { 1 });
+            }
+        }
+
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        usage.ru_maxrss = 123;
+        unsafe {
+            libc::close(pipe[0]);
+        }
+
+        let mut invalid_options_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_waitid,
+                    libc::P_PID,
+                    child,
+                    &mut invalid_options_info,
+                    0,
+                    std::ptr::null_mut::<libc::rusage>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        let mut pgrp_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_waitid,
+                    libc::P_PGID,
+                    0,
+                    &mut pgrp_info,
+                    libc::WEXITED | libc::WNOHANG,
+                    std::ptr::null_mut::<libc::rusage>(),
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { pgrp_info.si_pid() }, 0);
+
+        let pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, child, libc::O_NONBLOCK) } as libc::c_int;
+        assert!(pidfd >= 0, "pidfd_open with O_NONBLOCK should succeed");
+        let mut pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let pidfd_wait = unsafe {
+            libc::syscall(
+                libc::SYS_waitid,
+                libc::P_PIDFD,
+                pidfd,
+                &mut pidfd_info,
+                libc::WEXITED,
+                std::ptr::null_mut::<libc::rusage>(),
+            )
+        };
+        assert_eq!(pidfd_wait, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert_eq!(unsafe { libc::close(pidfd) }, 0);
+
+        let blocking_pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
+        assert!(blocking_pidfd >= 0, "blocking pidfd_open should succeed");
+        let mut blocking_pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_waitid,
+                    libc::P_PIDFD,
+                    blocking_pidfd,
+                    &mut blocking_pidfd_info,
+                    libc::WEXITED,
+                    std::ptr::null_mut::<libc::rusage>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(unsafe { libc::close(blocking_pidfd) }, 0);
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_waitid,
+                    libc::P_PID,
+                    child,
+                    std::ptr::null_mut::<libc::siginfo_t>(),
+                    libc::WEXITED | libc::WNOHANG,
+                    std::ptr::null_mut::<libc::rusage>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let no_event = unsafe {
+            libc::syscall(
+                libc::SYS_waitid,
+                libc::P_PID,
+                child,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+                &mut usage,
+            )
+        };
+        assert_eq!(no_event, 0);
+        assert_eq!(unsafe { info.si_pid() }, 0);
+        assert_eq!(usage.ru_maxrss, 123);
+
+        let byte = 1_u8;
+        assert_eq!(
+            unsafe { libc::write(pipe[1], (&byte as *const u8).cast(), 1) },
+            1
+        );
+        unsafe {
+            libc::close(pipe[1]);
+        }
+
+        let waited = unsafe {
+            libc::syscall(
+                libc::SYS_waitid,
+                libc::P_PID,
+                child,
+                &mut info,
+                libc::WEXITED,
+                &mut usage,
+            )
+        };
+        assert_eq!(waited, 0);
+        assert_eq!(unsafe { info.si_pid() }, child);
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        assert_eq!(unsafe { info.si_status() }, 42);
+        assert_eq!(unsafe { info.si_utime() }, 0);
+        assert_eq!(unsafe { info.si_stime() }, 0);
+        assert_eq!(usage.ru_utime.tv_sec, 0);
+        assert_eq!(usage.ru_utime.tv_usec, 0);
+        assert_eq!(usage.ru_stime.tv_sec, 0);
+        assert_eq!(usage.ru_stime.tv_usec, 0);
+        assert_eq!(usage.ru_maxrss, 0);
+    });
+}
+
+#[test]
+fn ordinary_clone_child_starts_before_parent_resumes() {
+    det_test_fn_sequential_without_pmu(|| {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let child_started = Arc::new(AtomicBool::new(false));
+        let child_flag = Arc::clone(&child_started);
+
+        let child = std::thread::spawn(move || {
+            child_flag.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            child_started.load(Ordering::SeqCst),
+            "an ordinary clone child must receive its startup turn before the parent resumes"
+        );
+
+        child.join().expect("child thread should exit cleanly");
+    });
+}
+
+#[test]
+fn ordinary_clone_parent_mode_can_resume_before_child() {
+    det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Parent, || {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let child_started = Arc::new(AtomicBool::new(false));
+        let child_flag = Arc::clone(&child_started);
+
+        let child = std::thread::spawn(move || {
+            child_flag.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            !child_started.load(Ordering::SeqCst),
+            "parent mode must permit the parent to resume before child startup"
+        );
+
+        child.join().expect("child thread should exit cleanly");
+    });
 }
 
 #[test]

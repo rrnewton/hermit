@@ -280,15 +280,12 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             Expectation::Pass,
             false,
         ),
-        // `git --version` (the Meta git wrapper) is futex- and clone3-heavy. It
-        // previously timed out because private `FUTEX_WAIT_BITSET` waits with an
-        // absolute deadline were misclassified as relative, advancing virtual
-        // time by roughly a full epoch. With that classification fixed it now
-        // runs deterministically to completion, so it is a passing case.
+        // Use the distro binary rather than Meta's instrumented /usr/local
+        // build, which starts telemetry polling threads even for --version.
         case(
             "threaded",
             "git",
-            &["/usr/local/bin/git"],
+            &["/usr/bin/git"],
             &["--version"],
             Some("git version"),
             Expectation::Pass,

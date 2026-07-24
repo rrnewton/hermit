@@ -23,12 +23,14 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
+use std::task::Poll;
 use std::time::SystemTime;
 
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::summary::RunSummary;
+use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -72,8 +74,23 @@ use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::scheduler::sched_loop;
+use crate::scheduler::sched_loop_external;
 use crate::tool_local::Detcore;
 use crate::types::*;
+
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|context| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
 
 #[derive(Debug)]
 struct InodePool {
@@ -219,6 +236,53 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
+        let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
+        let handle = if cfg.sequentialize_threads && spawn_scheduler {
+            Some(tokio::spawn(sched_loop(sched.clone(), global_time.clone())))
+        } else {
+            None
+        };
+
+        let preemptions_to_replay: Option<PreemptionReader> = cfg
+            .replay_preemptions_from
+            .as_ref()
+            .map(|path| PreemptionReader::new(path));
+        let range = Self::read_port_range();
+
+        Self {
+            sched,
+            next_port: AtomicU16::new(range[0]),
+            used_ports: Mutex::new(HashSet::new()),
+            port_start_range: AtomicU16::new(range[0]),
+            port_end_range: AtomicU16::new(range[1]),
+            open_file_to_port: Mutex::new(HashMap::new()),
+            past_first_execve: AtomicBool::new(false),
+            inodes: Arc::new(Mutex::new(InodePool::new())),
+            sched_handle: handle,
+            cfg: cfg.clone(),
+            realtime_start: SystemTime::now(),
+            global_time,
+            preemptions_to_replay,
+        }
+    }
+
+    /// Initializes global state whose sequential scheduler is driven by an
+    /// external backend executor.
+    pub fn init_for_external_scheduler(cfg: &Config) -> Self {
+        assert!(
+            cfg.sequentialize_threads,
+            "an external scheduler is only meaningful when threads are sequentialized"
+        );
+        Self::initialize(cfg, false)
+    }
+
+    /// Runs the sequential scheduler on a backend-owned executor.
+    pub async fn run_external_scheduler(&self, observer: Arc<dyn Fn(&'static str) + Send + Sync>) {
+        sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
+    }
+
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
     /// possible.
     pub fn force_shutdown_with_error(&self) {
@@ -350,36 +414,7 @@ impl GlobalTool for GlobalState {
 
     /// Called once during startup.
     async fn init_global_state(cfg: &Config) -> GlobalState {
-        let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
-        let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
-        let handle = if cfg.sequentialize_threads {
-            Some(tokio::spawn(sched_loop(sched.clone(), global_time.clone())))
-        } else {
-            None
-        };
-
-        let preemptions_to_replay: Option<PreemptionReader> = cfg
-            .replay_preemptions_from
-            .as_ref()
-            .map(|path| PreemptionReader::new(path));
-
-        let range = GlobalState::read_port_range();
-
-        GlobalState {
-            sched,
-            next_port: AtomicU16::new(range[0]),
-            used_ports: Mutex::new(HashSet::new()),
-            port_start_range: AtomicU16::new(range[0]),
-            port_end_range: AtomicU16::new(range[1]),
-            open_file_to_port: Mutex::new(HashMap::new()),
-            past_first_execve: AtomicBool::new(false),
-            inodes: Arc::new(Mutex::new(InodePool::new())),
-            sched_handle: handle,
-            cfg: cfg.clone(),
-            realtime_start: SystemTime::now(),
-            global_time,
-            preemptions_to_replay,
-        }
+        GlobalState::initialize(cfg, true)
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
@@ -411,6 +446,10 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
+            }
+            GlobalRequest::MarkPastFirstExecve => {
+                self.past_first_execve.store(true, SeqCst);
+                R::MarkPastFirstExecve(())
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
@@ -457,8 +496,11 @@ impl GlobalTool for GlobalState {
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid, mm) => {
-                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid, mm).await)
+            GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats) => {
+                R::DeregisterThread(
+                    self.recv_deregister_thread(from, dettid, detpid, mm, timeslice_stats)
+                        .await,
+                )
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -743,10 +785,19 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
-            let pos = sched.runqueue_push_back(child_dettid);
+            let child_first = self.cfg.sequentialize_threads
+                && !parent_is_kernel_blocked
+                && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
+            let pos = if child_first {
+                sched.runqueue_push_front(child_dettid)
+            } else {
+                sched.runqueue_push_back(child_dettid)
+            };
             debug!(
-                "[detcore] CreateChildThread with dtid {}: Added child to back of queue, position {}.",
-                child_dettid, pos,
+                "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
+                child_dettid,
+                if child_first { "front" } else { "back" },
+                pos,
             );
             // The vfork child has now registered itself in the run queue. Release
             // the scheduler's wait on this parent so the child (higher priority)
@@ -756,7 +807,8 @@ impl GlobalState {
             }
             sched.started_up.try_put(());
         }
-        // Parent thread yields so child can run (if it is higher priority).
+        // The child queue position above determines which equal-priority side
+        // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
         // queue, so it must not issue a ParentContinue request here.
         if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
@@ -785,7 +837,7 @@ impl GlobalState {
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
-            tokio::task::yield_now().await;
+            yield_once().await;
             let mut sched = self.sched.lock().unwrap();
             // The resources that must be held for the fresh thread to run:
             let rsrcs = {
@@ -866,13 +918,20 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
+    async fn recv_deregister_thread(
+        &self,
+        _from: Tid,
+        dettid: DetTid,
+        detpid: DetPid,
+        mm: MmId,
+        timeslice_stats: TimesliceStats,
+    ) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
-        self.sched
-            .lock()
-            .unwrap()
-            .logically_kill_thread(&dettid, &detpid, mm);
+        let mut sched = self.sched.lock().unwrap();
+        sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched.logically_kill_thread(&dettid, &detpid, mm);
+        drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -1133,6 +1192,9 @@ pub enum GlobalRequest {
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
 
+    /// Mark the initial image transition complete for backends that begin post-exec.
+    MarkPastFirstExecve,
+
     /// The parent is adding a child-thread to the round-robin pool.  Contains the dettid
     /// of the new child and it's starting scheduler priority IF it is available to the caller.
     /// The only scenario where the Priority will be missing is when we're replaying preemptions.
@@ -1151,8 +1213,9 @@ pub enum GlobalRequest {
     StartNewThread(DetTid, DetPid),
 
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
-    /// further turns.
-    DeregisterThread(DetTid, DetPid, MmId),
+    /// further turns. Carries the exiting thread's completed-timeslice distribution
+    /// so the scheduler can aggregate it into the final run report.
+    DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1196,6 +1259,7 @@ pub enum GlobalResponse {
     RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
+    MarkPastFirstExecve(()),
     CreateChildThread(()),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
@@ -1215,6 +1279,15 @@ pub enum GlobalResponse {
     AddUsedPort,
     ReleasePort(Option<u16>),
     PortFull,
+}
+
+pub async fn mark_past_first_execve<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve).await;
+    assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -1446,6 +1519,7 @@ pub async fn deregister_thread<R>(
     reverie: &R,
     detpid: DetPid,
     mm: MmId,
+    timeslice_stats: TimesliceStats,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1455,7 +1529,7 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm),
+                GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!

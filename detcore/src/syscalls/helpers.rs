@@ -59,16 +59,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // which is unsafe for a pipe whose reader and writer are interdependent -- doing
         // so is the root cause of the record/replay pipe deadlock. The remaining callers
         // (external poll, wait4) are external by construction (their fd is not a single
-        // extractable internal pipe). Guard the invariant in debug builds.
+        // extractable internal pipe). Guard the invariant in debug builds while the
+        // deterministic scheduler is active. With thread sequentialization disabled,
+        // resource requests are no-ops and internal pipes intentionally use a blocking
+        // host syscall, as documented by this method.
         debug_assert!(
-            !syscall_targets_internal_fd(guest, call),
+            !self.cfg.sequentialize_threads || !syscall_targets_internal_fd(guest, call),
             "record_or_replay_blocking (BlockingExternalIO) reached for an internal pipe fd \
              on syscall {}; internal fds must use the InternalIOPolling path",
             call.name()
         );
         {
             let mut rsrcs = Resources::new(dettid);
-            // Only truly EXTERNAL endpoints (host fds / network sockets) reach here.
+            // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
+            // Without it, resource_request is a no-op and internal fds may block directly.
             rsrcs.insert(ResourceID::BlockingExternalIO(op_id), Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
@@ -423,6 +427,29 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Poll {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Ppoll {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        let (tp, guard) = zero_timespec(guest).await;
+        // SAFETY: `tp` points to exclusively owned scratch storage kept alive by `guard`.
+        let tp = unsafe { tp.into_mut() };
+        (self.with_timeout(Some(tp)), Some(guard))
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Ppoll {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
         Ok(0)
     }
@@ -857,9 +884,9 @@ where
     }
 }
 
-async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
+pub(crate) async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
 where
-    C: NonblockableSyscall,
+    C: SyscallInfo,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
@@ -954,6 +981,10 @@ mod tests {
     fn signal_interruption_errno_matches_linux_restart_policy() {
         assert_eq!(
             reverie::syscalls::Poll::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::Ppoll::new().signal_interrupt_errno(),
             Errno::EINTR
         );
         assert_eq!(
