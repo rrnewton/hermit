@@ -29,7 +29,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest-observable compatibility state; they are not a sandbox boundary
     /// and do not ask the host kernel to enforce the virtual limit.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#532)
+    // TODO-HUMAN-REVIEW(#534)
     pub async fn handle_prlimit64<G: Guest<Self>>(
         &self,
         guest: &mut G,
