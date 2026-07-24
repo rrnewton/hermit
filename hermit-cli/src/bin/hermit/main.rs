@@ -144,7 +144,8 @@ enum Subcommand {
 
 impl Subcommand {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        if global.backend == Some(hermit::Backend::Sabre) && !matches!(self, Subcommand::Strace(_))
+        if global.backend == Some(hermit::Backend::Sabre)
+            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
         {
             anyhow::bail!(
                 "the SaBRe backend is available only through `hermit --backend sabre strace`"
