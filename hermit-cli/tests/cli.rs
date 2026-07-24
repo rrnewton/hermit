@@ -275,15 +275,10 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
 }
 
 #[test]
-fn run_fails_closed_for_unintegrated_backends() {
-    // DBI has no Hermit dispatch, so it must fail closed at the availability
-    // probe. KVM is covered separately by run_kvm_executes_dynamic_guest.
-    let output = hermit(&["run", "--backend", "dbi", "--", "/bin/true"]);
-    assert_failure_contains(&output, &["backend `dbi` is unavailable"]);
-    assert!(
-        !stderr(&output).contains("Hermit cannot use ptrace"),
-        "dbi should fail before ptrace capability probing"
-    );
+fn run_dbi_executes_integrated_backend() {
+    let args = ["run", "--backend", "dbi", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
 }
 
 #[test]
@@ -652,11 +647,11 @@ fn namespace_only_rejects_every_explicit_backend() {
 #[test]
 fn backend_accepted_in_global_position() {
     // The global-position `--backend` (before the subcommand) must be threaded
-    // through to `run`. Probe with the unintegrated DBI backend so the value's
-    // effect is observable without depending on ptrace capabilities being
-    // available.
-    let dbi = hermit(&["--backend", "dbi", "run", "--", "/bin/true"]);
-    assert_failure_contains(&dbi, &["backend `dbi` is unavailable"]);
+    // through to `run` and reach the integrated DBI backend.
+    let dbi_args = ["--backend", "dbi", "run", "--", "/bin/true"];
+    let dbi = hermit(&dbi_args);
+
+    assert_success(&dbi, &dbi_args);
 
     if Path::new("/dev/kvm").exists() {
         let args = ["--backend", "kvm", "run", "--", "/bin/true"];

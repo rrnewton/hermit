@@ -7,12 +7,16 @@ edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1.0.103"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
+detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
 diff = "0.1.13"
 dirs = "6.0"
 edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
@@ -27,10 +31,10 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6a334a13bac006040fdc3de47523119ec1b2a698" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6a334a13bac006040fdc3de47523119ec1b2a698" }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6a334a13bac006040fdc3de47523119ec1b2a698" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "6a334a13bac006040fdc3de47523119ec1b2a698" }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "bf5427d05e7dac135c132b25e7ff770cbb6dbc8f" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "bf5427d05e7dac135c132b25e7ff770cbb6dbc8f", default-features = false }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "bf5427d05e7dac135c132b25e7ff770cbb6dbc8f" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "bf5427d05e7dac135c132b25e7ff770cbb6dbc8f" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

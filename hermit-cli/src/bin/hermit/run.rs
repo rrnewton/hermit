@@ -915,7 +915,14 @@ impl RunOpts {
         // and returns an accurate, program-specific error.
         match backend {
             Backend::Ptrace | Backend::Kvm => {}
-            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Dbi => {
+                return super::backends::run_dbi(
+                    &self.program,
+                    &self.args,
+                    self.verify,
+                    global.log,
+                );
+            }
         }
 
         if self.no_namespace {

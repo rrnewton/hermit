@@ -12,8 +12,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use chrono::DateTime;
-use chrono::Local;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
@@ -75,7 +73,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ret = self.record_or_replay(guest, call).await?;
         if let Some(buf) = call.buf() {
             let mut un = guest.memory().read_value(buf)?;
-            let epoch: DateTime<Local> = guest.config().epoch.into();
+            // Keep this in configured UTC: `Local` initializes libc TLS, which is unavailable
+            // while a DynamoRIO application thread is executing a client callback.
+            let epoch = guest.config().epoch;
 
             if !guest.config().has_uts_namespace {
                 // FIXME: It should be possible to remove this once all tests

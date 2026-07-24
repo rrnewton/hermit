@@ -5,6 +5,7 @@ members = [
   "common/test-allocator",
   "detcore",
   "detcore-model",
+  "detcore-dbi",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
