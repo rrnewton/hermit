@@ -573,6 +573,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::fork,
                 Sysno::vfork,
                 Sysno::wait4,
+                Sysno::waitid,
                 Sysno::setsid,
                 Sysno::uname,
                 Sysno::exit_group,
@@ -613,6 +614,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
                 Sysno::poll,
+                Sysno::ppoll,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -1142,6 +1144,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // child registers itself and runs to exec/exit.
             Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
+            Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
             Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
             Syscall::Gettimeofday(s) if virtualize_time => self.handle_gettimeofday(guest, s).await,
@@ -1204,6 +1207,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
             Syscall::Poll(s) => self.handle_poll(guest, s).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
             Syscall::EpollCreate(s) => {
                 self.handle_epoll_create1(guest, EpollCreate1::from(s))
                     .await
@@ -1428,7 +1433,7 @@ mod subscription_tests {
                 .any(|sysno| sysno == Sysno::clock_gettime)
         );
         assert!(
-            !subscriptions
+            subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::ppoll)
         );
