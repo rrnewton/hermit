@@ -281,6 +281,41 @@ fn run_dbi_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW: verify host-coreutils coverage is suitable for this CI gate.
+#[test]
+fn run_dbi_executes_guests_with_dynamic_mmaps() {
+    let cases: [(&str, &[u8], &str); 2] = [
+        ("/usr/bin/sort", b"3\n1\n2\n", "1\n2\n3\n"),
+        (
+            "/usr/bin/md5sum",
+            b"hello\n",
+            "b1946ac92492d2347c6235b4d2611184  -\n",
+        ),
+    ];
+
+    for (program, input, expected) in cases {
+        let args = [
+            "run",
+            "--backend",
+            "dbi",
+            "--strict",
+            "--verify",
+            "--",
+            program,
+        ];
+        let output = hermit_with_stdin(&args, input);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected);
+        assert!(
+            stderr(&output)
+                .contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
+            "DBI confirmation missing for {program}:\n{}",
+            stderr(&output),
+        );
+    }
+}
+
 #[test]
 fn run_kvm_executes_dynamic_guest() {
     if !Path::new("/dev/kvm").exists() {
