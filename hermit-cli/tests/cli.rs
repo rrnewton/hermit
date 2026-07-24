@@ -392,7 +392,7 @@ fn run_dbi_verifies_shell_process_lifecycle() {
         "--",
         "/bin/sh",
         "-c",
-        "/bin/echo hello",
+        "/bin/echo hello; :",
     ];
     let output = hermit(&args);
 
