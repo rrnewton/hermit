@@ -347,3 +347,16 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         "Hermit exited 0 without its determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
+fn python_getrandom_is_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let case = StrictCommandCase {
+        name: "python3 getrandom",
+        candidates: &["/usr/bin/python3"],
+        args: &["-c", "import os; print(os.urandom(16).hex())"],
+        stdin: None,
+    };
+    assert_l2_under_strict_verify(&case);
+}
