@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_SIGNAL_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -91,6 +92,32 @@ fn dbi_wait_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_signal_thread_guest() -> &'static Path {
+    DBI_SIGNAL_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-signal-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBI signal/thread guest directory");
+        let guest = build_root.join("dbi_signal_thread_lifecycle");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-pthread", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_signal_thread_lifecycle.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI signal/thread guest");
+        assert!(
+            output.status.success(),
+            "DBI signal/thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -373,6 +400,46 @@ fn run_dbi_verifies_process_wait_lifecycle() {
     assert_eq!(
         stdout(&output),
         "wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n"
+    );
+    assert!(
+        stderr(&output).contains("signals=2"),
+        "DBI signal-hook evidence missing:\n{}",
+        stderr(&output),
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-pending)
+#[test]
+fn run_dbi_verifies_signal_and_thread_lifecycle() {
+    let program = dbi_signal_thread_guest()
+        .to_str()
+        .expect("DBI signal/thread guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "dbi-signal-thread-ok usr1=1 usr2=1 usr2_child=0\n"
+    );
+    assert!(
+        stderr(&output).contains("signals=2"),
+        "DBI signal-hook evidence missing:\n{}",
+        stderr(&output),
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),

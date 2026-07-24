@@ -25,6 +25,7 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
@@ -42,16 +43,20 @@ use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::trace_schedevent;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::SchedEvent;
+use crate::types::SyscallPhase;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
@@ -311,6 +316,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         Ok(child_dettid.as_raw() as i64)
+    }
+
+    /// Registers a thread clone that a backend executed through its native
+    /// syscall path after Detcore suspended in [`Guest::inject`].
+    pub async fn register_external_thread_clone<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        flags: CloneFlags,
+        ctid: usize,
+        raw_result: i64,
+    ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-pending)
+        assert!(flags.contains(CloneFlags::CLONE_THREAD));
+        assert!(!flags.contains(CloneFlags::CLONE_VFORK));
+        let parent_dettid = guest.thread_state().dettid;
+        assert_eq!(guest.thread_state().clone_flags, Some(flags));
+        guest.thread_state_mut().clone_flags = None;
+
+        match Errno::from_ret(raw_result as usize) {
+            Ok(child_tid) => {
+                let child_dettid = DetTid::from_raw(child_tid as i32);
+                create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+                let parent_pedigree = &mut guest.thread_state_mut().pedigree;
+                let child_pedigree = parent_pedigree.fork_mut();
+                debug!(
+                    "[dtid {}] completed native thread clone (tid {}, pedigree {}); parent pedigree becomes {}",
+                    parent_dettid, child_dettid, child_pedigree, parent_pedigree,
+                );
+                Ok(child_dettid.as_raw() as i64)
+            }
+            Err(errno) => Err(Error::Errno(errno)),
+        }
+    }
+
+    /// Clears parent-side clone state when a native child exited before the
+    /// backend could admit it to Detcore. Such a child executed no application
+    /// instructions and therefore never owned scheduler state to deregister.
+    pub fn discard_external_thread_clone<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        flags: CloneFlags,
+        raw_result: i64,
+    ) -> Result<i64, Error> {
+        assert!(flags.contains(CloneFlags::CLONE_THREAD));
+        assert_eq!(guest.thread_state().clone_flags, Some(flags));
+        guest.thread_state_mut().clone_flags = None;
+        match Errno::from_ret(raw_result as usize) {
+            Ok(child_tid) => Ok(child_tid as i64),
+            Err(errno) => Err(Error::Errno(errno)),
+        }
+    }
+
+    /// Completes the Detcore syscall envelope after a backend publishes the
+    /// externally cloned child state. Publication must happen before this call
+    /// because the posthook may schedule the child immediately.
+    pub async fn finish_external_thread_clone<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+    ) -> Result<(), Error> {
+        let parent_dettid = guest.thread_state().dettid;
+        self.detlog_memory_maps(guest)?;
+        if guest.config().sequentialize_threads && self.cfg.should_trace_schedevent() {
+            trace_schedevent(
+                guest,
+                with_guest_time(
+                    guest,
+                    SchedEvent::syscall(parent_dettid, sysno, SyscallPhase::Posthook),
+                ),
+                true,
+            )
+            .await;
+        }
+        self.post_handler_hook(guest).await;
+        self.canonicalize_syscall_clobbers(guest).await;
+        Ok(())
     }
 
     /// Exit system call

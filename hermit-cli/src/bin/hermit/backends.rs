@@ -33,6 +33,7 @@ struct DbiSummary {
     branches: u64,
     syscalls: u64,
     rewritten: u64,
+    signals: u64,
     stdin_reads: u64,
     memory_hash: String,
 }
@@ -225,6 +226,9 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     let rewritten = field("rewritten=")?
         .parse::<u64>()
         .map_err(|_| Error::msg("DBI verification failed: invalid rewritten count"))?;
+    let signals = field("signals=")?
+        .parse::<u64>()
+        .map_err(|_| Error::msg("DBI verification failed: invalid signal count"))?;
     let stdin_reads = field("stdin_reads=")?
         .parse::<u64>()
         .map_err(|_| Error::msg("DBI verification failed: invalid stdin read count"))?;
@@ -244,6 +248,7 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
         branches,
         syscalls,
         rewritten,
+        signals,
         stdin_reads,
         memory_hash: hash.to_owned(),
     })

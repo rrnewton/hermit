@@ -16,7 +16,6 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
-use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Timespec;
 use tracing::info;
@@ -36,7 +35,15 @@ use crate::types::LogicalTime;
 // NB: note kernel has different notation of sigaction, we cannot
 // use libc's sigaction here unfortunately. See:
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
-const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
+const KERNEL_SIGACTION_WORDS: usize = 4;
+const SA_MASK_INDEX: usize = KERNEL_SIGACTION_WORDS - 1;
+const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-pending)
+fn clear_reserved_signal(mask: u64) -> u64 {
+    mask & !(1_u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1))
+}
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// We send the alarms to the global scheduler to handle.
@@ -96,13 +103,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(0);
         }
         Ok(if let Some(action) = call.action() {
-            let mut memory = guest.memory();
-            let sa_mask: AddrMut<libc::sigset_t> =
-                AddrMut::from_raw(SA_MASK_OFFET + action.as_raw()).unwrap();
-            let mut mask = memory.read_value(sa_mask)?;
-            unsafe { libc::sigdelset(&mut mask as *mut _, reverie::PERF_EVENT_SIGNAL as i32) };
-            memory.write_value(sa_mask, &mask)?;
-            guest.inject(call).await?
+            if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+                return Ok(guest.inject(call).await?);
+            }
+            let memory = guest.memory();
+            let mut stack = guest.stack().await;
+            let mut kernel_action: [u64; KERNEL_SIGACTION_WORDS] =
+                memory.read_value(action.cast())?;
+            kernel_action[SA_MASK_INDEX] = clear_reserved_signal(kernel_action[SA_MASK_INDEX]);
+            let copied_action = stack.push(kernel_action);
+            let _stack_guard = stack.commit()?;
+            let modified_call = syscalls::RtSigaction::new()
+                .with_signum(call.signum())
+                .with_action(Some(copied_action.cast()))
+                .with_old_action(call.old_action())
+                .with_sigsetsize(call.sigsetsize());
+            guest.inject(modified_call).await?
         } else {
             guest.inject(call).await?
         })
@@ -117,15 +133,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
             Ok(guest.inject(call).await?)
         } else if let Some(set) = call.set() {
+            if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+                return Ok(guest.inject(call).await?);
+            }
             let memory = guest.memory();
             let mut stack = guest.stack().await;
-            let mut set_mask = memory.read_value(set)?;
-            unsafe { libc::sigdelset(&mut set_mask as *mut _, reverie::PERF_EVENT_SIGNAL as i32) };
-            let new_set = stack.push(set_mask);
-            stack.commit()?;
+            let set_mask: u64 = memory.read_value(set.cast())?;
+            let new_set = stack.push(clear_reserved_signal(set_mask));
+            let _stack_guard = stack.commit()?;
             let modified_call = syscalls::RtSigprocmask::new()
                 .with_how(call.how())
-                .with_set(Some(new_set))
+                .with_set(Some(new_set.cast()))
                 .with_oldset(call.oldset())
                 .with_sigsetsize(call.sigsetsize());
             // Using inject (intead of tail_inject) here so that
@@ -134,6 +152,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Ok(guest.inject(call).await?)
         }
+    }
+
+    /// Sends a process-directed signal through the kernel. The backend's signal
+    /// event callback routes the selected delivery back through Detcore.
+    pub async fn handle_kill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Kill,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(call).await?)
+    }
+
+    /// Sends a thread-directed signal through the kernel before Detcore
+    /// schedules its delivery callback.
+    pub async fn handle_tgkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Tgkill,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(call).await?)
+    }
+
+    /// Handles the legacy thread-directed signal syscall.
+    pub async fn handle_tkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Tkill,
+    ) -> Result<i64, Error> {
+        Ok(guest.inject(call).await?)
     }
 
     /// rt_sigtimedwait system call
@@ -161,5 +208,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
         retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_sigset_clears_only_the_reserved_signal_bit() {
+        let full = u64::MAX;
+        let cleared = clear_reserved_signal(full);
+        let reserved = 1_u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1);
+        assert_eq!(cleared, full & !reserved);
+        assert_eq!(KERNEL_SIGSET_SIZE, 8);
     }
 }

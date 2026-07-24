@@ -1348,6 +1348,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
                 Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
                 Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
+                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
+                Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
