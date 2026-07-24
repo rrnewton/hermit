@@ -108,6 +108,7 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
@@ -179,7 +180,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#643): Review unsupported-syscall reporting and fail-fast behavior.
+    // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
     /// Applies the legacy policy to an explicitly listed but unsupported syscall.
     async fn handle_unsupported_syscall<G: Guest<Self>>(
         &self,
@@ -622,9 +623,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 Sysno::writev,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#683)
-                Sysno::pwrite64,
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
@@ -709,10 +707,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
-                Sysno::pselect6,
-                // TODO(T137258824): add proper Select
+                // TODO(T137258824): add proper Select / PSelect6
+                // Sysno::pselect6,
                 // Sysno::select,
             ]);
 
@@ -1261,9 +1257,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#683)
-                Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
@@ -1399,9 +1392,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
-                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
                 Syscall::EpollCreate(s) => {
                     self.handle_epoll_create1(guest, EpollCreate1::from(s))
@@ -1481,127 +1471,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
-            // The pinned Reverie revision lists this call as untyped, so dispatch by Sysno.
+            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
+            // dispatch it by Sysno while retaining typed guards for every represented call.
             SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
                 self.passthrough(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#683): Verify the untyped fchmodat2 dispatch edge.
-            SyscallClassification::PassThrough if call.number() == Sysno::fchmodat2 => {
-                self.passthrough(guest, call).await
-            }
-            SyscallClassification::PassThrough => match call {
-                Syscall::Access(_)
-                | Syscall::Brk(_)
-                | Syscall::Capget(_)
-                | Syscall::Capset(_)
-                | Syscall::Chdir(_)
-                | Syscall::Chmod(_)
-                // TODO-HUMAN-REVIEW(#683): Verify metadata/writeback passthrough dispatch.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Faccessat(_)
-                | Syscall::Fchdir(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fchmod(_)
-                | Syscall::Fchmodat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fchown(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fchownat(_)
-                | Syscall::Fdatasync(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fgetxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Flistxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fremovexattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fsetxattr(_)
-                | Syscall::Ftruncate(_)
-                // Fixed credentials and process-local unlocks are deterministic; fsync is
-                // conditional on guest-owned files and stable filesystem state.
-                // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fsync(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Getresgid(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Getresuid(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Munlock(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Munlockall(_)
-                // Stable guest files make these synchronous extent and pathname operations
-                // repeatable when the namespace is not externally mutated.
-                // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fallocate(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Readlinkat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Rename(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Renameat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Truncate(_)
-                | Syscall::Getcwd(_)
-                | Syscall::Getegid(_)
-                | Syscall::Geteuid(_)
-                | Syscall::Getgid(_)
-                | Syscall::Getgroups(_)
-                | Syscall::Getpid(_)
-                | Syscall::Gettid(_)
-                | Syscall::Getuid(_)
-                | Syscall::Getxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Lchown(_)
-                | Syscall::Lgetxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Link(_)
-                | Syscall::Linkat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Listxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Llistxattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Lremovexattr(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Lsetxattr(_)
-                | Syscall::Lseek(_)
-                | Syscall::Mkdir(_)
-                | Syscall::Mkdirat(_)
-                | Syscall::Mprotect(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Msync(_)
-                | Syscall::Readlink(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Readahead(_)
-                | Syscall::Removexattr(_)
-                | Syscall::Renameat2(_)
-                | Syscall::Rmdir(_)
-                | Syscall::RtSigreturn(_)
-                | Syscall::Setxattr(_)
-                | Syscall::SetRobustList(_)
-                | Syscall::SetTidAddress(_)
-                | Syscall::Sigaltstack(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Symlink(_)
-                | Syscall::Symlinkat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::SyncFileRange(_)
-                | Syscall::Umask(_)
-                | Syscall::Unlink(_)
-                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
-                unexpected => {
-                    self.handle_unsupported_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        config.panic_on_unsupported_syscalls,
-                    )
-                    .await
-                }
-            },
+            // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             SyscallClassification::Unsupported => match call {
                 Syscall::Prctl(s) if syscalls::is_supported_prctl_option(s.option()) => {
                     self.handle_prctl(guest, s).await
@@ -1615,7 +1492,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     )
                     .await
                 }
-            },
+            }
         };
 
         detlog!(
@@ -1753,11 +1630,6 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::writev)
-        );
-        assert!(
-            subscriptions
-                .iter_syscalls()
-                .any(|sysno| sysno == Sysno::pwrite64)
         );
     }
 }

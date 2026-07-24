@@ -26,7 +26,7 @@ pub(crate) enum SyscallClassification {
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
     /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
-    // TODO-HUMAN-REVIEW(#643): Review the issue-backed unsupported classification policy.
+    // TODO-HUMAN-REVIEW(PR-643): Review the issue-backed unsupported classification policy.
     Unsupported,
 }
 
@@ -284,6 +284,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
         // Every matching classification issue recommends PASS-THRU. These remain
         // conditional on Hermit's fixed-container and stable-state assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::_sysctl
         | Sysno::afs_syscall
         | Sysno::chown
@@ -322,6 +324,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // These require a deterministic handler or further investigation. Normal mode
         // records their use for an aggregate warning and preserves legacy forwarding;
         // --panic-on-unsupported-syscalls stops at the first use.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
