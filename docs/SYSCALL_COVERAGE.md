@@ -1,20 +1,20 @@
 # Hermit Syscall Coverage
 
 This audit describes syscall coverage for normal optimized `hermit run` on
-x86_64. It is source-derived from `rrnewton/hermit` commit `6c3854f` and the
-373 syscall names in the pinned `syscalls` 0.6.18 x86_64 table. It assesses
-Detcore policy, not whether a particular host kernel implements every table
+x86_64. It is source-derived from the current tree, using audit commit
+`6c3854f` as its baseline, and the 373 syscall names in the pinned `syscalls`
+0.6.18 x86_64 table. It assesses Detcore policy, not whether a particular host kernel implements every table
 entry.
 
 The headline result is:
 
 | Disposition in a default optimized run | Count | Share |
 | --- | ---: | ---: |
-| Trapped by Reverie and dispatched through Detcore | 86 | 23.1% |
-| Allowed directly to Linux without a Detcore syscall event | 287 | 76.9% |
+| Trapped by Reverie and dispatched through Detcore | 87 | 23.3% |
+| Allowed directly to Linux without a Detcore syscall event | 286 | 76.7% |
 | Total x86_64 names in the pinned table | 373 | 100% |
 
-This is not the same as saying that 86 syscalls are fully deterministic. Some
+This is not the same as saying that 87 syscalls are fully deterministic. Some
 trapped handlers only order an injected Linux call, rewrite selected output
 fields, maintain Detcore bookkeeping, or explicitly pass the call through.
 Conversely, a direct syscall can repeat when all of its inputs and host state
@@ -68,23 +68,23 @@ time, and virtual metadata. Disabling those options reduces both handling and
 subscriptions. `--strace-only`, for example, is a compatibility diagnostic and
 not a determinism configuration.
 
-Record/replay has a separate 49-name subscription. Its union with the default
+Record/replay has a separate 49-name subscription. Its union with the optimized
 run set contains 108 names: it additionally traps `access`, `fadvise64`,
 `fchdir`, `getpeername`, `getsockname`, `getsockopt`, `ioctl`, `lseek`, `mkdir`,
 `mprotect`, `pread64`, `pwrite64`, `pwritev`, `pwritev2`, `readlink`, `sendmsg`,
-`sendto`, `setsockopt`, `settimeofday`, `unlink`, `unlinkat`, and `writev`.
+`sendto`, `setsockopt`, `settimeofday`, `unlink`, and `unlinkat`.
 Recording those calls does not expand normal run-mode determinization.
 
 ## Trapped Coverage Matrix
 
-The following rows exhaust the 86 default optimized subscriptions.
+The following rows exhaust the 87 optimized subscriptions.
 
 | Area | Syscalls | Treatment | Determinism assessment |
 | --- | --- | --- | --- |
 | Virtual time and sleeps (8) | `gettimeofday`, `time`, `clock_gettime`, `clock_getres`, `nanosleep`, `clock_nanosleep`, `alarm`, `pause` | Time queries are emulated or overwritten from logical time. Sleeps and alarms use scheduler resources when serialization is enabled. | Strong for supported clocks/flags under default settings. Unsupported `clock_nanosleep` flags and scheduler-disabled paths inject host operations. `gettimeofday` still invokes Linux before overwriting the timeval. |
 | Virtual identity/random/system data (4) | `getrandom`, `getcpu`, `uname`, `sysinfo` | PRNG bytes, CPU/node zero, normalized UTS fields, and mostly synthetic system data. | `getrandom` and `getcpu` are deterministic from configuration/seed. `uname` retains some kernel-provided fields. `sysinfo.free_ram` uses live resident-page data, so the structure is not fully virtual. |
 | File metadata and directory order (7) | `stat`, `lstat`, `fstat`, `newfstatat`, `statx`, `getdents`, `getdents64` | Linux resolves the object; Detcore replaces inode/timestamps and sorts directory entries. | Partial. Object existence, permissions, type, size, contents, and I/O errors remain filesystem inputs. `fstat` has a source FIXME noting incomplete normalization. |
-| File, memory, and descriptor state (18) | `open`, `openat`, `creat`, `close`, `read`, `write`, `mmap`, `munmap`, `mremap`, `fcntl`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `utime`, `utimes`, `utimensat` | Operations are injected with path/FD resource ordering and bookkeeping; random-device reads are emulated; deterministic I/O retries short reads/writes. | Partial. Stable regular files are conditionally repeatable. File contents/errors remain inputs, memory mapping is explicitly incomplete, and most `fcntl` commands are passthrough. Deterministic I/O controls transfer length, not external data. |
+| File, memory, and descriptor state (19) | `open`, `openat`, `creat`, `close`, `read`, `write`, `writev`, `mmap`, `munmap`, `mremap`, `fcntl`, `dup`, `dup2`, `dup3`, `pipe`, `pipe2`, `utime`, `utimes`, `utimensat` | Operations are injected with path/FD resource ordering and bookkeeping; random-device reads are emulated; scalar deterministic I/O retries short reads/writes; writev retains an immutable vector snapshot for atomic pipe retries and advances larger blocking-pipe remainders in order. | Partial. Stable regular files are conditionally repeatable. File contents/errors remain inputs, memory mapping is explicitly incomplete, and most `fcntl` commands are passthrough. Deterministic I/O controls transfer length, not external data. |
 | Process/thread lifecycle (10) | `clone`, `clone3`, `fork`, `vfork`, `execve`, `execveat`, `exit`, `exit_group`, `wait4`, `setsid` | Detcore registers children, orders exit/wait, updates FD state across exec, and injects lifecycle calls. | Partial. PID/TID values are not virtualized. `vfork` is implemented as `fork`; `CLONE_VFORK` is unsupported. Executable/filesystem errors remain external. |
 | Synchronization and CPU policy (4) | `futex`, `sched_yield`, `sched_getaffinity`, `sched_setaffinity` | Supported futex WAIT/WAKE and BITSET operations are modeled; yield is a scheduler turn; affinity is virtualized to CPU 0. | Strong only for supported futex operations under the precise default mode. Other futex commands panic; scheduler-disabled and alternate debug modes inject or poll Linux. |
 | Signal API (5) | `rt_sigaction`, `rt_sigprocmask`, `rt_sigtimedwait`, `signalfd`, `signalfd4` | Protects Reverie's reserved signal, deterministically polls timed waits, and tracks signal FDs. | Partial. The kernel still owns masks/actions and signal-FD contents; signal sources and untrapped signal syscalls can remain external. |
@@ -111,11 +111,11 @@ or when another sub-tool adds a subscription. In an optimized normal run,
 ## Direct Passthrough Matrix
 
 Every name below bypasses Detcore in a default optimized run. The classification
-is conservative and exhaustive: the four classes contain 287 unique names.
+is conservative and exhaustive: the four classes contain 286 unique names.
 
 | Class | Count | Meaning |
 | --- | ---: | --- |
-| C: conditional | 111 | Usually repeats only when paths, files, descriptors, credentials, limits, address layout, and concurrent mutation are fixed. Hermit does not enforce those preconditions for the call. |
+| C: conditional | 110 | Usually repeats only when paths, files, descriptors, credentials, limits, address layout, and concurrent mutation are fixed. Hermit does not enforce those preconditions for the call. |
 | N: nondeterministic/model-breaking | 137 | Commonly exposes time, IDs, scheduling, readiness, mutable kernel state, host topology, or external input; may block outside Detcore or create/mutate objects absent from Detcore's model. |
 | P: privileged/legacy | 37 | Usually fails under the guest's namespace/capability policy or is obsolete, but errno/support still varies by host kernel and policy. |
 | S: backend-special | 2 | Direct execution is required by Reverie's restart/signal protocol; determinism depends on the surrounding trapped event path. |
@@ -138,7 +138,7 @@ pkey_free pkey_mprotect pread64 preadv preadv2 prlimit64 pwrite64 pwritev pwrite
 readlink readlinkat readv remap_file_pages removexattr rename renameat renameat2 rmdir sendfile
 set_robust_list set_tid_address setdomainname setfsgid setfsuid setgid setgroups sethostname
 setregid setresgid setresuid setreuid setrlimit setuid setxattr sigaltstack splice symlink
-symlinkat sync sync_file_range syncfs tee truncate umask unlink unlinkat vmsplice writev
+symlinkat sync sync_file_range syncfs tee truncate umask unlink unlinkat vmsplice
 ```
 
 ### N: Nondeterministic Or Model-Breaking
@@ -196,7 +196,7 @@ restart_syscall rt_sigreturn
 | P0 | Optimized subscriptions do not cover handled `recvmsg`/send-family calls. | Socket calls can block or complete according to host timing without a scheduler event; debug tests exercise different behavior. | Subscribe the implemented calls and add an optimized-build subscription test. Implement `recvmmsg` timeout semantics. |
 | P0 | Modern FD creators/mutators are untracked: `openat2`, `close_range`, `pidfd_open`, `pidfd_getfd`, `memfd_secret`, `fanotify_init`, `io_uring_setup`, and mount-FD APIs. | Detcore's FD type/flags/resource map diverges; later trapped `read`, `write`, `close`, `fcntl`, or polling may fail or use the wrong model. | Trap and update FD bookkeeping, or return a documented deterministic error until modeled. |
 | P0 | `select`, `pselect6`, `ppoll`, `epoll_pwait2`, new futex calls, and `waitid` bypass blocking control. | A guest thread can block in Linux outside Detcore's timed-wait/run-queue model, causing hangs and timing-dependent wake order. | Add nonblocking retry/scheduler adapters matching `poll`, `epoll_wait`, futex, and `wait4`. |
-| P1 | Positioned/vectored and zero-copy I/O bypass deterministic I/O and resource ordering. | Common runtimes, databases, and file servers expose short-I/O, file-offset, pipe, and socket timing differences. | Cover `pread*`, `pwrite*`, `readv`, `writev`, `sendfile`, `copy_file_range`, `splice`, `tee`, and `vmsplice`, classifying the FD type. |
+| P1 | Positioned/vectored and zero-copy I/O bypass deterministic I/O and resource ordering. | Common runtimes, databases, and file servers expose short-I/O, file-offset, pipe, and socket timing differences. | Cover `pread*`, `pwrite*`, `readv`, `sendfile`, `copy_file_range`, `splice`, `tee`, and `vmsplice`, classifying the FD type. |
 | P1 | POSIX/interval timers and accounting clocks use host time. | `getitimer`, `setitimer`, POSIX timers, `times`, and `getrusage` reveal wall/CPU timing and signal races. | Back timers with logical time and scheduler events; normalize CPU accounting or reject it. |
 | P1 | PID/TID and signal-target APIs are not virtualized. | IDs vary across namespace/host conditions and feed `kill`, pidfd, `/proc`, logs, and application protocols. | Define stable virtual IDs and translate syscall arguments/results consistently. |
 | P1 | `ioctl` and `prctl` are command-dependent catch-all holes. | Individual commands expose devices, terminals, CPU features, clocks, namespace state, or alter execution policy. | Inventory commands from representative workloads; explicitly model/allowlist deterministic commands and reject or record the rest. |
@@ -253,4 +253,4 @@ The matrix was produced by comparing:
 
 Re-run the audit whenever the syscall crate, subscription list, dispatch match,
 or record/replay subscription changes. The mechanically checkable invariants
-for this snapshot are `86 + 287 = 373` and `111 + 137 + 37 + 2 = 287`.
+for this snapshot are `87 + 286 = 373` and `110 + 137 + 37 + 2 = 286`.

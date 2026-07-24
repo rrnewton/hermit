@@ -143,7 +143,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::vfork
         | Sysno::wait4
         | Sysno::waitid
-        | Sysno::write => SyscallClassification::Determinized,
+        | Sysno::write
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#547)
+        | Sysno::writev => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -431,8 +434,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ustat
         | Sysno::vhangup
         | Sysno::vmsplice
-        | Sysno::vserver
-        | Sysno::writev => SyscallClassification::Unclassified,
+        | Sysno::vserver => SyscallClassification::Unclassified,
         // ===== END UNCLASSIFIED =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
@@ -458,7 +460,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [108, 39, 226]);
+        assert_eq!(counts, [109, 39, 225]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -490,6 +492,10 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::madvise),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::writev),
             SyscallClassification::Determinized
         );
         for sysno in [
