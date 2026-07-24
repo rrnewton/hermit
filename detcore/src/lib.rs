@@ -586,6 +586,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::lseek,
                 Sysno::fadvise64,
                 Sysno::mmap,
+                Sysno::madvise,
                 Sysno::munmap,
                 Sysno::mremap,
                 Sysno::fcntl,
@@ -1170,6 +1171,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
+                Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
                 Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
@@ -1558,6 +1560,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::ppoll)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::madvise)
         );
     }
 }

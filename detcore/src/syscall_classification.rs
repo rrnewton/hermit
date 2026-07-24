@@ -86,6 +86,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::io_uring_setup
         | Sysno::ioctl
         | Sysno::lstat
+        | Sysno::madvise
         | Sysno::membarrier
         | Sysno::memfd_create
         | Sysno::mmap
@@ -294,7 +295,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
-        | Sysno::madvise
         | Sysno::mbind
         | Sysno::memfd_secret
         | Sysno::migrate_pages
@@ -458,7 +458,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [106, 39, 228]);
+        assert_eq!(counts, [107, 39, 227]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -482,6 +482,10 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::prlimit64),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::madvise),
             SyscallClassification::Determinized
         );
         for sysno in [
@@ -516,7 +520,6 @@ mod tests {
             Sysno::add_key,
             Sysno::arch_prctl,
             Sysno::keyctl,
-            Sysno::madvise,
             Sysno::prctl,
             Sysno::readlinkat,
             Sysno::request_key,

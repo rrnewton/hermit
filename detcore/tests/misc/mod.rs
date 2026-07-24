@@ -78,6 +78,154 @@ where
     detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
 }
 
+fn madvise_result(address: *mut libc::c_void, len: usize, advice: libc::c_int) -> Result<(), i32> {
+    let result = unsafe { libc::madvise(address, len, advice) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .expect("madvise failure must set errno"))
+    }
+}
+
+fn run_madvise_policy_test(passthru_opt: bool) {
+    let config = detcore::Config {
+        preemption_timeout: None,
+        passthru_opt,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        || {
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            assert!(page_size > 0, "sysconf(_SC_PAGESIZE) should succeed");
+            let page_size = page_size as usize;
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED, "anonymous mmap should succeed");
+
+            let byte = mapping.cast::<u8>();
+            unsafe {
+                byte.write(0x5a);
+            }
+
+            assert_eq!(
+                madvise_result(mapping, page_size, libc::MADV_NORMAL),
+                Ok(())
+            );
+            assert_eq!(
+                madvise_result(mapping, page_size, libc::MADV_WILLNEED),
+                Ok(())
+            );
+            assert_eq!(
+                madvise_result(unsafe { byte.add(1) }.cast(), page_size, libc::MADV_FREE),
+                Err(libc::EINVAL),
+                "ignored advice must still validate page alignment"
+            );
+            assert_eq!(madvise_result(mapping, page_size, libc::MADV_FREE), Ok(()));
+            assert_eq!(madvise_result(mapping, page_size, libc::MADV_COLD), Ok(()));
+            assert_eq!(
+                unsafe { byte.read() },
+                0x5a,
+                "ignored advice changed memory"
+            );
+
+            for advice in [
+                libc::MADV_POPULATE_READ,
+                libc::MADV_POPULATE_WRITE,
+                libc::MADV_COLLAPSE,
+            ] {
+                assert_eq!(
+                    madvise_result(mapping, page_size, advice),
+                    Err(libc::EINVAL)
+                );
+                assert_eq!(
+                    madvise_result(std::ptr::null_mut(), 0, advice),
+                    Ok(()),
+                    "known zero-length advice should succeed"
+                );
+            }
+            for advice in [libc::MADV_HWPOISON, libc::MADV_SOFT_OFFLINE] {
+                assert_eq!(madvise_result(mapping, page_size, advice), Err(libc::EPERM));
+                assert_eq!(
+                    madvise_result(std::ptr::null_mut(), 0, advice),
+                    Ok(()),
+                    "known zero-length advice should succeed"
+                );
+            }
+            assert_eq!(
+                madvise_result(
+                    unsafe { byte.add(1) }.cast(),
+                    page_size,
+                    libc::MADV_HWPOISON
+                ),
+                Err(libc::EINVAL),
+                "common validation precedes the fixed policy error"
+            );
+            assert_eq!(
+                madvise_result(std::ptr::null_mut(), 0, i32::MAX),
+                Err(libc::EINVAL),
+                "zero length must not make unknown advice valid"
+            );
+
+            assert_eq!(
+                madvise_result(mapping, page_size, libc::MADV_DONTNEED),
+                Ok(())
+            );
+            assert_eq!(unsafe { byte.read() }, 0, "MADV_DONTNEED was not forwarded");
+            assert_eq!(unsafe { libc::munmap(mapping, page_size) }, 0);
+
+            assert_eq!(
+                madvise_result(mapping, page_size, libc::MADV_FREE),
+                Err(libc::ENOMEM),
+                "ignored advice must reject an unmapped range"
+            );
+
+            let shared = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(shared, libc::MAP_FAILED, "shared mmap should succeed");
+            let shared_byte = shared.cast::<u8>();
+            unsafe { shared_byte.write(0xa5) };
+            assert_eq!(
+                madvise_result(shared, page_size, libc::MADV_FREE),
+                Ok(()),
+                "normalized reclaim advice has a fixed no-op contract"
+            );
+            assert_eq!(unsafe { shared_byte.read() }, 0xa5);
+            assert_eq!(unsafe { libc::munmap(shared, page_size) }, 0);
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+#[test]
+fn madvise_policy_is_deterministic_and_preserves_semantic_advice() {
+    run_madvise_policy_test(false);
+}
+
+#[test]
+fn passthru_opt_still_intercepts_madvise() {
+    run_madvise_policy_test(true);
+}
+
 #[test]
 fn waitid_polls_until_child_exit_and_supports_wnohang() {
     det_test_fn_sequential_without_pmu(|| {
