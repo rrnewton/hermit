@@ -647,6 +647,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// wait4 system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
+    // TODO-HUMAN-REVIEW(PR-587): Confirm wait4 rusage canonicalization boundaries.
     pub async fn handle_wait4<G: Guest<Self>>(
         &self,
         guest: &mut G,
