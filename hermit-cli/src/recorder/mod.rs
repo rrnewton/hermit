@@ -107,7 +107,6 @@ impl Tool for Recorder {
             Sysno::getdents,
             Sysno::getdents64,
             Sysno::mmap,
-            Sysno::madvise,
             //Sysno::munmap,
             Sysno::open,
             Sysno::openat,
@@ -224,7 +223,6 @@ impl Tool for Recorder {
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
-            Syscall::Madvise(_) => self.let_through(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
@@ -395,21 +393,5 @@ impl Recorder {
         self.record_event(guest, result.map(SyscallEvent::Return));
 
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn subscriptions_include_madvise() {
-        let subscriptions = <Recorder as Tool>::subscriptions(&detcore::Config::default());
-
-        assert!(
-            subscriptions
-                .iter_syscalls()
-                .any(|sysno| sysno == Sysno::madvise)
-        );
     }
 }

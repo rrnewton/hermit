@@ -101,8 +101,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
     /// Ptrace/DBI forward hints and supported advice with guest-visible semantics.
-    /// Record/replay rejects discard advice because replay replaces file mappings
-    /// with anonymous mappings. Reclaim and asynchronous VM-policy
+    /// Record/replay accepts pure hints as no-ops and rejects guest-semantic advice
+    /// because replay replaces file mappings with anonymous mappings. Reclaim and
+    /// asynchronous VM-policy
     /// advice receives fixed success without exposing host memory pressure. Resource-
     /// dependent, backing-store, and hardware-failure operations receive fixed errors.
     /// KVM accepts pure hints as no-ops and reports ENOSYS for guest-visible semantics
@@ -123,15 +124,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => Ok(0),
             };
         }
-        if self.cfg.recordreplay_modes
-            && matches!(advice, libc::MADV_DONTNEED | libc::MADV_DONTNEED_LOCKED)
-        {
-            crate::detlog!(
-                "[dtid {}] madvise discard advice {} unsupported in record/replay",
-                guest.thread_state().dettid,
-                advice,
-            );
-            return Err(Errno::ENOSYS.into());
+        if self.cfg.recordreplay_modes {
+            match action {
+                MadviseAction::ForwardHint => {
+                    crate::detlog!(
+                        "[dtid {}] madvise hint {} accepted as record/replay no-op",
+                        guest.thread_state().dettid,
+                        advice,
+                    );
+                    return Ok(0);
+                }
+                MadviseAction::ForwardSemantic => {
+                    crate::detlog!(
+                        "[dtid {}] madvise advice {} unsupported in record/replay",
+                        guest.thread_state().dettid,
+                        advice,
+                    );
+                    return Err(Errno::ENOSYS.into());
+                }
+                MadviseAction::Ignore | MadviseAction::Reject(_) | MadviseAction::Unknown => {}
+            }
         }
 
         match action {

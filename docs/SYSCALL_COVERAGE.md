@@ -28,9 +28,10 @@ explicit policy:
 
 - Normal ptrace/DBI runs forward `MADV_NORMAL`, `MADV_RANDOM`,
   `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_DONTNEED`, and supported advice
-  with guest-visible fork, dump, or guard semantics. Record/replay returns fixed
-  `ENOSYS` for `MADV_DONTNEED` and `MADV_DONTNEED_LOCKED` because replay replaces
-  file mappings with anonymous mappings and cannot reproduce their discard effects.
+  with guest-visible fork, dump, or guard semantics. Record/replay treats pure
+  hints as fixed-success no-ops and returns fixed `ENOSYS` for every guest-semantic
+  advice because replay replaces file mappings with anonymous mappings and cannot
+  reproduce their mapping-dependent effects.
 - Host-pressure-dependent reclaim, KSM, and THP controls (`MADV_FREE`, `MADV_COLD`,
   `MADV_PAGEOUT`, and related advice) return fixed success after alignment and
   overflow validation without consulting backend-specific mapping state.
