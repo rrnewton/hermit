@@ -97,6 +97,16 @@ Use `cargo fmt --all` to apply formatting. Fix warnings in code you change; do
 not add broad `allow` attributes unless the warning is intentionally inapplicable
 and the reason is documented.
 
+## Script Convention
+
+- Project scripts use rust-script as `.rs` files with the shebang
+  `#!/usr/bin/env rust-script`.
+- Prefer rust-script over Python for all new scripts.
+- Scripts are usually single files, but may be split into subdirectories when
+  useful.
+- Install rust-script with `cargo install rust-script` if it is not already
+  available.
+
 ## Workspace Map
 
 The root Cargo workspace has ten members:
