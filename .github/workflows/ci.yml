@@ -71,7 +71,10 @@ jobs:
   # TODO-HUMAN-REVIEW(#553)
   qemu-l2:
     name: QEMU strict L2 boot (optional heavyweight)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.qemu_l2 }}
+    # Self-hosted PMU runner only exists on rrnewton/hermit. On
+    # facebookexperimental/hermit (no self-hosted runner) this job must be
+    # skipped so the workflow run can still conclude successfully.
+    if: ${{ github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_dispatch' && inputs.qemu_l2 }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
     timeout-minutes: 60
 
@@ -102,12 +105,20 @@ jobs:
 
   hardware:
     name: Host-dependent tests (self-hosted)
+    # The self-hosted PMU runner only exists on rrnewton/hermit. Gate the whole
+    # job on the repository so facebookexperimental/hermit (which has no
+    # self-hosted runner) SKIPS it entirely rather than queuing forever; a
+    # skipped job does not block the workflow run's success, so GitHub-hosted CI
+    # alone can conclude successfully there.
     if: >-
       ${{
-        github.event_name == 'push' ||
+        github.repository == 'rrnewton/hermit' &&
         (
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.user.login == 'rrnewton'
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.user.login == 'rrnewton'
+          )
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
