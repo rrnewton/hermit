@@ -7,6 +7,7 @@
  */
 
 #include <curl/curl.h>
+#include <fmt/format.h>
 #include <folly/Format.h>
 #include <gtest/gtest.h>
 #include <cstdlib>
@@ -25,7 +26,7 @@ size_t writeResponseData(char* ptr, size_t size, size_t nmemb, void* buffer);
 TEST(UseConfigurableFlakyService, request) {
   auto url = getFlakyServiceURL();
   auto postFields =
-      folly::sformat("app={}&token={}", FLAKY_SERVICE_APP, FLAKY_SERVICE_TOKEN);
+      fmt::format("app={}&token={}", FLAKY_SERVICE_APP, FLAKY_SERVICE_TOKEN);
   char buffer[FLAKY_SERVICE_RESPONSE_BUFFER_SIZE];
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -48,7 +49,7 @@ TEST(UseConfigurableFlakyService, request) {
 std::string getFlakyServiceURL() {
   auto od = std::getenv("OD");
   auto tier = od != nullptr ? od : "intern";
-  return folly::sformat(
+  return fmt::format(
       "https://interngraph.{}.facebook.com/hermetic_infra/flaky_service", tier);
 }
 
