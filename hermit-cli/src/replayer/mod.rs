@@ -15,7 +15,6 @@ mod network;
 mod random;
 mod time;
 
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use reverie::Errno;
@@ -31,13 +30,19 @@ use reverie::Tool;
 use reverie::syscalls::Close;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
-use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::OFlag;
-use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
+fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
+    match crate::fd::duplicate_guest_fd(pid, fd) {
+        Ok(duplicate) => (Some(duplicate), None),
+        Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
 
 use crate::desync::DesyncError;
 use crate::event_stream::DebugEvent;
@@ -51,6 +56,15 @@ pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// Duplicates of this guest process's captured output endpoints.
+    #[serde(skip)]
+    stdout: Option<std::os::fd::OwnedFd>,
+    #[serde(skip)]
+    stderr: Option<std::os::fd::OwnedFd>,
+    #[serde(skip)]
+    stdout_error: Option<String>,
+    #[serde(skip)]
+    stderr_error: Option<String>,
 }
 
 #[reverie::tool]
@@ -58,9 +72,15 @@ impl Tool for Replayer {
     type GlobalState = detcore::GlobalState;
     type ThreadState = EventReader;
 
-    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
+        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
+            stdout,
+            stderr,
+            stdout_error,
+            stderr_error,
         }
     }
 
@@ -155,28 +175,20 @@ impl Tool for Replayer {
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(call) => {
-                let cloexec = call.flags().contains(OFlag::O_CLOEXEC);
-                if let Some(source) = self.open_fd_alias_source(guest, syscall, call.flags()) {
-                    self.handle_fd_alias_open(guest, source, cloexec).await
-                } else {
-                    self.handle_virtual_fd_create(guest, cloexec).await
-                }
+                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                    .await
             }
             Syscall::Openat(call) => {
-                let cloexec = call.flags().contains(OFlag::O_CLOEXEC);
-                if let Some(source) = self.open_fd_alias_source(guest, syscall, call.flags()) {
-                    self.handle_fd_alias_open(guest, source, cloexec).await
-                } else {
-                    self.handle_virtual_fd_create(guest, cloexec).await
-                }
+                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                    .await
             }
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
             Syscall::Dup(_) => self.handle_replayed_fd_operation(guest, syscall).await,
-            Syscall::Dup2(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
@@ -215,6 +227,8 @@ impl Tool for Replayer {
             Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
@@ -229,69 +243,6 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
-    fn open_fd_alias_source<G: Guest<Self>>(
-        &self,
-        guest: &G,
-        syscall: Syscall,
-        flags: OFlag,
-    ) -> Option<i32> {
-        let access_mode = flags.bits() & libc::O_ACCMODE;
-        let allowed_flags = libc::O_ACCMODE | libc::O_CLOEXEC;
-        if flags.bits() & !allowed_flags != 0
-            || !matches!(access_mode, libc::O_WRONLY | libc::O_RDWR)
-        {
-            return None;
-        }
-        let path = match syscall {
-            Syscall::Open(call) => call.path().map(|path| path.read(&guest.memory())),
-            Syscall::Openat(call) => call.path().map(|path| path.read(&guest.memory())),
-            _ => return None,
-        };
-        let Some(Ok(path)) = path else {
-            return None;
-        };
-        let path = path.as_os_str().as_bytes();
-        match path {
-            b"/dev/stdout" => return Some(libc::STDOUT_FILENO),
-            b"/dev/stderr" => return Some(libc::STDERR_FILENO),
-            _ => {}
-        }
-        let suffix = [
-            b"/proc/self/fd/".as_slice(),
-            b"/proc/thread-self/fd/",
-            b"/dev/fd/",
-        ]
-        .into_iter()
-        .find_map(|prefix| path.strip_prefix(prefix))?;
-        std::str::from_utf8(suffix)
-            .ok()?
-            .parse()
-            .ok()
-            .filter(|fd| matches!(*fd, libc::STDOUT_FILENO | libc::STDERR_FILENO))
-    }
-
-    async fn handle_fd_alias_open<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        source: i32,
-        cloexec: bool,
-    ) -> Result<i64, Errno> {
-        let recorded = next_event!(guest, Return);
-        if let Ok(expected) = recorded {
-            let cmd = if cloexec {
-                FcntlCmd::F_DUPFD_CLOEXEC(expected as i32)
-            } else {
-                FcntlCmd::F_DUPFD(expected as i32)
-            };
-            let actual = guest
-                .inject_with_retry(Fcntl::new().with_fd(source).with_cmd(cmd))
-                .await
-                .unwrap_or_else(|error| panic!("could not replay FD alias open: {error}"));
-            assert_eq!(actual, expected, "FD alias open returned a different slot");
-        }
-        recorded
-    }
-
     pub(super) async fn reserve_replay_fd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -487,5 +438,38 @@ impl Replayer {
         _syscall: Syscall,
     ) -> Result<i64, Errno> {
         next_event!(guest, Return)
+    }
+
+    async fn handle_dup2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            // Some source descriptors are virtual: open-family syscalls replay
+            // their recorded return value without creating a live kernel fd.
+            // Preserve that behavior when there is nothing to duplicate in the
+            // replay process.
+            if actual != Err(Errno::EBADF) {
+                assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
+            }
+        }
+        recorded
+    }
+
+    // TODO-HUMAN-REVIEW(#557): Audit close_range fd-table replay semantics.
+    async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            assert_eq!(actual, recorded, "close_range side effects diverged");
+        }
+        recorded
     }
 }
