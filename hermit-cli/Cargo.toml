@@ -31,10 +31,10 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "e5b59608f98e4e399568561b36133ff72a578edb" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "e5b59608f98e4e399568561b36133ff72a578edb", default-features = false }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "e5b59608f98e4e399568561b36133ff72a578edb" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "e5b59608f98e4e399568561b36133ff72a578edb" }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "1360c539a69dc3e7a7fd362496881e6a3a27fc05" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "1360c539a69dc3e7a7fd362496881e6a3a27fc05", default-features = false }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "1360c539a69dc3e7a7fd362496881e6a3a27fc05" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "1360c539a69dc3e7a7fd362496881e6a3a27fc05" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
