@@ -75,11 +75,7 @@ fn info_logging_enabled() -> bool {
 fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Option<u64>) -> bool {
     match sysnum {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_fork
-        | libc::SYS_vfork
-        | libc::SYS_rt_sigreturn
-        | libc::SYS_execve
-        | libc::SYS_execveat => true,
+        libc::SYS_fork | libc::SYS_vfork | libc::SYS_rt_sigreturn | libc::SYS_execve => true,
         // AUTONOMOUS-BOT-IMPLEMENTED
         libc::SYS_clone => args[0] & libc::CLONE_THREAD as u64 == 0,
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -97,6 +93,17 @@ fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     loop {
         if RUNTIME_SHUTDOWN.load(Ordering::Acquire) {
             return;
+        }
+        // TODO-HUMAN-REVIEW(PR-587): Preserve scheduler continuation across failed exec.
+        if RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire) {
+            RUNTIME_PAUSED.store(true, Ordering::Release);
+            while RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire)
+                && !RUNTIME_SHUTDOWN.load(Ordering::Acquire)
+            {
+                unsafe { idle() };
+            }
+            RUNTIME_PAUSED.store(false, Ordering::Release);
+            continue;
         }
         match future.as_mut().poll(&mut context) {
             Poll::Ready(()) => return,
@@ -130,7 +137,8 @@ static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static RUNTIME_STOPPED: AtomicBool = AtomicBool::new(true);
+static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RUNTIME_PAUSED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -306,7 +314,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
     let emit = callbacks.emit;
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
-    RUNTIME_STOPPED.store(false, Ordering::Release);
+    RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
+    RUNTIME_PAUSED.store(false, Ordering::Release);
     emit_marker(emit, b"detcore-dbi: background client thread entered\n");
     let runtime = {
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
@@ -344,7 +353,6 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         runtime.global.run_external_scheduler(observer),
         callbacks.idle,
     );
-    RUNTIME_STOPPED.store(true, Ordering::Release);
     emit_marker(emit, b"detcore-dbi: background scheduler completed\n");
 }
 
@@ -362,7 +370,8 @@ pub extern "C" fn reverie_dbi_runtime_process_exit() {
 pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
     i32::from(
         READY_IMAGE.load(Ordering::Acquire) == image_generation
-            && !RUNTIME_STOPPED.load(Ordering::Acquire),
+            && !RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire)
+            && !RUNTIME_PAUSED.load(Ordering::Acquire),
     )
 }
 
@@ -422,6 +431,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
     }
 }
 
+fn resume_paused_runtime() {
+    RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
+    while RUNTIME_PAUSED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    READY_IMAGE.store(IMAGE_GENERATION.load(Ordering::Acquire), Ordering::Release);
+}
+
 /// Restarts the existing scheduler after the kernel rejects a native exec.
 ///
 /// # Safety
@@ -438,7 +455,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
             .is_some(),
         "failed exec had no Detcore runtime"
     );
-    RUNTIME_SHUTDOWN.store(false, Ordering::Release);
+    resume_paused_runtime();
 }
 
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
@@ -487,11 +504,16 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     } else {
         None
     };
+    if sysnum == libc::SYS_execveat {
+        unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
     if requires_native_process_lifecycle(sysnum, raw_args, clone3_flags) {
-        if matches!(sysnum, libc::SYS_execve | libc::SYS_execveat) {
+        if sysnum == libc::SYS_execve {
             READY_IMAGE.store(0, Ordering::Release);
-            RUNTIME_SHUTDOWN.store(true, Ordering::Release);
-            while !RUNTIME_STOPPED.load(Ordering::Acquire) {
+            RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+            while !RUNTIME_PAUSED.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
             assert_eq!(
@@ -665,11 +687,15 @@ mod tests {
             libc::SYS_vfork,
             libc::SYS_rt_sigreturn,
             libc::SYS_execve,
-            libc::SYS_execveat,
         ] {
             assert!(requires_native_process_lifecycle(sysnum, &args, None));
         }
-        for sysnum in [libc::SYS_wait4, libc::SYS_waitid, libc::SYS_read] {
+        for sysnum in [
+            libc::SYS_execveat,
+            libc::SYS_wait4,
+            libc::SYS_waitid,
+            libc::SYS_read,
+        ] {
             assert!(!requires_native_process_lifecycle(sysnum, &args, None));
         }
     }
@@ -690,6 +716,7 @@ mod tests {
             &args,
             None
         ));
+
         assert!(requires_native_process_lifecycle(
             libc::SYS_clone3,
             &args,
