@@ -2494,21 +2494,21 @@ function apply_locally_validated_label {
         fi
 
         if ! run_id=$("${gh_cmd[@]}" api \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
+            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci-selfhosted.yml/runs?head_sha=${local_head}&per_page=100" \
             --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
             2>>"$LOG_FILE"); then
-            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
+            printf "⚠️  failed to query self-hosted CI runs for %s (full log: %s)\n" \
                 "$local_head" "$LOG_FILE" >&2
             return 0
         fi
         if [[ -z $run_id ]]; then
-            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
+            printf "ℹ️  No in-flight self-hosted CI run found for %s\n" "$local_head"
         elif "${gh_cmd[@]}" api --method POST \
             "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/runs/${run_id}/cancel" \
             >>"$LOG_FILE" 2>&1; then
-            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
+            printf "🛑 Cancelled self-hosted CI run %s for %s\n" "$run_id" "$local_head"
         else
-            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
+            printf "⚠️  failed to cancel self-hosted CI run %s for %s (full log: %s)\n" \
                 "$run_id" "$local_head" "$LOG_FILE" >&2
         fi
     else
