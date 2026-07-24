@@ -26,9 +26,12 @@ mod replayer;
 mod script;
 
 use std::fs;
+use std::io;
 use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
@@ -53,6 +56,71 @@ pub use reverie::process::Stdio;
 pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
+
+enum KvmStdinReservation {
+    Open(fs::File),
+    Closed,
+}
+
+static KVM_STDIN_RESERVATION: Mutex<Option<KvmStdinReservation>> = Mutex::new(None);
+
+/// Saves stdin captured before Rust's process startup can reuse a closed fd 0.
+pub fn reserve_kvm_stdin(stdin: Option<fs::File>) -> io::Result<()> {
+    let mut reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    if reservation.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "KVM stdin is already reserved",
+        ));
+    }
+    *reservation = Some(match stdin {
+        Some(file) => KvmStdinReservation::Open(file),
+        None => KvmStdinReservation::Closed,
+    });
+    Ok(())
+}
+
+fn duplicate_current_stdin() -> io::Result<Option<fs::File>> {
+    // SAFETY: F_DUPFD_CLOEXEC duplicates fd 0 without taking ownership of it.
+    let duplicate = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate >= 0 {
+        // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+        return Ok(Some(unsafe { fs::File::from_raw_fd(duplicate) }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+fn ensure_kvm_stdin_reserved() -> io::Result<()> {
+    let mut reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    if reservation.is_none() {
+        *reservation = Some(match duplicate_current_stdin()? {
+            Some(file) => KvmStdinReservation::Open(file),
+            None => KvmStdinReservation::Closed,
+        });
+    }
+    Ok(())
+}
+
+fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
+    ensure_kvm_stdin_reserved()?;
+    let reservation = KVM_STDIN_RESERVATION
+        .lock()
+        .map_err(|_| io::Error::other("KVM stdin reservation lock is poisoned"))?;
+    match reservation.as_ref() {
+        Some(KvmStdinReservation::Open(file)) => Ok(Some(file.try_clone()?)),
+        Some(KvmStdinReservation::Closed) => Ok(None),
+        None => unreachable!("stdin reservation was initialized above"),
+    }
+}
 
 /// The result of recording a command.
 #[derive(Debug, Serialize, Deserialize)]
@@ -292,6 +360,7 @@ async fn run_kvm(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    let stdin = reserved_kvm_stdin()?;
     let requested_cwd = command
         .get_current_dir()
         .map(Path::to_owned)
@@ -357,7 +426,7 @@ async fn run_kvm(
     let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
-    let mut backend = reverie_kvm::KvmBackend::new(KVM_GUEST_MEMORY_BYTES)
+    let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     backend
         .install_static_elf_with_context(&image, &argv, &envp, &cwd)
@@ -407,8 +476,27 @@ pub fn run(
 }
 
 /// Run the given command using the selected instrumentation backend.
+pub fn run_with_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    if backend == Backend::Kvm {
+        ensure_kvm_stdin_reserved()?;
+    }
+    run_with_backend_inner(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
-pub async fn run_with_backend(
+async fn run_with_backend_inner(
     command: Command,
     config: DetConfig,
     print_summary: bool,
@@ -456,8 +544,27 @@ pub fn run_with_output(
 }
 
 /// Variant of [`run_with_backend`] that also captures stdout/stderr.
+pub fn run_with_output_backend(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+) -> Result<Output, Error> {
+    if backend == Backend::Kvm {
+        ensure_kvm_stdin_reserved()?;
+    }
+    run_with_output_backend_inner(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
-pub async fn run_with_output_backend(
+async fn run_with_output_backend_inner(
     mut command: Command,
     config: DetConfig,
     print_summary: bool,

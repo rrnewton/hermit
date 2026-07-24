@@ -868,6 +868,9 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        if self.selected_backend() == Backend::Kvm {
+            hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+        }
 
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
         // subsequent tracing_subscriber::fmt::init() call.

@@ -7,11 +7,13 @@
  */
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -19,6 +21,46 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 fn hermit(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+}
+
+fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+    child
+        .stdin
+        .take()
+        .expect("hermit stdin should be piped")
+        .write_all(input)
+        .expect("failed to write hermit stdin");
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+}
+
+fn hermit_with_closed_stdin(args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec closes only the child descriptor immediately before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::close(libc::STDIN_FILENO) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    command
         .output()
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
 }
@@ -424,6 +466,162 @@ fn run_kvm_reads_host_file() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), expected);
+}
+
+#[test]
+fn run_kvm_reads_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_stdin(&args, b"hello\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "hello\n");
+}
+
+#[test]
+fn run_kvm_verify_isolates_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_stdin(&args, b"not-visible-during-capture\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn run_kvm_preserves_closed_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_closed_stdin(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(stdout(&output), "");
+    assert!(
+        stderr(&output)
+            .to_ascii_lowercase()
+            .contains("bad file descriptor")
+    );
+}
+
+#[test]
+fn run_kvm_verify_does_not_write_to_standard_input() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create stdin fixture");
+    let path = temp.path().join("stdin");
+    fs::write(&path, b"original-data").expect("failed to write stdin fixture");
+    let stdin = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("failed to open stdin fixture");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/perl",
+        "-MPOSIX",
+        "-e",
+        "POSIX::write(0, \"leak\", 4); exit 0",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(Stdio::from(stdin))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+
+    assert_success(&output, &args);
+    assert_eq!(fs::read(path).unwrap(), b"original-data");
+}
+
+#[test]
+fn run_kvm_counts_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/wc",
+    ];
+    let output = hermit_with_stdin(&args, b"hello\n");
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output).split_whitespace().collect::<Vec<_>>(),
+        ["1", "1", "6"]
+    );
+}
+
+#[test]
+fn run_kvm_reports_hostname() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/hostname",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "reverie-kvm\n");
 }
 
 #[test]
