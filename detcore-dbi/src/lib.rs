@@ -23,6 +23,7 @@ use std::pin::pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -51,7 +52,8 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
-type Emitter = unsafe extern "C" fn(*const u8, usize);
+type Emitter = reverie_dbi::RuntimeEmitter;
+type Idler = reverie_dbi::RuntimeIdler;
 
 fn emit_marker(emit: Emitter, message: &'static [u8]) {
     unsafe { emit(message.as_ptr(), message.len()) };
@@ -67,14 +69,34 @@ fn info_logging_enabled() -> bool {
     )
 }
 
-fn run_cooperative<F: Future<Output = ()>>(future: F) {
+fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Option<u64>) -> bool {
+    match sysnum {
+        libc::SYS_fork
+        | libc::SYS_vfork
+        | libc::SYS_wait4
+        | libc::SYS_waitid
+        | libc::SYS_rt_sigreturn
+        | libc::SYS_execve
+        | libc::SYS_execveat => true,
+        libc::SYS_clone => args[0] & libc::CLONE_THREAD as u64 == 0,
+        libc::SYS_clone3 => {
+            clone3_flags.is_some_and(|flags| flags & libc::CLONE_THREAD as u64 == 0)
+        }
+        _ => false,
+    }
+}
+
+fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     loop {
+        if RUNTIME_SHUTDOWN.load(Ordering::Acquire) {
+            return;
+        }
         match future.as_mut().poll(&mut context) {
             Poll::Ready(()) => return,
-            Poll::Pending => std::hint::spin_loop(),
+            Poll::Pending => unsafe { idle() },
         }
     }
 }
@@ -100,6 +122,8 @@ struct NativeThreadScratch {
 }
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static RUNTIME_STOPPED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -141,7 +165,7 @@ fn error_result(error: Error) -> i64 {
     }
 }
 
-/// Returns the release cdylib path produced beside the running Hermit binary.
+/// Returns the cdylib built beside the running Hermit binary or in Cargo's deps directory.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or_else(|| {
@@ -150,15 +174,20 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
             "Hermit executable has no parent directory",
         )
     })?;
-    let runtime = directory.join("libhermit.so");
-    if runtime.is_file() {
-        Ok(runtime)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Hermit DBI runtime was not built at {}", runtime.display()),
-        ))
-    }
+    let direct = directory.join("libhermit.so");
+    let deps = directory.join("deps/libhermit.so");
+    [direct, deps]
+        .into_iter()
+        .find(|runtime| runtime.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Hermit DBI runtime was not built beside {} or in its deps directory",
+                    executable.display()
+                ),
+            )
+        })
 }
 fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File> {
     let lock = fs::OpenOptions::new()
@@ -237,10 +266,11 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
 ///
 /// # Safety
 ///
-/// `argument` must encode a valid `Emitter` callback pointer.
+/// `argument` must point to a valid [`reverie_dbi::DbiRuntimeCallbacks`] value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
-    let emit: Emitter = unsafe { std::mem::transmute(argument) };
+    let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
+    let emit = callbacks.emit;
     emit_marker(emit, b"detcore-dbi: background client thread entered\n");
     emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
     let mut config = Config {
@@ -270,8 +300,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
             unsafe { emit(line.as_ptr(), line.len()) };
         }
     });
-    run_cooperative(runtime.global.run_external_scheduler(observer));
+    run_cooperative(
+        runtime.global.run_external_scheduler(observer),
+        callbacks.idle,
+    );
+    RUNTIME_STOPPED.store(true, Ordering::Release);
     emit_marker(emit, b"detcore-dbi: background scheduler completed\n");
+}
+
+/// Requests shutdown of the backend-owned scheduler at process exit.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_process_exit() {
+    RUNTIME_SHUTDOWN.store(true, Ordering::Release);
 }
 
 /// Reports whether the Detcore global scheduler is ready for guest callbacks.
@@ -363,6 +403,31 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let clone3_flags = if sysnum == libc::SYS_clone3
+        && raw_args[0] != 0
+        && raw_args[1] >= std::mem::size_of::<u64>() as u64
+    {
+        let mut flags = 0_u64;
+        let read = unsafe {
+            read_memory(
+                raw_args[0] as usize,
+                (&mut flags as *mut u64).cast(),
+                std::mem::size_of_val(&flags),
+            )
+        };
+        (read != 0).then_some(flags)
+    } else {
+        None
+    };
+    if requires_native_process_lifecycle(sysnum, raw_args, clone3_flags) {
+        if matches!(sysnum, libc::SYS_execve | libc::SYS_execveat) {
+            RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+            while !RUNTIME_STOPPED.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        return 0;
+    }
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = RUNTIME
@@ -510,5 +575,64 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
         syscalls.write(TOTAL_SYSCALLS.load(Ordering::Relaxed));
         rewritten.write(TOTAL_REWRITTEN.load(Ordering::Relaxed));
         memory_hash.write(MEMORY_HASH.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_lifecycle_syscalls_stay_native() {
+        let args = [0_u64; 6];
+        for sysnum in [
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_wait4,
+            libc::SYS_waitid,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_execve,
+            libc::SYS_execveat,
+        ] {
+            assert!(requires_native_process_lifecycle(sysnum, &args, None));
+        }
+        assert!(!requires_native_process_lifecycle(
+            libc::SYS_read,
+            &args,
+            None
+        ));
+    }
+
+    #[test]
+    fn clone_classification_separates_processes_from_threads() {
+        let mut args = [0_u64; 6];
+        args[0] = libc::SIGCHLD as u64;
+        assert!(requires_native_process_lifecycle(
+            libc::SYS_clone,
+            &args,
+            None
+        ));
+
+        args[0] = libc::CLONE_THREAD as u64;
+        assert!(!requires_native_process_lifecycle(
+            libc::SYS_clone,
+            &args,
+            None
+        ));
+        assert!(requires_native_process_lifecycle(
+            libc::SYS_clone3,
+            &args,
+            Some(libc::SIGCHLD as u64)
+        ));
+        assert!(!requires_native_process_lifecycle(
+            libc::SYS_clone3,
+            &args,
+            Some(libc::CLONE_THREAD as u64)
+        ));
+        assert!(!requires_native_process_lifecycle(
+            libc::SYS_clone3,
+            &args,
+            None
+        ));
     }
 }

@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -65,6 +66,31 @@ fn dbi_mmap_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_wait_guest() -> &'static Path {
+    DBI_WAIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-wait");
+        fs::create_dir_all(&build_root).expect("failed to create DBI wait guest directory");
+        let guest = build_root.join("dbi_wait_lifecycle");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_wait_lifecycle.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI wait guest");
+        assert!(
+            output.status.success(),
+            "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -323,6 +349,34 @@ fn run_dbi_verifies_application_mmap() {
     assert!(
         stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
         "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
+fn run_dbi_verifies_process_wait_lifecycle() {
+    let program = dbi_wait_guest()
+        .to_str()
+        .expect("DBI wait guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n"
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
