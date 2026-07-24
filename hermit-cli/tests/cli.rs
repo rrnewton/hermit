@@ -294,7 +294,7 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
         stderr.contains("invalid value 'unknown'"),
         "unexpected error:\n{stderr}"
     );
-    for backend in ["ptrace", "dbi", "kvm"] {
+    for backend in ["ptrace", "dbi", "liteinst", "kvm"] {
         assert!(
             stderr.contains(backend),
             "missing {backend:?} in:\n{stderr}"
@@ -307,6 +307,31 @@ fn run_dbi_executes_integrated_backend() {
     let args = ["run", "--backend", "dbi", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the experimental preload verification boundary.
+#[test]
+fn run_liteinst_verifies_integrated_preload_backend() {
+    let args = [
+        "run",
+        "--backend",
+        "liteinst",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/echo",
+        "liteinst-cli-ok",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "liteinst-cli-ok\n");
+    let stderr = stderr(&output);
+    assert!(stderr.contains("Detcore Tool is not active"), "{stderr}");
+    assert!(
+        stderr.contains("LiteInst path confirmed: preload compatibility events matched"),
+        "{stderr}"
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -825,7 +850,7 @@ fn run_kvm_reports_fixed_supplementary_groups() {
 
 #[test]
 fn namespace_only_rejects_every_explicit_backend() {
-    for backend in ["ptrace", "dbi", "kvm"] {
+    for backend in ["ptrace", "dbi", "liteinst", "kvm"] {
         let args = [
             "run",
             "--backend",

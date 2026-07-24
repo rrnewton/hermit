@@ -80,7 +80,7 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|kvm` as a global option, before the
+Hermit accepts `--backend=ptrace|dbi|liteinst|kvm` as a global option, before the
 subcommand, since the backend applies to how any subcommand instruments the
 guest. Omitting the option selects `ptrace`, preserving the existing behavior:
 
@@ -92,8 +92,17 @@ For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
-SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
+explicit alternative-backend request. The experimental LiteInst backend needs
+`libdetcore_liteinst.so`, produced by `cargo build --workspace`, beside the
+Hermit binary. It supports dynamically linked, single-threaded Linux x86-64
+guests and compares stdout, guest stderr, exit status, and syscall-number
+events for `--verify`. It does not run the Detcore Tool: exec, thread creation,
+CPUID/TSC/random-instruction virtualization, and complete signal multiplexing
+remain unsupported. Its `--strict --verify` result is a compatibility repeat
+check, not the production determinism guarantee provided by the ptrace backend.
+
+The DynamoRIO prototype requires a discoverable SDK and does not yet expose a
+Detcore process launcher. The bare KVM prototype
 requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
 and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
 an availability error rather than running the command without determinization.

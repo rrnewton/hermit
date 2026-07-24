@@ -280,6 +280,34 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
     })
 }
 
+/// Returns the LiteInst preload cdylib produced beside the Hermit binary.
+#[doc(hidden)]
+pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    let runtime = directory.join("libdetcore_liteinst.so");
+    runtime.is_file().then_some(runtime).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "libdetcore_liteinst.so was not built beside the Hermit binary",
+        )
+    })
+}
+
+fn liteinst_runtime_unavailable_reason() -> Option<String> {
+    liteinst_runtime_library_path().err().map(|error| {
+        format!(
+            "the LiteInst preload runtime is unavailable: {error}; build the Hermit workspace so \
+             libdetcore_liteinst.so is produced beside the hermit binary"
+        )
+    })
+}
+
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
     fs::OpenOptions::new()
         .read(true)
@@ -303,18 +331,21 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
+    /// Use the experimental LiteInst preload backend.
+    Liteinst,
     /// Use the KVM backend.
     Kvm,
 }
 
 impl Backend {
-    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+    const ALL: [Self; 4] = [Self::Ptrace, Self::Dbi, Self::Liteinst, Self::Kvm];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
             Self::Dbi => "dbi",
+            Self::Liteinst => "liteinst",
             Self::Kvm => "kvm",
         }
     }
@@ -353,6 +384,7 @@ impl Backend {
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
+            Self::Liteinst => liteinst_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }

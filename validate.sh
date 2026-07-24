@@ -25,6 +25,7 @@ cd "$ROOT_DIR" || exit 1
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
+#   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -35,6 +36,7 @@ ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
+LITEINST_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
+        --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -66,6 +69,7 @@ only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -99,7 +103,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY
 
 checks=0
 failures=0
@@ -147,6 +151,7 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+readonly LITEINST_COMPAT_EXPECTED=29
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: RR_COMPAT_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
@@ -660,6 +665,126 @@ function rr_compatibility_probe {
     printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
         "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
     return 0
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-id): Review the experimental LiteInst compatibility ratchet.
+function liteinst_compatibility_probe {
+    local label=$1
+    shift
+
+    local started_at=$SECONDS
+    local output_start
+    local status
+    local summary
+
+    {
+        printf "=== LiteInst compatibility: %s ===\n" "$label"
+        printf "Command: timeout %s %q run --backend liteinst --strict --verify --" \
+            "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if timeout "$STRICT_COMPAT_TIMEOUT" \
+        "$STRICT_COMPAT_HERMIT_BIN" run --backend liteinst --strict --verify -- "$@" \
+        </dev/null >>"$LOG_FILE" 2>&1; then
+        status=0
+        printf "  ✅ %-12s PASS LiteInst L2 (%ss)\n" "$label" "$((SECONDS - started_at))"
+    else
+        status=$?
+        summary=$(failure_summary "$output_start")
+        printf "  ❌ %-12s FAIL (exit %s: %s)\n" "$label" "$status" "$summary"
+    fi
+
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    return "$status"
+}
+
+function run_liteinst_compatibility_envelope {
+    local passed=0
+    local failed=0
+    local total
+
+    printf "\n== LiteInst compatibility baseline (blocking gate) ==\n"
+    printf "=== LiteInst compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
+
+    liteinst_compatibility_probe true /bin/true \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe echo /bin/echo hermit-compat \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe seq /usr/bin/seq 10 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cat /bin/cat README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe wc /usr/bin/wc -c README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe head /usr/bin/head -n 3 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe base64 /usr/bin/base64 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe id /usr/bin/id -u \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uname /usr/bin/uname -sr \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe printf /usr/bin/printf '%s=%d\n' hermit 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe stat /usr/bin/stat -c '%n %s %f' README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe arch /usr/bin/arch \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe factor /usr/bin/factor 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe expr /usr/bin/expr 2 + 2 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hostname /usr/bin/hostname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe perl /usr/bin/perl -e 'print 42, chr(10)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe awk /usr/bin/awk 'BEGIN { print 42 }' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sqlite3 /usr/bin/sqlite3 :memory: 'SELECT 1+1;' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sort /usr/bin/sort README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe file /usr/bin/file /bin/sh \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe readlink /usr/bin/readlink -f README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe du /usr/bin/du -sk README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nproc /usr/bin/nproc \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gcc /usr/bin/gcc --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe g++ /usr/bin/g++ --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe make /usr/bin/make --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe openssl /usr/bin/openssl dgst -sha256 /etc/hostname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+
+    total=$((passed + failed))
+    if ((total != LITEINST_COMPAT_EXPECTED)); then
+        printf "❌ LiteInst compatibility baseline selected %s rows; expected %s\n" \
+            "$total" "$LITEINST_COMPAT_EXPECTED"
+        return 1
+    fi
+    if ((failed == 0)); then
+        printf "✅ LiteInst compatibility baseline (%s/%s passed L2)\n" "$passed" "$total"
+        return 0
+    fi
+    printf "❌ LiteInst compatibility baseline (%s/%s passed L2, %s regressed)\n" \
+        "$passed" "$total" "$failed"
+    return 1
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1284,6 +1409,18 @@ if ((STRICT_COMPAT_ONLY == 1)); then
     exit $?
 fi
 
+if ((LITEINST_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit and LiteInst runtime" \
+        cargo build --release -p hermit -p detcore-liteinst
+    if ((failures == 0)); then
+        run_check "LiteInst compatibility baseline (29 programs)" \
+            run_liteinst_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
 if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
@@ -1325,8 +1462,8 @@ fi
 
 run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
-run_check "Build release Hermit for strict compatibility" \
-    cargo build --release -p hermit
+run_check "Build release Hermit and LiteInst runtime for compatibility" \
+    cargo build --release -p hermit -p detcore-liteinst
 
 # Cargo supports concurrent commands in one target directory. Run checks that
 # do not execute Hermit guests alongside the ordered runtime and PMU gates.
@@ -1341,6 +1478,8 @@ run_check "Hermit verify-mode smoke test" hermit_verify_smoke
 if ! run_strict_compatibility_envelope; then
     printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
 fi
+run_check "LiteInst compatibility baseline (29 programs)" \
+    run_liteinst_compatibility_envelope
 run_check "Record/replay compatibility baseline (99 programs)" \
     run_rr_compatibility_envelope
 # Nextest runs most package unit and Cargo integration targets in parallel.
