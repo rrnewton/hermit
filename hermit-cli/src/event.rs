@@ -27,7 +27,9 @@ pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<
         // SIOCETHTOOL stores its output behind the data pointer nested in an
         // ifreq. Treating it as an opaque request would lose guest-visible
         // memory updates, so reject it identically during record and replay.
-        ioctl::Request::Other(SIOCETHTOOL, _) => Some(Errno::ENODEV),
+        ioctl::Request::SIOCETHTOOL(_) | ioctl::Request::Other(SIOCETHTOOL, _) => {
+            Some(Errno::ENODEV)
+        }
         _ => None,
     }
 }
@@ -166,9 +168,15 @@ mod tests {
 
     #[test]
     fn siocethtool_has_a_deterministic_error() {
-        let request = ioctl::Request::Other(SIOCETHTOOL, 0x1234);
+        let request = ioctl::Request::SIOCETHTOOL(None);
 
         assert_eq!(deterministic_ioctl_error(&request), Some(Errno::ENODEV));
+
+        let legacy_request = ioctl::Request::Other(SIOCETHTOOL, 0x1234);
+        assert_eq!(
+            deterministic_ioctl_error(&legacy_request),
+            Some(Errno::ENODEV)
+        );
     }
 
     #[test]
