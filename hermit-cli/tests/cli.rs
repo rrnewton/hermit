@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -92,6 +93,31 @@ fn dbi_exec_failure_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI exec-failure guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_execveat_guest() -> &'static Path {
+    DBI_EXECVEAT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-execveat");
+        fs::create_dir_all(&build_root).expect("failed to create DBI execveat guest directory");
+        let guest = build_root.join("dbi_execveat_unsupported");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_execveat_unsupported.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI execveat guest");
+        assert!(
+            output.status.success(),
+            "DBI execveat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -451,6 +477,30 @@ fn run_dbi_recovers_after_failed_exec() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "recovered after failed exec\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+#[test]
+fn run_dbi_rejects_unfollowed_execveat() {
+    let program = dbi_execveat_guest()
+        .to_str()
+        .expect("DBI execveat guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "execveat unsupported\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
         "DBI determinism confirmation missing:\n{}",
