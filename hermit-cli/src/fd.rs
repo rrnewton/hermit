@@ -13,7 +13,7 @@ use std::os::fd::RawFd;
 
 use reverie::Pid;
 
-// TODO-HUMAN-REVIEW(PR-PENDING): Audit pidfd-based guest descriptor duplication.
+// TODO-HUMAN-REVIEW(#556): Audit pidfd-based guest descriptor duplication.
 pub(crate) fn duplicate_guest_fd(pid: Pid, fd: RawFd) -> std::io::Result<OwnedFd> {
     // pidfd_getfd returns a true duplicate of the guest descriptor, preserving
     // its open-file description (including offsets, flags, and socket identity).
@@ -41,7 +41,7 @@ pub(crate) fn duplicate_guest_fd(pid: Pid, fd: RawFd) -> std::io::Result<OwnedFd
     Ok(duplicate)
 }
 
-// TODO-HUMAN-REVIEW(PR-PENDING): Audit kcmp-based open-file identity checks.
+// TODO-HUMAN-REVIEW(#556): Audit kcmp-based open-file identity checks.
 pub(crate) fn same_open_file_description(left: RawFd, right: RawFd) -> std::io::Result<bool> {
     const KCMP_FILE: libc::c_int = 0;
     // SAFETY: kcmp only compares descriptor-table entries owned by this process.

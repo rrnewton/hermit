@@ -434,7 +434,7 @@ impl Replayer {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Audit recorded write side effects and signal fidelity.
+    // TODO-HUMAN-REVIEW(#556): Audit recorded write side effects and signal fidelity.
     pub(super) async fn handle_write_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -457,7 +457,7 @@ impl Replayer {
         event.result
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Audit captured-output ftruncate replay.
+    // TODO-HUMAN-REVIEW(#556): Audit captured-output ftruncate replay.
     pub(super) fn handle_ftruncate<G: Guest<Self>>(
         &self,
         guest: &mut G,

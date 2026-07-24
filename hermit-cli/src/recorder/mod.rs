@@ -410,7 +410,7 @@ impl Recorder {
         result
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Audit close_range fd-table replay semantics.
+    // TODO-HUMAN-REVIEW(#556): Audit close_range fd-table replay semantics.
     async fn handle_close_range<G: Guest<Self>>(
         &self,
         guest: &mut G,
