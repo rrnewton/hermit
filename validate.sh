@@ -218,14 +218,15 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
+readonly RR_COMPAT_KNOWN_FAILING_EXPECTED=19
 # The prior 115/121 floor plus 25 passing additions in the current corpus.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=140
 readonly SABRE_COMPAT_TOTAL=147
 COMPATIBILITY_MODE=strict
 
-# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
-# strict corpus below; this set only selects the rows known to pass R/R.
+# Exact pass/failure partition measured against the strict corpus below.
+# Commands remain owned by that corpus; only passing rows enter the blocking gate.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -254,6 +255,22 @@ if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
 fi
+declare -Ar RR_COMPAT_KNOWN_FAILING_LABELS=(
+    [cargo]=1 [rustc]=1 [node]=1 [mktemp]=1 [diff]=1 [patch]=1 [tar]=1
+    [cp]=1 [mv]=1 [rm]=1 [mkdir]=1 [rmdir]=1 [touch]=1 [chmod]=1
+    [chown]=1 [ln]=1 [csplit]=1 [install]=1 [mkfifo]=1
+)
+if ((${#RR_COMPAT_KNOWN_FAILING_LABELS[@]} != RR_COMPAT_KNOWN_FAILING_EXPECTED)); then
+    echo "validate.sh: R/R known-failing label set must contain exactly $RR_COMPAT_KNOWN_FAILING_EXPECTED rows" >&2
+    exit 2
+fi
+for rr_label in "${!RR_COMPAT_KNOWN_FAILING_LABELS[@]}"; do
+    if [[ -n ${RR_COMPAT_PASSING_LABELS[$rr_label]+selected} ]]; then
+        echo "validate.sh: R/R label appears in both pass and known-failure sets: $rr_label" >&2
+        exit 2
+    fi
+done
+unset rr_label
 RR_COMPAT_PASSED=0
 RR_COMPAT_FAILED=0
 RR_COMPAT_TOTAL=0
@@ -852,6 +869,11 @@ function rr_compatibility_probe {
     shift
 
     if [[ -z ${RR_COMPAT_PASSING_LABELS[$label]+selected} ]]; then
+        if [[ -z ${RR_COMPAT_KNOWN_FAILING_LABELS[$label]+known_failure} ]]; then
+            printf "  ❌ %-12s missing from the R/R pass/failure matrix\n" "$label"
+            RR_COMPAT_FAILED=$((RR_COMPAT_FAILED + 1))
+            return 0
+        fi
         RR_COMPAT_SKIPPED=$((RR_COMPAT_SKIPPED + 1))
         return 0
     fi
@@ -1399,12 +1421,17 @@ function run_compatibility_corpus {
                 "$RR_COMPAT_TOTAL" "$RR_COMPAT_EXPECTED" "$RR_COMPAT_SKIPPED"
             return 1
         fi
+        if ((RR_COMPAT_SKIPPED != RR_COMPAT_KNOWN_FAILING_EXPECTED)); then
+            printf "❌ Record/replay compatibility matrix has %s known failures; expected %s\n" \
+                "$RR_COMPAT_SKIPPED" "$RR_COMPAT_KNOWN_FAILING_EXPECTED"
+            return 1
+        fi
         if ((RR_COMPAT_FAILED == 0)); then
-            printf "✅ Record/replay compatibility baseline (%s/%s passed R/R; %s unselected)\n" \
+            printf "✅ Record/replay compatibility baseline (%s/%s passed R/R; %s known failing)\n" \
                 "$RR_COMPAT_PASSED" "$RR_COMPAT_TOTAL" "$RR_COMPAT_SKIPPED"
             return 0
         fi
-        printf "❌ Record/replay compatibility baseline (%s/%s passed R/R, %s regressed; %s unselected)\n" \
+        printf "❌ Record/replay compatibility baseline (%s/%s passed R/R, %s regressed; %s known failing)\n" \
             "$RR_COMPAT_PASSED" "$RR_COMPAT_TOTAL" "$RR_COMPAT_FAILED" \
             "$RR_COMPAT_SKIPPED"
         return 1
@@ -1683,7 +1710,7 @@ function run_full_suite {
     if ! run_strict_compatibility_envelope; then
         printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
     fi
-    run_check "Record/replay compatibility baseline (128 programs)" \
+    run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
         run_rr_compatibility_envelope
     # Nextest runs most package unit and Cargo integration targets in parallel.
     # Detcore's PMU tests depend on same-binary coordination; nextest would launch
@@ -1756,7 +1783,7 @@ if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
     if ((failures == 0)); then
-        run_check "Record/replay compatibility baseline (128 programs)" \
+        run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
     fi
     print_summary
