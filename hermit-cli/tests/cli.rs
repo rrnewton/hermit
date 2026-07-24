@@ -282,7 +282,7 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW: verify host-coreutils coverage is suitable for this CI gate.
+// TODO-HUMAN-REVIEW(#543): verify host-coreutils coverage is suitable for this CI gate.
 #[test]
 fn run_dbi_executes_guests_with_dynamic_mmaps() {
     let cases: [(&str, &[u8], &str); 2] = [
