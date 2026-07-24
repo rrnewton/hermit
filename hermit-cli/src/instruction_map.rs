@@ -341,9 +341,12 @@ fn nondeterministic_instruction(instruction: &Instruction) -> Option<&'static st
         Mnemonic::Cpuid => Some("cpuid"),
         Mnemonic::Rdrand => Some("rdrand"),
         Mnemonic::Rdtsc => Some("rdtsc"),
+        Mnemonic::Rdtscp => Some("rdtscp"),
         Mnemonic::Rdseed => Some("rdseed"),
+        Mnemonic::Sysenter => Some("sysenter"),
         Mnemonic::Xbegin => Some("xbegin"),
         Mnemonic::Xend => Some("xend"),
+        Mnemonic::Int if instruction.immediate8() == 0x80 => Some("int80"),
         _ => None,
     }
 }
@@ -402,7 +405,7 @@ mod tests {
     fn all_target_instructions() -> Vec<u8> {
         vec![
             0x0f, 0x05, 0x0f, 0xa2, 0x48, 0x0f, 0xc7, 0xf0, 0x0f, 0x31, 0x48, 0x0f, 0xc7, 0xf8,
-            0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
+            0x0f, 0x01, 0xf9, 0x0f, 0x34, 0xcd, 0x80, 0xc7, 0xf8, 0, 0, 0, 0, 0x0f, 0x01, 0xd5,
         ]
     }
 
@@ -439,11 +442,26 @@ mod tests {
                 },
                 InstructionSite {
                     offset: 78,
+                    instruction: "rdtscp".into(),
+                    length: 3
+                },
+                InstructionSite {
+                    offset: 81,
+                    instruction: "sysenter".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 83,
+                    instruction: "int80".into(),
+                    length: 2
+                },
+                InstructionSite {
+                    offset: 85,
                     instruction: "xbegin".into(),
                     length: 6
                 },
                 InstructionSite {
-                    offset: 84,
+                    offset: 91,
                     instruction: "xend".into(),
                     length: 3
                 },

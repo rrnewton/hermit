@@ -13,6 +13,7 @@
 mod chroot;
 mod consts;
 mod desync;
+pub mod e9patch;
 mod error;
 mod event;
 mod event_stream;
@@ -308,10 +309,18 @@ pub enum Backend {
     Sabre,
     /// Use the KVM backend.
     Kvm,
+    /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
+    E9patch,
 }
 
 impl Backend {
-    const ALL: [Self; 4] = [Self::Ptrace, Self::Dbi, Self::Sabre, Self::Kvm];
+    const ALL: [Self; 5] = [
+        Self::Ptrace,
+        Self::Dbi,
+        Self::Sabre,
+        Self::Kvm,
+        Self::E9patch,
+    ];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
@@ -320,6 +329,7 @@ impl Backend {
             Self::Dbi => "dbi",
             Self::Sabre => "sabre",
             Self::Kvm => "kvm",
+            Self::E9patch => "e9patch",
         }
     }
 
@@ -360,6 +370,10 @@ impl Backend {
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
+            Self::E9patch => validate_tracing_environment()
+                .err()
+                .map(|error| error.to_string())
+                .or_else(e9patch::unavailable_reason),
         }
     }
 }
@@ -398,6 +412,12 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // the namespace probe here would test nested namespaces instead of the host.
     if backend == Backend::Ptrace {
         return Ok(());
+    }
+    if backend == Backend::E9patch {
+        return Err(anyhow!(
+            "backend `e9patch` requires CLI preprocessing; library callers must use \
+             e9patch::prepare and then select `ptrace`"
+        ));
     }
     // The KVM backend has its own dispatch (`run_kvm`); it must not reach here.
     backend.ensure_available()?;
@@ -873,6 +893,7 @@ mod tests {
     use super::Backend;
     use super::dbi_runtime_unavailable_reason;
     use super::dynamorio_sdk_available;
+    use super::ensure_backend_dispatch;
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     use super::sabre_runtime_unavailable_reason;
@@ -896,6 +917,10 @@ mod tests {
         assert_eq!(
             available.contains(&Backend::Kvm),
             kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
+        );
+        assert_eq!(
+            available.contains(&Backend::E9patch),
+            Backend::E9patch.is_available()
         );
     }
 
@@ -942,6 +967,15 @@ mod tests {
                 assert!(!message.contains("requires root privileges"));
             }
         }
+    }
+
+    #[test]
+    fn public_backend_dispatch_rejects_unprepared_e9patch() {
+        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
+        assert!(
+            error.to_string().contains("requires CLI preprocessing"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

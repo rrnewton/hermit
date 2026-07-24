@@ -145,7 +145,8 @@ Requires a bare-metal-class host with PMU access. Covers:
   fail-closed ratchet (`scripts/test-fail-closed.sh`), the working-envelope gate
   (`validate.sh --envelope-compare`), and the debugger integration tests
 - **Backend parity ratchet:** always for `ptrace`; `kvm` only when `/dev/kvm` is
-  readable+writable; `dbi` only when the DynamoRIO environment is configured
+  readable+writable; `dbi` only when the DynamoRIO environment is configured;
+  `e9patch` only when `e9tool` is in `PATH` or `HERMIT_E9TOOL` is set
 
 If the mount-namespace probe fails, the job falls back to
 `cargo test -p hermit --lib --bins` only.
