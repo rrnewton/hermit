@@ -188,9 +188,8 @@ jobs:
     - name: Standard command strict-verify compatibility tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    - name: Strict compatibility envelope (nonblocking)
+    - name: Strict compatibility envelope (blocking)
       if: steps.namespaces.outputs.available == 'true'
-      continue-on-error: true
       run: ./validate.sh --strict-compat-only
     - name: Build pinned LevelDB integration fixture
       if: steps.namespaces.outputs.available == 'true'
