@@ -235,6 +235,7 @@ impl Default for GlobalState {
 
 impl Drop for GlobalState {
     fn drop(&mut self) {
+        // TODO-HUMAN-REVIEW(#643): Review shutdown-time aggregate warning delivery.
         if let Some(message) =
             format_unsupported_syscall_warning(&self.unsupported_syscalls.lock().unwrap())
         {
@@ -457,6 +458,7 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
             }
+            // TODO-HUMAN-REVIEW(#643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
                 self.unsupported_syscalls.lock().unwrap().insert(name);
                 R::ReportUnsupportedSyscall(())
@@ -1177,6 +1179,7 @@ pub enum GlobalRequest {
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
 
+    // TODO-HUMAN-REVIEW(#643): Review this new Detcore global RPC request.
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
 
@@ -1247,6 +1250,7 @@ pub enum GlobalResponse {
     RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
+    // TODO-HUMAN-REVIEW(#643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
     MarkPastFirstExecve(()),
     CreateChildThread(()),
@@ -1290,6 +1294,7 @@ where
     assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
 }
 
+// TODO-HUMAN-REVIEW(#643): Review the guest-to-global unsupported-syscall report path.
 pub async fn report_unsupported_syscall<G, T>(guest: &mut G, sysno: Sysno)
 where
     G: Guest<Detcore<T>>,
