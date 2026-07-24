@@ -33,6 +33,9 @@ pub struct StraceOpts {
 
 impl StraceOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        if global.log.is_some() || global.log_file.is_some() {
+            anyhow::bail!("the SaBRe strace backend does not support --log or --log-file");
+        }
         match global.backend {
             Some(Backend::Sabre) => super::backends::run_sabre(&self.program, &self.args),
             Some(backend) => anyhow::bail!(
