@@ -31,16 +31,7 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "35dc0af48504f96f9418204694fb3a9d913dd792" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "35dc0af48504f96f9418204694fb3a9d913dd792", default-features = false }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "35dc0af48504f96f9418204694fb3a9d913dd792" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "35dc0af48504f96f9418204694fb3a9d913dd792" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-shell-words = "1.1.1"
-tempfile = "3.27.0"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
-uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "9e3ddd04327d5ba64a99c23581dca4534a1be556" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "9e3ddd04327d5ba64a99c23581dca4534a1be556", default-features = false }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "9e3ddd04327d5ba64a99c23581dca4534a1be556" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "9e3ddd04327d5ba64a99c23581dca4534a1be556" }

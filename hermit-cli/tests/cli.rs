@@ -715,6 +715,47 @@ fn run_kvm_reports_hostname() {
     assert_eq!(stdout(&output), "reverie-kvm\n");
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+#[test]
+fn run_kvm_matches_ptrace_supplementary_groups() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/id").exists() {
+        return;
+    }
+
+    let kvm_args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/id",
+        "-G",
+    ];
+    let kvm_output = hermit(&kvm_args);
+    assert_success(&kvm_output, &kvm_args);
+
+    let ptrace_args = [
+        "run",
+        "--backend",
+        "ptrace",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/id",
+        "-G",
+    ];
+    let ptrace_output = hermit(&ptrace_args);
+    assert_success(&ptrace_output, &ptrace_args);
+
+    assert_eq!(
+        stdout(&kvm_output),
+        stdout(&ptrace_output),
+        "KVM must expose the same fixed-container supplementary groups as ptrace"
+    );
+}
+
 #[test]
 fn namespace_only_rejects_every_explicit_backend() {
     for backend in ["ptrace", "dbi", "kvm"] {
