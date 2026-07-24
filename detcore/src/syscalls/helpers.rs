@@ -15,6 +15,8 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -537,6 +539,81 @@ impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#268): Confirm select/pselect6 nonblockize + retry semantics,
+// including the pselect6 sigmask atomicity limitation documented on the handler.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Select {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        // A nonblocking select points `timeout` at a zeroed timeval so each probe
+        // returns immediately. Allocate that timeval in guest memory; the guard
+        // keeps it alive across the retry loop's repeated injections.
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut stack = guest.stack().await;
+        let mut memory = guest.memory();
+        let tp: AddrMut<libc::timeval> = stack.reserve();
+        memory
+            .write_value(tp, &tv)
+            .expect("write zeroed timeval for nonblocking select");
+        let guard = stack.commit().expect("stack.commit to succeed");
+        (self.with_timeout(Some(tp)), Some(guard))
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Select {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        // select(2) returns 0 when the timeout expires with no ready descriptors.
+        Ok(0)
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#268): pselect6's sigmask is applied per-probe rather than
+// atomically across the whole logical wait (see handle_pselect6 note).
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Pselect6 {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        // reverie models pselect6's timeout as a `timeval` pointer (see the
+        // Pselect6 typed_syscall definition). Point it at a zeroed value so each
+        // probe returns immediately; keep sigmask untouched.
+        let tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut stack = guest.stack().await;
+        let mut memory = guest.memory();
+        let tp: AddrMut<libc::timeval> = stack.reserve();
+        memory
+            .write_value(tp, &tv)
+            .expect("write zeroed timeval for nonblocking pselect6");
+        let guard = stack.commit().expect("stack.commit to succeed");
+        (self.with_timeout(Some(tp.into())), Some(guard))
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::Pselect6 {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
 /// While the read syscall is quite general, this nonblocking capacity is used
 /// ONLY for sockets and pipes.
 #[async_trait]
@@ -976,5 +1053,23 @@ mod tests {
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
         );
+    }
+
+    #[test]
+    fn select_pselect6_nonblocking_contract() {
+        // select/pselect6 report "would block" the same way poll does: a zero
+        // return means no fds are ready, so the deterministic retry loop must
+        // treat Ok(0) as "try again" and a logical timeout as a 0 return.
+        let select = reverie::syscalls::Select::new();
+        assert!(select.syscall_would_have_blocked(Ok(0)));
+        assert!(!select.syscall_would_have_blocked(Ok(1)));
+        assert_eq!(select.signal_interrupt_errno(), Errno::EINTR);
+        assert_eq!(select.timeout_return_val(), Ok(0));
+
+        let pselect6 = reverie::syscalls::Pselect6::new();
+        assert!(pselect6.syscall_would_have_blocked(Ok(0)));
+        assert!(!pselect6.syscall_would_have_blocked(Ok(2)));
+        assert_eq!(pselect6.signal_interrupt_errno(), Errno::EINTR);
+        assert_eq!(pselect6.timeout_return_val(), Ok(0));
     }
 }
