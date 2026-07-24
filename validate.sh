@@ -479,6 +479,8 @@ function hermit_verify_smoke {
         /bin/echo "$SMOKE_MARKER"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
 # Run one known-compatible application at L2. Each row has its own hard timeout
 # so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
