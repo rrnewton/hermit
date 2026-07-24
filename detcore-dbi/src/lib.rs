@@ -201,7 +201,7 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
     })?;
     let direct = directory.join("libhermit.so");
     let deps = directory.join("deps/libhermit.so");
-    [direct, deps]
+    [deps, direct]
         .into_iter()
         .find(|runtime| runtime.is_file())
         .ok_or_else(|| {
