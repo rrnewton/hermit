@@ -15,6 +15,7 @@ mod network;
 mod random;
 mod time;
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use reverie::Errno;
@@ -27,6 +28,13 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Close;
+use reverie::syscalls::EfdFlags;
+use reverie::syscalls::Eventfd2;
+use reverie::syscalls::Fcntl;
+use reverie::syscalls::FcntlCmd;
+use reverie::syscalls::OFlag;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
@@ -146,24 +154,48 @@ impl Tool for Replayer {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Open(call) => {
+                let cloexec = call.flags().contains(OFlag::O_CLOEXEC);
+                if let Some(source) = self.open_fd_alias_source(guest, syscall, call.flags()) {
+                    self.handle_fd_alias_open(guest, source, cloexec).await
+                } else {
+                    self.handle_virtual_fd_create(guest, cloexec).await
+                }
+            }
+            Syscall::Openat(call) => {
+                let cloexec = call.flags().contains(OFlag::O_CLOEXEC);
+                if let Some(source) = self.open_fd_alias_source(guest, syscall, call.flags()) {
+                    self.handle_fd_alias_open(guest, source, cloexec).await
+                } else {
+                    self.handle_virtual_fd_create(guest, cloexec).await
+                }
+            }
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup2(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup3(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
-            Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
-            // FIXME: Not all fcntl cases are simple.
+            Syscall::Fcntl(call)
+                if matches!(
+                    call.cmd(),
+                    FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
+                ) =>
+            {
+                self.handle_replayed_fd_operation(guest, syscall).await
+            }
+            Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
+                self.handle_replayed_fd_operation(guest, syscall).await
+            }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
@@ -197,8 +229,134 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
-    /// Replays the recorded result of `close` while preserving its effect on
-    /// descriptors created by syscalls that are injected during replay.
+    fn open_fd_alias_source<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+        flags: OFlag,
+    ) -> Option<i32> {
+        let access_mode = flags.bits() & libc::O_ACCMODE;
+        let allowed_flags = libc::O_ACCMODE | libc::O_CLOEXEC;
+        if flags.bits() & !allowed_flags != 0
+            || !matches!(access_mode, libc::O_WRONLY | libc::O_RDWR)
+        {
+            return None;
+        }
+        let path = match syscall {
+            Syscall::Open(call) => call.path().map(|path| path.read(&guest.memory())),
+            Syscall::Openat(call) => call.path().map(|path| path.read(&guest.memory())),
+            _ => return None,
+        };
+        let Some(Ok(path)) = path else {
+            return None;
+        };
+        let path = path.as_os_str().as_bytes();
+        match path {
+            b"/dev/stdout" => return Some(libc::STDOUT_FILENO),
+            b"/dev/stderr" => return Some(libc::STDERR_FILENO),
+            _ => {}
+        }
+        let suffix = [
+            b"/proc/self/fd/".as_slice(),
+            b"/proc/thread-self/fd/",
+            b"/dev/fd/",
+        ]
+        .into_iter()
+        .find_map(|prefix| path.strip_prefix(prefix))?;
+        std::str::from_utf8(suffix)
+            .ok()?
+            .parse()
+            .ok()
+            .filter(|fd| matches!(*fd, libc::STDOUT_FILENO | libc::STDERR_FILENO))
+    }
+
+    async fn handle_fd_alias_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        source: i32,
+        cloexec: bool,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            let cmd = if cloexec {
+                FcntlCmd::F_DUPFD_CLOEXEC(expected as i32)
+            } else {
+                FcntlCmd::F_DUPFD(expected as i32)
+            };
+            let actual = guest
+                .inject_with_retry(Fcntl::new().with_fd(source).with_cmd(cmd))
+                .await
+                .unwrap_or_else(|error| panic!("could not replay FD alias open: {error}"));
+            assert_eq!(actual, expected, "FD alias open returned a different slot");
+        }
+        recorded
+    }
+
+    pub(super) async fn reserve_replay_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        cloexec: bool,
+    ) {
+        let flags = if cloexec {
+            EfdFlags::EFD_CLOEXEC
+        } else {
+            EfdFlags::empty()
+        };
+        let placeholder = guest
+            .inject_with_retry(Eventfd2::new().with_count(0).with_flags(flags))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("could not reserve replay FD {fd} with an eventfd: {error}")
+            });
+        if placeholder != i64::from(fd) {
+            let _ = guest.inject(Close::new().with_fd(placeholder as i32)).await;
+            panic!(
+                "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
+            );
+        }
+    }
+
+    async fn handle_virtual_fd_create<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        cloexec: bool,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(fd) = recorded {
+            self.reserve_replay_fd(guest, fd as i32, cloexec).await;
+        }
+        recorded
+    }
+
+    async fn handle_replayed_fd_operation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            let actual = guest
+                .inject_with_retry(syscall)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "replayed FD operation {:?} failed after recording returned {expected}: {error}",
+                        syscall
+                    )
+                });
+            if actual != expected {
+                panic!(
+                    "replay FD namespace diverged for {:?}: recorded {expected}, replayed {actual}",
+                    syscall
+                );
+            }
+        }
+        recorded
+    }
+
+    /// Replays the recorded result of `close` while preserving its physical FD
+    /// namespace effect.
     async fn handle_close<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -206,18 +364,20 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
 
-        if recorded.is_ok() {
-            // Some descriptor creators (for example memfd_create and
-            // epoll_create1) are injected in both record and replay modes. A
-            // replayed close must therefore release the physical descriptor as
-            // well as the logical Detcore entry. EBADF is expected when the fd
-            // came from a replay-only recorded open and has no physical peer.
-            if let Err(error) = guest.inject(syscall).await
-                && error != Errno::EBADF
-            {
+        // Linux releases a descriptor even when close reports EINTR, EIO,
+        // ENOSPC, or EDQUOT. EBADF leaves the namespace unchanged, while
+        // ERESTARTSYS means Reverie must restart the injection first.
+        if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
+            && let Err(error) = guest.inject(syscall).await
+        {
+            if error == Errno::EBADF {
+                // Some replayed descriptor sources, notably SCM_RIGHTS,
+                // currently have no physical peer.
+                tracing::debug!(?syscall, "replayed close had no physical descriptor");
+            } else {
                 tracing::warn!(
                     ?error,
-                    "physical close during replay differed from the recorded success"
+                    "physical close during replay differed from the recorded result"
                 );
             }
         }

@@ -128,17 +128,13 @@ impl Replayer {
         let fd = syscall.fd();
 
         if fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO {
-            // Always let these through since they affect what we get to see.
-            //
-            // TODO: It would be better to do correct file descriptor tracking
-            // to avoid edge cases where a program may close the stderr/stdout
-            // file descriptors and immediately open a file. In that case,
-            // output would go to a file instead (which should *not* be let
-            // through).
-            guest.inject_with_retry(Syscall::from(syscall)).await
-        } else {
-            Ok(count)
+            // Preserve visible output when these are inherited or duplicated
+            // from a real stream. A replay-only open uses an eventfd placeholder,
+            // so injection has no external output and its result is ignored.
+            let _ = guest.inject_with_retry(Syscall::from(syscall)).await;
         }
+
+        Ok(count)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(
@@ -195,9 +191,8 @@ impl Replayer {
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
-            // Replayed opens do not necessarily create host file descriptors.
-            // Detcore updates the logical descriptor metadata after this returns.
-            next_event!(guest, Return)
+            self.handle_replayed_fd_operation(guest, Syscall::from(syscall))
+                .await
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
