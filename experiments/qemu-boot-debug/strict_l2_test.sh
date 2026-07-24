@@ -109,6 +109,7 @@ printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
   "$kernel_image" "$initramfs_image" "$run_dir"
 
 # AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#553)
 # The ptrace verifier captures guest stdout without replaying it. Run the exact
 # guest once under strict mode to assert the init success marker, then run the
 # same command under --verify for the L2 comparison.

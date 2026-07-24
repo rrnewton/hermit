@@ -58,6 +58,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#553)
 only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
@@ -905,6 +906,7 @@ if ((STRICT_COMPAT_ONLY == 1)); then
 fi
 
 # AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#553)
 if ((QEMU_L2_ONLY == 1)); then
     run_check "Build release Hermit for QEMU L2" \
         cargo build --release -p hermit

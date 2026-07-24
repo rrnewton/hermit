@@ -68,6 +68,7 @@ jobs:
       run: cargo fmt --all -- --check
 
   # AUTONOMOUS-BOT-IMPLEMENTED
+  # TODO-HUMAN-REVIEW(#553)
   qemu-l2:
     name: QEMU strict L2 boot (optional heavyweight)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.qemu_l2 }}
