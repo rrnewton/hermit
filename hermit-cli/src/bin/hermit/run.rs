@@ -134,8 +134,8 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Enable fail-closed strict deterministic mode. Deterministic scheduling and I/O are the
+    /// default; this explicit flag additionally rejects unsupported syscalls immediately.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
@@ -924,14 +924,22 @@ fn display_runopts4() {
 }
 
 #[test]
-fn strict_flag_preserves_deterministic_defaults() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+    let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    normal.validate_args_with_perf_support(true).unwrap();
+    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
 
-    assert!(ro.det_opts.det_config.sequentialize_threads);
-    assert!(ro.det_opts.det_config.deterministic_io);
-    assert!(!ro.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    strict.validate_args_with_perf_support(true).unwrap();
+
+    assert!(strict.det_opts.det_config.sequentialize_threads);
+    assert!(strict.det_opts.det_config.deterministic_io);
+    assert!(!strict.det_opts.det_config.passthru_opt);
+    assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", strict),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
@@ -1497,6 +1505,11 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#644): Review explicit strict mode failing on unsupported syscalls.
+        if self.strict {
+            config.panic_on_unsupported_syscalls = true;
+        }
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
