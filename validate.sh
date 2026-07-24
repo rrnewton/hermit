@@ -593,7 +593,9 @@ function run_strict_compatibility_envelope {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe node node -e 'console.log(42)' \
+    # Avoid host instrumentation wrappers in /usr/local/bin. The distro ELF is
+    # the runtime whose determinism this probe is intended to measure.
+    strict_compatibility_probe node /usr/bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
