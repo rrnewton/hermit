@@ -102,6 +102,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pipe2
         | Sysno::poll
         | Sysno::ppoll
+        | Sysno::pselect6
+        | Sysno::select
         | Sysno::prlimit64
         | Sysno::pread64
         | Sysno::read
@@ -347,7 +349,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
-        | Sysno::pselect6
         | Sysno::ptrace
         | Sysno::putpmsg
         | Sysno::pwrite64
@@ -380,7 +381,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setscheduler
         | Sysno::seccomp
         | Sysno::security
-        | Sysno::select
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
@@ -460,7 +460,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 39, 224]);
+        assert_eq!(counts, [112, 39, 222]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 

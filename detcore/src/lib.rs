@@ -703,9 +703,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // TODO(T137258824): add proper Select / PSelect6
-                // Sysno::pselect6,
-                // Sysno::select,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Sysno::select,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Sysno::pselect6,
             ]);
 
             if do_sched {
@@ -1387,6 +1388,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                Syscall::Select(s) => self.handle_select(guest, s).await,
+                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
                 Syscall::EpollCreate(s) => {
