@@ -35,6 +35,11 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
+    /// The execution backend installs a deterministic CPUID policy without instruction faults.
+    #[serde(default)]
+    #[clap(skip)]
+    pub cpuid_virtualized_by_backend: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and

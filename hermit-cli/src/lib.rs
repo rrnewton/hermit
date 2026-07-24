@@ -377,7 +377,7 @@ const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
 async fn run_kvm(
     command: &Command,
-    config: DetConfig,
+    mut config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
@@ -448,6 +448,7 @@ async fn run_kvm(
     let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
+    config.cpuid_virtualized_by_backend = true;
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     backend

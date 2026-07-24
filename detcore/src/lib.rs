@@ -589,6 +589,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::munmap,
                 Sysno::mremap,
                 Sysno::fcntl,
+                Sysno::arch_prctl,
                 Sysno::ioctl,
                 Sysno::futex,
                 Sysno::clone,
@@ -1231,6 +1232,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                     }
                 }
+                Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 Syscall::Uname(s) => self.handle_uname(guest, s).await,
                 Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
@@ -1513,6 +1515,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::ppoll)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::arch_prctl)
         );
     }
 }
