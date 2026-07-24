@@ -20,6 +20,30 @@ fields, maintain Detcore bookkeeping, or explicitly pass the call through.
 Conversely, a direct syscall can repeat when all of its inputs and host state
 are frozen, but Hermit does not enforce that property.
 
+### Post-Snapshot `madvise` Policy
+
+The historical counts below predate Detcore's `madvise(2)` handler. Current
+optimized run mode and record/replay subscriptions trap `madvise` and apply this
+explicit policy:
+
+- Normal ptrace/DBI runs forward `MADV_NORMAL`, `MADV_RANDOM`,
+  `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_DONTNEED`, and supported advice
+  with guest-visible fork, dump, or guard semantics. Record/replay treats pure
+  hints as fixed-success no-ops and returns fixed `ENOSYS` for every guest-semantic
+  advice because replay replaces file mappings with anonymous mappings and cannot
+  reproduce their mapping-dependent effects.
+- Host-pressure-dependent reclaim, KSM, and THP controls (`MADV_FREE`, `MADV_COLD`,
+  `MADV_PAGEOUT`, and related advice) return fixed success after alignment and
+  overflow validation without consulting backend-specific mapping state.
+- `MADV_REMOVE` and synchronous population/collapse return fixed `EINVAL`;
+  hardware-failure injection returns fixed `EPERM`; unknown advice returns
+  fixed `EINVAL`. Aligned, known zero-length probes succeed; unaligned calls
+  return `EINVAL`.
+
+KVM accepts pure access-pattern/prefetch hints as deterministic no-ops. Advice
+whose memory, fork, dump, backing-store, or guard semantics the pinned KVM
+executor cannot reproduce returns deterministic `ENOSYS`.
+
 ## Terminology And Scope
 
 - **Emulated** means Detcore returns a result without executing the guest's
