@@ -37,14 +37,14 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        self.0 >= other.0
+        self == other
     }
 }
 
 /// hermit record/replay version.
 // NB: Increase the version number when there's any breaking changes, i.e.:
 // when new syscalls are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x101);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x102);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,6 +214,13 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_version_requires_an_exact_match() {
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x101)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x103)));
+    }
 
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
