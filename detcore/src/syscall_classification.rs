@@ -25,8 +25,8 @@ pub(crate) enum SyscallClassification {
     Determinized,
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
-    /// The syscall retains the legacy fail-closed-or-forward policy pending investigation.
-    Unclassified,
+    /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
+    Unsupported,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -207,62 +207,105 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
-        // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
-        // TODO/FIXME: These syscalls have not been classified. They temporarily use
-        // the legacy passthrough policy and may need deterministic handling. Each must
-        // be investigated and moved to DETERMINIZED or PASS-THRU.
+        // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+        // Every matching classification issue recommends PASS-THRU. These remain
+        // conditional on Hermit's fixed-container and stable-state assumptions.
         Sysno::_sysctl
-        | Sysno::acct
-        | Sysno::add_key
-        | Sysno::adjtimex
         | Sysno::afs_syscall
-        | Sysno::bpf
-        | Sysno::cachestat
         | Sysno::chown
         | Sysno::chroot
-        | Sysno::clock_adjtime
-        | Sysno::clock_settime
-        | Sysno::close_range
-        | Sysno::copy_file_range
         | Sysno::create_module
-        | Sysno::delete_module
-        | Sysno::epoll_pwait2
         | Sysno::faccessat
-        | Sysno::fallocate
-        | Sysno::fanotify_init
-        | Sysno::fanotify_mark
         | Sysno::fchmod
         | Sysno::fchmodat2
         | Sysno::fchown
         | Sysno::fchownat
         | Sysno::fgetxattr
+        | Sysno::fremovexattr
+        | Sysno::fsetxattr
+        | Sysno::fsync
+        | Sysno::get_kernel_syms
+        | Sysno::get_thread_area
+        | Sysno::getpmsg
+        | Sysno::getresgid
+        | Sysno::getresuid
+        | Sysno::lchown
+        | Sysno::link
+        | Sysno::lremovexattr
+        | Sysno::lsetxattr
+        | Sysno::mbind
+        | Sysno::mknod
+        | Sysno::mknodat
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::modify_ldt
+        | Sysno::msync
+        | Sysno::munlock
+        | Sysno::munlockall
+        | Sysno::nfsservctl
+        | Sysno::personality
+        | Sysno::pkey_alloc
+        | Sysno::pkey_free
+        | Sysno::pkey_mprotect
+        | Sysno::putpmsg
+        | Sysno::query_module
+        | Sysno::readahead
+        | Sysno::readlinkat
+        | Sysno::rename
+        | Sysno::renameat
+        | Sysno::sched_get_priority_max
+        | Sysno::sched_get_priority_min
+        | Sysno::security
+        | Sysno::set_mempolicy
+        | Sysno::set_thread_area
+        | Sysno::symlink
+        | Sysno::sync
+        | Sysno::sync_file_range
+        | Sysno::syncfs
+        | Sysno::truncate
+        | Sysno::tuxcall
+        | Sysno::uselib
+        | Sysno::vserver => SyscallClassification::PassThrough,
+        // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+
+        // ===== UNSUPPORTED SYSCALLS =====
+        // These require a deterministic handler or further investigation. Normal mode
+        // records their use for an aggregate warning and preserves legacy forwarding;
+        // --panic-on-unsupported-syscalls stops at the first use.
+        Sysno::acct
+        | Sysno::add_key
+        | Sysno::adjtimex
+        | Sysno::bpf
+        | Sysno::cachestat
+        | Sysno::clock_adjtime
+        | Sysno::clock_settime
+        | Sysno::close_range
+        | Sysno::copy_file_range
+        | Sysno::delete_module
+        | Sysno::epoll_pwait2
+        | Sysno::fallocate
+        | Sysno::fanotify_init
+        | Sysno::fanotify_mark
         | Sysno::finit_module
         | Sysno::flistxattr
         | Sysno::flock
-        | Sysno::fremovexattr
         | Sysno::fsconfig
-        | Sysno::fsetxattr
         | Sysno::fsmount
         | Sysno::fsopen
         | Sysno::fspick
-        | Sysno::fsync
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
-        | Sysno::get_kernel_syms
         | Sysno::get_mempolicy
         | Sysno::get_robust_list
-        | Sysno::get_thread_area
         | Sysno::getitimer
         | Sysno::getpeername
         | Sysno::getpgid
         | Sysno::getpgrp
-        | Sysno::getpmsg
         | Sysno::getppid
         | Sysno::getpriority
-        | Sysno::getresgid
-        | Sysno::getresuid
         | Sysno::getrlimit
         | Sysno::getsid
         | Sysno::getsockname
@@ -286,29 +329,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
-        | Sysno::lchown
-        | Sysno::link
         | Sysno::listen
         | Sysno::listmount
         | Sysno::listxattr
         | Sysno::llistxattr
         | Sysno::lookup_dcookie
-        | Sysno::lremovexattr
-        | Sysno::lsetxattr
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
-        | Sysno::mbind
         | Sysno::memfd_secret
         | Sysno::migrate_pages
         | Sysno::mincore
-        | Sysno::mknod
-        | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
-        | Sysno::modify_ldt
         | Sysno::mount
         | Sysno::mount_setattr
         | Sysno::move_mount
@@ -323,23 +355,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgget
         | Sysno::msgrcv
         | Sysno::msgsnd
-        | Sysno::msync
-        | Sysno::munlock
-        | Sysno::munlockall
         | Sysno::name_to_handle_at
-        | Sysno::nfsservctl
         | Sysno::open_by_handle_at
         | Sysno::open_tree
         | Sysno::openat2
         | Sysno::perf_event_open
-        | Sysno::personality
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
         | Sysno::pivot_root
-        | Sysno::pkey_alloc
-        | Sysno::pkey_free
-        | Sysno::pkey_mprotect
         | Sysno::prctl
         | Sysno::preadv
         | Sysno::preadv2
@@ -349,28 +373,20 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_writev
         | Sysno::pselect6
         | Sysno::ptrace
-        | Sysno::putpmsg
         | Sysno::pwrite64
         | Sysno::pwritev
         | Sysno::pwritev2
-        | Sysno::query_module
         | Sysno::quotactl
         | Sysno::quotactl_fd
-        | Sysno::readahead
-        | Sysno::readlinkat
         | Sysno::readv
         | Sysno::reboot
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
-        | Sysno::rename
-        | Sysno::renameat
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::rt_sigpending
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_get_priority_max
-        | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
         | Sysno::sched_getparam
         | Sysno::sched_getscheduler
@@ -379,16 +395,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setparam
         | Sysno::sched_setscheduler
         | Sysno::seccomp
-        | Sysno::security
         | Sysno::select
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::set_mempolicy
         | Sysno::set_mempolicy_home_node
-        | Sysno::set_thread_area
         | Sysno::setdomainname
         | Sysno::setfsgid
         | Sysno::setfsuid
@@ -416,31 +429,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::statmount
         | Sysno::swapoff
         | Sysno::swapon
-        | Sysno::symlink
-        | Sysno::sync
-        | Sysno::sync_file_range
-        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::tgkill
         | Sysno::times
         | Sysno::tkill
-        | Sysno::truncate
-        | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
-        | Sysno::uselib
         | Sysno::ustat
         | Sysno::vhangup
-        | Sysno::vmsplice
-        | Sysno::vserver => SyscallClassification::Unclassified,
-        // ===== END UNCLASSIFIED =====
+        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
         // make changes to the pinned table a compile error; this arm only satisfies the
         // external-enum language requirement and deliberately fails closed.
-        _unexpected => panic!("unclassified Sysno outside pinned ABI"),
+        _unexpected => panic!("unsupported Sysno outside pinned ABI"),
     }
 }
 
@@ -456,11 +461,11 @@ mod tests {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unclassified => counts[2] += 1,
+                SyscallClassification::Unsupported => counts[2] += 1,
             }
         }
 
-        assert_eq!(counts, [110, 39, 224]);
+        assert_eq!(counts, [110, 96, 167]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -511,9 +516,12 @@ mod tests {
             Sysno::getgroups,
             Sysno::getxattr,
             Sysno::lgetxattr,
+            Sysno::lchown,
+            Sysno::link,
             Sysno::linkat,
             Sysno::mkdir,
             Sysno::mkdirat,
+            Sysno::readlinkat,
             Sysno::removexattr,
             Sysno::renameat2,
             Sysno::rmdir,
@@ -523,17 +531,18 @@ mod tests {
             Sysno::umask,
             Sysno::unlink,
             Sysno::unlinkat,
+            Sysno::vserver,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         for sysno in [
             Sysno::add_key,
             Sysno::keyctl,
+            Sysno::kill,
             Sysno::prctl,
-            Sysno::readlinkat,
             Sysno::request_key,
         ] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
     }
 }
