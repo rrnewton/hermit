@@ -349,7 +349,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
-    /// Handle vectored reads, keeping deterministic RNG semantics for /dev/[u]random.
+    /// Handle vectored reads with deterministic semantics for /dev/random and /dev/urandom.
     pub async fn handle_readv_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
