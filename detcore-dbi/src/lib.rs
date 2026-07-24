@@ -211,16 +211,25 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_library_path()?;
+    let source = reverie_dbi::native_client_source_dir();
+    let source_identity = source
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::file_name)
+        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
     let directory = runtime
         .parent()
         .expect("runtime library path must have a parent")
-        .join("detcore-dbi-native");
+        .join(format!(
+            "detcore-dbi-native-{}",
+            source_identity.to_string_lossy()
+        ));
     fs::create_dir_all(&directory)?;
     let _build_lock = lock_native_client_build(&directory)?;
 
     let configure = Command::new("cmake")
         .arg("-S")
-        .arg(reverie_dbi::native_client_source_dir())
+        .arg(source)
         .arg("-B")
         .arg(&directory)
         .arg("-DCMAKE_BUILD_TYPE=Release")

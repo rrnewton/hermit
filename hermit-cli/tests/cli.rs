@@ -382,6 +382,30 @@ fn run_dbi_verifies_process_wait_lifecycle() {
 }
 
 #[test]
+fn run_dbi_verifies_shell_process_lifecycle() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/sh",
+        "-c",
+        "/bin/echo hello",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "hello\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
 fn run_kvm_executes_dynamic_guest() {
     if !Path::new("/dev/kvm").exists() {
         return;
