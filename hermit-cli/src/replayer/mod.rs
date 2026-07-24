@@ -148,7 +148,7 @@ impl Tool for Replayer {
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
@@ -197,6 +197,34 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    /// Replays the recorded result of `close` while preserving its effect on
+    /// descriptors created by syscalls that are injected during replay.
+    async fn handle_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+
+        if recorded.is_ok() {
+            // Some descriptor creators (for example memfd_create and
+            // epoll_create1) are injected in both record and replay modes. A
+            // replayed close must therefore release the physical descriptor as
+            // well as the logical Detcore entry. EBADF is expected when the fd
+            // came from a replay-only recorded open and has no physical peer.
+            if let Err(error) = guest.inject(syscall).await
+                && error != Errno::EBADF
+            {
+                tracing::warn!(
+                    ?error,
+                    "physical close during replay differed from the recorded success"
+                );
+            }
+        }
+
+        recorded
+    }
+
     // Check if we received the expected syscall or not.
     fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let thread = guest.tid();
