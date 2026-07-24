@@ -73,3 +73,38 @@ can remove native atomic contention in the multithreaded counter workload.
 Use `--output PATH` to retain multiple result sets outside the default ignored
 directory. Use `--hermit PATH --skip-build` to benchmark a specific existing
 Hermit executable.
+
+## Targeted backend comparison
+
+`targeted.py` isolates four backend cost shapes:
+
+| Benchmark | Fixed workload | Intended signal |
+| --- | --- | --- |
+| `cpu_bound` | 1,000,000 arithmetic iterations and no loop syscalls | Instruction execution and deterministic preemption cost. |
+| `syscall_heavy` | 100,000 raw calls, alternating `getpid` and `clock_gettime` | Per-syscall interception cost. |
+| `large_startup` | Traverse a 4 MiB executable text path once | Large-image translation and process startup cost. |
+| `mixed_workload` | 10,000 compute blocks, each followed by raw `getpid` | Amortized compute plus interception cost. |
+
+Run the complete matrix from the repository root:
+
+```sh
+with-proxy ./benchmarks/targeted.py
+```
+
+The default is five measured samples plus one warmup for native, ptrace, DBI,
+and KVM. Every Hermit command uses explicit `--strict`, `--log=error`, and
+no determinism relaxations. Before timing, the runner requires each backend to
+exit zero and produce byte-identical stdout to native. A backend or workload
+that fails this precheck is recorded as unavailable rather than misreported as
+a fast sample.
+
+The runner reports medians and ratios against the native median. Raw samples,
+commands, host metadata, and failure reasons are written under the ignored
+`benchmarks/results/targeted/` directory. Use `--backends`, `--benchmarks`,
+`--iterations`, and `--output` to select a smaller matrix or preserve
+multiple result sets. For example:
+
+```sh
+./benchmarks/targeted.py --skip-build --iterations 1 --warmups 0 \
+  --backends native,ptrace --benchmarks cpu_bound
+```
