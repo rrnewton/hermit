@@ -25,6 +25,8 @@ cd "$ROOT_DIR" || exit 1
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
+#   ./validate.sh --backend-compat-only dbi   # gate a backend's passing ratchet
+#   ./validate.sh --backend-compat-expand kvm # run all rows and report expansion
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -35,6 +37,8 @@ ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
+BACKEND_COMPAT_ONLY=""
+BACKEND_COMPAT_EXPAND=""
 QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -50,6 +54,16 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
+        --backend-compat-only)
+            BACKEND_COMPAT_ONLY=${2:-}
+            [[ $BACKEND_COMPAT_ONLY == dbi || $BACKEND_COMPAT_ONLY == kvm ]] || \
+                { echo "validate.sh: --backend-compat-only needs dbi or kvm" >&2; exit 2; }
+            shift 2 ;;
+        --backend-compat-expand)
+            BACKEND_COMPAT_EXPAND=${2:-}
+            [[ $BACKEND_COMPAT_EXPAND == dbi || $BACKEND_COMPAT_EXPAND == kvm ]] || \
+                { echo "validate.sh: --backend-compat-expand needs dbi or kvm" >&2; exit 2; }
+            shift 2 ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -66,6 +80,8 @@ only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
+[[ -n $BACKEND_COMPAT_ONLY ]] && ((only_modes += 1))
+[[ -n $BACKEND_COMPAT_EXPAND ]] && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -99,7 +115,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY BACKEND_COMPAT_ONLY
+readonly BACKEND_COMPAT_EXPAND QEMU_L2_ONLY
 
 checks=0
 failures=0
@@ -145,7 +162,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
-readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
+readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
@@ -154,6 +172,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
+readonly STRICT_COMPAT_EXPECTED=121
 COMPATIBILITY_MODE=strict
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
@@ -186,10 +205,55 @@ if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
 fi
+
+# Backend ratchets select commands from the same strict corpus. Expansion mode
+# runs every row and prints candidates that can be added without duplicating
+# command definitions. This DBI baseline was measured on 2026-07-24 with the
+# primary release binary; java timed out and the PATH file wrapper was not ELF.
+readonly DBI_COMPAT_EXPECTED=119
+declare -Ar DBI_COMPAT_PASSING_LABELS=(
+    [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
+    [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
+    [cargo]=1 [rustc]=1 [node]=1 [python3]=1 [git]=1 [gcc]=1 [g++]=1 [make]=1
+    [bzip2]=1 [gzip]=1 [xz]=1 [zstd]=1 [openssl]=1 [sort]=1 [uniq]=1 [tr]=1
+    [cut]=1 [tee]=1 [paste]=1 [comm]=1 [join]=1 [find]=1 [stat]=1
+    [basename]=1 [dirname]=1 [env]=1 [printenv]=1 [uname]=1 [factor]=1 [expr]=1
+    [dd]=1 [df]=1 [du]=1 [hostname]=1 [whoami]=1 [groups]=1 [tty]=1 [nproc]=1
+    [arch]=1 [realpath]=1 [readlink]=1 [mktemp]=1 [sha256sum]=1 [sha1sum]=1
+    [md5sum]=1 [wc-lines]=1 [nl]=1 [expand]=1 [unexpand]=1 [test]=1 [bracket]=1
+    [printf]=1 [sleep]=1 [stdbuf]=1 [nohup]=1 [nice]=1 [ionice]=1 [taskset]=1
+    [chrt]=1 [flock]=1 [logger]=1 [getopt]=1 [column]=1 [hexdump]=1 [xxd]=1
+    [strings]=1 [od]=1 [sum]=1 [cksum]=1 [b2sum]=1 [tsort]=1 [ptx]=1
+    [pinky]=1 [logname]=1 [users]=1 [uptime]=1 [diff]=1 [patch]=1 [grep]=1
+    [egrep]=1 [fgrep]=1 [sed]=1 [tar]=1 [cp]=1 [mv]=1 [rm]=1 [mkdir]=1
+    [rmdir]=1 [touch]=1 [chmod]=1 [chown]=1 [ln]=1 [date]=1 [cal]=1 [yes]=1
+    [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1 [csplit]=1
+    [split]=1 [install]=1 [mkfifo]=1 [cmp]=1
+)
+# KVM can open /dev/kvm, but its Linux ELF execution personality is not yet
+# implemented, so its measured envelope is 0/121 and has no blocking gate.
+readonly KVM_COMPAT_EXPECTED=0
+declare -Ar KVM_COMPAT_PASSING_LABELS=()
+if ((${#DBI_COMPAT_PASSING_LABELS[@]} != DBI_COMPAT_EXPECTED)); then
+    echo "validate.sh: DBI compatibility label set must contain exactly $DBI_COMPAT_EXPECTED rows" >&2
+    exit 2
+fi
+if ((${#KVM_COMPAT_PASSING_LABELS[@]} != KVM_COMPAT_EXPECTED)); then
+    echo "validate.sh: KVM compatibility label set must contain exactly $KVM_COMPAT_EXPECTED rows" >&2
+    exit 2
+fi
 RR_COMPAT_PASSED=0
 RR_COMPAT_FAILED=0
 RR_COMPAT_TOTAL=0
 RR_COMPAT_SKIPPED=0
+BACKEND_COMPAT_PASSED=0
+BACKEND_COMPAT_FAILED=0
+BACKEND_COMPAT_TOTAL=0
+BACKEND_COMPAT_SKIPPED=0
+BACKEND_COMPAT_EXPANDING=0
+declare -a BACKEND_COMPAT_PASSING_LABELS=()
+declare -a BACKEND_COMPAT_NEW_LABELS=()
+declare -a BACKEND_COMPAT_FAILED_LABELS=()
 declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
@@ -667,6 +731,85 @@ function rr_compatibility_probe {
     return 0
 }
 
+function backend_compatibility_label_selected {
+    local backend=$1
+    local label=$2
+
+    case "$backend" in
+        dbi) [[ -n ${DBI_COMPAT_PASSING_LABELS[$label]+selected} ]] ;;
+        kvm) [[ -n ${KVM_COMPAT_PASSING_LABELS[$label]+selected} ]] ;;
+        *) return 2 ;;
+    esac
+}
+
+function backend_compatibility_expected {
+    case "$1" in
+        dbi) printf "%s" "$DBI_COMPAT_EXPECTED" ;;
+        kvm) printf "%s" "$KVM_COMPAT_EXPECTED" ;;
+        *) return 2 ;;
+    esac
+}
+
+# Execute one selected ratchet row, or every row in expansion mode. Failures are
+# accumulated instead of returned so one unsupported program cannot hide later
+# expansion candidates.
+function backend_compatibility_probe {
+    local backend=$1
+    local label=$2
+    shift 2
+
+    local selected=0
+    local started_at=$SECONDS
+    local output_start
+    local status
+    local summary
+
+    backend_compatibility_label_selected "$backend" "$label" && selected=1
+    if ((BACKEND_COMPAT_EXPANDING == 0 && selected == 0)); then
+        BACKEND_COMPAT_SKIPPED=$((BACKEND_COMPAT_SKIPPED + 1))
+        return 0
+    fi
+
+    BACKEND_COMPAT_TOTAL=$((BACKEND_COMPAT_TOTAL + 1))
+    {
+        printf "=== %s compatibility: %s ===\n" "${backend^^}" "$label"
+        printf "Command: timeout %s %q run --backend %q --strict --verify --" \
+            "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN" "$backend"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if ((VERBOSE == 1)); then
+        printf "  %s compatibility probe: %s\n" "${backend^^}" "$label"
+    fi
+
+    if timeout "$STRICT_COMPAT_TIMEOUT" \
+        "$STRICT_COMPAT_HERMIT_BIN" run --backend "$backend" --strict --verify -- "$@" \
+        </dev/null >>"$LOG_FILE" 2>&1; then
+        status=0
+        BACKEND_COMPAT_PASSED=$((BACKEND_COMPAT_PASSED + 1))
+        BACKEND_COMPAT_PASSING_LABELS+=("$label")
+        if ((selected == 0)); then
+            BACKEND_COMPAT_NEW_LABELS+=("$label")
+        fi
+        printf "  ✅ %-4s %-12s PASS L2 (%ss)\n" "${backend^^}" "$label" "$((SECONDS - started_at))"
+    else
+        status=$?
+        BACKEND_COMPAT_FAILED=$((BACKEND_COMPAT_FAILED + 1))
+        BACKEND_COMPAT_FAILED_LABELS+=("$label")
+        summary=$(failure_summary "$output_start")
+        printf "  ❌ %-4s %-12s FAIL (exit %s: %s)\n" \
+            "${backend^^}" "$label" "$status" "$summary"
+    fi
+
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    return 0
+}
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
 # Run one known-compatible application at L2. Each row has its own hard timeout
@@ -677,6 +820,10 @@ function strict_compatibility_probe {
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         rr_compatibility_probe "$label" "$@"
+        return 0
+    fi
+    if [[ $COMPATIBILITY_MODE == dbi || $COMPATIBILITY_MODE == kvm ]]; then
+        backend_compatibility_probe "$COMPATIBILITY_MODE" "$label" "$@"
         return 0
     fi
 
@@ -725,13 +872,20 @@ function run_compatibility_corpus {
     local failed=0
     local total=0
 
-    if [[ $COMPATIBILITY_MODE == rr ]]; then
-        printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
-        printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
-    else
-        printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
-        printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
-    fi
+    case "$COMPATIBILITY_MODE" in
+        rr)
+            printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
+            printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE" ;;
+        dbi|kvm)
+            if ((BACKEND_COMPAT_EXPANDING == 1)); then
+                printf "\n== %s full compatibility expansion (L2) ==\n" "${COMPATIBILITY_MODE^^}"
+            else
+                printf "\n== %s compatibility baseline (blocking L2 gate) ==\n" "${COMPATIBILITY_MODE^^}"
+            fi ;;
+        *)
+            printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
+            printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE" ;;
+    esac
 
     strict_compatibility_probe echo /bin/echo hermit-compat \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1125,7 +1279,50 @@ function run_compatibility_corpus {
         return 1
     fi
 
+    if [[ $COMPATIBILITY_MODE == dbi || $COMPATIBILITY_MODE == kvm ]]; then
+        local expected
+        expected=$(backend_compatibility_expected "$COMPATIBILITY_MODE")
+        if ((BACKEND_COMPAT_EXPANDING == 1)); then
+            if ((BACKEND_COMPAT_TOTAL != STRICT_COMPAT_EXPECTED)); then
+                printf "❌ %s expansion selected %s rows; expected full corpus of %s\n" \
+                    "${COMPATIBILITY_MODE^^}" "$BACKEND_COMPAT_TOTAL" "$STRICT_COMPAT_EXPECTED"
+                return 1
+            fi
+            printf "%s expansion result: %s/%s passed L2; %s failed\n" \
+                "${COMPATIBILITY_MODE^^}" "$BACKEND_COMPAT_PASSED" \
+                "$BACKEND_COMPAT_TOTAL" "$BACKEND_COMPAT_FAILED"
+            printf "  passing labels (%s): %s\n" "$BACKEND_COMPAT_PASSED" \
+                "${BACKEND_COMPAT_PASSING_LABELS[*]:-(none)}"
+            printf "  failing labels (%s): %s\n" "$BACKEND_COMPAT_FAILED" \
+                "${BACKEND_COMPAT_FAILED_LABELS[*]:-(none)}"
+            printf "  newly passing labels (%s): %s\n" "${#BACKEND_COMPAT_NEW_LABELS[@]}" \
+                "${BACKEND_COMPAT_NEW_LABELS[*]:-(none)}"
+            return 0
+        fi
+        if ((BACKEND_COMPAT_TOTAL != expected)); then
+            printf "❌ %s compatibility baseline selected %s rows; expected %s (%s skipped)\n" \
+                "${COMPATIBILITY_MODE^^}" "$BACKEND_COMPAT_TOTAL" "$expected" \
+                "$BACKEND_COMPAT_SKIPPED"
+            return 1
+        fi
+        if ((BACKEND_COMPAT_FAILED == 0)); then
+            printf "✅ %s compatibility baseline (%s/%s passed L2; %s unselected)\n" \
+                "${COMPATIBILITY_MODE^^}" "$BACKEND_COMPAT_PASSED" \
+                "$BACKEND_COMPAT_TOTAL" "$BACKEND_COMPAT_SKIPPED"
+            return 0
+        fi
+        printf "❌ %s compatibility baseline (%s/%s passed L2, %s regressed; %s unselected)\n" \
+            "${COMPATIBILITY_MODE^^}" "$BACKEND_COMPAT_PASSED" \
+            "$BACKEND_COMPAT_TOTAL" "$BACKEND_COMPAT_FAILED" "$BACKEND_COMPAT_SKIPPED"
+        return 1
+    fi
+
     total=$((passed + failed))
+    if ((total != STRICT_COMPAT_EXPECTED)); then
+        printf "❌ Strict compatibility corpus contains %s rows; expected %s\n" \
+            "$total" "$STRICT_COMPAT_EXPECTED"
+        return 1
+    fi
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
         return 0
@@ -1151,6 +1348,26 @@ function run_rr_compatibility_envelope {
     COMPATIBILITY_MODE=rr
     run_compatibility_corpus || status=$?
     COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+function run_backend_compatibility_envelope {
+    local backend=$1
+    local expand=${2:-0}
+    local status=0
+
+    BACKEND_COMPAT_PASSED=0
+    BACKEND_COMPAT_FAILED=0
+    BACKEND_COMPAT_TOTAL=0
+    BACKEND_COMPAT_SKIPPED=0
+    BACKEND_COMPAT_EXPANDING=$expand
+    BACKEND_COMPAT_PASSING_LABELS=()
+    BACKEND_COMPAT_NEW_LABELS=()
+    BACKEND_COMPAT_FAILED_LABELS=()
+    COMPATIBILITY_MODE=$backend
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    BACKEND_COMPAT_EXPANDING=0
     return "$status"
 }
 
@@ -1355,6 +1572,36 @@ if ((RR_COMPAT_ONLY == 1)); then
     exit $?
 fi
 
+if [[ -n $BACKEND_COMPAT_ONLY ]]; then
+    run_check "Build release Hermit for ${BACKEND_COMPAT_ONLY^^} compatibility" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        expected=$(backend_compatibility_expected "$BACKEND_COMPAT_ONLY")
+        if ((expected == 0)); then
+            printf "SKIP: %s compatibility gate has no executable Linux guest ratchet yet\n" \
+                "${BACKEND_COMPAT_ONLY^^}"
+        else
+            run_check "${BACKEND_COMPAT_ONLY^^} compatibility baseline ($expected programs)" \
+                run_backend_compatibility_envelope "$BACKEND_COMPAT_ONLY" 0
+        fi
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+if [[ -n $BACKEND_COMPAT_EXPAND ]]; then
+    run_check "Build release Hermit for ${BACKEND_COMPAT_EXPAND^^} expansion" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        run_check "${BACKEND_COMPAT_EXPAND^^} full compatibility expansion ($STRICT_COMPAT_EXPECTED programs)" \
+            run_backend_compatibility_envelope "$BACKEND_COMPAT_EXPAND" 1
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#553)
 if ((QEMU_L2_ONLY == 1)); then
@@ -1399,6 +1646,10 @@ run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
 if ! run_strict_compatibility_envelope; then
     printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
+fi
+if ((DBI_COMPAT_EXPECTED > 0)); then
+    run_check "DBI compatibility baseline ($DBI_COMPAT_EXPECTED programs)" \
+        run_backend_compatibility_envelope dbi 0
 fi
 run_check "Record/replay compatibility baseline (128 programs)" \
     run_rr_compatibility_envelope
