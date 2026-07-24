@@ -3,7 +3,6 @@ name: CI (GitHub-hosted)
 on:
   push:
   pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
 # Hosted capacity is elastic. Do not add a concurrency group here: every push
