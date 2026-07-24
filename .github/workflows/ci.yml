@@ -40,7 +40,7 @@ jobs:
     - name: Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y bc bsdextrautils bzip2 cmake curl default-jdk-headless file g++ gcc gawk git gzip jq libpython3.12-testsuite libunwind-dev liblzma-dev lua5.4 make nginx nodejs openssl perl python3-full redis-server redis-tools sqlite3 util-linux xz-utils zlib1g-dev zstd
+        sudo apt-get install -y bc bsdextrautils bzip2 cmake curl default-jdk-headless file g++ gcc gawk git gzip jq libunwind-dev liblzma-dev lua5.4 make nginx nodejs openssl perl python3-full redis-server redis-tools sqlite3 util-linux xz-utils zlib1g-dev zstd
     - name: Enable unprivileged user and mount namespaces
       run: |
         if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -145,13 +145,13 @@ jobs:
         if command -v dnf >/dev/null; then
           sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
           sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-          for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml gdb lldb; do
+          for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml python3-test gdb lldb; do
             sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
           done
         elif command -v apt-get >/dev/null; then
           sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
           sudo apt-get install -y g++ libunwind-dev liblzma-dev
-          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox gdb lldb; do
+          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox libpython3.12-testsuite gdb lldb; do
             sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
           done
         else
@@ -163,6 +163,7 @@ jobs:
         test -r /proc/sys/kernel/perf_event_paranoid
         test -r /dev/kvm -a -w /dev/kvm
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
+        python3 -c 'import test.support'
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
     - name: PMU and CPUID test lane
       run: ./validate.sh --hardware-only --no-label-pr

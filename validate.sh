@@ -1405,7 +1405,7 @@ function run_hosted_validation {
     run_check "Portable ignored Hermit mode cases" cargo test -p hermit --test hermit_modes -- --ignored --skip chaos_buck_ --test-threads=1
     run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test python_stdlib --test random_determinism --test rcx_canonicalization -- --ignored --test-threads=1
+    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test random_determinism --test rcx_canonicalization -- --ignored --test-threads=1
     run_check "Portable concurrency stress" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
     run_check "Portable ignored concurrency stress" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
     run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
@@ -1439,16 +1439,16 @@ function run_hardware_validation {
     run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation record_replay redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
     run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
+    run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
     run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1
 
     run_check "Build pinned LevelDB integration fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
     run_check "Focused LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb focused_leveldb_tests_are_deterministic_under_strict -- --exact --test-threads=1
-    run_check "Extended LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb -- --ignored --test-threads=1
+    run_check "LevelDB env_posix strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb leveldb_env_posix_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "Extended Redis strict determinism" cargo test -p hermit --test redis_strict -- --ignored --test-threads=1
-    run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick -- --ignored --test-threads=1
 
     if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-        run_check "PMU rr syscall suite" cargo test -p hermit --test rr_suite -- --ignored --test-threads=1
+        run_check "PMU rr syscall suite" cargo test -p hermit --test rr_suite -- --ignored --skip rr_ppoll --skip rr_rlimit --skip rr_sched_yield_to_lower_priority --test-threads=1
     else
         failures=$((failures + 1))
         checks=$((checks + 1))

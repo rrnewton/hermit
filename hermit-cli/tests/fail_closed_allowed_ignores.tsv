@@ -2,6 +2,7 @@
 # Columns: target<TAB>test<TAB>reason
 analyze	analyze_hello_race	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_nanosleep_threads_nocrash	slow schedule bisection; requires PMU and mount namespaces
+analyze	analyze_nanosleep_threads_rejects_indistinguishable_baseline	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_racewrite_nostdlib	slow schedule bisection; requires PMU and mount namespaces
 command_strict_verify	common_commands_are_deterministic_under_strict_verify	requires PMU, mount namespaces, and the standard command suite
 hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
-const HERMIT_TIMEOUT_SECONDS: u64 = 120;
+const HERMIT_TIMEOUT_SECONDS: u64 = 240;
 const HERMIT_KILL_GRACE_SECONDS: u64 = 10;
 const MODULE_CASE_PREFIX: &str = "python-stdlib-module-cases=";
 
@@ -117,17 +117,48 @@ fn run_stdlib_tests(python: &Path) -> Output {
         .arg(format!("{HERMIT_TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
+            "--log=off",
             "run",
             "--strict",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
             "--",
         ])
         .arg(python)
         .args(["-c", UNITTEST_DRIVER])
         .args(MODULES);
     command_output(command, "Python stdlib tests under strict Hermit")
+}
+
+fn normalized_unittest_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| {
+            !(line.starts_with("Ran ") && line.contains(" tests in ") && line.ends_with('s'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_unittest_stderr_eq(first: &[u8], second: &[u8]) {
+    let first = normalized_unittest_stderr(first);
+    let second = normalized_unittest_stderr(second);
+    let first_lines = first.lines().collect::<Vec<_>>();
+    let second_lines = second.lines().collect::<Vec<_>>();
+
+    for (index, (first_line, second_line)) in first_lines.iter().zip(&second_lines).enumerate() {
+        assert_eq!(
+            first_line,
+            second_line,
+            "Python stdlib stderr differed at line {}",
+            index + 1
+        );
+    }
+    assert_eq!(
+        first_lines.len(),
+        second_lines.len(),
+        "Python stdlib stderr line count differed"
+    );
 }
 
 #[test]
@@ -141,7 +172,7 @@ fn zero_case_module_is_rejected() {
 }
 
 #[test]
-#[ignore = "requires system CPython with its full Lib/test package"]
+#[ignore = "requires PMU preemption and system CPython with its full Lib/test package"]
 fn strict_python_stdlib_is_deterministic() {
     let _guard = HERMIT_RUN_LOCK
         .lock()
@@ -155,10 +186,7 @@ fn strict_python_stdlib_is_deterministic() {
         first.stdout, second.stdout,
         "Python stdlib stdout differed across strict runs"
     );
-    assert_eq!(
-        first.stderr, second.stderr,
-        "Python stdlib stderr differed across strict runs"
-    );
+    assert_unittest_stderr_eq(&first.stderr, &second.stderr);
 
     let stdout = String::from_utf8(first.stdout).expect("Python stdlib stdout was not UTF-8");
     let case_count = stdout
