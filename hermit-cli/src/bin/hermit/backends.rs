@@ -13,6 +13,9 @@
 //! The DBI path launches the real guest through DynamoRIO and links the native
 //! client against Hermit's `detcore-dbi` runtime. That runtime instantiates the
 //! production [`detcore::Detcore`] Tool over [`reverie_dbi::DbiGuest`].
+//!
+//! The SaBRe path ([`hermit::Backend::Sabre`]) performs static rewriting with a
+//! Reverie plugin and is reachable only through `hermit --backend sabre strace`.
 
 use std::ffi::OsString;
 use std::fs;
