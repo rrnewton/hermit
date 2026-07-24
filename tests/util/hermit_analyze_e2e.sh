@@ -40,7 +40,7 @@ ANALYZE_OPTS="--run-arg=--network=host" \
     "$ANALYZE_DRIVER" "$HERMIT" "$HELLO_RACE"
 
 echo ":: [schedule_search] Localizing racewrite_nostdlib"
-ANALYZE_OPTS="--run-arg=--network=host --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo" \
+ANALYZE_OPTS="--run-arg=--network=host --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=foobar" \
     EXPECTED_OUTPUT="tests/c/simple/racewrite_nostdlib.c:35" \
     timeout "$ANALYZE_TIMEOUT" \
     "$ANALYZE_DRIVER" "$HERMIT" "$RACEWRITE"

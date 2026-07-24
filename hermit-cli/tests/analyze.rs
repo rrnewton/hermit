@@ -175,6 +175,42 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
     }
 }
 
+/// Exercises analyze's fail-closed endpoint check for a workload whose target
+/// outcome now also occurs under the non-chaos baseline schedule.
+fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts: &[&str]) {
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.arg("analyze");
+    command.args(analyze_opts);
+    command
+        .arg(format!("--report-file={}", report_file.display()))
+        .args(["--analyze-seed=0", "--search", "--"])
+        .args(["--chaos", "--summary", "--preemption-timeout=400000", "--"])
+        .arg(guest);
+
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly found distinct target and baseline schedules\n{combined}"
+    );
+    assert!(
+        combined.contains("baseline run matched target criteria when it should not"),
+        "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
+    );
+}
+
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_hello_race() {
@@ -196,7 +232,9 @@ fn analyze_racewrite_nostdlib() {
             "--selfcheck",
             "--run-arg=--base-env=empty",
             "--target-exit-code=0",
-            "--target-stdout=barfoo",
+            // The current non-chaos baseline is barfoo; analyze the opposite
+            // write order so the endpoints remain behaviorally distinct.
+            "--target-stdout=foobar",
         ],
         // The racing `write` syscall lives at this line in the guest source.
         "racewrite_nostdlib.c:35",
@@ -205,11 +243,10 @@ fn analyze_racewrite_nostdlib() {
 
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
-fn analyze_nanosleep_threads_nocrash() {
-    run_analyze(
-        "analyze nanosleep-threads-nocrash",
+fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
+    run_analyze_expect_baseline_collision(
+        "analyze nanosleep-threads baseline collision",
         &workloads().nanosleep_nocrash,
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
-        "",
     );
 }
