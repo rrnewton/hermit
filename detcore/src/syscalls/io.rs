@@ -106,7 +106,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// ppoll syscall (MAYHANG)
-    // TODO-HUMAN-REVIEW(PR-pending)
+    // TODO-HUMAN-REVIEW(PR-273)
     pub async fn handle_ppoll<G: Guest<Self>>(
         &self,
         guest: &mut G,
