@@ -716,10 +716,90 @@ fn run_kvm_reports_hostname() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#544): Confirm ptrace is the right KVM credential oracle.
+// TODO-HUMAN-REVIEW(#544): Confirm the host C compiler is acceptable for this KVM smoke guest.
 #[test]
-fn run_kvm_matches_ptrace_supplementary_groups() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/id").exists() {
+fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let compiler = ["cc", "gcc", "clang"]
+        .into_iter()
+        .find(|program| {
+            Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("KVM syscall regression requires cc, gcc, or clang on PATH");
+
+    let temp = tempfile::tempdir().expect("failed to create pipe guest directory");
+    let source = temp.path().join("pipe_roundtrip.c");
+    let binary = temp.path().join("pipe_roundtrip");
+    fs::write(
+        &source,
+        br#"#define _GNU_SOURCE
+#include <fcntl.h>
+#include <grp.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static int roundtrip(int flags) {
+    int fds[2];
+    char buffer[3] = {0};
+    int result = flags < 0 ? pipe(fds) : pipe2(fds, flags);
+    if (result != 0) return 1;
+    if (write(fds[1], "ok", 2) != 2) return 2;
+    if (read(fds[0], buffer, 2) != 2) return 3;
+    if (close(fds[0]) != 0 || close(fds[1]) != 0) return 4;
+    return strcmp(buffer, "ok") != 0;
+}
+
+int main(void) {
+    gid_t groups[1] = {0};
+    if (roundtrip(-1) || roundtrip(O_CLOEXEC | O_NONBLOCK)) return 1;
+    if (getgroups(0, NULL) != 1) return 5;
+    if (getgroups(1, groups) != 1 || groups[0] != 65534) return 6;
+    puts("kvm-syscalls-ok");
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write pipe guest");
+    let compile = Command::new(compiler)
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("failed to invoke C compiler");
+    assert!(
+        compile.status.success(),
+        "failed to compile pipe guest: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let program = binary.to_str().expect("pipe guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--tmp=/tmp",
+        "--base-env=minimal",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "kvm-syscalls-ok\n");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
+#[test]
+fn run_kvm_reports_fixed_supplementary_groups() {
+    if !Path::new("/dev/kvm").exists() {
         return;
     }
 
@@ -731,29 +811,15 @@ fn run_kvm_matches_ptrace_supplementary_groups() {
         "--verify",
         "--base-env=minimal",
         "--",
-        "/usr/bin/id",
+        "id",
         "-G",
     ];
     let kvm_output = hermit(&kvm_args);
     assert_success(&kvm_output, &kvm_args);
-
-    let ptrace_args = [
-        "run",
-        "--backend",
-        "ptrace",
-        "--strict",
-        "--base-env=minimal",
-        "--",
-        "/usr/bin/id",
-        "-G",
-    ];
-    let ptrace_output = hermit(&ptrace_args);
-    assert_success(&ptrace_output, &ptrace_args);
-
     assert_eq!(
         stdout(&kvm_output),
-        stdout(&ptrace_output),
-        "KVM must expose the same fixed-container supplementary groups as ptrace"
+        "0 65534\n",
+        "KVM must report its root-plus-overflow-group credential persona"
     );
 }
 
