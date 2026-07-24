@@ -86,7 +86,7 @@ pub enum SyscallEvent {
     Poll(PollEvent),
     SockOpt(SockOptEvent),
     EpollWait(EpollWaitEvent),
-    // TODO-HUMAN-REVIEW(#556): Audit the V2 record/replay event schema.
+    // TODO-HUMAN-REVIEW(#557): Audit the V2 record/replay event schema.
     WriteV2(WriteEvent),
     ReadV2(ReadEvent),
     ReadvV2(ReadEvent),
@@ -94,7 +94,7 @@ pub enum SyscallEvent {
 }
 
 /// Recorded output and signal side effects of a read syscall.
-// TODO-HUMAN-REVIEW(#556): Audit the recorded signalfd side-effect API.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded signalfd side-effect API.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadEvent {
     /// Bytes returned to the guest.
@@ -104,7 +104,7 @@ pub struct ReadEvent {
 }
 
 /// Recorded result and side effects of a write-family syscall.
-// TODO-HUMAN-REVIEW(#556): Audit the recorded output and SIGPIPE API.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded output and SIGPIPE API.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteEvent {
     pub result: Result<i64, Errno>,
@@ -119,7 +119,7 @@ pub struct WriteEvent {
 }
 
 /// Recorded result and captured-output side effect of ftruncate.
-// TODO-HUMAN-REVIEW(#556): Audit the recorded ftruncate side-effect API.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded ftruncate side-effect API.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FtruncateEvent {
     /// Recorded syscall result.

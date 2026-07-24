@@ -325,7 +325,7 @@ impl Recorder {
         result
     }
 
-    // TODO-HUMAN-REVIEW(#556): Audit captured-output ftruncate recording.
+    // TODO-HUMAN-REVIEW(#557): Audit captured-output ftruncate recording.
     pub(super) async fn handle_ftruncate<G: Guest<Self>>(
         &self,
         guest: &mut G,
