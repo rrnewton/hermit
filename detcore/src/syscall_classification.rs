@@ -26,6 +26,7 @@ pub(crate) enum SyscallClassification {
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
     /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
+    // TODO-HUMAN-REVIEW(#643): Review the issue-backed unsupported classification policy.
     Unsupported,
 }
 
