@@ -143,8 +143,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::write => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
-        // These existing passthroughs are classified as safe under Hermit container,
-        // serialization, and record/replay assumptions.
+        // These existing and triaged passthroughs are conditionally repeatable under
+        // Hermit's fixed-container, stable-filesystem, and serialization assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
         Sysno::access
         | Sysno::brk
         | Sysno::getcwd
@@ -159,7 +160,43 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::readlink
         | Sysno::set_robust_list
         | Sysno::set_tid_address
-        | Sysno::sigaltstack => SyscallClassification::PassThrough,
+        | Sysno::sigaltstack
+        // capget/capset/getgroups observe or update kernel credential state that starts
+        // from the fixed container identity on each run.
+        | Sysno::capget
+        | Sysno::capset
+        | Sysno::getgroups
+        // chdir/fchdir/faccessat2/umask are deterministic process-state transitions or
+        // checks given a fixed namespace, credential set, and filesystem image.
+        | Sysno::chdir
+        | Sysno::faccessat2
+        | Sysno::fchdir
+        | Sysno::umask
+        // chmod/fchmodat/linkat/mkdir/mkdirat/renameat2/rmdir/symlinkat/unlink/unlinkat
+        // repeat given stable guest-visible filesystem state with no external mutation.
+        | Sysno::chmod
+        | Sysno::fchmodat
+        | Sysno::linkat
+        | Sysno::mkdir
+        | Sysno::mkdirat
+        | Sysno::renameat2
+        | Sysno::rmdir
+        | Sysno::symlinkat
+        | Sysno::unlink
+        | Sysno::unlinkat
+        // getxattr/lgetxattr/removexattr/setxattr are deterministic for stable objects
+        // and do not introduce asynchronous state or new kernel objects.
+        | Sysno::getxattr
+        | Sysno::lgetxattr
+        | Sysno::removexattr
+        | Sysno::setxattr
+        // fdatasync/ftruncate have deterministic results for stable guest-owned files;
+        // physical flush latency is outside guest logical time.
+        | Sysno::fdatasync
+        | Sysno::ftruncate
+        // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
+        // handling, while KVM deterministically reports its current lack of signal support.
+        | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
         // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
@@ -174,10 +211,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::arch_prctl
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::capget
-        | Sysno::capset
-        | Sysno::chdir
-        | Sysno::chmod
         | Sysno::chown
         | Sysno::chroot
         | Sysno::clock_adjtime
@@ -188,17 +221,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::delete_module
         | Sysno::epoll_pwait2
         | Sysno::faccessat
-        | Sysno::faccessat2
         | Sysno::fallocate
         | Sysno::fanotify_init
         | Sysno::fanotify_mark
-        | Sysno::fchdir
         | Sysno::fchmod
-        | Sysno::fchmodat
         | Sysno::fchmodat2
         | Sysno::fchown
         | Sysno::fchownat
-        | Sysno::fdatasync
         | Sysno::fgetxattr
         | Sysno::finit_module
         | Sysno::flistxattr
@@ -210,7 +239,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fsopen
         | Sysno::fspick
         | Sysno::fsync
-        | Sysno::ftruncate
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -219,7 +247,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::get_mempolicy
         | Sysno::get_robust_list
         | Sysno::get_thread_area
-        | Sysno::getgroups
         | Sysno::getitimer
         | Sysno::getpeername
         | Sysno::getpgid
@@ -233,7 +260,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getsid
         | Sysno::getsockname
         | Sysno::getsockopt
-        | Sysno::getxattr
         | Sysno::init_module
         | Sysno::io_cancel
         | Sysno::io_destroy
@@ -254,9 +280,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
         | Sysno::lchown
-        | Sysno::lgetxattr
         | Sysno::link
-        | Sysno::linkat
         | Sysno::listen
         | Sysno::listmount
         | Sysno::listxattr
@@ -273,8 +297,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::memfd_secret
         | Sysno::migrate_pages
         | Sysno::mincore
-        | Sysno::mkdir
-        | Sysno::mkdirat
         | Sysno::mknod
         | Sysno::mknodat
         | Sysno::mlock
@@ -335,16 +357,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::reboot
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
-        | Sysno::removexattr
         | Sysno::rename
         | Sysno::renameat
-        | Sysno::renameat2
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::rmdir
         | Sysno::rt_sigpending
         | Sysno::rt_sigqueueinfo
-        | Sysno::rt_sigreturn
         | Sysno::rt_sigsuspend
         | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_get_priority_max
@@ -385,7 +403,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::settimeofday
         | Sysno::setuid
-        | Sysno::setxattr
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
@@ -396,7 +413,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::swapoff
         | Sysno::swapon
         | Sysno::symlink
-        | Sysno::symlinkat
         | Sysno::sync
         | Sysno::sync_file_range
         | Sysno::syncfs
@@ -408,10 +424,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::tkill
         | Sysno::truncate
         | Sysno::tuxcall
-        | Sysno::umask
         | Sysno::umount2
-        | Sysno::unlink
-        | Sysno::unlinkat
         | Sysno::unshare
         | Sysno::uselib
         | Sysno::ustat
@@ -444,7 +457,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [105, 15, 253]);
+        assert_eq!(counts, [105, 39, 229]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -466,6 +479,34 @@ mod tests {
             classify_syscall(Sysno::ppoll),
             SyscallClassification::Determinized
         );
+        for sysno in [
+            Sysno::capget,
+            Sysno::capset,
+            Sysno::chdir,
+            Sysno::chmod,
+            Sysno::faccessat2,
+            Sysno::fchdir,
+            Sysno::fchmodat,
+            Sysno::fdatasync,
+            Sysno::ftruncate,
+            Sysno::getgroups,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::linkat,
+            Sysno::mkdir,
+            Sysno::mkdirat,
+            Sysno::removexattr,
+            Sysno::renameat2,
+            Sysno::rmdir,
+            Sysno::rt_sigreturn,
+            Sysno::setxattr,
+            Sysno::symlinkat,
+            Sysno::umask,
+            Sysno::unlink,
+            Sysno::unlinkat,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
+        }
         for sysno in [
             Sysno::add_key,
             Sysno::arch_prctl,
