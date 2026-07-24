@@ -614,6 +614,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
                 Sysno::poll,
+                Sysno::ppoll,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -1206,6 +1207,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
             Syscall::Poll(s) => self.handle_poll(guest, s).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
             Syscall::EpollCreate(s) => {
                 self.handle_epoll_create1(guest, EpollCreate1::from(s))
                     .await
@@ -1430,7 +1433,7 @@ mod subscription_tests {
                 .any(|sysno| sysno == Sysno::clock_gettime)
         );
         assert!(
-            !subscriptions
+            subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::ppoll)
         );
