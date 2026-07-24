@@ -87,7 +87,7 @@ jobs:
 
     steps:
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#TBD)
+    # TODO-HUMAN-REVIEW(#647)
     - name: Remove stale checkout locks
       run: |
         if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
@@ -154,7 +154,7 @@ jobs:
 
     steps:
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#TBD)
+    # TODO-HUMAN-REVIEW(#647)
     - name: Remove stale checkout locks
       run: |
         if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then

@@ -90,7 +90,7 @@ jobs:
       VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
       # AUTONOMOUS-BOT-IMPLEMENTED
-      # TODO-HUMAN-REVIEW(#TBD)
+      # TODO-HUMAN-REVIEW(#647)
       - name: Remove stale checkout locks
         run: |
           if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
@@ -161,7 +161,7 @@ jobs:
       VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
       # AUTONOMOUS-BOT-IMPLEMENTED
-      # TODO-HUMAN-REVIEW(#TBD)
+      # TODO-HUMAN-REVIEW(#647)
       - name: Remove stale checkout locks
         run: |
           if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
