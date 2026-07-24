@@ -47,6 +47,59 @@ fn from_str(s: &str) -> [i8; 65] {
     ret
 }
 
+const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
+    let flags = flags as u32;
+    let random = flags & libc::GRND_RANDOM != 0;
+    let insecure = flags & libc::GRND_INSECURE != 0;
+
+    if flags & !GETRANDOM_ALLOWED_FLAGS != 0 || (random && insecure) {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
+// Linux's import_ubuf clamps getrandom requests to MAX_RW_COUNT on x86_64.
+const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
+
+fn getrandom_request_len(requested: usize) -> usize {
+    requested.min(GETRANDOM_MAX_BYTES)
+}
+
+fn write_random_chunk(
+    mut memory: impl MemoryAccess,
+    remote_buf: AddrMut<u8>,
+    local_buf: &[u8],
+) -> Result<usize, Errno> {
+    const PTRACE_WORD_SPLIT: usize = std::mem::size_of::<u64>() / 2;
+
+    if local_buf.len() != std::mem::size_of::<u64>() {
+        return memory.write(remote_buf, local_buf);
+    }
+
+    // safeptrace uses PTRACE_POKEDATA for exactly eight bytes, which bypasses guest page
+    // protections. Split that case so getrandom observes the same EFAULT boundary as Linux.
+    let first = memory.write(remote_buf, &local_buf[..PTRACE_WORD_SPLIT])?;
+    if first < PTRACE_WORD_SPLIT {
+        return Ok(first);
+    }
+    let Some(second_buf) = remote_buf
+        .as_raw()
+        .checked_add(PTRACE_WORD_SPLIT)
+        .and_then(AddrMut::<u8>::from_raw)
+    else {
+        return Ok(first);
+    };
+    match memory.write(second_buf, &local_buf[PTRACE_WORD_SPLIT..]) {
+        Ok(second) => Ok(first + second),
+        Err(_) => Ok(first),
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
@@ -148,26 +201,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         len: usize,
         source: &str,
     ) -> Result<usize, Error> {
-        let word_size = std::mem::size_of::<u64>();
-        let word_count = len / word_size + usize::from(!len.is_multiple_of(word_size));
-        let mut local_words = vec![0_u64; word_count];
-        // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
-        let local_buf =
-            unsafe { std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), len) };
-        guest.thread_state_mut().thread_prng().fill(local_buf);
-        let n = guest.memory().write(remote_buf, local_buf)?;
+        let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
+        let mut hasher = DefaultHasher::new();
+        let mut written = 0;
+
+        while written < len {
+            let remote_chunk = match remote_buf
+                .as_raw()
+                .checked_add(written)
+                .and_then(AddrMut::<u8>::from_raw)
+            {
+                Some(address) => address,
+                None if written == 0 => return Err(Errno::EFAULT.into()),
+                None => break,
+            };
+            let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
+            // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
+            let local_buf = unsafe {
+                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
+            };
+            guest.thread_state_mut().thread_prng().fill(local_buf);
+            let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
+                Ok(n) => n,
+                Err(_) if written > 0 => break,
+                Err(error) => return Err(error.into()),
+            };
+            if n == 0 {
+                if written == 0 {
+                    return Err(Errno::EFAULT.into());
+                }
+                break;
+            }
+            if cfg!(debug_assertions) {
+                Hash::hash_slice(&local_buf[..n], &mut hasher);
+            }
+            written += n;
+            if n < chunk_len {
+                break;
+            }
+        }
+
         if cfg!(debug_assertions) {
-            let mut hasher = DefaultHasher::new();
-            Hash::hash_slice(local_buf, &mut hasher);
             detlog!(
                 "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
                 guest.thread_state().dettid,
                 source,
-                n,
+                written,
                 hasher.finish()
             );
         }
-        Ok(n)
+        Ok(written)
     }
 
     /// uname syscall
@@ -198,15 +281,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(ret)
     }
 
-    /// getrandom system call
+    /// Fill `getrandom(2)` requests from the current thread's seeded deterministic PRNG.
+    /// Supported blocking/source-selection flags share that always-ready stream; invalid Linux
+    /// flag combinations are rejected before guest memory is touched.
     pub async fn handle_getrandom<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Getrandom,
     ) -> Result<i64, Error> {
+        validate_getrandom_flags(call.flags())?;
+        let len = getrandom_request_len(call.buflen());
+        if len == 0 {
+            return Ok(0);
+        }
+
         let buf = call.buf().ok_or(Errno::EFAULT)?;
 
-        let n = self.fill_random_bytes(guest, buf, call.buflen(), "getrandom")?;
+        let n = self.fill_random_bytes(guest, buf, len, "getrandom")?;
         Ok(n as i64)
     }
 
@@ -289,5 +380,45 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn getrandom_accepts_linux_flags() {
+        for flags in [
+            0,
+            libc::GRND_NONBLOCK as usize,
+            libc::GRND_RANDOM as usize,
+            (libc::GRND_NONBLOCK | libc::GRND_RANDOM) as usize,
+            libc::GRND_INSECURE as usize,
+            (libc::GRND_NONBLOCK | libc::GRND_INSECURE) as usize,
+            1_usize << 32,
+        ] {
+            assert!(
+                validate_getrandom_flags(flags).is_ok(),
+                "valid flags rejected: {flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn getrandom_rejects_invalid_flags() {
+        for flags in [
+            0x8000_0000,
+            (1_usize << 32) | 0x8000_0000,
+            (libc::GRND_RANDOM | libc::GRND_INSECURE) as usize,
+        ] {
+            assert_eq!(validate_getrandom_flags(flags), Err(Errno::EINVAL));
+        }
+    }
+
+    #[test]
+    fn getrandom_caps_requests_at_linux_max_rw_count() {
+        assert_eq!(getrandom_request_len(16), 16);
+        assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
     }
 }
