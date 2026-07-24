@@ -559,10 +559,18 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
-    async fn further(&mut self) {
+    async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
-        if self.count <= YIELDS_FIRST {
+        if blocking {
+            if self.count <= YIELDS_FIRST {
+                std::thread::yield_now();
+            } else {
+                let round = self.count - YIELDS_FIRST;
+                let micros = if round > 13 { 10_000 } else { 2 ^ round };
+                std::thread::sleep(Duration::from_micros(micros));
+            }
+        } else if self.count <= YIELDS_FIRST {
             tokio::task::yield_now().await;
         } else {
             let round = self.count - YIELDS_FIRST;
@@ -582,8 +590,30 @@ impl Default for Backoff {
     }
 }
 
+pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
+    sched_loop_inner(sched, timer, false, None).await;
+}
+
+pub(crate) async fn sched_loop_external(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    observer: SchedulerObserver,
+) {
+    sched_loop_inner(sched, timer, true, Some(observer)).await;
+}
+
+async fn sched_loop_inner(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    blocking_backoff: bool,
+    observer: Option<SchedulerObserver>,
+) {
     info!("[scheduler] daemon task starting up, waiting for guest thread start..");
+    if let Some(observer) = &observer {
+        observer("daemon task starting; waiting for guest thread");
+    }
     let (iv, stop_after_iter) = {
         // Block until queue is populated.
         let sched = sched.lock().unwrap();
@@ -591,17 +621,21 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
     };
     iv.get().await;
     info!("[scheduler] guest in queue, scheduler proceeding..",);
+    if let Some(observer) = &observer {
+        observer("guest registered; deterministic scheduler proceeding");
+    }
     let mut iter: u64 = 0;
     // We keep track of whether the last turn was a SKIP:
     let mut last_res = Err(SkipTurn);
     let mut backoff = Backoff::new();
+    let mut observed_turn = false;
 
     loop {
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
         // SPINNING below), we need to make sure that other threads can progress so we don't
         // busy-wait too tightly.
         if last_res.is_err() {
-            backoff.further().await;
+            backoff.further(blocking_backoff).await;
         } else {
             backoff.reset();
         }
@@ -623,6 +657,9 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
             let sched = sched.lock().unwrap();
             if sched.run_queue.is_empty() && sched.blocked.is_empty() {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
+                if let Some(observer) = &observer {
+                    observer("run queue empty; scheduler completed");
+                }
                 return;
             } else if let Some(stop) = sched.stop_after_turn
                 && sched.turn > stop
@@ -639,6 +676,12 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+        if last_res.is_ok() && !observed_turn {
+            if let Some(observer) = &observer {
+                observer("completed a deterministic scheduling turn");
+            }
+            observed_turn = true;
+        }
     }
 }
 

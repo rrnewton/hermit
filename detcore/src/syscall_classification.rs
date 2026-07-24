@@ -137,6 +137,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::utimes
         | Sysno::vfork
         | Sysno::wait4
+        | Sysno::waitid
         | Sysno::write => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
@@ -416,7 +417,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::vhangup
         | Sysno::vmsplice
         | Sysno::vserver
-        | Sysno::waitid
         | Sysno::writev => SyscallClassification::Unclassified,
         // ===== END UNCLASSIFIED =====
 
@@ -443,7 +443,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [103, 17, 253]);
+        assert_eq!(counts, [104, 17, 252]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 

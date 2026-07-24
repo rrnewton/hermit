@@ -861,9 +861,9 @@ where
     }
 }
 
-async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
+pub(crate) async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
 where
-    C: NonblockableSyscall,
+    C: SyscallInfo,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {

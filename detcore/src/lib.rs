@@ -596,6 +596,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::fork,
                 Sysno::vfork,
                 Sysno::wait4,
+                Sysno::waitid,
                 Sysno::setsid,
                 Sysno::uname,
                 Sysno::exit_group,
@@ -1018,6 +1019,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
         if let Some(ptr) = guest.auxv().at_random() {
@@ -1173,6 +1175,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // child registers itself and runs to exec/exit.
                 Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
+                Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 Syscall::Gettimeofday(s) => {
