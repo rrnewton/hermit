@@ -37,14 +37,15 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        self.0 >= other.0
+        self.0 >= other.0 && other.0 >= MIN_COMPATIBLE_RECORD_VERSION.0
     }
 }
 
 /// hermit record/replay version.
 // NB: Increase the version number when there's any breaking changes, i.e.:
 // when new syscalls are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x101);
+const MIN_COMPATIBLE_RECORD_VERSION: RecordVersion = RecordVersion(0x102);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x102);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,9 +152,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         panic_on_unsupported_syscalls: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
-        // Record/replay has its own exact subscription set and format. Preserve the
-        // existing partial Detcore set so this run-mode default does not change v0x101
-        // event streams.
+        // Record/replay keeps partial Detcore subscription; madvise policy semantics
+        // begin in v0x102.
         passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
@@ -220,5 +220,12 @@ mod tests {
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
         assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+    }
+
+    #[test]
+    fn record_version_rejects_pre_madvise_policy_streams() {
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x101)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x103)));
     }
 }
