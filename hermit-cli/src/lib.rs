@@ -208,18 +208,21 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
+    /// Use the SaBRe static binary rewriting backend.
+    Sabre,
     /// Use the KVM backend.
     Kvm,
 }
 
 impl Backend {
-    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+    const ALL: [Self; 4] = [Self::Ptrace, Self::Dbi, Self::Sabre, Self::Kvm];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
             Self::Dbi => "dbi",
+            Self::Sabre => "sabre",
             Self::Kvm => "kvm",
         }
     }
@@ -262,6 +265,10 @@ impl Backend {
             // missing client is reported at launch time with an actionable error,
             // so ungating here does not affect the default ptrace path.
             Self::Dbi => None,
+            Self::Sabre => Some(
+                "the SaBRe M1 backend is available only through `hermit --backend sabre strace`"
+                    .to_owned(),
+            ),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
                 Some(
                     "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
@@ -639,6 +646,7 @@ mod tests {
         // DBI is available iff the DynamoRIO SDK is present on this host
         // (passes both on CI runners without the SDK and on dev hosts with it).
         assert_eq!(available.contains(&Backend::Dbi), dynamorio_sdk_available());
+        assert!(!available.contains(&Backend::Sabre));
         assert!(!available.contains(&Backend::Kvm));
     }
 
