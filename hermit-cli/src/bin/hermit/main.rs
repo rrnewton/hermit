@@ -32,6 +32,51 @@ mod schedule_search;
 mod tracing;
 mod verify;
 mod version;
+use std::fs::File;
+use std::io;
+use std::os::fd::FromRawFd;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
+
+const STDIN_UNCAPTURED: i32 = i32::MIN;
+const STDIN_TAKEN: i32 = i32::MIN + 1;
+static STARTUP_STDIN: AtomicI32 = AtomicI32::new(STDIN_UNCAPTURED);
+
+unsafe extern "C" fn capture_startup_stdin() {
+    // SAFETY: this runs single-threaded before Rust can sanitize a closed fd 0.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    let value = if fd >= 0 {
+        fd
+    } else {
+        // SAFETY: fcntl failed in this thread, so errno contains its error.
+        let errno = unsafe { *libc::__errno_location() };
+        -errno - 1
+    };
+    STARTUP_STDIN.store(value, Ordering::Relaxed);
+}
+
+#[used]
+#[unsafe(link_section = ".preinit_array")]
+static CAPTURE_STARTUP_STDIN: unsafe extern "C" fn() = capture_startup_stdin;
+
+fn startup_stdin() -> io::Result<Option<File>> {
+    let value = STARTUP_STDIN.swap(STDIN_TAKEN, Ordering::AcqRel);
+    if value >= 0 {
+        // SAFETY: the startup hook created this owned descriptor and transfers it here once.
+        return Ok(Some(unsafe { File::from_raw_fd(value) }));
+    }
+    if value == STDIN_UNCAPTURED || value == STDIN_TAKEN {
+        return Err(io::Error::other(
+            "startup stdin was not captured exactly once",
+        ));
+    }
+    let errno = -value - 1;
+    if errno == libc::EBADF {
+        Ok(None)
+    } else {
+        Err(io::Error::from_raw_os_error(errno))
+    }
+}
 
 use clap::Parser;
 use colored::*;

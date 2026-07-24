@@ -7,10 +7,13 @@
  */
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -18,6 +21,46 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 fn hermit(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+}
+
+fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+    child
+        .stdin
+        .take()
+        .expect("hermit stdin should be piped")
+        .write_all(input)
+        .expect("failed to write hermit stdin");
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+}
+
+fn hermit_with_closed_stdin(args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec closes only the child descriptor immediately before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::close(libc::STDIN_FILENO) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    command
         .output()
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
 }
@@ -232,39 +275,348 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
 }
 
 #[test]
-fn run_fails_closed_for_unintegrated_backends() {
-    // DBI has no Hermit dispatch, so it must fail closed at the availability
-    // probe. (KVM is now integrated; see `run_kvm_reaches_backend_then_fails_execution`.)
-    let output = hermit(&["run", "--backend", "dbi", "--", "/bin/true"]);
-    assert_failure_contains(&output, &["backend `dbi` is unavailable"]);
+fn run_dbi_executes_integrated_backend() {
+    let args = ["run", "--backend", "dbi", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+}
+
+#[test]
+fn run_kvm_executes_dynamic_guest() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--",
+        "/bin/echo",
+        "hello",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "hello\n");
     assert!(
         !stderr(&output).contains("Hermit cannot use ptrace"),
-        "dbi should fail before ptrace capability probing"
+        "kvm must not fall through to the ptrace backend:\n{}",
+        stderr(&output),
     );
 }
 
 #[test]
-fn run_kvm_reaches_backend_then_fails_execution() {
-    // The KVM backend is wired into hermit-cli via reverie-kvm, but reverie-kvm
-    // does not yet implement a Linux execution personality, so an explicit
-    // `--backend kvm` reaches the backend dispatch and then fails with an
-    // accurate, program-specific error instead of the generic availability
-    // message used for unintegrated backends. The exact wording depends on
-    // whether /dev/kvm is accessible on the test host, so assert on the stable
-    // prefix common to both outcomes.
-    let args = ["run", "--backend", "kvm", "--", "/bin/true"];
+fn run_kvm_resolves_bare_program_from_guest_path() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "echo",
+        "from-kvm-path",
+    ];
     let output = hermit(&args);
 
-    assert_failure_contains(&output, &["the KVM backend cannot run"]);
-    let stderr = stderr(&output);
-    assert!(
-        !stderr.contains("is unavailable"),
-        "kvm should reach its dispatch, not the generic availability probe:\n{stderr}"
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "from-kvm-path\n");
+}
+
+#[test]
+fn run_kvm_propagates_explicit_environment() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=empty",
+        "--env=KVM_M3C=passed",
+        "--",
+        "/usr/bin/env",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "KVM_M3C=passed\n");
+}
+
+#[test]
+fn run_kvm_respects_workdir_for_relative_paths() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create KVM cwd fixture");
+    fs::write(temp.path().join("message.txt"), b"from-kvm-cwd\n")
+        .expect("failed to write KVM cwd fixture");
+    let workdir = temp
+        .path()
+        .to_str()
+        .expect("temporary path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--tmp=/tmp",
+        "--workdir",
+        workdir,
+        "--",
+        "/bin/cat",
+        "message.txt",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "from-kvm-cwd\n");
+}
+
+#[test]
+fn run_kvm_lists_host_directory_metadata() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create KVM directory fixture");
+    fs::write(temp.path().join("alpha.txt"), b"alpha\n")
+        .expect("failed to write KVM directory fixture");
+    fs::create_dir(temp.path().join("subdir")).expect("failed to create KVM subdirectory");
+    std::os::unix::fs::symlink("alpha.txt", temp.path().join("alpha-link"))
+        .expect("failed to create KVM symlink fixture");
+    let workdir = temp
+        .path()
+        .to_str()
+        .expect("temporary path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--tmp=/tmp",
+        "--workdir",
+        workdir,
+        "--",
+        "/bin/ls",
+        "-ln",
+        ".",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let listing = stdout(&output);
+    let alpha = listing
+        .lines()
+        .find(|line| line.ends_with(" alpha.txt") && !line.contains(" -> "))
+        .unwrap_or_else(|| panic!("missing file in:\n{listing}"));
+    let alpha_fields: Vec<_> = alpha.split_whitespace().collect();
+    assert!(alpha_fields[0].starts_with("-rw"), "bad file mode: {alpha}");
+    assert_eq!(alpha_fields[4], "6", "bad file size: {alpha}");
+    let subdir = listing
+        .lines()
+        .find(|line| line.ends_with(" subdir"))
+        .unwrap_or_else(|| panic!("missing directory in:\n{listing}"));
+    assert!(subdir.starts_with("d"), "bad directory type: {subdir}");
+    let link = listing
+        .lines()
+        .find(|line| line.ends_with(" alpha-link -> alpha.txt"))
+        .unwrap_or_else(|| panic!("missing symlink in:\n{listing}"));
+    assert!(link.starts_with("l"), "bad symlink type: {link}");
+}
+
+#[test]
+fn run_kvm_reads_host_file() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let expected = fs::read_to_string("/etc/hostname").expect("failed to read host hostname");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+        "/etc/hostname",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected);
+}
+
+#[test]
+fn run_kvm_reads_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_stdin(&args, b"hello\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "hello\n");
+}
+
+#[test]
+fn run_kvm_verify_isolates_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_stdin(&args, b"not-visible-during-capture\n");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn run_kvm_preserves_closed_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/cat",
+    ];
+    let output = hermit_with_closed_stdin(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected output: {output:?}"
     );
+    assert_eq!(stdout(&output), "");
     assert!(
-        !stderr.contains("Hermit cannot use ptrace"),
-        "kvm must not fall through to the ptrace backend:\n{stderr}"
+        stderr(&output)
+            .to_ascii_lowercase()
+            .contains("bad file descriptor")
     );
+}
+
+#[test]
+fn run_kvm_verify_does_not_write_to_standard_input() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("failed to create stdin fixture");
+    let path = temp.path().join("stdin");
+    fs::write(&path, b"original-data").expect("failed to write stdin fixture");
+    let stdin = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("failed to open stdin fixture");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/perl",
+        "-MPOSIX",
+        "-e",
+        "POSIX::write(0, \"leak\", 4); exit 0",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(Stdio::from(stdin))
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+
+    assert_success(&output, &args);
+    assert_eq!(fs::read(path).unwrap(), b"original-data");
+}
+
+#[test]
+fn run_kvm_counts_standard_input() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/wc",
+    ];
+    let output = hermit_with_stdin(&args, b"hello\n");
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output).split_whitespace().collect::<Vec<_>>(),
+        ["1", "1", "6"]
+    );
+}
+
+#[test]
+fn run_kvm_reports_hostname() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/hostname",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "reverie-kvm\n");
 }
 
 #[test]
@@ -295,22 +647,22 @@ fn namespace_only_rejects_every_explicit_backend() {
 #[test]
 fn backend_accepted_in_global_position() {
     // The global-position `--backend` (before the subcommand) must be threaded
-    // through to `run`. Probe with the unintegrated DBI backend so the value's
-    // effect is observable without depending on ptrace capabilities being
-    // available.
-    let dbi = hermit(&["--backend", "dbi", "run", "--", "/bin/true"]);
-    assert_failure_contains(&dbi, &["backend `dbi` is unavailable"]);
+    // through to `run` and reach the integrated DBI backend.
+    let dbi_args = ["--backend", "dbi", "run", "--", "/bin/true"];
+    let dbi = hermit(&dbi_args);
 
-    // KVM is integrated (via reverie-kvm) but has no Linux execution personality
-    // yet, so the global-position value must still reach the KVM dispatch and
-    // produce its accurate, program-specific error.
-    let kvm = hermit(&["--backend", "kvm", "run", "--", "/bin/true"]);
-    assert_failure_contains(&kvm, &["the KVM backend cannot run"]);
-    assert!(
-        !stderr(&kvm).contains("is unavailable"),
-        "global-position kvm should reach its dispatch:\n{}",
-        stderr(&kvm)
-    );
+    assert_success(&dbi, &dbi_args);
+
+    if Path::new("/dev/kvm").exists() {
+        let args = ["--backend", "kvm", "run", "--", "/bin/true"];
+        let kvm = hermit(&args);
+        assert_success(&kvm, &args);
+        assert!(
+            !stderr(&kvm).contains("Hermit cannot use ptrace"),
+            "global-position kvm should reach its dispatch:\n{}",
+            stderr(&kvm),
+        );
+    }
 }
 
 #[test]
