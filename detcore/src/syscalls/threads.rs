@@ -53,6 +53,10 @@ use crate::tool_local::PendingVfork;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+// Preserve the historical Detcore ABI while hiding the host's configured CPU
+// count. This represents one virtual CPU in a fixed 128-bit kernel mask.
+const VIRTUAL_CPUSET_BYTES: usize = 16;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WaitidSigchldFields {
@@ -804,18 +808,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Ignore requests to set affinity.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Accept valid affinity masks without changing the host scheduler.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
-        _call: syscalls::SchedSetaffinity,
+        guest: &mut G,
+        call: syscalls::SchedSetaffinity,
     ) -> Result<i64, Error> {
-        // TODO: we could keep track of what the user sets the affinity to in
-        // the global state, and then report back, consistently, what they have
-        // written.
+        let size_bytes = call.len() as usize;
+        if size_bytes == 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        let mask = call.mask().ok_or(Errno::EFAULT)?;
+        let mask: Addr<u8> = mask.cast();
+        let mut requested = [0u8; VIRTUAL_CPUSET_BYTES];
+        let bytes_to_read = size_bytes.min(VIRTUAL_CPUSET_BYTES);
+        guest
+            .memory()
+            .read_exact(mask, &mut requested[..bytes_to_read])?;
+        info!(
+            "Suppressing sched_setaffinity mask {:?}; affinity remains virtual CPU 0",
+            requested
+        );
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
     /// Report that we are on cpu 0, irrespective of what physical CPU we are on.
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
@@ -823,19 +842,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
         let size_bytes: usize = call.len() as usize;
+        if size_bytes < VIRTUAL_CPUSET_BYTES
+            || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>())
+        {
+            return Err(Errno::EINVAL.into());
+        }
 
         // N.B. we can't use an opaque, type-safe representation such as
         // nix::sched::CpuSet currently.  The problem is that the
         // SchedGetAffinity syscall treats this field as a u64.
-        let mut cpu_set = vec![0u8; size_bytes];
-
-        if let Some(first) = cpu_set.first_mut() {
-            *first = 1;
-        }
+        let mut cpu_set = [0u8; VIRTUAL_CPUSET_BYTES];
+        cpu_set[0] = 1;
 
         info!(
             "Suppressing sched_getaffinity and returning {}-byte virtualized result, {:?}",
-            size_bytes, cpu_set
+            VIRTUAL_CPUSET_BYTES, cpu_set
         );
         if let Some(mask) = call.mask() {
             let mask: AddrMut<u8> = mask.cast();
@@ -844,7 +865,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // > On success, the raw sched_getaffinity() system call returns the size (in bytes) of
             // > the cpumask_t data type that is used internally by the kernel to represent the CPU
             // > set bit mask.
-            Ok(16)
+            Ok(VIRTUAL_CPUSET_BYTES as i64)
         } else {
             Err(Error::Errno(Errno::EFAULT))
         }
