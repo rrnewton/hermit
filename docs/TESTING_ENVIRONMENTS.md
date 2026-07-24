@@ -94,48 +94,22 @@ Notes:
 
 ## CI tiers: what runs where
 
-CI (`.github/workflows/ci.yml`) is the reference for which tests are expected in
-ordinary GitHub Actions versus a specialized runner. There are two jobs:
+CI is split into two independent workflows:
 
-### `regular` — GitHub-hosted (`ubuntu-latest`)
+- `.github/workflows/ci-hosted.yml` runs the `regular` job on
+  `ubuntu-latest`. It has no concurrency cancellation, so every push and
+  pull-request run can complete even when specialized runners are unavailable.
+  It executes `./validate.sh --hosted-only --no-label-pr`, which owns the
+  portable test subset and the DBI parity ratchet.
+- `.github/workflows/ci-selfhosted.yml` runs the `hardware` job on
+  `[self-hosted, Linux, X64, hermit, pmu]`. New commits cancel older runs for
+  the same pull request or branch. It executes
+  `./validate.sh --hardware-only --no-label-pr` and also owns the manually
+  dispatched QEMU strict-L2 job.
 
-Runs on every push and pull request. Covers the **environment-independent
-subset**:
-
-- `cargo build --workspace`
-- `cargo nextest run --profile ci --workspace` **excluding** `detcore`,
-  `hermit`, and `hermetic_infra_hermit_flaky-tests`
-- `cargo test -p hermit --lib --bins` (no namespace-dependent integration tests)
-- `cargo test -p detcore --lib --bins` and
-  `cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact`
-  (PMU-free: this test calls `reverie_ptrace::ret_without_perf!()`)
-- doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
-
-GitHub-hosted runners have **no usable PMU and no CPUID faulting**, so the
-detcore and hermit integration suites are deliberately excluded here.
-
-### `hardware` — self-hosted (`[self-hosted, Linux, X64, hermit, pmu]`)
-
-Runs on push, and on pull requests only from the trusted `rrnewton` account.
-Requires a bare-metal-class host with PMU access. Covers:
-
-- **CPUID/RDRAND/RDSEED:** `tests_misc has_rdrand_without_detcore`,
-  `tests_misc rdrand_rdseed_is_masked`
-- **PMU timing/parallelism:** `tests_time --ignored`,
-  `tests_parallelism futex_wait_parent --ignored`,
-  `tests_parallelism 'mem_race::' --ignored`,
-  `tests_parallelism 'mem_print_race::' --ignored`
-- **Namespace-gated Hermit integration** (only if a mount-namespace probe
-  succeeds): `arbitrary_binaries`, `cli`, `clock_determinism`,
-  `epoll_determinism`, `mmap_determinism`, `procfs_determinism`,
-  `signal_determinism`, `record_replay_matrix`, `strict_mode_matrix`, the
-  fail-closed ratchet (`scripts/test-fail-closed.sh`), the working-envelope gate
-  (`validate.sh --envelope-compare`), and the debugger integration tests
-- **Backend parity ratchet:** always for `ptrace`; `kvm` only when `/dev/kvm` is
-  readable+writable; `dbi` only when the DynamoRIO environment is configured
-
-If the mount-namespace probe fails, the job falls back to
-`cargo test -p hermit --lib --bins` only.
+The merge gate requires only the GitHub-hosted workflow. Self-hosted results are
+reported separately as a best-effort hardware signal. Exact test ownership is
+documented in [CI/validate alignment](ci-validate-alignment.md).
 
 ## Hardware-sensitive Cargo tests
 
