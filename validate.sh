@@ -571,6 +571,49 @@ function run_strict_compatibility_envelope {
     strict_compatibility_probe bzip2 bash -c \
         'bzip2 -c README.md | sha256sum' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe gzip bash -c \
+        'gzip -cn README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe xz bash -c \
+        'xz -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe zstd bash -c \
+        'zstd -q -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe openssl openssl dgst -sha256 /etc/hostname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sort bash -c \
+        'printf "beta\nalpha\nalpha\n" | sort' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe uniq bash -c \
+        'printf "alpha\nalpha\nbeta\n" | uniq -c' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe tr bash -c \
+        'printf "Hermit\n" | tr "[:upper:]" "[:lower:]"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cut bash -c \
+        'printf "alpha:beta\n" | cut -d: -f2' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe paste bash -c \
+        'paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe comm bash -c \
+        'comm <(printf "alpha\nbeta\n") <(printf "beta\ngamma\n")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe join bash -c \
+        'join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe find find /etc -maxdepth 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Numeric output avoids nondeterministic host NSS owner/group lookups.
+    strict_compatibility_probe stat stat -c '%n %s %f' /etc/hostname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe file file /bin/sh \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe factor factor 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe expr expr 2 + 2 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((failed == 0)); then
