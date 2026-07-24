@@ -71,14 +71,18 @@ fn info_logging_enabled() -> bool {
     )
 }
 
+// TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
 fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Option<u64>) -> bool {
     match sysnum {
+        // AUTONOMOUS-BOT-IMPLEMENTED
         libc::SYS_fork
         | libc::SYS_vfork
         | libc::SYS_rt_sigreturn
         | libc::SYS_execve
         | libc::SYS_execveat => true,
+        // AUTONOMOUS-BOT-IMPLEMENTED
         libc::SYS_clone => args[0] & libc::CLONE_THREAD as u64 == 0,
+        // AUTONOMOUS-BOT-IMPLEMENTED
         libc::SYS_clone3 => {
             clone3_flags.is_some_and(|flags| flags & libc::CLONE_THREAD as u64 == 0)
         }
@@ -296,6 +300,7 @@ pub extern "C" fn reverie_dbi_runtime_image_init() -> u64 {
 ///
 /// `argument` must point to a valid [`reverie_dbi::DbiRuntimeCallbacks`] value.
 #[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
 pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
@@ -345,6 +350,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
 #[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm process-exit scheduler ownership.
 pub extern "C" fn reverie_dbi_runtime_process_exit() {
     READY_IMAGE.store(0, Ordering::Release);
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
@@ -352,6 +358,7 @@ pub extern "C" fn reverie_dbi_runtime_process_exit() {
 
 /// Reports whether the Detcore global scheduler is ready for this image.
 #[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm image-generation readiness ordering.
 pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
     i32::from(
         READY_IMAGE.load(Ordering::Acquire) == image_generation
@@ -422,6 +429,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
 /// `_scratch` must be the pointer supplied by the native DBI callback. It is not
 /// dereferenced because a failed exec preserves the current Detcore thread state.
 #[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm failed-exec preserves Runtime and thread state.
 pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, _pid: i32) {
     assert!(
         RUNTIME
@@ -441,6 +449,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 /// address six syscall arguments and `result` must be writable.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
