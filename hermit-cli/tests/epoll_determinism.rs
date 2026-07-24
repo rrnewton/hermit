@@ -153,6 +153,7 @@ fn nested_epoll_delivery_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#549)
 #[test]
 fn notification_control_syscalls_are_deterministic() {
     assert_scenario_is_deterministic("control-fds");

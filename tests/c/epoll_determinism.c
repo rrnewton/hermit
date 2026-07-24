@@ -325,6 +325,7 @@ static void run_nested(void) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#549)
 static void expect_notification_flags(
     int fd,
     const char* label,

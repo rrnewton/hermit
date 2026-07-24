@@ -1323,6 +1323,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     s.display(&guest.memory())
                 ),
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#549)
                 // The obsolete x86_64 entry point is absent from modern Linux kernels.
                 Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
 
