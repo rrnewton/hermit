@@ -4,6 +4,13 @@ See [the QEMU boot guide](../../docs/QEMU_BOOT.md) for the maintained
 configuration and `smoke_test.sh` for the automated marker and clock-failure
 checks.
 
+> **2026-07-23 update:** Current main boots this workload under literal
+> `run --strict` with no relaxations. The source-revisioned L1 result and
+> syscall analysis are in
+> [`STRICT_BOOT_20260723.md`](STRICT_BOOT_20260723.md). The report below is the
+> earlier baseline that established the fast compatibility profile and the
+> pre-`ppoll` strict failure mode.
+
 Date: 2026-07-22 UTC (2026-07-21 PDT)
 
 Repository: `rrnewton/hermit`

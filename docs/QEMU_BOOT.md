@@ -1,13 +1,19 @@
 # Booting Linux with QEMU under Hermit
 
-Hermit can boot a minimal x86_64 Linux guest with QEMU's TCG accelerator. The
-verified configuration reached the initramfs marker and powered off in 13.25
-seconds. It combines Hermit's virtual time with QEMU's fixed instruction-count
-clock.
+Hermit can boot a minimal x86_64 Linux guest with QEMU's TCG accelerator in
+two modes:
 
-This is a compatibility profile, not a fully deterministic VM profile.
-`--no-sequentialize-threads` lets Linux schedule QEMU's host threads
-concurrently, so their interleavings are not controlled by Hermit.
+- A strict, sequentialized run reached the initramfs marker and powered off in
+  166.486 wall seconds on current main. This is an L1 result; it has not yet
+  been repeated with `--verify` for L2 assurance.
+- A faster compatibility profile reached the same marker in 13.25 seconds. It
+  uses `--no-sequentialize-threads`, so QEMU's host-thread interleavings are not
+  controlled by Hermit.
+
+Both profiles combine Hermit's virtual time with QEMU's fixed
+instruction-count clock. The strict result depends on deterministic `ppoll`
+simulation, which lets QEMU's main thread wait while its vCPU and helper
+threads run under Hermit's serialized scheduler.
 
 ## Prerequisites
 
@@ -61,7 +67,41 @@ The test passes only when QEMU exits successfully, the console contains
 `SHARED_FUTEX_QEMU_KERNEL_OK`, and it contains none of the clock-calibration
 failures observed in the control runs.
 
-## Exact working command
+## Strict boot
+
+Build the initramfs as described below, then use the normal strict scheduler
+with a wall-clock bound long enough to reach the first serial output. The
+recorded run first wrote to the serial console after 85.074 seconds and exited
+after 166.486 seconds:
+
+```bash
+timeout --kill-after=10s --signal=TERM 180s \
+  target/release/hermit --log info run --strict -- \
+  qemu-system-x86_64 \
+  -m 256M \
+  -accel tcg,thread=single \
+  -smp 1 \
+  -icount shift=0,sleep=off \
+  -kernel /boot/vmlinuz \
+  -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
+  -display none \
+  -serial stdio \
+  -monitor none \
+  -no-reboot \
+  -append 'console=ttyS0 panic=-1 rdinit=/init'
+```
+
+This command uses the ptrace backend, INFO logging, and no relaxations. A
+successful exit and marker establish L1 only. Add `--verify` for an L2 test;
+the current evidence does not claim L2.
+
+Do not add `--no-sequentialize-threads` or disable preemption when evaluating
+the strict profile. Those options select the compatibility profile below.
+
+The source-revisioned trace analysis is in
+[`STRICT_BOOT_20260723.md`](../experiments/qemu-boot-debug/STRICT_BOOT_20260723.md).
+
+## Fast compatibility command
 
 After creating the initramfs as described below, the recorded working command
 is:
@@ -90,27 +130,34 @@ provide usable CPUID faulting. It exposes host CPUID results and is separate
 from the scheduling and clock configuration. A host on which Hermit's CPUID
 virtualization works may omit this option.
 
-## Why QEMU needs concurrent host threads
+## Scheduling profiles
 
 Hermit normally serializes all threads and uses PMU retired-conditional-branch
 preemption to choose among them deterministically. QEMU has a CPU-bound TCG
 vCPU thread plus main-loop and helper threads that must service timers, I/O,
 and wakeups.
 
-With normal Hermit scheduling, a bounded QEMU boot made too little progress to
-reach firmware serial output. Disabling virtual time did not fix that result.
-Disabling only PMU preemption while keeping thread sequentialization let the
-TCG vCPU starve QEMU's other threads.
+Before `ppoll` was determinized, a 30-minute strict run produced no serial
+output and advanced only 0.830 seconds of Hermit virtual CPU time. The QEMU
+main thread could enter `ppoll` without a deterministic simulated wait, so the
+serialized scheduler did not reliably hand execution to the vCPU/helper
+threads.
 
-The working profile therefore uses both:
+Current main intercepts `ppoll`, probes it nonblocking, and waits through the
+deterministic I/O scheduler. In the successful strict trace, all 23 `ppoll`
+calls completed and the vCPU owned 827 of 980 visible COMMIT records. This made
+the default strict scheduler sufficient; no concurrency or preemption
+relaxation was used.
+
+The faster compatibility profile still uses both:
 
 - `--no-sequentialize-threads`, so QEMU's host threads can run concurrently;
 - `--preemption-timeout disabled`, so Hermit does not apply PMU preemption to
   this compatibility run.
 
-This restores boot throughput at the cost of deterministic QEMU host-thread
-scheduling. `-accel tcg,thread=single -smp 1` still keeps the emulated guest
-to one TCG vCPU; it does not serialize QEMU's host-side support threads.
+That profile trades deterministic QEMU host-thread scheduling for lower wall
+time. `-accel tcg,thread=single -smp 1` keeps the emulated guest to one TCG
+vCPU in either profile; it does not remove QEMU's host-side support threads.
 
 ## Why fixed QEMU icount is required
 
@@ -233,9 +280,10 @@ reboot: Power down
 
 ## Troubleshooting
 
-- **No serial output before the timeout:** Confirm both Hermit scheduling
-  options are present. Default sequentialization is functionally live but was
-  too slow for the bounded boot.
+- **No serial output before the timeout:** A strict INFO run first emitted
+  serial data after 85 seconds on the evidence host, so use at least a
+  180-second bound. For the fast compatibility profile, confirm both Hermit
+  scheduling relaxations are present.
 - **PIT calibration or TSC watchdog errors:** Confirm the exact
   `-icount shift=0,sleep=off` option. Do not replace it with host-clock
   pacing.
@@ -248,8 +296,10 @@ reboot: Power down
 
 ## Evidence
 
-The preserved experiment in [`experiments/qemu-boot-debug/`](../experiments/qemu-boot-debug/)
-contains the six-mode comparison, exact host and binary metadata, timing, and
-clock diagnostics. The successful row is
-`virtual_minimal_fixed_icount` in [`results.csv`](../experiments/qemu-boot-debug/results.csv).
-Large raw traces and console logs are intentionally excluded.
+The preserved experiment in
+[`experiments/qemu-boot-debug/`](../experiments/qemu-boot-debug/) contains the
+original six-mode comparison plus the strict current-main follow-up. The fast
+compatibility row is `virtual_minimal_fixed_icount`; the strict L1 row is
+`strict_current_main_ppoll` in
+[`results.csv`](../experiments/qemu-boot-debug/results.csv). Large raw traces
+and console logs are intentionally excluded.

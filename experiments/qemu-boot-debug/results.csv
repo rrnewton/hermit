@@ -5,3 +5,4 @@ virtual_no_sequentialization,true,false,200000000,none,30,30,124,SeaBIOS,not_rea
 virtual_sequentialized_no_preemption,true,true,disabled,shift0_sleepoff,30,30,forced_SIGKILL,none,not_reached,cpu_bound_vcpu_starves_other_threads
 virtual_minimal_no_icount,true,false,disabled,none,30,30,124,kernel_console,no_current_clocksource,local_global_time_domains_diverge
 virtual_minimal_fixed_icount,true,false,disabled,shift0_sleepoff,90,13.25,0,initramfs_marker,coherent_1000.031MHz,complete_boot
+strict_current_main_ppoll,true,true,200000000,shift0_sleepoff,180,166.486,0,initramfs_marker,coherent_1000.012MHz,strict_L1_after_ppoll_determinization
