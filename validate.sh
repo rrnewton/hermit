@@ -206,6 +206,8 @@ if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     exit 2
 fi
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#579): Review the backend compatibility ratchets and expansion policy.
 # Backend ratchets select commands from the same strict corpus. Expansion mode
 # runs every row and prints candidates that can be added without duplicating
 # command definitions. This DBI baseline was measured on 2026-07-24 with the
@@ -731,6 +733,8 @@ function rr_compatibility_probe {
     return 0
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#579): Review backend selection, accounting, and failure aggregation.
 function backend_compatibility_label_selected {
     local backend=$1
     local label=$2
