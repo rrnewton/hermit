@@ -577,6 +577,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let mut subscription = Subscription::none();
             subscription.syscalls([
                 Sysno::write,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Sysno::writev,
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
@@ -1141,6 +1143,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         | Syscall::Time(_)
                         | Syscall::ClockGettime(_)
                         | Syscall::Write(_)
+                        | Syscall::Writev(_)
                 );
                 // TODO(T86591083): remove this conditional to bump logical time unconditionally:
                 if bumpit && virtualize_time {
@@ -1162,6 +1165,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Writev(w) => self.handle_writev(guest, w).await,
                 Syscall::Openat(o) => self.handle_openat(guest, o).await,
                 Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
@@ -1565,6 +1570,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::arch_prctl)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::writev)
         );
     }
 }

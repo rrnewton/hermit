@@ -14,7 +14,12 @@ use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
+use reverie::syscalls;
 use reverie::syscalls::Addr;
+use reverie::syscalls::Displayable;
+use reverie::syscalls::MapFlags;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -161,6 +166,241 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
+    /// nonblocking. A positive short write is an implementation artifact here: without
+    /// O_NONBLOCK, Linux blocks until the full vector is written unless a signal or error
+    /// interrupts it. Atomic vectors retain a private iovec snapshot for every retry; larger
+    /// vectors advance a positive short-write remainder through scalar writes.
+    pub async fn execute_blocking_pipe_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        const MAX_IOVECS: usize = 1024;
+        // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        // Linux guarantees pipe writes through this size are atomic.
+        const PIPE_BUF: usize = 4096;
+
+        let Some(iov_addr) = call.iov() else {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        };
+        if call.len() == 0 || call.len() > MAX_IOVECS {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        let iovecs: Vec<(usize, usize)> = {
+            let mut raw_iovecs = vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                call.len()
+            ];
+            guest.memory().read_values(iov_addr, &mut raw_iovecs)?;
+            raw_iovecs
+                .into_iter()
+                .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
+                .collect()
+        };
+        let requested = iovecs.iter().try_fold(0usize, |total, (_, length)| {
+            total.checked_add(*length).ok_or(Errno::EINVAL)
+        })?;
+        if requested > isize::MAX as usize {
+            return Err(Errno::EINVAL.into());
+        }
+        let target = requested.min(MAX_RW_COUNT);
+        if target == 0 {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        let atomic_pipe_write = target <= PIPE_BUF;
+
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let subtool = self.cfg.recordreplay_modes.then_some(self);
+        let mut current = Syscall::Writev(call);
+        let mut written_total = 0usize;
+
+        loop {
+            if resources.poll_attempt > 0
+                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            let result = if atomic_pipe_write {
+                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
+                    .await
+            } else {
+                match subtool {
+                    Some(detcore) => detcore.record_or_replay(guest, current).await,
+                    None => guest.inject_with_retry(current).await,
+                }
+            };
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    if written_total >= target {
+                        break Ok(written_total as i64);
+                    }
+                    if atomic_pipe_write {
+                        break Ok(written_total as i64);
+                    }
+                    current = match remaining_writev_segment(
+                        call.fd(),
+                        &iovecs,
+                        written_total,
+                        target - written_total,
+                    ) {
+                        Ok(Some(write)) => Syscall::Write(write),
+                        Ok(None) => break Ok(written_total as i64),
+                        Err(_) => break Ok(written_total as i64),
+                    };
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Errno::EAGAIN) => {
+                    if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
+                        current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
+                            Ok(Some(write)) => Syscall::Write(write),
+                            Ok(None) => break Ok(0),
+                            Err(error) => break Err(error.into()),
+                        };
+                    }
+                }
+                Err(error) => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for {}blocking pipe writev after {:?}: {}",
+                resources.poll_attempt,
+                if atomic_pipe_write { "atomic " } else { "" },
+                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        }
+    }
+
+    async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+        iovecs: &[(usize, usize)],
+    ) -> Result<i64, Errno> {
+        // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
+        // path is smaller; this covers common vectors without consuming guest VM mappings.
+        const STACK_IOVECS: usize = 32;
+        if iovecs.len() <= STACK_IOVECS {
+            let mut stack = guest.stack().await;
+            let scratch_array = {
+                let mut raw_iovecs = [libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                }; STACK_IOVECS];
+                for (raw, (base, length)) in raw_iovecs.iter_mut().zip(iovecs) {
+                    raw.iov_base = *base as *mut libc::c_void;
+                    raw.iov_len = *length;
+                }
+                stack.push(raw_iovecs)
+            };
+            let scratch_iov: Addr<libc::iovec> = scratch_array.cast();
+            let _guard = stack
+                .commit()
+                .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
+            let scratch_call = call.with_iov(Some(scratch_iov));
+            return if self.cfg.recordreplay_modes {
+                self.record_or_replay(guest, scratch_call).await
+            } else {
+                guest.inject_with_retry(scratch_call).await
+            };
+        }
+
+        let mapping_len = iovecs
+            .len()
+            .checked_mul(std::mem::size_of::<libc::iovec>())
+            .expect("validated iovec count cannot overflow scratch length");
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(mapping_len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("failed to map atomic writev scratch: {error}"));
+        let mapped = usize::try_from(mapped)
+            .unwrap_or_else(|_| panic!("atomic writev scratch mmap returned {mapped}"));
+        let scratch_iov = Addr::<libc::iovec>::from_raw(mapped)
+            .unwrap_or_else(|| panic!("atomic writev scratch mmap returned a null address"));
+        let mapping_addr: Addr<libc::c_void> = scratch_iov.cast();
+        let write_result = {
+            let raw_iovecs: Vec<libc::iovec> = iovecs
+                .iter()
+                .map(|(base, length)| libc::iovec {
+                    iov_base: *base as *mut libc::c_void,
+                    iov_len: *length,
+                })
+                .collect();
+            // SAFETY: the injected anonymous mapping is exclusively owned scratch space.
+            guest
+                .memory()
+                .write_values(unsafe { scratch_iov.into_mut() }, &raw_iovecs)
+        };
+        if let Err(write_error) = write_result {
+            guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Some(mapping_addr))
+                        .with_len(mapping_len),
+                ))
+                .await
+                .unwrap_or_else(|cleanup_error| {
+                    panic!(
+                        "failed to populate atomic writev scratch ({write_error}); cleanup failed ({cleanup_error})"
+                    )
+                });
+            panic!("failed to populate atomic writev scratch: {write_error}");
+        }
+
+        let scratch_call = call.with_iov(Some(scratch_iov));
+        let result = if self.cfg.recordreplay_modes {
+            self.record_or_replay(guest, scratch_call).await
+        } else {
+            guest.inject_with_retry(scratch_call).await
+        };
+        guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(mapping_addr))
+                    .with_len(mapping_len),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("failed to unmap atomic writev scratch: {error}"));
+        result
+    }
+
     /// Override physically_nonblocking to true for the file descriptor, if appropriate.
     pub fn maybe_set_nonblocking_fd<G: Guest<Self>>(&self, guest: &G, fd: i32) {
         if self.cfg.sequentialize_threads && !self.cfg.debug_externalize_sockets {
@@ -172,6 +412,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap();
         }
     }
+}
+
+fn remaining_writev_segment(
+    fd: i32,
+    iovecs: &[(usize, usize)],
+    mut consumed: usize,
+    remaining_limit: usize,
+) -> Result<Option<syscalls::Write>, Errno> {
+    for (base, length) in iovecs {
+        if consumed >= *length {
+            consumed -= *length;
+            continue;
+        }
+        let base = base.checked_add(consumed).ok_or(Errno::EFAULT)?;
+        let buffer = Addr::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
+        return Ok(Some(
+            syscalls::Write::new()
+                .with_fd(fd)
+                .with_buf(Some(buffer))
+                .with_len((*length - consumed).min(remaining_limit)),
+        ));
+    }
+    Ok(None)
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:
@@ -592,6 +855,22 @@ impl NonblockableSyscall for reverie::syscalls::Write {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         // A return value of Ok(0) indicates end of file.
         // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+/// Vectored writes have the same blocking behavior as scalar writes on pipes and sockets.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Writev {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
 }

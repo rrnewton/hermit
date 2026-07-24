@@ -505,6 +505,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// SYS_writev system call.
+    ///
+    /// Preserve the initial writev as one kernel operation so its iovec order remains intact.
+    /// Detcore adds open-file resource ordering and nonblocking scheduler integration; a
+    /// blocking pipe short write is completed by the helper because Hermit injected O_NONBLOCK.
+    pub async fn handle_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.resource(),
+                    detfd.stat().map(|x| x.inode),
+                )
+            })?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let result = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking
+        {
+            self.execute_blocking_pipe_writev(guest, call).await
+        } else if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        {
+            self.execute_nonblockable_fd_syscall(guest, call).await
+        } else {
+            Ok(self.record_or_replay(guest, call).await?)
+        };
+
+        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+            let inode =
+                raw_ino.expect("virtualized metadata requires stat data for every tracked fd");
+            touch_file(guest, inode).await;
+        }
+
+        resource_release_all(guest).await;
+        result
+    }
+
     /// SYS_mmap system call.
     pub async fn handle_mmap<G: Guest<Self>>(
         &self,
