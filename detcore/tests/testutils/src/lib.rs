@@ -71,6 +71,7 @@ static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
 /// (This is the bottom element of a lattice containing exponentially many possibly Configs.)
 pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: false,
+    cpuid_virtualized_by_backend: false,
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
@@ -125,6 +126,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// (This is drawn from the middle of the lattice of possible Configs.)
 pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
+    cpuid_virtualized_by_backend: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
@@ -179,6 +181,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// (This is the top element of a lattice containing exponentially many possibly Configs.)
 pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: true,
+    cpuid_virtualized_by_backend: false,
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,

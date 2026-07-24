@@ -39,6 +39,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         Sysno::accept
         | Sysno::accept4
         | Sysno::alarm
+        | Sysno::arch_prctl
         | Sysno::bind
         | Sysno::clock_getres
         | Sysno::clock_gettime
@@ -210,7 +211,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::add_key
         | Sysno::adjtimex
         | Sysno::afs_syscall
-        | Sysno::arch_prctl
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::chown
@@ -458,7 +458,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [106, 39, 228]);
+        assert_eq!(counts, [107, 39, 227]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -478,6 +478,10 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::ppoll),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::arch_prctl),
             SyscallClassification::Determinized
         );
         assert_eq!(
@@ -514,7 +518,6 @@ mod tests {
         }
         for sysno in [
             Sysno::add_key,
-            Sysno::arch_prctl,
             Sysno::keyctl,
             Sysno::madvise,
             Sysno::prctl,
