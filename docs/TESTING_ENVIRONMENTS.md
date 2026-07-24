@@ -109,11 +109,20 @@ Notes:
 
 ## CI tiers: what runs where
 
-CI (`.github/workflows/ci.yml`) is the reference for which tests are expected in
-ordinary GitHub Actions versus a specialized runner. There are two jobs:
+CI is split into two independent workflows:
 
-### `regular` — GitHub-hosted (`ubuntu-latest`)
+- `.github/workflows/ci-hosted.yml` runs the `regular` job on
+  `ubuntu-latest`. It has no concurrency cancellation, so every push and
+  pull-request run can complete even when specialized runners are unavailable.
+  It executes `./validate.sh --hosted-only --no-label-pr`, which owns the
+  portable test subset and the DBI parity ratchet.
+- `.github/workflows/ci-selfhosted.yml` runs the `hardware` job on
+  `[self-hosted, Linux, X64, hermit, pmu]`. New commits cancel older runs for
+  the same pull request or branch. It executes
+  `./validate.sh --hardware-only --no-label-pr` and also owns the manually
+  dispatched QEMU strict-L2 job.
 
+### `regular` - GitHub-hosted (`ubuntu-latest`)
 Runs on every push and pull request. Covers the **environment-independent
 subset**:
 
@@ -149,6 +158,10 @@ Requires a bare-metal-class host with PMU access. Covers:
 
 If the mount-namespace probe fails, the job falls back to
 `cargo test -p hermit --lib --bins` only.
+
+The merge gate requires only the GitHub-hosted workflow. Self-hosted results are
+reported separately as a best-effort hardware signal. Exact test ownership is
+documented in [CI/validate alignment](ci-validate-alignment.md).
 
 ## Hardware-sensitive Cargo tests
 

@@ -1,4 +1,4 @@
-name: Rust
+name: CI (self-hosted)
 
 on:
   push:
@@ -13,8 +13,11 @@ on:
         type: boolean
         default: false
 
+# Self-hosted capacity is scarce, so a newer commit replaces an older run for
+# the same pull request or branch. Individual PMU jobs use a second concurrency
+# group below so they never overlap across workflow runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: selfhosted-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,49 +27,6 @@ env:
   RUSTDOCFLAGS: -D warnings
 
 jobs:
-  regular:
-    name: Regular tests (GitHub-hosted)
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Enforce detcore backend-abstraction commandment
-      run: ./scripts/check-detcore-backend-abstraction.sh
-    - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
-    - name: Install cargo-nextest
-      run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
-    - name: Build
-      run: cargo build --workspace
-    - name: Test regular workspace crates
-      run: >-
-        cargo nextest run --profile ci --workspace
-        --exclude detcore
-        --exclude hermit
-        --exclude hermetic_infra_hermit_flaky-tests
-    - name: Upload nextest JUnit report
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: nextest-junit-${{ github.job }}
-        path: target/nextest/ci/junit.xml
-        if-no-files-found: warn
-        retention-days: 14
-    - name: Test Hermit without namespace-dependent integration tests
-      run: cargo test -p hermit --lib --bins
-    - name: Test Detcore without hardware-dependent integration tests
-      run: cargo test -p detcore --lib --bins
-    - name: Documentation
-      run: |
-        cargo test --workspace --doc
-        cargo doc --workspace --no-deps
-    - name: Rust components
-      run: rustup component add clippy rustfmt
-    - name: Clippy
-      run: cargo clippy --workspace --all-targets -- -D warnings
-    - name: Format
-      run: cargo fmt --all -- --check
-
   # AUTONOMOUS-BOT-IMPLEMENTED
   # TODO-HUMAN-REVIEW(#553)
   qemu-l2:
