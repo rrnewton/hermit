@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
@@ -24,6 +25,19 @@ use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_local::Detcore;
+
+const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
+const ARCH_REQ_XCOMP_GUEST_PERM: libc::c_int = 0x1025;
+
+const ARCH_SHSTK_ENABLE: libc::c_int = 0x5001;
+const ARCH_SHSTK_DISABLE: libc::c_int = 0x5002;
+const ARCH_SHSTK_LOCK: libc::c_int = 0x5003;
+const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
+const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
+const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
 fn from_str(s: &str) -> [i8; 65] {
     let mut ret: [i8; 65] = [0; 65];
@@ -34,6 +48,98 @@ fn from_str(s: &str) -> [i8; 65] {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    fn write_arch_prctl_u64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_addr: usize,
+        value: u64,
+    ) -> Result<i64, Error> {
+        let addr = AddrMut::<u64>::from_raw(raw_addr).ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(addr, &value)?;
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
+    /// Preserve thread-local bases while hiding host CPU feature controls.
+    pub async fn handle_arch_prctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ArchPrctl,
+    ) -> Result<i64, Error> {
+        let cpuid_uses_backend_policy =
+            self.cfg.virtualize_cpuid && self.cfg.cpuid_virtualized_by_backend;
+        let cpuid_uses_faulting = self.cfg.virtualize_cpuid && guest.has_cpuid_interception();
+        match call.cmd() {
+            ArchPrctlCmd::ARCH_SET_FS(_)
+            | ArchPrctlCmd::ARCH_SET_GS(_)
+            | ArchPrctlCmd::ARCH_GET_FS(_)
+            | ArchPrctlCmd::ARCH_GET_GS(_) => Ok(guest.inject(call).await?),
+
+            // KVM installs a deterministic CPUID table while leaving the instruction enabled.
+            ArchPrctlCmd::ARCH_GET_CPUID(_) if cpuid_uses_backend_policy => Ok(1),
+            ArchPrctlCmd::ARCH_SET_CPUID(value) if cpuid_uses_backend_policy => {
+                if value == 0 {
+                    Err(Errno::EPERM.into())
+                } else {
+                    Ok(0)
+                }
+            }
+
+            // When Reverie successfully disables native CPUID, Detcore answers its fault from a
+            // fixed table. Preserve that backend state and reject attempts to re-enable CPUID.
+            ArchPrctlCmd::ARCH_GET_CPUID(_) if cpuid_uses_faulting => Ok(0),
+            ArchPrctlCmd::ARCH_SET_CPUID(value) if cpuid_uses_faulting => {
+                if value == 0 {
+                    Ok(0)
+                } else {
+                    Err(Errno::EPERM.into())
+                }
+            }
+            // Reverie cannot faithfully deliver a CPUID fault requested by the tracee. In
+            // explicit host-CPUID mode, expose a fixed enabled control state and reject disable.
+            ArchPrctlCmd::ARCH_GET_CPUID(_) if !self.cfg.virtualize_cpuid => Ok(1),
+            ArchPrctlCmd::ARCH_SET_CPUID(value) if !self.cfg.virtualize_cpuid => {
+                if value == 0 {
+                    Err(Errno::EPERM.into())
+                } else {
+                    Ok(0)
+                }
+            }
+
+            // Ptrace hosts without CPUID-faulting support retain the kernel's honest state.
+            ArchPrctlCmd::ARCH_GET_CPUID(_) | ArchPrctlCmd::ARCH_SET_CPUID(_) => {
+                Ok(guest.inject(call).await?)
+            }
+
+            // Expose a conservative virtual CPU with no optional extended-state permissions.
+            ArchPrctlCmd::Other(
+                ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM | ARCH_GET_XCOMP_GUEST_PERM,
+                addr,
+            ) => self.write_arch_prctl_u64(guest, addr, 0),
+            ArchPrctlCmd::Other(ARCH_REQ_XCOMP_PERM | ARCH_REQ_XCOMP_GUEST_PERM, _) => {
+                Err(Errno::EINVAL.into())
+            }
+
+            // Keep shadow stacks disabled in the virtual policy. Disabling an already-disabled
+            // feature is idempotent; enable/lock/unlock requests cannot be honored.
+            ArchPrctlCmd::Other(ARCH_SHSTK_STATUS, addr) => {
+                self.write_arch_prctl_u64(guest, addr, 0)
+            }
+            ArchPrctlCmd::Other(ARCH_SHSTK_DISABLE, features)
+                if features != 0 && features & !ARCH_SHSTK_VALID_MASK == 0 =>
+            {
+                Ok(0)
+            }
+            ArchPrctlCmd::Other(ARCH_SHSTK_DISABLE, _)
+            | ArchPrctlCmd::Other(ARCH_SHSTK_ENABLE | ARCH_SHSTK_LOCK | ARCH_SHSTK_UNLOCK, _) => {
+                Err(Errno::EINVAL.into())
+            }
+
+            ArchPrctlCmd::Other(_, _) => Err(Errno::EINVAL.into()),
+        }
+    }
+
     /// Fill guest memory from the deterministic PRNG owned by the current thread.
     pub(super) fn fill_random_bytes<G: Guest<Self>>(
         &self,
