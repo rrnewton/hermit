@@ -328,7 +328,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         raw_result: i64,
     ) -> Result<i64, Error> {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-pending)
+        // TODO-HUMAN-REVIEW(#592)
         assert!(flags.contains(CloneFlags::CLONE_THREAD));
         assert!(!flags.contains(CloneFlags::CLONE_VFORK));
         let parent_dettid = guest.thread_state().dettid;

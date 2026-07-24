@@ -414,7 +414,7 @@ fn run_dbi_verifies_process_wait_lifecycle() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending)
+// TODO-HUMAN-REVIEW(#592)
 #[test]
 fn run_dbi_verifies_signal_and_thread_lifecycle() {
     let program = dbi_signal_thread_guest()

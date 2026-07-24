@@ -40,7 +40,7 @@ const SA_MASK_INDEX: usize = KERNEL_SIGACTION_WORDS - 1;
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending)
+// TODO-HUMAN-REVIEW(#592)
 fn clear_reserved_signal(mask: u64) -> u64 {
     mask & !(1_u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1))
 }

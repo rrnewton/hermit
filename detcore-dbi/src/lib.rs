@@ -7,7 +7,7 @@
  */
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending)
+// TODO-HUMAN-REVIEW(#592)
 
 //! DynamoRIO callback runtime that executes the real Detcore [`Tool`] over
 //! [`reverie_dbi::DbiGuest`].
