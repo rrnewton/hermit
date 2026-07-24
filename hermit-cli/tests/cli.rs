@@ -11,11 +11,14 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
+static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -42,6 +45,31 @@ fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
     child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+}
+
+fn dbi_mmap_guest() -> &'static Path {
+    DBI_MMAP_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-mmap");
+        fs::create_dir_all(&build_root).expect("failed to create DBI mmap guest directory");
+        let guest = build_root.join("dbi_mmap_exec");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_mmap_exec.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI mmap guest");
+        assert!(
+            output.status.success(),
+            "DBI mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
 }
 
 fn hermit_with_closed_stdin(args: &[&str]) -> Output {
@@ -279,6 +307,24 @@ fn run_dbi_executes_integrated_backend() {
     let args = ["run", "--backend", "dbi", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBI regression.
+#[test]
+fn run_dbi_verifies_application_mmap() {
+    let program = dbi_mmap_guest()
+        .to_str()
+        .expect("DBI mmap guest path should be UTF-8");
+    let args = ["run", "--backend", "dbi", "--verify", "--", program];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "dbi-mmap-exec-ok\n");
+    assert!(
+        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
 }
 
 #[test]
