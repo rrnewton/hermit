@@ -1585,10 +1585,11 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run.
+# Auto-apply the `locally-validated` PR label after a fully-green full run, then
+# cancel the redundant in-flight CI run for the exact validated commit.
 # Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Label creation and application are best-effort so
-# GitHub or proxy failures never change the validation result.
+# `locally-validated` label. Label application and CI cancellation are
+# best-effort so GitHub or proxy failures never change the validation result.
 # The PR is taken from $PR_NUMBER when set, else detected from the current branch
 # via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
 # never changes validation's exit status.
@@ -1598,6 +1599,7 @@ function apply_locally_validated_label {
     local pr=$PR_NUMBER
     local pr_head=""
     local local_head
+    local run_id=""
     local -a gh_cmd=(gh)
 
     if ! command -v gh >/dev/null 2>&1; then
@@ -1642,6 +1644,25 @@ function apply_locally_validated_label {
     if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
         >>"$LOG_FILE" 2>&1; then
         printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
+
+        if ! run_id=$("${gh_cmd[@]}" api \
+            "repos/rrnewton/hermit/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
+            --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
+            2>>"$LOG_FILE"); then
+            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
+                "$local_head" "$LOG_FILE" >&2
+            return 0
+        fi
+        if [[ -z $run_id ]]; then
+            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
+        elif "${gh_cmd[@]}" api --method POST \
+            "repos/rrnewton/hermit/actions/runs/${run_id}/cancel" \
+            >>"$LOG_FILE" 2>&1; then
+            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
+        else
+            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
+                "$run_id" "$local_head" "$LOG_FILE" >&2
+        fi
     else
         printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
             "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
