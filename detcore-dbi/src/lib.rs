@@ -215,7 +215,7 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
 ///
 /// # Safety
 ///
-/// `argument` must encode a valid [`Emitter`] callback pointer.
+/// `argument` must encode a valid `Emitter` callback pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
     let emit: Emitter = unsafe { std::mem::transmute(argument) };
