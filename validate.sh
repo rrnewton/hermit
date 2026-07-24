@@ -547,7 +547,7 @@ function hermit_verify_smoke {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
+# TODO-HUMAN-REVIEW(#567): Review the blocking R/R compatibility ratchet.
 # Run one record or replay phase with a private process group so a regression
 # cannot leave tracees behind after the per-phase deadline.
 function run_rr_compatibility_phase {
@@ -662,6 +662,8 @@ function rr_compatibility_probe {
     return 0
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
 # Run one known-compatible application at L2. Each row has its own hard timeout
 # so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
