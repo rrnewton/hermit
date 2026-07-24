@@ -115,7 +115,9 @@ fn top_level_help_lists_user_facing_commands() {
     let help = stdout(&output);
 
     assert!(help.contains("Usage: hermit [OPTIONS] <COMMAND>"));
-    for command in ["run", "record", "replay", "log-diff", "analyze", "bisect"] {
+    for command in [
+        "run", "strace", "record", "replay", "log-diff", "analyze", "bisect",
+    ] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
 }

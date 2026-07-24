@@ -604,6 +604,7 @@ fn backend_values_parse_and_round_trip() {
     for (value, expected) in [
         ("ptrace", Backend::Ptrace),
         ("dbi", Backend::Dbi),
+        ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
     ] {
         let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
@@ -913,6 +914,9 @@ impl RunOpts {
         match backend {
             Backend::Ptrace | Backend::Kvm => {}
             Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+            Backend::Sabre => anyhow::bail!(
+                "the SaBRe M1 backend is available only through `hermit --backend sabre strace`"
+            ),
         }
 
         if self.no_namespace {
@@ -939,7 +943,7 @@ impl RunOpts {
     pub fn validate_args(&mut self) -> Result<(), Error> {
         let perf_supported = match self.selected_backend() {
             Backend::Ptrace => reverie_ptrace::is_perf_supported(),
-            Backend::Dbi | Backend::Kvm => true,
+            Backend::Dbi | Backend::Sabre | Backend::Kvm => true,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
