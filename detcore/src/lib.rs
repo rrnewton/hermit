@@ -621,6 +621,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::epoll_wait_old,
                 Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
+                Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
@@ -1248,6 +1249,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
             Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
             Syscall::Pause(s) => self.handle_pause(guest, s).await,
+            Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
 
             // These are to allow execution of a minimal rust executable
             // (namely //hermetic_infra/detcore:get-syscall-support)
@@ -1425,6 +1427,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::clock_gettime)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::rt_sigsuspend)
         );
         assert!(
             !subscriptions
