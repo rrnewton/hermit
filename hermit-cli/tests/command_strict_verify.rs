@@ -281,3 +281,69 @@ fn common_commands_are_deterministic_under_strict_verify() {
         assert_l2_under_strict_verify(case);
     }
 }
+
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
+fn python_prlimit64_query_is_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let case = StrictCommandCase {
+        name: "python3 prlimit64 query",
+        candidates: &["/usr/bin/python3"],
+        args: &[],
+        stdin: None,
+    };
+    let python = required_command(&case);
+    let query = "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE))";
+
+    let strict_output = Command::new("timeout")
+        .args([
+            "--kill-after",
+            HERMIT_VERIFY_KILL_AFTER,
+            HERMIT_VERIFY_TIMEOUT,
+        ])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "run", "--strict", "--"])
+        .arg(&python)
+        .args(["-c", query])
+        .output()
+        .expect("failed to start Python prlimit64 strict-mode value regression");
+    let strict_stdout = String::from_utf8_lossy(&strict_output.stdout);
+    let strict_stderr = String::from_utf8_lossy(&strict_output.stderr);
+    assert!(
+        strict_output.status.success(),
+        "Python prlimit64 strict-mode query failed: {}\n\
+         stdout:\n{strict_stdout}\nstderr:\n{strict_stderr}",
+        strict_output.status
+    );
+    assert_eq!(
+        strict_stdout.trim(),
+        "(1048576, 1048576)",
+        "Python observed a non-deterministic RLIMIT_NOFILE value"
+    );
+
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after",
+            HERMIT_VERIFY_KILL_AFTER,
+            HERMIT_VERIFY_TIMEOUT,
+        ])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .arg(&python)
+        .args(["-c", query])
+        .output()
+        .expect("failed to start Python prlimit64 strict/verify regression");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python prlimit64 query did not reach L2 under strict verification: {}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("Determinism verified") || stdout.contains("Determinism verified"),
+        "Hermit exited 0 without its determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}

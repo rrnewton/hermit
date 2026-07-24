@@ -638,6 +638,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::sched_yield,
                 Sysno::poll,
                 Sysno::ppoll,
+                Sysno::prlimit64,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -939,6 +940,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         Arc::clone(&pts.1.posix_timers)
                     } else {
                         Arc::new(Mutex::new(PosixTimers::default()))
+                    },
+                    // Resource limits are process state: threads share them,
+                    // while a forked process inherits a snapshot.
+                    resource_limits: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.resource_limits)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .resource_limits
+                                .lock()
+                                .expect("resource limits mutex poisoned")
+                                .clone(),
+                        ))
                     },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
@@ -1328,6 +1342,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
 
                 // POSIX per-process timers. Arming is tracked against the virtual
                 // clock so these verify deterministically under --strict; timer
