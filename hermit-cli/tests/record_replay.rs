@@ -240,7 +240,12 @@ fn workload(name: &str) -> &Workload {
         .unwrap_or_else(|| panic!("unknown record/replay workload: {name}"))
 }
 
-fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+fn record_replay_command_with_options(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    record_options: &[&str],
+) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     // Bound replay as well as recording: --record-timeout only covers the first phase.
     let mut command = Command::new("timeout");
@@ -249,6 +254,7 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["record", "start", "--verify", "--record-timeout=30"])
+        .args(record_options)
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
         .arg(program)
@@ -265,6 +271,10 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     );
 }
 
+fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+    record_replay_command_with_options(name, program, args, &[]);
+}
+
 fn record_replay(workload: &Workload) {
     record_replay_command(workload.name, &workload.path, &[]);
 }
@@ -275,16 +285,16 @@ fn run_record_replay(name: &str) {
 }
 
 #[test]
-fn record_strict_direct_cli_records_and_replays_echo() {
+fn record_direct_cli_records_and_replays_echo() {
     let _guard = hermit_record_lock();
-    let data_dir = tempfile::tempdir().expect("failed to create strict recording directory");
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
 
     let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
     record
-        .args(["--log=off", "record", "--strict", "--data-dir"])
+        .args(["--log=off", "record", "--data-dir"])
         .arg(data_dir.path())
         .args(["--", "/bin/echo", "hello"]);
-    let record_output = command_output(record, "strict direct CLI recording");
+    let record_output = command_output(record, "direct CLI recording");
     assert_eq!(
         record_output.stdout, b"hello\n",
         "recorded guest stdout changed"
@@ -294,11 +304,63 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     replay
         .args(["--log=off", "replay", "--autopilot", "--data-dir"])
         .arg(data_dir.path());
-    let replay_output = command_output(replay, "strict direct CLI replay");
+    let replay_output = command_output(replay, "direct CLI replay");
     assert_eq!(
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
     );
+}
+
+#[test]
+fn record_all_captures_boundary_sources() {
+    let _guard = hermit_record_lock();
+    let build_dir = tempfile::tempdir().expect("failed to create boundary workload directory");
+    let source = build_dir.path().join("record_boundaries.c");
+    let program = build_dir.path().join("record_boundaries");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <cpuid.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <unistd.h>
+#ifndef RWF_ATOMIC
+#define RWF_ATOMIC 0x40
+#endif
+
+static volatile sig_atomic_t saw_signal;
+static void handle_signal(int signal) { saw_signal = signal; }
+
+int main(void) {
+  struct timespec resolution;
+  unsigned char first[4], second[4];
+  struct iovec iov[2] = {{first, sizeof(first)}, {second, sizeof(second)}};
+  unsigned eax, ebx, ecx, edx;
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0 || readv(fd, iov, 2) != 8) return 2;
+  errno = 0;
+  if (syscall(SYS_preadv2, fd, iov, 2, 0, 0, RWF_ATOMIC) != -1 || errno != EOPNOTSUPP) return 5;
+  if (clock_getres(CLOCK_REALTIME, &resolution) != 0) return 3;
+  if (signal(SIGUSR1, handle_signal) == SIG_ERR || raise(SIGUSR1) != 0) return 4;
+  __cpuid_count(0, 0, eax, ebx, ecx, edx);
+  printf("%ld %ld %ld %ld %ld %ld %ld %u %02x%02x %d\n",
+         (long)getpid(), (long)syscall(SYS_gettid), (long)getppid(),
+         (long)getpgid(0), (long)getpgrp(), (long)getsid(0),
+         resolution.tv_nsec, eax, first[0], second[0], saw_signal);
+  return 0;
+}
+"#,
+    )
+    .expect("failed to write boundary workload");
+    compile_c(&source, &program);
+    record_replay_command_with_options("default-boundaries", &program, &[], &[]);
+    record_replay_command_with_options("record-all-boundaries", &program, &[], &["--record-all"]);
 }
 
 #[test]

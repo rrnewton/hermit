@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn record_accepts_strict_direct_and_start_forms() {
+    fn record_rejects_run_only_strict_flag() {
         for args in [
             vec!["hermit", "record", "--strict", "--", "/bin/echo", "hello"],
             vec![
@@ -241,8 +241,29 @@ mod tests {
                 "hello",
             ],
         ] {
-            let parsed = Args::try_parse_from(args).expect("record --strict should parse");
-            assert!(matches!(parsed.command, Subcommand::Record(_)));
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn record_accepts_feature_boundary_flags() {
+        for flag in [
+            "--record-time",
+            "--record-pids",
+            "--record-sched",
+            "--record-cpuid",
+            "--record-rng",
+            "--record-fs",
+            "--record-signals",
+            "--record-all",
+        ] {
+            for start in [None, Some("start")] {
+                let mut args = vec!["hermit", "record"];
+                args.extend(start);
+                args.extend([flag, "--", "/bin/true"]);
+                let parsed = Args::try_parse_from(args).expect("record feature flag should parse");
+                assert!(matches!(parsed.command, Subcommand::Record(_)));
+            }
         }
     }
 

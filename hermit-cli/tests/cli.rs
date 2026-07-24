@@ -1028,9 +1028,21 @@ fn record_help_lists_management_commands() {
     for command in ["list", "rm", "clean", "start"] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
+    for flag in [
+        "--record-time",
+        "--record-pids",
+        "--record-sched",
+        "--record-cpuid",
+        "--record-rng",
+        "--record-fs",
+        "--record-signals",
+        "--record-all",
+    ] {
+        assert!(help.contains(flag), "missing {flag:?} in:\n{help}");
+    }
     assert!(
-        help.contains("--strict"),
-        "missing direct strict option in:\n{help}"
+        !help.contains("--strict"),
+        "unexpected run-only flag in:\n{help}"
     );
 }
 

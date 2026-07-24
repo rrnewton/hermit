@@ -60,6 +60,16 @@ impl<T: Eq + fmt::Display> ReplayCursor<T> {
     }
 }
 
+impl<T> ReplayCursor<T> {
+    pub fn is_empty(&self) -> bool {
+        self.inner_data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner_data.len()
+    }
+}
+
 impl<T> Iterator for ReplayCursor<T> {
     type Item = T;
 

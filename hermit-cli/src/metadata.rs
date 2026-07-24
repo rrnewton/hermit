@@ -12,6 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use detcore::BlockingMode;
+use detcore::RecordFeatures;
 use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
@@ -44,7 +45,9 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x103);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x104);
+
+const SCHEDULE_NAME: &str = "schedule.json";
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,12 +70,15 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Sources captured by this recording instead of determinized by Detcore.
+    #[serde(default)]
+    pub record_features: RecordFeatures,
 }
 
 impl Metadata {
     /// Creates a new metadata object, populating it with information about a
     /// command.
-    pub fn new(command: &Command) -> Result<Self, Error> {
+    pub fn new(command: &Command, record_features: RecordFeatures) -> Result<Self, Error> {
         let exe = command.find_program()?;
 
         let program = command.get_program().to_string_lossy().into_owned();
@@ -115,6 +121,7 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
+            record_features,
         })
     }
 
@@ -141,12 +148,23 @@ impl Metadata {
     }
 }
 
-// TODO: Record this in the metadata instead of hardcoding this.
-pub fn record_or_replay_config(data: &Path) -> detcore::Config {
+#[derive(Clone, Copy)]
+pub enum RecordReplayMode {
+    Record,
+    Replay,
+}
+
+pub fn record_or_replay_config(
+    data: &Path,
+    record_features: RecordFeatures,
+    mode: RecordReplayMode,
+) -> detcore::Config {
     // NOTE: Record and replay should use the exact same detcore
     // configuration. Otherwise, the behavior of the program could diverge
     // during replay.
     let default_config: detcore::Config = Default::default();
+    let record_schedule = record_features.sched || record_features.signals;
+    let schedule_path = data.join(SCHEDULE_NAME);
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
         sequentialize_threads: true,
@@ -155,9 +173,11 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // begin in v0x102.
         passthru_opt: true,
         deterministic_io: false,
-        virtualize_time: false,
+        virtualize_time: !record_features.time,
+        // Record/replay needs real descriptor metadata for file-backed mmap and
+        // loader bootstrap. The filesystem stream remains captured in both modes.
         virtualize_metadata: false,
-        virtualize_cpuid: true,
+        virtualize_cpuid: !record_features.cpuid,
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,
         has_uts_namespace: true,
@@ -178,11 +198,14 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         sched_heuristic: Default::default(),
         sched_seed: default_config.sched_seed,
         recordreplay_modes: true,
-        record_preemptions: false,
-        record_preemptions_to: None,
+        record_features,
+        record_preemptions: record_schedule && matches!(mode, RecordReplayMode::Record),
+        record_preemptions_to: (record_schedule && matches!(mode, RecordReplayMode::Record))
+            .then_some(schedule_path.clone()),
         replay_preemptions_from: None,
-        replay_schedule_from: None,
-        replay_exhausted_panic: false,
+        replay_schedule_from: (record_schedule && matches!(mode, RecordReplayMode::Replay))
+            .then_some(schedule_path),
+        replay_exhausted_panic: record_schedule && matches!(mode, RecordReplayMode::Replay),
         die_on_desync: true,
         stacktrace_event: Vec::new(),
         stacktrace_signal: None,
@@ -219,18 +242,73 @@ mod tests {
     #[test]
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x103)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
+    }
+
+    #[test]
+    fn record_features_default_when_reading_legacy_metadata() {
+        let command = Command::new("/bin/true");
+        let metadata = Metadata::new(&command, RecordFeatures::all()).unwrap();
+        let mut value = serde_json::to_value(metadata).unwrap();
+        value.as_object_mut().unwrap().remove("record_features");
+        value["version"] = serde_json::json!(0x103);
+
+        let parsed: Metadata = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.version, RecordVersion(0x103));
+        assert_eq!(parsed.record_features, RecordFeatures::default());
     }
 
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
-        assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+        for mode in [RecordReplayMode::Record, RecordReplayMode::Replay] {
+            assert!(
+                record_or_replay_config(Path::new("replay-data"), RecordFeatures::default(), mode)
+                    .passthru_opt
+            );
+        }
+    }
+
+    #[test]
+    fn default_record_policy_determinizes_internal_sources() {
+        let config = record_or_replay_config(
+            Path::new("replay-data"),
+            RecordFeatures::default(),
+            RecordReplayMode::Record,
+        );
+        assert!(config.virtualize_time);
+        assert!(config.virtualize_cpuid);
+        assert!(!config.virtualize_metadata);
+        assert!(!config.record_preemptions);
+        assert_eq!(config.record_features, RecordFeatures::default());
+    }
+
+    #[test]
+    fn record_all_captures_sources_and_replays_the_schedule() {
+        let features = RecordFeatures::all();
+        let record =
+            record_or_replay_config(Path::new("replay-data"), features, RecordReplayMode::Record);
+        assert!(!record.virtualize_time);
+        assert!(!record.virtualize_cpuid);
+        assert!(!record.virtualize_metadata);
+        assert_eq!(
+            record.record_preemptions_to,
+            Some(PathBuf::from("replay-data/schedule.json"))
+        );
+
+        let replay =
+            record_or_replay_config(Path::new("replay-data"), features, RecordReplayMode::Replay);
+        assert!(replay.replay_exhausted_panic);
+        assert!(replay.die_on_desync);
+        assert_eq!(
+            replay.replay_schedule_from,
+            Some(PathBuf::from("replay-data/schedule.json"))
+        );
     }
 
     #[test]
     fn record_version_rejects_pre_madvise_policy_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x101)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x103)));
     }
 }

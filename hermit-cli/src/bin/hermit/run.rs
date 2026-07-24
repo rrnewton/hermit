@@ -1254,6 +1254,7 @@ impl RunOpts {
             ComparisonOptions {
                 success_message: "Success: deterministic. Determinism verified.",
                 failure_message: "Failure: nondeterministic.",
+                compare_logs: true,
                 verbose: self.verify_verbose,
             },
         )?;

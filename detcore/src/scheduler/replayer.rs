@@ -276,6 +276,24 @@ impl Replayer {
         }
     }
 
+    pub(super) fn ensure_complete(&self) -> anyhow::Result<()> {
+        let desyncs: u64 = self
+            .desync_counts
+            .values()
+            .map(|stats| stats.soft + stats.hard)
+            .sum();
+        anyhow::ensure!(
+            desyncs == 0,
+            "schedule replay completed with {desyncs} desynchronized events"
+        );
+        anyhow::ensure!(
+            self.cursor.is_empty(),
+            "schedule replay ended with {} unconsumed events",
+            self.cursor.len()
+        );
+        Ok(())
+    }
+
     pub fn observe_event(&mut self, observed: &SchedEvent) -> ReplayAction {
         let mytid = observed.dettid;
         let current_ix = self.traced_event_count;
@@ -304,13 +322,13 @@ impl Replayer {
 
             let is_desync = is_desync(observed, &expected);
             let mut in_hard_desync_mode = false;
+            if is_desync && self.die_on_desync {
+                eprintln!("Replay mode desynchronized from trace, bailing out.");
+                return ReplayAction::Stop(StopReason::FatalDesync);
+            }
             if is_desync {
                 let counts = self.desync_counts.entry(mytid).or_default();
                 if is_hard_desync(observed, &expected) {
-                    if self.die_on_desync {
-                        eprintln!("Replay mode desynchronized from trace, bailing out.");
-                        return ReplayAction::Stop(StopReason::FatalDesync);
-                    }
                     counts.hard += 1;
                     in_hard_desync_mode = true;
                 } else {
@@ -566,6 +584,16 @@ mod tests {
     }
 
     #[test]
+    fn completion_rejects_unconsumed_events() {
+        let mut builder = builder::SchedTestBuilder::new();
+        let event = builder.branch(10, tid(3));
+        let mut replayer = Replayer::new([event.clone()]);
+        assert!(replayer.ensure_complete().is_err());
+        assert_eq!(replayer.observe_event(&event), ReplayAction::Continue(None));
+        assert!(replayer.ensure_complete().is_ok());
+    }
+
+    #[test]
     fn test_continue_() {
         let mut b = builder::SchedTestBuilder::new();
         let schedule = vec![b.branch(10, tid(3))];
@@ -573,6 +601,19 @@ mod tests {
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(None)
+        );
+    }
+
+    #[test]
+    fn die_on_desync_rejects_soft_count_mismatch() {
+        let mut builder = builder::SchedTestBuilder::new();
+        let expected = builder.branch(10, tid(3));
+        let observed = builder.branch(11, tid(3));
+        let mut replayer = Replayer::new([expected]);
+        replayer.die_on_desync = true;
+        assert_eq!(
+            replayer.observe_event(&observed),
+            ReplayAction::Stop(StopReason::FatalDesync)
         );
     }
 

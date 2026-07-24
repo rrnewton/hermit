@@ -39,6 +39,7 @@ use clap::ValueEnum;
 use consts::METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
+pub use detcore::RecordFeatures;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
 pub use detcore_dbi::reverie_dbi_runtime_background_init;
@@ -463,7 +464,7 @@ async fn run_kvm(
         .map_err(|error| anyhow!("KVM guest execution failed: {error}"))?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+        .await?;
 
     if !capture_output {
         std::io::stdout().write_all(&stdout)?;
@@ -548,7 +549,7 @@ async fn run_with_backend_inner(
     let (exit_status, global_state) = builder.spawn().await?.wait().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await; // Before it's dropped by this function.
+        .await?; // Before it's dropped by this function.
     Ok(exit_status)
 }
 
@@ -618,7 +619,7 @@ async fn run_with_output_backend_inner(
     let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+        .await?;
     Ok(output)
 }
 
@@ -667,8 +668,17 @@ impl HermitData {
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        self.record_with_features(command, RecordFeatures::default())
+    }
+
+    /// Records the execution with an explicit determinize-or-record policy.
+    pub fn record_with_features(
+        &self,
+        command: Command,
+        record_features: RecordFeatures,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to(command, data.path())?;
+        let exit_status = record_to_with_features(command, data.path(), record_features)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -792,7 +802,23 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// Records to the specified directory, which must already exist.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Record::spawn(command, dir).await?.wait().await?)
+    Record::spawn(command, dir, RecordFeatures::default())
+        .await?
+        .wait()
+        .await
+}
+
+/// Records to the specified directory with an explicit determinize-or-record policy.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_to_with_features(
+    command: Command,
+    dir: &Path,
+    record_features: RecordFeatures,
+) -> Result<ExitStatus, Error> {
+    Record::spawn(command, dir, record_features)
+        .await?
+        .wait()
+        .await
 }
 
 /// Records to the specified directory, which must already exist. The
@@ -803,32 +829,49 @@ pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Outp
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    Ok(Record::spawn(command, dir)
+    Record::spawn(command, dir, RecordFeatures::default())
         .await?
         .wait_with_output()
-        .await?)
+        .await
+}
+
+/// Records with captured output and an explicit determinize-or-record policy.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_with_output_features(
+    mut command: Command,
+    dir: &Path,
+    record_features: RecordFeatures,
+) -> Result<Output, Error> {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    Record::spawn(command, dir, record_features)
+        .await?
+        .wait_with_output()
+        .await
 }
 
 /// Replays from the specified directory.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, None).await?.wait().await?)
+    Replay::spawn(dir, false, None).await?.wait().await
 }
 
 /// Replays with a gdb server.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, Some(port)).await?.wait().await?)
+    Replay::spawn(dir, false, Some(port)).await?.wait().await
 }
 
 /// Replays from the specified directory which must already exist. The
 /// stderr/stdout of the replay is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
-    Ok(Replay::spawn(dir, true, None)
+    Replay::spawn(dir, true, None)
         .await?
         .wait_with_output()
-        .await?)
+        .await
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ use crate::error::Error;
 use crate::interp;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
+use crate::metadata::RecordReplayMode;
 use crate::metadata::record_or_replay_config;
 use crate::replayer::Replayer;
 
@@ -75,7 +76,8 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let config = record_or_replay_config(dir);
+        let config =
+            record_or_replay_config(dir, metadata.record_features, RecordReplayMode::Replay);
         let sequentialize_threads = config.sequentialize_threads;
 
         let chroot =
@@ -122,18 +124,18 @@ impl Replay {
     }
 
     /// Waits for the replay to finish and returns its exit status.
-    pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
+    pub async fn wait(self) -> Result<ExitStatus, Error> {
         let (exit_status, global_state) = self.tracer.wait().await?;
         self.chroot.remove()?;
-        global_state.clean_up(false, &None).await;
+        global_state.clean_up(false, &None).await?;
         Ok(exit_status)
     }
 
     /// Waits for the replay to finish and collects its output.
-    pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
+    pub async fn wait_with_output(self) -> Result<Output, Error> {
         let (output, global_state) = self.tracer.wait_with_output().await?;
         self.chroot.remove()?;
-        global_state.clean_up(false, &None).await;
+        global_state.clean_up(false, &None).await?;
         Ok(output)
     }
 }

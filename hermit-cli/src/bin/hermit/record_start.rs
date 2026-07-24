@@ -17,8 +17,10 @@ use std::time::Duration;
 use clap::Args;
 use colored::Colorize;
 use hermit::Context;
+use hermit::DetConfig;
 use hermit::Error;
 use hermit::HermitData;
+use hermit::RecordFeatures;
 use hermit::SerializableError;
 use hermit::Shebang;
 use nix::sys::signal::SaFlags;
@@ -154,10 +156,37 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
-    /// for command-line compatibility with `hermit run --strict`.
-    #[clap(long = "strict")]
-    _strict: bool,
+    /// Record host time instead of using Detcore's logical clock.
+    #[clap(long)]
+    record_time: bool,
+
+    /// Record guest-visible process and thread identifiers.
+    #[clap(long)]
+    record_pids: bool,
+
+    /// Record Detcore's schedule and replay it exactly.
+    #[clap(long)]
+    record_sched: bool,
+
+    /// Record host CPUID results instead of using Detcore's stable CPUID table.
+    #[clap(long)]
+    record_cpuid: bool,
+
+    /// Record host RNG results instead of using Detcore's seeded PRNG.
+    #[clap(long)]
+    record_rng: bool,
+
+    /// Explicitly select filesystem capture at the record boundary.
+    #[clap(long)]
+    record_fs: bool,
+
+    /// Record signal delivery ordering in the schedule trace.
+    #[clap(long)]
+    record_signals: bool,
+
+    /// Record every configurable nondeterminism source.
+    #[clap(long)]
+    record_all: bool,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
@@ -200,6 +229,27 @@ impl StartOpts {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
+
+    fn det_config(&self) -> DetConfig {
+        let record_features = if self.record_all {
+            RecordFeatures::all()
+        } else {
+            RecordFeatures {
+                time: self.record_time,
+                pids: self.record_pids,
+                sched: self.record_sched,
+                cpuid: self.record_cpuid,
+                rng: self.record_rng,
+                fs: self.record_fs,
+                signals: self.record_signals,
+            }
+        };
+        DetConfig {
+            record_features,
+            ..DetConfig::default()
+        }
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
             self.record_verify(global)
@@ -221,7 +271,11 @@ impl StartOpts {
                             let mut command = Command::new(self.program());
                             command.args(&self.args);
                             with_recording_deadline(timeout, || {
-                                hermit::record_to(command, &data_path)
+                                hermit::record_to_with_features(
+                                    command,
+                                    &data_path,
+                                    self.det_config().record_features,
+                                )
                             })
                             .map_err(SerializableError::from)
                         })
@@ -233,7 +287,9 @@ impl StartOpts {
                         let _guard = global.init_tracing();
                         let mut command = Command::new(self.program());
                         command.args(&self.args);
-                        hermit.record(command).map_err(SerializableError::from)
+                        hermit
+                            .record_with_features(command, self.det_config().record_features)
+                            .map_err(SerializableError::from)
                     })
                     .context("Container exited unexpectedly")??,
             };
@@ -270,9 +326,17 @@ impl StartOpts {
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_with_output(command, data_dir)
+                        hermit::record_with_output_features(
+                            command,
+                            data_dir,
+                            self.det_config().record_features,
+                        )
                     }),
-                    None => hermit::record_with_output(command, data_dir),
+                    None => hermit::record_with_output_features(
+                        command,
+                        data_dir,
+                        self.det_config().record_features,
+                    ),
                 }
                 .map_err(SerializableError::from)
             })
@@ -288,6 +352,10 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
+        // Captured schedule replay emits different Detcore bookkeeping from recording it.
+        // In that mode, compare the guest-observable output and status only.
+        let features = self.det_config().record_features;
+
         compare_two_runs(
             ComparedRun {
                 output: &recording,
@@ -300,6 +368,7 @@ impl StartOpts {
             ComparisonOptions {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
+                compare_logs: !(features.sched || features.signals),
                 verbose: false,
             },
         )
@@ -322,10 +391,18 @@ impl StartOpts {
                 command.args(&self.args);
 
                 match record_timeout {
-                    Some(timeout) => {
-                        with_recording_deadline(timeout, || hermit::record_to(command, data_dir))
-                    }
-                    None => hermit::record_to(command, data_dir),
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_to_with_features(
+                            command,
+                            data_dir,
+                            self.det_config().record_features,
+                        )
+                    }),
+                    None => hermit::record_to_with_features(
+                        command,
+                        data_dir,
+                        self.det_config().record_features,
+                    ),
                 }
                 .map_err(SerializableError::from)
             })
@@ -386,6 +463,53 @@ impl StartOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(clap::Parser)]
+    struct TestStart {
+        #[clap(flatten)]
+        opts: StartOpts,
+    }
+
+    #[test]
+    fn record_feature_policy_defaults_to_determinization() {
+        let parsed = <TestStart as clap::Parser>::parse_from(["test", "/bin/true"]);
+        assert_eq!(
+            parsed.opts.det_config().record_features,
+            RecordFeatures::default()
+        );
+    }
+
+    #[test]
+    fn record_feature_policy_preserves_individual_choices() {
+        let parsed = <TestStart as clap::Parser>::parse_from([
+            "test",
+            "--record-time",
+            "--record-rng",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            parsed.opts.det_config().record_features,
+            RecordFeatures {
+                time: true,
+                rng: true,
+                ..RecordFeatures::default()
+            }
+        );
+    }
+
+    #[test]
+    fn record_all_overrides_individual_feature_selection() {
+        let parsed = <TestStart as clap::Parser>::parse_from([
+            "test",
+            "--record-all",
+            "--record-time",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            parsed.opts.det_config().record_features,
+            RecordFeatures::all()
+        );
+    }
 
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
     // perpetually pending and silently disable the deadline. Arming must unblock

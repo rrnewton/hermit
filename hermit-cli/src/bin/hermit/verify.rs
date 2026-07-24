@@ -29,6 +29,7 @@ pub(crate) struct ComparedRun<'a> {
 pub(crate) struct ComparisonOptions<'a> {
     pub success_message: &'a str,
     pub failure_message: &'a str,
+    pub compare_logs: bool,
     pub verbose: bool,
 }
 
@@ -105,33 +106,35 @@ pub fn compare_two_runs(
         }
     }
 
-    eprintln!(
-        ":: {} {} and {}",
-        "Comparing logs...".yellow().bold(),
-        log1.display(),
-        log2.display()
-    );
-
-    let mut diff_options = logdiff::LogDiffOpts {
-        strip_lines: true,
-        syscall_history: 5,
-        ..Default::default()
-    };
-    if options.verbose {
-        diff_options.comparison = logdiff::LogComparisonMode::FullTrace;
-        diff_options.strip_lines = false;
-        diff_options.syscall_history = 10;
-    }
-
-    if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
-        failed = true;
-        eprintln!(":: {}", "Log differences found between runs.".red().bold());
+    if options.compare_logs {
         eprintln!(
-            ":: {}: {} {}",
-            "Respective Logs retained for further inspection".red(),
+            ":: {} {} and {}",
+            "Comparing logs...".yellow().bold(),
             log1.display(),
             log2.display()
         );
+
+        let mut diff_options = logdiff::LogDiffOpts {
+            strip_lines: true,
+            syscall_history: 5,
+            ..Default::default()
+        };
+        if options.verbose {
+            diff_options.comparison = logdiff::LogComparisonMode::FullTrace;
+            diff_options.strip_lines = false;
+            diff_options.syscall_history = 10;
+        }
+
+        if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
+            failed = true;
+            eprintln!(":: {}", "Log differences found between runs.".red().bold());
+            eprintln!(
+                ":: {}: {} {}",
+                "Respective Logs retained for further inspection".red(),
+                log1.display(),
+                log2.display()
+            );
+        }
     }
 
     if out1.status != out2.status {
@@ -210,6 +213,7 @@ mod tests {
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
+                compare_logs: true,
             },
         )
     }
@@ -222,6 +226,35 @@ mod tests {
 
         assert_eq!(
             compare(&left, log1, &right, log2).unwrap(),
+            ExitStatus::Exited(0)
+        );
+    }
+
+    #[test]
+    fn output_only_comparison_ignores_internal_log_differences() {
+        let output = output(0, b"same\n", b"");
+        let (left, right) = temp_log_files("schedule_record", "schedule_replay").unwrap();
+        fs::write(left.path(), b"record-side scheduler trace\n").unwrap();
+        fs::write(right.path(), b"replay-side scheduler trace\n").unwrap();
+
+        assert_eq!(
+            compare_two_runs(
+                ComparedRun {
+                    output: &output,
+                    log: left.into_temp_path(),
+                },
+                ComparedRun {
+                    output: &output,
+                    log: right.into_temp_path(),
+                },
+                ComparisonOptions {
+                    success_message: "verified",
+                    failure_message: "failed",
+                    compare_logs: false,
+                    verbose: false,
+                },
+            )
+            .unwrap(),
             ExitStatus::Exited(0)
         );
     }

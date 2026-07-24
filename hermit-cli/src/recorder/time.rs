@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::ClockGetres;
 use reverie::syscalls::ClockGettime;
 use reverie::syscalls::Gettimeofday;
 use reverie::syscalls::MemoryAccess;
@@ -36,6 +37,28 @@ impl Recorder {
 
         self.record_event(guest, event);
 
+        result
+    }
+
+    pub(super) async fn handle_clock_getres<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: ClockGetres,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        let event = result.and_then(|ret| {
+            debug_assert_eq!(ret, 0);
+            match syscall.res() {
+                Some(addr) => {
+                    let timespec: Timespec = guest.memory().read_value(addr)?;
+                    Ok(SyscallEvent::Timespec(TimespecEvent { timespec }))
+                }
+                None => Ok(SyscallEvent::Return(ret)),
+            }
+        });
+
+        self.record_event(guest, event);
         result
     }
 

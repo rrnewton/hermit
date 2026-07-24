@@ -234,13 +234,27 @@ The command prints a recording ID. Recordings default to
 `$XDG_CACHE_HOME/hermit`, normally `~/.cache/hermit`. Select another directory
 with `--data-dir=DIR` or the `HERMIT_DATA_DIR` environment variable.
 
-For command-line compatibility with `hermit run --strict`, recording also accepts
-`--strict`. Record/replay already uses a single serialized configuration, so the flag
-does not change recording semantics. The direct form is an alias for `record start`:
+Record mode determinizes Detcore-managed nondeterminism sources by default and
+records external network and filesystem input needed to reconstruct execution.
+Select internal sources that should instead be captured in the recording
+with `--record-time`, `--record-pids`, `--record-sched`, `--record-cpuid`,
+`--record-rng`, `--record-fs`, and `--record-signals`. `--record-all` selects all
+seven. `--record-fs` makes the filesystem side of the boundary explicit;
+filesystem results are currently captured in either mode because replay needs
+them for file-backed mappings and loader bootstrap. The selected boundary is
+stored in recording metadata and restored for replay:
 
 ```bash
-hermit record --strict -- /bin/echo recorded
+hermit record --record-time -- /bin/date
+hermit record start --record-all -- /path/to/program
 ```
+
+`--record-signals` records the ordering of signal deliveries that Hermit observes.
+Guest-generated signals are reproduced with their generating syscalls; external
+signal sources must recur during replay because record mode does not synthesize
+host-originated signals.
+
+`--strict` is a `hermit run` option and is not accepted by record mode.
 
 List recordings:
 

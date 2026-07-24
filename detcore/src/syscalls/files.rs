@@ -260,10 +260,15 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let res = match fd_type {
             FdType::Rng => {
-                trace!("Read call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                return Ok(n as i64);
+                if self.cfg.recordreplay_modes && self.cfg.record_features.rng {
+                    Ok(self.record_or_replay(guest, call).await?)
+                } else {
+                    trace!("Read call RNG fd {}, simulating...", call.fd());
+                    let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                    let n =
+                        self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                    Ok(n as i64)
+                }
             }
             FdType::Regular => {
                 if guest.config().deterministic_io {
@@ -320,12 +325,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let res = match fd_type {
-            FdType::Rng => (|| -> Result<i64, Error> {
-                trace!("Pread64 call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
-                Ok(n as i64)
-            })(),
+            FdType::Rng => {
+                if self.cfg.recordreplay_modes && self.cfg.record_features.rng {
+                    Ok(self.record_or_replay(guest, call).await?)
+                } else {
+                    trace!("Pread64 call RNG fd {}, simulating...", call.fd());
+                    let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                    let n =
+                        self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                    Ok(n as i64)
+                }
+            }
             FdType::Regular if guest.config().deterministic_io => {
                 self.deterministic_pread64(guest, call).await
             }
@@ -337,6 +347,79 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         resource_release_all(guest).await;
         res
+    }
+
+    /// Handle vectored reads, keeping deterministic RNG semantics for /dev/[u]random.
+    pub async fn handle_readv_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        iov_addr: Option<usize>,
+        iovcnt: usize,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty());
+        let Ok(fd_type) = fd_type else {
+            return Ok(self.record_or_replay(guest, call).await?);
+        };
+        if fd_type != FdType::Rng || (self.cfg.recordreplay_modes && self.cfg.record_features.rng) {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        if let Syscall::Preadv2(preadv2) = call {
+            const RWF_SUPPORTED: i32 = 0x3f;
+            if preadv2.flags() & !RWF_SUPPORTED != 0 {
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+        }
+
+        const IOV_MAX: usize = 1024;
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        if iovcnt > IOV_MAX {
+            return Err(Errno::EINVAL.into());
+        }
+        if iovcnt == 0 {
+            return Ok(0);
+        }
+
+        let iov = iov_addr
+            .and_then(Addr::<libc::iovec>::from_raw)
+            .ok_or(Errno::EFAULT)?;
+        let mut iovecs = vec![
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            };
+            iovcnt
+        ];
+        guest.memory().read_values(iov, &mut iovecs)?;
+
+        let mut written = 0usize;
+        for entry in iovecs {
+            let len = entry.iov_len.min(MAX_RW_COUNT - written);
+            if len == 0 {
+                if written == MAX_RW_COUNT {
+                    break;
+                }
+                continue;
+            }
+            let Some(buf) = AddrMut::<u8>::from_raw(entry.iov_base as usize) else {
+                if written == 0 {
+                    return Err(Errno::EFAULT.into());
+                }
+                break;
+            };
+            let n = match self.fill_random_bytes(guest, buf, len, "/dev/[u]random readv") {
+                Ok(n) => n,
+                Err(_) if written > 0 => break,
+                Err(error) => return Err(error),
+            };
+            written += n;
+            if n < len || written == MAX_RW_COUNT {
+                break;
+            }
+        }
+
+        Ok(written as i64)
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its

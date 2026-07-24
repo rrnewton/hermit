@@ -28,6 +28,50 @@ const fn default_true() -> bool {
     true
 }
 
+/// Nondeterminism sources that record mode captures instead of determinizing.
+///
+/// Network and filesystem input needed to reconstruct execution are always
+/// captured and are therefore not represented as optional internal sources.
+/// An empty policy is the record-mode default for Detcore-managed sources.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecordFeatures {
+    /// Capture host time instead of using Detcore's logical clock.
+    pub time: bool,
+    /// Capture guest-visible process and thread identifiers.
+    pub pids: bool,
+    /// Capture Detcore's chosen schedule for exact replay.
+    pub sched: bool,
+    /// Capture host CPUID results instead of using Detcore's stable CPUID table.
+    pub cpuid: bool,
+    /// Capture host RNG syscall results instead of using Detcore's seeded PRNG.
+    pub rng: bool,
+    /// Explicitly select filesystem capture at the policy boundary.
+    ///
+    /// Record/replay currently captures filesystem results in either mode because
+    /// replay needs them to reconstruct file-backed mappings and loader state.
+    pub fs: bool,
+    /// Capture signal delivery ordering in the recorded schedule.
+    ///
+    /// External signal sources must recur during replay; this policy orders observed
+    /// deliveries but does not synthesize host-originated signals.
+    pub signals: bool,
+}
+
+impl RecordFeatures {
+    /// Select every configurable recording source.
+    pub const fn all() -> Self {
+        Self {
+            time: true,
+            pids: true,
+            sched: true,
+            cpuid: true,
+            rng: true,
+            fs: true,
+            signals: true,
+        }
+    }
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -281,6 +325,11 @@ pub struct Config {
     /// and reproduce more, recording less, then this flag should become obsolete.
     #[clap(skip = false)]
     pub recordreplay_modes: bool,
+
+    /// Record-mode policy for choosing captured sources over deterministic substitutes.
+    #[serde(default)]
+    #[clap(skip)]
+    pub record_features: RecordFeatures,
 
     /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.

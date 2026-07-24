@@ -17,6 +17,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use reverie::CpuIdResult;
 use reverie::Errno;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -118,6 +119,8 @@ pub struct Recorder {
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
     #[serde(skip)]
     stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
+    /// Sources selected for capture instead of Detcore substitution.
+    record_features: detcore::RecordFeatures,
 }
 
 #[reverie::tool]
@@ -132,6 +135,7 @@ impl Tool for Recorder {
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            record_features: cfg.record_features,
         }
     }
 
@@ -149,7 +153,7 @@ impl Tool for Recorder {
         })
     }
 
-    fn subscriptions(_config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
+    fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         let mut subscription = Subscription::none();
         subscription.rdtsc().cpuid().syscalls([
             Sysno::execve,
@@ -196,6 +200,7 @@ impl Tool for Recorder {
             Sysno::ioctl,
             Sysno::socket,
             Sysno::clock_gettime,
+            Sysno::clock_getres,
             Sysno::gettimeofday,
             Sysno::settimeofday,
             Sysno::time,
@@ -216,6 +221,17 @@ impl Tool for Recorder {
             Sysno::unlink,
             Sysno::unlinkat,
         ]);
+
+        if config.record_features.pids {
+            subscription.syscalls([
+                Sysno::getpid,
+                Sysno::gettid,
+                Sysno::getppid,
+                Sysno::getpgid,
+                Sysno::getpgrp,
+                Sysno::getsid,
+            ]);
+        }
 
         subscription
     }
@@ -316,6 +332,7 @@ impl Tool for Recorder {
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
+            Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
@@ -337,6 +354,16 @@ impl Tool for Recorder {
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
+            Syscall::Getpid(_)
+            | Syscall::Gettid(_)
+            | Syscall::Getppid(_)
+            | Syscall::Getpgid(_)
+            | Syscall::Getpgrp(_)
+            | Syscall::Getsid(_)
+                if self.record_features.pids =>
+            {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
@@ -349,6 +376,28 @@ impl Tool for Recorder {
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         self.release_unreferenced_outputs(guest.pid());
         Ok(())
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        eax: u32,
+        ecx: u32,
+    ) -> Result<CpuIdResult, Errno> {
+        let native = std::arch::x86_64::__cpuid_count(eax, ecx);
+        let result = CpuIdResult {
+            eax: native.eax,
+            ebx: native.ebx,
+            ecx: native.ecx,
+            edx: native.edx,
+        };
+        self.record_event(
+            guest,
+            Ok(SyscallEvent::Cpuid([
+                result.eax, result.ebx, result.ecx, result.edx,
+            ])),
+        );
+        Ok(result)
     }
 
     async fn handle_rdtsc_event<G: Guest<Self>>(

@@ -2315,6 +2315,11 @@ impl Scheduler {
             .unwrap_or_default();
 
         let total_desyncs = total_desync_stats.soft + total_desync_stats.hard;
+        if let Some(replayer) = &self.replayer
+            && replayer.die_on_desync
+        {
+            replayer.ensure_complete()?;
+        }
         let desync_descrip = if total_desyncs > 0 {
             let mut buf = String::new();
             write!(

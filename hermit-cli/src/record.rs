@@ -18,6 +18,7 @@ use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::metadata::Metadata;
+use crate::metadata::RecordReplayMode;
 use crate::metadata::record_or_replay_config;
 use crate::recorder::Recorder;
 
@@ -32,8 +33,12 @@ pub struct Record {
 
 impl Record {
     /// Spawns a new recording.
-    pub async fn spawn(command: Command, dir: &Path) -> Result<Self, Error> {
-        let metadata = Metadata::new(&command)?;
+    pub async fn spawn(
+        command: Command,
+        dir: &Path,
+        record_features: detcore::RecordFeatures,
+    ) -> Result<Self, Error> {
+        let metadata = Metadata::new(&command, record_features)?;
 
         let exe = dir.join(EXE_NAME);
 
@@ -46,7 +51,7 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let config = record_or_replay_config(dir);
+        let config = record_or_replay_config(dir, record_features, RecordReplayMode::Record);
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)
@@ -57,16 +62,16 @@ impl Record {
     }
 
     /// Waits for the replay to finish and returns its exit status.
-    pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
+    pub async fn wait(self) -> Result<ExitStatus, Error> {
         let (exit_status, global_state) = self.tracer.wait().await?;
-        global_state.clean_up(false, &None).await;
+        global_state.clean_up(false, &None).await?;
         Ok(exit_status)
     }
 
     /// Waits for the replay to finish and collects its output.
-    pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
+    pub async fn wait_with_output(self) -> Result<Output, Error> {
         let (output, global_state) = self.tracer.wait_with_output().await?;
-        global_state.clean_up(false, &None).await;
+        global_state.clean_up(false, &None).await?;
         Ok(output)
     }
 }

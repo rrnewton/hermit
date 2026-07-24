@@ -70,6 +70,7 @@ use std::time::Duration;
 
 pub use config::BlockingMode;
 pub use config::Config;
+pub use config::RecordFeatures;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 use rand::RngExt as _;
@@ -771,6 +772,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     edx: 0,
                 }
             })
+        } else if self.cfg.recordreplay_modes && self.cfg.record_features.cpuid {
+            self.record_or_replay
+                .handle_cpuid_event(&mut guest.into_guest(), eax, ecx)
+                .await?
         } else {
             cpuid!(eax, ecx)
         };
@@ -1265,7 +1270,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await.map_err(Into::into),
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await.map_err(Into::into),
-                Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
+                Syscall::Getrandom(s) => {
+                    if self.cfg.recordreplay_modes && self.cfg.record_features.rng {
+                        self.record_or_replay(guest, s).await.map_err(Into::into)
+                    } else {
+                        self.handle_getrandom(guest, s).await
+                    }
+                }
                 Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
                 Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
                 // NB: lutimes is a libc function not a syscall
@@ -1443,15 +1454,47 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
-            SyscallClassification::Unclassified => {
-                self.handle_unclassified_syscall(
-                    guest,
-                    call,
-                    dettid,
-                    config.panic_on_unsupported_syscalls,
-                )
-                .await
-            }
+            SyscallClassification::Unclassified => match call {
+                Syscall::Readv(s) => {
+                    self.handle_readv_family(
+                        guest,
+                        s.fd(),
+                        s.iov().map(|addr| addr.as_raw()),
+                        s.len(),
+                        s.into(),
+                    )
+                    .await
+                }
+                Syscall::Preadv(s) => {
+                    self.handle_readv_family(
+                        guest,
+                        s.fd(),
+                        s.iov().map(|addr| addr.as_raw()),
+                        s.iov_len(),
+                        s.into(),
+                    )
+                    .await
+                }
+                Syscall::Preadv2(s) => {
+                    self.handle_readv_family(
+                        guest,
+                        s.fd(),
+                        s.iov().map(|addr| addr.as_raw()),
+                        s.iov_len() as usize,
+                        s.into(),
+                    )
+                    .await
+                }
+                unexpected => {
+                    self.handle_unclassified_syscall(
+                        guest,
+                        unexpected,
+                        dettid,
+                        config.panic_on_unsupported_syscalls,
+                    )
+                    .await
+                }
+            },
         };
 
         detlog!(

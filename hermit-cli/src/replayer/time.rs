@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::ClockGetres;
 use reverie::syscalls::ClockGettime;
 use reverie::syscalls::Gettimeofday;
 use reverie::syscalls::MemoryAccess;
@@ -29,6 +30,20 @@ impl Replayer {
             // clock_gettime always returns 0 on success.
             Ok(0)
         })
+    }
+
+    pub(super) async fn handle_clock_getres<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: ClockGetres,
+    ) -> Result<i64, Errno> {
+        match syscall.res() {
+            Some(addr) => next_event!(guest, Timespec).and_then(|event| {
+                guest.memory().write_value(addr, &event.timespec)?;
+                Ok(0)
+            }),
+            None => next_event!(guest, Return),
+        }
     }
 
     pub(super) async fn handle_time<G: Guest<Self>>(

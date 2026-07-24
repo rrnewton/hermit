@@ -323,7 +323,11 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
@@ -331,7 +335,7 @@ impl GlobalState {
         }
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
-        let mut summary = self.into_run_summary().unwrap();
+        let mut summary = self.into_run_summary()?;
 
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
@@ -352,6 +356,7 @@ impl GlobalState {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
+        Ok(())
     }
 
     fn into_run_summary(self) -> anyhow::Result<RunSummary> {

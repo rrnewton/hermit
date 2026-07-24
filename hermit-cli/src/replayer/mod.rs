@@ -17,6 +17,7 @@ mod time;
 
 use std::path::PathBuf;
 
+use reverie::CpuIdResult;
 use reverie::Errno;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -65,6 +66,8 @@ pub struct Replayer {
     stdout_error: Option<String>,
     #[serde(skip)]
     stderr_error: Option<String>,
+    /// Sources selected for capture instead of Detcore substitution.
+    record_features: detcore::RecordFeatures,
 }
 
 #[reverie::tool]
@@ -81,6 +84,7 @@ impl Tool for Replayer {
             stderr,
             stdout_error,
             stderr_error,
+            record_features: cfg.record_features,
         }
     }
 
@@ -193,6 +197,7 @@ impl Tool for Replayer {
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
+            Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
@@ -225,12 +230,32 @@ impl Tool for Replayer {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Getpid(_)
+            | Syscall::Gettid(_)
+            | Syscall::Getppid(_)
+            | Syscall::Getpgid(_)
+            | Syscall::Getpgrp(_)
+            | Syscall::Getsid(_)
+                if self.record_features.pids =>
+            {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
+    }
+
+    async fn handle_cpuid_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _eax: u32,
+        _ecx: u32,
+    ) -> Result<CpuIdResult, Errno> {
+        let [eax, ebx, ecx, edx] = next_event!(guest, Cpuid)?;
+        Ok(CpuIdResult { eax, ebx, ecx, edx })
     }
 
     async fn handle_rdtsc_event<G: Guest<Self>>(

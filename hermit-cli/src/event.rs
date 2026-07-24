@@ -80,6 +80,8 @@ pub enum SyscallEvent {
     Statfs(Vec<u8>),
     Statx(StatxBuf),
     Rdtsc(RdtscResult),
+    /// Native `[eax, ebx, ecx, edx]` returned by a CPUID instruction.
+    Cpuid([u32; 4]),
     Ioctl(ioctl::Output),
     Timespec(TimespecEvent),
     Timeofday((Timeval, Timezone)),
