@@ -498,7 +498,10 @@ fn run_dbi_rejects_unfollowed_execveat() {
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "execveat unsupported\n");
+    assert_eq!(
+        stdout(&output),
+        "execveat unsupported in root and fork child\n"
+    );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
         "DBI determinism confirmation missing:\n{}",
