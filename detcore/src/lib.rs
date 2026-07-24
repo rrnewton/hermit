@@ -1361,22 +1361,52 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
+            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
+            // dispatch it by Sysno while retaining typed guards for every represented call.
+            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => match call {
                 Syscall::Access(_)
                 | Syscall::Brk(_)
+                | Syscall::Capget(_)
+                | Syscall::Capset(_)
+                | Syscall::Chdir(_)
+                | Syscall::Chmod(_)
+                | Syscall::Fchdir(_)
+                | Syscall::Fchmodat(_)
+                | Syscall::Fdatasync(_)
+                | Syscall::Ftruncate(_)
                 | Syscall::Getcwd(_)
                 | Syscall::Getegid(_)
                 | Syscall::Geteuid(_)
                 | Syscall::Getgid(_)
+                | Syscall::Getgroups(_)
                 | Syscall::Getpid(_)
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
+                | Syscall::Getxattr(_)
+                | Syscall::Lgetxattr(_)
+                | Syscall::Linkat(_)
                 | Syscall::Lseek(_)
+                | Syscall::Mkdir(_)
+                | Syscall::Mkdirat(_)
                 | Syscall::Mprotect(_)
                 | Syscall::Readlink(_)
+                | Syscall::Removexattr(_)
+                | Syscall::Renameat2(_)
+                | Syscall::Rmdir(_)
+                | Syscall::RtSigreturn(_)
+                | Syscall::Setxattr(_)
                 | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
-                | Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
+                | Syscall::Sigaltstack(_)
+                | Syscall::Symlinkat(_)
+                | Syscall::Umask(_)
+                | Syscall::Unlink(_)
+                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
                 unexpected => {
                     self.handle_unclassified_syscall(
                         guest,
