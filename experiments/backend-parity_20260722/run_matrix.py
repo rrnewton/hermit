@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -98,6 +99,10 @@ class Fixtures:
 
         local = SCRIPT_DIR / "fixtures"
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
+            "file_io_batch": (local / "file_io_batch.c", ()),
+            "memory_batch": (local / "memory_batch.c", ()),
+            "process_batch": (local / "process_batch.c", ()),
+            "signal_batch": (local / "signal_batch.c", ()),
             "pthread_lifecycle": (local / "pthread_lifecycle.c", ("-pthread",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
@@ -128,6 +133,26 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "exit_zero": (["/bin/true"], 0, b""),
         "exit_status": (["/bin/sh", "-c", "exit 23"], 23, b""),
         "file_read": (["/bin/cat", str(fixture_input)], 0, fixture_input.read_bytes()),
+        "file_io_batch": (
+            [str(fixtures.binary("file_io_batch")), str(fixture_input)],
+            0,
+            b"file-io-ok\n",
+        ),
+        "memory_batch": (
+            [str(fixtures.binary("memory_batch"))],
+            0,
+            b"memory-ok\n",
+        ),
+        "process_batch": (
+            [str(fixtures.binary("process_batch"))],
+            0,
+            b"process-ok\n",
+        ),
+        "signal_batch": (
+            [str(fixtures.binary("signal_batch"))],
+            0,
+            b"signal-ok\n",
+        ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
             0,
@@ -148,15 +173,35 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         raise MatrixError(f"matrix has no implementation for {name}") from error
 
 
+def run_subprocess(
+    command: list[str], timeout: int = 30
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=stdout, stderr=stderr
+        ) from error
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def backend_block(backend: str, hermit: Path) -> str | None:
     if backend == "dbi":
         try:
-            smoke = subprocess.run(
-                [str(hermit), "run", "--backend", "dbi", "--", "/bin/true"],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=30,
-                check=False,
+            smoke = run_subprocess(
+                [str(hermit), "run", "--backend", "dbi", "--", "/bin/true"]
             )
         except subprocess.TimeoutExpired:
             return "DBI smoke timed out"
@@ -171,11 +216,20 @@ def backend_block(backend: str, hermit: Path) -> str | None:
 
 
 def hermit_command(
-    hermit: Path, backend: str, guest: list[str], name: str
+    hermit: Path,
+    backend: str,
+    guest: list[str],
+    name: str,
+    strict_verify: bool,
+    expected_status: int,
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
         command.extend(["--backend", backend])
+    if strict_verify:
+        command.append("--strict")
+        if expected_status == 0:
+            command.append("--verify")
     command.extend(
         [
             "--base-env=minimal",
@@ -190,17 +244,22 @@ def hermit_command(
 
 
 def run_case(
-    hermit: Path, backend: str, name: str, fixtures: Fixtures
+    hermit: Path,
+    backend: str,
+    name: str,
+    fixtures: Fixtures,
+    strict_verify: bool,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     baseline: bytes | None = None
+    assurance = "L2" if strict_verify and expected_status == 0 else "L1"
     started = time.monotonic()
     for iteration in range(RUNS):
-        command = hermit_command(hermit, backend, guest, name)
+        command = hermit_command(
+            hermit, backend, guest, name, strict_verify, expected_status
+        )
         try:
-            result = subprocess.run(
-                command, capture_output=True, timeout=30, check=False
-            )
+            result = run_subprocess(command)
         except subprocess.TimeoutExpired:
             return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
 
@@ -252,7 +311,11 @@ def run_case(
                     f"run {iteration + 1} output differed from run 1",
                     time.monotonic() - started,
                 )
-    return "PASS", f"{RUNS}/{RUNS} runs matched", time.monotonic() - started
+    return (
+        "PASS",
+        f"{assurance} {RUNS}/{RUNS} invocations matched",
+        time.monotonic() - started,
+    )
 
 
 def write_results(path: Path, results: list[dict[str, str]]) -> None:
@@ -299,6 +362,14 @@ def parse_args() -> argparse.Namespace:
         "--probe-gaps",
         action="store_true",
         help="run documented gaps and report XPASS candidates",
+    )
+    parser.add_argument(
+        "--strict-verify",
+        action="store_true",
+        help=(
+            "run zero-exit cases with --strict --verify; expected nonzero exits "
+            "run with --strict"
+        ),
     )
     parser.add_argument(
         "--require-backend",
@@ -353,7 +424,9 @@ def main() -> int:
                     )
                     continue
 
-                status, detail, duration = run_case(hermit, backend, name, fixtures)
+                status, detail, duration = run_case(
+                    hermit, backend, name, fixtures, args.strict_verify
+                )
                 if expectation == "gap" and status == "PASS":
                     status = "XPASS"
                     detail = "candidate for promotion from gap to pass"
