@@ -18,6 +18,7 @@ colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
 detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
 diff = "0.1.13"
+digest = { version = "0.0.0", path = "../common/digest" }
 dirs = "6.0"
 edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -32,10 +33,10 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0871d6dc0d3fffbe90a2dbe2459dc2bea1ced747" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0871d6dc0d3fffbe90a2dbe2459dc2bea1ced747", default-features = false }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0871d6dc0d3fffbe90a2dbe2459dc2bea1ced747" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0871d6dc0d3fffbe90a2dbe2459dc2bea1ced747" }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ba4cffc65c9c25a6863d34de1f786fd55fdd6965" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ba4cffc65c9c25a6863d34de1f786fd55fdd6965", default-features = false }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ba4cffc65c9c25a6863d34de1f786fd55fdd6965" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ba4cffc65c9c25a6863d34de1f786fd55fdd6965" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
