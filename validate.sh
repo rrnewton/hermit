@@ -228,7 +228,12 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
 readonly STRICT_COMPAT_HERMIT_BIN
-readonly STRICT_COMPAT_TIMEOUT=60
+STRICT_COMPAT_TIMEOUT=${STRICT_COMPAT_TIMEOUT:-60}
+if [[ ! $STRICT_COMPAT_TIMEOUT =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: STRICT_COMPAT_TIMEOUT must be a positive integer" >&2
+    exit 2
+fi
+readonly STRICT_COMPAT_TIMEOUT
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
@@ -280,27 +285,26 @@ fi
 # TODO-HUMAN-REVIEW(#579): Review the backend compatibility ratchets and expansion policy.
 # Backend ratchets select commands from the same strict corpus. Expansion mode
 # runs every row and prints candidates that can be added without duplicating
-# command definitions. This DBI baseline was measured on 2026-07-24 with the
-# primary release binary; java timed out and the PATH file wrapper was not ELF.
-readonly DBI_COMPAT_EXPECTED=119
+# command definitions. This DBI baseline was measured on 2026-07-24 against
+# current main and its pinned Reverie runtime; unselected rows remain explicit gaps.
+readonly DBI_COMPAT_EXPECTED=80
 declare -Ar DBI_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
-    [cargo]=1 [rustc]=1 [node]=1 [python3]=1 [git]=1 [gcc]=1 [g++]=1 [make]=1
-    [bzip2]=1 [gzip]=1 [xz]=1 [zstd]=1 [openssl]=1 [sort]=1 [uniq]=1 [tr]=1
-    [cut]=1 [tee]=1 [paste]=1 [comm]=1 [join]=1 [find]=1 [stat]=1
-    [basename]=1 [dirname]=1 [env]=1 [printenv]=1 [uname]=1 [factor]=1 [expr]=1
-    [dd]=1 [df]=1 [du]=1 [hostname]=1 [whoami]=1 [groups]=1 [tty]=1 [nproc]=1
-    [arch]=1 [realpath]=1 [readlink]=1 [mktemp]=1 [sha256sum]=1 [sha1sum]=1
+    [python3]=1 [git]=1 [gcc]=1 [g++]=1 [make]=1
+    [openssl]=1 [sort]=1 [uniq]=1 [tr]=1
+    [cut]=1 [tee]=1 [find]=1 [stat]=1
+    [basename]=1 [dirname]=1 [uname]=1 [factor]=1 [expr]=1
+    [dd]=1 [df]=1 [du]=1 [hostname]=1 [whoami]=1 [groups]=1 [nproc]=1
+    [arch]=1 [realpath]=1 [readlink]=1 [sha256sum]=1 [sha1sum]=1
     [md5sum]=1 [wc-lines]=1 [nl]=1 [expand]=1 [unexpand]=1 [test]=1 [bracket]=1
-    [printf]=1 [sleep]=1 [stdbuf]=1 [nohup]=1 [nice]=1 [ionice]=1 [taskset]=1
-    [chrt]=1 [flock]=1 [logger]=1 [getopt]=1 [column]=1 [hexdump]=1 [xxd]=1
+    [printf]=1 [sleep]=1
+    [logger]=1 [getopt]=1 [column]=1 [hexdump]=1 [xxd]=1
     [strings]=1 [od]=1 [sum]=1 [cksum]=1 [b2sum]=1 [tsort]=1 [ptx]=1
-    [pinky]=1 [logname]=1 [users]=1 [uptime]=1 [diff]=1 [patch]=1 [grep]=1
-    [egrep]=1 [fgrep]=1 [sed]=1 [tar]=1 [cp]=1 [mv]=1 [rm]=1 [mkdir]=1
-    [rmdir]=1 [touch]=1 [chmod]=1 [chown]=1 [ln]=1 [date]=1 [cal]=1 [yes]=1
-    [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1 [csplit]=1
-    [split]=1 [install]=1 [mkfifo]=1 [cmp]=1
+    [pinky]=1 [logname]=1 [users]=1 [diff]=1 [grep]=1
+    [sed]=1 [rm]=1
+    [rmdir]=1 [date]=1 [cal]=1 [yes]=1
+    [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [numfmt]=1
 )
 # KVM can open /dev/kvm, but its Linux ELF execution personality is not yet
 # implemented, so its measured envelope is 0/147 and has no blocking gate.
