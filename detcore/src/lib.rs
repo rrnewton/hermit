@@ -573,6 +573,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::fork,
                 Sysno::vfork,
                 Sysno::wait4,
+                Sysno::waitid,
                 Sysno::setsid,
                 Sysno::uname,
                 Sysno::exit_group,
@@ -1141,6 +1142,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // child registers itself and runs to exec/exit.
             Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
             Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
+            Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
             Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
             Syscall::Gettimeofday(s) if virtualize_time => self.handle_gettimeofday(guest, s).await,

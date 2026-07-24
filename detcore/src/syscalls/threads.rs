@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use procfs::process::Process;
 use rand::Rng;
 use reverie::Error;
 use reverie::Guest;
@@ -38,9 +39,11 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
+use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
@@ -49,6 +52,68 @@ use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WaitidSigchldFields {
+    pid: libc::pid_t,
+    uid: libc::uid_t,
+    status: libc::c_int,
+    utime: libc::c_long,
+    stime: libc::c_long,
+}
+
+#[repr(C)]
+union WaitidSiginfoFields {
+    _alignment: *mut libc::c_void,
+    sigchld: WaitidSigchldFields,
+}
+
+#[repr(C)]
+struct WaitidSiginfoHead {
+    _base: [libc::c_int; 3],
+    fields: WaitidSiginfoFields,
+}
+
+fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
+    debug_assert!(
+        std::mem::size_of::<WaitidSiginfoHead>() <= std::mem::size_of::<libc::siginfo_t>()
+    );
+    // SAFETY: Linux siginfo_t starts with three c_int fields followed by a
+    // pointer-aligned union. Its SIGCHLD member is pid, uid, status, utime,
+    // and stime in that order. The local repr(C) mirror changes only the two
+    // host CPU-accounting fields and preserves the kernel-populated event.
+    let sigchld = unsafe {
+        &mut (*(info as *mut libc::siginfo_t).cast::<WaitidSiginfoHead>())
+            .fields
+            .sigchld
+    };
+    sigchld.utime = 0;
+    sigchld.stime = 0;
+}
+
+fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
+    let pgrp = Process::new(pid.as_raw())
+        .and_then(|process| process.stat())
+        .map(|stat| stat.pgrp)
+        .map_err(|_| Errno::ESRCH)?;
+    if pgrp == 0 {
+        Err(Errno::EOPNOTSUPP)
+    } else {
+        Ok(pgrp)
+    }
+}
+
+fn guest_fd_status_flags(pid: Pid, fd: libc::c_int) -> Result<libc::c_int, Errno> {
+    let path = format!("/proc/{}/fdinfo/{}", pid.as_raw(), fd);
+    let contents = std::fs::read_to_string(path).map_err(|_| Errno::EBADF)?;
+    let flags = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .map(str::trim)
+        .ok_or(Errno::EINVAL)?;
+    libc::c_int::from_str_radix(flags, 8).map_err(|_| Errno::EINVAL)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FutexTimeout {
@@ -603,6 +668,141 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// waitid system call
+    /// This is handled by the scheduler and not passed to the record/replay layer.
+    pub async fn handle_waitid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mut call: syscalls::Waitid,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let mut rsrc = Resources::new(dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("waitid");
+
+        let event_options = libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED;
+        let allowed_options = event_options
+            | libc::WNOHANG
+            | libc::WNOWAIT
+            | libc::__WNOTHREAD
+            | libc::__WALL
+            | libc::__WCLONE;
+        if call.options() & event_options == 0 || call.options() & !allowed_options != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        // POSIX requires non-null infop. Linux accepts null, but that form can
+        // expose host rusage and requires backend-neutral scratch memory for
+        // deterministic polling. Reject it uniformly instead of diverging or
+        // panicking on DBI's unsupported scratch stack.
+        if call.info().is_none() {
+            return Err(Errno::EFAULT.into());
+        }
+
+        // Linux snapshots P_PGID with id 0 at syscall entry. Preserve that
+        // identity across polling calls without issuing a guest-visible syscall.
+        if call.which() == libc::P_PGID as i32 && call.pid() == 0 {
+            call = call.with_pid(snapshot_process_group(guest.pid())?);
+        }
+
+        // A blocking waitid on an O_NONBLOCK pidfd must return EAGAIN rather
+        // than being converted to WNOHANG. Acquire the scheduler resource first,
+        // then snapshot fdinfo and issue the one-shot wait without another yield.
+        let pidfd_nonblocking =
+            if call.which() == libc::P_PIDFD as i32 && call.options() & libc::WNOHANG == 0 {
+                resource_request(guest, rsrc.clone()).await;
+                guest_fd_status_flags(guest.pid(), call.pid())? & libc::O_NONBLOCK != 0
+            } else {
+                false
+            };
+        if call.which() == libc::P_PIDFD as i32
+            && call.options() & libc::WNOHANG == 0
+            && !pidfd_nonblocking
+        {
+            // Polling a numeric pidfd cannot preserve Linux's held file
+            // reference if another thread closes and reuses the descriptor.
+            // Reject the blocking form until Detcore can retain that identity.
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        let info = call.info().expect("waitid infop checked above");
+
+        // Unlike wait4, waitid returns zero both when it reports a child event and
+        // when WNOHANG finds nothing. Polling must inspect si_pid to distinguish
+        // those cases.
+        // Known limitation: without backend-neutral scratch memory, an invalid
+        // non-null infop faults on the first physical poll rather than after a
+        // child becomes waitable.
+        // siginfo_t has no portable initializer. An all-zero value is the
+        // waitid WNOHANG sentinel defined by POSIX and Linux.
+        let empty_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+
+        if call.options() & libc::WNOHANG != 0 || pidfd_nonblocking {
+            if !pidfd_nonblocking {
+                resource_request(guest, rsrc).await;
+            }
+            info!(
+                "[dtid {}] Executing non-blocking waitid in one shot.",
+                dettid
+            );
+            guest.memory().write_value(info, &empty_info)?;
+            let value = guest.inject_with_retry(call).await?;
+            let mut info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+            // SAFETY: waitid writes either zeroed output or the SIGCHLD
+            // siginfo_t variant, for which libc exposes si_pid.
+            if unsafe { info_value.si_pid() } != 0 {
+                canonicalize_waitid_siginfo(&mut info_value);
+                guest.memory().write_value(info, &info_value)?;
+                if let Some(rusage) = call.rusage() {
+                    // Host CPU and scheduling counters are not deterministic.
+                    let usage: libc::rusage = unsafe { std::mem::zeroed() };
+                    guest.memory().write_value(rusage, &usage)?;
+                }
+            }
+            return Ok(value);
+        }
+
+        let poll_call = call.with_options(call.options() | libc::WNOHANG);
+        let mut first_poll = true;
+        loop {
+            let signaled = !first_poll
+                && resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
+            first_poll = false;
+
+            guest.memory().write_value(info, &empty_info)?;
+            let result = guest.inject_with_retry(poll_call).await;
+            match result {
+                Ok(value) => {
+                    let mut info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+                    // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
+                    // structure is used only for the no-event WNOHANG result.
+                    let child_pid = unsafe { info_value.si_pid() };
+                    if child_pid != 0 {
+                        canonicalize_waitid_siginfo(&mut info_value);
+                        guest.memory().write_value(info, &info_value)?;
+                        if let Some(rusage) = call.rusage() {
+                            // Host CPU and scheduling counters are not deterministic.
+                            let usage: libc::rusage = unsafe { std::mem::zeroed() };
+                            guest.memory().write_value(rusage, &usage)?;
+                        }
+                        return Ok(value);
+                    }
+
+                    if signaled {
+                        return Err(Errno::ERESTARTSYS.into());
+                    }
+                    rsrc.poll_attempt += 1;
+                    trace!(
+                        "Retry #{} for waitid because no child state is ready",
+                        rsrc.poll_attempt
+                    );
+                    record_retry_event(guest, poll_call).await;
+                }
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+    }
+
     /// Ignore requests to set affinity.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
@@ -653,6 +853,35 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waitid_siginfo_canonicalization_clears_only_cpu_accounting() {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = libc::SIGCHLD;
+        info.si_code = libc::CLD_EXITED;
+        // SAFETY: This uses the same Linux SIGCHLD layout mirror validated by
+        // canonicalize_waitid_siginfo.
+        let fields = unsafe {
+            &mut (*(std::ptr::addr_of_mut!(info)).cast::<WaitidSiginfoHead>())
+                .fields
+                .sigchld
+        };
+        fields.pid = 123;
+        fields.uid = 456;
+        fields.status = 7;
+        fields.utime = 8;
+        fields.stime = 9;
+
+        canonicalize_waitid_siginfo(&mut info);
+
+        assert_eq!(info.si_signo, libc::SIGCHLD);
+        assert_eq!(info.si_code, libc::CLD_EXITED);
+        assert_eq!(unsafe { info.si_pid() }, 123);
+        assert_eq!(unsafe { info.si_uid() }, 456);
+        assert_eq!(unsafe { info.si_status() }, 7);
+        assert_eq!(unsafe { info.si_utime() }, 0);
+        assert_eq!(unsafe { info.si_stime() }, 0);
+    }
 
     #[test]
     fn futex_timeout_units_and_modes_match_linux() {
