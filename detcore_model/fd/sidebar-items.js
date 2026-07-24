@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["FdSlot","FilesId","OpenFileId"],"type":["DetInode","RawFd","RawInode"]};

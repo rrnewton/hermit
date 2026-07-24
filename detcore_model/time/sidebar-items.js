@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["NANOS_PER_NONDET_INSTR","NANOS_PER_RCB","NANOS_PER_SCHED","NANOS_PER_SYSCALL"],"struct":["DetTime","GlobalTime","LogicalTime"],"type":["LogicalDuration","Microseconds"]};

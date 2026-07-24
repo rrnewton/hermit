@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["detcore",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"detcore/preemptions/struct.ThreadHistoryIterator.html\" title=\"struct detcore::preemptions::ThreadHistoryIterator\">ThreadHistoryIterator</a>",0]]],["detcore_model",[["impl&lt;T&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"detcore_model/collections/struct.ReplayCursor.html\" title=\"struct detcore_model::collections::ReplayCursor\">ReplayCursor</a>&lt;T&gt;",0]]],["edit_distance",[["impl&lt;'a, 'b, T&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"edit_distance/struct.Perm.html\" title=\"struct edit_distance::Perm\">Perm</a>&lt;'a, 'b, T&gt;<div class=\"where\">where\n    T: <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/hash/trait.Hash.html\" title=\"trait core::hash::Hash\">Hash</a> + <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.Eq.html\" title=\"trait core::cmp::Eq\">Eq</a>,</div>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[374,384,646]}

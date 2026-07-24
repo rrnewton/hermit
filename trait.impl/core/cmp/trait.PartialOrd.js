@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["detcore_model",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.PartialOrd.html\" title=\"trait core::cmp::PartialOrd\">PartialOrd</a> for <a class=\"struct\" href=\"detcore_model/pid/struct.DetPid.html\" title=\"struct detcore_model::pid::DetPid\">DetPid</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.PartialOrd.html\" title=\"trait core::cmp::PartialOrd\">PartialOrd</a> for <a class=\"struct\" href=\"detcore_model/time/struct.DetTime.html\" title=\"struct detcore_model::time::DetTime\">DetTime</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.PartialOrd.html\" title=\"trait core::cmp::PartialOrd\">PartialOrd</a> for <a class=\"struct\" href=\"detcore_model/time/struct.LogicalTime.html\" title=\"struct detcore_model::time::LogicalTime\">LogicalTime</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.PartialOrd.html\" title=\"trait core::cmp::PartialOrd\">PartialOrd</a> for <a class=\"struct\" href=\"detcore_model/fd/struct.OpenFileId.html\" title=\"struct detcore_model::fd::OpenFileId\">OpenFileId</a>",0]]],["digest",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/nightly/core/cmp/trait.PartialOrd.html\" title=\"trait core::cmp::PartialOrd\">PartialOrd</a> for <a class=\"struct\" href=\"digest/struct.Digest.html\" title=\"struct digest::Digest\">Digest</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1179,272]}
