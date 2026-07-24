@@ -146,6 +146,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // These existing and triaged passthroughs are conditionally repeatable under
         // Hermit's fixed-container, stable-filesystem, and serialization assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
         Sysno::access
         | Sysno::brk
         | Sysno::getcwd

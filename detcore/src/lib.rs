@@ -1362,6 +1362,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
             // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
             // dispatch it by Sysno while retaining typed guards for every represented call.
             SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
