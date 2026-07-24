@@ -357,6 +357,7 @@ impl Backend {
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
+            // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }

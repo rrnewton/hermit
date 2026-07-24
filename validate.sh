@@ -69,6 +69,8 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;

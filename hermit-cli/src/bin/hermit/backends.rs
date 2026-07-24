@@ -358,6 +358,7 @@ fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
 /// * HERMIT_SABRE_BINARY: pinned SaBRe executable.
 /// * HERMIT_SABRE_PLUGIN: libreverie_sabre_strace_plugin.so.
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
 pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, Error> {
     let (runner, sabre, plugin) = sabre_artifacts()?;
 
@@ -400,6 +401,7 @@ fn sabre_output(mut command: StdCommand, input: &[u8], runner: &Path) -> Result<
 /// same guest twice and compares its exit status, stdout, and stderr. This is
 /// therefore a compatibility check, not Hermit's L2 determinism guarantee.
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
 pub fn run_sabre(
     program: &Path,
     args: &[String],

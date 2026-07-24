@@ -936,6 +936,7 @@ impl RunOpts {
                     global.log,
                 );
             }
+            // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
             Backend::Sabre => {
                 return super::backends::run_sabre(
                     &self.program,
