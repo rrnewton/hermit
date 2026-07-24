@@ -167,6 +167,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#547)
     /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
     /// nonblocking. A positive short write is an implementation artifact here: without
     /// O_NONBLOCK, Linux blocks until the full vector is written unless a signal or error
@@ -860,6 +861,7 @@ impl NonblockableSyscall for reverie::syscalls::Write {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#547)
 /// Vectored writes have the same blocking behavior as scalar writes on pipes and sockets.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Writev {

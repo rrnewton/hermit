@@ -578,6 +578,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             subscription.syscalls([
                 Sysno::write,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#547)
                 Sysno::writev,
                 Sysno::openat,
                 Sysno::open,
@@ -1166,6 +1167,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#547)
                 Syscall::Writev(w) => self.handle_writev(guest, w).await,
                 Syscall::Openat(o) => self.handle_openat(guest, o).await,
                 Syscall::Open(o) => self.handle_openat(guest, o.into()).await,

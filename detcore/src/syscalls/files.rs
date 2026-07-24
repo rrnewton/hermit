@@ -506,6 +506,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#547)
     /// SYS_writev system call.
     ///
     /// Preserve the initial writev as one kernel operation so its iovec order remains intact.

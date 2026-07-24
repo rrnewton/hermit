@@ -144,6 +144,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::waitid
         | Sysno::write
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
