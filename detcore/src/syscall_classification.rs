@@ -100,6 +100,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pipe2
         | Sysno::poll
         | Sysno::ppoll
+        | Sysno::prlimit64
         | Sysno::pread64
         | Sysno::read
         | Sysno::recvfrom
@@ -336,7 +337,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pkey_free
         | Sysno::pkey_mprotect
         | Sysno::prctl
-        | Sysno::prlimit64
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_madvise
@@ -458,7 +458,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [105, 39, 229]);
+        assert_eq!(counts, [106, 39, 228]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -478,6 +478,10 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::ppoll),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::prlimit64),
             SyscallClassification::Determinized
         );
         for sysno in [
@@ -514,7 +518,6 @@ mod tests {
             Sysno::keyctl,
             Sysno::madvise,
             Sysno::prctl,
-            Sysno::prlimit64,
             Sysno::readlinkat,
             Sysno::request_key,
         ] {

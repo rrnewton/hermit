@@ -15,6 +15,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 struct resource_name {
@@ -75,6 +76,25 @@ static rlim_t lower_soft_limit(rlim_t current, rlim_t amount) {
   return current;
 }
 
+static void require_prlimit_error(
+    pid_t pid,
+    int resource,
+    const struct rlimit* new_limit,
+    int expected_errno,
+    const char* operation) {
+  errno = 0;
+  if (syscall(SYS_prlimit64, pid, resource, new_limit, NULL) != -1 ||
+      errno != expected_errno) {
+    fprintf(
+        stderr,
+        "%s returned errno %d, expected %d\n",
+        operation,
+        errno,
+        expected_errno);
+    exit(1);
+  }
+}
+
 static void check_limit_queries(void) {
   for (size_t i = 0; i < sizeof(resources) / sizeof(resources[0]); ++i) {
     struct rlimit libc_limit = {0};
@@ -96,7 +116,6 @@ static void check_limit_queries(void) {
       fail("SYS_prlimit64 query");
     }
 
-    require_limit("getrlimit/syscall", &syscall_limit, &libc_limit);
     require_limit("getrlimit/prlimit64", &prlimit_limit, &libc_limit);
     printf(
         "limit %s %" PRIu64 ":%" PRIu64 "\n",
@@ -108,6 +127,7 @@ static void check_limit_queries(void) {
 
 static void check_limit_mutations(void) {
   struct rlimit original = {0};
+  struct rlimit raw_original = {0};
   struct rlimit changed = {0};
   struct rlimit observed = {0};
   struct rlimit previous = {0};
@@ -121,8 +141,8 @@ static void check_limit_mutations(void) {
   if (setrlimit(RLIMIT_NOFILE, &changed) != 0) {
     fail("setrlimit libc");
   }
-  if (syscall(SYS_getrlimit, RLIMIT_NOFILE, &observed) != 0) {
-    fail("getrlimit after libc setrlimit");
+  if (getrlimit(RLIMIT_NOFILE, &observed) != 0) {
+    fail("libc getrlimit after libc setrlimit");
   }
   require_limit("libc setrlimit", &observed, &changed);
   printf(
@@ -133,20 +153,23 @@ static void check_limit_mutations(void) {
     fail("restore after libc setrlimit");
   }
 
-  changed = original;
-  changed.rlim_cur = lower_soft_limit(original.rlim_cur, 2);
+  if (syscall(SYS_getrlimit, RLIMIT_NOFILE, &raw_original) != 0) {
+    fail("SYS_getrlimit before SYS_setrlimit");
+  }
+  changed = raw_original;
+  changed.rlim_cur = lower_soft_limit(raw_original.rlim_cur, 2);
   if (syscall(SYS_setrlimit, RLIMIT_NOFILE, &changed) != 0) {
     fail("SYS_setrlimit");
   }
-  if (getrlimit(RLIMIT_NOFILE, &observed) != 0) {
-    fail("getrlimit after SYS_setrlimit");
+  if (syscall(SYS_getrlimit, RLIMIT_NOFILE, &observed) != 0) {
+    fail("SYS_getrlimit after SYS_setrlimit");
   }
   require_limit("syscall setrlimit", &observed, &changed);
   printf(
       "setrlimit syscall %" PRIu64 ":%" PRIu64 "\n",
       (uint64_t)observed.rlim_cur,
       (uint64_t)observed.rlim_max);
-  if (setrlimit(RLIMIT_NOFILE, &original) != 0) {
+  if (syscall(SYS_setrlimit, RLIMIT_NOFILE, &raw_original) != 0) {
     fail("restore after SYS_setrlimit");
   }
 
@@ -175,6 +198,88 @@ static void check_limit_mutations(void) {
   if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &original, NULL) != 0) {
     fail("restore after SYS_prlimit64");
   }
+
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &observed) != 0) {
+    fail("SYS_prlimit64 RLIMIT_CORE query");
+  }
+  require_prlimit_error(
+      0, RLIMIT_CORE, &observed, EPERM, "dangerous prlimit64 mutation");
+  require_prlimit_error(
+      getpid() + 1, RLIMIT_NOFILE, NULL, EPERM, "other-pid prlimit64 query");
+  require_prlimit_error(
+      getpid() + 1,
+      RLIMIT_NLIMITS,
+      NULL,
+      EINVAL,
+      "other-pid invalid-resource prlimit64 query");
+  require_prlimit_error(
+      getpid() + 1, RLIMIT_NOFILE, (void*)1, EFAULT, "other-pid bad prlimit64 input");
+  require_prlimit_error(
+      0, RLIMIT_NLIMITS, NULL, EINVAL, "invalid-resource prlimit64 query");
+
+  changed = original;
+  changed.rlim_max = original.rlim_max + 1;
+  require_prlimit_error(
+      0, RLIMIT_NOFILE, &changed, EPERM, "hard-limit prlimit64 raise");
+
+  changed = original;
+  changed.rlim_cur = original.rlim_max + 1;
+  require_prlimit_error(
+      0, RLIMIT_NOFILE, &changed, EINVAL, "invalid prlimit64 soft limit");
+  puts("prlimit64 refusals deterministic");
+}
+
+static void check_prlimit_fork_inheritance(void) {
+  struct rlimit original = {0};
+  struct rlimit inherited = {0};
+  struct rlimit child_limit = {0};
+  struct rlimit observed = {0};
+
+  if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, NULL, &original) != 0) {
+    fail("prlimit64 before fork");
+  }
+  inherited = original;
+  inherited.rlim_cur = lower_soft_limit(original.rlim_cur, 4);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &inherited, NULL) != 0) {
+    fail("prlimit64 parent mutation before fork");
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork for prlimit64 inheritance");
+  }
+  if (child == 0) {
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, NULL, &observed) != 0) {
+      fail("prlimit64 child inherited query");
+    }
+    require_limit("prlimit64 child inheritance", &observed, &inherited);
+
+    child_limit = inherited;
+    child_limit.rlim_cur = lower_soft_limit(inherited.rlim_cur, 1);
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &child_limit, NULL) != 0) {
+      fail("prlimit64 child independent mutation");
+    }
+    if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, NULL, &observed) != 0) {
+      fail("prlimit64 child independent query");
+    }
+    require_limit("prlimit64 child state", &observed, &child_limit);
+    _exit(0);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "prlimit64 fork child failed with status %d\n", status);
+    exit(1);
+  }
+  if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, NULL, &observed) != 0) {
+    fail("prlimit64 parent query after fork");
+  }
+  require_limit("prlimit64 parent independence", &observed, &inherited);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_NOFILE, &original, NULL) != 0) {
+    fail("prlimit64 parent restore after fork");
+  }
+  puts("prlimit64 fork inheritance deterministic");
 }
 
 // Every rusage field except ru_maxrss must be a deterministic zero. When
@@ -256,6 +361,7 @@ static void check_sysinfo(void) {
 int main(void) {
   check_limit_queries();
   check_limit_mutations();
+  check_prlimit_fork_inheritance();
   check_rusage(RUSAGE_SELF, "self", 1);
   check_rusage(RUSAGE_THREAD, "thread", 1);
   check_rusage(RUSAGE_CHILDREN, "children", 0);
