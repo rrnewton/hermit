@@ -10,11 +10,11 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# Serialize deployments so overlapping pushes cannot race on the gh-pages
-# branch, but never cancel a deploy that is already in flight.
+# Supersede older runs for the same ref so documentation deploys do not
+# accumulate behind newer commits.
 concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # peaceiris/actions-gh-pages pushes the built docs to the gh-pages branch using
 # GITHUB_TOKEN, which needs write access to repository contents.

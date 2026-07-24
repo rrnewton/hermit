@@ -119,3 +119,100 @@ fn chaos_sched_yield_makes_progress_without_timer_preemption() {
         run_seed(seed);
     }
 }
+
+fn run_strict_guest(args: &[&str]) {
+    let mut command = Command::new("timeout");
+    command
+        .arg("--kill-after=2s")
+        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--",
+        ])
+        .arg(guest())
+        .args(args);
+
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start strict guest: {rendered}: {error}"));
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "sched_yield guest timed out under strict verify: {rendered}"
+    );
+    assert!(
+        output.status.success(),
+        "sched_yield guest failed under strict verify: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn strict_sched_yield_is_deterministic() {
+    run_strict_guest(&[]);
+}
+
+#[test]
+fn strict_vfork_child_sched_yield_is_deterministic() {
+    run_strict_guest(&["--vfork"]);
+}
+
+#[test]
+fn preemption_replay_preserves_vfork_sched_yield_progress() {
+    let schedule = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sched-yield-preemptions.json");
+    let _ = fs::remove_file(&schedule);
+
+    for (phase, option) in [
+        (
+            "record",
+            format!("--record-preemptions-to={}", schedule.display()),
+        ),
+        (
+            "replay",
+            format!("--replay-preemptions-from={}", schedule.display()),
+        ),
+    ] {
+        let mut command = Command::new("timeout");
+        command
+            .arg("--kill-after=2s")
+            .arg(format!("{TIMEOUT_SECONDS}s"))
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--strict",
+                "--preemption-timeout=disabled",
+                &option,
+                "--base-env=minimal",
+                "--no-virtualize-cpuid",
+                "--",
+            ])
+            .arg(guest())
+            .arg("--vfork");
+
+        let rendered = format!("{command:?}");
+        let output = command.output().unwrap_or_else(|error| {
+            panic!("failed to start preemption {phase}: {rendered}: {error}")
+        });
+        assert_ne!(
+            output.status.code(),
+            Some(124),
+            "preemption {phase} timed out: {rendered}"
+        );
+        assert!(
+            output.status.success(),
+            "preemption {phase} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}

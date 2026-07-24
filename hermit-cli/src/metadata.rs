@@ -150,6 +150,11 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
         sequentialize_threads: true,
+        runs_post_fork: default_config.runs_post_fork,
+        // Record/replay has its own exact subscription set and format. Preserve the
+        // existing partial Detcore set so this run-mode default does not change v0x101
+        // event streams.
+        passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
         virtualize_metadata: false,
@@ -204,4 +209,14 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         config.preemption_timeout = None;
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_and_replay_preserve_partial_subscriptions() {
+        assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+    }
 }
