@@ -50,6 +50,7 @@ fn from_str(s: &str) -> [i8; 65] {
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#545): Confirm getrandom flag, stream, and fault semantics.
 fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
     let flags = flags as u32;
     let random = flags & libc::GRND_RANDOM != 0;
