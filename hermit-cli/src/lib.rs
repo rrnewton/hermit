@@ -36,6 +36,20 @@ use consts::METADATA_NAME;
 pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_background_init;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_name;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_pre_syscall;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_ready;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_thread_exit;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_thread_init;
+#[doc(hidden)]
+pub use detcore_dbi::reverie_dbi_runtime_totals;
 pub use error::Context;
 pub use error::Error;
 pub use error::SerializableError;
@@ -171,6 +185,9 @@ fn is_dynamorio_sdk(path: &Path) -> bool {
 }
 
 fn dynamorio_sdk_available() -> bool {
+    if reverie_dbi::bundled_drrun_path().is_file() {
+        return true;
+    }
     const DEFAULT_ROOTS: [&str; 3] = [
         "/usr/lib/cmake/DynamoRIO",
         "/usr/local/lib/cmake/DynamoRIO",
@@ -183,6 +200,15 @@ fn dynamorio_sdk_available() -> bool {
         .map(PathBuf::from)
         .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
         .any(|path| is_dynamorio_sdk(&path))
+}
+
+fn dbi_runtime_unavailable_reason() -> Option<String> {
+    detcore_dbi::runtime_library_path().err().map(|error| {
+        format!(
+            "the Detcore DBI runtime is unavailable: {error}; build the hermit binary and \
+             cdylib in the same target directory"
+        )
+    })
 }
 
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
@@ -257,11 +283,7 @@ impl Backend {
                 "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
                     .to_owned(),
             ),
-            // With the SDK present, the DBI backend is available: `run_dbi` shells
-            // out to `drrun -c $HERMIT_DBI_CLIENT` to execute the real guest. A
-            // missing client is reported at launch time with an actionable error,
-            // so ungating here does not affect the default ptrace path.
-            Self::Dbi => None,
+            Self::Dbi => dbi_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")).or_else(|| {
                 Some(
                     "the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI"
@@ -624,6 +646,7 @@ mod tests {
     use std::fs;
 
     use super::Backend;
+    use super::dbi_runtime_unavailable_reason;
     use super::dynamorio_sdk_available;
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
@@ -636,9 +659,10 @@ mod tests {
             available.contains(&Backend::Ptrace),
             Backend::Ptrace.is_available()
         );
-        // DBI is available iff the DynamoRIO SDK is present on this host
-        // (passes both on CI runners without the SDK and on dev hosts with it).
-        assert_eq!(available.contains(&Backend::Dbi), dynamorio_sdk_available());
+        assert_eq!(
+            available.contains(&Backend::Dbi),
+            dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
+        );
         assert!(!available.contains(&Backend::Kvm));
     }
 
@@ -657,18 +681,15 @@ mod tests {
 
     #[test]
     fn prototype_backends_fail_closed() {
-        // Without the SDK, DBI must fail closed with an actionable message. With
-        // the SDK present it is available (a missing client is reported later, at
-        // launch time), so only assert the fail-closed path when the SDK is absent.
         match Backend::Dbi.ensure_available() {
             Ok(()) => assert!(
-                dynamorio_sdk_available(),
-                "DBI reported available without a DynamoRIO SDK"
+                dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none(),
+                "DBI reported available without its SDK and runtime"
             ),
             Err(dbi_error) => {
                 let message = dbi_error.to_string();
                 assert!(
-                    message.contains("DynamoRIO SDK"),
+                    message.contains("DynamoRIO SDK") || message.contains("Detcore DBI runtime"),
                     "unexpected DBI availability error: {message}"
                 );
             }
