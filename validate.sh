@@ -23,6 +23,8 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
+#   ./validate.sh --verbose                  # stream each gate's command, PID,
+#                                            # elapsed time, and subprocess output
 #   ./validate.sh --label-pr                 # on a fully-green full run, tag the
 #                                            # current branch's PR
 #                                            # 'locally-validated' (opt-in; env
@@ -34,6 +36,8 @@ ENVELOPE_BASELINE=""
 # never mutate a live PR as a silent side effect of a routine local run.
 LABEL_PR=0
 [[ -n ${VALIDATE_LABEL_PR:-} ]] && LABEL_PR=1
+VERBOSE=0
+[[ ${VALIDATE_VERBOSE:-0} == 1 ]] && VERBOSE=1
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,14 +47,33 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --label-pr) LABEL_PR=1; shift ;;
+        --verbose) VERBOSE=1; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
 
+GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-600}
+TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
+VERBOSE_INTERVAL_SECONDS=${VALIDATE_VERBOSE_INTERVAL_SECONDS:-10}
+if [[ ! $GATE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: VALIDATE_GATE_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! $TIMEOUT_KILL_GRACE_SECONDS =~ ^[0-9]+$ ]]; then
+    echo "validate.sh: VALIDATE_TIMEOUT_KILL_GRACE_SECONDS must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: VALIDATE_VERBOSE_INTERVAL_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
+
 checks=0
 failures=0
+active_check_pid=""
 declare -a background_pids=()
 declare -a background_names=()
 declare -a background_logs=()
@@ -70,6 +93,13 @@ if [[ -z $LOG_FILE ]]; then
 fi
 readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
+if ((VERBOSE == 1)); then
+    printf "Verbose validation enabled\n"
+    printf "  root: %s\n" "$ROOT_DIR"
+    printf "  log: %s\n" "$LOG_FILE"
+    printf "  gate timeout: %ss (kill grace: %ss; heartbeat: %ss)\n" \
+        "$GATE_TIMEOUT_SECONDS" "$TIMEOUT_KILL_GRACE_SECONDS" "$VERBOSE_INTERVAL_SECONDS"
+fi
 
 readonly NEXTEST_VERSION=0.9.100
 NEXTEST_PROFILE_NAME=${NEXTEST_PROFILE:-}
@@ -115,10 +145,26 @@ readonly L4_REPS=${L4_REPS:-20}
 ENVELOPE_JSON=${ENVELOPE_JSON:-"$ROOT_DIR/envelope.json"}
 ENVELOPE_LAST_JSON=""
 
+function kill_process_tree {
+    local pid=$1
+    local signal=$2
+    local child
+
+    while read -r child; do
+        [[ -n $child ]] || continue
+        kill_process_tree "$child" "$signal"
+    done < <(ps -o pid= --ppid "$pid" 2>/dev/null)
+    kill "-$signal" "$pid" 2>/dev/null || true
+}
+
 function cleanup {
     local pid
+
+    if [[ -n $active_check_pid ]]; then
+        kill_process_tree "$active_check_pid" TERM
+    fi
     for pid in "${background_pids[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        kill_process_tree "$pid" TERM
     done
     wait 2>/dev/null || true
     rm -rf "$VALIDATION_TMP_DIR"
@@ -158,6 +204,74 @@ function failure_summary {
     printf "%s" "$summary"
 }
 
+function run_timed_command {
+    local name=$1
+    local log_file=$2
+    shift 2
+
+    local started_at=$SECONDS
+    local next_report=$VERBOSE_INTERVAL_SECONDS
+    local pid
+    local status
+    local elapsed
+    local grace_deadline
+
+    (
+        if ((VERBOSE == 1)); then
+            "$@" 2>&1 |
+                tee -a "$log_file" |
+                sed -u "s|^|[$name] |"
+        else
+            "$@" >>"$log_file" 2>&1
+        fi
+    ) &
+    pid=$!
+    active_check_pid=$pid
+
+    if ((VERBOSE == 1)); then
+        printf "  subprocess PID: %s\n" "$pid"
+    fi
+
+    while kill -0 "$pid" 2>/dev/null; do
+        elapsed=$((SECONDS - started_at))
+        if ((elapsed >= GATE_TIMEOUT_SECONDS)); then
+            kill_process_tree "$pid" TERM
+            grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+            while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+                sleep 0.2
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill_process_tree "$pid" KILL
+            fi
+            wait "$pid" 2>/dev/null || true
+            active_check_pid=""
+            printf "Gate timed out after %ss (subprocess PID %s)\n" \
+                "$GATE_TIMEOUT_SECONDS" "$pid" >>"$log_file"
+            printf "⏱️  %s timed out after %ss (subprocess PID %s)\n" \
+                "$name" "$GATE_TIMEOUT_SECONDS" "$pid"
+            return 124
+        fi
+
+        if ((VERBOSE == 1 && elapsed >= next_report)); then
+            printf "  still running: %s (PID %s, elapsed %ss/%ss)\n" \
+                "$name" "$pid" "$elapsed" "$GATE_TIMEOUT_SECONDS"
+            next_report=$((next_report + VERBOSE_INTERVAL_SECONDS))
+        fi
+        sleep 0.2
+    done
+
+    if wait "$pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    active_check_pid=""
+    if ((VERBOSE == 1)); then
+        printf "  subprocess PID %s finished after %ss\n" "$pid" "$((SECONDS - started_at))"
+    fi
+    return "$status"
+}
+
 function run_check {
     local name=$1
     shift
@@ -175,7 +289,14 @@ function run_check {
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
-    if "$@" >>"$LOG_FILE" 2>&1; then
+    if ((VERBOSE == 1)); then
+        printf "\n▶ %s\n" "$name"
+        printf "  command:"
+        printf " %q" "$@"
+        printf "\n  timeout: %ss\n" "$GATE_TIMEOUT_SECONDS"
+    fi
+
+    if run_timed_command "$name" "$LOG_FILE" "$@"; then
         status=0
         printf "✅ %s (1 passed, 0 failed, %ss)\n" \
             "$name" "$((SECONDS - started_at))"
@@ -202,18 +323,30 @@ function start_check {
     local log_file="$VALIDATION_TMP_DIR/check-$index.log"
     local duration_file="$VALIDATION_TMP_DIR/check-$index.duration"
 
+    {
+        printf "Command:"
+        printf " %q" "$@"
+        printf "\n"
+    } >"$log_file"
+    if ((VERBOSE == 1)); then
+        printf "\n▶ %s (background)\n" "$name"
+        printf "  command:"
+        printf " %q" "$@"
+        printf "\n  timeout: %ss\n" "$GATE_TIMEOUT_SECONDS"
+    fi
+
     (
         local started_at=$SECONDS
         local status
 
-        printf "Command:"
-        printf " %q" "$@"
-        printf "\n"
-        "$@"
-        status=$?
+        if run_timed_command "$name" "$log_file" "$@"; then
+            status=0
+        else
+            status=$?
+        fi
         printf "%s\n" "$((SECONDS - started_at))" >"$duration_file"
         exit "$status"
-    ) >"$log_file" 2>&1 &
+    ) &
 
     background_pids+=("$!")
     background_names+=("$name")
@@ -233,6 +366,10 @@ function wait_for_background_checks {
         local status
         local duration
         local summary
+
+        if ((VERBOSE == 1)); then
+            printf "\n▶ Collecting background gate: %s (manager PID %s)\n" "$name" "$pid"
+        fi
 
         if wait "$pid"; then
             status=0
@@ -358,11 +495,17 @@ function run_envelope {
     local probe label cmd i ok
     local -a cmdarr detail=()
 
+    if ((VERBOSE == 1)); then
+        printf "\n▶ Working-envelope measurement (L4 stress reps=%s)\n" "$L4_REPS"
+    fi
     printf "=== Working-envelope measurement (L4 stress reps=%s) ===\n" "$L4_REPS" >>"$LOG_FILE"
     for probe in "${ENVELOPE_PROBES[@]}"; do
         label=${probe%%|*}
         cmd=${probe#*|}
         read -r -a cmdarr <<<"$cmd"
+        if ((VERBOSE == 1)); then
+            printf "  envelope probe: %s (%s)\n" "$label" "$cmd"
+        fi
         total=$((total + 1))
         local p1=0 p2=0 p3=0 p4=0 prr=0
 
@@ -491,9 +634,8 @@ function print_summary {
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
 if [[ $ENVELOPE_MODE == only ]]; then
-    printf "Building workspace for envelope measurement...\n"
-    if ! cargo build --workspace >>"$LOG_FILE" 2>&1; then
-        printf "❌ build failed (full log: %s)\n" "$LOG_FILE" >&2
+    run_check "Build workspace for envelope measurement" cargo build --workspace
+    if ((failures != 0)); then
         exit 1
     fi
     run_envelope
