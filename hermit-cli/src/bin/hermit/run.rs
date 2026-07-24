@@ -695,6 +695,26 @@ fn passthru_optimization_requires_explicit_opt_in() {
     assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review rejecting optimization that bypasses fail-closed policy.
+#[test]
+fn passthru_optimization_rejects_fail_closed_modes() {
+    for fail_closed in ["--strict", "--panic-on-unsupported-syscalls"] {
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", "--passthru-opt", fail_closed, "fakeprog"]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--passthru-opt"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("fail-closed"),
+            "unexpected error: {message}"
+        );
+    }
+}
+
 #[test]
 fn timeslice_flags_parse_and_round_trip() {
     let mut ro = RunOpts::parse_from([
@@ -1041,6 +1061,7 @@ impl RunOpts {
                     &self.args,
                     self.verify,
                     global.log,
+                    self.effective_det_config().panic_on_unsupported_syscalls,
                 );
             }
             // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
@@ -1100,9 +1121,15 @@ impl RunOpts {
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#644): Review explicit strict mode failing on unsupported syscalls.
+        // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
         if self.strict {
             config.panic_on_unsupported_syscalls = true;
+        }
+        if config.passthru_opt && config.panic_on_unsupported_syscalls {
+            anyhow::bail!(
+                "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
+                 (--strict or --panic-on-unsupported-syscalls)"
+            );
         }
 
         // virtualize_metadata implies virtualize_time

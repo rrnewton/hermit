@@ -18,6 +18,7 @@
 //! Reverie plugin. Generic runs use quiet compatibility checking, while
 //! `hermit --backend sabre strace` retains verbose syscall diagnostics.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal as _;
@@ -55,6 +56,43 @@ impl DbiSummary {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review DBI run-wide warning collection and shutdown delivery.
+struct DbiUnsupportedSyscallReport {
+    file: tempfile::NamedTempFile,
+}
+
+impl DbiUnsupportedSyscallReport {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            file: tempfile::NamedTempFile::new()?,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        self.file.as_file_mut().seek(SeekFrom::Start(0))?;
+        let mut contents = String::new();
+        self.file.as_file_mut().read_to_string(&mut contents)?;
+        let syscalls = contents.lines().map(str::to_owned).collect::<BTreeSet<_>>();
+        if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
+            eprintln!("WARNING: {message}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DbiUnsupportedSyscallReport {
+    fn drop(&mut self) {
+        if let Err(error) = self.emit() {
+            eprintln!("WARNING: failed to read DBI unsupported-syscall report: {error}");
+        }
+    }
+}
+
 struct TeeReader<R, W> {
     input: R,
     replay: W,
@@ -78,6 +116,7 @@ pub fn run_dbi(
     args: &[String],
     verify: bool,
     log: Option<LevelFilter>,
+    panic_on_unsupported_syscalls: bool,
 ) -> Result<ExitStatus, Error> {
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
@@ -94,14 +133,28 @@ pub fn run_dbi(
                 client.display()
             ))
         })?
-        .summary(true);
+        .summary(true)
+        .isolated_process_group(true);
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
         drrun.display()
     );
 
+    let unsupported_report = DbiUnsupportedSyscallReport::new()?;
     let mut guest = StdCommand::new(program);
+    guest.env(
+        detcore_dbi::PANIC_ON_UNSUPPORTED_SYSCALLS_ENV,
+        if panic_on_unsupported_syscalls {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    guest.env(
+        detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_ENV,
+        unsupported_report.path(),
+    );
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
     }

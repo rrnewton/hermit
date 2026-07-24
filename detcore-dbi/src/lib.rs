@@ -53,6 +53,14 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review DBI policy propagation through the client environment.
+/// Environment variable enabling immediate failure on unsupported syscalls in DBI guests.
+pub const PANIC_ON_UNSUPPORTED_SYSCALLS_ENV: &str = "HERMIT_DBI_PANIC_ON_UNSUPPORTED_SYSCALLS";
+
+/// Environment variable naming the DBI run-wide unsupported-syscall report file.
+pub const UNSUPPORTED_SYSCALL_REPORT_ENV: &str = "HERMIT_DBI_UNSUPPORTED_SYSCALL_REPORT";
+
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbi::RuntimeEmitter;
 type Idler = reverie_dbi::RuntimeIdler;
@@ -327,6 +335,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 sequentialize_threads: true,
                 deterministic_io: true,
                 max_timeslice: None,
+                panic_on_unsupported_syscalls: std::env::var_os(PANIC_ON_UNSUPPORTED_SYSCALLS_ENV)
+                    .is_some_and(|value| value == "1"),
+                unsupported_syscall_report: std::env::var_os(UNSUPPORTED_SYSCALL_REPORT_ENV)
+                    .map(PathBuf::from),
                 ..Config::default()
             };
             config.validate();

@@ -22,6 +22,7 @@ static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -143,6 +144,34 @@ fn dbi_wait_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the DBI unsupported-syscall fixture build.
+fn dbi_unsupported_syscall_guest() -> &'static Path {
+    DBI_UNSUPPORTED_SYSCALL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-unsupported-syscall");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBI unsupported-syscall guest directory");
+        let guest = build_root.join("dbi_unsupported_syscall");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_unsupported_syscall.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI unsupported-syscall guest");
+        assert!(
+            output.status.success(),
+            "DBI unsupported-syscall guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -388,6 +417,40 @@ fn run_dbi_executes_integrated_backend() {
     let args = ["run", "--backend", "dbi", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
+#[test]
+fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBI unsupported-syscall guest path should be UTF-8");
+
+    let normal_args = ["run", "--backend", "dbi", "--verify", "--", program];
+    let normal = hermit(&normal_args);
+    assert_success(&normal, &normal_args);
+    assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
+    let normal_stderr = stderr(&normal);
+    let warning = "syscalls getppid used but not yet supported";
+    assert_eq!(
+        normal_stderr.matches(warning).count(),
+        1,
+        "expected one aggregate warning:\n{normal_stderr}"
+    );
+
+    let strict_args = ["run", "--backend", "dbi", "--strict", "--", program];
+    let strict = hermit(&strict_args);
+    assert!(
+        !strict.status.success(),
+        "strict DBI unexpectedly succeeded:\n{}",
+        stderr(&strict)
+    );
+    assert!(
+        stderr(&strict).contains("unsupported syscall: Getppid"),
+        "strict DBI failure omitted unsupported syscall:\n{}",
+        stderr(&strict)
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

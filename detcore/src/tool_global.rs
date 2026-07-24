@@ -17,6 +17,7 @@ use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -194,6 +195,9 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
+    // Optional append-only sink shared by DBI fork descendants.
+    unsupported_syscall_report: Option<Mutex<File>>,
+
     // Open file description to bound port.
     open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
@@ -235,7 +239,7 @@ impl Default for GlobalState {
 
 impl Drop for GlobalState {
     fn drop(&mut self) {
-        // TODO-HUMAN-REVIEW(#643): Review shutdown-time aggregate warning delivery.
+        // TODO-HUMAN-REVIEW(PR-643): Review shutdown-time aggregate warning delivery.
         if let Some(message) =
             format_unsupported_syscall_warning(&self.unsupported_syscalls.lock().unwrap())
         {
@@ -261,11 +265,26 @@ impl GlobalState {
             .map(|path| PreemptionReader::new(path));
         let range = Self::read_port_range();
 
+        let unsupported_syscall_report = cfg.unsupported_syscall_report.as_ref().and_then(|path| {
+            match fs::OpenOptions::new().append(true).open(path) {
+                Ok(file) => Some(Mutex::new(file)),
+                Err(error) => {
+                    warn!(
+                        "failed to open unsupported-syscall report {}: {}",
+                        path.display(),
+                        error
+                    );
+                    None
+                }
+            }
+        });
+
         Self {
             sched,
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            unsupported_syscall_report,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
@@ -458,9 +477,19 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
             }
-            // TODO-HUMAN-REVIEW(#643): Review run-wide unsupported-syscall aggregation.
+            // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
-                self.unsupported_syscalls.lock().unwrap().insert(name);
+                let inserted = self
+                    .unsupported_syscalls
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone());
+                if inserted
+                    && let Some(report) = &self.unsupported_syscall_report
+                    && let Err(error) = writeln!(report.lock().unwrap(), "{name}")
+                {
+                    warn!("failed to append unsupported-syscall report: {error}");
+                }
                 R::ReportUnsupportedSyscall(())
             }
             GlobalRequest::MarkPastFirstExecve => {
@@ -1179,7 +1208,7 @@ pub enum GlobalRequest {
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
 
-    // TODO-HUMAN-REVIEW(#643): Review this new Detcore global RPC request.
+    // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC request.
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
 
@@ -1250,7 +1279,7 @@ pub enum GlobalResponse {
     RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
-    // TODO-HUMAN-REVIEW(#643): Review this new Detcore global RPC response.
+    // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
     MarkPastFirstExecve(()),
     CreateChildThread(()),
@@ -1274,7 +1303,10 @@ pub enum GlobalResponse {
     PortFull,
 }
 
-fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option<String> {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the shared warning formatter API.
+/// Formats one deterministic warning for a set of unsupported syscall names.
+pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option<String> {
     if syscalls.is_empty() {
         None
     } else {
@@ -1294,7 +1326,7 @@ where
     assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
 }
 
-// TODO-HUMAN-REVIEW(#643): Review the guest-to-global unsupported-syscall report path.
+// TODO-HUMAN-REVIEW(PR-643): Review the guest-to-global unsupported-syscall report path.
 pub async fn report_unsupported_syscall<G, T>(guest: &mut G, sysno: Sysno)
 where
     G: Guest<Detcore<T>>,

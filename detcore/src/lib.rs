@@ -108,6 +108,7 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
@@ -179,7 +180,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#643): Review unsupported-syscall reporting and fail-fast behavior.
+    // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
     /// Applies the legacy policy to an explicitly listed but unsupported syscall.
     async fn handle_unsupported_syscall<G: Guest<Self>>(
         &self,
@@ -1475,55 +1476,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
                 self.passthrough(guest, call).await
             }
-            SyscallClassification::PassThrough => match call {
-                Syscall::Access(_)
-                | Syscall::Brk(_)
-                | Syscall::Capget(_)
-                | Syscall::Capset(_)
-                | Syscall::Chdir(_)
-                | Syscall::Chmod(_)
-                | Syscall::Fchdir(_)
-                | Syscall::Fchmodat(_)
-                | Syscall::Fdatasync(_)
-                | Syscall::Ftruncate(_)
-                | Syscall::Getcwd(_)
-                | Syscall::Getegid(_)
-                | Syscall::Geteuid(_)
-                | Syscall::Getgid(_)
-                | Syscall::Getgroups(_)
-                | Syscall::Getpid(_)
-                | Syscall::Gettid(_)
-                | Syscall::Getuid(_)
-                | Syscall::Getxattr(_)
-                | Syscall::Lgetxattr(_)
-                | Syscall::Linkat(_)
-                | Syscall::Lseek(_)
-                | Syscall::Mkdir(_)
-                | Syscall::Mkdirat(_)
-                | Syscall::Mprotect(_)
-                | Syscall::Readlink(_)
-                | Syscall::Removexattr(_)
-                | Syscall::Renameat2(_)
-                | Syscall::Rmdir(_)
-                | Syscall::RtSigreturn(_)
-                | Syscall::Setxattr(_)
-                | Syscall::SetRobustList(_)
-                | Syscall::SetTidAddress(_)
-                | Syscall::Sigaltstack(_)
-                | Syscall::Symlinkat(_)
-                | Syscall::Umask(_)
-                | Syscall::Unlink(_)
-                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
-                unexpected => {
-                    self.handle_unsupported_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        config.panic_on_unsupported_syscalls,
-                    )
-                    .await
-                }
-            },
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             SyscallClassification::Unsupported => {
                 self.handle_unsupported_syscall(
                     guest,

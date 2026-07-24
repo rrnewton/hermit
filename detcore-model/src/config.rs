@@ -206,10 +206,17 @@ pub struct Config {
     #[clap(long)]
     pub deterministic_io: bool,
 
-    /// DANGEROUS: Panic on unsupported syscalls, this is useful for
-    /// debugging detcore itself, not recommended otherwise.
+    /// Fail immediately on unsupported syscalls instead of forwarding them.
+    /// Explicit strict mode enables this policy.
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review the internal cross-process warning report channel.
+    /// Internal append-only report used to aggregate unsupported syscalls across backend processes.
+    #[serde(default)]
+    #[clap(skip)]
+    pub unsupported_syscall_report: Option<PathBuf>,
 
     /// Panic when a precise PMU timer overshoots its expected RCB target instead of logging an
     /// error and continuing through normal timer handling. Intended for Detcore debugging.
