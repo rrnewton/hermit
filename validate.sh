@@ -120,6 +120,8 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+[[ -n $BACKEND_COMPAT_ONLY ]] && VALIDATION_PROFILE="backend-compat-$BACKEND_COMPAT_ONLY"
+[[ -n $BACKEND_COMPAT_EXPAND ]] && VALIDATION_PROFILE="backend-expand-$BACKEND_COMPAT_EXPAND"
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -301,7 +303,7 @@ declare -Ar DBI_COMPAT_PASSING_LABELS=(
     [split]=1 [install]=1 [mkfifo]=1 [cmp]=1
 )
 # KVM can open /dev/kvm, but its Linux ELF execution personality is not yet
-# implemented, so its measured envelope is 0/121 and has no blocking gate.
+# implemented, so its measured envelope is 0/147 and has no blocking gate.
 readonly KVM_COMPAT_EXPECTED=0
 declare -Ar KVM_COMPAT_PASSING_LABELS=()
 if ((${#DBI_COMPAT_PASSING_LABELS[@]} != DBI_COMPAT_EXPECTED)); then
@@ -1963,6 +1965,10 @@ function run_full_suite {
 
     if ! run_strict_compatibility_envelope; then
         printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
+    fi
+    if ((DBI_COMPAT_EXPECTED > 0)); then
+        run_check "DBI compatibility baseline ($DBI_COMPAT_EXPECTED programs)" \
+            run_backend_compatibility_envelope dbi 0
     fi
     run_check "Record/replay compatibility baseline (128 programs)" \
         run_rr_compatibility_envelope
