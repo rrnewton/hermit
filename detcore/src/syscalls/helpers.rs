@@ -540,7 +540,7 @@ impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#267): Confirm select/pselect6 nonblockize + retry semantics,
+// TODO-HUMAN-REVIEW(#268): Confirm select/pselect6 nonblockize + retry semantics,
 // including the pselect6 sigmask atomicity limitation documented on the handler.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Select {
@@ -578,7 +578,7 @@ impl TimeoutableSyscall for reverie::syscalls::Select {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#267): pselect6's sigmask is applied per-probe rather than
+// TODO-HUMAN-REVIEW(#268): pselect6's sigmask is applied per-probe rather than
 // atomically across the whole logical wait (see handle_pselect6 note).
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Pselect6 {
