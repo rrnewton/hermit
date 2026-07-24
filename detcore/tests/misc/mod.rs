@@ -79,6 +79,164 @@ where
 }
 
 #[test]
+fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
+    det_test_fn_sequential_without_pmu(|| {
+        const VIRTUAL_CPUSET_BYTES: usize = 16;
+
+        let mut mask = [0xaa_u8; 32];
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_sched_getaffinity,
+                0,
+                mask.len(),
+                mask.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, VIRTUAL_CPUSET_BYTES as libc::c_long);
+        assert_eq!(mask[0], 1);
+        assert!(mask[1..VIRTUAL_CPUSET_BYTES].iter().all(|byte| *byte == 0));
+        assert!(
+            mask[VIRTUAL_CPUSET_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0xaa),
+            "sched_getaffinity must not overwrite bytes beyond its return value"
+        );
+
+        let mut short_mask = [0_u8; VIRTUAL_CPUSET_BYTES - 1];
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_getaffinity,
+                    0,
+                    short_mask.len(),
+                    short_mask.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_getaffinity,
+                    0,
+                    VIRTUAL_CPUSET_BYTES + 1,
+                    mask.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_getaffinity,
+                    0,
+                    short_mask.len(),
+                    std::ptr::null_mut::<u8>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_getaffinity,
+                    0,
+                    VIRTUAL_CPUSET_BYTES,
+                    std::ptr::null_mut::<u8>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+
+        let requested = [1_u8 << 1];
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setaffinity,
+                    0,
+                    requested.len(),
+                    requested.as_ptr(),
+                )
+            },
+            0
+        );
+
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_sched_setaffinity, 0, 0, requested.as_ptr(),) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setaffinity,
+                    0,
+                    requested.len(),
+                    std::ptr::null::<u8>(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EFAULT)
+        );
+
+        let empty_request = [0_u8];
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setaffinity,
+                    0,
+                    empty_request.len(),
+                    empty_request.as_ptr(),
+                )
+            },
+            0,
+            "even an empty requested set is normalized to virtual CPU 0"
+        );
+
+        mask.fill(0xaa);
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sched_getaffinity,
+                    0,
+                    mask.len(),
+                    mask.as_mut_ptr(),
+                )
+            },
+            VIRTUAL_CPUSET_BYTES as libc::c_long
+        );
+        assert_eq!(mask[0], 1);
+        assert!(mask[1..VIRTUAL_CPUSET_BYTES].iter().all(|byte| *byte == 0));
+    });
+}
+
+#[test]
 fn waitid_polls_until_child_exit_and_supports_wnohang() {
     det_test_fn_sequential_without_pmu(|| {
         let mut pipe = [0; 2];
