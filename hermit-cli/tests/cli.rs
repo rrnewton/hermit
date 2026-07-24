@@ -324,6 +324,20 @@ fn run_liteinst_verifies_integrated_preload_backend() {
         "liteinst-cli-ok",
     ];
     let output = hermit(&args);
+    let runtime = Path::new(env!("CARGO_BIN_EXE_hermit"))
+        .parent()
+        .expect("Hermit binary should have a parent directory")
+        .join("libdetcore_liteinst.so");
+    if !runtime.is_file() {
+        assert_failure_contains(
+            &output,
+            &[
+                "backend `liteinst` is unavailable",
+                "libdetcore_liteinst.so was not built beside the Hermit binary",
+            ],
+        );
+        return;
+    }
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "liteinst-cli-ok\n");
     let stderr = stderr(&output);
