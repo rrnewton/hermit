@@ -669,6 +669,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#274): Review waitid polling and compatibility boundaries.
     /// waitid system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
     pub async fn handle_waitid<G: Guest<Self>>(
