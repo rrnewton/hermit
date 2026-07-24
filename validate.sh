@@ -34,7 +34,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
-#   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
+#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
@@ -995,7 +995,7 @@ function rr_compatibility_probe {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
+# TODO-HUMAN-REVIEW(#521): Review the strict compatibility policy.
 # Run one application through strict L2 or the SaBRe compatibility path. Each
 # row has its own hard timeout so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
@@ -1123,8 +1123,8 @@ function run_compatibility_corpus {
         printf "\n== e9patch compatibility matrix (L2) ==\n"
         printf "=== e9patch compatibility matrix (L2) ===\n" >>"$LOG_FILE"
     else
-        printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
-        printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
+        printf "\n== Strict compatibility envelope (L2, blocking) ==\n"
+        printf "=== Strict compatibility envelope (L2, blocking) ===\n" >>"$LOG_FILE"
     fi
 
     strict_compatibility_probe echo /bin/echo hermit-compat \
@@ -1739,7 +1739,7 @@ function run_compatibility_corpus {
         return 0
     fi
 
-    printf "❌ Strict compatibility envelope (%s/%s passed L2, %s regressed; nonblocking)\n" \
+    printf "❌ Strict compatibility envelope (%s/%s passed L2, %s regressed; blocking)\n" \
         "$passed" "$total" "$failed"
     return 1
 }
