@@ -34,7 +34,7 @@ pub struct StraceOpts {
 impl StraceOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         match global.backend {
-            Some(Backend::Sabre) => super::backends::run_sabre(&self.program, &self.args),
+            Some(Backend::Sabre) => super::backends::run_sabre_strace(&self.program, &self.args),
             Some(backend) => anyhow::bail!(
                 "the M1 strace command requires `--backend sabre`, not `--backend {}`",
                 backend.as_str()
