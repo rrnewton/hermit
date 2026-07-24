@@ -16,10 +16,91 @@ use reverie::syscalls::MemoryAccess;
 use crate::Detcore;
 use crate::RecordOrReplay;
 use crate::tool_global::thread_observe_time;
+use crate::tool_local::ResourceLimit;
 
 const MB: u64 = 1024 * 1024;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Virtualize `prlimit64(2)` for the current guest process.
+    ///
+    /// Queries return process-local deterministic values. Mutations are kept
+    /// virtual and restricted to limits that do not grant access to host
+    /// resources or affect host scheduling. Accepted mutations update only
+    /// guest-observable compatibility state; they are not a sandbox boundary
+    /// and do not ask the host kernel to enforce the virtual limit.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#534)
+    pub async fn handle_prlimit64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Prlimit64,
+    ) -> Result<i64, Error> {
+        let resource = call.resource();
+        let resource_limits = guest.thread_state().resource_limits.clone();
+        if resource_limits
+            .lock()
+            .expect("resource limits mutex poisoned")
+            .get(resource)
+            .is_none()
+        {
+            return Err(Errno::EINVAL.into());
+        }
+
+        let requested = if let Some(address) = call.new_rlim() {
+            let limit: libc::rlimit64 = guest.memory().read_value(address)?;
+            Some(ResourceLimit {
+                current: limit.rlim_cur,
+                maximum: limit.rlim_max,
+            })
+        } else {
+            None
+        };
+
+        let pid = call.pid();
+        if pid != 0 && pid != guest.pid().as_raw() {
+            return Err(Errno::EPERM.into());
+        }
+
+        let previous = {
+            let mut limits = resource_limits
+                .lock()
+                .expect("resource limits mutex poisoned");
+            let previous = limits
+                .get(resource)
+                .expect("resource validity changed while handling prlimit64");
+
+            if let Some(requested) = requested {
+                if requested.current > requested.maximum {
+                    return Err(Errno::EINVAL.into());
+                }
+                if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
+                    return Err(Errno::EPERM.into());
+                }
+                if requested.maximum > previous.maximum {
+                    return Err(Errno::EPERM.into());
+                }
+                limits.set(resource, requested);
+            }
+
+            previous
+        };
+
+        if let Some(address) = call.old_rlim() {
+            let previous = libc::rlimit64 {
+                rlim_cur: previous.current,
+                rlim_max: previous.maximum,
+            };
+            guest.memory().write_value(address, &previous)?;
+        }
+
+        crate::detlog!(
+            "prlimit64: pid={pid}, resource={resource}, mutation={}, old={}:{}",
+            requested.is_some(),
+            previous.current,
+            previous.maximum
+        );
+        Ok(0)
+    }
     /// Return a deterministic resource-usage snapshot. Host CPU times, page-fault counts, and
     /// context-switch counts depend on kernel scheduling, so report zero until Detcore models
     /// those counters using logical execution progress.

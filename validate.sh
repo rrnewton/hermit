@@ -23,6 +23,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
+#   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # A fully-green full run labels the current PR `locally-validated` by default.
@@ -30,6 +31,7 @@ cd "$ROOT_DIR" || exit 1
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
+STRICT_COMPAT_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
             ENVELOPE_MODE="only"; ENVELOPE_BASELINE=${2:-}
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
+        --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -67,6 +70,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
+readonly STRICT_COMPAT_ONLY
 
 checks=0
 failures=0
@@ -112,6 +116,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
+readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+readonly STRICT_COMPAT_TIMEOUT=60
 declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
@@ -473,6 +479,110 @@ function hermit_verify_smoke {
         /bin/echo "$SMOKE_MARKER"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
+# Run one known-compatible application at L2. Each row has its own hard timeout
+# so a regression cannot stall the rest of the matrix.
+function strict_compatibility_probe {
+    local label=$1
+    shift
+
+    local started_at=$SECONDS
+    local output_start
+    local status
+    local summary
+
+    {
+        printf "=== Strict compatibility: %s ===\n" "$label"
+        printf "Command: timeout %s %q run --strict --verify --" \
+            "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if ((VERBOSE == 1)); then
+        printf "  compatibility probe: %s\n" "$label"
+    fi
+
+    if timeout "$STRICT_COMPAT_TIMEOUT" \
+        "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- "$@" \
+        </dev/null >>"$LOG_FILE" 2>&1; then
+        status=0
+        printf "  ✅ %-12s PASS L2 (%ss)\n" "$label" "$((SECONDS - started_at))"
+    else
+        status=$?
+        summary=$(failure_summary "$output_start")
+        printf "  ❌ %-12s FAIL (exit %s: %s)\n" "$label" "$status" "$summary"
+    fi
+
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    return "$status"
+}
+
+# This is an observation gate for now: full validation prints every regression
+# but does not add it to the fatal failure count. --strict-compat-only exposes
+# the real aggregate status so CI can mark the step while continue-on-error
+# keeps the lane nonblocking until the matrix is ratcheted.
+function run_strict_compatibility_envelope {
+    local passed=0
+    local failed=0
+    local total=0
+
+    printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
+    printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
+
+    strict_compatibility_probe echo /bin/echo hermit-compat \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe seq /usr/bin/seq 10 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cat /bin/cat README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe wc /usr/bin/wc -c README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe head /usr/bin/head -n 3 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe base64 /usr/bin/base64 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe id /usr/bin/id -u \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe lua lua -e 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe awk awk 'BEGIN { print 42 }' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sqlite3 sqlite3 :memory: 'SELECT 1+1;' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Expand $i inside the guest shell, not here.
+    # shellcheck disable=SC2016
+    strict_compatibility_probe bash bash -c \
+        'for i in 1 2 3; do echo "$i"; done' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cargo cargo --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe rustc rustc --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe bzip2 bash -c \
+        'bzip2 -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+
+    total=$((passed + failed))
+    if ((failed == 0)); then
+        printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
+        return 0
+    fi
+
+    printf "❌ Strict compatibility envelope (%s/%s passed L2, %s regressed; nonblocking)\n" \
+        "$passed" "$total" "$failed"
+    return 1
+}
+
 # Run one probe at one assurance level. $1 = extra run flags (space-split on
 # purpose); remaining args are the guest argv. Returns the guest/hermit status.
 function _envelope_level {
@@ -652,6 +762,16 @@ function print_summary {
 
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
+if ((STRICT_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit for strict compatibility" \
+        cargo build --release -p hermit
+    if ((failures != 0)); then
+        exit 1
+    fi
+    run_strict_compatibility_envelope
+    exit $?
+fi
+
 if [[ $ENVELOPE_MODE == only ]]; then
     run_check "Build workspace for envelope measurement" cargo build --workspace
     if ((failures != 0)); then
@@ -667,6 +787,8 @@ fi
 
 run_check "cargo-nextest available" ensure_cargo_nextest
 run_check "Build workspace" cargo build --workspace
+run_check "Build release Hermit for strict compatibility" \
+    cargo build --release -p hermit
 
 # Cargo supports concurrent commands in one target directory. Run checks that
 # do not execute Hermit guests alongside the ordered runtime and PMU gates.
@@ -678,6 +800,9 @@ start_check "Documentation" cargo doc --workspace --no-deps
 run_check "Hermit run smoke test" hermit_run_smoke
 run_check "Hermit output determinism" hermit_determinism_check
 run_check "Hermit verify-mode smoke test" hermit_verify_smoke
+if ! run_strict_compatibility_envelope; then
+    printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
+fi
 # Nextest runs most package unit and Cargo integration targets in parallel.
 # Detcore's PMU tests depend on same-binary coordination; nextest would launch
 # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.

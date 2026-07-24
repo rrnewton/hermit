@@ -167,6 +167,50 @@ impl PosixTimers {
     }
 }
 
+/// One virtualized resource limit, represented in the `prlimit64` ABI's units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ResourceLimit {
+    pub(crate) current: u64,
+    pub(crate) maximum: u64,
+}
+
+/// Deterministic resource limits owned by one guest process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ResourceLimits {
+    limits: Vec<ResourceLimit>,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        let unlimited = ResourceLimit {
+            current: libc::RLIM64_INFINITY,
+            maximum: libc::RLIM64_INFINITY,
+        };
+        let mut limits = vec![unlimited; libc::RLIMIT_RTTIME as usize + 1];
+        limits[libc::RLIMIT_STACK as usize] = ResourceLimit {
+            current: 8 * 1024 * 1024,
+            maximum: libc::RLIM64_INFINITY,
+        };
+        limits[libc::RLIMIT_NOFILE as usize] = ResourceLimit {
+            current: 1_048_576,
+            maximum: 1_048_576,
+        };
+        Self { limits }
+    }
+}
+
+impl ResourceLimits {
+    /// Return a limit when `resource` is a valid Linux resource number.
+    pub(crate) fn get(&self, resource: u32) -> Option<ResourceLimit> {
+        self.limits.get(resource as usize).copied()
+    }
+
+    /// Replace a previously validated resource limit.
+    pub(crate) fn set(&mut self, resource: u32, limit: ResourceLimit) {
+        self.limits[resource as usize] = limit;
+    }
+}
+
 /// Nanoseconds remaining until `deadline` relative to `now`, saturating at 0.
 /// A disarmed timer (`None`) or an already-elapsed deadline reports 0, which is
 /// how the kernel reports an expired/disarmed timer via `timer_gettime`.
@@ -459,6 +503,58 @@ mod posix_timers_tests {
         assert!(!timers.contains(id));
         // Deleting again fails.
         assert!(!timers.remove(id));
+    }
+}
+
+#[cfg(test)]
+mod resource_limits_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_fixed_and_cover_linux_resources() {
+        let limits = ResourceLimits::default();
+        assert_eq!(
+            limits.get(libc::RLIMIT_STACK),
+            Some(ResourceLimit {
+                current: 8 * 1024 * 1024,
+                maximum: libc::RLIM64_INFINITY,
+            })
+        );
+        assert_eq!(
+            limits.get(libc::RLIMIT_NOFILE),
+            Some(ResourceLimit {
+                current: 1_048_576,
+                maximum: 1_048_576,
+            })
+        );
+        assert_eq!(
+            limits.get(libc::RLIMIT_CORE),
+            Some(ResourceLimit {
+                current: libc::RLIM64_INFINITY,
+                maximum: libc::RLIM64_INFINITY,
+            })
+        );
+        assert_eq!(limits.get(libc::RLIMIT_RTTIME + 1), None);
+    }
+
+    #[test]
+    fn cloned_process_state_changes_independently() {
+        let parent = ResourceLimits::default();
+        let mut child = parent.clone();
+        let lowered = ResourceLimit {
+            current: 1024,
+            maximum: 1_048_576,
+        };
+        child.set(libc::RLIMIT_NOFILE, lowered);
+
+        assert_eq!(child.get(libc::RLIMIT_NOFILE), Some(lowered));
+        assert_eq!(
+            parent.get(libc::RLIMIT_NOFILE),
+            Some(ResourceLimit {
+                current: 1_048_576,
+                maximum: 1_048_576,
+            })
+        );
     }
 }
 
@@ -759,6 +855,9 @@ pub struct ThreadState<T> {
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
     pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
 
+    /// Resource limits shared by threads and copied when a new process forks.
+    pub(crate) resource_limits: Arc<Mutex<ResourceLimits>>,
+
     /// pseudo random number state
     pub prng: Pcg64Mcg,
 
@@ -807,6 +906,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
             .field("posix_timers", &self.posix_timers)
+            .field("resource_limits", &self.resource_limits)
             .field("prng", &self.prng)
             .field("chaos_prng", &self.chaos_prng)
             .field("thread_logical_time", &self.thread_logical_time)
@@ -878,6 +978,7 @@ impl<T> ThreadState<T> {
                 FileMetadata::new(pid).setup_stdio(pid.into(), pid),
             )),
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
+            resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:

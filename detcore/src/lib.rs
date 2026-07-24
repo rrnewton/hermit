@@ -639,6 +639,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::sched_yield,
                 Sysno::poll,
                 Sysno::ppoll,
+                Sysno::prlimit64,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -940,6 +941,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         Arc::clone(&pts.1.posix_timers)
                     } else {
                         Arc::new(Mutex::new(PosixTimers::default()))
+                    },
+                    // Resource limits are process state: threads share them,
+                    // while a forked process inherits a snapshot.
+                    resource_limits: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.resource_limits)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .resource_limits
+                                .lock()
+                                .expect("resource limits mutex poisoned")
+                                .clone(),
+                        ))
                     },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
@@ -1330,6 +1344,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
 
                 // POSIX per-process timers. Arming is tracked against the virtual
                 // clock so these verify deterministically under --strict; timer
@@ -1363,22 +1378,52 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
+            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
+            // dispatch it by Sysno while retaining typed guards for every represented call.
+            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => match call {
                 Syscall::Access(_)
                 | Syscall::Brk(_)
+                | Syscall::Capget(_)
+                | Syscall::Capset(_)
+                | Syscall::Chdir(_)
+                | Syscall::Chmod(_)
+                | Syscall::Fchdir(_)
+                | Syscall::Fchmodat(_)
+                | Syscall::Fdatasync(_)
+                | Syscall::Ftruncate(_)
                 | Syscall::Getcwd(_)
                 | Syscall::Getegid(_)
                 | Syscall::Geteuid(_)
                 | Syscall::Getgid(_)
+                | Syscall::Getgroups(_)
                 | Syscall::Getpid(_)
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
+                | Syscall::Getxattr(_)
+                | Syscall::Lgetxattr(_)
+                | Syscall::Linkat(_)
                 | Syscall::Lseek(_)
+                | Syscall::Mkdir(_)
+                | Syscall::Mkdirat(_)
                 | Syscall::Mprotect(_)
                 | Syscall::Readlink(_)
+                | Syscall::Removexattr(_)
+                | Syscall::Renameat2(_)
+                | Syscall::Rmdir(_)
+                | Syscall::RtSigreturn(_)
+                | Syscall::Setxattr(_)
                 | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
-                | Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
+                | Syscall::Sigaltstack(_)
+                | Syscall::Symlinkat(_)
+                | Syscall::Umask(_)
+                | Syscall::Unlink(_)
+                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
                 unexpected => {
                     self.handle_unclassified_syscall(
                         guest,
