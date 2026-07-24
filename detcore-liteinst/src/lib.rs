@@ -7,7 +7,7 @@
  */
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the preload constructor boundary.
+// TODO-HUMAN-REVIEW(#585): Review the preload constructor boundary.
 
 //! Hermit-owned cdylib wrapper for Reverie's LiteInst preload runtime.
 

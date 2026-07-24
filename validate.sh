@@ -920,7 +920,7 @@ function rr_compatibility_probe {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(PR-id): Review the experimental LiteInst compatibility ratchet.
+# TODO-HUMAN-REVIEW(#585): Review the experimental LiteInst compatibility ratchet.
 function liteinst_compatibility_probe {
     local label=$1
     shift

@@ -310,7 +310,7 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the experimental preload verification boundary.
+// TODO-HUMAN-REVIEW(#585): Review the experimental preload verification boundary.
 #[test]
 fn run_liteinst_verifies_integrated_preload_backend() {
     let args = [

@@ -177,7 +177,7 @@ pub fn run_dbi(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the experimental preload verification boundary.
+// TODO-HUMAN-REVIEW(#585): Review the experimental preload verification boundary.
 /// Runs a guest through the LiteInst preload compatibility path.
 pub fn run_liteinst(
     program: &Path,
