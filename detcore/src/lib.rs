@@ -995,6 +995,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
         if let Some(ptr) = guest.auxv().at_random() {
