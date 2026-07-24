@@ -10,9 +10,6 @@ readonly EXPECTED_TESTS=330900
 readonly STALL_MARKER='Time: lock3.test '
 readonly -a KNOWN_FAILURES=(
   backup2-6
-  busy2-1.1.3
-  busy2-2.1.3
-  busy2-2.1.5
   delete-8.1
   delete-8.2
   delete-8.3
@@ -20,8 +17,6 @@ readonly -a KNOWN_FAILURES=(
   delete-8.5
   delete-8.6
   extension01-1.6
-  like-14.1
-  like-14.2
 )
 
 fail() {

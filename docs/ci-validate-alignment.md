@@ -16,8 +16,9 @@ The Rust workflow and local validation use the same capability selectors:
 | Hardware | self-hosted `[Linux, X64, hermit, pmu]` | `./validate.sh --hardware-only --no-label-pr` | PMU, CPUID, KVM, or another host capability is part of the test |
 
 The default `./validate.sh` remains the developer superset. The focused modes
-exist so either CI subset can be reproduced independently.
-
+exist so either CI subset can be reproduced independently. The tiered workflow
+maps `quick` to portable, `full` to per-PR hardware, and long database stress
+to the weekly self-hosted `super` profile.
 ## Portable lane
 
 The hosted job enables user and mount namespaces before starting Hermit. This
@@ -25,18 +26,18 @@ is a privilege prerequisite, not a PMU or CPUID dependency. Guest tests in this
 lane either need no hardware event handling or explicitly pass:
 
 ```text
---preemption-timeout=disabled --no-virtualize-cpuid
+--max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 436 of the 760 Cargo-discovered cases:
+The selector covers exactly 478 of the 803 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
-| Workspace unit, bin, and doc baseline | 246 | Existing regular-job selection |
+| Workspace unit, bin, and doc baseline | 280 | Existing regular-job selection |
 | Detcore misc without CPUID probes | 21 | `tests_misc`, excluding two RDRAND/CPUID cases |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 163 | Non-KVM CLI, 67 non-PMU modes, apps, commands, IPC, time, memory, procfs, signals, Python, stress, and rr source contract |
+| Portable Hermit integration cases | 171 | Non-KVM CLI, 67 non-PMU modes, apps, commands, IPC, time, memory, procfs, signals, Python, stress, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
 the 147-row strict compatibility corpus with PMU and CPUID explicitly disabled.
@@ -49,14 +50,14 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The self-hosted selector covers the remaining 324 Cargo cases:
+The self-hosted selector covers the remaining 325 Cargo cases:
 
 | Group | Cases | Hardware reason |
 | --- | ---: | --- |
 | Detcore CPUID/RDRAND probes | 2 | Host feature probe and deterministic masking |
-| Detcore time tests | 12 | Nonzero RCB preemption configuration |
+| Detcore time tests | 14 | Nonzero RCB preemption configuration |
 | Detcore parallel variants | 11 | Deterministic RCB preemption assertions |
-| KVM CLI cases | 17 | Read/write `/dev/kvm` is required |
+| KVM CLI cases | 16 | Read/write `/dev/kvm` is required |
 | Buck chaos variants | 8 | Explicit one-million-RCB time slice |
 | Runtime, database, scheduling, and syscall targets | 46 | Default PMU/CPUID or record/replay configuration |
 | Ignored runtime/database/analyze tiers | 14 | Default PMU/CPUID configuration; the randomized full LevelDB and SQLite veryquick suites run in the weekly `super` tier |
@@ -72,11 +73,11 @@ one-hour per-gate timeout for those CPU-heavy fixtures.
 The per-PR hardware lane runs LevelDB's bounded `env_posix_test`; the full
 randomized LevelDB and SQLite veryquick suites remain in the weekly `super`
 profile because each takes tens of minutes on the self-hosted runner.
-The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit` (host policy rejects
-`setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
+The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
+(host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
 
 The hardware lane also gates the three record/replay working-envelope cells,
-the 128-row R/R compatibility corpus, fail-closed behavior, debugger
+the 128-row R/R compatibility corpus, debugger
 integration, and ptrace backend parity. Missing rr sources, namespaces, PMU,
 CPUID, KVM, or runtime prerequisites fail the lane instead of silently reducing
 coverage.

@@ -107,7 +107,7 @@ class Fixtures:
             ),
             "random_sources": (
                 REPOSITORY / "tests/c/random_sources.c",
-                ("-pthread", "-D_GNU_SOURCE"),
+                ("-D_GNU_SOURCE", "-pthread"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
         }
@@ -149,8 +149,17 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         raise MatrixError(f"matrix has no implementation for {name}") from error
 
 
-def backend_block(backend: str) -> str | None:
-    if backend == "kvm":
+def backend_block(backend: str, hermit: Path) -> str | None:
+    if backend == "dbi":
+        smoke = run_with_timeout(
+            [str(hermit), "run", "--backend", "dbi", "--", "/bin/true"]
+        )
+        if smoke is None:
+            return "DBI smoke timed out"
+        if smoke.returncode != 0:
+            diagnostic = smoke.stderr.decode(errors="replace").strip()
+            return f"DBI smoke exited {smoke.returncode}: {diagnostic[-300:]}"
+    elif backend == "kvm":
         kvm = Path("/dev/kvm")
         if not kvm.exists() or not os.access(kvm, os.R_OK | os.W_OK):
             return "/dev/kvm is not readable and writable"
@@ -166,7 +175,7 @@ def hermit_command(
     command.extend(
         [
             "--base-env=minimal",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--tmp=/tmp",
         ]
     )
@@ -179,6 +188,7 @@ def hermit_command(
 def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] | None:
     process = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -332,7 +342,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))
         for backend in backends:
-            block = backend_block(backend)
+            block = backend_block(backend, hermit)
             if block:
                 print(f"BLOCKED {backend}: {block}")
                 if args.require_backend:

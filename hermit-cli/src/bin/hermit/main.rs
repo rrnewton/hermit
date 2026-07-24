@@ -21,6 +21,7 @@ mod bnz;
 mod clean;
 mod container;
 mod global_opts;
+mod instruction_map;
 mod list;
 mod logdiff;
 mod record;
@@ -29,6 +30,7 @@ mod remove;
 mod replay;
 mod run;
 mod schedule_search;
+mod strace;
 mod tracing;
 mod verify;
 mod version;
@@ -86,10 +88,12 @@ use hermit::ExitStatus;
 use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
+use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
+use self::strace::StraceOpts;
 use self::version::Version;
 
 #[derive(Debug, Parser)]
@@ -111,6 +115,10 @@ enum Subcommand {
     #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<RunOpts>),
 
+    /// Trace a program's syscalls through the selected backend.
+    #[clap(name = "strace")]
+    Strace(StraceOpts),
+
     /// Record the execution of a program (EXPERIMENTAL).
     #[clap(name = "record", trailing_var_arg = true)]
     Record(RecordOpts),
@@ -128,17 +136,30 @@ enum Subcommand {
     /// Bisect passing and failing schedules to localize a race.
     #[clap(name = "bisect", trailing_var_arg = true)]
     Bisect(Box<BisectOpts>),
+
+    /// Generate a JSON map of nondeterministic instructions in an ELF binary.
+    #[clap(name = "instruction-map")]
+    InstructionMap(InstructionMapOpts),
 }
 
 impl Subcommand {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        if global.backend == Some(hermit::Backend::Sabre)
+            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
+        {
+            anyhow::bail!(
+                "the SaBRe backend is available only through `hermit --backend sabre strace`"
+            );
+        }
         match self {
             Subcommand::Run(x) => x.main(global),
+            Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
             Subcommand::LogDiff(x) => Ok(x.main(global)),
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
+            Subcommand::InstructionMap(x) => x.main(global),
         }
     }
 }
@@ -209,7 +230,7 @@ mod tests {
             "--bad",
             "bad.json",
             "--",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "/bin/true",
         ])
         .unwrap();
@@ -247,6 +268,49 @@ mod tests {
     }
 
     #[test]
+    fn sabre_strace_command_parses_in_requested_form() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "sabre",
+            "strace",
+            "--",
+            "/bin/echo",
+            "hello",
+        ])
+        .expect("requested SaBRe strace form should parse");
+        assert_eq!(args.global.backend, Some(Backend::Sabre));
+        assert!(matches!(args.command, Subcommand::Strace(_)));
+    }
+
+    #[test]
+    fn sabre_strace_rejects_run_options_it_does_not_honor() {
+        for option in [
+            "--namespace-only",
+            "--verify",
+            "--strict",
+            "--env=SHOULD_NOT_BE_IGNORED=1",
+            "--workdir=/tmp",
+        ] {
+            let result = Args::try_parse_from([
+                "hermit",
+                "--backend",
+                "sabre",
+                "strace",
+                option,
+                "--",
+                "/bin/true",
+            ]);
+            assert!(
+                result.is_err(),
+                "SaBRe strace unexpectedly accepted unsupported option {option}"
+            );
+        }
+    }
+
+    #[test]
     fn record_accepts_a_positive_timeout() {
         Args::try_parse_from([
             "hermit",
@@ -272,5 +336,19 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn instruction_map_accepts_binary_and_cache_directory() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "instruction-map",
+            "--cache-dir",
+            "/tmp/instruction-maps",
+            "/bin/ls",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::InstructionMap(_)));
     }
 }

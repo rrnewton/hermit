@@ -19,6 +19,37 @@ implementation issue and link it here.
 > environment-independent subset only, not the PMU- and namespace-dependent
 > integration matrix.
 
+## `validate.sh` levels
+
+`./validate.sh` accepts one optional validation level. With no level argument,
+it runs `full` for backward compatibility.
+
+| Level | Coverage |
+| --- | --- |
+| `quick` | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
+| `full` (default) | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. |
+| `super` | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+
+Super mode defaults to `SUPER_REPETITIONS=20` and a concurrency limit of about
+1.5 times the online CPU count. Override those with positive integers in
+`SUPER_REPETITIONS` and `SUPER_JOBS`; lower values are useful for a local smoke
+run. The runner prints the host OS from `/etc/os-release`, repetition count,
+concurrency, and online CPU count so pass-rate reports retain their execution
+context.
+
+The full and super backend gates probe actual runtime capability: KVM requires
+a readable and writable `/dev/kvm`; DBI must complete a bounded `/bin/true`
+smoke using either its bundled DynamoRIO runtime or explicit environment
+configuration. An unavailable alternate backend is reported as `SKIP`, not as
+a ptrace failure.
+
+The full compatibility matrices invoke system utilities by their Linux paths
+or command names. Ubuntu and Fedora split those tools across different
+packages (notably `coreutils`, `util-linux`, `bsdextrautils`/`util-linux`, and
+compression packages). The OS name printed at startup must accompany results;
+install missing utilities rather than interpreting `command not found` as a
+Hermit determinism regression.
+
 ## Capability axes
 
 These axes are orthogonal. A host can satisfy some and not others, and each
@@ -137,14 +168,14 @@ Match observed output to a cause before filing a bug. Exact strings live in
 
 ### Missing or blocked PMU / perf permissions
 
-- `--preemption-timeout requires user-space perf counters ... continuing with timer preemption disabled`
-- `perf_event_open is unavailable; continuing with --preemption-timeout=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
+- `--max-timeslice requires user-space perf counters ... continuing with timer preemption disabled`
+- `perf_event_open is unavailable; continuing with --max-timeslice=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
 - `Hardware perf counters are not supported on this machine. Records/Replays may randomly fail`
 - Guest **hangs after a PMU warning**: timer preemption is disabled and a
   CPU-bound thread reaches no scheduling event.
 
 **Action:** lower `/proc/sys/kernel/perf_event_paranoid`, grant PMU access, or
-accept `--preemption-timeout=disabled` (weaker scheduling fidelity). This is an
+accept `--max-timeslice=disabled` (weaker scheduling fidelity). This is an
 **environment** condition, not a Hermit bug.
 
 ### Unsupported / unrecognized CPU model

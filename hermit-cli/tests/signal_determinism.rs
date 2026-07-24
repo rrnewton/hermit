@@ -83,7 +83,7 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ]);
         command.arg(signal_guest()).arg(scenario);
@@ -154,6 +154,14 @@ fn signal_interrupts_rt_sigtimedwait_despite_sa_restart() {
     run_signal_scenario(
         "sigtimedwait-sa-restart",
         "rt_sigtimedwait interrupted deliveries=1 pending=SIGUSR2\n",
+    );
+}
+
+#[test]
+fn blocking_sigsuspend_releases_the_scheduler() {
+    run_signal_scenario(
+        "blocking-sigsuspend",
+        "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
     );
 }
 

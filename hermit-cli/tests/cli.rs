@@ -19,6 +19,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -65,6 +68,81 @@ fn dbi_mmap_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_exec_failure_guest() -> &'static Path {
+    DBI_EXEC_FAILURE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-exec-failure");
+        fs::create_dir_all(&build_root).expect("failed to create DBI exec-failure guest directory");
+        let guest = build_root.join("dbi_exec_failure");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_exec_failure.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI exec-failure guest");
+        assert!(
+            output.status.success(),
+            "DBI exec-failure guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_execveat_guest() -> &'static Path {
+    DBI_EXECVEAT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-execveat");
+        fs::create_dir_all(&build_root).expect("failed to create DBI execveat guest directory");
+        let guest = build_root.join("dbi_execveat_unsupported");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_execveat_unsupported.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI execveat guest");
+        assert!(
+            output.status.success(),
+            "DBI execveat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbi_wait_guest() -> &'static Path {
+    DBI_WAIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-wait");
+        fs::create_dir_all(&build_root).expect("failed to create DBI wait guest directory");
+        let guest = build_root.join("dbi_wait_lifecycle");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_wait_lifecycle.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI wait guest");
+        assert!(
+            output.status.success(),
+            "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -186,7 +264,9 @@ fn top_level_help_lists_user_facing_commands() {
     let help = stdout(&output);
 
     assert!(help.contains("Usage: hermit [OPTIONS] <COMMAND>"));
-    for command in ["run", "record", "replay", "log-diff", "analyze", "bisect"] {
+    for command in [
+        "run", "strace", "record", "replay", "log-diff", "analyze", "bisect",
+    ] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
 }
@@ -233,7 +313,8 @@ fn run_help_exposes_determinism_modes() {
         "--verify-verbose",
         "--record-preemptions",
         "--replay-preemptions-from",
-        "--preemption-timeout",
+        "--max-timeslice",
+        "--target-timeslice",
         "--backend <BACKEND>",
         "ptrace",
         "dbi",
@@ -253,13 +334,13 @@ fn run_strict_flag_is_accepted_and_runs() {
     // Regression test for GH #12: `docs/Users.md` documents
     // `hermit run --strict ...`, and the CLI must accept that spelling and run
     // the guest to completion. Strict determinism is the default, so `--strict`
-    // is a compatibility no-op over the defaults. `--preemption-timeout=disabled`
+    // is a compatibility no-op over the defaults. `--max-timeslice=disabled`
     // and `--no-virtualize-cpuid` keep this runnable on hosts without accessible
     // PMU counters or CPUID faulting; neither weakens what `--strict` controls.
     let args = [
         "run",
         "--strict",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
         "--",
         "/bin/true",
@@ -323,6 +404,136 @@ fn run_dbi_verifies_application_mmap() {
     assert!(
         stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
         "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
+fn run_dbi_verifies_process_wait_lifecycle() {
+    let program = dbi_wait_guest()
+        .to_str()
+        .expect("DBI wait guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n"
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
+fn run_dbi_verifies_shell_process_lifecycle() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/sh",
+        "-c",
+        "/bin/echo hello; :",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "hello\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
+#[test]
+fn run_dbi_verifies_pipe_backpressure() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/bash",
+        "-c",
+        "printf x | grep x | wc -l",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "1\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
+fn run_dbi_recovers_after_failed_exec() {
+    let program = dbi_exec_failure_guest()
+        .to_str()
+        .expect("DBI exec-failure guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "recovered after failed exec\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+#[test]
+fn run_dbi_rejects_unfollowed_execveat() {
+    let program = dbi_execveat_guest()
+        .to_str()
+        .expect("DBI execveat guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "execveat unsupported in root and fork child\n"
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
@@ -870,6 +1081,34 @@ fn backend_accepted_in_global_position() {
 }
 
 #[test]
+fn sabre_backend_validation_honors_command_scope() {
+    let non_run = hermit(&["--backend", "sabre", "record", "list"]);
+    assert_failure_contains(&non_run, &["SaBRe backend", "only through", "strace"]);
+
+    let local_override = hermit(&[
+        "--backend",
+        "sabre",
+        "run",
+        "--backend",
+        "ptrace",
+        "--",
+        "/definitely/missing/sabre-backend-override-test",
+    ]);
+    assert_failure_contains(&local_override, &["does not exist or is not accessible"]);
+    assert!(!stderr(&local_override).contains("SaBRe backend"));
+
+    let log = hermit(&[
+        "--backend",
+        "sabre",
+        "--log",
+        "info",
+        "strace",
+        "--",
+        "/bin/true",
+    ]);
+    assert_failure_contains(&log, &["does not support --log or --log-file"]);
+}
+#[test]
 fn global_position_rejects_unknown_backends() {
     let args = ["--backend", "unknown", "run", "--", "/bin/true"];
     let output = hermit(&args);
@@ -966,7 +1205,7 @@ fn no_namespace_runs_without_container_setup() {
     let args = [
         "run",
         "--no-namespace",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/echo",
         "hello",
@@ -994,7 +1233,7 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         "run",
         "--no-namespace",
         "--pin-threads",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/usr/bin/nproc",
     ];
@@ -1007,7 +1246,7 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         "--no-namespace",
         "--verify",
         "--pin-threads",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/sh",
         "-c",
@@ -1153,7 +1392,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command.args([
             "run",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
             "--",
             "/bin/true",

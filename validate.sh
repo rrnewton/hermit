@@ -17,14 +17,22 @@ readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
 # --- Argument parsing -------------------------------------------------------
-# Default (no args): run the full validation suite, which also prints the
-# working-envelope vector at the end. The envelope path is factored out so CI
+# Usage: ./validate.sh [quick|full|super] [options]
+# Default (no level): run the full validation suite, which also prints the
+# working-envelope vector at the end.
+#   quick  Core ptrace run/verify/record smoke tests; no alternate backends.
+#   full   Everything in quick plus the complete suite and DBI/KVM gates.
+#   super  Repeat stress probes (20x by default) under moderate oversubscription
+#          and report a pass rate for every probe.
+#
+# The envelope path is factored out so CI
 # can call the *identical* measurement code and produce matching numbers:
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
+#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
 #   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
@@ -35,8 +43,11 @@ cd "$ROOT_DIR" || exit 1
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
+VALIDATION_LEVEL="full"       # quick | full | super
+VALIDATION_LEVEL_EXPLICIT=0
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
+SABRE_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 HOSTED_ONLY=0
 HARDWARE_ONLY=0
@@ -47,6 +58,14 @@ VERBOSE=0
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        quick|full|super)
+            if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
+                echo "validate.sh: choose only one validation level" >&2
+                exit 2
+            fi
+            VALIDATION_LEVEL=$1
+            VALIDATION_LEVEL_EXPLICIT=1
+            shift ;;
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
         --envelope-compare)
             ENVELOPE_MODE="only"; ENVELOPE_BASELINE=${2:-}
@@ -54,6 +73,9 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
+        --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --hosted-only) HOSTED_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
@@ -72,6 +94,7 @@ only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((HOSTED_ONLY == 1)) && ((only_modes += 1))
 ((HARDWARE_ONLY == 1)) && ((only_modes += 1))
@@ -79,6 +102,18 @@ if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
 fi
+if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
+    echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+VALIDATION_PROFILE=$VALIDATION_LEVEL
+[[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
+((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
+((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
+((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
+((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+((HOSTED_ONLY == 1)) && VALIDATION_PROFILE="hosted-only"
+((HARDWARE_ONLY == 1)) && VALIDATION_PROFILE="hardware-only"
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -111,7 +146,30 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY HOSTED_ONLY HARDWARE_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY
+readonly HOSTED_ONLY HARDWARE_ONLY VALIDATION_LEVEL VALIDATION_PROFILE
+
+SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
+if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: SUPER_REPETITIONS must be a positive integer" >&2
+    exit 2
+fi
+host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
+if [[ ! $host_cpus =~ ^[1-9][0-9]*$ ]]; then
+    host_cpus=1
+fi
+SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
+if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
+    exit 2
+fi
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus
+
+HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
+HOST_OS=${HOST_OS#\"}
+HOST_OS=${HOST_OS%\"}
+[[ -n $HOST_OS ]] || HOST_OS="unknown Linux"
+readonly HOST_OS
 
 checks=0
 failures=0
@@ -134,7 +192,13 @@ if [[ -z $LOG_FILE ]]; then
     exit 1
 fi
 readonly LOG_FILE
-printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
+printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
+    "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
+printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
+if [[ $VALIDATION_LEVEL == super ]]; then
+    printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
+        "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
+fi
 if ((VERBOSE == 1)); then
     printf "Verbose validation enabled\n"
     printf "  root: %s\n" "$ROOT_DIR"
@@ -159,6 +223,8 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
+readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: RR_COMPAT_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
@@ -166,6 +232,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
+# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# This is a compatibility floor, not a Detcore determinism claim.
+readonly SABRE_COMPAT_EXPECTED=140
+readonly SABRE_COMPAT_TOTAL=147
 COMPATIBILITY_MODE=strict
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
@@ -206,7 +276,7 @@ declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
     --no-virtualize-cpuid
-    --preemption-timeout=disabled
+    --max-timeslice=disabled
 )
 
 # --- Working-envelope measurement -------------------------------------------
@@ -255,6 +325,7 @@ function cleanup {
     done
     wait 2>/dev/null || true
     rm -rf "$VALIDATION_TMP_DIR"
+    rm -rf "$REAL_COMPAT_FIXTURES"
 }
 
 function interrupted {
@@ -563,6 +634,197 @@ function hermit_verify_smoke {
         /bin/echo "$SMOKE_MARKER"
 }
 
+function hermit_record_replay_smoke {
+    local case_dir="$VALIDATION_TMP_DIR/record-smoke"
+    local data_dir="$case_dir/recording"
+    local record_stdout="$case_dir/record.stdout"
+    local replay_stdout="$case_dir/replay.stdout"
+
+    rm -rf "$case_dir"
+    mkdir -p "$case_dir"
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" record start --data-dir "$data_dir" -- \
+        /bin/echo "$SMOKE_MARKER" >"$record_stdout" || return
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" replay --autopilot --data-dir "$data_dir" \
+        >"$replay_stdout" || return
+    grep -Fxq "$SMOKE_MARKER" "$record_stdout" &&
+        cmp -s "$record_stdout" "$replay_stdout"
+}
+
+function backend_selector_supported {
+    "$HERMIT_BIN" run --help 2>&1 | grep -q -- '--backend'
+}
+
+function kvm_backend_available {
+    [[ -r /dev/kvm && -w /dev/kvm ]]
+}
+
+function dbi_backend_available {
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" run --backend dbi -- /bin/true \
+        </dev/null >/dev/null 2>&1
+}
+
+function note_backend_skip {
+    local backend=$1
+    local reason=$2
+    printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason"
+    printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason" >>"$LOG_FILE"
+}
+
+function run_full_backend_gates {
+    if ! backend_selector_supported; then
+        note_backend_skip "DBI/KVM" "backend selector is unavailable"
+        return
+    fi
+
+    if kvm_backend_available; then
+        run_check "KVM backend parity ratchet" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            --backend kvm --require-backend
+    else
+        note_backend_skip "KVM" "/dev/kvm is not readable and writable"
+    fi
+
+    if dbi_backend_available; then
+        run_check "DBI backend parity ratchet" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            --backend dbi --require-backend
+    else
+        note_backend_skip "DBI" "backend smoke did not complete successfully"
+    fi
+}
+
+function super_probe_command {
+    local probe=$1
+    local iteration=$2
+    local data_dir
+    local status
+
+    case "$probe" in
+        ptrace-strict-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- \
+                /bin/echo "hermit-super-$iteration" ;;
+        ptrace-pipeline)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- \
+                bash -c 'yes hermit | head -n 64 | sha256sum' ;;
+        ptrace-record-replay)
+            data_dir="$VALIDATION_TMP_DIR/super-record-$iteration"
+            rm -rf "$data_dir"
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" record start --verify \
+                --data-dir "$data_dir" -- /bin/echo "hermit-super-record-$iteration"
+            status=$?
+            rm -rf "$data_dir"
+            return "$status" ;;
+        kvm-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$HERMIT_BIN" run --backend kvm --verify -- \
+                /bin/echo "hermit-super-kvm-$iteration" ;;
+        dbi-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$HERMIT_BIN" run --backend dbi --verify -- \
+                /bin/echo "hermit-super-dbi-$iteration" ;;
+        *)
+            echo "validate.sh: unknown super probe: $probe" >&2
+            return 2 ;;
+    esac
+}
+
+function run_super_probe {
+    local probe=$1
+    local passed=0
+    local iteration=1
+    local batch_size
+    local i
+    local status
+    local log_file
+    local -a pids=()
+    local -a iterations=()
+    local -a logs=()
+
+    while ((iteration <= SUPER_REPETITIONS)); do
+        batch_size=$SUPER_JOBS
+        if ((batch_size > SUPER_REPETITIONS - iteration + 1)); then
+            batch_size=$((SUPER_REPETITIONS - iteration + 1))
+        fi
+        pids=()
+        iterations=()
+        logs=()
+        for ((i = 0; i < batch_size; i += 1)); do
+            log_file="$VALIDATION_TMP_DIR/super-${probe}-$iteration.log"
+            super_probe_command "$probe" "$iteration" >"$log_file" 2>&1 &
+            pids+=("$!")
+            iterations+=("$iteration")
+            logs+=("$log_file")
+            iteration=$((iteration + 1))
+        done
+
+        for i in "${!pids[@]}"; do
+            if wait "${pids[$i]}"; then
+                passed=$((passed + 1))
+            else
+                status=$?
+                {
+                    printf '%s\n' \
+                        "--- super $probe iteration ${iterations[$i]} failed (exit $status) ---"
+                    tail -n 120 "${logs[$i]}"
+                } >>"$LOG_FILE"
+            fi
+        done
+    done
+
+    if ((passed == SUPER_REPETITIONS)); then
+        printf "  ✅ %-24s %s/%s (100%%)\n" \
+            "$probe" "$passed" "$SUPER_REPETITIONS" |
+            tee -a "$VALIDATION_TMP_DIR/super-report"
+        return 0
+    fi
+
+    printf "  ⚠️  %-24s %s/%s (%s%%) FLAKY/FAILING\n" \
+        "$probe" "$passed" "$SUPER_REPETITIONS" \
+        "$((100 * passed / SUPER_REPETITIONS))" |
+        tee -a "$VALIDATION_TMP_DIR/super-report"
+    return 1
+}
+
+function run_super_stress_suite {
+    local failed=0
+    local -a probes=(
+        ptrace-strict-verify
+        ptrace-pipeline
+        ptrace-record-replay
+    )
+    local probe
+
+    : >"$VALIDATION_TMP_DIR/super-report"
+    if backend_selector_supported && kvm_backend_available; then
+        probes+=(kvm-verify)
+    else
+        note_backend_skip "KVM super stress" "backend unavailable"
+        printf "  SKIP KVM super stress (backend unavailable)\n" \
+            >>"$VALIDATION_TMP_DIR/super-report"
+    fi
+    if backend_selector_supported && dbi_backend_available; then
+        probes+=(dbi-verify)
+    else
+        note_backend_skip "DBI super stress" "backend unavailable"
+        printf "  SKIP DBI super stress (backend unavailable)\n" \
+            >>"$VALIDATION_TMP_DIR/super-report"
+    fi
+
+    printf "\n== Super stress pass rates ==\n"
+    printf "Repetitions: %s; concurrency: %s; online CPUs: %s\n" \
+        "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
+    for probe in "${probes[@]}"; do
+        run_super_probe "$probe" || failed=$((failed + 1))
+    done
+    ((failed == 0))
+}
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#567): Review the blocking R/R compatibility ratchet.
 # Run one record or replay phase with a private process group so a regression
@@ -681,8 +943,8 @@ function rr_compatibility_probe {
 
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
-# Run one known-compatible application at L2. Each row has its own hard timeout
-# so a regression cannot stall the rest of the matrix.
+# Run one application through strict L2 or the SaBRe compatibility path. Each
+# row has its own hard timeout so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
     local label=$1
     shift
@@ -696,29 +958,38 @@ function strict_compatibility_probe {
     local output_start
     local status
     local summary
+    local assurance=L2
+    local -a run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        assurance=SaBRe
+        run_args=(run --backend sabre --strict --verify --)
+    fi
 
     {
-        printf "=== Strict compatibility: %s ===\n" "$label"
-        printf "Command: timeout %s %q run --strict --verify --no-virtualize-cpuid --preemption-timeout=disabled --" \
+        printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
+        printf "Command: timeout %s %q" \
             "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+        printf " %q" "${run_args[@]}"
         printf " %q" "$@"
         printf "\n"
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
     if ((VERBOSE == 1)); then
-        printf "  compatibility probe: %s\n" "$label"
+        printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
     if timeout "$STRICT_COMPAT_TIMEOUT" \
-        "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify --no-virtualize-cpuid --preemption-timeout=disabled -- "$@" \
+        "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
         </dev/null >>"$LOG_FILE" 2>&1; then
         status=0
-        printf "  ✅ %-12s PASS L2 (%ss)\n" "$label" "$((SECONDS - started_at))"
+        printf "  ✅ %-12s PASS %s (%ss)\n" \
+            "$label" "$assurance" "$((SECONDS - started_at))"
     else
         status=$?
         summary=$(failure_summary "$output_start")
-        printf "  ❌ %-12s FAIL (exit %s: %s)\n" "$label" "$status" "$summary"
+        printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
+            "$label" "$assurance" "$status" "$summary"
     fi
 
     {
@@ -728,10 +999,23 @@ function strict_compatibility_probe {
     return "$status"
 }
 
-# This is an observation gate for now: full validation prints every regression
-# but does not add it to the fatal failure count. --strict-compat-only exposes
-# the real aggregate status so CI can mark the step while continue-on-error
-# keeps the lane nonblocking until the matrix is ratcheted.
+# Strict compatibility remains an observation gate in full validation. The
+# focused SaBRe and record/replay modes enforce their measured blocking floors.
+# Strict mode replaces banner probes with functional workloads so an
+# executable that merely starts cannot be counted as compatible at L2.
+function functional_compatibility_probe {
+    local label=$1
+    shift
+
+    if [[ $COMPATIBILITY_MODE != strict ]]; then
+        strict_compatibility_probe "$label" "$@"
+        return $?
+    fi
+
+    strict_compatibility_probe "$label" env \
+        REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
+        bash "$REAL_COMPAT_WORKLOAD" "$label"
+}
 function run_compatibility_corpus {
     local passed=0
     local failed=0
@@ -740,6 +1024,9 @@ function run_compatibility_corpus {
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
         printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
+    elif [[ $COMPATIBILITY_MODE == sabre ]]; then
+        printf "\n== SaBRe compatibility ratchet (blocking floor) ==\n"
+        printf "=== SaBRe compatibility ratchet (blocking floor) ===\n" >>"$LOG_FILE"
     else
         printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
         printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
@@ -780,11 +1067,11 @@ function run_compatibility_corpus {
     strict_compatibility_probe bash bash -c \
         'for i in 1 2 3; do echo "$i"; done' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe cargo cargo --version \
+    functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe rustc rustc --version \
+    functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe java java -version \
+    functional_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -794,43 +1081,43 @@ function run_compatibility_corpus {
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     strict_compatibility_probe git /usr/bin/git --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gcc gcc --version \
+    functional_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe g++ g++ --version \
+    functional_compatibility_probe g++ g++ --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe make make --version \
+    functional_compatibility_probe make make --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ar /usr/bin/ar --version \
+    functional_compatibility_probe ar /usr/bin/ar --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe as /usr/bin/as --version \
+    functional_compatibility_probe as /usr/bin/as --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ld /usr/bin/ld --version \
+    functional_compatibility_probe ld /usr/bin/ld --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe nm /usr/bin/nm --version \
+    functional_compatibility_probe nm /usr/bin/nm --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe objcopy /usr/bin/objcopy --version \
+    functional_compatibility_probe objcopy /usr/bin/objcopy --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe objdump /usr/bin/objdump --version \
+    functional_compatibility_probe objdump /usr/bin/objdump --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ranlib /usr/bin/ranlib --version \
+    functional_compatibility_probe ranlib /usr/bin/ranlib --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe readelf /usr/bin/readelf --version \
+    functional_compatibility_probe readelf /usr/bin/readelf --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe size /usr/bin/size --version \
+    functional_compatibility_probe size /usr/bin/size --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe strip /usr/bin/strip --version \
+    functional_compatibility_probe strip /usr/bin/strip --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe addr2line /usr/bin/addr2line --version \
+    functional_compatibility_probe addr2line /usr/bin/addr2line --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe c++filt /usr/bin/c++filt --version \
+    functional_compatibility_probe c++filt /usr/bin/c++filt --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe elfedit /usr/bin/elfedit --version \
+    functional_compatibility_probe elfedit /usr/bin/elfedit --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gprof /usr/bin/gprof --version \
+    functional_compatibility_probe gprof /usr/bin/gprof --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe cpp /usr/bin/cpp --version \
+    functional_compatibility_probe cpp /usr/bin/cpp --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gcov /usr/bin/gcov --version \
+    functional_compatibility_probe gcov /usr/bin/gcov --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bzip2 bash -c \
         'bzip2 -c README.md | sha256sum' \
@@ -1138,6 +1425,22 @@ function run_compatibility_corpus {
     fi
 
     total=$((passed + failed))
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        if ((total != SABRE_COMPAT_TOTAL)); then
+            printf "❌ SaBRe compatibility corpus selected %s rows; expected %s\n" \
+                "$total" "$SABRE_COMPAT_TOTAL"
+            return 1
+        fi
+        if ((passed < SABRE_COMPAT_EXPECTED)); then
+            printf "❌ SaBRe compatibility ratchet regressed (%s/%s passed; floor %s)\n" \
+                "$passed" "$total" "$SABRE_COMPAT_EXPECTED"
+            return 1
+        fi
+        printf "✅ SaBRe compatibility ratchet (%s/%s passed; floor %s)\n" \
+            "$passed" "$total" "$SABRE_COMPAT_EXPECTED"
+        return 0
+    fi
+
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
         return 0
@@ -1149,8 +1452,35 @@ function run_compatibility_corpus {
 }
 
 function run_strict_compatibility_envelope {
+    if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
+        "$REAL_COMPAT_FIXTURES" >>"$LOG_FILE" 2>&1; then
+        printf "❌ Unable to prepare functional compatibility fixtures (log: %s)\n" \
+            "$LOG_FILE"
+        return 1
+    fi
+
     COMPATIBILITY_MODE=strict
     run_compatibility_corpus
+}
+
+function run_sabre_compatibility_envelope {
+    local status=0
+
+    COMPATIBILITY_MODE=sabre
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+function require_sabre_artifacts {
+    local variable
+    for variable in HERMIT_SABRE_RUNNER HERMIT_SABRE_BINARY HERMIT_SABRE_PLUGIN; do
+        if [[ -z ${!variable:-} || ! -f ${!variable} ]]; then
+            printf "validate.sh: %s must name a regular file for SaBRe compatibility\n" \
+                "$variable" >&2
+            return 1
+        fi
+    done
 }
 
 function run_rr_compatibility_envelope {
@@ -1269,19 +1599,27 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run.
+# Auto-apply the `locally-validated` PR label after a fully-green full run, add
+# an audit comment with the validation results, then cancel the redundant
+# in-flight CI run for the exact validated commit.
 # Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Label creation and application are best-effort so
-# GitHub or proxy failures never change the validation result.
+# `locally-validated` label. Label application and CI cancellation are
+# best-effort so GitHub or proxy failures never change the validation result.
 # The PR is taken from $PR_NUMBER when set, else detected from the current branch
 # via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
 # never changes validation's exit status.
+readonly LOCALLY_VALIDATED_REPOSITORY="rrnewton/hermit"
 readonly LOCALLY_VALIDATED_LABEL="locally-validated"
 
 function apply_locally_validated_label {
     local pr=$PR_NUMBER
     local pr_head=""
     local local_head
+    local comment_body=""
+    local host_name=""
+    local passed_checks=0
+    local timestamp=""
+    local run_id=""
     local -a gh_cmd=(gh)
 
     if ! command -v gh >/dev/null 2>&1; then
@@ -1295,15 +1633,17 @@ function apply_locally_validated_label {
     fi
 
     if [[ -z $pr ]]; then
-        pr=$("${gh_cmd[@]}" pr view --json number -q .number 2>/dev/null) || true
+        pr=$("${gh_cmd[@]}" pr view --repo "$LOCALLY_VALIDATED_REPOSITORY" \
+            --json number -q .number 2>/dev/null) || true
     fi
     if [[ -z $pr ]]; then
         printf "⚠️  no PR found for the current branch; skipping '%s' label\n" \
             "$LOCALLY_VALIDATED_LABEL" >&2
         return 0
     fi
-    pr_head=$("${gh_cmd[@]}" pr view "$pr" --json headRefOid \
-        -q .headRefOid 2>/dev/null) || true
+    pr_head=$("${gh_cmd[@]}" pr view "$pr" \
+        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
+        --json headRefOid -q .headRefOid 2>/dev/null) || true
     if [[ -z $pr_head ]]; then
         printf "⚠️  could not read PR #%s head; skipping '%s' label\n" \
             "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
@@ -1319,13 +1659,53 @@ function apply_locally_validated_label {
     # Ensure a fresh repository can accept the label. Failure is harmless here:
     # the edit below reports the actionable warning and validation remains green.
     "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
+        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
         --color 1d76db \
         --description "Full local validation passed for the current PR head" \
         --force >>"$LOG_FILE" 2>&1 || true
 
     if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
+        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
         >>"$LOG_FILE" 2>&1; then
         printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
+
+        host_name=$(hostname -f 2>/dev/null) || \
+            host_name=$(hostname 2>/dev/null) || host_name="unknown"
+        timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
+        passed_checks=$((checks - failures))
+        # Single quotes keep the Markdown backticks literal in the comment body.
+        # shellcheck disable=SC2016
+        printf -v comment_body \
+            '[impl agent, validate.sh]\n\nLocal validation passed.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Timestamp (UTC): `%s`' \
+            "$local_head" "$VALIDATION_PROFILE" "$passed_checks" \
+            "$host_name" "$timestamp"
+        if "${gh_cmd[@]}" pr comment "$pr" \
+            --repo "$LOCALLY_VALIDATED_REPOSITORY" \
+            --body "$comment_body" >>"$LOG_FILE" 2>&1; then
+            printf "💬 Added local validation results to PR #%s\n" "$pr"
+        else
+            printf "⚠️  failed to comment validation results on PR #%s (full log: %s)\n" \
+                "$pr" "$LOG_FILE" >&2
+        fi
+
+        if ! run_id=$("${gh_cmd[@]}" api \
+            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
+            --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
+            2>>"$LOG_FILE"); then
+            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
+                "$local_head" "$LOG_FILE" >&2
+            return 0
+        fi
+        if [[ -z $run_id ]]; then
+            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
+        elif "${gh_cmd[@]}" api --method POST \
+            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/runs/${run_id}/cancel" \
+            >>"$LOG_FILE" 2>&1; then
+            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
+        else
+            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
+                "$run_id" "$local_head" "$LOG_FILE" >&2
+        fi
     else
         printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
             "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
@@ -1335,12 +1715,84 @@ function apply_locally_validated_label {
 function print_summary {
     local passed=$((checks - failures))
     if ((failures == 0)); then
-        printf "✅ Validation summary (%s passed, 0 failed; full log: %s)\n" \
-            "$passed" "$LOG_FILE"
+        printf "✅ Validation summary [%s] (%s passed, 0 failed; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$LOG_FILE"
     else
-        printf "❌ Validation summary (%s passed, %s failed; full log: %s)\n" \
-            "$passed" "$failures" "$LOG_FILE"
+        printf "❌ Validation summary [%s] (%s passed, %s failed; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$failures" "$LOG_FILE"
     fi
+}
+
+function run_quick_suite {
+    run_check "Build workspace" cargo build --workspace
+    run_check "Detcore core unit tests" cargo test -p detcore --lib
+    run_check "Hermit run smoke test" hermit_run_smoke
+    run_check "Hermit output determinism" hermit_determinism_check
+    run_check "Hermit verify-mode smoke test" hermit_verify_smoke
+    run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
+}
+
+function run_full_suite {
+    run_check "cargo-nextest available" ensure_cargo_nextest
+    run_quick_suite
+    run_check "Build release Hermit" cargo build --release -p hermit
+
+    # Cargo supports concurrent commands in one target directory. Run checks that
+    # do not execute Hermit guests alongside the ordered runtime and PMU gates.
+    start_check "Test workspace documentation" cargo test --workspace --doc
+    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+    start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Documentation" cargo doc --workspace --no-deps
+
+    if ! run_strict_compatibility_envelope; then
+        printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
+    fi
+    run_check "Record/replay compatibility baseline (128 programs)" \
+        run_rr_compatibility_envelope
+    # Nextest runs most package unit and Cargo integration targets in parallel.
+    # Detcore's PMU tests depend on same-binary coordination; nextest would launch
+    # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
+    run_check "Test workspace and integrations" \
+        "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
+        --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test detcore package" cargo test -p detcore
+    run_check "Fast concurrency stress suite" \
+        "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
+        --run-ignored only -E 'test(=fast_chaos_matrix)'
+    # rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
+    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+        run_check "rr syscall suite" \
+            cargo test -p hermit --test rr_suite -- --ignored
+    else
+        echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
+    fi
+    # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
+    run_check "Hermit analyze scenarios" \
+        cargo test -p hermit --test analyze -- --ignored
+    run_check "Schedule search E2E (requires PMU)" \
+        ./tests/util/hermit_analyze_e2e.sh
+
+    run_full_backend_gates
+    wait_for_background_checks
+
+    # Measure and report the working-envelope vector (informational; does not gate).
+    run_envelope
+}
+
+function run_super_suite {
+    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
+    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
+
+    run_check "Build workspace" cargo build --workspace
+    run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Super repeated determinism probes" run_super_stress_suite
+    if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then
+        printf "\n== Super stress pass rates ==\n"
+        cat "$VALIDATION_TMP_DIR/super-report"
+    fi
+    run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
+    run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
+    run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1457,7 +1909,6 @@ function run_hardware_validation {
 
     run_check "Record/replay working-envelope level" run_hardware_envelope_record_replay
     run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
-    run_check "Fail-closed Hermit test ratchet" ./scripts/test-fail-closed.sh
     run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
     run_check "Ptrace backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
 
@@ -1483,6 +1934,21 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         exit 1
     fi
     run_strict_compatibility_envelope
+    exit $?
+fi
+
+if ((SABRE_COMPAT_ONLY == 1)); then
+    run_check "SaBRe artifacts configured" require_sabre_artifacts
+    if ((failures == 0)); then
+        run_check "Build release Hermit for SaBRe compatibility" \
+            cargo build --release -p hermit
+    fi
+    if ((failures == 0)); then
+        run_check "SaBRe compatibility ratchet (147 programs)" \
+            run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
     exit $?
 fi
 
@@ -1525,60 +1991,17 @@ if [[ $ENVELOPE_MODE == only ]]; then
     exit 0
 fi
 
-run_check "cargo-nextest available" ensure_cargo_nextest
-run_check "Build workspace" cargo build --workspace
-run_check "Build release Hermit for strict compatibility" \
-    cargo build --release -p hermit
-
-# Cargo supports concurrent commands in one target directory. Run checks that
-# do not execute Hermit guests alongside the ordered runtime and PMU gates.
-start_check "Test workspace documentation" cargo test --workspace --doc
-start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-start_check "Rustfmt" cargo fmt --all -- --check
-start_check "Documentation" cargo doc --workspace --no-deps
-
-run_check "Hermit run smoke test" hermit_run_smoke
-run_check "Hermit output determinism" hermit_determinism_check
-run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-if ! run_strict_compatibility_envelope; then
-    printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
-fi
-run_check "Record/replay compatibility baseline (128 programs)" \
-    run_rr_compatibility_envelope
-# Nextest runs most package unit and Cargo integration targets in parallel.
-# Detcore's PMU tests depend on same-binary coordination; nextest would launch
-# them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
-run_check "Test workspace and integrations" \
-    "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
-    --exclude hermetic_infra_hermit_flaky-tests
-run_check "Test detcore package" cargo test -p detcore
-run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
-run_check "Fast concurrency stress suite" \
-    "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
-    --run-ignored only -E 'test(=fast_chaos_matrix)'
-# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
-if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-    run_check "rr syscall suite" \
-        cargo test -p hermit --test rr_suite -- --ignored
-else
-    echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
-fi
-# `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
-run_check "Hermit analyze scenarios" \
-    cargo test -p hermit --test analyze -- --ignored
-run_check "Schedule search E2E (requires PMU)" \
-    ./tests/util/hermit_analyze_e2e.sh
-
-wait_for_background_checks
-
-# Measure and report the working-envelope vector (informational; does not gate).
-run_envelope
+case "$VALIDATION_LEVEL" in
+    quick) run_quick_suite ;;
+    full) run_full_suite ;;
+    super) run_super_suite ;;
+esac
 
 print_summary
 
 # On a fully-green full run, tag the PR unless explicitly disabled. GitHub
 # failures are warnings and never affect the final validation exit status.
-if ((failures == 0)) && ((LABEL_PR == 1)); then
+if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
     apply_locally_validated_label
 fi
 

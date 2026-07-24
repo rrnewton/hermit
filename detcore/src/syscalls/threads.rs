@@ -620,12 +620,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SchedYield,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads {
-            if self.cfg.chaos && self.cfg.preemption_timeout.is_none() {
+            // In chaos mode, thread-interleaving diversity (and thus fairness)
+            // comes entirely from re-randomizing thread priorities at
+            // preemption-timer expirations. When timer preemption is disabled
+            // (`--max-timeslice disabled`), priorities are fixed at thread
+            // creation and never change. A plain yield only re-enqueues the
+            // caller at the back of its own (fixed) priority level, so a thread
+            // that spins on sched_yield while holding the numerically-lowest
+            // priority is always reselected first and starves every thread it is
+            // waiting on (GH #81). Treat sched_yield as an explicit chaos
+            // reprioritization point: draw a fresh random priority for the
+            // caller so it cedes the CPU and other runnable threads can make
+            // progress. This mirrors what `end_timeslice` does at a timer-driven
+            // preemption point, and is recorded for chaos replay.
+            if self.cfg.chaos && self.cfg.max_timeslice.is_none() {
                 let change_time = guest.thread_state().thread_logical_time.as_nanos();
                 let request = Self::random_priority_changepoint_request(guest, change_time);
                 resource_request(guest, request).await;
             } else if !self.cfg.chaos && self.cfg.replay_preemptions_from.is_some() {
-                if self.cfg.preemption_timeout.is_some() {
+                if self.cfg.max_timeslice.is_some() {
                     guest
                         .thread_state_mut()
                         .reset_timeslice_for_explicit_yield();
@@ -647,6 +660,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// wait4 system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
+    // TODO-HUMAN-REVIEW(PR-587): Confirm wait4 rusage canonicalization boundaries.
     pub async fn handle_wait4<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -657,19 +671,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
-        let opts1 = call.options();
-        if opts1.contains(WaitPidFlag::WNOHANG) {
+        let value = if call.options().contains(WaitPidFlag::WNOHANG) {
             resource_request(guest, rsrc.clone()).await;
             info!(
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
             );
-            Ok(guest.inject_with_retry(call).await?)
+            guest.inject_with_retry(call).await?
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
-            retry_nonblocking_syscall(guest, call, rsrc, None).await
+            retry_nonblocking_syscall(guest, call, rsrc, None).await?
+        };
+        if value > 0
+            && let Some(rusage) = call.rusage()
+        {
+            // Host CPU and scheduling counters are not deterministic.
+            let usage: libc::rusage = unsafe { std::mem::zeroed() };
+            guest.memory().write_value(rusage, &usage)?;
         }
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -18,6 +18,7 @@ mod event;
 mod event_stream;
 mod fd;
 mod id;
+pub mod instruction_map;
 mod interp;
 mod metadata;
 mod record;
@@ -303,18 +304,21 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
+    /// Use the SaBRe static binary rewriting backend.
+    Sabre,
     /// Use the KVM backend.
     Kvm,
 }
 
 impl Backend {
-    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+    const ALL: [Self; 4] = [Self::Ptrace, Self::Dbi, Self::Sabre, Self::Kvm];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
             Self::Dbi => "dbi",
+            Self::Sabre => "sabre",
             Self::Kvm => "kvm",
         }
     }
@@ -353,9 +357,40 @@ impl Backend {
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
+            // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
+            Self::Sabre => sabre_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }
+}
+
+fn sabre_runtime_unavailable_reason() -> Option<String> {
+    for (variable, description) in [
+        ("HERMIT_SABRE_RUNNER", "Reverie SaBRe runner"),
+        ("HERMIT_SABRE_BINARY", "SaBRe executable"),
+        ("HERMIT_SABRE_PLUGIN", "Reverie SaBRe plugin"),
+    ] {
+        let Some(value) = std::env::var_os(variable) else {
+            return Some(format!("set {variable} to the {description} path"));
+        };
+        let path = Path::new(&value);
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Some(format!(
+                    "{variable}={} is not a regular file",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "cannot access {variable}={}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
@@ -840,6 +875,7 @@ mod tests {
     use super::dynamorio_sdk_available;
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
+    use super::sabre_runtime_unavailable_reason;
 
     #[test]
     fn default_and_available_backends_reflect_host_probes() {
@@ -852,6 +888,10 @@ mod tests {
         assert_eq!(
             available.contains(&Backend::Dbi),
             dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
+        );
+        assert_eq!(
+            available.contains(&Backend::Sabre),
+            sabre_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Kvm),
@@ -953,7 +993,7 @@ mod tests {
 
         // Minimal deterministic Detcore config with RCB preemption disabled.
         let mut config =
-            super::DetConfig::parse_from(["hermit-kvm-test", "--preemption-timeout=disabled"]);
+            super::DetConfig::parse_from(["hermit-kvm-test", "--max-timeslice=disabled"]);
         config.validate();
 
         let runtime = tokio::runtime::Builder::new_current_thread()

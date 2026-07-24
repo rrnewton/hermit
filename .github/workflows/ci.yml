@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 180
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - uses: actions/setup-go@v5
       with:
         go-version: stable
@@ -76,7 +76,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         submodules: recursive
     - name: Dependencies
@@ -130,7 +130,7 @@ jobs:
       DETCORE_TEST_RUST_LOG: "off"
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         submodules: recursive
     - uses: actions/setup-go@v5

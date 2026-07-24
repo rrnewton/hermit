@@ -92,7 +92,7 @@ fn sqlite_veryquick_is_deterministic_under_strict_hermit() {
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "SQLite 3.51.2 veryquick: reproduced lock4 stall with 13 identical pre-stall failures."
+            "SQLite 3.51.2 veryquick: reproduced lock4 stall with 8 identical pre-stall failures."
         ),
         "SQLite veryquick harness did not report deterministic success:\n{}",
         String::from_utf8_lossy(&output.stdout),

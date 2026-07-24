@@ -13,12 +13,19 @@
 //! The DBI path launches the real guest through DynamoRIO and links the native
 //! client against Hermit's `detcore-dbi` runtime. That runtime instantiates the
 //! production [`detcore::Detcore`] Tool over [`reverie_dbi::DbiGuest`].
+//!
+//! The SaBRe path ([`hermit::Backend::Sabre`]) performs static rewriting with a
+//! Reverie plugin. Generic runs use quiet compatibility checking, while
+//! `hermit --backend sabre strace` retains verbose syscall diagnostics.
 
+use std::ffi::OsString;
+use std::fs;
 use std::io::IsTerminal as _;
 use std::io::Read;
 use std::io::Seek as _;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::process::Output;
@@ -257,4 +264,235 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::Exited(output.status.code().unwrap_or(1))
+}
+
+fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
+    let value = std::env::var_os(variable).ok_or_else(|| {
+        Error::msg(format!(
+            "the sabre backend needs {variable}=<path-to-{description}>"
+        ))
+    })?;
+    validate_sabre_artifact(Path::new(&value), variable, executable)
+}
+
+fn validate_sabre_artifact(
+    requested_path: &Path,
+    variable: &str,
+    executable: bool,
+) -> Result<OsString, Error> {
+    let path = fs::canonicalize(requested_path).map_err(|error| {
+        Error::msg(format!(
+            "the sabre backend cannot access {variable}={}: {error}",
+            requested_path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&path).map_err(|error| {
+        Error::msg(format!(
+            "the sabre backend cannot inspect {variable}={}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::msg(format!(
+            "the sabre backend needs {variable}={} to be a regular file",
+            path.display()
+        )));
+    }
+    if executable && metadata.permissions().mode() & 0o111 == 0 {
+        return Err(Error::msg(format!(
+            "the sabre backend needs {variable}={} to be executable",
+            path.display()
+        )));
+    }
+    Ok(path.into_os_string())
+}
+
+const SABRE_QUIET_ENV: &str = "REVERIE_SABRE_STRACE_QUIET";
+
+fn sabre_command(
+    runner: &OsString,
+    sabre: &OsString,
+    plugin: &OsString,
+    program: &Path,
+    args: &[String],
+    quiet: bool,
+    log: Option<LevelFilter>,
+) -> StdCommand {
+    let mut command = StdCommand::new(runner);
+    command
+        .arg("--sabre")
+        .arg(sabre)
+        .arg("--plugin")
+        .arg(plugin)
+        .arg("--")
+        .arg(program)
+        .args(args);
+    if quiet {
+        command.env(SABRE_QUIET_ENV, "1");
+    }
+    if let Some(level) = log {
+        command.env("HERMIT_LOG", level.to_string());
+    }
+    command
+}
+
+fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
+    Ok((
+        sabre_artifact("HERMIT_SABRE_RUNNER", "reverie-sabre-strace", true)?,
+        sabre_artifact("HERMIT_SABRE_BINARY", "sabre", true)?,
+        sabre_artifact(
+            "HERMIT_SABRE_PLUGIN",
+            "libreverie_sabre_strace_plugin.so",
+            false,
+        )?,
+    ))
+}
+
+/// Runs program through the shared Reverie strace tool over SaBRe.
+///
+/// The SaBRe host and plugin live in the coordinated Reverie checkout, so
+/// Hermit uses explicit artifact paths rather than taking an unreleased Cargo
+/// dependency:
+///
+/// * HERMIT_SABRE_RUNNER: reverie-sabre-strace executable.
+/// * HERMIT_SABRE_BINARY: pinned SaBRe executable.
+/// * HERMIT_SABRE_PLUGIN: libreverie_sabre_strace_plugin.so.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
+pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, Error> {
+    let (runner, sabre, plugin) = sabre_artifacts()?;
+
+    eprintln!("hermit: [sabre backend] tracing {program:?} with the shared Reverie tool");
+
+    let status = sabre_command(&runner, &sabre, &plugin, program, args, false, None)
+        .status()
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to launch the SaBRe runner {}: {error}",
+                Path::new(&runner).display()
+            ))
+        })?;
+
+    Ok(status.into())
+}
+
+fn sabre_output(mut command: StdCommand, input: &[u8], runner: &Path) -> Result<Output, Error> {
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        Error::msg(format!(
+            "failed to launch the SaBRe runner {}: {error}",
+            runner.display()
+        ))
+    })?;
+    child
+        .stdin
+        .take()
+        .expect("piped SaBRe stdin")
+        .write_all(input)?;
+    child.wait_with_output().map_err(Error::from)
+}
+
+/// Runs a compatibility probe through the shared Reverie syscall tool.
+///
+/// SaBRe does not provide Detcore determinization. Verification executes the
+/// same guest twice and compares its exit status, stdout, and stderr. This is
+/// therefore a compatibility check, not Hermit's L2 determinism guarantee.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
+pub fn run_sabre(
+    program: &Path,
+    args: &[String],
+    verify: bool,
+    log: Option<LevelFilter>,
+) -> Result<ExitStatus, Error> {
+    let (runner, sabre, plugin) = sabre_artifacts()?;
+    let runner_path = Path::new(&runner);
+
+    eprintln!(
+        "hermit: [sabre backend] shared Reverie StraceTool active for {program:?}; \
+         Detcore determinization is unavailable"
+    );
+
+    if !verify {
+        let status = sabre_command(&runner, &sabre, &plugin, program, args, true, log)
+            .status()
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to launch the SaBRe runner {}: {error}",
+                    runner_path.display()
+                ))
+            })?;
+        return Ok(status.into());
+    }
+
+    let mut input = Vec::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::stdin().read_to_end(&mut input)?;
+    }
+
+    eprintln!(":: SaBRe compatibility run 1...");
+    let first = sabre_output(
+        sabre_command(&runner, &sabre, &plugin, program, args, true, log),
+        &input,
+        runner_path,
+    )?;
+    if !first.status.success() {
+        write_output(&first)?;
+        return Ok(output_status(&first));
+    }
+
+    eprintln!(":: SaBRe compatibility run 2...");
+    let second = sabre_output(
+        sabre_command(&runner, &sabre, &plugin, program, args, true, log),
+        &input,
+        runner_path,
+    )?;
+    if !second.status.success() {
+        write_output(&second)?;
+        return Ok(output_status(&second));
+    }
+
+    if first.status != second.status {
+        return Err(Error::msg(format!(
+            "SaBRe compatibility verification failed: exit statuses differed ({} != {})",
+            first.status, second.status
+        )));
+    }
+    if first.stdout != second.stdout {
+        return Err(Error::msg(
+            "SaBRe compatibility verification failed: guest stdout differed between runs",
+        ));
+    }
+    if first.stderr != second.stderr {
+        return Err(Error::msg(
+            "SaBRe compatibility verification failed: guest stderr differed between runs",
+        ));
+    }
+
+    write_output(&first)?;
+    eprintln!(
+        ":: SaBRe compatibility verified (shared Reverie StraceTool; no Detcore determinization)."
+    );
+    Ok(ExitStatus::Exited(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sabre_artifact_returns_the_validated_absolute_path() {
+        let file = tempfile::NamedTempFile::new_in(".").unwrap();
+        let relative_path = file.path().file_name().unwrap();
+
+        let resolved = validate_sabre_artifact(Path::new(relative_path), "test-artifact", false)
+            .map(std::path::PathBuf::from)
+            .unwrap();
+
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
+    }
 }
