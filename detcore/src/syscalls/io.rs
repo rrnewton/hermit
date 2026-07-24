@@ -17,6 +17,7 @@ use nix::fcntl::OFlag;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use tracing::debug;
@@ -31,6 +32,7 @@ use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::nanos_duration_to_absolute_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
@@ -113,6 +115,140 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .record_or_replay_blocking(guest, Syscall::Poll(call))
                 .await?)
         }
+    }
+
+    /// select syscall (MAYHANG).
+    ///
+    /// Determinized exactly like `poll`: instead of a real-time kernel block we
+    /// convert to a zero-timeout probe and retry under the deterministic
+    /// scheduler (`retry_nonblocking_syscall_with_timeout`), or hand truly
+    /// external / record-replay cases to `record_or_replay_blocking`
+    /// (BlockingExternalIO). `timeout` is a `*timeval`: NULL means block forever
+    /// (no logical deadline), `{0,0}` (or nonpositive) means return immediately,
+    /// and a positive value becomes an absolute logical deadline.
+    pub async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+    ) -> Result<i64, Error> {
+        let maybe_tv: Option<libc::timeval> = match call.timeout() {
+            None => None,
+            Some(p) => Some(guest.memory().read_value(p)?),
+        };
+        let is_zero = matches!(maybe_tv, Some(tv) if tv.tv_sec == 0 && tv.tv_usec == 0);
+
+        if self.cfg.recordreplay_modes && is_zero {
+            // Cannot block, but still yield a scheduler turn so a polling thread
+            // cannot monopolize the guest between preemptions (parity w/ poll).
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            Ok(self
+                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .await?)
+        } else {
+            self.handle_internal_select(guest, call, maybe_tv).await
+        }
+    }
+
+    /// Handle a guest-internal `select` call that can be fully determinized.
+    pub async fn handle_internal_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+        maybe_tv: Option<libc::timeval>,
+    ) -> Result<i64, Error> {
+        // Immediate / already-nonblocking or invalid timeout: a single probe is
+        // sufficient (the kernel returns 0 for {0,0} or EINVAL for a malformed
+        // timeval), so there is nothing to poll-retry.
+        let probe_once = match maybe_tv {
+            Some(tv) => {
+                (tv.tv_sec == 0 && tv.tv_usec == 0)
+                    || tv.tv_sec < 0
+                    || tv.tv_usec < 0
+                    || tv.tv_usec >= 1_000_000
+            }
+            None => false,
+        };
+        if probe_once {
+            return Ok(guest.inject(call).await?);
+        }
+        let maybe_timeout_ns = match maybe_tv {
+            None => None, // NULL timeout: block (poll-retry) until a descriptor is ready.
+            Some(tv) => {
+                let nanos = (tv.tv_sec as u128) * 1_000_000_000 + (tv.tv_usec as u128) * 1_000;
+                nanos_duration_to_absolute_timeout(guest, nanos).await
+            }
+        };
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("select");
+        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+    }
+
+    /// pselect6 syscall (MAYHANG).
+    ///
+    /// Same determinization as `select`. NOTE: pselect6 atomically installs
+    /// `sigmask` for the duration of the wait; the nonblockize-and-retry model
+    /// applies the mask per probe rather than atomically across the whole logical
+    /// wait, so a signal that an atomic pselect6 would have blocked could in
+    /// principle be observed between probes. Detcore already serializes and
+    /// determinizes signal delivery, and the retry loop honors `ResumeStatus::
+    /// Signaled`, so this is a documented approximation rather than a
+    /// nondeterminism source. reverie models the timeout as a `*timeval`.
+    pub async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        let maybe_tv: Option<libc::timeval> = match call.timeout() {
+            None => None,
+            Some(p) => Some(guest.memory().read_value(p)?),
+        };
+        let is_zero = matches!(maybe_tv, Some(tv) if tv.tv_sec == 0 && tv.tv_usec == 0);
+
+        if self.cfg.recordreplay_modes && is_zero {
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            Ok(self
+                .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                .await?)
+        } else {
+            self.handle_internal_pselect6(guest, call, maybe_tv).await
+        }
+    }
+
+    /// Handle a guest-internal `pselect6` call that can be fully determinized.
+    pub async fn handle_internal_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        maybe_tv: Option<libc::timeval>,
+    ) -> Result<i64, Error> {
+        let probe_once = match maybe_tv {
+            Some(tv) => {
+                (tv.tv_sec == 0 && tv.tv_usec == 0)
+                    || tv.tv_sec < 0
+                    || tv.tv_usec < 0
+                    || tv.tv_usec >= 1_000_000
+            }
+            None => false,
+        };
+        if probe_once {
+            return Ok(guest.inject(call).await?);
+        }
+        let maybe_timeout_ns = match maybe_tv {
+            None => None,
+            Some(tv) => {
+                let nanos = (tv.tv_sec as u128) * 1_000_000_000 + (tv.tv_usec as u128) * 1_000;
+                nanos_duration_to_absolute_timeout(guest, nanos).await
+            }
+        };
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("pselect6");
+        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
     }
 
     /// epoll_create1 syscall
