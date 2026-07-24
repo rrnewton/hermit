@@ -51,6 +51,21 @@ impl Replayer {
 
         // This is safe since we only record non-NULL pointers.
         let addr = unsafe { AddrMut::<u8>::from_raw_unchecked(event.addr) };
+        if event.file_snapshot {
+            assert!(
+                crate::recorded_files::is_snapshot_fd(guest.pid().as_raw(), syscall.fd(),),
+                "recorded mmap expected a file snapshot at fd {}",
+                syscall.fd(),
+            );
+            let ptr = guest
+                .inject_with_retry(syscall.with_addr(Some(addr.cast::<libc::c_void>().into())))
+                .await?;
+            assert_eq!(
+                ptr as usize, event.addr,
+                "failed to map recorded file snapshot at desired address"
+            );
+            return Ok(ptr);
+        }
 
         let len = syscall.len();
         let prot = syscall.prot();

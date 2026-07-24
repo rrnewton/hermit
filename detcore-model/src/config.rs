@@ -30,8 +30,9 @@ const fn default_true() -> bool {
 
 /// Nondeterminism sources that record mode captures instead of determinizing.
 ///
-/// Network and filesystem input needed to reconstruct execution are always
-/// captured and are therefore not represented as optional internal sources.
+/// Network input and filesystem syscall results needed to reconstruct execution
+/// are always captured. The filesystem flag selects portable regular-file
+/// snapshots instead of inline read and mapping bytes.
 /// An empty policy is the record-mode default for Detcore-managed sources.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecordFeatures {
@@ -45,10 +46,9 @@ pub struct RecordFeatures {
     pub cpuid: bool,
     /// Capture host RNG syscall results instead of using Detcore's seeded PRNG.
     pub rng: bool,
-    /// Explicitly select filesystem capture at the policy boundary.
-    ///
-    /// Record/replay currently captures filesystem results in either mode because
-    /// replay needs them to reconstruct file-backed mappings and loader state.
+    /// Copy read-only regular-file inputs into the trace and replay from those
+    /// snapshots. Without this flag, file reads and mappings remain inline
+    /// syscall events.
     pub fs: bool,
     /// Capture signal delivery ordering in the recorded schedule.
     ///

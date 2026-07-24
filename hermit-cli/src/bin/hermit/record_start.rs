@@ -176,7 +176,7 @@ pub struct StartOpts {
     #[clap(long)]
     record_rng: bool,
 
-    /// Explicitly select filesystem capture at the record boundary.
+    /// Copy read-only regular-file inputs into the portable recording.
     #[clap(long)]
     record_fs: bool,
 

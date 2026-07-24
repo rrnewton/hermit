@@ -239,14 +239,20 @@ records external network and filesystem input needed to reconstruct execution.
 Select internal sources that should instead be captured in the recording
 with `--record-time`, `--record-pids`, `--record-sched`, `--record-cpuid`,
 `--record-rng`, `--record-fs`, and `--record-signals`. `--record-all` selects all
-seven. `--record-fs` makes the filesystem side of the boundary explicit;
-filesystem results are currently captured in either mode because replay needs
-them for file-backed mappings and loader bootstrap. The selected boundary is
-stored in recording metadata and restored for replay:
+seven.
+
+`--record-fs` copies each read-only regular file opened by the guest into the
+trace as `files/SHA256`. An inspectable `files.json` manifest records its
+original path, modification time, size, and hash. Replay verifies each hash and
+opens the private snapshot, so the original file may be changed or removed.
+Pipes, sockets, directories, and writable files retain syscall-level event
+capture. The selected boundary is stored in recording metadata and restored for
+replay:
 
 ```bash
 hermit record --record-time -- /bin/date
 hermit record start --record-all -- /path/to/program
+hermit record start --record-fs -- /bin/cat /path/to/input
 ```
 
 `--record-signals` records the ordering of signal deliveries that Hermit observes.

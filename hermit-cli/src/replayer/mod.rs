@@ -32,7 +32,6 @@ use reverie::syscalls::Close;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
 use reverie::syscalls::FcntlCmd;
-use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -139,14 +138,22 @@ impl Tool for Replayer {
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
             Syscall::Readv(syscall) => {
-                self.handle_readv_family(guest, syscall.iov().map(|a| a.as_raw()), syscall.len())
-                    .await
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.len(),
+                    syscall.fd(),
+                    syscall.into(),
+                )
+                .await
             }
             Syscall::Preadv(syscall) => {
                 self.handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len(),
+                    syscall.fd(),
+                    syscall.into(),
                 )
                 .await
             }
@@ -155,6 +162,8 @@ impl Tool for Replayer {
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len() as usize,
+                    syscall.fd(),
+                    syscall.into(),
                 )
                 .await
             }
@@ -166,6 +175,12 @@ impl Tool for Replayer {
             Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Lseek(call)
+                if self.record_features.fs
+                    && crate::recorded_files::is_snapshot_fd(guest.pid().as_raw(), call.fd()) =>
+            {
+                self.handle_snapshot_io(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -178,14 +193,8 @@ impl Tool for Replayer {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
-                    .await
-            }
-            Syscall::Openat(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
-                    .await
-            }
+            Syscall::Open(call) => self.handle_open(guest, syscall, call.flags()).await,
+            Syscall::Openat(call) => self.handle_open(guest, syscall, call.flags()).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
@@ -291,18 +300,6 @@ impl Replayer {
                 "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
             );
         }
-    }
-
-    async fn handle_virtual_fd_create<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        cloexec: bool,
-    ) -> Result<i64, Errno> {
-        let recorded = next_event!(guest, Return);
-        if let Ok(fd) = recorded {
-            self.reserve_replay_fd(guest, fd as i32, cloexec).await;
-        }
-        recorded
     }
 
     async fn handle_replayed_fd_operation<G: Guest<Self>>(

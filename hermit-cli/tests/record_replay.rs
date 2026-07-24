@@ -312,6 +312,99 @@ fn record_direct_cli_records_and_replays_echo() {
 }
 
 #[test]
+fn record_fs_copies_files_and_replays_without_the_source() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let fixture_dir = tempfile::tempdir().expect("failed to create record-fs fixture");
+    let input = fixture_dir.path().join("portable-input.txt");
+    let payload = b"HERMIT_RECORD_FS_PAYLOAD_7c734ef4f6db4591a0e54fd2e497807a\n";
+    fs::write(&input, payload).expect("failed to write record-fs input");
+    let canonical_input = input.canonicalize().expect("failed to canonicalize input");
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--record-fs", "--data-dir"])
+        .arg(data_dir.path())
+        .args(["--", "/bin/cat"])
+        .arg(&input);
+    let record_output = command_output(record, "record-fs recording");
+    assert_eq!(record_output.stdout, payload);
+
+    let id = fs::read_to_string(data_dir.path().join("last"))
+        .expect("recording did not update last")
+        .trim()
+        .to_owned();
+    let trace = data_dir.path().join(id);
+    let manifest: serde_json::Value = serde_json::from_reader(
+        fs::File::open(trace.join("files.json")).expect("recording omitted files.json"),
+    )
+    .expect("files.json is invalid");
+    let entries = manifest.as_array().expect("files.json must be an array");
+    let input_entry = entries
+        .iter()
+        .find(|entry| entry["path"].as_str() == canonical_input.to_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "files.json did not record input {}: {manifest:#}",
+                canonical_input.display()
+            )
+        });
+    assert_eq!(input_entry["size"].as_u64(), Some(payload.len() as u64));
+    assert!(input_entry["mtime_secs"].as_i64().is_some());
+    assert!(input_entry["mtime_nanos"].as_i64().is_some());
+    let hash = input_entry["sha256"]
+        .as_str()
+        .expect("recorded input has no SHA-256");
+    assert_eq!(hash.len(), 64);
+    let snapshot = trace.join("files").join(hash);
+    assert_eq!(
+        fs::read(&snapshot).expect("recorded snapshot is missing"),
+        payload
+    );
+
+    for entry in fs::read_dir(trace.join("thread")).expect("thread event directory is missing") {
+        let entry = entry.expect("failed to read thread event entry");
+        if entry.path().extension().is_none() {
+            let event_bytes = fs::read(entry.path()).expect("failed to read event stream");
+            assert!(
+                !event_bytes
+                    .windows(payload.len())
+                    .any(|window| window == payload),
+                "regular-file payload was stored inline in a thread event stream"
+            );
+        }
+    }
+
+    fs::remove_file(&input).expect("failed to remove original input");
+    let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let replay_output = command_output(replay, "record-fs replay");
+    assert_eq!(replay_output.stdout, payload);
+
+    let mut corrupt = payload.to_vec();
+    corrupt[0] ^= 1;
+    fs::write(&snapshot, corrupt).expect("failed to corrupt snapshot");
+    let mut corrupt_replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    corrupt_replay
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let output = corrupt_replay
+        .output()
+        .expect("failed to start corrupt-snapshot replay");
+    assert!(
+        !output.status.success(),
+        "corrupt snapshot replay succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("SHA-256"),
+        "missing snapshot-integrity diagnostic:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn record_all_captures_boundary_sources() {
     let _guard = hermit_record_lock();
     let build_dir = tempfile::tempdir().expect("failed to create boundary workload directory");

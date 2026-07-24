@@ -17,6 +17,7 @@ use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
@@ -28,6 +29,7 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Recorder;
+use crate::event::FileOpenEvent;
 use crate::event::FtruncateEvent;
 use crate::event::ReadEvent;
 use crate::event::StatEvent;
@@ -188,6 +190,12 @@ impl Recorder {
         fd: libc::c_int,
         syscall: Syscall,
     ) -> Result<i64, Errno> {
+        if self.is_captured_file(guest.pid(), fd) {
+            let result = guest.inject(syscall).await;
+            self.record_event(guest, result.map(SyscallEvent::Return));
+            return result;
+        }
+
         let result = guest.inject(syscall).await;
 
         self.record_event(
@@ -213,6 +221,11 @@ impl Recorder {
         guest: &mut G,
         syscall: Read,
     ) -> Result<i64, Errno> {
+        if self.is_captured_file(guest.pid(), syscall.fd()) {
+            let result = guest.inject(syscall).await;
+            self.record_event(guest, result.map(SyscallEvent::Return));
+            return result;
+        }
         let result = guest.inject(syscall).await;
 
         self.record_event(
@@ -240,6 +253,11 @@ impl Recorder {
         guest: &mut G,
         syscall: Pread64,
     ) -> Result<i64, Errno> {
+        if self.is_captured_file(guest.pid(), syscall.fd()) {
+            let result = guest.inject(syscall).await;
+            self.record_event(guest, result.map(SyscallEvent::Return));
+            return result;
+        }
         let result = guest.inject(syscall).await;
 
         self.record_event(
@@ -252,6 +270,49 @@ impl Recorder {
             }),
         );
 
+        result
+    }
+
+    pub(super) async fn handle_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        flags: OFlag,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let event = result.map(|fd| {
+            let snapshot = if self.record_features.fs
+                && flags.bits() & libc::O_ACCMODE == libc::O_RDONLY
+                && flags.bits() & libc::O_PATH == 0
+            {
+                let proc_path = format!("/proc/{}/fd/{fd}", guest.pid().as_raw());
+                let metadata = std::fs::metadata(&proc_path).ok();
+                if metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.file_type().is_file())
+                {
+                    let recorded = crate::recorded_files::capture_fd(
+                        &self.data,
+                        guest.pid().as_raw(),
+                        fd as libc::c_int,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("failed to capture read-only file {proc_path}: {error}")
+                    });
+                    self.remember_captured_file(metadata.as_ref().unwrap());
+                    Some(recorded.sha256)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            SyscallEvent::Open(FileOpenEvent {
+                fd: fd as libc::c_int,
+                snapshot,
+            })
+        });
+        self.record_event(guest, event);
         result
     }
 

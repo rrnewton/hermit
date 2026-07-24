@@ -20,6 +20,8 @@ use reverie::syscalls::Getdents64;
 use reverie::syscalls::Getuid;
 use reverie::syscalls::Ioctl;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::OFlag;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::Readlink;
@@ -33,6 +35,7 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Replayer;
+use crate::consts::REPLAY_FILES_ROOT;
 use crate::event::deterministic_ioctl_error;
 
 #[repr(C)]
@@ -282,7 +285,83 @@ fn read_write_bytes<M: MemoryAccess>(
     }
 }
 
+fn snapshot_open_flags(mut flags: OFlag) -> OFlag {
+    flags.remove(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_TRUNC);
+    flags
+}
+
 impl Replayer {
+    pub(super) async fn handle_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        flags: OFlag,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Open)?;
+        let Some(snapshot) = event.snapshot else {
+            self.reserve_replay_fd(guest, event.fd, flags.contains(OFlag::O_CLOEXEC))
+                .await;
+            return Ok(i64::from(event.fd));
+        };
+
+        assert!(
+            snapshot.len() == 64
+                && snapshot
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid recorded file SHA-256 name {snapshot:?}"
+        );
+        let replay_flags = snapshot_open_flags(flags);
+        let path = format!("{REPLAY_FILES_ROOT}/{snapshot}");
+        let path_bytes = path.as_bytes();
+        assert!(
+            path_bytes.len() < 128,
+            "recorded file snapshot path is too long: {path}"
+        );
+        let mut buffer = [0u8; 128];
+        buffer[..path_bytes.len()].copy_from_slice(path_bytes);
+
+        let mut stack = guest.stack().await;
+        let path_addr = stack.push(buffer);
+        let guard = stack.commit()?;
+        let path_ptr = PathPtr::from_ptr(path_addr.as_raw() as *const libc::c_char);
+        let rewritten = match syscall {
+            Syscall::Open(call) => Syscall::Open(call.with_path(path_ptr).with_flags(replay_flags)),
+            Syscall::Openat(call) => Syscall::Openat(
+                call.with_dirfd(libc::AT_FDCWD)
+                    .with_path(path_ptr)
+                    .with_flags(replay_flags),
+            ),
+            _ => unreachable!("snapshot open handler received {syscall:?}"),
+        };
+        let actual = guest.inject_with_retry(rewritten).await;
+        drop(guard);
+        assert_eq!(
+            actual,
+            Ok(i64::from(event.fd)),
+            "failed to open recorded file snapshot {snapshot} at descriptor {}",
+            event.fd,
+        );
+        actual
+    }
+
+    pub(super) async fn handle_snapshot_io<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            let actual = guest.inject_with_retry(syscall).await;
+            assert_eq!(
+                actual,
+                Ok(expected),
+                "recorded file operation diverged for {syscall:?}"
+            );
+        }
+        recorded
+    }
+
     /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
     /// scattering the recorded flattened output bytes across the guest's current
     /// `iovec` buffers, without touching any live descriptor.
@@ -291,7 +370,15 @@ impl Replayer {
         guest: &mut G,
         iov_addr: Option<usize>,
         iovcnt: usize,
+        fd: libc::c_int,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
+        if self.record_features.fs
+            && crate::recorded_files::is_snapshot_fd(guest.pid().as_raw(), fd)
+        {
+            return self.handle_snapshot_io(guest, syscall).await;
+        }
+
         let event = next_event!(guest, ReadvV2)?;
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
@@ -306,6 +393,12 @@ impl Replayer {
         guest: &mut G,
         syscall: Read,
     ) -> Result<i64, Errno> {
+        if self.record_features.fs
+            && crate::recorded_files::is_snapshot_fd(guest.pid().as_raw(), syscall.fd())
+        {
+            return self.handle_snapshot_io(guest, syscall.into()).await;
+        }
+
         let event = next_event!(guest, ReadV2)?;
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
@@ -325,6 +418,12 @@ impl Replayer {
         guest: &mut G,
         syscall: Pread64,
     ) -> Result<i64, Errno> {
+        if self.record_features.fs
+            && crate::recorded_files::is_snapshot_fd(guest.pid().as_raw(), syscall.fd())
+        {
+            return self.handle_snapshot_io(guest, syscall.into()).await;
+        }
+
         let buf = next_event!(guest, Bytes)?;
 
         assert!(buf.len() <= syscall.len());
@@ -732,5 +831,15 @@ mod tests {
         }
         // SAFETY: the write end remains open until after the worker exits.
         unsafe { libc::close(pipe[1]) };
+    }
+
+    #[test]
+    fn snapshot_open_flags_remove_creation_side_effects() {
+        let flags =
+            OFlag::O_RDONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_TRUNC | OFlag::O_CLOEXEC;
+        let replay = snapshot_open_flags(flags);
+
+        assert!(!replay.intersects(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_TRUNC));
+        assert!(replay.contains(OFlag::O_CLOEXEC));
     }
 }

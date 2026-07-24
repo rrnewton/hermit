@@ -12,6 +12,7 @@ mod network;
 mod random;
 mod time;
 
+use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -39,7 +40,17 @@ use crate::event::SyscallEvent;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventWriter;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
 struct OutputIdentity {
     device: u64,
     inode: u64,
@@ -119,6 +130,9 @@ pub struct Recorder {
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
     #[serde(skip)]
     stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
+    /// Regular-file inodes copied into this trace by `--record-fs`.
+    #[serde(skip)]
+    captured_files: Mutex<BTreeSet<OutputIdentity>>,
     /// Sources selected for capture instead of Detcore substitution.
     record_features: detcore::RecordFeatures,
 }
@@ -135,6 +149,7 @@ impl Tool for Recorder {
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            captured_files: Mutex::new(BTreeSet::new()),
             record_features: cfg.record_features,
         }
     }
@@ -318,8 +333,8 @@ impl Tool for Recorder {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Open(call) => self.handle_open(guest, syscall, call.flags()).await,
+            Syscall::Openat(call) => self.handle_open(guest, syscall, call.flags()).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
@@ -516,6 +531,15 @@ impl Recorder {
         if let Err(err) = self.append_exec_path(&path) {
             tracing::warn!("Failed to record exec path {:?}: {}", path, err);
         }
+        if self.record_features.fs
+            && let Err(error) = crate::recorded_files::capture_path(&self.data, &path)
+        {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "failed to capture executable path"
+            );
+        }
     }
 
     /// Appends a single executable path to the recording's `exec_paths` file.
@@ -551,6 +575,38 @@ impl Recorder {
             .push_event(Event { event })
             // TODO: Log errors instead of panicking.
             .unwrap();
+    }
+
+    pub(super) fn remember_captured_file(&self, metadata: &std::fs::Metadata) {
+        self.captured_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(OutputIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+    }
+
+    pub(super) fn is_captured_file(&self, pid: Pid, fd: libc::c_int) -> bool {
+        if !self.record_features.fs || !crate::recorded_files::fd_is_read_only(pid.as_raw(), fd) {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
+            return false;
+        };
+        let identity = OutputIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if self
+            .captured_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&identity)
+        {
+            return true;
+        }
+        crate::recorded_files::manifest_contains_fd(&self.data, pid.as_raw(), fd).unwrap_or(false)
     }
 
     /// Called for syscalls to explicitly let through. This should only be called

@@ -9,6 +9,7 @@
 use std::fs;
 use std::io;
 use std::os::unix;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -93,6 +94,11 @@ impl TempChroot {
     /// Like `copy`, but copies `path` to `{chroot}/{path}`.
     pub fn copy_same(&self, path: &Path) -> io::Result<()> {
         self.copy(path, path)
+    }
+
+    /// Applies Unix permission bits to a path inside the chroot.
+    pub fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
+        fs::set_permissions(self.relpath(path), fs::Permissions::from_mode(mode))
     }
 
     /// Creates a directory in the chroot.

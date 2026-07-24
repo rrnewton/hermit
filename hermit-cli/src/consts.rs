@@ -17,3 +17,12 @@ pub const EXE_NAME: &str = "exe";
 /// replayer uses this to populate its chroot so that child processes can
 /// re-exec the same binaries.
 pub const EXEC_PATHS_NAME: &str = "exec_paths";
+
+/// Directory containing content-addressed regular-file snapshots.
+pub const FILES_DIR_NAME: &str = "files";
+
+/// Inspectable metadata for files captured by `--record-fs`.
+pub const FILES_MANIFEST_NAME: &str = "files.json";
+
+/// Absolute path where snapshots are exposed inside the replay chroot.
+pub const REPLAY_FILES_ROOT: &str = "/.hermit-recorded-files";

@@ -21,6 +21,7 @@ mod id;
 mod interp;
 mod metadata;
 mod record;
+mod recorded_files;
 mod recorder;
 mod replay;
 mod replayer;

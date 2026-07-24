@@ -158,6 +158,12 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     // would otherwise get `ENOENT` from the injected `execve` and desynchronize.
     populate_recorded_exec_paths(dir, &chroot, &metadata.exe)?;
 
+    // File snapshots are copied last so portable trace contents take
+    // precedence over any changed host files used by legacy bootstrap helpers.
+    if metadata.record_features.fs {
+        crate::recorded_files::populate_chroot(dir, &chroot)?;
+    }
+
     // Create the working directory.
     chroot.create_dir_all(&metadata.current_dir)?;
 

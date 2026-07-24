@@ -29,6 +29,7 @@ impl Recorder {
             return guest.inject(syscall).await;
         }
 
+        let file_snapshot = self.is_captured_file(guest.pid(), syscall.fd());
         let len = syscall.len();
 
         // Do the injection. We need to record the pointer the mapping is at and
@@ -41,27 +42,36 @@ impl Recorder {
             guest,
             match result {
                 Ok(addr) => {
-                    let addr = Addr::from_raw(addr as usize).ok_or(Errno::EINVAL)?;
+                    if file_snapshot {
+                        Ok(SyscallEvent::Mmap(MmapEvent {
+                            addr: addr as usize,
+                            buf: Vec::new(),
+                            file_snapshot: true,
+                        }))
+                    } else {
+                        let addr = Addr::from_raw(addr as usize).ok_or(Errno::EINVAL)?;
 
-                    // NOTE: We can't use `read_exact` here to slurp up the
-                    // memory map bytes. The memory size may be larger than the
-                    // physical file size for dynamic libraries. The following
-                    // `read` will read up to the physical file length, not the
-                    // length specified on the memory map. The left over bytes
-                    // that extend past the end of the physical file should be
-                    // set to zeros when we replay this `mmap`.
-                    let mut buf = vec![0u8; len];
-                    let physical_length = guest.memory().read(addr, &mut buf)?;
+                        // NOTE: We can't use `read_exact` here to slurp up the
+                        // memory map bytes. The memory size may be larger than the
+                        // physical file size for dynamic libraries. The following
+                        // `read` will read up to the physical file length, not the
+                        // length specified on the memory map. The left over bytes
+                        // that extend past the end of the physical file should be
+                        // set to zeros when we replay this `mmap`.
+                        let mut buf = vec![0u8; len];
+                        let physical_length = guest.memory().read(addr, &mut buf)?;
 
-                    // Don't store more bytes than we need to. When we create
-                    // the anonymous map later, the extra bytes will be
-                    // initialized to zero automatically.
-                    buf.truncate(physical_length);
+                        // Don't store more bytes than we need to. When we create
+                        // the anonymous map later, the extra bytes will be
+                        // initialized to zero automatically.
+                        buf.truncate(physical_length);
 
-                    Ok(SyscallEvent::Mmap(MmapEvent {
-                        addr: addr.as_raw(),
-                        buf,
-                    }))
+                        Ok(SyscallEvent::Mmap(MmapEvent {
+                            addr: addr.as_raw(),
+                            buf,
+                            file_snapshot: false,
+                        }))
+                    }
                 }
                 Err(errno) => Err(errno),
             },

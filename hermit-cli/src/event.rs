@@ -69,6 +69,7 @@ pub enum SyscallEvent {
     /// they are scattered back across the guest's `iovec` buffers. The length of
     /// the vector is exactly the return value of the syscall.
     Readv(Vec<u8>),
+    Open(FileOpenEvent),
     Write(i64),
     Mmap(MmapEvent),
     Recvmsg(RecvmsgEvent),
@@ -105,6 +106,16 @@ pub struct ReadEvent {
     pub consumed_sigpipe_count: u64,
 }
 
+/// Result of opening a descriptor while filesystem capture is enabled.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileOpenEvent {
+    /// Descriptor returned by the recording kernel.
+    pub fd: libc::c_int,
+    /// SHA-256 snapshot name for a captured read-only regular file. Other file
+    /// types retain the existing virtual-descriptor replay behavior.
+    pub snapshot: Option<String>,
+}
+
 /// Recorded result and side effects of a write-family syscall.
 // TODO-HUMAN-REVIEW(#557): Audit the recorded output and SIGPIPE API.
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,9 +147,11 @@ pub struct FtruncateEvent {
 pub struct MmapEvent {
     /// The address where the memory shall be mapped.
     pub addr: usize,
-    /// The contents of the memory map. Note that this may be less than the
-    /// requested `length`.
+    /// The inline contents of the memory map. Note that this may be less than
+    /// the requested `length`. Empty when `file_snapshot` is true.
     pub buf: Vec<u8>,
+    /// The mapping is backed by a captured file instead of inline bytes.
+    pub file_snapshot: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

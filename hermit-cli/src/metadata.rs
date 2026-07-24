@@ -45,7 +45,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x104);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x105);
 
 const SCHEDULE_NAME: &str = "schedule.json";
 
@@ -243,7 +243,7 @@ mod tests {
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x103)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x106)));
     }
 
     #[test]
@@ -304,6 +304,11 @@ mod tests {
             replay.replay_schedule_from,
             Some(PathBuf::from("replay-data/schedule.json"))
         );
+    }
+
+    #[test]
+    fn record_version_rejects_pre_file_snapshot_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
     }
 
     #[test]
