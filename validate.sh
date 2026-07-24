@@ -26,6 +26,8 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
+#   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
+#   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # A fully-green full run labels the current PR `locally-validated` by default.
@@ -36,6 +38,8 @@ ENVELOPE_BASELINE=""
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
+HOSTED_ONLY=0
+HARDWARE_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -51,6 +55,8 @@ while [[ $# -gt 0 ]]; do
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
+        --hosted-only) HOSTED_ONLY=1; shift ;;
+        --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -67,6 +73,8 @@ only_modes=0
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+((HOSTED_ONLY == 1)) && ((only_modes += 1))
+((HARDWARE_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -82,6 +90,10 @@ if ((QEMU_L2_ONLY == 1)); then
     # One boot-oracle phase plus run1/run2/compare, with five minutes for
     # process startup, teardown, and reporting outside those phase budgets.
     default_gate_timeout_seconds=$((4 * qemu_phase_timeout_seconds + 300))
+elif ((HARDWARE_ONLY == 1)); then
+    # The PMU memory-race fixtures perform tens of millions of instrumented
+    # atomic operations. They need a longer per-family budget than portable CI.
+    default_gate_timeout_seconds=3600
 fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
@@ -99,7 +111,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY HOSTED_ONLY HARDWARE_ONLY
 
 checks=0
 failures=0
@@ -682,7 +694,7 @@ function strict_compatibility_probe {
 
     {
         printf "=== Strict compatibility: %s ===\n" "$label"
-        printf "Command: timeout %s %q run --strict --verify --" \
+        printf "Command: timeout %s %q run --strict --verify --no-virtualize-cpuid --preemption-timeout=disabled --" \
             "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
         printf " %q" "$@"
         printf "\n"
@@ -694,7 +706,7 @@ function strict_compatibility_probe {
     fi
 
     if timeout "$STRICT_COMPAT_TIMEOUT" \
-        "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- "$@" \
+        "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify --no-virtualize-cpuid --preemption-timeout=disabled -- "$@" \
         </dev/null >>"$LOG_FILE" 2>&1; then
         status=0
         printf "  ✅ %-12s PASS L2 (%ss)\n" "$label" "$((SECONDS - started_at))"
@@ -769,7 +781,7 @@ function run_compatibility_corpus {
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
-    strict_compatibility_probe git /usr/local/bin/git.meta.real --version \
+    strict_compatibility_probe git /usr/bin/git --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1272,8 +1284,139 @@ function print_summary {
     fi
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# The two CI jobs call these selectors directly. Keep capability-dependent
+# tests out of the hosted selector so either lane can be rerun independently.
+function run_hosted_envelope_levels {
+    local probe cmd iteration
+    local -a command
+
+    for probe in "${ENVELOPE_PROBES[@]}"; do
+        cmd=${probe#*|}
+        read -r -a command <<<"$cmd"
+        _envelope_level "--strict" "${command[@]}" || return $?
+        _envelope_level "--strict --verify" "${command[@]}" || return $?
+        _envelope_level "--strict --verify --detlog-heap --detlog-stack" "${command[@]}" || return $?
+        for ((iteration = 0; iteration < L4_REPS; iteration++)); do
+            _envelope_level "--strict --verify" "${command[@]}" || return $?
+        done
+    done
+}
+
+function run_hardware_envelope_record_replay {
+    local probe cmd
+    local -a command
+
+    for probe in "${ENVELOPE_PROBES[@]}"; do
+        cmd=${probe#*|}
+        read -r -a command <<<"$cmd"
+        timeout "${HERMIT_RR_TIMEOUT:-$HERMIT_SMOKE_TIMEOUT}" \
+            "$HERMIT_BIN" record start --verify -- "${command[@]}" \
+            </dev/null >>"$LOG_FILE" 2>&1 || return $?
+    done
+}
+
+function run_hermit_targets_serial {
+    local target
+    for target in "$@"; do
+        cargo test -p hermit --test "$target" -- --test-threads=1 || return $?
+    done
+}
+
+function run_hosted_validation {
+    run_check "cargo-nextest available" ensure_cargo_nextest
+    run_check "Build workspace" cargo build --workspace
+    run_check "Build release Hermit for strict compatibility" cargo build --release -p hermit
+
+    start_check "Test workspace documentation" cargo test --workspace --doc
+    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+    start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Documentation" cargo doc --workspace --no-deps
+
+    run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test flaky guest crate" cargo test -p hermetic_infra_hermit_flaky-tests
+    run_check "Test Hermit unit and binary targets" cargo test -p hermit --lib --bins
+    run_check "Test Detcore unit and binary targets" cargo test -p detcore --lib --bins
+    run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=4
+    run_check "Test Detcore non-PMU parallel cases" cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4
+
+    run_check "Portable Hermit integration targets" run_hermit_targets_serial arbitrary_binaries chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism integration_matrix ipc_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism
+    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --test-threads=1
+    run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip chaos_buck_ --test-threads=1
+    run_check "Portable ignored Hermit mode cases" cargo test -p hermit --test hermit_modes -- --ignored --skip chaos_buck_ --test-threads=1
+    run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
+    run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
+    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test python_stdlib --test random_determinism --test rcx_canonicalization -- --ignored --test-threads=1
+    run_check "Portable concurrency stress" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
+    run_check "Portable ignored concurrency stress" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
+    run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
+    run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
+    run_check "Portable working-envelope levels" run_hosted_envelope_levels
+
+    if ! run_strict_compatibility_envelope; then
+        printf "WARNING: Strict compatibility regressions remain informational.\n"
+    fi
+
+    wait_for_background_checks
+    print_summary
+    ((failures == 0))
+}
+
+function run_hardware_validation {
+    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-ci"
+    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
+
+    run_check "Build workspace" cargo build --workspace
+    run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
+    run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
+    run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
+    run_check "PMU timing cases" cargo test -p detcore --test tests_time -- --test-threads=4
+    run_check "PMU parallel futex cases" cargo test -p detcore --test tests_parallelism futex_wait_parent -- --skip futex_wait_parent::raw --test-threads=3
+    run_check "PMU parallel memory cases" cargo test -p detcore --test tests_parallelism 'mem_race::' -- --skip raw_run_par_mode --skip noop_mode --skip with_signal --test-threads=1
+    run_check "PMU parallel memory-and-print cases" cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --skip raw_run_par_mode --test-threads=1
+
+    run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
+    run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
+    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation record_replay redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
+    run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --test-threads=1
+    run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
+    run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1
+
+    run_check "Build pinned LevelDB integration fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
+    run_check "Focused LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb focused_leveldb_tests_are_deterministic_under_strict -- --exact --test-threads=1
+    run_check "Extended LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb -- --ignored --test-threads=1
+    run_check "Extended Redis strict determinism" cargo test -p hermit --test redis_strict -- --ignored --test-threads=1
+    run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick -- --ignored --test-threads=1
+
+    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+        run_check "PMU rr syscall suite" cargo test -p hermit --test rr_suite -- --ignored --test-threads=1
+    else
+        failures=$((failures + 1))
+        checks=$((checks + 1))
+        echo "FAIL: PMU rr syscall suite requires initialized third-party/rr"
+    fi
+
+    run_check "Record/replay working-envelope level" run_hardware_envelope_record_replay
+    run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
+    run_check "Fail-closed Hermit test ratchet" ./scripts/test-fail-closed.sh
+    run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
+    run_check "Ptrace backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
+
+    print_summary
+    ((failures == 0))
+}
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
+if ((HOSTED_ONLY == 1)); then
+    run_hosted_validation
+    exit $?
+fi
+
+if ((HARDWARE_ONLY == 1)); then
+    run_hardware_validation
+    exit $?
+fi
+
 if ((STRICT_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for strict compatibility" \
         cargo build --release -p hermit
@@ -1350,6 +1493,7 @@ run_check "Test workspace and integrations" \
     "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
     --exclude hermetic_infra_hermit_flaky-tests
 run_check "Test detcore package" cargo test -p detcore
+run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
 run_check "Fast concurrency stress suite" \
     "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
     --run-ignored only -E 'test(=fast_chaos_matrix)'

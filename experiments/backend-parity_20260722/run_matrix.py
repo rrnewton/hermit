@@ -106,7 +106,7 @@ class Fixtures:
             ),
             "random_sources": (
                 REPOSITORY / "tests/c/random_sources.c",
-                ("-pthread",),
+                ("-pthread", "-D_GNU_SOURCE"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
         }
@@ -149,18 +149,7 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
 
 
 def backend_block(backend: str) -> str | None:
-    if backend == "dbi":
-        missing = [
-            name
-            for name in ("DYNAMORIO_HOME", "HERMIT_DRRUN", "HERMIT_DBI_CLIENT")
-            if not os.environ.get(name)
-        ]
-        if missing:
-            return "missing " + ", ".join(missing)
-        for name in ("HERMIT_DRRUN", "HERMIT_DBI_CLIENT"):
-            if not Path(os.environ[name]).is_file():
-                return f"{name} does not name a file: {os.environ[name]}"
-    elif backend == "kvm":
+    if backend == "kvm":
         kvm = Path("/dev/kvm")
         if not kvm.exists() or not os.access(kvm, os.R_OK | os.W_OK):
             return "/dev/kvm is not readable and writable"

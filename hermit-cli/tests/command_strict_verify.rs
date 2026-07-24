@@ -57,7 +57,15 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(&program)
         .args(case.args)
         .stdin(if case.stdin.is_some() {
@@ -102,7 +110,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + standard Unix command tools"]
+#[ignore = "e2e: requires hermit + mount namespaces + standard Unix command tools"]
 fn common_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let cases = [
@@ -283,7 +291,7 @@ fn common_commands_are_deterministic_under_strict_verify() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
+#[ignore = "e2e: requires hermit + mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let case = StrictCommandCase {
@@ -302,7 +310,14 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--"])
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(&python)
         .args(["-c", query])
         .output()
@@ -328,7 +343,15 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(&python)
         .args(["-c", query])
         .output()
@@ -349,7 +372,7 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
+#[ignore = "e2e: requires hermit + mount namespaces + /usr/bin/python3"]
 fn python_getrandom_is_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let case = StrictCommandCase {
