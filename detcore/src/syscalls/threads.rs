@@ -809,6 +809,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#546)
     /// Accept valid affinity masks without changing the host scheduler.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
@@ -835,6 +836,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#546)
     /// Report that we are on cpu 0, irrespective of what physical CPU we are on.
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
