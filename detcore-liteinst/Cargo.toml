@@ -9,4 +9,4 @@ repository = "https://github.com/facebookexperimental/hermit"
 crate-type = ["cdylib"]
 
 [dependencies]
-reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "3ab452514a226b8d75e98534d0bdaae28f9200c2", default-features = false }
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "190626bc1fef01a3c849c8123e9926ea9b83c77c", default-features = false }
