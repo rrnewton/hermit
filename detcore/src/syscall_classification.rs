@@ -154,10 +154,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::gettid
         | Sysno::getuid
         | Sysno::lseek
-        | Sysno::madvise
         | Sysno::mprotect
         | Sysno::readlink
-        | Sysno::readlinkat
         | Sysno::set_robust_list
         | Sysno::set_tid_address
         | Sysno::sigaltstack => SyscallClassification::PassThrough,
@@ -269,6 +267,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
+        | Sysno::madvise
         | Sysno::mbind
         | Sysno::memfd_secret
         | Sysno::migrate_pages
@@ -330,6 +329,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl
         | Sysno::quotactl_fd
         | Sysno::readahead
+        | Sysno::readlinkat
         | Sysno::readv
         | Sysno::reboot
         | Sysno::recvmmsg
@@ -443,7 +443,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [105, 17, 251]);
+        assert_eq!(counts, [105, 15, 253]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -469,8 +469,10 @@ mod tests {
             Sysno::add_key,
             Sysno::arch_prctl,
             Sysno::keyctl,
+            Sysno::madvise,
             Sysno::prctl,
             Sysno::prlimit64,
+            Sysno::readlinkat,
             Sysno::request_key,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);

@@ -1372,10 +1372,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
                 | Syscall::Lseek(_)
-                | Syscall::Madvise(_)
                 | Syscall::Mprotect(_)
                 | Syscall::Readlink(_)
-                | Syscall::Readlinkat(_)
                 | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
