@@ -716,6 +716,7 @@ fn run_kvm_reports_hostname() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#544): Confirm ptrace is the right KVM credential oracle.
 #[test]
 fn run_kvm_matches_ptrace_supplementary_groups() {
     if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/id").exists() {
