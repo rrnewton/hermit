@@ -34,6 +34,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
+#   ./validate.sh --backend dbi               # run one backend's parity ratchet
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # A fully-green full run labels the current PR `locally-validated` by default.
@@ -47,6 +48,7 @@ STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
+BACKEND_ONLY=""
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -73,6 +75,13 @@ while [[ $# -gt 0 ]]; do
         # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
+        --backend)
+            BACKEND_ONLY=${2:-}
+            case "$BACKEND_ONLY" in
+                ptrace|dbi|kvm) ;;
+                *) echo "validate.sh: --backend must be ptrace, dbi, or kvm" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -90,6 +99,7 @@ only_modes=0
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+[[ -n $BACKEND_ONLY ]] && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -104,6 +114,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+[[ -n $BACKEND_ONLY ]] && VALIDATION_PROFILE="backend-$BACKEND_ONLY"
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -132,7 +143,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY BACKEND_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -262,7 +273,7 @@ declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
     --no-virtualize-cpuid
-    --preemption-timeout=disabled
+    --max-timeslice=disabled
 )
 
 # --- Working-envelope measurement -------------------------------------------
@@ -1724,6 +1735,22 @@ function run_super_suite {
         cat "$VALIDATION_TMP_DIR/super-report"
     fi
 }
+
+if [[ -n $BACKEND_ONLY ]]; then
+    run_check "Build release Hermit for $BACKEND_ONLY backend parity" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        run_check "$BACKEND_ONLY backend strict parity ratchet" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            --backend "$BACKEND_ONLY" \
+            --hermit "$STRICT_COMPAT_HERMIT_BIN" \
+            --strict-verify \
+            --require-backend
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
 
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
