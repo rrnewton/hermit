@@ -1247,6 +1247,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.passthrough(guest, call).await
                 }
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#TBD)
+            // The pinned Reverie revision exposes process_madvise only as a raw call.
+            SyscallClassification::Determinized if call.number() == Sysno::process_madvise => {
+                match call {
+                    Syscall::Other(_, args) => Self::handle_process_madvise(args.arg0, args.arg4),
+                    _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
+                }
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1340,7 +1349,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                     }
                 }
+                Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
+                Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
+                Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
+                Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
                 Syscall::Uname(s) => self.handle_uname(guest, s).await,
                 Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
@@ -1366,6 +1380,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
                 Syscall::Connect(s) => self.handle_connect(guest, s).await,
                 Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                Syscall::Setsockopt(s) => self.handle_setsockopt(guest, s).await,
+                Syscall::Listen(s) => self.handle_listen(guest, s).await,
+                Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
+                Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
+                Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
@@ -1430,6 +1449,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+                Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
+                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
 
                 Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
                 Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
@@ -1443,6 +1465,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
                 Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+                Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
+                Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
 
                 // POSIX per-process timers. Arming is tracked against the virtual
                 // clock so these verify deterministically under --strict; timer
@@ -1492,6 +1516,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Brk(_)
                 | Syscall::Capget(_)
                 | Syscall::Capset(_)
+                | Syscall::Chown(_)
                 | Syscall::Chdir(_)
                 | Syscall::Chmod(_)
                 // TODO-HUMAN-REVIEW(#683): Verify metadata/writeback passthrough dispatch.
@@ -1547,6 +1572,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Getgid(_)
                 | Syscall::Getgroups(_)
                 | Syscall::Getpid(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#TBD)
+                | Syscall::Getpgid(_)
+                | Syscall::Getpgrp(_)
+                | Syscall::Getppid(_)
+                | Syscall::Getsid(_)
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
                 | Syscall::Getxattr(_)
@@ -1573,12 +1604,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Readlink(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Readahead(_)
+                | Syscall::Readlinkat(_)
                 | Syscall::Removexattr(_)
                 | Syscall::Renameat2(_)
                 | Syscall::Rmdir(_)
                 | Syscall::RtSigreturn(_)
                 | Syscall::Setxattr(_)
                 | Syscall::SetRobustList(_)
+                | Syscall::Setpgid(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
