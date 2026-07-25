@@ -78,12 +78,9 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
+    # TODO-HUMAN-REVIEW(#657)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -148,12 +145,9 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
+    # TODO-HUMAN-REVIEW(#657)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"
