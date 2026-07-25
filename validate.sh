@@ -17,13 +17,17 @@ readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
 # --- Argument parsing -------------------------------------------------------
-# Usage: ./validate.sh [quick|full|super] [options]
+# Usage: ./validate.sh [quick|hosted-only|full|super] [options]
 # Default (no level): run the full validation suite, which also prints the
-# working-envelope vector at the end.
-#   quick  Core ptrace run/verify/record smoke tests; no alternate backends.
-#   full   Everything in quick plus the complete suite and DBI/KVM gates.
-#   super  Repeat stress probes (20x by default) under moderate oversubscription
-#          and report a pass rate for every probe.
+# working-envelope vector at the end. VALIDATE_LEVEL may select the same level.
+#   quick        Core ptrace run/verify/record smoke tests; no alternate backends.
+#   hosted-only  Portable build, test, lint, format, and documentation gates
+#                matching GitHub-hosted CI; no PMU or namespace requirements.
+#   full         Everything in quick plus the complete suite and DBI/KVM gates.
+#   super        Repeat stress probes (20x by default) under moderate
+#                oversubscription and report a pass rate for every probe.
+#   --quick      Alias for the quick level.
+#   --hosted     Alias for the hosted-only level.
 #
 # The envelope path is factored out so CI
 # can call the *identical* measurement code and produce matching numbers:
@@ -33,6 +37,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
+#   ./validate.sh --e9patch-compat-only       # measure the e9patch L2 app matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
 #   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
@@ -43,13 +48,32 @@ cd "$ROOT_DIR" || exit 1
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
-VALIDATION_LEVEL="full"       # quick | full | super
+VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | hosted-only | full | super
 VALIDATION_LEVEL_EXPLICIT=0
+if [[ -n ${VALIDATE_LEVEL:-} ]]; then
+    case "$VALIDATION_LEVEL" in
+        quick|hosted-only|full|super) ;;
+        *)
+            echo "validate.sh: invalid VALIDATE_LEVEL: $VALIDATION_LEVEL" >&2
+            exit 2 ;;
+    esac
+    VALIDATION_LEVEL_EXPLICIT=1
+fi
+
+function select_validation_level {
+    local level=$1
+    if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
+        echo "validate.sh: choose only one validation level" >&2
+        exit 2
+    fi
+    VALIDATION_LEVEL=$level
+    VALIDATION_LEVEL_EXPLICIT=1
+}
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
+E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
-HOSTED_ONLY=0
 HARDWARE_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -58,13 +82,14 @@ VERBOSE=0
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        quick|full|super)
-            if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
-                echo "validate.sh: choose only one validation level" >&2
-                exit 2
-            fi
-            VALIDATION_LEVEL=$1
-            VALIDATION_LEVEL_EXPLICIT=1
+        quick|hosted-only|full|super)
+            select_validation_level "$1"
+            shift ;;
+        --quick)
+            select_validation_level quick
+            shift ;;
+        --hosted|--hosted-only)
+            select_validation_level hosted-only
             shift ;;
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
         --envelope-compare)
@@ -76,8 +101,9 @@ while [[ $# -gt 0 ]]; do
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
+        # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
+        --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
-        --hosted-only) HOSTED_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -95,8 +121,8 @@ only_modes=0
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
-((HOSTED_ONLY == 1)) && ((only_modes += 1))
 ((HARDWARE_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -111,9 +137,23 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
+((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
-((HOSTED_ONLY == 1)) && VALIDATION_PROFILE="hosted-only"
 ((HARDWARE_ONLY == 1)) && VALIDATION_PROFILE="hardware-only"
+
+case "$VALIDATION_PROFILE" in
+    quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
+    hosted-only) VALIDATION_ESTIMATE="about 8 minutes" ;;
+    full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
+    super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
+    strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
+    sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
+    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
+    envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
+esac
+readonly VALIDATION_ESTIMATE
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -146,8 +186,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY
-readonly HOSTED_ONLY HARDWARE_ONLY VALIDATION_LEVEL VALIDATION_PROFILE
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY E9PATCH_COMPAT_ONLY QEMU_L2_ONLY
+readonly HARDWARE_ONLY VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
 if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
@@ -195,6 +235,7 @@ readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
     "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
 printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
+printf "Estimated time: %s\n" "$VALIDATION_ESTIMATE"
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -232,11 +273,17 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
-# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=140
-readonly SABRE_COMPAT_TOTAL=147
+readonly SABRE_COMPAT_EXPECTED=151
+readonly SABRE_COMPAT_TOTAL=151
+readonly E9PATCH_COMPAT_TOTAL=151
 COMPATIBILITY_MODE=strict
+E9PATCH_COMPAT_REWRITTEN=0
+E9PATCH_COMPAT_ZERO_SITE=0
+E9PATCH_COMPAT_CANDIDATE_ONLY=0
+E9PATCH_COMPAT_NON_ELF=0
+E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
 # strict corpus below; this set only selects the rows known to pass R/R.
@@ -272,6 +319,9 @@ RR_COMPAT_PASSED=0
 RR_COMPAT_FAILED=0
 RR_COMPAT_TOTAL=0
 RR_COMPAT_SKIPPED=0
+RR_COMPAT_FAIL_FAST_SKIPPED=0
+RR_COMPAT_CANARY_FAILED=0
+RR_COMPAT_CANARY_LABEL=""
 declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
@@ -869,6 +919,10 @@ function rr_compatibility_probe {
         RR_COMPAT_SKIPPED=$((RR_COMPAT_SKIPPED + 1))
         return 0
     fi
+    if ((RR_COMPAT_CANARY_FAILED == 1)); then
+        RR_COMPAT_FAIL_FAST_SKIPPED=$((RR_COMPAT_FAIL_FAST_SKIPPED + 1))
+        return 0
+    fi
 
     local case_dir="$VALIDATION_TMP_DIR/rr-$label"
     local data_dir="$case_dir/recording"
@@ -918,6 +972,11 @@ function rr_compatibility_probe {
     fi
 
     RR_COMPAT_FAILED=$((RR_COMPAT_FAILED + 1))
+    if ((RR_COMPAT_TOTAL == 1)); then
+        RR_COMPAT_CANARY_FAILED=1
+        RR_COMPAT_CANARY_LABEL=$label
+        printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
+    fi
     {
         printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
             "$record_status" "$replay_status" "$stdout_equal"
@@ -959,10 +1018,14 @@ function strict_compatibility_probe {
     local status
     local summary
     local assurance=L2
+    local backend_diagnostic=""
     local -a run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
         run_args=(run --backend sabre --strict --verify --)
+    elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        assurance="e9patch L2"
+        run_args=(run --backend e9patch --strict --verify --)
     fi
 
     {
@@ -996,6 +1059,24 @@ function strict_compatibility_probe {
         printf "Exit: %s\n" "$status"
         printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
     } >>"$LOG_FILE"
+
+    if [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        backend_diagnostic=$(sed -n "${output_start},\$p" "$LOG_FILE" |
+            grep -m1 '^:: Backend: e9patch' || true)
+        if [[ $backend_diagnostic == *"main_executable=non-ELF"* ]]; then
+            ((E9PATCH_COMPAT_NON_ELF += 1))
+        elif [[ $backend_diagnostic =~ candidate_sites=([0-9]+).*mapped_sites=([0-9]+) ]]; then
+            if ((BASH_REMATCH[2] > 0)); then
+                ((E9PATCH_COMPAT_REWRITTEN += 1))
+            elif ((BASH_REMATCH[1] > 0)); then
+                ((E9PATCH_COMPAT_CANDIDATE_ONLY += 1))
+            else
+                ((E9PATCH_COMPAT_ZERO_SITE += 1))
+            fi
+        else
+            ((E9PATCH_COMPAT_NO_DIAGNOSTIC += 1))
+        fi
+    fi
     return "$status"
 }
 
@@ -1027,6 +1108,9 @@ function run_compatibility_corpus {
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         printf "\n== SaBRe compatibility ratchet (blocking floor) ==\n"
         printf "=== SaBRe compatibility ratchet (blocking floor) ===\n" >>"$LOG_FILE"
+    elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        printf "\n== e9patch compatibility matrix (L2) ==\n"
+        printf "=== e9patch compatibility matrix (L2) ===\n" >>"$LOG_FILE"
     else
         printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
         printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
@@ -1060,7 +1144,11 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sqlite3 sqlite3 :memory: 'SELECT 1+1;' \
+    strict_compatibility_probe sqlite3 sqlite3 :memory: \
+        'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe jq /usr/bin/jq -c -n \
+        '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
@@ -1071,12 +1159,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe java java -version \
+    functional_compatibility_probe java java \
+        -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
+        'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
+        file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     strict_compatibility_probe git /usr/bin/git --version \
@@ -1130,6 +1225,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe zstd bash -c \
         'zstd -q -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe zip-unzip bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe openssl openssl dgst -sha256 /etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1209,7 +1307,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe mktemp bash -c \
-        'd=$(mktemp -d /tmp/hermit-compat.XXXXXX) && basename "$d" && rmdir "$d"' \
+        'set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d "$d"; rmdir "$d"; printf "mktemp-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1263,17 +1361,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
-    strict_compatibility_probe taskset bash -c 'taskset -p $$' \
+    strict_compatibility_probe taskset bash -c \
+        'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    strict_compatibility_probe chrt bash -c 'chrt -p $$' \
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe flock bash -c \
         'set -euo pipefail; rm -f /tmp/hermit-compat-flock; flock -x /tmp/hermit-compat-flock -c "printf \"flock-ok\\n\""; rm -f /tmp/hermit-compat-flock' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Exercise logger formatting without writing to a host logging service.
-    strict_compatibility_probe logger /usr/bin/logger --stderr --no-act \
-        -t hermit-compat logger-ok \
+    # Capture logger's wall-clock prefix and assert only its semantic payload.
+    strict_compatibility_probe logger bash -c \
+        'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe getopt /usr/bin/getopt -o ab: -- -a -b value \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1384,7 +1484,7 @@ function run_compatibility_corpus {
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe shuf bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\ndelta\n" | shuf' \
+        'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1408,6 +1508,12 @@ function run_compatibility_corpus {
     # between otherwise identical strict runs.
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
+        if ((RR_COMPAT_CANARY_FAILED == 1)); then
+            printf "❌ Record/replay compatibility canary %s failed; executed %s selected probe and skipped %s remaining selected probes (%s unselected)\n" \
+                "$RR_COMPAT_CANARY_LABEL" "$RR_COMPAT_TOTAL" \
+                "$RR_COMPAT_FAIL_FAST_SKIPPED" "$RR_COMPAT_SKIPPED"
+            return 1
+        fi
         if ((RR_COMPAT_TOTAL != RR_COMPAT_EXPECTED)); then
             printf "❌ Record/replay compatibility baseline selected %s rows; expected %s (%s skipped)\n" \
                 "$RR_COMPAT_TOTAL" "$RR_COMPAT_EXPECTED" "$RR_COMPAT_SKIPPED"
@@ -1441,6 +1547,38 @@ function run_compatibility_corpus {
         return 0
     fi
 
+    if [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        local classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
+            E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
+            E9PATCH_COMPAT_NO_DIAGNOSTIC))
+        printf "e9patch preprocessing: %s rewritten, %s zero-site, %s candidate-only, %s non-ELF fallback, %s without diagnostic\n" \
+            "$E9PATCH_COMPAT_REWRITTEN" "$E9PATCH_COMPAT_ZERO_SITE" \
+            "$E9PATCH_COMPAT_CANDIDATE_ONLY" "$E9PATCH_COMPAT_NON_ELF" \
+            "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+        if ((total != E9PATCH_COMPAT_TOTAL)); then
+            printf "❌ e9patch compatibility corpus selected %s rows; expected %s\n" \
+                "$total" "$E9PATCH_COMPAT_TOTAL"
+            return 1
+        fi
+        if ((classified != total)); then
+            printf "❌ e9patch compatibility classified %s rows; expected %s\n" \
+                "$classified" "$total"
+            return 1
+        fi
+        if ((E9PATCH_COMPAT_NO_DIAGNOSTIC != 0)); then
+            printf "❌ e9patch compatibility had %s rows without a backend diagnostic\n" \
+                "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+            return 1
+        fi
+        if ((failed == 0)); then
+            printf "✅ e9patch compatibility matrix (%s/%s passed L2)\n" "$passed" "$total"
+            return 0
+        fi
+        printf "❌ e9patch compatibility matrix (%s/%s passed L2, %s gaps)\n" \
+            "$passed" "$total" "$failed"
+        return 1
+    fi
+
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
         return 0
@@ -1472,6 +1610,39 @@ function run_sabre_compatibility_envelope {
     return "$status"
 }
 
+# TODO-HUMAN-REVIEW(PR-664): Review e9patch tool discovery and corpus accounting.
+function require_e9patch_artifacts {
+    local e9tool=${HERMIT_E9TOOL:-}
+    local backend=${HERMIT_E9PATCH_BACKEND:-}
+    if [[ -z $e9tool ]]; then
+        e9tool=$(command -v e9tool || true)
+    fi
+    if [[ -z $backend && -n $e9tool ]]; then
+        backend=$(dirname "$e9tool")/e9patch
+    fi
+    if [[ -z $e9tool || ! -x $e9tool ]]; then
+        printf "validate.sh: HERMIT_E9TOOL must name an executable e9tool for e9patch compatibility\n" >&2
+        return 1
+    fi
+    if [[ -z $backend || ! -x $backend ]]; then
+        printf "validate.sh: HERMIT_E9PATCH_BACKEND must name an executable e9patch backend\n" >&2
+        return 1
+    fi
+}
+
+function run_e9patch_compatibility_envelope {
+    local status=0
+    E9PATCH_COMPAT_REWRITTEN=0
+    E9PATCH_COMPAT_ZERO_SITE=0
+    E9PATCH_COMPAT_CANDIDATE_ONLY=0
+    E9PATCH_COMPAT_NON_ELF=0
+    E9PATCH_COMPAT_NO_DIAGNOSTIC=0
+    COMPATIBILITY_MODE=e9patch
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
 function require_sabre_artifacts {
     local variable
     for variable in HERMIT_SABRE_RUNNER HERMIT_SABRE_BINARY HERMIT_SABRE_PLUGIN; do
@@ -1490,6 +1661,9 @@ function run_rr_compatibility_envelope {
     RR_COMPAT_FAILED=0
     RR_COMPAT_TOTAL=0
     RR_COMPAT_SKIPPED=0
+    RR_COMPAT_FAIL_FAST_SKIPPED=0
+    RR_COMPAT_CANARY_FAILED=0
+    RR_COMPAT_CANARY_LABEL=""
     COMPATIBILITY_MODE=rr
     run_compatibility_corpus || status=$?
     COMPATIBILITY_MODE=strict
@@ -1723,6 +1897,26 @@ function print_summary {
     fi
 }
 
+function run_hosted_only_suite {
+    run_check "Detcore backend-abstraction check" \
+        ./scripts/check-detcore-backend-abstraction.sh
+    run_check "cargo-nextest available" ensure_cargo_nextest
+    run_check "Build workspace" cargo build --workspace
+
+    start_check "Test workspace documentation" cargo test --workspace --doc
+    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+    start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Documentation" cargo doc --workspace --no-deps
+
+    run_check "Test portable workspace crates" \
+        "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit \
+        --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test Hermit libraries and binaries" cargo test -p hermit --lib --bins
+    run_check "Test Detcore libraries and binaries" cargo test -p detcore --lib --bins
+
+    wait_for_background_checks
+}
+
 function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
     run_check "Detcore core unit tests" cargo test -p detcore --lib
@@ -1918,7 +2112,7 @@ function run_hardware_validation {
 }
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
-if ((HOSTED_ONLY == 1)); then
+if [[ $VALIDATION_LEVEL == hosted-only ]]; then
     run_hosted_validation
     exit $?
 fi
@@ -1945,8 +2139,23 @@ if ((SABRE_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "SaBRe compatibility ratchet (147 programs)" \
+        run_check "SaBRe compatibility ratchet (151 programs)" \
             run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+if ((E9PATCH_COMPAT_ONLY == 1)); then
+    run_check "e9patch artifacts configured" require_e9patch_artifacts
+    if ((failures == 0)); then
+        run_check "Build release Hermit for e9patch compatibility" \
+            cargo build --release -p hermit
+    fi
+    if ((failures == 0)); then
+        run_check "e9patch compatibility matrix (151 programs)" \
+            run_e9patch_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
@@ -1994,6 +2203,7 @@ fi
 
 case "$VALIDATION_LEVEL" in
     quick) run_quick_suite ;;
+    hosted-only) run_hosted_only_suite ;;
     full) run_full_suite ;;
     super) run_super_suite ;;
 esac

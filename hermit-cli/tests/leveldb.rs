@@ -67,6 +67,7 @@ fn executable(build_dir: &Path, name: &str) -> PathBuf {
 }
 
 fn strict_run(binary: &Path, args: &[&str]) -> Output {
+    // AUTONOMOUS-BOT-IMPLEMENTED(#657): Hermit diagnostics include host timestamps and are not guest output.
     Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "run", "--strict", "--base-env=minimal", "--"])
         .arg(binary)

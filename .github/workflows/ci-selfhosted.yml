@@ -40,6 +40,14 @@ jobs:
     timeout-minutes: 60
 
     steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -95,6 +103,14 @@ jobs:
       DETCORE_TEST_RUST_LOG: "off"
 
     steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
