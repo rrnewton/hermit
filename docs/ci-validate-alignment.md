@@ -41,7 +41,7 @@ The selector covers exactly 445 of the 843 Cargo-discovered cases:
 | Portable Hermit integration cases | 107 | Non-KVM CLI, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 164-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
+the 180-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
 The compatibility corpus retains its existing informational policy.
 
 The lane also requires all six DynamoRIO DBI parity scenarios currently
