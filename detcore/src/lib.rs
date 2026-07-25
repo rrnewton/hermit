@@ -1663,7 +1663,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Unlink(_)
                 | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#716): classify_syscall is the single source of
+                // TODO-HUMAN-REVIEW(#721): classify_syscall is the single source of
                 // truth and already vetted this syscall as deterministic PassThrough.
                 // Forward it even when it has no typed `Syscall` variant above: the
                 // reserved/removed ENOSYS group and other rarely-typed syscalls only

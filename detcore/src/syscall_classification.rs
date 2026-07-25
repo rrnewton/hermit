@@ -311,7 +311,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
 
         // ===== NEWLY-CLASSIFIED DETERMINISTIC PASS-THRU =====
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#716): Promotions out of the legacy Unclassified
+        // TODO-HUMAN-REVIEW(#721): Promotions out of the legacy Unclassified
         // (fail-closed-under-strict) set. Each group forwards to the kernel with
         // a result that repeats across the two `--strict --verify` runs, so
         // classifying them as PassThrough expands the strict compatibility
