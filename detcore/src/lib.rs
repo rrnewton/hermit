@@ -1662,15 +1662,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Umask(_)
                 | Syscall::Unlink(_)
                 | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
-                unexpected => {
-                    self.handle_unclassified_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        config.panic_on_unsupported_syscalls,
-                    )
-                    .await
-                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#716): classify_syscall is the single source of
+                // truth and already vetted this syscall as deterministic PassThrough.
+                // Forward it even when it has no typed `Syscall` variant above: the
+                // reserved/removed ENOSYS group and other rarely-typed syscalls only
+                // surface as `Syscall::Other`, so routing them back through the
+                // fail-closed path here would contradict their PassThrough policy.
+                unexpected => self.passthrough(guest, unexpected).await,
             },
             SyscallClassification::Unclassified => {
                 self.handle_unclassified_syscall(

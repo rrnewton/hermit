@@ -309,22 +309,66 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
+        // ===== NEWLY-CLASSIFIED DETERMINISTIC PASS-THRU =====
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#716): Promotions out of the legacy Unclassified
+        // (fail-closed-under-strict) set. Each group forwards to the kernel with
+        // a result that repeats across the two `--strict --verify` runs, so
+        // classifying them as PassThrough expands the strict compatibility
+        // envelope without introducing a new source of nondeterminism.
+        //
+        // Group 1 — reserved or long-removed syscalls. The pinned x86-64 kernel
+        // returns -ENOSYS unconditionally for these (never implemented, or
+        // removed years ago), independent of privilege or run state, so the
+        // forwarded result is byte-identical on every run.
+        Sysno::afs_syscall
+        | Sysno::tuxcall
+        | Sysno::security
+        | Sysno::vserver
+        | Sysno::create_module
+        | Sysno::get_kernel_syms
+        | Sysno::query_module
+        | Sysno::nfsservctl
+        | Sysno::_sysctl
+        | Sysno::getpmsg
+        | Sysno::putpmsg
+        // Group 2 — memory locking. Symmetric with the already-passed-through
+        // munlock/munlockall: no guest-visible output beyond a return value that
+        // is fixed for a given environment (0, or a deterministic -EPERM/-ENOMEM
+        // driven by RLIMIT_MEMLOCK), and both verify runs share that environment.
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        // Group 3 — filesystem node creation. Symmetric with the already-passed-
+        // through mkdir/mkdirat; Hermit delegates filesystem state to its
+        // stable-filesystem assumption rather than determinizing it.
+        | Sysno::mknod
+        | Sysno::mknodat
+        // Group 4 — scheduler policy constants. Return a fixed per-policy integer
+        // (e.g. 99/1 for SCHED_FIFO/RR, 0/0 for SCHED_OTHER) that does not depend
+        // on run state.
+        | Sysno::sched_get_priority_max
+        | Sysno::sched_get_priority_min
+        // Group 5 — filesystem flush. Return 0 (or a deterministic -EBADF for a
+        // bad fd) with no nondeterministic result, consistent with the
+        // stable-filesystem policy.
+        | Sysno::sync
+        | Sysno::syncfs => SyscallClassification::PassThrough,
+        // ===== END NEWLY-CLASSIFIED DETERMINISTIC PASS-THRU =====
+
         // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
         // TODO/FIXME: These syscalls have not been classified. They temporarily use
         // the legacy passthrough policy and may need deterministic handling. Each must
         // be investigated and moved to DETERMINIZED or PASS-THRU.
-        Sysno::_sysctl
-        | Sysno::acct
+        Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
-        | Sysno::afs_syscall
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::chroot
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::create_module
         | Sysno::delete_module
         | Sysno::epoll_pwait2
         | Sysno::fanotify_init
@@ -339,12 +383,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
-        | Sysno::get_kernel_syms
         | Sysno::get_mempolicy
         | Sysno::get_robust_list
         | Sysno::get_thread_area
         | Sysno::getitimer
-        | Sysno::getpmsg
         | Sysno::init_module
         | Sysno::io_cancel
         | Sysno::io_destroy
@@ -373,11 +415,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::memfd_secret
         | Sysno::migrate_pages
         | Sysno::mincore
-        | Sysno::mknod
-        | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
         | Sysno::modify_ldt
         | Sysno::mount
         | Sysno::mount_setattr
@@ -394,7 +431,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgsnd
         | Sysno::name_to_handle_at
-        | Sysno::nfsservctl
         | Sysno::open_by_handle_at
         | Sysno::open_tree
         | Sysno::openat2
@@ -413,10 +449,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
         | Sysno::ptrace
-        | Sysno::putpmsg
         | Sysno::pwritev
         | Sysno::pwritev2
-        | Sysno::query_module
         | Sysno::quotactl
         | Sysno::quotactl_fd
         | Sysno::readv
@@ -427,8 +461,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_get_priority_max
-        | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
         | Sysno::sched_getparam
         | Sysno::sched_getscheduler
@@ -437,7 +469,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setparam
         | Sysno::sched_setscheduler
         | Sysno::seccomp
-        | Sysno::security
         | Sysno::select
         | Sysno::semctl
         | Sysno::semget
@@ -469,21 +500,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::statmount
         | Sysno::swapoff
         | Sysno::swapon
-        | Sysno::sync
-        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
-        | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
         | Sysno::uselib
         | Sysno::ustat
         | Sysno::vhangup
-        | Sysno::vmsplice
-        | Sysno::vserver => SyscallClassification::Unclassified,
+        | Sysno::vmsplice => SyscallClassification::Unclassified,
         // ===== END UNCLASSIFIED =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
@@ -509,7 +536,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [128, 74, 171]);
+        assert_eq!(counts, [128, 94, 151]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -632,6 +659,18 @@ mod tests {
             Sysno::umask,
             Sysno::unlink,
             Sysno::unlinkat,
+            // Promoted out of Unclassified (deterministic kernel forwarding).
+            Sysno::afs_syscall,
+            Sysno::create_module,
+            Sysno::getpmsg,
+            Sysno::mlock,
+            Sysno::mlockall,
+            Sysno::mknod,
+            Sysno::mknodat,
+            Sysno::sched_get_priority_max,
+            Sysno::sched_get_priority_min,
+            Sysno::sync,
+            Sysno::syncfs,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
