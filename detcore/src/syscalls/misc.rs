@@ -218,6 +218,69 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#TBD)
+    /// Handle deterministic process-local `prctl` options and reject the rest.
+    pub async fn handle_prctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Prctl,
+    ) -> Result<i64, Error> {
+        match call.option() {
+            // The capability bounding set is fixed by the container launch policy.
+            libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            _ => Err(Errno::ENOSYS.into()),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#TBD)
+    /// Report the deterministic default nice value for the current process.
+    pub async fn handle_getpriority<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Getpriority,
+    ) -> Result<i64, Error> {
+        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 {
+            // The raw Linux syscall returns 20 - nice, so nice 0 is reported as 20.
+            Ok(20)
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#TBD)
+    /// Accept the common reset-to-default request without changing host scheduling.
+    pub async fn handle_setpriority<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Setpriority,
+    ) -> Result<i64, Error> {
+        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 && call.prio() == 0 {
+            Ok(0)
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#TBD)
+    /// Reject cross-process memory advice without consulting host process state.
+    pub fn handle_process_madvise(pidfd: usize, flags: usize) -> Result<i64, Error> {
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        // Linux interprets pidfd as an int. Preserve its deterministic invalid-fd
+        // rejection, but never let a valid host pidfd alter another process's memory.
+        if (pidfd as libc::c_int) < 0 {
+            Err(Errno::EBADF.into())
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
     /// Fill guest memory from the deterministic PRNG owned by the current thread.
     pub(super) fn fill_random_bytes<G: Guest<Self>>(
         &self,
@@ -459,5 +522,24 @@ mod tests {
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
         assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+    }
+
+    #[test]
+    fn process_madvise_is_rejected_deterministically() {
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(
+                (-10_000_i32) as usize,
+                0
+            ),
+            Err(Error::Errno(Errno::EBADF))
+        ));
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 1),
+            Err(Error::Errno(Errno::EINVAL))
+        ));
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 0),
+            Err(Error::Errno(Errno::EPERM))
+        ));
     }
 }

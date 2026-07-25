@@ -146,6 +146,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::waitid
         | Sysno::write
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#TBD)
+        | Sysno::clock_settime
+        | Sysno::getpeername
+        | Sysno::getsockname
+        | Sysno::getsockopt
+        | Sysno::getpriority
+        | Sysno::getrlimit
+        | Sysno::kill
+        | Sysno::listen
+        | Sysno::prctl
+        | Sysno::rt_sigpending
+        | Sysno::setitimer
+        | Sysno::setpriority
+        | Sysno::process_madvise
+        | Sysno::setrlimit
+        | Sysno::setsockopt
+        | Sysno::tgkill
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev => SyscallClassification::Determinized,
 
@@ -156,17 +173,25 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
         Sysno::access
         | Sysno::brk
+        | Sysno::chown
         | Sysno::getcwd
         | Sysno::getegid
         | Sysno::geteuid
         | Sysno::getgid
         | Sysno::getpid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#TBD)
+        | Sysno::getpgid
+        | Sysno::getpgrp
+        | Sysno::getppid
+        | Sysno::getsid
         | Sysno::gettid
         | Sysno::getuid
         | Sysno::lseek
         | Sysno::mprotect
         | Sysno::readlink
         | Sysno::set_robust_list
+        | Sysno::setpgid
         | Sysno::set_tid_address
         | Sysno::sigaltstack
         // capget/capset/getgroups observe or update kernel credential state that starts
@@ -244,10 +269,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::afs_syscall
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::chown
         | Sysno::chroot
         | Sysno::clock_adjtime
-        | Sysno::clock_settime
         | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::create_module
@@ -279,16 +302,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::get_robust_list
         | Sysno::get_thread_area
         | Sysno::getitimer
-        | Sysno::getpeername
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getpmsg
-        | Sysno::getppid
-        | Sysno::getpriority
-        | Sysno::getrlimit
-        | Sysno::getsid
-        | Sysno::getsockname
-        | Sysno::getsockopt
         | Sysno::init_module
         | Sysno::io_cancel
         | Sysno::io_destroy
@@ -304,13 +318,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::kexec_file_load
         | Sysno::kexec_load
         | Sysno::keyctl
-        | Sysno::kill
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
         | Sysno::lchown
         | Sysno::link
-        | Sysno::listen
         | Sysno::listmount
         | Sysno::listxattr
         | Sysno::llistxattr
@@ -360,10 +372,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pkey_alloc
         | Sysno::pkey_free
         | Sysno::pkey_mprotect
-        | Sysno::prctl
         | Sysno::preadv
         | Sysno::preadv2
-        | Sysno::process_madvise
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
@@ -383,7 +393,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::rt_sigpending
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_get_priority_max
@@ -412,16 +421,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setgid
         | Sysno::setgroups
         | Sysno::sethostname
-        | Sysno::setitimer
         | Sysno::setns
-        | Sysno::setpgid
-        | Sysno::setpriority
         | Sysno::setregid
         | Sysno::setresgid
         | Sysno::setresuid
         | Sysno::setreuid
-        | Sysno::setrlimit
-        | Sysno::setsockopt
         | Sysno::settimeofday
         | Sysno::setuid
         | Sysno::shmat
@@ -440,7 +444,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
-        | Sysno::tgkill
         | Sysno::times
         | Sysno::tkill
         | Sysno::tuxcall
@@ -476,7 +479,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 49, 214]);
+        assert_eq!(counts, [126, 55, 192]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -515,8 +518,29 @@ mod tests {
             SyscallClassification::Determinized
         );
         for sysno in [
+            Sysno::clock_settime,
+            Sysno::getpeername,
+            Sysno::getsockname,
+            Sysno::getsockopt,
+            Sysno::getpriority,
+            Sysno::getrlimit,
+            Sysno::kill,
+            Sysno::listen,
+            Sysno::prctl,
+            Sysno::rt_sigpending,
+            Sysno::setitimer,
+            Sysno::setpriority,
+            Sysno::process_madvise,
+            Sysno::setrlimit,
+            Sysno::setsockopt,
+            Sysno::tgkill,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+        for sysno in [
             Sysno::capget,
             Sysno::capset,
+            Sysno::chown,
             Sysno::chdir,
             Sysno::chmod,
             Sysno::faccessat2,
@@ -534,13 +558,19 @@ mod tests {
             Sysno::rename,
             Sysno::renameat,
             Sysno::getgroups,
+            Sysno::getppid,
             Sysno::getxattr,
+            Sysno::getpgid,
+            Sysno::getpgrp,
+            Sysno::getsid,
+            Sysno::setpgid,
             Sysno::lgetxattr,
             Sysno::linkat,
             Sysno::mkdir,
             Sysno::mkdirat,
             Sysno::removexattr,
             Sysno::renameat2,
+            Sysno::readlinkat,
             Sysno::rmdir,
             Sysno::rt_sigreturn,
             Sysno::setxattr,
@@ -556,7 +586,6 @@ mod tests {
             Sysno::add_key,
             Sysno::keyctl,
             Sysno::msync,
-            Sysno::prctl,
             Sysno::readahead,
             Sysno::request_key,
             Sysno::sync_file_range,
