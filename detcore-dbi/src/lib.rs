@@ -217,7 +217,7 @@ fn append_copied_syscall_record(sysnum: i64) {
     buffer[index] = b'@';
     let _ = unsafe {
         libc::write(
-            UNSUPPORTED_SYSCALL_REPORT_FD,
+            report_fd,
             buffer[index..].as_ptr().cast(),
             buffer.len() - index,
         )
