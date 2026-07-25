@@ -939,6 +939,29 @@ impl GlobalState {
                     let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
                     return Some(SchedValue::Value(num));
                 }
+                FutexAction::RequeueRequest {
+                    target,
+                    max_wake,
+                    max_requeue,
+                } => {
+                    let num =
+                        sched.requeue_futex_waiters(dettid, futexid, target, max_wake, max_requeue);
+                    return Some(SchedValue::Value(num));
+                }
+                FutexAction::WakeOpRequest {
+                    target,
+                    max_wake,
+                    max_wake_target,
+                } => {
+                    let num = sched.wake_futex_waiters_two(
+                        dettid,
+                        futexid,
+                        target,
+                        max_wake,
+                        max_wake_target,
+                    );
+                    return Some(SchedValue::Value(num));
+                }
                 FutexAction::WakeFinished(_num_threads) => {
                     return None;
                 }
@@ -1514,6 +1537,7 @@ pub async fn deregister_thread<R>(
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-PENDING): Review the futex requeue and two-queue wake RPC contract.
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
@@ -1523,6 +1547,24 @@ pub enum FutexAction {
     WaitFinished,
     /// Check in before a FUTEX_WAKE, parameterized by the number of threads woken.
     WakeRequest(i32),
+    /// Atomically wake and requeue waiters from one modeled futex to another.
+    RequeueRequest {
+        /// Destination futex queue.
+        target: FutexID,
+        /// Maximum waiters to wake from the source queue.
+        max_wake: i32,
+        /// Maximum remaining waiters to move to the destination queue.
+        max_requeue: i32,
+    },
+    /// Atomically wake waiters from two modeled futex queues.
+    WakeOpRequest {
+        /// Second futex queue.
+        target: FutexID,
+        /// Maximum waiters to wake from the first queue.
+        max_wake: i32,
+        /// Maximum waiters to wake from the second queue.
+        max_wake_target: i32,
+    },
     /// Check in after a FUTEX_WAKE, parameterized by the number of threads woken.
     WakeFinished(i32),
 }

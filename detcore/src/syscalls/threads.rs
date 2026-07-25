@@ -8,6 +8,7 @@
 
 //! System calls for dealing with threads and concurrency.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -25,6 +26,8 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
@@ -56,6 +59,98 @@ use crate::types::LogicalTime;
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
 const VIRTUAL_CPUSET_BYTES: usize = 16;
+
+const ROBUST_LIST_LIMIT: usize = 2048;
+const ROBUST_LIST_HEAD_SIZE: usize = 3 * std::mem::size_of::<usize>();
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+const FUTEX2_SIZE_MASK: u32 = 0x03;
+const FUTEX2_SIZE_U32: u32 = 0x02;
+const FUTEX2_NUMA: u32 = 0x04;
+const FUTEX2_MPOL: u32 = 0x08;
+const FUTEX2_PRIVATE: u32 = libc::FUTEX_PRIVATE_FLAG as u32;
+const FUTEX2_VALID_MASK: u32 = FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RobustListHead {
+    list_next: usize,
+    futex_offset: isize,
+    list_op_pending: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct FutexWaitv {
+    val: u64,
+    uaddr: u64,
+    flags: u32,
+    reserved: u32,
+}
+
+fn robust_futex_address(entry: usize, offset: isize) -> Option<usize> {
+    if offset >= 0 {
+        entry.checked_add(offset as usize)
+    } else {
+        entry.checked_sub(offset.unsigned_abs())
+    }
+}
+
+fn validate_futex2_flags(flags: u32) -> Result<bool, Errno> {
+    if flags & !FUTEX2_VALID_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 || flags & (FUTEX2_NUMA | FUTEX2_MPOL) != 0 {
+        return Err(Errno::ENOSYS);
+    }
+    Ok(flags & FUTEX2_PRIVATE != 0)
+}
+
+fn futex2_address(raw: usize) -> Result<AddrMut<'static, u32>, Errno> {
+    if raw == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if raw % std::mem::align_of::<u32>() != 0 {
+        return Err(Errno::EINVAL);
+    }
+    AddrMut::from_raw(raw).ok_or(Errno::EFAULT)
+}
+
+fn sign_extend_12(value: u32) -> i32 {
+    ((value << 20) as i32) >> 20
+}
+
+fn apply_futex_wake_op(encoded: u32, old: i32) -> Result<(i32, bool), Errno> {
+    let op = (encoded >> 28) & 0x7;
+    let shift_oparg = encoded & 0x8000_0000 != 0;
+    let mut oparg = sign_extend_12((encoded >> 12) & 0x0fff);
+    let cmparg = sign_extend_12(encoded & 0x0fff);
+    let comparison = (encoded >> 24) & 0x0f;
+
+    if shift_oparg {
+        oparg = 1_i32.wrapping_shl((oparg & 31) as u32);
+    }
+    let new = match op {
+        0 => oparg,
+        1 => old.wrapping_add(oparg),
+        2 => old | oparg,
+        3 => old & !oparg,
+        4 => old ^ oparg,
+        _ => return Err(Errno::ENOSYS),
+    };
+    let wake_second = match comparison {
+        0 => old == cmparg,
+        1 => old != cmparg,
+        2 => old < cmparg,
+        3 => old <= cmparg,
+        4 => old > cmparg,
+        5 => old >= cmparg,
+        _ => return Err(Errno::ENOSYS),
+    };
+    Ok((new, wake_second))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -210,6 +305,397 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review robust-list registration and owner-death cleanup.
+    /// Register the kernel robust list and mirror its head for deterministic exit cleanup.
+    pub async fn handle_set_robust_list<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SetRobustList,
+    ) -> Result<i64, Error> {
+        let head = call.head().map(AddrMut::as_raw);
+        let result = guest.inject(call).await?;
+        if result == 0 {
+            guest.thread_state_mut().robust_list_head = head;
+        }
+        Ok(result)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic self-query robust-list policy.
+    /// Return the calling thread's modeled robust-list registration.
+    pub fn handle_get_robust_list<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::GetRobustList,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid.as_raw();
+        if call.pid() != 0 && call.pid() != dettid {
+            return Err(Error::Errno(Errno::EPERM));
+        }
+        let len_ptr = call.len_ptr().ok_or(Errno::EFAULT)?;
+        let head_ptr = call.head_ptr().ok_or(Errno::EFAULT)?;
+        let head = guest.thread_state().robust_list_head.unwrap_or(0);
+        guest
+            .memory()
+            .write_value(len_ptr, &ROBUST_LIST_HEAD_SIZE)?;
+        let raw_head_ptr = AddrMut::<usize>::from_raw(head_ptr.as_raw()).ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(raw_head_ptr, &head)?;
+        Ok(0)
+    }
+
+    async fn cleanup_robust_list_on_exit<G: Guest<Self>>(&self, guest: &mut G) {
+        let Some(head_address) = guest.thread_state_mut().robust_list_head.take() else {
+            return;
+        };
+        let Some(head_ptr) = Addr::<RobustListHead>::from_raw(head_address) else {
+            return;
+        };
+        let head = match guest.memory().read_value(head_ptr) {
+            Ok(head) => head,
+            Err(error) => {
+                debug!("could not read robust-list head at {head_address:#x}: {error}");
+                return;
+            }
+        };
+
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = head.list_next;
+        for _ in 0..ROBUST_LIST_LIMIT {
+            if current == head_address {
+                break;
+            }
+            if current == 0 || !seen.insert(current) {
+                debug!("invalid or cyclic robust list at {current:#x}");
+                break;
+            }
+            entries.push(current);
+            let Some(next_ptr) = Addr::<usize>::from_raw(current) else {
+                break;
+            };
+            current = match guest.memory().read_value(next_ptr) {
+                Ok(next) => next,
+                Err(error) => {
+                    debug!("could not read robust-list entry at {current:#x}: {error}");
+                    break;
+                }
+            };
+        }
+        if head.list_op_pending != 0 {
+            entries.push(head.list_op_pending);
+        }
+
+        let owner_tid = guest.thread_state().dettid.as_raw() as u32 & FUTEX_TID_MASK;
+        let mut cleaned = BTreeSet::new();
+        let mut futexes = Vec::new();
+        for entry in entries {
+            let Some(address) = robust_futex_address(entry, head.futex_offset) else {
+                continue;
+            };
+            if !cleaned.insert(address) {
+                continue;
+            }
+            let Some(word_ptr) = AddrMut::<u32>::from_raw(address) else {
+                continue;
+            };
+            let old = match guest.memory().read_value(word_ptr) {
+                Ok(old) => old,
+                Err(_) => continue,
+            };
+            if old & FUTEX_TID_MASK != owner_tid {
+                continue;
+            }
+            let new = (old & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+            if guest.memory().write_value(word_ptr, &new).is_err() {
+                continue;
+            }
+            if old & FUTEX_WAITERS != 0 {
+                futexes.push((guest.thread_state().futex_id(address, false), new as i32));
+            }
+        }
+
+        for (futexid, value) in futexes {
+            let _ = futex_action(
+                guest,
+                FutexAction::WakeRequest(1),
+                &futexid,
+                value,
+                u32::MAX,
+            )
+            .await;
+            let _ = futex_action(
+                guest,
+                FutexAction::WakeFinished(1),
+                &futexid,
+                value,
+                u32::MAX,
+            )
+            .await;
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex timeout and EINTR results.
+    async fn handle_futex_wait_result<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        futexid: &crate::types::FutexID,
+        initial_value: i32,
+        mask: u32,
+        deadline: Option<LogicalTime>,
+    ) -> Result<i64, Error> {
+        let answer = futex_action(
+            guest,
+            FutexAction::WaitRequest(deadline),
+            futexid,
+            initial_value,
+            mask,
+        )
+        .await;
+        let result = match answer {
+            None => Ok(0),
+            Some(SchedValue::TimeOut) => Err(Error::Errno(Errno::ETIMEDOUT)),
+            Some(SchedValue::Value(value)) if value == Errno::EINTR.into_raw() as u64 => {
+                Err(Error::Errno(Errno::EINTR))
+            }
+            Some(SchedValue::Value(value)) => Ok(value as i64),
+        };
+        futex_action(
+            guest,
+            FutexAction::WaitFinished,
+            futexid,
+            initial_value,
+            mask,
+        )
+        .await;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 wake ABI and scheduler mapping.
+    /// Wake modeled U32 futex2 waiters without entering the host scheduler.
+    pub async fn handle_futex2_wake<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        let address = futex2_address(args.arg0)?;
+        let mask = u32::try_from(args.arg1).map_err(|_| Errno::EINVAL)?;
+        if mask == 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let count = args.arg2 as i32;
+        if count < 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let private = validate_futex2_flags(args.arg3 as u32)?;
+        let futexid = guest.thread_state().futex_id(address.as_raw(), private);
+        let woken = futex_action(guest, FutexAction::WakeRequest(count), &futexid, 0, mask)
+            .await
+            .expect("futex2 wake must return a count");
+        match woken {
+            SchedValue::Value(value) => Ok(value as i64),
+            SchedValue::TimeOut => unreachable!("wake has no timeout"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 wait ABI and logical timeout.
+    /// Wait on a modeled U32 futex2 word using Detcore logical time.
+    pub async fn handle_futex2_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        let address = futex2_address(args.arg0)?;
+        let expected = u32::try_from(args.arg1).map_err(|_| Errno::EINVAL)?;
+        let mask = u32::try_from(args.arg2).map_err(|_| Errno::EINVAL)?;
+        if mask == 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let private = validate_futex2_flags(args.arg3 as u32)?;
+        let timeout = Addr::<Timespec>::from_raw(args.arg4);
+        let clockid = args.arg5 as i32;
+        if timeout.is_some() && clockid != libc::CLOCK_MONOTONIC && clockid != libc::CLOCK_REALTIME
+        {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let mut legacy_flags = libc::FUTEX_WAIT_BITSET;
+        if private {
+            legacy_flags |= libc::FUTEX_PRIVATE_FLAG;
+        }
+        if timeout.is_some() && clockid == libc::CLOCK_REALTIME {
+            legacy_flags |= libc::FUTEX_CLOCK_REALTIME;
+        }
+        let deadline = self
+            .futex_timeout_deadline(guest, legacy_flags, timeout)
+            .await?;
+        let observed = guest.memory().read_value(address)?;
+        if observed != expected {
+            return Err(Error::Errno(Errno::EAGAIN));
+        }
+        let futexid = guest.thread_state().futex_id(address.as_raw(), private);
+        self.handle_futex_wait_result(guest, &futexid, observed as i32, mask, deadline)
+            .await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 requeue ABI and queue ordering.
+    /// Wake and requeue modeled U32 futex2 waiters deterministically.
+    pub async fn handle_futex2_requeue<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        if args.arg1 != 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let max_wake = args.arg2 as i32;
+        let max_requeue = args.arg3 as i32;
+        if max_wake < 0 || max_requeue < 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let first_ptr = Addr::<FutexWaitv>::from_raw(args.arg0).ok_or(Errno::EINVAL)?;
+        let second_raw = args
+            .arg0
+            .checked_add(std::mem::size_of::<FutexWaitv>())
+            .ok_or(Errno::EFAULT)?;
+        let second_ptr = Addr::<FutexWaitv>::from_raw(second_raw).ok_or(Errno::EFAULT)?;
+        let first = guest.memory().read_value(first_ptr)?;
+        let second = guest.memory().read_value(second_ptr)?;
+        if first.reserved != 0 || second.reserved != 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let source_private = validate_futex2_flags(first.flags)?;
+        let target_private = validate_futex2_flags(second.flags)?;
+        let expected = u32::try_from(first.val).map_err(|_| Errno::EINVAL)?;
+        let _ = u32::try_from(second.val).map_err(|_| Errno::EINVAL)?;
+        let source_address = futex2_address(first.uaddr as usize)?;
+        let target_address = futex2_address(second.uaddr as usize)?;
+        let observed = guest.memory().read_value(source_address)?;
+        if observed != expected {
+            return Err(Error::Errno(Errno::EAGAIN));
+        }
+        let source = guest
+            .thread_state()
+            .futex_id(source_address.as_raw(), source_private);
+        let target = guest
+            .thread_state()
+            .futex_id(target_address.as_raw(), target_private);
+        let changed = futex_action(
+            guest,
+            FutexAction::RequeueRequest {
+                target,
+                max_wake,
+                max_requeue,
+            },
+            &source,
+            observed as i32,
+            u32::MAX,
+        )
+        .await
+        .expect("futex2 requeue must return a count");
+        match changed {
+            SchedValue::Value(value) => Ok(value as i64),
+            SchedValue::TimeOut => unreachable!("requeue has no timeout"),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Replace fixed refusal with multi-queue wait modeling.
+    /// Refuse vector waits until one thread can register on multiple modeled queues.
+    pub fn handle_futex2_waitv(&self, _args: SyscallArgs) -> Result<i64, Error> {
+        Err(Error::Errno(Errno::ENOSYS))
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review legacy futex requeue ABI and scheduler transitions.
+    async fn handle_futex_requeue<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        initial_value: i32,
+        compare: bool,
+    ) -> Result<i64, Error> {
+        let (_, raw) = call.into_parts();
+        let max_wake = call.val();
+        let max_requeue = raw.arg3 as i32;
+        if max_wake < 0 || max_requeue < 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if compare && initial_value != call.val3() {
+            return Err(Error::Errno(Errno::EAGAIN));
+        }
+        let source_address = call.uaddr().ok_or(Errno::EFAULT)?;
+        let target_address = call.uaddr2().ok_or(Errno::EFAULT)?;
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let source = guest
+            .thread_state()
+            .futex_id(source_address.as_raw(), private);
+        let target = guest
+            .thread_state()
+            .futex_id(target_address.as_raw(), private);
+        let changed = futex_action(
+            guest,
+            FutexAction::RequeueRequest {
+                target,
+                max_wake,
+                max_requeue,
+            },
+            &source,
+            initial_value,
+            u32::MAX,
+        )
+        .await
+        .expect("futex requeue must return a count");
+        match changed {
+            SchedValue::Value(value) => Ok(value as i64),
+            SchedValue::TimeOut => unreachable!("requeue has no timeout"),
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review legacy FUTEX_WAKE_OP atomicity and decoding.
+    async fn handle_futex_wake_op<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        initial_value: i32,
+    ) -> Result<i64, Error> {
+        let (_, raw) = call.into_parts();
+        let max_wake = call.val();
+        let max_wake_target = raw.arg3 as i32;
+        if max_wake < 0 || max_wake_target < 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let source_address = call.uaddr().ok_or(Errno::EFAULT)?;
+        let target_address = call.uaddr2().ok_or(Errno::EFAULT)?;
+        let old = guest.memory().read_value(target_address)?;
+        let (new, wake_target) = apply_futex_wake_op(call.val3() as u32, old)?;
+        guest.memory().write_value(target_address, &new)?;
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let source = guest
+            .thread_state()
+            .futex_id(source_address.as_raw(), private);
+        let target = guest
+            .thread_state()
+            .futex_id(target_address.as_raw(), private);
+        let woken = futex_action(
+            guest,
+            FutexAction::WakeOpRequest {
+                target,
+                max_wake,
+                max_wake_target: if wake_target { max_wake_target } else { 0 },
+            },
+            &source,
+            initial_value,
+            u32::MAX,
+        )
+        .await
+        .expect("futex wake-op must return a count");
+        match woken {
+            SchedValue::Value(value) => Ok(value as i64),
+            SchedValue::TimeOut => unreachable!("wake-op has no timeout"),
+        }
+    }
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -328,6 +814,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        if self.cfg.sequentialize_threads {
+            self.cleanup_robust_list_on_exit(guest).await;
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -449,42 +938,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let maybe_timeout_lt = self
                         .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
                         .await?;
-                    let ans = futex_action(
+                    self.handle_futex_wait_result(
                         guest,
-                        FutexAction::WaitRequest(maybe_timeout_lt),
                         &futexid,
                         init_val,
                         bitset,
+                        maybe_timeout_lt,
                     )
-                    .await;
-                    let res = if ans != Some(SchedValue::TimeOut) {
-                        let expected = call.val();
-                        let observed = guest.memory().read_value(ptr).unwrap();
-                        trace!(
-                            "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
-                            &dettid, observed, expected,
-                        );
-                        if expected == observed {
-                            debug!(
-                                "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
-                            );
-                        }
-                        Ok(0)
-                    } else {
-                        trace!("[detcore, dtid {}] futex wait timed out", &dettid);
-                        Err(Error::Errno(Errno::ETIMEDOUT))
-                    };
-                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
-                        .await;
-                    res
+                    .await
                 }
             }
-            libc::FUTEX_FD => {
-                panic!("[detcore] refusing to execute FUTEX_FD, which was removed in Linux 2.6.26.")
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            libc::FUTEX_REQUEUE => {
+                self.handle_futex_requeue(guest, call, init_val, false)
+                    .await
             }
-            other => {
-                panic!("[detcore] futex op not handled yet: {}", other);
-            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            libc::FUTEX_CMP_REQUEUE => self.handle_futex_requeue(guest, call, init_val, true).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            libc::FUTEX_WAKE_OP => self.handle_futex_wake_op(guest, call, init_val).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            libc::FUTEX_FD
+            | libc::FUTEX_LOCK_PI
+            | libc::FUTEX_UNLOCK_PI
+            | libc::FUTEX_TRYLOCK_PI
+            | libc::FUTEX_WAIT_REQUEUE_PI
+            | libc::FUTEX_CMP_REQUEUE_PI
+            | libc::FUTEX_LOCK_PI2 => Err(Error::Errno(Errno::ENOSYS)),
+            _ => Err(Error::Errno(Errno::ENOSYS)),
         }
     }
 
@@ -546,12 +1027,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(res)
                 }
             }
-            libc::FUTEX_FD => {
-                panic!("[detcore] refusing to execute FUTEX_FD, which was removed in Linux 2.6.26.")
-            }
-            other => {
-                panic!("[detcore] futex op not handled yet: {}", other);
-            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            libc::FUTEX_REQUEUE
+            | libc::FUTEX_CMP_REQUEUE
+            | libc::FUTEX_WAKE_OP
+            | libc::FUTEX_FD
+            | libc::FUTEX_LOCK_PI
+            | libc::FUTEX_UNLOCK_PI
+            | libc::FUTEX_TRYLOCK_PI
+            | libc::FUTEX_WAIT_REQUEUE_PI
+            | libc::FUTEX_CMP_REQUEUE_PI
+            | libc::FUTEX_LOCK_PI2 => Err(Error::Errno(Errno::ENOSYS)),
+            _ => Err(Error::Errno(Errno::ENOSYS)),
         }
     }
 
@@ -959,6 +1446,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn futex_wake_op_decodes_signed_arguments_and_comparisons() {
+        let set_one_if_zero = (1_u32 << 12) | 0;
+        assert_eq!(apply_futex_wake_op(set_one_if_zero, 0), Ok((1, true)));
+        assert_eq!(apply_futex_wake_op(set_one_if_zero, 7), Ok((1, false)));
+
+        let add_minus_one_if_positive = (1_u32 << 28) | (4_u32 << 24) | (0x0fff_u32 << 12);
+        assert_eq!(
+            apply_futex_wake_op(add_minus_one_if_positive, 3),
+            Ok((2, true))
+        );
+        assert_eq!(apply_futex_wake_op(7_u32 << 28, 0), Err(Errno::ENOSYS));
+    }
+
+    #[test]
+    fn futex2_flags_accept_only_supported_u32_words() {
+        assert_eq!(validate_futex2_flags(FUTEX2_SIZE_U32), Ok(false));
+        assert_eq!(
+            validate_futex2_flags(FUTEX2_SIZE_U32 | FUTEX2_PRIVATE),
+            Ok(true)
+        );
+        assert_eq!(validate_futex2_flags(0), Err(Errno::ENOSYS));
+        assert_eq!(
+            validate_futex2_flags(FUTEX2_SIZE_U32 | FUTEX2_NUMA),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(validate_futex2_flags(0x10), Err(Errno::EINVAL));
+    }
     #[test]
     fn absolute_futex_timeout_is_rebased_to_logical_time() {
         let logical_now = LogicalTime::from_secs(100);

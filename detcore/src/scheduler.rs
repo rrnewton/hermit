@@ -1232,6 +1232,64 @@ impl Scheduler {
         num_woken as u64
     }
 
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex queue migration and wake ordering.
+    /// Wake some source waiters and move a deterministic subset of the rest to another futex.
+    pub fn requeue_futex_waiters(
+        &mut self,
+        waker_dettid: DetTid,
+        source: FutexID,
+        target: FutexID,
+        max_to_wake: i32,
+        max_to_requeue: i32,
+    ) -> u64 {
+        debug_assert!(max_to_wake >= 0);
+        debug_assert!(max_to_requeue >= 0);
+
+        let Some(mut waiters) = self.blocked.futex_waiters.remove(&source) else {
+            return 0;
+        };
+        let num_woken = waiters.len().min(max_to_wake as usize);
+        let to_wake = self.choose_futex_wakees(&mut waiters, num_woken);
+        for waiter in to_wake {
+            self.wake_futex_waiter(waiter);
+        }
+
+        let num_requeued = waiters.len().min(max_to_requeue as usize);
+        let requeued = self.choose_futex_wakees(&mut waiters, num_requeued);
+        if !waiters.is_empty() {
+            self.blocked.futex_waiters.insert(source, waiters);
+        }
+        if !requeued.is_empty() {
+            self.blocked
+                .futex_waiters
+                .entry(target)
+                .or_default()
+                .extend(requeued);
+        }
+        trace!(
+            "[detcore, dtid {}] requeued {} futex waiters and woke {}",
+            waker_dettid, num_requeued, num_woken
+        );
+        (num_woken + num_requeued) as u64
+    }
+
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review atomic two-queue wake scheduling.
+    /// Wake waiters from two futex queues as one scheduler action.
+    pub fn wake_futex_waiters_two(
+        &mut self,
+        waker_dettid: DetTid,
+        first: FutexID,
+        second: FutexID,
+        max_first: i32,
+        max_second: i32,
+    ) -> u64 {
+        debug_assert!(max_first >= 0);
+        debug_assert!(max_second >= 0);
+        let first_woken = self.wake_futex_waiters(waker_dettid, first, max_first, u32::MAX);
+        let second_woken = self.wake_futex_waiters(waker_dettid, second, max_second, u32::MAX);
+        first_woken + second_woken
+    }
+
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
     pub fn wake_futex_child_cleartid(&mut self, futid: FutexID, dettid: DetTid) {
         debug!(
@@ -2602,6 +2660,42 @@ mod test {
         assert_eq!(waiters.len(), 1, "nonmatching waiters must remain queued");
     }
 
+    #[test]
+    fn futex_requeue_wakes_then_moves_a_bounded_subset() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let mm = MmId::initial(DetTid::from_raw(1));
+        let source = FutexID::private(mm, 0x1000);
+        let target = FutexID::private(mm, 0x2000);
+        for raw_tid in [1, 2] {
+            let dettid = DetTid::from_raw(raw_tid);
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX);
+        }
+
+        assert_eq!(
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), source, target, 1, 1),
+            2
+        );
+        assert!(!scheduler.blocked.futex_waiters.contains_key(&source));
+        assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
+        assert_eq!(scheduler.run_queue.len(), 1);
+
+        assert_eq!(
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), target, target, 0, 1),
+            1
+        );
+        assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
+    }
     #[test]
     fn test_my_thread_group1() {
         let mut tree: ThreadTree = Default::default();

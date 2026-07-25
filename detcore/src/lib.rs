@@ -635,6 +635,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::arch_prctl,
                 Sysno::ioctl,
                 Sysno::futex,
+                Sysno::futex_requeue,
+                Sysno::futex_wait,
+                Sysno::futex_waitv,
+                Sysno::futex_wake,
+                Sysno::get_robust_list,
+                Sysno::set_robust_list,
                 Sysno::clone,
                 Sysno::clone3,
                 Sysno::fork,
@@ -1001,6 +1007,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
+                    robust_list_head: None,
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -1081,6 +1088,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        guest.thread_state_mut().robust_list_head = None;
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
@@ -1233,6 +1241,34 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
 
         let res = match classify_syscall(call.number()) {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 dispatch until Reverie has typed ABIs.
+            SyscallClassification::Determinized
+                if matches!(
+                    call.number(),
+                    Sysno::futex_requeue
+                        | Sysno::futex_wait
+                        | Sysno::futex_waitv
+                        | Sysno::futex_wake
+                ) =>
+            {
+                if !self.cfg.sequentialize_threads {
+                    self.passthrough(guest, call).await
+                } else {
+                    let (number, args) = call.into_parts();
+                    match number {
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        Sysno::futex_requeue => self.handle_futex2_requeue(guest, args).await,
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        Sysno::futex_wait => self.handle_futex2_wait(guest, args).await,
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        Sysno::futex_waitv => self.handle_futex2_waitv(args),
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        Sysno::futex_wake => self.handle_futex2_wake(guest, args).await,
+                        _ => unreachable!(),
+                    }
+                }
+            }
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {
@@ -1267,6 +1303,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
                 Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
                 Syscall::Futex(s) => self.handle_futex(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::GetRobustList(s) => self.handle_get_robust_list(guest, s),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
 
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
@@ -1504,7 +1544,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Rmdir(_)
                 | Syscall::RtSigreturn(_)
                 | Syscall::Setxattr(_)
-                | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_)
                 | Syscall::Symlinkat(_)

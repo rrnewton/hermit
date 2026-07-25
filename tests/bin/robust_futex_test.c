@@ -13,11 +13,9 @@
  *   cc -O2 -Wall -Wextra -Werror -pthread \
  *     tests/bin/robust_futex_test.c -o robust_futex_test
  *
- * Native Linux must print PASS and exit 0. Under Hermit's precise futex model,
- * the waiter is held in Detcore's queue rather than the kernel futex queue.
- * Kernel robust-list cleanup marks the mutex FUTEX_OWNER_DIED, but its internal
- * wake cannot reach Detcore's waiter. The strict run therefore exposes the
- * missing owner-death bridge instead of printing PASS.
+ * Native Linux and Hermit strict verification must print both PASS lines and
+ * exit 0. The test covers Detcore's precise robust owner-death bridge, legacy
+ * futex requeue/wake-op handling, and the U32 futex2 wait/wake/requeue ABIs.
  */
 
 #define _GNU_SOURCE
@@ -33,6 +31,26 @@
 #include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef SYS_futex_wake
+#define SYS_futex_wake 454
+#endif
+#ifndef SYS_futex_wait
+#define SYS_futex_wait 455
+#endif
+#ifndef SYS_futex_requeue
+#define SYS_futex_requeue 456
+#endif
+#ifndef FUTEX2_SIZE_U32
+#define FUTEX2_SIZE_U32 2U
+#endif
+
+struct futex_waitv_local {
+  uint64_t val;
+  uint64_t uaddr;
+  uint32_t flags;
+  uint32_t reserved;
+};
 
 #if !defined(__GLIBC__)
 #error "This reproducer relies on glibc's pthread_mutex_t futex word layout"
@@ -137,6 +155,60 @@ static void *waiter_thread(void *unused) {
   return NULL;
 }
 
+static void check_futex_variants(void) {
+  int source = 0;
+  int target = 7;
+
+  long result = syscall(SYS_futex, &source, FUTEX_CMP_REQUEUE_PRIVATE, 0,
+                        (void *)(uintptr_t)1, &target, 0);
+  if (result != 0) {
+    perror("FUTEX_CMP_REQUEUE_PRIVATE");
+    exit(EXIT_FAILURE);
+  }
+
+  int operation = FUTEX_OP(FUTEX_OP_ADD, 2, FUTEX_OP_CMP_EQ, 7);
+  result = syscall(SYS_futex, &source, FUTEX_WAKE_OP_PRIVATE, 0, NULL,
+                   &target, operation);
+  if (result != 0 || target != 9) {
+    fprintf(stderr, "FUTEX_WAKE_OP_PRIVATE: result=%ld target=%d\n", result,
+            target);
+    exit(EXIT_FAILURE);
+  }
+
+  const uint32_t futex2_flags = FUTEX2_SIZE_U32 | FUTEX_PRIVATE_FLAG;
+  errno = 0;
+  result = syscall(SYS_futex_wait, &source, 1UL, UINT32_MAX, futex2_flags,
+                   NULL, -1);
+  if (result != -1 || errno != EAGAIN) {
+    fprintf(stderr, "futex_wait mismatch: result=%ld errno=%d\n", result,
+            errno);
+    exit(EXIT_FAILURE);
+  }
+
+  result = syscall(SYS_futex_wake, &source, (unsigned long)UINT32_MAX, 1,
+                   futex2_flags);
+  if (result != 0) {
+    perror("futex_wake");
+    exit(EXIT_FAILURE);
+  }
+
+  struct futex_waitv_local waiters[2] = {
+      {.val = 0,
+       .uaddr = (uintptr_t)&source,
+       .flags = futex2_flags,
+       .reserved = 0},
+      {.val = 0,
+       .uaddr = (uintptr_t)&target,
+       .flags = futex2_flags,
+       .reserved = 0},
+  };
+  result = syscall(SYS_futex_requeue, waiters, 0, 0, 1);
+  if (result != 0) {
+    perror("futex_requeue");
+    exit(EXIT_FAILURE);
+  }
+}
+
 static void check_pthread(int ret, const char *operation) {
   if (ret != 0) {
     fprintf(stderr, "%s: %d\n", operation, ret);
@@ -172,6 +244,8 @@ int main(void) {
   }
 
   check_pthread(pthread_mutex_destroy(&mutex), "pthread_mutex_destroy");
+  check_futex_variants();
   puts("PASS: robust mutex waiter received EOWNERDEAD");
+  puts("PASS: legacy and futex2 variants handled deterministically");
   return EXIT_SUCCESS;
 }
