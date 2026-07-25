@@ -200,6 +200,8 @@ impl Recorder {
                         fd,
                         &bytes,
                     ),
+                    replay_kernel_side_effect: self
+                        .fd_requires_replay_kernel_side_effect(guest.pid(), fd),
                     bytes,
                 }))
             }),
@@ -228,6 +230,8 @@ impl Recorder {
                         &buf,
                     ),
                     bytes: buf,
+                    replay_kernel_side_effect: self
+                        .fd_requires_replay_kernel_side_effect(guest.pid(), syscall.fd()),
                 }))
             }),
         );
@@ -311,6 +315,9 @@ impl Recorder {
             && metadata.is_some_and(|metadata| {
                 metadata.file_type().is_fifo() || metadata.file_type().is_socket()
             });
+        let replay_kernel_side_effect = result.is_ok()
+            && output_fd.is_none()
+            && self.fd_requires_replay_kernel_side_effect(guest.pid(), syscall.fd());
         self.record_event(
             guest,
             Ok(SyscallEvent::WriteV2(WriteEvent {
@@ -319,6 +326,7 @@ impl Recorder {
                 output_offset,
                 generated_sigpipe,
                 advances_output_offset,
+                replay_kernel_side_effect,
             })),
         );
 

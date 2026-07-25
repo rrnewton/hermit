@@ -14,6 +14,8 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Fcntl;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
@@ -282,17 +284,64 @@ fn read_write_bytes<M: MemoryAccess>(
     }
 }
 
+async fn inject_kernel_side_effect<G: Guest<Replayer>>(
+    guest: &mut G,
+    fd: libc::c_int,
+    syscall: Syscall,
+) -> Result<i64, Errno> {
+    let result = guest.inject(syscall).await;
+    if result != Err(Errno::EAGAIN) {
+        return result;
+    }
+
+    let flags = guest
+        .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFL))
+        .await? as libc::c_int;
+    if flags & libc::O_NONBLOCK == 0 {
+        return result;
+    }
+    guest
+        .inject(
+            Fcntl::new()
+                .with_fd(fd)
+                .with_cmd(FcntlCmd::F_SETFL(flags & !libc::O_NONBLOCK)),
+        )
+        .await?;
+    let result = guest.inject(syscall).await;
+    let restored = guest
+        .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_SETFL(flags)))
+        .await;
+    assert_eq!(restored, Ok(0), "failed to restore replay fd flags");
+    result
+}
+
 impl Replayer {
     /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
     /// scattering the recorded flattened output bytes across the guest's current
-    /// `iovec` buffers, without touching any live descriptor.
+    /// `iovec` buffers. Guest-created pipes and eventfds are also read live so
+    /// their kernel state remains aligned with the recording.
     pub(super) async fn handle_readv_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
         iov_addr: Option<usize>,
         iovcnt: usize,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadvV2)?;
+        if event.replay_kernel_side_effect {
+            let fd = match syscall {
+                Syscall::Readv(call) => call.fd(),
+                Syscall::Preadv(call) => call.fd(),
+                Syscall::Preadv2(call) => call.fd(),
+                _ => unreachable!("readv-family handler received {syscall:?}"),
+            };
+            let actual = inject_kernel_side_effect(guest, fd, syscall).await;
+            assert_eq!(
+                actual,
+                Ok(event.bytes.len() as i64),
+                "replayed readv kernel side effect diverged"
+            );
+        }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
         }
@@ -307,6 +356,14 @@ impl Replayer {
         syscall: Read,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadV2)?;
+        if event.replay_kernel_side_effect {
+            let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
+            assert_eq!(
+                actual,
+                Ok(event.bytes.len() as i64),
+                "replayed read kernel side effect diverged"
+            );
+        }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
         }
@@ -442,6 +499,14 @@ impl Replayer {
         syscall: WriteFamily,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, WriteV2)?;
+        if event.replay_kernel_side_effect {
+            let actual =
+                inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
+            assert_eq!(
+                actual, event.result,
+                "replayed write kernel side effect diverged"
+            );
+        }
         if event.generated_sigpipe {
             self.replay_sigpipe(guest).await?;
         }

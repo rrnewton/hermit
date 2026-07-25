@@ -353,6 +353,24 @@ fn record_mkdir_and_rmdir_side_effects() {
 }
 
 #[test]
+fn record_nested_mkdir_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "nested-mkdir-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-nested-mkdir; rm -rf \"$root\"; mkdir -p \"$root/a/b\"; test -d \"$root/a/b\"; printf 'nested-mkdir-ok\\n'; rm -rf \"$root\"",
+            ),
+        ],
+    );
+}
+
+#[test]
 fn record_mkfifo_in_replay_tmp() {
     let _guard = hermit_record_lock();
     let shell = Path::new("/bin/bash");
@@ -530,6 +548,24 @@ fn record_curl_version() {
     };
 
     record_replay_command("curl", curl, &[OsStr::new("--version")]);
+}
+
+#[test]
+fn record_node_eventfd_epoll_sequence() {
+    let _guard = hermit_record_lock();
+    let node = [Path::new("/usr/bin/node"), Path::new("/usr/local/bin/node")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(node) = node else {
+        eprintln!("node is not installed; skipping eventfd/epoll record coverage");
+        return;
+    };
+
+    record_replay_command(
+        "node-eventfd-epoll-sequence",
+        node,
+        &[OsStr::new("-e"), OsStr::new("console.log(42)")],
+    );
 }
 
 /// Regression test for the SQLite record/replay Mmap-event panic.

@@ -12,7 +12,9 @@ mod network;
 mod random;
 mod time;
 
+use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -38,7 +40,17 @@ use crate::event::SyscallEvent;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventWriter;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
 struct OutputIdentity {
     device: u64,
     inode: u64,
@@ -56,6 +68,22 @@ impl OutputIdentity {
     fn matches(&self, metadata: &std::fs::Metadata) -> bool {
         self.device == metadata.dev() && self.inode == metadata.ino()
     }
+}
+
+fn inherited_pipe_identities(pid: Pid) -> BTreeSet<OutputIdentity> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw())) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.file_type().is_fifo().then_some(OutputIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        })
+        .collect()
 }
 fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
     let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
@@ -113,6 +141,8 @@ pub struct Recorder {
     /// Physical output endpoints inherited by the root guest.
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
+    /// Pipes inherited from the Hermit launcher are external inputs/outputs, not guest IPC.
+    inherited_pipes: BTreeSet<OutputIdentity>,
     /// Stable regular-file OFDs used for offset aliasing checks.
     #[serde(skip)]
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
@@ -130,6 +160,7 @@ impl Tool for Recorder {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
+            inherited_pipes: inherited_pipe_identities(pid),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
         }
@@ -363,6 +394,50 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    fn fd_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
+        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
+        if std::fs::read_link(&path)
+            .ok()
+            .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
+        {
+            return true;
+        }
+
+        let Some(identity) = std::fs::metadata(path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_fifo())
+            .map(|metadata| OutputIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        else {
+            return false;
+        };
+        !self.inherited_pipes.contains(&identity)
+    }
+
+    fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
+        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", pid.as_raw()))
+        else {
+            return false;
+        };
+        let targets = fdinfo.lines().filter_map(|line| {
+            line.strip_prefix("tfd:")?
+                .split_whitespace()
+                .next()?
+                .parse::<libc::c_int>()
+                .ok()
+        });
+        let mut saw_target = false;
+        for target in targets {
+            saw_target = true;
+            if !self.fd_requires_replay_kernel_side_effect(pid, target) {
+                return false;
+            }
+        }
+        saw_target
+    }
+
     pub(super) fn output_ofd_matches(
         &self,
         output_fd: libc::c_int,

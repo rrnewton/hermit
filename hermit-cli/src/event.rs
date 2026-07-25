@@ -101,6 +101,8 @@ pub struct ReadEvent {
     pub bytes: Vec<u8>,
     /// Number of pending SIGPIPE instances consumed by this signalfd read.
     pub consumed_sigpipe_count: u64,
+    /// Whether replay must execute the read to advance a guest-created kernel object.
+    pub replay_kernel_side_effect: bool,
 }
 
 /// Recorded result and side effects of a write-family syscall.
@@ -116,6 +118,8 @@ pub struct WriteEvent {
     pub advances_output_offset: bool,
     /// Whether the kernel generated SIGPIPE together with EPIPE.
     pub generated_sigpipe: bool,
+    /// Whether replay must execute a successful write to advance a guest-created kernel object.
+    pub replay_kernel_side_effect: bool,
 }
 
 /// Recorded result and captured-output side effect of ftruncate.
@@ -192,6 +196,8 @@ pub struct EpollWaitEvent {
     pub events: Vec<u8>,
     /// The number of initialized events in the buffer.
     pub updated: usize,
+    /// Whether replay must wait on the guest-created kernel epoll set.
+    pub replay_kernel_side_effect: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -135,14 +135,20 @@ impl Tool for Replayer {
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
             Syscall::Readv(syscall) => {
-                self.handle_readv_family(guest, syscall.iov().map(|a| a.as_raw()), syscall.len())
-                    .await
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.len(),
+                    syscall.into(),
+                )
+                .await
             }
             Syscall::Preadv(syscall) => {
                 self.handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len(),
+                    syscall.into(),
                 )
                 .await
             }
@@ -151,6 +157,7 @@ impl Tool for Replayer {
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len() as usize,
+                    syscall.into(),
                 )
                 .await
             }

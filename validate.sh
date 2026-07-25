@@ -255,7 +255,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly RR_COMPAT_EXPECTED=130
+readonly RR_COMPAT_EXPECTED=132
 # The prior 115/121 floor plus 25 passing additions in the current corpus.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=140
@@ -281,7 +281,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [tsort]=1 [ptx]=1 [pinky]=1 [logname]=1 [users]=1 [uptime]=1
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
-    [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1
+    [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
     [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
