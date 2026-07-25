@@ -710,16 +710,40 @@ impl Replayer {
             ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
         ) {
             let snapshot = next_event!(guest, FileClone)?;
-            if self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
-                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+            let source_fd = match request {
+                ioctl::Request::FICLONE(fd) => Some(fd),
+                ioctl::Request::FICLONERANGE(Some(range)) => guest
+                    .memory()
+                    .read_value(range)
+                    .ok()
+                    .map(|range: libc::file_clone_range| range.src_fd as libc::c_int),
+                ioctl::Request::FICLONERANGE(None) => None,
+                _ => unreachable!(),
+            };
+            let destination_is_internal = self.fd_is_in_replay_root(guest.pid(), syscall.fd());
+            let source_is_internal =
+                source_fd.is_some_and(|fd| self.fd_is_in_replay_root(guest.pid(), fd));
+            if destination_is_internal && source_is_internal {
+                let actual = guest.inject(syscall).await;
+                assert_eq!(actual, Ok(0), "replayed physical clone diverged");
+            } else if destination_is_internal {
+                let extents = snapshot.extents.unwrap_or_else(|| {
+                    panic!(
+                        "clone snapshot unavailable and source fd {:?} is not materialized",
+                        source_fd
+                    )
+                });
+                let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
                     .unwrap_or_else(|error| {
-                        panic!("failed to duplicate cloned replay file: {error}")
+                        panic!("failed to open cloned replay destination {path}: {error}")
                     });
-                let file = std::fs::File::from(duplicate);
                 file.set_len(0)
                     .and_then(|()| file.set_len(snapshot.length))
                     .unwrap_or_else(|error| panic!("failed to size cloned replay file: {error}"));
-                for extent in snapshot.extents {
+                for extent in extents {
                     file.write_all_at(&extent.bytes, extent.offset)
                         .unwrap_or_else(|error| {
                             panic!("failed to materialize cloned replay extent: {error}")

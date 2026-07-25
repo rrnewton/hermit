@@ -169,7 +169,7 @@ pub struct FileCloneEvent {
     /// Final logical destination length.
     pub length: u64,
     /// Allocated data extents in the final destination image.
-    pub extents: Vec<FileExtent>,
+    pub extents: Option<Vec<FileExtent>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

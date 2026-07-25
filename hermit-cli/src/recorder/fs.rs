@@ -193,10 +193,12 @@ fn read_dense_clone_snapshot(file: &std::fs::File, length: u64) -> std::io::Resu
     file.read_exact_at(&mut bytes, 0)?;
     Ok(FileCloneEvent {
         length,
-        extents: (!bytes.is_empty())
-            .then_some(FileExtent { offset: 0, bytes })
-            .into_iter()
-            .collect(),
+        extents: Some(
+            (!bytes.is_empty())
+                .then_some(FileExtent { offset: 0, bytes })
+                .into_iter()
+                .collect(),
+        ),
     })
 }
 
@@ -264,7 +266,10 @@ fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
         cursor = hole;
     }
 
-    Ok(FileCloneEvent { length, extents })
+    Ok(FileCloneEvent {
+        length,
+        extents: Some(extents),
+    })
 }
 
 impl Recorder {
@@ -564,7 +569,20 @@ impl Recorder {
         ) {
             let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
             let snapshot = clone_snapshot(&path).unwrap_or_else(|error| {
-                panic!("failed to snapshot cloned destination {path}: {error}")
+                let length = std::fs::metadata(&path)
+                    .unwrap_or_else(|metadata_error| {
+                        panic!("failed to stat cloned destination {path}: {metadata_error}")
+                    })
+                    .len();
+                tracing::warn!(
+                    %error,
+                    length,
+                    "clone snapshot unavailable; replay requires physical source and destination"
+                );
+                FileCloneEvent {
+                    length,
+                    extents: None,
+                }
             });
             self.record_event(guest, Ok(SyscallEvent::FileClone(snapshot)));
         } else if matches!(
