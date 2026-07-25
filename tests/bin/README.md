@@ -1,8 +1,8 @@
 # Manual C regression programs
 
-These programs are focused reproducers that are not part of the generated
-Cargo test manifest. Build their executables outside the source tree or remove
-them before committing.
+These programs are focused reproducers. Build their executables outside the
+source tree or remove them before committing. The robust-futex reproducer is
+also compiled by `hermit-cli/tests/threading_syscalls.rs`.
 
 ## Robust futex owner death
 
@@ -35,64 +35,25 @@ On x86_64 Linux with glibc, the control exits 0:
 ```text
 $ timeout 10s ./robust_futex_test
 PASS: robust mutex waiter received EOWNERDEAD
+PASS: legacy and futex2 variants handled deterministically
 ```
 
-### Current strict result
+### Hermit strict verification
 
-At fork `main` commit `46836669bd6c2f7151fbe65c55f4ea5bd1440897`, the
-requested strict run does not reach L1 (ptrace backend, default log level,
-relaxations: none):
+The default precise futex model now mirrors each thread's robust-list head and
+performs deterministic owner-death cleanup before the host thread exits. The
+regression reaches L2 (ptrace backend, log level off, relaxations: none):
 
 ```text
-$ timeout 10s target/release/hermit run --strict -- ./robust_futex_test
-thread 'main' (1) panicked at detcore/src/scheduler.rs:1631:17:
-Deadlock detected: thread(s) waiting on futex, but no runnable threads left.
-```
-
-The host timeout exits 124 because the scheduler panic does not terminate all
-stopped tracees. A DEBUG capture makes the missing bridge explicit:
-
-```bash
-timeout 20s target/release/hermit --log debug run --strict -- \
-  ./robust_futex_test 2>/tmp/robust-futex-owner-death-debug.log
-```
-
-The waiter (`dtid 7`) blocks on the robust mutex word:
-
-```text
-inbound syscall: futex(0x404100, 0, -2147483643, NULL, NULL, 4210976) = ?
-```
-
-The owner (`dtid 5`) then exits. Detcore logs only its modeled
-`CLONE_CHILD_CLEARTID` wake, at a different futex address. The scheduler's
-deadlock dump still contains `dtid 7` in `futex_waiters` at address `4210944`
-(`0x404100`). Linux kernel robust-list cleanup updated the mutex and issued an
-internal kernel wake, but that wake could not reach Detcore's emulated waiter
-queue.
-
-### Polling-mode diagnostic
-
-Polling mode observes the kernel's owner-death word update instead of relying
-on Detcore's precise waiter queue. It reaches L2 (ptrace backend, ERROR log
-level, `--debug-futex-mode polling`, no determinism relaxations):
-
-```text
-$ timeout 20s target/release/hermit --log error run --strict --verify \
-    --debug-futex-mode polling -- ./robust_futex_test
-:: Run1...
-:: Run2...
-Logs contain 531 | 531 messages total
-Logs contain 294 | 294 DETLOG & scheduler COMMIT messages
-Done processing logs, no substantive differences found.
+$ timeout --kill-after 5s 30s target/release/hermit --log=off run \
+    --strict --verify --base-env=minimal --max-timeslice=disabled \
+    --tmp=/tmp -- ./robust_futex_test
 :: Success: deterministic. Determinism verified.
 ```
 
-This control confirms that kernel robust-list cleanup updates the mutex word
-correctly. It does not fix the default precise mode, where the kernel wake and
-Detcore's emulated waiter queue remain disconnected.
+The same fixture also probes legacy `FUTEX_CMP_REQUEUE` and `FUTEX_WAKE_OP`,
+plus the U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces.
 
-After the robust-list bridge is implemented, the strict command above should
-exit 0 and print the same PASS line as the native control.
 # POSIX timer signal-delivery probe
 
 `posix_timer_test.c` arms a one-shot `CLOCK_MONOTONIC` POSIX timer for

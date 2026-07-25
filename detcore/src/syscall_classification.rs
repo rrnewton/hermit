@@ -71,11 +71,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::futex
+        // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex2 classification.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_requeue
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_wait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_waitv
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_wake
         | Sysno::futimesat
         | Sysno::getcpu
         | Sysno::getdents
         | Sysno::getdents64
         | Sysno::getrandom
+        // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic robust-list classification.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::get_robust_list
         | Sysno::getrusage
         | Sysno::gettimeofday
         | Sysno::inotify_add_watch
@@ -119,6 +131,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sendmsg
         | Sysno::sendto
         | Sysno::setsid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::set_robust_list
         | Sysno::signalfd
         | Sysno::signalfd4
         | Sysno::socket
@@ -166,7 +180,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lseek
         | Sysno::mprotect
         | Sysno::readlink
-        | Sysno::set_robust_list
         | Sysno::set_tid_address
         | Sysno::sigaltstack
         // capget/capset/getgroups observe or update kernel credential state that starts
@@ -270,13 +283,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fsmount
         | Sysno::fsopen
         | Sysno::fspick
-        | Sysno::futex_requeue
-        | Sysno::futex_wait
-        | Sysno::futex_waitv
-        | Sysno::futex_wake
         | Sysno::get_kernel_syms
         | Sysno::get_mempolicy
-        | Sysno::get_robust_list
         | Sysno::get_thread_area
         | Sysno::getitimer
         | Sysno::getpeername
@@ -476,12 +484,26 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 49, 214]);
+        assert_eq!(counts, [116, 43, 214]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
     #[test]
     fn representative_policies_stay_in_their_reviewed_sections() {
+        for sysno in [
+            Sysno::futex_requeue,
+            Sysno::futex_wait,
+            Sysno::futex_waitv,
+            Sysno::futex_wake,
+            Sysno::get_robust_list,
+            Sysno::set_robust_list,
+        ] {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno} must stay on the threading handler path"
+            );
+        }
         assert_eq!(
             classify_syscall(Sysno::futex),
             SyscallClassification::Determinized
