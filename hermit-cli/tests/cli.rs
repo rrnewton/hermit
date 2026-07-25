@@ -500,12 +500,12 @@ fn run_dbi_verifies_pipe_backpressure() {
         "--",
         "/bin/bash",
         "-c",
-        "printf x | grep x | wc -l",
+        r#"{ printf "%4096s" x; for _ in {1..100000}; do :; done; printf "%1371s" y; } | wc -c"#,
     ];
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "1\n");
+    assert_eq!(stdout(&output), "5467\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
         "DBI determinism confirmation missing:\n{}",
