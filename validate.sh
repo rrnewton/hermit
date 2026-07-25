@@ -2326,9 +2326,7 @@ function run_hosted_only_suite {
     run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
     run_check "Portable working-envelope levels" run_hosted_envelope_levels
 
-    if ! run_strict_compatibility_envelope; then
-        printf "WARNING: Strict compatibility regressions remain informational.\n"
-    fi
+    run_check "Strict compatibility envelope" run_strict_compatibility_envelope
 
     wait_for_background_checks
     print_summary
