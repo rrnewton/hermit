@@ -37,6 +37,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
+#   ./validate.sh --e9patch-compat-only       # measure the e9patch L2 app matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -69,6 +70,7 @@ function select_validation_level {
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
+E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -96,6 +98,8 @@ while [[ $# -gt 0 ]]; do
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
+        # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
+        --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -113,6 +117,7 @@ only_modes=0
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -127,6 +132,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
+((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 
 case "$VALIDATION_PROFILE" in
@@ -137,6 +143,7 @@ case "$VALIDATION_PROFILE" in
     strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
+    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
 esac
@@ -169,7 +176,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY E9PATCH_COMPAT_ONLY
+readonly QEMU_L2_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -256,11 +264,17 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
-# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=140
-readonly SABRE_COMPAT_TOTAL=147
+readonly SABRE_COMPAT_EXPECTED=151
+readonly SABRE_COMPAT_TOTAL=151
+readonly E9PATCH_COMPAT_TOTAL=151
 COMPATIBILITY_MODE=strict
+E9PATCH_COMPAT_REWRITTEN=0
+E9PATCH_COMPAT_ZERO_SITE=0
+E9PATCH_COMPAT_CANDIDATE_ONLY=0
+E9PATCH_COMPAT_NON_ELF=0
+E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
 # strict corpus below; this set only selects the rows known to pass R/R.
@@ -995,10 +1009,14 @@ function strict_compatibility_probe {
     local status
     local summary
     local assurance=L2
+    local backend_diagnostic=""
     local -a run_args=(run --strict --verify --)
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
         run_args=(run --backend sabre --strict --verify --)
+    elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        assurance="e9patch L2"
+        run_args=(run --backend e9patch --strict --verify --)
     fi
 
     {
@@ -1032,6 +1050,24 @@ function strict_compatibility_probe {
         printf "Exit: %s\n" "$status"
         printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
     } >>"$LOG_FILE"
+
+    if [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        backend_diagnostic=$(sed -n "${output_start},\$p" "$LOG_FILE" |
+            grep -m1 '^:: Backend: e9patch' || true)
+        if [[ $backend_diagnostic == *"main_executable=non-ELF"* ]]; then
+            ((E9PATCH_COMPAT_NON_ELF += 1))
+        elif [[ $backend_diagnostic =~ candidate_sites=([0-9]+).*mapped_sites=([0-9]+) ]]; then
+            if ((BASH_REMATCH[2] > 0)); then
+                ((E9PATCH_COMPAT_REWRITTEN += 1))
+            elif ((BASH_REMATCH[1] > 0)); then
+                ((E9PATCH_COMPAT_CANDIDATE_ONLY += 1))
+            else
+                ((E9PATCH_COMPAT_ZERO_SITE += 1))
+            fi
+        else
+            ((E9PATCH_COMPAT_NO_DIAGNOSTIC += 1))
+        fi
+    fi
     return "$status"
 }
 
@@ -1063,6 +1099,9 @@ function run_compatibility_corpus {
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         printf "\n== SaBRe compatibility ratchet (blocking floor) ==\n"
         printf "=== SaBRe compatibility ratchet (blocking floor) ===\n" >>"$LOG_FILE"
+    elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        printf "\n== e9patch compatibility matrix (L2) ==\n"
+        printf "=== e9patch compatibility matrix (L2) ===\n" >>"$LOG_FILE"
     else
         printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
         printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
@@ -1099,6 +1138,9 @@ function run_compatibility_corpus {
     strict_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe jq /usr/bin/jq -c -n \
+        '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
     strict_compatibility_probe bash bash -c \
@@ -1108,12 +1150,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe java java -version \
+    functional_compatibility_probe java java \
+        -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
+        'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
+        file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
@@ -1167,6 +1216,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe zstd bash -c \
         'zstd -q -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe zip-unzip bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe openssl openssl dgst -sha256 /etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1245,7 +1297,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe mktemp bash -c \
-        'd=$(mktemp -d /tmp/hermit-compat.XXXXXX) && basename "$d" && rmdir "$d"' \
+        'set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d "$d"; rmdir "$d"; printf "mktemp-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1299,17 +1351,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
-    strict_compatibility_probe taskset bash -c 'taskset -p $$' \
+    strict_compatibility_probe taskset bash -c \
+        'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    strict_compatibility_probe chrt bash -c 'chrt -p $$' \
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe flock bash -c \
         'set -euo pipefail; rm -f /tmp/hermit-compat-flock; flock -x /tmp/hermit-compat-flock -c "printf \"flock-ok\\n\""; rm -f /tmp/hermit-compat-flock' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Exercise logger formatting without writing to a host logging service.
-    strict_compatibility_probe logger /usr/bin/logger --stderr --no-act \
-        -t hermit-compat logger-ok \
+    # Capture logger's wall-clock prefix and assert only its semantic payload.
+    strict_compatibility_probe logger bash -c \
+        'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe getopt /usr/bin/getopt -o ab: -- -a -b value \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1420,7 +1474,7 @@ function run_compatibility_corpus {
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe shuf bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\ndelta\n" | shuf' \
+        'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1483,6 +1537,38 @@ function run_compatibility_corpus {
         return 0
     fi
 
+    if [[ $COMPATIBILITY_MODE == e9patch ]]; then
+        local classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
+            E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
+            E9PATCH_COMPAT_NO_DIAGNOSTIC))
+        printf "e9patch preprocessing: %s rewritten, %s zero-site, %s candidate-only, %s non-ELF fallback, %s without diagnostic\n" \
+            "$E9PATCH_COMPAT_REWRITTEN" "$E9PATCH_COMPAT_ZERO_SITE" \
+            "$E9PATCH_COMPAT_CANDIDATE_ONLY" "$E9PATCH_COMPAT_NON_ELF" \
+            "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+        if ((total != E9PATCH_COMPAT_TOTAL)); then
+            printf "❌ e9patch compatibility corpus selected %s rows; expected %s\n" \
+                "$total" "$E9PATCH_COMPAT_TOTAL"
+            return 1
+        fi
+        if ((classified != total)); then
+            printf "❌ e9patch compatibility classified %s rows; expected %s\n" \
+                "$classified" "$total"
+            return 1
+        fi
+        if ((E9PATCH_COMPAT_NO_DIAGNOSTIC != 0)); then
+            printf "❌ e9patch compatibility had %s rows without a backend diagnostic\n" \
+                "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+            return 1
+        fi
+        if ((failed == 0)); then
+            printf "✅ e9patch compatibility matrix (%s/%s passed L2)\n" "$passed" "$total"
+            return 0
+        fi
+        printf "❌ e9patch compatibility matrix (%s/%s passed L2, %s gaps)\n" \
+            "$passed" "$total" "$failed"
+        return 1
+    fi
+
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
         return 0
@@ -1509,6 +1595,39 @@ function run_sabre_compatibility_envelope {
     local status=0
 
     COMPATIBILITY_MODE=sabre
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+# TODO-HUMAN-REVIEW(PR-664): Review e9patch tool discovery and corpus accounting.
+function require_e9patch_artifacts {
+    local e9tool=${HERMIT_E9TOOL:-}
+    local backend=${HERMIT_E9PATCH_BACKEND:-}
+    if [[ -z $e9tool ]]; then
+        e9tool=$(command -v e9tool || true)
+    fi
+    if [[ -z $backend && -n $e9tool ]]; then
+        backend=$(dirname "$e9tool")/e9patch
+    fi
+    if [[ -z $e9tool || ! -x $e9tool ]]; then
+        printf "validate.sh: HERMIT_E9TOOL must name an executable e9tool for e9patch compatibility\n" >&2
+        return 1
+    fi
+    if [[ -z $backend || ! -x $backend ]]; then
+        printf "validate.sh: HERMIT_E9PATCH_BACKEND must name an executable e9patch backend\n" >&2
+        return 1
+    fi
+}
+
+function run_e9patch_compatibility_envelope {
+    local status=0
+    E9PATCH_COMPAT_REWRITTEN=0
+    E9PATCH_COMPAT_ZERO_SITE=0
+    E9PATCH_COMPAT_CANDIDATE_ONLY=0
+    E9PATCH_COMPAT_NON_ELF=0
+    E9PATCH_COMPAT_NO_DIAGNOSTIC=0
+    COMPATIBILITY_MODE=e9patch
     run_compatibility_corpus || status=$?
     COMPATIBILITY_MODE=strict
     return "$status"
@@ -1873,8 +1992,23 @@ if ((SABRE_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "SaBRe compatibility ratchet (147 programs)" \
+        run_check "SaBRe compatibility ratchet (151 programs)" \
             run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+if ((E9PATCH_COMPAT_ONLY == 1)); then
+    run_check "e9patch artifacts configured" require_e9patch_artifacts
+    if ((failures == 0)); then
+        run_check "Build release Hermit for e9patch compatibility" \
+            cargo build --release -p hermit
+    fi
+    if ((failures == 0)); then
+        run_check "e9patch compatibility matrix (151 programs)" \
+            run_e9patch_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
