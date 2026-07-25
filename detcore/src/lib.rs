@@ -1496,6 +1496,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Munlock(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Munlockall(_)
+                // Stable guest files make these synchronous extent and pathname operations
+                // repeatable when the namespace is not externally mutated.
+                // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Fallocate(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Readlinkat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Rename(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Renameat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Truncate(_)
                 | Syscall::Getcwd(_)
                 | Syscall::Getegid(_)
                 | Syscall::Geteuid(_)
@@ -1534,15 +1547,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
-            SyscallClassification::Unclassified => {
-                self.handle_unclassified_syscall(
-                    guest,
-                    call,
-                    dettid,
-                    config.panic_on_unsupported_syscalls,
-                )
-                .await
-            }
+            SyscallClassification::Unclassified => match call {
+                Syscall::Prctl(s) if syscalls::is_supported_prctl_option(s.option()) => {
+                    self.handle_prctl(guest, s).await
+                }
+                unexpected => {
+                    self.handle_unclassified_syscall(
+                        guest,
+                        unexpected,
+                        dettid,
+                        config.panic_on_unsupported_syscalls,
+                    )
+                    .await
+                }
+            },
         };
 
         detlog!(
