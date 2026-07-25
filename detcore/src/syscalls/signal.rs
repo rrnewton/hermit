@@ -106,7 +106,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let direct = syscalls::Kill::new()
                     .with_pid(candidate.process.as_raw())
                     .with_sig(libc::SIGKILL);
-                match guest.inject(direct).await {
+                match guest.inject_with_retry(direct).await {
                     Ok(0) => delivered_targets.extend(candidate.threads),
                     Ok(result) => info!(
                         "[detcore, dtid {}] targeted SIGKILL for process {} returned unexpected result {}",
@@ -145,7 +145,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 Ok(0)
             } else {
-                guest.inject(call).await
+                guest.inject_with_retry(call).await
             };
             if !sender_targets.is_empty() {
                 let (surviving, cancelled, woken) =

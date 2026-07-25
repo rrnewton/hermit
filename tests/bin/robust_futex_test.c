@@ -46,6 +46,9 @@
 #ifndef SYS_futex_requeue
 #define SYS_futex_requeue 456
 #endif
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif
 #ifndef FUTEX2_SIZE_U32
 #define FUTEX2_SIZE_U32 2U
 #endif
@@ -58,6 +61,20 @@ struct futex_waitv_local {
   uint64_t uaddr;
   uint32_t flags;
   uint32_t reserved;
+};
+
+struct clone_args_local {
+  uint64_t flags;
+  uint64_t pidfd;
+  uint64_t child_tid;
+  uint64_t parent_tid;
+  uint64_t exit_signal;
+  uint64_t stack;
+  uint64_t stack_size;
+  uint64_t tls;
+  uint64_t set_tid;
+  uint64_t set_tid_size;
+  uint64_t cgroup;
 };
 
 #if !defined(__GLIBC__)
@@ -881,7 +898,7 @@ static void check_caught_sigchld(void) {
 }
 
 static void check_broadcast_sigkill(void) {
-  atomic_bool *ready =
+  atomic_int *ready =
       mmap(NULL, sizeof(*ready), PROT_READ | PROT_WRITE,
            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (ready == MAP_FAILED) {
@@ -889,19 +906,36 @@ static void check_broadcast_sigkill(void) {
     exit(EXIT_FAILURE);
   }
 
-  pid_t child = fork();
+  pid_t child = syscall(SYS_clone, (unsigned long)(SIGCHLD | CLONE_UNTRACED),
+                        NULL, NULL, NULL, 0);
   if (child < 0) {
-    perror("fork broadcast target");
+    perror("clone untraced broadcast target");
     exit(EXIT_FAILURE);
   }
   if (child == 0) {
-    atomic_store_explicit(ready, true, memory_order_release);
+    atomic_fetch_add_explicit(ready, 1, memory_order_release);
     for (;;) {
       pause();
     }
   }
 
-  while (!atomic_load_explicit(ready, memory_order_acquire)) {
+  const struct clone_args_local clone3_args = {
+      .flags = CLONE_UNTRACED,
+      .exit_signal = SIGCHLD,
+  };
+  pid_t clone3_child = syscall(SYS_clone3, &clone3_args, sizeof(clone3_args));
+  if (clone3_child < 0) {
+    perror("clone3 untraced broadcast target");
+    exit(EXIT_FAILURE);
+  }
+  if (clone3_child == 0) {
+    atomic_fetch_add_explicit(ready, 1, memory_order_release);
+    for (;;) {
+      pause();
+    }
+  }
+
+  while (atomic_load_explicit(ready, memory_order_acquire) != 2) {
     sched_yield();
   }
   if (kill(-1, SIGKILL) != 0) {
@@ -909,11 +943,15 @@ static void check_broadcast_sigkill(void) {
     exit(EXIT_FAILURE);
   }
 
-  int status = 0;
-  if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
-      WTERMSIG(status) != SIGKILL) {
-    fprintf(stderr, "broadcast SIGKILL target=%#x\n", status);
-    exit(EXIT_FAILURE);
+  const pid_t targets[] = {child, clone3_child};
+  for (size_t index = 0; index < 2; ++index) {
+    int status = 0;
+    if (waitpid(targets[index], &status, 0) != targets[index] ||
+        !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+      fprintf(stderr, "broadcast SIGKILL target %d=%#x\n", targets[index],
+              status);
+      exit(EXIT_FAILURE);
+    }
   }
   if (munmap(ready, sizeof(*ready)) != 0) {
     perror("munmap broadcast state");

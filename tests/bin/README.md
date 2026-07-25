@@ -67,7 +67,10 @@ The Hermit integration test also invokes the fixture's
 waits until a child is ready, calls `kill(-1, SIGKILL)` with SIGCHLD unmasked,
 and verifies the child status at L2. It first installs a SIGCHLD handler and
 waits for a separate child event, guarding against suppression of caught
-signals, then restores the default disposition. Do not run that mode natively.
+signals, then restores the default disposition. The broadcast targets request
+`CLONE_UNTRACED` through both legacy `clone` and `clone3`; Detcore must remove
+that flag so every live guest descendant remains represented in the
+deterministic scheduler. Do not run that mode natively.
 
 # POSIX timer signal-delivery probe
 

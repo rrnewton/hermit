@@ -137,6 +137,12 @@ fn default_signal_action_terminates(signum: i32) -> bool {
     ) || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signum)
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review forced descendant tracing for complete scheduler state.
+fn sanitize_clone_flags(mut flags: CloneFlags) -> CloneFlags {
+    flags.remove(CloneFlags::CLONE_UNTRACED);
+    flags
+}
+
 // TODO-HUMAN-REVIEW(PR-659): Review futex2 U32 flag and errno policy.
 fn validate_futex2_flags(flags: u32) -> Result<bool, Errno> {
     if flags & !FUTEX2_VALID_MASK != 0 {
@@ -889,8 +895,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         clone_family: syscalls::family::CloneFamily,
     ) -> Result<i64, Error> {
-        let flags = clone_family.flags(&guest.memory());
+        let original_flags = clone_family.flags(&guest.memory());
+        let flags = sanitize_clone_flags(original_flags);
         let ctid = clone_family.child_tid(&guest.memory());
+        let mut clone3_stack_guard = None;
+        let clone_family = if flags == original_flags {
+            clone_family
+        } else {
+            info!(
+                "[detcore, dtid {}] removing CLONE_UNTRACED to keep the child under deterministic scheduling",
+                guest.thread_state().dettid
+            );
+            match clone_family {
+                syscalls::family::CloneFamily::Clone(call) => {
+                    syscalls::family::CloneFamily::Clone(call.with_flags(
+                        nix::sched::CloneFlags::from_bits_retain(flags.bits() as libc::c_int),
+                    ))
+                }
+                syscalls::family::CloneFamily::Clone3(call) => {
+                    let args_address = call.args().ok_or(Error::Errno(Errno::EFAULT))?;
+                    let mut args: syscalls::CloneArgs = guest.memory().read_value(args_address)?;
+                    args.flags = flags;
+                    let mut stack = guest.stack().await;
+                    let sanitized_args = stack.push(args);
+                    let sanitized_args = AddrMut::from_raw(sanitized_args.as_raw())
+                        .expect("stack allocation returned a null clone3 argument address");
+                    clone3_stack_guard = Some(stack.commit()?);
+                    syscalls::family::CloneFamily::Clone3(call.with_args(Some(sanitized_args)))
+                }
+                other => other,
+            }
+        };
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
         let ts = guest.thread_state_mut();
@@ -933,6 +968,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
+        drop(clone3_stack_guard);
 
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
@@ -1671,6 +1707,16 @@ mod tests {
         assert!(default_signal_action_terminates(libc::SIGRTMIN()));
         assert!(!default_signal_action_terminates(libc::SIGCHLD));
         assert!(!default_signal_action_terminates(libc::SIGSTOP));
+    }
+
+    #[test]
+    fn clone_untraced_is_removed_from_guest_flags() {
+        let flags =
+            CloneFlags::CLONE_UNTRACED | CloneFlags::CLONE_VM | CloneFlags::CLONE_CHILD_CLEARTID;
+        assert_eq!(
+            sanitize_clone_flags(flags),
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_CHILD_CLEARTID
+        );
     }
 
     #[test]
