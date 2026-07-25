@@ -1,6 +1,6 @@
 # Fail-Closed Test Status
 
-Status: fail-closed batches through terminal, signal, and timer handling complete, 2026-07-22
+Status: all currently applicable integration tests pass fail-closed, 2026-07-22
 
 Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
 Detcore into a panic instead of silently passing it through. The integration
@@ -22,41 +22,41 @@ Detcore now handles `pread64` deterministically and disables `rseq` by
 returning `ENOSYS`. Batch two adds resource-ordered `lseek` passthrough, fixed
 success for advisory `fadvise64`, and PID-namespace `getpid`/`gettid` results.
 Batch three adds explicit handling for `ioctl`, `tgkill`, `mkdir`, `setitimer`,
-`clock_settime`, `getrlimit`, `kill`, and `setsockopt`. Of the 20 tests blocked
-on batch three, 7 now pass and 13 reach later unsupported syscalls. The measured
-applicable pass count is 76/89. Remaining blockers are `getuid` (6 tests),
-`listen` (3), `rt_sigpending` (2), `setrlimit` (1), and `unlinkat` (1).
+`clock_settime`, `getrlimit`, `kill`, and `setsockopt`. Batch four closes the
+final 13 exceptions with namespace-stable identity calls, ordered socket and
+filesystem operations, kernel-backed pending-signal queries, and explicit
+resource, timer, and arbitrary-binary support. The measured applicable pass
+count is now 89/89 with no known failures.
 
 | Test target or category | Fail-closed pass | Known failure | Ignored | Mode N/A |
 | --- | ---: | ---: | ---: | ---: |
-| `arbitrary_binaries` | 0 | 1 | 0 | 1 |
+| `arbitrary_binaries` | 1 | 0 | 0 | 1 |
 | `cli` | 0 | 0 | 0 | 10 |
 | `clock_determinism` | 1 | 0 | 0 | 0 |
 | `epoll_determinism` | 5 | 0 | 0 | 0 |
-| `hermit_modes` | 53 | 10 | 8 | 0 |
+| `hermit_modes` | 63 | 0 | 8 | 0 |
 | `ipc_determinism` | 1 | 0 | 0 | 0 |
 | `mmap_determinism` | 5 | 0 | 0 | 0 |
 | `procfs_determinism` | 6 | 0 | 0 | 0 |
 | `random_determinism` | 1 | 0 | 0 | 0 |
 | `record_replay` | 0 | 0 | 0 | 17 |
-| `signal_determinism` | 3 | 2 | 0 | 0 |
+| `signal_determinism` | 5 | 0 | 0 | 0 |
 | `stress_suite` | 0 | 0 | 3 | 0 |
 | `thread_sync_determinism` | 1 | 0 | 0 | 0 |
 | Hermit library and binary unit tests | 0 | 0 | 0 | 33 |
-| **Total** | **76** | **13** | **11** | **61** |
+| **Total** | **89** | **0** | **11** | **61** |
 
-The ratchet now enables 76 fail-closed integration tests. The exact enabled set
-is the applicable inventory not present in either exception manifest; a full
-serial ratchet run verifies all 76.
+The ratchet now enables all 89 applicable fail-closed integration tests. A
+full serial ratchet run verifies the complete enabled inventory.
 
 The complete test-level matrix is represented by the table plus these
 machine-readable exception lists:
 
 - [`fail_closed_known_failures.tsv`](../hermit-cli/tests/fail_closed_known_failures.tsv)
-  records every failing target/test pair and its first observed blocker. The
-  `pread64` and `rseq` batches raised coverage from 3 to 36 tests. Batch two
-  adds 33 more passes and reclassifies 11 tests at their later blockers. Batch
-  three adds 7 more passes and reclassifies 13 tests at later blockers.
+  records failing target/test pairs and their first observed blockers. It now
+  contains no debt rows: the `pread64` and `rseq` work raised coverage from 3
+  to 36 tests, batch two reached 69, batch three reached 76, and batch four
+  enabled the remaining 13 tests.
 - [`fail_closed_allowed_ignores.tsv`](../hermit-cli/tests/fail_closed_allowed_ignores.tsv)
   records the eight PMU-dependent mode tests and three explicit stress tiers.
 - Unit tests, `cli`, and `record_replay` do not execute Detcore's `hermit run`
@@ -110,5 +110,4 @@ missing release entries; see
 
 A future true fail-closed mode must subscribe to all syscalls (or install an
 equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 76/89 to full
-coverage of the currently applicable integration inventory.
+calls that Detcore does observe and holds coverage at 89/89 for the currently applicable integration inventory.

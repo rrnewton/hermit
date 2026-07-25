@@ -196,6 +196,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Return the kernel pending-signal set after Detcore-ordered delivery.
+    pub async fn handle_rt_sigpending<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigpending,
+    ) -> Result<i64, Error> {
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
     /// rt_sigtimedwait system call
     ///
     /// This is handled by the scheduler and not passed to the record/replay layer,
