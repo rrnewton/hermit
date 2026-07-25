@@ -32,11 +32,11 @@ use crate::instruction_map::default_cache_dir;
 use crate::instruction_map::load_or_generate;
 
 /// Environment variable that overrides the e9tool executable.
-// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch tool override.
-pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
+// TODO-HUMAN-REVIEW(PR-711): Review the shared e9patch tool override.
+pub const E9TOOL_ENV: &str = "REVERIE_E9TOOL";
 /// Environment variable that overrides the e9patch backend executable.
-// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
-pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
+// TODO-HUMAN-REVIEW(PR-711): Review the shared e9patch backend override.
+pub const E9PATCH_BACKEND_ENV: &str = "REVERIE_E9PATCH_BACKEND";
 
 const REWRITE_SCHEMA_VERSION: u32 = 6;
 

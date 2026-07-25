@@ -3142,10 +3142,10 @@ function run_sabre_compatibility_envelope {
     return "$status"
 }
 
-# TODO-HUMAN-REVIEW(PR-664): Review e9patch tool discovery and corpus accounting.
+# TODO-HUMAN-REVIEW(PR-711): Review shared e9patch tool discovery.
 function require_e9patch_artifacts {
-    local e9tool=${HERMIT_E9TOOL:-}
-    local backend=${HERMIT_E9PATCH_BACKEND:-}
+    local e9tool=${REVERIE_E9TOOL:-}
+    local backend=${REVERIE_E9PATCH_BACKEND:-}
     if [[ -z $e9tool ]]; then
         e9tool=$(command -v e9tool || true)
     fi
@@ -3153,11 +3153,11 @@ function require_e9patch_artifacts {
         backend=$(dirname "$e9tool")/e9patch
     fi
     if [[ -z $e9tool || ! -x $e9tool ]]; then
-        printf "validate.sh: HERMIT_E9TOOL must name an executable e9tool for e9patch compatibility\n" >&2
+        printf "validate.sh: REVERIE_E9TOOL must name an executable e9tool for e9patch compatibility\n" >&2
         return 1
     fi
     if [[ -z $backend || ! -x $backend ]]; then
-        printf "validate.sh: HERMIT_E9PATCH_BACKEND must name an executable e9patch backend\n" >&2
+        printf "validate.sh: REVERIE_E9PATCH_BACKEND must name an executable e9patch backend\n" >&2
         return 1
     fi
 
