@@ -144,6 +144,23 @@ fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
         })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Resolve a JDK tool from the setup-java toolchain before host fallbacks.
+fn required_jdk_app(name: &str, fallbacks: &[&str]) -> PathBuf {
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let path = PathBuf::from(java_home).join("bin").join(name);
+        assert!(
+            path.is_file(),
+            "ERROR: JAVA_HOME is set but required JDK tool {} is missing",
+            path.display(),
+        );
+        return path;
+    }
+
+    required_app(name, fallbacks)
+}
+
 /// Run `hermit run --strict --verify -- <program> <args>` and assert that
 /// Hermit's verifier reports a bitwise-identical repeat run (L2).
 ///
@@ -222,7 +239,7 @@ fn redis_server_version_is_deterministic_under_strict_verify() {
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JVM"]
 fn java_version_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     assert_l2_under_strict_verify(&java, &["-version"]);
 }
 
@@ -356,7 +373,7 @@ fn compile_go(source: &str, bin_name: &str) -> PathBuf {
 /// Compile a single Java class with the host `javac`, returning the classpath
 /// directory that holds the resulting `.class`.
 fn compile_java(source: &str, class_name: &str) -> PathBuf {
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
     let dir = build_dir(class_name);
     let src = dir.join(format!("{class_name}.java"));
     fs::write(&src, source).expect("failed to write Java source");
@@ -443,24 +460,19 @@ fn go_goroutines_are_deterministic_under_strict_verify() {
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
 fn java_hello_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#651)
-    // Interpreter mode avoids nonessential JIT worker threads in this JVM
-    // runtime smoke test. JIT startup has intermittently stopped making
-    // progress under host contention on the shared self-hosted runner.
-    assert_l2_under_strict_verify(&java, &["-Xint", "-cp", classpath, "Hello"]);
+    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Hello"]);
 }
 
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
 fn java_threads_are_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-Xint", "-cp", classpath, "Threads"]);
+    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Threads"]);
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
@@ -481,7 +493,7 @@ fn javac_is_l1_deterministic_under_strict() {
     // Hermit's --verify reports it nondeterministic, so it is asserted at L1.
     // Compile into two separate output directories under --strict and compare
     // both the exit status (via `run_once_under_strict`) and the emitted class.
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
 
     let src_dir = build_dir("javac_l1_src");
     let src = src_dir.join("Hello.java");
