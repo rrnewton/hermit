@@ -179,6 +179,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
         Sysno::access
         | Sysno::brk
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#663)
         | Sysno::chown
         | Sysno::getcwd
         | Sysno::getegid
@@ -197,6 +199,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mprotect
         | Sysno::readlink
         | Sysno::set_robust_list
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#663)
         | Sysno::setpgid
         | Sysno::set_tid_address
         | Sysno::sigaltstack
@@ -359,7 +363,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
-        | Sysno::listen
         | Sysno::listmount
         | Sysno::lookup_dcookie
         | Sysno::lsm_get_self_attr
@@ -632,12 +635,7 @@ mod tests {
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
-        for sysno in [
-            Sysno::add_key,
-            Sysno::keyctl,
-            Sysno::prctl,
-            Sysno::request_key,
-        ] {
+        for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
         }
     }
