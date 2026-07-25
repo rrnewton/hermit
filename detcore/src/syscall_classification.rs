@@ -152,7 +152,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::waitid
         | Sysno::write
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#TBD)
+        // TODO-HUMAN-REVIEW(#663)
         | Sysno::clock_settime
         | Sysno::getpeername
         | Sysno::getsockname
@@ -186,7 +186,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getgid
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#TBD)
+        // TODO-HUMAN-REVIEW(#663)
         | Sysno::getpgid
         | Sysno::getpgrp
         | Sysno::getppid

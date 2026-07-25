@@ -1248,7 +1248,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#TBD)
+            // TODO-HUMAN-REVIEW(#663)
             // The pinned Reverie revision exposes process_madvise only as a raw call.
             SyscallClassification::Determinized if call.number() == Sysno::process_madvise => {
                 match call {
@@ -1573,7 +1573,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Getgroups(_)
                 | Syscall::Getpid(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#TBD)
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Getpgid(_)
                 | Syscall::Getpgrp(_)
                 | Syscall::Getppid(_)

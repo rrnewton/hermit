@@ -1267,7 +1267,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Apply a socket option to an already tracked socket. The syscall has no
     /// output buffer; record/replay captures its result and later socket I/O is
     /// still mediated by Detcore's nonblocking scheduler paths.
