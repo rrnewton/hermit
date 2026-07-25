@@ -342,6 +342,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Helper for performing a deterministic read that retries until it gets all its
     /// bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#689): Confirm partial reads take precedence over later errors.
     async fn deterministic_read<G: Guest<Self>>(
         &self,
         guest: &mut G,

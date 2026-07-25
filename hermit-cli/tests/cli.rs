@@ -489,6 +489,7 @@ fn run_dbi_verifies_shell_process_lifecycle() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
+// TODO-HUMAN-REVIEW(#689): Confirm the split-write case protects partial-read semantics.
 #[test]
 fn run_dbi_verifies_pipe_backpressure() {
     let args = [
