@@ -67,6 +67,25 @@ fn info_logging_enabled() -> bool {
     )
 }
 
+/// Returns the initial nanosecond value of Detcore's configured logical clock.
+pub fn configured_epoch_nanoseconds(config: &Config) -> io::Result<u64> {
+    let micros = config.epoch.timestamp_micros();
+    u64::try_from(micros)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Detcore DBI requires an epoch on or after 1970",
+            )
+        })?
+        .checked_mul(1_000)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Detcore DBI epoch does not fit in nanoseconds",
+            )
+        })
+}
+
 fn run_cooperative<F: Future<Output = ()>>(future: F) {
     let mut future = pin!(future);
     let waker = Waker::noop();
@@ -510,5 +529,30 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
         syscalls.write(TOTAL_SYSCALLS.load(Ordering::Relaxed));
         rewritten.write(TOTAL_REWRITTEN.load(Ordering::Relaxed));
         memory_hash.write(MEMORY_HASH.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_epoch_matches_detcore_logical_clock() {
+        assert_eq!(
+            configured_epoch_nanoseconds(&Config::default()).unwrap(),
+            1_640_995_199_000_000_000
+        );
+    }
+
+    #[test]
+    fn pre_unix_epoch_is_rejected_without_wrapping() {
+        let config = Config {
+            epoch: "1969-12-31T23:59:59Z".parse().unwrap(),
+            ..Config::default()
+        };
+
+        let error = configured_epoch_nanoseconds(&config).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("on or after 1970"));
     }
 }

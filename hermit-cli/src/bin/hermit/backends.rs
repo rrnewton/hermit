@@ -58,6 +58,7 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 pub fn run_dbi(
     program: &Path,
     args: &[String],
+    virtual_time_epoch_ns: u64,
     verify: bool,
     log: Option<LevelFilter>,
 ) -> Result<ExitStatus, Error> {
@@ -76,7 +77,8 @@ pub fn run_dbi(
                 client.display()
             ))
         })?
-        .summary(true);
+        .summary(true)
+        .virtual_time_epoch_ns(virtual_time_epoch_ns);
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
@@ -87,6 +89,7 @@ pub fn run_dbi(
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
     }
+    guest.env("TZ", "UTC0");
     guest.args(args);
 
     if !verify {

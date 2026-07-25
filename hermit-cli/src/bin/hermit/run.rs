@@ -919,6 +919,7 @@ impl RunOpts {
                 return super::backends::run_dbi(
                     &self.program,
                     &self.args,
+                    detcore_dbi::configured_epoch_nanoseconds(&self.det_opts.det_config)?,
                     self.verify,
                     global.log,
                 );

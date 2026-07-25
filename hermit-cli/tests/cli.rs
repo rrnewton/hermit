@@ -328,6 +328,40 @@ fn run_dbi_verifies_application_mmap() {
 }
 
 #[test]
+fn run_dbi_aligns_virtual_clock_and_normalizes_timezone() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--epoch=2000-01-02T03:04:05Z",
+        "--",
+        "/bin/date",
+        "+%s|%Y-%m-%dT%H:%M:%S%z|%Z",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .env("TZ", "America/Los_Angeles")
+        .env("TZDIR", "/nonexistent")
+        .output()
+        .expect("failed to run Hermit DBI clock regression");
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "946782245|2000-01-02T03:04:05+0000|UTC\n");
+    assert!(
+        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
 fn run_kvm_executes_dynamic_guest() {
     if !Path::new("/dev/kvm").exists() {
         return;

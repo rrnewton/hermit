@@ -17,3 +17,10 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie = { path = "../../worktrees_reverie/slot80/reverie" }
+reverie-dbi = { path = "../../worktrees_reverie/slot80/reverie-dbi" }
+reverie-kvm = { path = "../../worktrees_reverie/slot80/reverie-kvm" }
+reverie-ptrace = { path = "../../worktrees_reverie/slot80/reverie-ptrace" }
+reverie-syscalls = { path = "../../worktrees_reverie/slot80/reverie-syscalls" }
