@@ -484,6 +484,9 @@ impl GlobalTool for GlobalState {
                 let remaining = self.recv_register_alarm(dpid, dtid, secs, sig).await;
                 R::RegisterAlarm(remaining)
             }
+            GlobalRequest::SendSignal(dpid, m_dtid, sig) => {
+                R::SendSignal(self.recv_send_signal(dpid, m_dtid, sig).await)
+            }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -1076,6 +1079,19 @@ impl GlobalState {
         self.port_end_range.store(range[1], SeqCst);
     }
 
+    /// Deliver a `kill`/`tkill`/`tgkill` signal via the global scheduler.
+    pub async fn recv_send_signal(
+        &self,
+        detpid: DetPid,
+        m_dettid: Option<DetTid>,
+        sig: SigWrapper,
+    ) -> bool {
+        self.sched
+            .lock()
+            .unwrap()
+            .send_signal(detpid, m_dettid, sig.0)
+    }
+
     /// Register an alarm (delayed signal delivery) with the global scheduler.
     pub async fn recv_register_alarm(
         &self,
@@ -1147,6 +1163,11 @@ pub enum GlobalRequest {
     /// Basically performs an alarm syscall, takes seconds.
     RegisterAlarm(DetPid, DetTid, Seconds, SigWrapper),
 
+    /// Deliver a signal from `kill`/`tkill`/`tgkill`. The first field is the
+    /// target process; the second is `Some(tid)` for a thread-directed signal
+    /// (`tkill`/`tgkill`) or `None` for a process-directed signal (`kill`).
+    SendSignal(DetPid, Option<DetTid>, SigWrapper),
+
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
@@ -1179,6 +1200,8 @@ pub enum GlobalResponse {
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
     RegisterAlarm(Seconds),
+    /// `true` if the signal was delivered to a live target, `false` for `ESRCH`.
+    SendSignal(bool),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -1641,6 +1664,30 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Deliver a signal to `target_pid` (process-directed when `m_dettid` is `None`,
+/// thread-directed otherwise) through the global scheduler. Returns `true` if a
+/// live target received the signal, `false` if none exists (`ESRCH`).
+pub async fn send_signal<G, T>(
+    guest: &mut G,
+    target_pid: DetPid,
+    m_dettid: Option<DetTid>,
+    sig: Signal,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::SendSignal(target_pid, m_dettid, SigWrapper(sig)),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::SendSignal(delivered) => delivered,
         _ => unreachable!(),
     }
 }

@@ -26,6 +26,8 @@ use crate::syscalls::helpers::relative_timespec_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resource_request;
+use crate::tool_global::send_signal;
+use crate::types::DetPid;
 use crate::types::LogicalTime;
 
 // NB: note kernel has different notation of sigaction, we cannot
@@ -141,6 +143,120 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(guest.inject(modified_call).await?)
         } else {
             Ok(guest.inject(call).await?)
+        }
+    }
+
+    /// getpid: return the deterministic virtual process id (thread-group leader).
+    pub async fn handle_getpid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _call: syscalls::Getpid,
+    ) -> Result<i64, Error> {
+        let detpid = guest
+            .thread_state()
+            .detpid
+            .unwrap_or_else(|| guest.thread_state().dettid);
+        Ok(detpid.as_raw() as i64)
+    }
+
+    /// gettid: return the deterministic virtual thread id.
+    pub async fn handle_gettid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _call: syscalls::Gettid,
+    ) -> Result<i64, Error> {
+        Ok(guest.thread_state().dettid.as_raw() as i64)
+    }
+
+    /// kill: deliver a process-directed signal.
+    pub async fn handle_kill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Kill,
+    ) -> Result<i64, Error> {
+        let raw_pid = call.pid();
+        // Determine the target process. pid > 0 targets that process; pid == 0
+        // targets the caller's own process group, which within a single Hermit
+        // container we approximate as the caller's own process. Broadcast and
+        // arbitrary process-group targets (pid < 0) are not modeled
+        // deterministically yet.
+        let own_pid = guest
+            .thread_state()
+            .detpid
+            .unwrap_or_else(|| guest.thread_state().dettid);
+        let target_pid = if raw_pid > 0 {
+            DetPid::from_raw(raw_pid)
+        } else if raw_pid == 0 {
+            own_pid
+        } else {
+            info!(
+                "[dtid {}] kill({}, {}): process-group/broadcast signals are not yet modeled deterministically",
+                guest.thread_state().dettid,
+                raw_pid,
+                call.sig()
+            );
+            return Err(Error::Errno(Errno::ENOSYS));
+        };
+        self.deliver_kill_family(guest, target_pid, None, call.sig())
+            .await
+    }
+
+    /// tkill: deliver a thread-directed signal to a single thread.
+    pub async fn handle_tkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Tkill,
+    ) -> Result<i64, Error> {
+        let target_tid = DetPid::from_raw(call.tid());
+        // For a thread-directed signal the "process" argument is only used as a
+        // fallback; pass the target thread's own id.
+        self.deliver_kill_family(guest, target_tid, Some(target_tid), call.sig())
+            .await
+    }
+
+    /// tgkill: deliver a thread-directed signal to a thread in a thread group.
+    pub async fn handle_tgkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Tgkill,
+    ) -> Result<i64, Error> {
+        let target_pid = DetPid::from_raw(call.tgid());
+        let target_tid = DetPid::from_raw(call.tid());
+        self.deliver_kill_family(guest, target_pid, Some(target_tid), call.sig())
+            .await
+    }
+
+    /// Shared implementation for kill/tkill/tgkill: validate the signal number
+    /// and route delivery through the deterministic scheduler.
+    async fn deliver_kill_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target_pid: DetPid,
+        m_dettid: Option<DetPid>,
+        raw_sig: i32,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            // Without the scheduler engaged there is nothing to route through;
+            // preserve the prior best-effort behavior.
+            info!(
+                "[dtid {}] kill-family signal {} to {} passed through (scheduler disabled)",
+                guest.thread_state().dettid,
+                raw_sig,
+                target_pid
+            );
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
+        // A signal number of 0 performs no delivery; it only checks that the
+        // target exists. We optimistically report success.
+        if raw_sig == 0 {
+            return Ok(0);
+        }
+        let signal = Signal::try_from(raw_sig).map_err(|_| Error::Errno(Errno::EINVAL))?;
+        let delivered = send_signal(guest, target_pid, m_dettid, signal).await;
+        if delivered {
+            Ok(0)
+        } else {
+            Err(Error::Errno(Errno::ESRCH))
         }
     }
 

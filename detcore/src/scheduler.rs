@@ -1301,6 +1301,82 @@ impl Scheduler {
         }
     }
 
+    /// Deliver a signal synchronously in response to a guest `kill`/`tkill`/`tgkill`.
+    ///
+    /// Unlike [`Self::signal_guest`], the target here may be the currently running
+    /// thread (a thread signalling itself) or a thread that is actively
+    /// busy-polling, so this does not assume the target is parked in the
+    /// scheduler. The signal is made physically pending on the target thread and,
+    /// if the target is otherwise blocked, it is force-unblocked so that it gets
+    /// scheduled and picks the signal up. Returns `false` if no live target
+    /// exists (so the caller can report `ESRCH`).
+    fn deliver_signal(
+        &mut self,
+        detpid: DetPid,
+        m_dettid: Option<DetTid>,
+        signal: Signal,
+    ) -> bool {
+        let target = match self.resolve_signal_target(detpid, m_dettid) {
+            Some(t) => t,
+            None => return false,
+        };
+        debug!(
+            "[dtid {}] deliver signal {} physically to guest thread (kill family).",
+            target, signal
+        );
+        let pid = Pid::from_raw(target.as_raw()); // TODO(T78538674): virtualize pid/tid:
+        signal::kill(pid, signal).expect("signal::kill to go through");
+
+        let mut inbound = Resources::new(target);
+        inbound.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+
+        match self.thread_status(target) {
+            ThreadStatus::Gone => {
+                // Raced with target exit; nothing more to do.
+            }
+            ThreadStatus::NotRunning => {
+                // The target is blocked (e.g. in a blocking syscall or sleeping);
+                // force it back onto the run queue so it resumes and takes the
+                // signal, replacing whatever it was waiting on.
+                self.force_unblock_thread(target, inbound);
+            }
+            ThreadStatus::Running => {
+                // The target is already runnable, e.g. busy-polling a nonblocking
+                // syscall retry. It is already queued, so overwrite its pending
+                // request in place so the scheduler reports the signal on its next
+                // turn (see `unblock_guest`). Only do this when the request Ivar is
+                // readable, meaning the thread is parked awaiting a turn rather than
+                // mid-execution; otherwise the raw signal above suffices.
+                if let Some(nxt) = self.next_turns.get_mut(&target) {
+                    if nxt.req.try_read().is_some() {
+                        nxt.req = Ivar::full(Ok(inbound));
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Like [`Self::select_signal_target`] but non-panicking: returns `None` when
+    /// the requested thread or process has no live target thread.
+    fn resolve_signal_target(&self, detpid: DetPid, m_dettid: Option<DetTid>) -> Option<DetTid> {
+        if let Some(dettid) = m_dettid {
+            return match self.thread_status(dettid) {
+                ThreadStatus::Gone => None,
+                ThreadStatus::Running | ThreadStatus::NotRunning => Some(dettid),
+            };
+        }
+        // Process-directed: deliver to the group leader if it is still alive. This
+        // is an approximation of Linux semantics (which pick any thread that does
+        // not block the signal); it is correct for the common case where the group
+        // leader has the signal unblocked. TODO(T137242449): honor per-thread
+        // signal masks when choosing the target.
+        match self.thread_status(detpid) {
+            ThreadStatus::Gone => None,
+            ThreadStatus::Running | ThreadStatus::NotRunning => Some(detpid),
+        }
+    }
+
     // Force a thread out blocking and into the runnable state, replacing its resource request.
     fn force_unblock_thread(&mut self, dettid: DetTid, rsrcs: Resources) {
         info!(
@@ -2243,6 +2319,18 @@ impl Scheduler {
     }
 
     // Returns the number of seconds until any previously scheduled alarm, if any (zero otherwise).
+    /// Deliver a signal to a process (`kill`) or specific thread (`tkill`/`tgkill`).
+    /// `m_dettid` is `Some` for thread-directed signals. Returns `false` when no
+    /// live target exists, so the caller can report `ESRCH`.
+    pub fn send_signal(
+        &mut self,
+        detpid: DetPid,
+        m_dettid: Option<DetTid>,
+        sig: Signal,
+    ) -> bool {
+        self.deliver_signal(detpid, m_dettid, sig)
+    }
+
     pub fn register_alarm(
         &mut self,
         detpid: DetPid,

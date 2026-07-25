@@ -359,8 +359,12 @@ rr_test!(
     0,
     &[]
 );
-// rr_multiple_pending_signals_sequential is flaky under Hermit (intermittently
-// hangs); see docs/rr-test-suite.md.
+rr_test!(
+    rr_multiple_pending_signals_sequential,
+    "multiple_pending_signals_sequential",
+    0,
+    &[]
+);
 rr_test!(rr_munmap_discontinuous, "munmap_discontinuous", 0, &[]);
 rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
