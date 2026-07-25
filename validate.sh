@@ -264,7 +264,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=159
+readonly STRICT_COMPAT_TOTAL=164
 readonly RR_COMPAT_EXPECTED=128
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
