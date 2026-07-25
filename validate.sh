@@ -256,14 +256,14 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=132
-# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# Main's 128-row ratchet plus rmdir, mkfifo, mkdir, and node.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=140
-readonly SABRE_COMPAT_TOTAL=147
+readonly SABRE_COMPAT_EXPECTED=145
+readonly SABRE_COMPAT_TOTAL=151
 COMPATIBILITY_MODE=strict
 
-# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
-# strict corpus below; this set only selects the rows known to pass R/R.
+# Commands remain owned by the strict corpus below; this exact set only selects
+# rows measured to pass R/R.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -288,6 +288,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
 )
+# mktemp remains excluded: SIGCHLD delivery can race the command-substitution pipe EOF
+# during replay, changing deterministic log order while preserving output and exit status.
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
@@ -1099,6 +1101,9 @@ function run_compatibility_corpus {
     strict_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe jq /usr/bin/jq -c -n \
+        '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
     strict_compatibility_probe bash bash -c \
@@ -1110,10 +1115,16 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
+        'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
+        file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
@@ -1167,6 +1178,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe zstd bash -c \
         'zstd -q -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe zip-unzip bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe openssl openssl dgst -sha256 /etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1246,7 +1260,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe mktemp bash -c \
-        'd=$(mktemp -d /tmp/hermit-compat.XXXXXX) && basename "$d" && rmdir "$d"' \
+        'set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d "$d"; rmdir "$d"; printf "mktemp-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1300,17 +1314,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
-    strict_compatibility_probe taskset bash -c 'taskset -p $$' \
+    strict_compatibility_probe taskset bash -c \
+        'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    strict_compatibility_probe chrt bash -c 'chrt -p $$' \
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe flock bash -c \
         'set -euo pipefail; rm -f /tmp/hermit-compat-flock; flock -x /tmp/hermit-compat-flock -c "printf \"flock-ok\\n\""; rm -f /tmp/hermit-compat-flock' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Exercise logger formatting without writing to a host logging service.
-    strict_compatibility_probe logger /usr/bin/logger --stderr --no-act \
-        -t hermit-compat logger-ok \
+    # Capture logger's wall-clock prefix and assert only its semantic payload.
+    strict_compatibility_probe logger bash -c \
+        'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe getopt /usr/bin/getopt -o ab: -- -a -b value \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1421,7 +1437,7 @@ function run_compatibility_corpus {
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe shuf bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\ndelta\n" | shuf' \
+        'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
