@@ -347,13 +347,14 @@ static void *pending_owner_thread(void *opaque) {
   state->head.list.next = &state->head.list;
   state->head.futex_offset =
       (char *)&state->futex_word - (char *)&state->entry;
-  state->head.list_op_pending = &state->entry;
+  state->head.list_op_pending = NULL;
   if (syscall(SYS_set_robust_list, &state->head, sizeof(state->head)) != 0) {
     atomic_store_explicit(&state->owner_error,
                           OWNER_SET_ROBUST_LIST_FAILED, memory_order_release);
     atomic_store_explicit(&state->registered, true, memory_order_release);
     return thread_result(OWNER_SET_ROBUST_LIST_FAILED);
   }
+  state->head.list_op_pending = &state->entry;
   atomic_store_explicit(&state->registered, true, memory_order_release);
   while (!atomic_load_explicit(&state->waiter_entered, memory_order_acquire)) {
     sched_yield();
@@ -422,7 +423,7 @@ static void check_pending_owner_zero_sigkill_wake(void) {
     state->head.list.next = &state->head.list;
     state->head.futex_offset =
         (char *)&state->futex_word - (char *)&state->entry;
-    state->head.list_op_pending = &state->entry;
+    state->head.list_op_pending = NULL;
     if (syscall(SYS_set_robust_list, &state->head, sizeof(state->head)) != 0) {
       atomic_store_explicit(&state->owner_error,
                             OWNER_SET_ROBUST_LIST_FAILED,
@@ -430,6 +431,7 @@ static void check_pending_owner_zero_sigkill_wake(void) {
       atomic_store_explicit(&state->registered, true, memory_order_release);
       _exit(80);
     }
+    state->head.list_op_pending = &state->entry;
     atomic_store_explicit(&state->registered, true, memory_order_release);
     while (!atomic_load_explicit(&state->waiter_entered,
                                  memory_order_acquire)) {
@@ -496,6 +498,79 @@ static void check_pending_owner_zero_sigkill_wake(void) {
   }
   if (munmap(state, sizeof(*state)) != 0) {
     perror("munmap pending SIGKILL state");
+    exit(EXIT_FAILURE);
+  }
+}
+
+struct exec_owner_state {
+  struct robust_list_head head;
+  struct robust_list entry;
+  int futex_word;
+  atomic_bool registered;
+  atomic_bool waiter_entered;
+};
+
+static void check_robust_owner_exec_wake(void) {
+  struct exec_owner_state *state =
+      mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (state == MAP_FAILED) {
+    perror("mmap exec owner state");
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t owner = fork();
+  if (owner < 0) {
+    perror("fork exec owner");
+    exit(EXIT_FAILURE);
+  }
+  if (owner == 0) {
+    state->head.list.next = &state->entry;
+    state->entry.next = &state->head.list;
+    state->head.futex_offset =
+        (char *)&state->futex_word - (char *)&state->entry;
+    state->head.list_op_pending = NULL;
+    state->futex_word = (int)((unsigned int)syscall(SYS_gettid) | FUTEX_WAITERS);
+    if (syscall(SYS_set_robust_list, &state->head, sizeof(state->head)) != 0) {
+      _exit(83);
+    }
+    atomic_store_explicit(&state->registered, true, memory_order_release);
+    while (!atomic_load_explicit(&state->waiter_entered,
+                                 memory_order_acquire)) {
+      sched_yield();
+    }
+    for (int i = 0; i < 1000; ++i) {
+      sched_yield();
+    }
+    execl("/usr/bin/true", "true", NULL);
+    _exit(84);
+  }
+
+  while (!atomic_load_explicit(&state->registered, memory_order_acquire)) {
+    sched_yield();
+  }
+  int expected = atomic_load_explicit((_Atomic int *)&state->futex_word,
+                                      memory_order_acquire);
+  atomic_store_explicit(&state->waiter_entered, true, memory_order_release);
+  errno = 0;
+  long result = syscall(SYS_futex, &state->futex_word, FUTEX_WAIT, expected,
+                        NULL, NULL, 0);
+  if (result != 0) {
+    fprintf(stderr, "exec owner FUTEX_WAIT: result=%ld errno=%d\n", result,
+            errno);
+    exit(EXIT_FAILURE);
+  }
+
+  int status = 0;
+  if (waitpid(owner, &status, 0) != owner || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0 ||
+      ((unsigned int)state->futex_word & FUTEX_OWNER_DIED) == 0) {
+    fprintf(stderr, "exec owner result status=%#x word=%#x\n", status,
+            (unsigned int)state->futex_word);
+    exit(EXIT_FAILURE);
+  }
+  if (munmap(state, sizeof(*state)) != 0) {
+    perror("munmap exec owner state");
     exit(EXIT_FAILURE);
   }
 }
@@ -1205,6 +1280,7 @@ int main(int argc, char **argv) {
   check_robust_list_lookup();
   check_pending_owner_zero_wake();
   check_pending_owner_zero_sigkill_wake();
+  check_robust_owner_exec_wake();
 
   pthread_mutexattr_t attr;
   check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init");
@@ -1241,6 +1317,7 @@ int main(int argc, char **argv) {
   check_negative_process_group_sigkill();
   puts("PASS: blocked and failed signals preserved live owner");
   puts("PASS: pending owner-zero robust wake preserved word");
+  puts("PASS: robust owner exec woke modeled waiter");
   puts("PASS: robust mutex waiter received EOWNERDEAD");
   puts("PASS: sibling robust-list lookup and ESRCH semantics");
   puts("PASS: legacy and futex2 variants handled deterministically");

@@ -851,6 +851,10 @@ pub struct ThreadState<T> {
     /// Per-thread robust-futex registrations shared within this thread group.
     pub(crate) robust_list_heads: Arc<Mutex<BTreeMap<DetTid, Option<usize>>>>,
 
+    // TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity cache.
+    /// Last robust-list activity state published for this thread.
+    pub(crate) robust_list_active: bool,
+
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
@@ -996,6 +1000,7 @@ impl<T> ThreadState<T> {
             clone_flags: None,
             pending_vfork: None,
             robust_list_heads: Arc::new(Mutex::new(BTreeMap::from([(pid, None)]))),
+            robust_list_active: false,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),

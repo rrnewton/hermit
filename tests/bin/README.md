@@ -36,17 +36,20 @@ On x86_64 Linux with glibc, the control exits 0:
 $ timeout 10s ./robust_futex_test
 PASS: blocked and failed signals preserved live owner
 PASS: pending owner-zero robust wake preserved word
+PASS: robust owner exec woke modeled waiter
 PASS: robust mutex waiter received EOWNERDEAD
 PASS: sibling robust-list lookup and ESRCH semantics
 PASS: legacy and futex2 variants handled deterministically
 PASS: exit_group and fatal-signal owner death recovered
+PASS: completed SIGKILL did not wake a future futex wait
 PASS: negative process-group SIGKILL handled deterministically
 ```
 
 ### Hermit strict verification
 
-The default precise futex model now mirrors each thread's robust-list head and
-performs deterministic owner-death cleanup before the host thread exits. The
+The default precise futex model mirrors each thread's robust-list head, observes
+list activity at deterministic boundaries, and reconciles modeled waiters after
+Linux owner-death cleanup on exit, fatal signal, and successful exec. The
 regression reaches L2 (ptrace backend, log level off, relaxations: none):
 
 ```text
@@ -60,6 +63,9 @@ The same fixture blocks real waiters across legacy `FUTEX_CMP_REQUEUE` and the
 U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
 `FUTEX_WAKE_OP`, sibling `get_robust_list`, missing-thread `ESRCH`,
 process-shared `exit_group`, and external `SIGKILL` cleanup.
+The raw pending-owner cases register an initially empty `list_op_pending`, then
+mutate it in userspace before blocking; the exec case verifies that a
+process-shared waiter is released when its registered robust owner execs.
 The external `SIGKILL` case keeps an unrelated process continuously runnable
 with `sched_yield` until the robust waiter observes `EOWNERDEAD`, preventing
 reconciliation from depending on global run-queue idleness.

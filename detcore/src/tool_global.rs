@@ -505,13 +505,19 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
-            GlobalRequest::RegisterRobustPendingFutex(owner, futexid) => {
+            GlobalRequest::SetRobustListOwnerActive(owner, active) => {
                 self.sched
                     .lock()
                     .unwrap()
-                    .register_robust_pending_futex(owner, futexid);
-                R::RegisterRobustPendingFutex(())
+                    .set_robust_list_owner_active(owner, active);
+                R::SetRobustListOwnerActive(())
             }
+            GlobalRequest::CompleteRobustExec(executor, group) => R::CompleteRobustExec(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .complete_robust_exec(executor, group),
+            ),
             GlobalRequest::PrepareSigkillTarget(sender, target) => R::PrepareSigkillTarget(
                 self.sched
                     .lock()
@@ -1033,7 +1039,7 @@ impl GlobalState {
                 FutexAction::WaitRequest(deadline) => {
                     sched.prepare_sigkill_futex_recheck(dettid, futexid);
                     sched.capture_late_sigkill_futex_waiter(dettid, futexid, init_read);
-                    sched.sleep_futex_waiter(&dettid, futexid, deadline, init_read, mask);
+                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask);
                     assert!(sched.run_queue.remove_tid(dettid));
                     sched.publish_pending_sigkill_futex_wake();
                     sched.publish_completed_sigkill_futex_recheck(dettid, futexid);
@@ -1320,9 +1326,13 @@ pub enum GlobalRequest {
     /// so the scheduler can aggregate it into the final run report.
     DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
-    /// Mirror a zero-owner robust `list_op_pending` futex identity.
-    // TODO-HUMAN-REVIEW(PR-659): Review robust pending-futex registration RPC.
-    RegisterRobustPendingFutex(DetTid, Option<FutexID>),
+    /// Record whether one thread's registered robust-list head is active.
+    // TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity RPC.
+    SetRobustListOwnerActive(DetTid, bool),
+
+    /// Reconcile robust-owner futex waiters after a successful exec.
+    // TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust reconciliation RPC.
+    CompleteRobustExec(DetTid, Vec<DetTid>),
 
     /// Resolve and register managed SIGKILL targets before injection.
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation RPC.
@@ -1399,8 +1409,10 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
-    // TODO-HUMAN-REVIEW(PR-659): Review robust pending-futex registration response.
-    RegisterRobustPendingFutex(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity response.
+    SetRobustListOwnerActive(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust reconciliation response.
+    CompleteRobustExec(u64),
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
     PrepareSigkillTarget(Vec<DetTid>),
     // TODO-HUMAN-REVIEW(PR-659): Review exact-delivery candidate-resolution response.
@@ -1721,9 +1733,9 @@ where
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review zero-owner robust pending-futex mirroring.
-/// Mirror the exact pending futex visible when a thread registers its robust-list head.
-pub async fn register_robust_pending_futex<G, T>(guest: &mut G, futexid: Option<FutexID>)
+// TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity lifetime.
+/// Record whether the current thread's registered robust-list head is active.
+pub async fn set_robust_list_owner_active<G, T>(guest: &mut G, active: bool)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1731,11 +1743,27 @@ where
     let owner = guest.thread_state().dettid;
     let (_, response) = send_and_update_time(
         guest,
-        GlobalRequest::RegisterRobustPendingFutex(owner, futexid),
+        GlobalRequest::SetRobustListOwnerActive(owner, active),
     )
     .await;
     match response {
-        GlobalResponse::RegisterRobustPendingFutex(()) => {}
+        GlobalResponse::SetRobustListOwnerActive(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust wake reconciliation.
+/// Release modeled futex waiters after Linux cleans a thread group's robust lists on exec.
+pub async fn complete_robust_exec<G, T>(guest: &mut G, group: Vec<DetTid>) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let executor = guest.thread_state().dettid;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::CompleteRobustExec(executor, group)).await;
+    match response {
+        GlobalResponse::CompleteRobustExec(woken) => woken,
         _ => unreachable!(),
     }
 }

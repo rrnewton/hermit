@@ -377,6 +377,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        self.refresh_robust_list_activity(guest).await;
         self.end_timeslice_if_needed(guest).await;
     }
 
@@ -1035,6 +1036,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
                     robust_list_heads,
+                    robust_list_active: false,
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -1116,10 +1118,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
         let dettid = guest.thread_state().dettid;
+        let prior_group = guest
+            .thread_state()
+            .robust_list_heads
+            .lock()
+            .expect("robust-list registry mutex poisoned")
+            .keys()
+            .copied()
+            .collect();
+        let woken = tool_global::complete_robust_exec(guest, prior_group).await;
+        info!(
+            "[detcore, dtid {}] successful exec reconciled {} modeled robust futex waiter(s)",
+            dettid, woken
+        );
         guest.thread_state_mut().robust_list_heads = Arc::new(Mutex::new(
             std::collections::BTreeMap::from([(dettid, None)]),
         ));
-        tool_global::register_robust_pending_futex(guest, None).await;
+        guest.thread_state_mut().robust_list_active = false;
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 

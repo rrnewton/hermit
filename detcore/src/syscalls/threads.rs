@@ -52,8 +52,8 @@ use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
-use crate::tool_global::register_robust_pending_futex;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_robust_list_owner_active;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
@@ -427,16 +427,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SetRobustList,
     ) -> Result<i64, Error> {
         let head = call.head().map(AddrMut::as_raw);
-        let pending_futex = head.and_then(|head_address| {
-            let head_ptr = Addr::<RobustListHead>::from_raw(head_address)?;
-            let head_value = guest.memory().read_value(head_ptr).ok()?;
-            let (pending, pi) = decode_robust_pointer(head_value.list_op_pending);
-            if pending == 0 || pi {
-                return None;
-            }
-            let address = robust_futex_address(pending, head_value.futex_offset)?;
-            Some(guest.thread_state().futex_id(address, false))
-        });
         let result = guest.inject(call).await?;
         if result == 0 {
             let dettid = guest.thread_state().dettid;
@@ -446,9 +436,43 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .lock()
                 .expect("robust-list registry mutex poisoned")
                 .insert(dettid, head);
-            register_robust_pending_futex(guest, pending_futex).await;
+            self.refresh_robust_list_activity(guest).await;
         }
         Ok(result)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic robust-list activity observation.
+    /// Publish robust-list activity changes observed when Detcore regains control.
+    pub(crate) async fn refresh_robust_list_activity<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+            return;
+        }
+        let dettid = guest.thread_state().dettid;
+        let head = guest
+            .thread_state()
+            .robust_list_heads
+            .lock()
+            .expect("robust-list registry mutex poisoned")
+            .get(&dettid)
+            .copied()
+            .flatten();
+        let active = match head {
+            None => false,
+            Some(head_address) => {
+                let Some(head_ptr) = Addr::<RobustListHead>::from_raw(head_address) else {
+                    return;
+                };
+                let Ok(head_value) = guest.memory().read_value(head_ptr) else {
+                    return;
+                };
+                head_value.list_op_pending != 0 || head_value.list_next != head_address
+            }
+        };
+        if guest.thread_state().robust_list_active == active {
+            return;
+        }
+        guest.thread_state_mut().robust_list_active = active;
+        set_robust_list_owner_active(guest, active).await;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
