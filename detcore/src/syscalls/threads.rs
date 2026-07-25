@@ -76,6 +76,7 @@ const FUTEX2_VALID_MASK: u32 = FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FU
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+// TODO-HUMAN-REVIEW(PR-659): Review native robust-list head ABI mirror.
 struct RobustListHead {
     list_next: usize,
     futex_offset: isize,
@@ -84,6 +85,7 @@ struct RobustListHead {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+// TODO-HUMAN-REVIEW(PR-659): Review native futex2 waiter ABI mirror.
 struct FutexWaitv {
     val: u64,
     uaddr: u64,
@@ -91,6 +93,7 @@ struct FutexWaitv {
     reserved: u32,
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review robust entry-relative futex address calculation.
 fn robust_futex_address(entry: usize, offset: isize) -> Option<usize> {
     if offset >= 0 {
         entry.checked_add(offset as usize)
@@ -162,6 +165,7 @@ fn sign_extend_12(value: u32) -> i32 {
     ((value << 20) as i32) >> 20
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review FUTEX_WAKE_OP signed operand decoding.
 fn apply_futex_wake_op(encoded: u32, old: i32) -> Result<(i32, bool), Errno> {
     let op = (encoded >> 28) & 0x7;
     let shift_oparg = encoded & 0x8000_0000 != 0;
@@ -415,8 +419,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             DetTid::from_raw(call.pid())
         };
-        let len_ptr = call.len_ptr().ok_or(Errno::EFAULT)?;
-        let head_ptr = call.head_ptr().ok_or(Errno::EFAULT)?;
         let head = guest
             .thread_state()
             .robust_list_heads
@@ -426,6 +428,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .copied()
             .ok_or(Errno::ESRCH)?
             .unwrap_or(0);
+        let len_ptr = call.len_ptr().ok_or(Errno::EFAULT)?;
+        let head_ptr = call.head_ptr().ok_or(Errno::EFAULT)?;
         guest
             .memory()
             .write_value(len_ptr, &ROBUST_LIST_HEAD_SIZE)?;
@@ -440,6 +444,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         whole_group: bool,
     ) {
+        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+            return;
+        }
         let current = guest.thread_state().dettid;
         let registrations = {
             let mut heads = guest
@@ -461,14 +468,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
-        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
-            return;
-        }
         for (owner, head) in registrations {
             self.cleanup_robust_list_head(guest, owner, head).await;
         }
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review robust-list traversal and pending-entry ordering.
     async fn cleanup_robust_list_head<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -524,6 +529,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review individual robust futex owner-death transition.
     async fn cleanup_robust_futex<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -588,13 +594,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         futexid: &crate::types::FutexID,
+        address: usize,
         initial_value: i32,
         mask: u32,
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
         let answer = futex_action(
             guest,
-            FutexAction::WaitRequest(deadline),
+            FutexAction::WaitRequest { deadline, address },
             futexid,
             initial_value,
             mask,
@@ -678,8 +685,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Error::Errno(Errno::EAGAIN));
         }
         let futexid = guest.thread_state().futex_id(address.as_raw(), private);
-        self.handle_futex_wait_result(guest, &futexid, observed as i32, mask, deadline)
-            .await
+        self.handle_futex_wait_result(
+            guest,
+            &futexid,
+            address.as_raw(),
+            observed as i32,
+            mask,
+            deadline,
+        )
+        .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -772,6 +786,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let source_address = call.uaddr().ok_or(Errno::EFAULT)?;
         let target_address = call.uaddr2().ok_or(Errno::EFAULT)?;
+        if !target_address
+            .as_raw()
+            .is_multiple_of(std::mem::align_of::<u32>())
+        {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if call.futex_op() & libc::FUTEX_CLOCK_REALTIME != 0 {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
         let source = guest
             .thread_state()
@@ -815,6 +838,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let source_address = call.uaddr().ok_or(Errno::EFAULT)?;
         let target_address = call.uaddr2().ok_or(Errno::EFAULT)?;
+        if !target_address
+            .as_raw()
+            .is_multiple_of(std::mem::align_of::<u32>())
+        {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if call.futex_op() & libc::FUTEX_CLOCK_REALTIME != 0 {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
         let old = guest.memory().read_value(target_address)?;
         let (new, wake_target) = apply_futex_wake_op(call.val3() as u32, old)?;
         guest.memory().write_value(target_address, &new)?;
@@ -1002,6 +1034,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Some(x) => x,
         };
+        if !ptr.as_raw().is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
         let init_val = guest.memory().read_value(ptr)?;
         trace!(
             "[detcore, dtid {}] futex op with memory address containing value {}",
@@ -1091,6 +1126,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.handle_futex_wait_result(
                         guest,
                         &futexid,
+                        ptr.as_raw(),
                         init_val,
                         bitset,
                         maybe_timeout_lt,

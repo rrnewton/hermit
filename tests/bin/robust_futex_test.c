@@ -48,6 +48,9 @@
 #ifndef FUTEX2_SIZE_U32
 #define FUTEX2_SIZE_U32 2U
 #endif
+#ifndef FUTEX_TID_MASK
+#define FUTEX_TID_MASK 0x3fffffffU
+#endif
 
 struct futex_waitv_local {
   uint64_t val;
@@ -166,6 +169,7 @@ static void *waiter_thread(void *unused) {
 struct robust_lookup_state {
   atomic_bool ready;
   atomic_bool done;
+  atomic_int error;
   atomic_int tid;
   atomic_uintptr_t head;
 };
@@ -176,6 +180,9 @@ static void *robust_lookup_thread(void *opaque) {
   size_t len = 0;
   if (syscall(SYS_get_robust_list, 0, &head, &len) != 0 || head == NULL ||
       len != sizeof(*head)) {
+    atomic_store_explicit(&state->error, ROBUST_LOOKUP_FAILED,
+                          memory_order_release);
+    atomic_store_explicit(&state->ready, true, memory_order_release);
     return thread_result(ROBUST_LOOKUP_FAILED);
   }
   atomic_store_explicit(&state->tid, (int)syscall(SYS_gettid),
@@ -196,6 +203,15 @@ static void check_robust_list_lookup(void) {
   while (!atomic_load_explicit(&state.ready, memory_order_acquire)) {
     sched_yield();
   }
+  if (atomic_load_explicit(&state.error, memory_order_acquire) != 0) {
+    atomic_store_explicit(&state.done, true, memory_order_release);
+    void *result = NULL;
+    check_pthread(pthread_join(thread, &result),
+                  "pthread_join(failed robust lookup)");
+    fprintf(stderr, "robust lookup thread failed: %lu\n",
+            (unsigned long)(uintptr_t)result);
+    exit(EXIT_FAILURE);
+  }
 
   struct robust_list_head *head = NULL;
   size_t len = 0;
@@ -214,6 +230,13 @@ static void check_robust_list_lookup(void) {
     fprintf(stderr, "get_robust_list missing tid: errno=%d\n", errno);
     exit(EXIT_FAILURE);
   }
+  errno = 0;
+  if (syscall(SYS_get_robust_list, INT_MAX, NULL, NULL) != -1 ||
+      errno != ESRCH) {
+    fprintf(stderr, "get_robust_list missing tid/null outputs: errno=%d\n",
+            errno);
+    exit(EXIT_FAILURE);
+  }
 
   atomic_store_explicit(&state.done, true, memory_order_release);
   void *result = NULL;
@@ -221,6 +244,136 @@ static void check_robust_list_lookup(void) {
   if (result != NULL) {
     fprintf(stderr, "robust lookup thread result=%lu\n",
             (unsigned long)(uintptr_t)result);
+    exit(EXIT_FAILURE);
+  }
+}
+
+static void check_blocked_and_failed_signal_preserve_owner(void) {
+  pthread_mutexattr_t attr;
+  pthread_mutex_t live_mutex;
+  check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init signal");
+  check_pthread(pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST),
+                "pthread_mutexattr_setrobust signal");
+  check_pthread(pthread_mutex_init(&live_mutex, &attr),
+                "pthread_mutex_init signal");
+  check_pthread(pthread_mutexattr_destroy(&attr),
+                "pthread_mutexattr_destroy signal");
+
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGTERM);
+  check_pthread(pthread_sigmask(SIG_BLOCK, &blocked, NULL),
+                "pthread_sigmask block SIGTERM");
+  check_pthread(pthread_mutex_lock(&live_mutex), "pthread_mutex_lock signal");
+
+  struct robust_list_head *before = NULL;
+  struct robust_list_head *after = NULL;
+  size_t before_len = 0;
+  size_t after_len = 0;
+  if (syscall(SYS_get_robust_list, 0, &before, &before_len) != 0 ||
+      kill(getpid(), SIGTERM) != 0 ||
+      syscall(SYS_get_robust_list, 0, &after, &after_len) != 0) {
+    perror("blocked SIGTERM robust-list probe");
+    exit(EXIT_FAILURE);
+  }
+  unsigned int word =
+      (unsigned int)__atomic_load_n(&live_mutex.__data.__lock, __ATOMIC_ACQUIRE);
+  unsigned int owner = (unsigned int)syscall(SYS_gettid) & FUTEX_TID_MASK;
+  if (before != after || before_len != after_len || (word & FUTEX_TID_MASK) != owner ||
+      (word & FUTEX_OWNER_DIED) != 0) {
+    fprintf(stderr, "blocked SIGTERM corrupted live robust owner: word=%#x\n",
+            word);
+    exit(EXIT_FAILURE);
+  }
+
+  errno = 0;
+  if (syscall(SYS_tgkill, getpid(), INT_MAX, SIGKILL) != -1 || errno != ESRCH) {
+    fprintf(stderr, "failed tgkill expected ESRCH, got errno=%d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+  word =
+      (unsigned int)__atomic_load_n(&live_mutex.__data.__lock, __ATOMIC_ACQUIRE);
+  if ((word & FUTEX_TID_MASK) != owner || (word & FUTEX_OWNER_DIED) != 0) {
+    fprintf(stderr, "failed tgkill corrupted live robust owner: word=%#x\n",
+            word);
+    exit(EXIT_FAILURE);
+  }
+
+  signal(SIGTERM, SIG_IGN);
+  check_pthread(pthread_sigmask(SIG_UNBLOCK, &blocked, NULL),
+                "pthread_sigmask unblock SIGTERM");
+  check_pthread(pthread_mutex_unlock(&live_mutex), "pthread_mutex_unlock signal");
+  check_pthread(pthread_mutex_destroy(&live_mutex),
+                "pthread_mutex_destroy signal");
+}
+
+struct pending_owner_state {
+  struct robust_list_head head;
+  struct robust_list entry;
+  int futex_word;
+  atomic_bool registered;
+  atomic_bool waiter_entered;
+  atomic_int owner_error;
+};
+
+static void *pending_owner_thread(void *opaque) {
+  struct pending_owner_state *state = opaque;
+  state->head.list.next = &state->head.list;
+  state->head.futex_offset =
+      (char *)&state->futex_word - (char *)&state->entry;
+  state->head.list_op_pending = &state->entry;
+  if (syscall(SYS_set_robust_list, &state->head, sizeof(state->head)) != 0) {
+    atomic_store_explicit(&state->owner_error,
+                          OWNER_SET_ROBUST_LIST_FAILED, memory_order_release);
+    atomic_store_explicit(&state->registered, true, memory_order_release);
+    return thread_result(OWNER_SET_ROBUST_LIST_FAILED);
+  }
+  atomic_store_explicit(&state->registered, true, memory_order_release);
+  while (!atomic_load_explicit(&state->waiter_entered, memory_order_acquire)) {
+    sched_yield();
+  }
+  sched_yield();
+  return NULL;
+}
+
+static void *pending_futex_waiter(void *opaque) {
+  struct pending_owner_state *state = opaque;
+  while (!atomic_load_explicit(&state->registered, memory_order_acquire)) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&state->owner_error, memory_order_acquire) != 0) {
+    return thread_result(OWNER_SET_ROBUST_LIST_FAILED);
+  }
+  atomic_store_explicit(&state->waiter_entered, true, memory_order_release);
+  if (syscall(SYS_futex, &state->futex_word, FUTEX_WAIT, 0, NULL, NULL, 0) !=
+      0) {
+    perror("pending owner-zero FUTEX_WAIT");
+    return thread_result(RAW_FUTEX_WAIT_FAILED);
+  }
+  return NULL;
+}
+
+static void check_pending_owner_zero_wake(void) {
+  struct pending_owner_state state = {0};
+  pthread_t owner;
+  pthread_t waiter;
+  check_pthread(pthread_create(&owner, NULL, pending_owner_thread, &state),
+                "pthread_create(pending owner)");
+  check_pthread(pthread_create(&waiter, NULL, pending_futex_waiter, &state),
+                "pthread_create(pending waiter)");
+
+  void *owner_result = NULL;
+  void *waiter_result = NULL;
+  check_pthread(pthread_join(owner, &owner_result),
+                "pthread_join(pending owner)");
+  check_pthread(pthread_join(waiter, &waiter_result),
+                "pthread_join(pending waiter)");
+  if (owner_result != NULL || waiter_result != NULL || state.futex_word != 0) {
+    fprintf(stderr,
+            "pending owner-zero result owner=%lu waiter=%lu word=%#x\n",
+            (unsigned long)(uintptr_t)owner_result,
+            (unsigned long)(uintptr_t)waiter_result,
+            (unsigned int)state.futex_word);
     exit(EXIT_FAILURE);
   }
 }
@@ -374,12 +527,14 @@ struct process_shared_state {
   pthread_mutex_t mutex;
   atomic_bool owner_locked;
   atomic_bool waiter_blocked;
+  atomic_int owner_error;
 };
 
 static void *process_owner_thread(void *opaque) {
   struct process_shared_state *state = opaque;
   int result = pthread_mutex_lock(&state->mutex);
   if (result != 0) {
+    atomic_store_explicit(&state->owner_error, result, memory_order_release);
     return thread_result(OWNER_LOCK_FAILED);
   }
   atomic_store_explicit(&state->owner_locked, true, memory_order_release);
@@ -425,18 +580,39 @@ static void check_group_termination(bool fatal_signal) {
     if (pthread_create(&owner, NULL, process_owner_thread, state) != 0) {
       _exit(80);
     }
+    if (fatal_signal) {
+      for (;;) {
+        sched_yield();
+      }
+    }
     while (!atomic_load_explicit(&state->waiter_blocked, memory_order_acquire)) {
       sched_yield();
     }
-    if (fatal_signal) {
-      kill(getpid(), SIGKILL);
-    } else {
-      syscall(SYS_exit_group, 0);
-    }
+    syscall(SYS_exit_group, 0);
     _exit(81);
   }
 
+  pid_t killer = -1;
+  if (fatal_signal) {
+    killer = fork();
+    if (killer < 0) {
+      perror("fork killer");
+      exit(EXIT_FAILURE);
+    }
+    if (killer == 0) {
+      while (!atomic_load_explicit(&state->waiter_blocked,
+                                   memory_order_acquire)) {
+        sched_yield();
+      }
+      _exit(kill(child, SIGKILL) == 0 ? 0 : 82);
+    }
+  }
+
   while (!atomic_load_explicit(&state->owner_locked, memory_order_acquire)) {
+    if (atomic_load_explicit(&state->owner_error, memory_order_acquire) != 0) {
+      fprintf(stderr, "process-shared owner failed before locking\n");
+      exit(EXIT_FAILURE);
+    }
     sched_yield();
   }
   int result = pthread_mutex_lock(&state->mutex);
@@ -458,6 +634,14 @@ static void check_group_termination(bool fatal_signal) {
             fatal_signal ? "SIGKILL" : "exit_group", status);
     exit(EXIT_FAILURE);
   }
+  if (killer > 0) {
+    int killer_status = 0;
+    if (waitpid(killer, &killer_status, 0) != killer ||
+        !WIFEXITED(killer_status) || WEXITSTATUS(killer_status) != 0) {
+      fprintf(stderr, "unexpected killer status: %#x\n", killer_status);
+      exit(EXIT_FAILURE);
+    }
+  }
   check_pthread(pthread_mutex_destroy(&state->mutex),
                 "pthread_mutex_destroy shared");
   if (munmap(state, sizeof(*state)) != 0) {
@@ -470,8 +654,27 @@ static void check_futex_variants(void) {
   int source = 0;
   int target = 7;
 
-  long result = syscall(SYS_futex, &source, FUTEX_CMP_REQUEUE_PRIVATE, 0,
-                        (void *)(uintptr_t)1, &target, 0);
+  errno = 0;
+  long result = syscall(SYS_futex, (char *)&source + 1, FUTEX_WAKE_PRIVATE, 1,
+                        NULL, NULL, 0);
+  if (result != -1 || errno != EINVAL) {
+    fprintf(stderr, "unaligned FUTEX_WAKE_PRIVATE: result=%ld errno=%d\n",
+            result, errno);
+    exit(EXIT_FAILURE);
+  }
+
+  errno = 0;
+  result = syscall(SYS_futex, &source,
+                   FUTEX_CMP_REQUEUE_PRIVATE | FUTEX_CLOCK_REALTIME, 0,
+                   (void *)(uintptr_t)1, &target, 0);
+  if (result != -1 || errno != ENOSYS) {
+    fprintf(stderr, "clocked FUTEX_CMP_REQUEUE_PRIVATE: result=%ld errno=%d\n",
+            result, errno);
+    exit(EXIT_FAILURE);
+  }
+
+  result = syscall(SYS_futex, &source, FUTEX_CMP_REQUEUE_PRIVATE, 0,
+                   (void *)(uintptr_t)1, &target, 0);
   if (result != 0) {
     perror("FUTEX_CMP_REQUEUE_PRIVATE");
     exit(EXIT_FAILURE);
@@ -528,7 +731,9 @@ static void check_pthread(int ret, const char *operation) {
 }
 
 int main(void) {
+  check_blocked_and_failed_signal_preserve_owner();
   check_robust_list_lookup();
+  check_pending_owner_zero_wake();
 
   pthread_mutexattr_t attr;
   check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init");
@@ -561,6 +766,8 @@ int main(void) {
   check_blocked_futex_variants();
   check_group_termination(false);
   check_group_termination(true);
+  puts("PASS: blocked and failed signals preserved live owner");
+  puts("PASS: pending owner-zero robust wake preserved word");
   puts("PASS: robust mutex waiter received EOWNERDEAD");
   puts("PASS: sibling robust-list lookup and ESRCH semantics");
   puts("PASS: legacy and futex2 variants handled deterministically");

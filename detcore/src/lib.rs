@@ -108,6 +108,7 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+use tool_global::reconcile_robust_futexes_after_kernel_exit;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 use tool_local::PosixTimers;
@@ -641,9 +642,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futex_wake,
                 Sysno::get_robust_list,
                 Sysno::set_robust_list,
-                Sysno::kill,
-                Sysno::tgkill,
-                Sysno::tkill,
                 Sysno::clone,
                 Sysno::clone3,
                 Sysno::fork,
@@ -1330,13 +1328,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
 
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Kill(s) => self.handle_signal_send(guest, s.into()).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Tgkill(s) => self.handle_signal_send(guest, s.into()).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Tkill(s) => self.handle_signal_send(guest, s.into()).await,
-
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
@@ -1683,6 +1674,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
         let mm_id = thread_state.mm_id;
+        // TODO-HUMAN-REVIEW(PR-659): Review SIGKILL post-kernel robust-futex reconciliation.
+        if matches!(exit_status, ExitStatus::Signaled(Signal::SIGKILL, _)) {
+            let woken = reconcile_robust_futexes_after_kernel_exit(
+                dettid,
+                thread_state.thread_logical_time.clone(),
+                &self.cfg,
+                global_state,
+            )
+            .await;
+            info!(
+                "[detcore, dtid {}] reconciled {} modeled robust-futex waiter(s) after SIGKILL",
+                dettid, woken
+            );
+        }
         thread_state
             .robust_list_heads
             .lock()

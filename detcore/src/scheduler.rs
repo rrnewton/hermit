@@ -155,10 +155,13 @@ pub struct ThreadExited;
 
 /// A thread waiting on a futex, including the bitset accepted by wake operations.
 #[derive(Debug, Clone)]
+// TODO-HUMAN-REVIEW(PR-659): Review waiter address/value probes used after kernel owner death.
 pub struct FutexWaiter {
     dettid: DetTid,
     response: Ivar<SchedResponse>,
     bitset: u32,
+    expected: i32,
+    address: usize,
 }
 
 /// Deterministically pick one element from `choices` using the supplied PRNG,
@@ -1107,6 +1110,8 @@ impl Scheduler {
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
         bitset: u32,
+        expected: i32,
+        address: usize,
     ) {
         let nxt = self
             .next_turns
@@ -1117,6 +1122,8 @@ impl Scheduler {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
+            expected,
+            address,
         });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
@@ -1291,6 +1298,35 @@ impl Scheduler {
         let first_woken = self.wake_futex_waiters(waker_dettid, first, max_first, u32::MAX);
         let second_woken = self.wake_futex_waiters(waker_dettid, second, max_second, u32::MAX);
         first_woken + second_woken
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review post-kernel-exit robust futex reconciliation.
+    /// Wake one modeled waiter for each futex whose kernel-visible word changed to OWNER_DIED.
+    pub fn reconcile_robust_futex_waiters<F>(&mut self, exiting: DetTid, mut read_word: F) -> u64
+    where
+        F: FnMut(DetTid, usize) -> Option<u32>,
+    {
+        const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+        let ready = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .filter_map(|(&futexid, waiters)| {
+                waiters
+                    .iter()
+                    .any(|waiter| {
+                        read_word(waiter.dettid, waiter.address).is_some_and(|current| {
+                            current != waiter.expected as u32 && current & FUTEX_OWNER_DIED != 0
+                        })
+                    })
+                    .then_some(futexid)
+            })
+            .collect::<Vec<_>>();
+
+        ready
+            .into_iter()
+            .map(|futexid| self.wake_futex_waiters(exiting, futexid, 1, u32::MAX))
+            .sum()
     }
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
@@ -2567,6 +2603,8 @@ mod test {
             dettid: DetTid::from_raw(dettid),
             response: Ivar::new(),
             bitset,
+            expected: 0,
+            address: 0x1000 + dettid as usize * 4,
         }
     }
 
@@ -2682,7 +2720,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX);
+            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX, 0, 0x1000);
         }
 
         assert_eq!(
@@ -2719,7 +2757,14 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
+            scheduler.sleep_futex_waiter(
+                &dettid,
+                futex,
+                None,
+                u32::MAX,
+                0,
+                if raw_tid == 1 { 0x1000 } else { 0x2000 },
+            );
         }
 
         assert_eq!(
@@ -2741,6 +2786,50 @@ mod test {
                 .is_none_or(Vec::is_empty)
         );
         assert_eq!(scheduler.run_queue.len(), 2);
+    }
+
+    #[test]
+    fn sigkill_reconciliation_wakes_only_changed_owner_died_word() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let mm = MmId::initial(DetTid::from_raw(1));
+        let changed = FutexID::private(mm, 0x1000);
+        let unchanged = FutexID::private(mm, 0x2000);
+        let expected = 0x8000_0001_u32 as i32;
+        for (raw_tid, futex, address) in [(1, changed, 0x1000), (2, unchanged, 0x2000)] {
+            let dettid = DetTid::from_raw(raw_tid);
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, expected, address);
+        }
+
+        assert_eq!(
+            scheduler.reconcile_robust_futex_waiters(DetTid::from_raw(3), |_tid, address| {
+                match address {
+                    0x1000 => Some(0xc000_0000),
+                    0x2000 => Some(expected as u32),
+                    _ => None,
+                }
+            },),
+            1
+        );
+        assert!(
+            scheduler
+                .blocked
+                .futex_waiters
+                .get(&changed)
+                .is_none_or(Vec::is_empty)
+        );
+        assert_eq!(scheduler.blocked.futex_waiters[&unchanged].len(), 1);
+        assert_eq!(scheduler.run_queue.len(), 1);
     }
 
     #[test]

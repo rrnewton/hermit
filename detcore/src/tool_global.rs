@@ -49,6 +49,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::config::BlockingMode;
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
@@ -90,6 +91,24 @@ async fn yield_once() {
         }
     })
     .await;
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review process_vm_readv bounds and exit-time permissions.
+fn read_guest_u32(tid: DetTid, address: usize) -> Option<u32> {
+    let mut word = 0_u32;
+    let local = libc::iovec {
+        iov_base: (&raw mut word).cast(),
+        iov_len: std::mem::size_of::<u32>(),
+    };
+    let remote = libc::iovec {
+        iov_base: address as *mut libc::c_void,
+        iov_len: std::mem::size_of::<u32>(),
+    };
+    // SAFETY: process_vm_readv copies into the local initialized u32 and treats
+    // the guest-controlled remote address as fallible input. Short reads and
+    // invalid addresses are rejected below.
+    let read = unsafe { libc::process_vm_readv(tid.as_raw(), &local, 1, &remote, 1, 0) };
+    (read == std::mem::size_of::<u32>() as isize).then_some(word)
 }
 
 #[derive(Debug)]
@@ -502,6 +521,12 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
+            GlobalRequest::ReconcileRobustFutexes(exiting) => R::ReconcileRobustFutexes(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .reconcile_robust_futex_waiters(exiting, read_guest_u32),
+            ),
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
                     .await,
@@ -928,8 +953,8 @@ impl GlobalState {
                 .resp
                 .clone();
             match action {
-                FutexAction::WaitRequest(maybe_timeout) => {
-                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
+                FutexAction::WaitRequest { deadline, address } => {
+                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask, _init_read, address);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -1211,6 +1236,10 @@ pub enum GlobalRequest {
     /// so the scheduler can aggregate it into the final run report.
     DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
+    /// Reconcile kernel robust-futex cleanup with Detcore's modeled wait queues.
+    // TODO-HUMAN-REVIEW(PR-659): Review post-exit robust reconciliation request.
+    ReconcileRobustFutexes(DetTid),
+
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
@@ -1258,6 +1287,8 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review post-exit robust reconciliation response.
+    ReconcileRobustFutexes(u64),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -1537,12 +1568,40 @@ pub async fn deregister_thread<R>(
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review SIGKILL exit reconciliation RPC.
+/// Wake modeled waiters after Linux has performed robust-futex cleanup for a killed task.
+pub async fn reconcile_robust_futexes_after_kernel_exit<R>(
+    exiting: DetTid,
+    threads_time: DetTime,
+    cfg: &Config,
+    reverie: &R,
+) -> u64
+where
+    R: GlobalRPC<GlobalState>,
+{
+    if !cfg.sequentialize_threads || cfg.debug_futex_mode != BlockingMode::Precise {
+        return 0;
+    }
+    let response = reverie
+        .send_rpc((threads_time, GlobalRequest::ReconcileRobustFutexes(exiting)))
+        .await;
+    match response.1 {
+        GlobalResponse::ReconcileRobustFutexes(woken) => woken,
+        _ => unreachable!(),
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-659): Review the futex requeue and two-queue wake RPC contract.
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
     /// Check in before a FUTEX_WAIT, including an optional timeout.
-    WaitRequest(Option<LogicalTime>),
+    WaitRequest {
+        /// Optional logical timeout deadline.
+        deadline: Option<LogicalTime>,
+        /// Guest virtual address to probe if the kernel later performs robust cleanup.
+        address: usize,
+    },
     /// Check in after a FUTEX_WAIT
     WaitFinished,
     /// Check in before a FUTEX_WAKE, parameterized by the number of threads woken.

@@ -98,9 +98,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::io_uring_register
         | Sysno::io_uring_setup
         | Sysno::ioctl
-        // TODO-HUMAN-REVIEW(PR-659): Review deterministic self-signal cleanup classification.
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::kill
         | Sysno::lstat
         | Sysno::madvise
         | Sysno::membarrier
@@ -153,10 +150,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::timerfd_create
         | Sysno::timerfd_gettime
         | Sysno::timerfd_settime
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::tgkill
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::tkill
         | Sysno::uname
         | Sysno::userfaultfd
         | Sysno::utime
@@ -319,6 +312,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::kexec_file_load
         | Sysno::kexec_load
         | Sysno::keyctl
+        | Sysno::kill
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
@@ -454,7 +448,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
+        | Sysno::tgkill
         | Sysno::times
+        | Sysno::tkill
         | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
@@ -488,7 +484,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [119, 43, 211]);
+        assert_eq!(counts, [116, 43, 214]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 

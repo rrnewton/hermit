@@ -34,6 +34,8 @@ On x86_64 Linux with glibc, the control exits 0:
 
 ```text
 $ timeout 10s ./robust_futex_test
+PASS: blocked and failed signals preserved live owner
+PASS: pending owner-zero robust wake preserved word
 PASS: robust mutex waiter received EOWNERDEAD
 PASS: sibling robust-list lookup and ESRCH semantics
 PASS: legacy and futex2 variants handled deterministically
