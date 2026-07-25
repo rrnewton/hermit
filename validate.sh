@@ -98,7 +98,7 @@ while [[ $# -gt 0 ]]; do
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
-        # TODO-HUMAN-REVIEW(#663): Review the focused LiteInst compatibility CLI.
+        # TODO-HUMAN-REVIEW(#688): Review the focused LiteInst compatibility CLI.
         --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
@@ -1011,7 +1011,7 @@ function rr_compatibility_probe {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#663): Review the blocking LiteInst compatibility floor.
+# TODO-HUMAN-REVIEW(#688): Review the blocking LiteInst compatibility floor.
 function liteinst_compatibility_probe {
     local label=$1
     shift

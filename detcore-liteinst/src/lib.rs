@@ -11,7 +11,7 @@
 #![deny(missing_docs)]
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#663): Review the preload constructor boundary.
+// TODO-HUMAN-REVIEW(#688): Review the preload constructor boundary.
 /// Installs the LiteInst runtime once before guest application code starts.
 ///
 /// Reverie's constructor feature is disabled so this wrapper is the only

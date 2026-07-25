@@ -622,7 +622,7 @@ fn receive_liteinst_stream(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#663): Review the LiteInst compatibility boundary.
+// TODO-HUMAN-REVIEW(#688): Review the LiteInst compatibility boundary.
 /// Runs a guest through Reverie's LiteInst preload compatibility path.
 ///
 /// This backend compares observable results but does not activate Detcore and
