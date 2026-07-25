@@ -15,6 +15,7 @@ mod network;
 mod random;
 mod time;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use reverie::Errno;
@@ -30,10 +31,12 @@ use reverie::Tool;
 use reverie::syscalls::Close;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
+use reverie::syscalls::Fchdir;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
+use reverie::syscalls::Unlinkat;
 use serde::Deserialize;
 use serde::Serialize;
 fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
@@ -42,6 +45,13 @@ fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>,
         Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
         Err(error) => (None, Some(error.to_string())),
     }
+}
+
+fn is_replay_placeholder(pid: Pid, fd: libc::c_int) -> bool {
+    std::fs::read_link(format!("/proc/{}/fd/{fd}", pid.as_raw()))
+        .ok()
+        .as_deref()
+        == Some(Path::new("anon_inode:[eventfd]"))
 }
 
 use crate::desync::DesyncError;
@@ -190,7 +200,7 @@ impl Tool for Replayer {
                     .await
             }
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
-            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
@@ -235,7 +245,7 @@ impl Tool for Replayer {
             // TODO-HUMAN-REVIEW(#653)
             Syscall::Mkdir(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_replayed_side_effect(guest, syscall).await,
-            Syscall::Unlinkat(_) => self.handle_replayed_side_effect(guest, syscall).await,
+            Syscall::Unlinkat(call) => self.handle_unlinkat(guest, call).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
@@ -287,18 +297,56 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(fd) = recorded {
-            if flags.contains(OFlag::O_CREAT) || flags.contains(OFlag::O_DIRECTORY) {
+            if flags.contains(OFlag::O_CREAT) {
                 let actual = guest.inject_with_retry(syscall).await;
                 assert_eq!(
                     actual, recorded,
                     "replay materialized open returned a different descriptor"
                 );
+            } else if flags.contains(OFlag::O_DIRECTORY) {
+                match guest.inject_with_retry(syscall).await {
+                    Ok(actual) => assert_eq!(
+                        actual, fd,
+                        "replay materialized directory returned a different descriptor"
+                    ),
+                    Err(_) => {
+                        self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
+                            .await;
+                    }
+                }
             } else {
                 self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                     .await;
             }
         }
         recorded
+    }
+
+    async fn handle_fchdir<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Fchdir,
+    ) -> Result<i64, Errno> {
+        if is_replay_placeholder(guest.pid(), syscall.fd()) {
+            self.handle_simple(guest, syscall.into()).await
+        } else {
+            self.handle_replayed_side_effect(guest, syscall.into())
+                .await
+        }
+    }
+
+    async fn handle_unlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Unlinkat,
+    ) -> Result<i64, Errno> {
+        if syscall.dirfd() != libc::AT_FDCWD && is_replay_placeholder(guest.pid(), syscall.dirfd())
+        {
+            self.handle_simple(guest, syscall.into()).await
+        } else {
+            self.handle_replayed_side_effect(guest, syscall.into())
+                .await
+        }
     }
 
     async fn handle_replayed_side_effect<G: Guest<Self>>(
