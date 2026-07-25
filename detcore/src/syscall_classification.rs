@@ -217,7 +217,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::munlockall
         // These synchronous extent and pathname operations are repeatable for guest-owned
         // files in a fixed namespace with adequate space and no external mutation.
-        // TODO-HUMAN-REVIEW(PR-PENDING): Verify stable-filesystem passthrough assumptions.
+        // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fallocate
         // AUTONOMOUS-BOT-IMPLEMENTED
