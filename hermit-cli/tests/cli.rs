@@ -397,7 +397,7 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#663): Review the LiteInst CLI compatibility assertion.
+// TODO-HUMAN-REVIEW(#688): Review the LiteInst CLI compatibility assertion.
 #[test]
 fn run_liteinst_verifies_integrated_preload_backend() {
     if !hermit::Backend::Liteinst.is_available() {

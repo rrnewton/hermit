@@ -284,7 +284,7 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#663): Review LiteInst runtime discovery.
+// TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
 /// Returns the LiteInst preload cdylib produced beside the Hermit binary.
 #[doc(hidden)]
 pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
