@@ -38,6 +38,9 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
+#   ./validate.sh --backend-compare BACKEND   # run BACKEND once per probe and
+#                                            # diff against the ptrace golden logs
+#                                            # (BACKEND: kvm|dbi|sabre|e9patch)
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -72,6 +75,7 @@ RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
+BACKEND_COMPARE=""
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -100,6 +104,13 @@ while [[ $# -gt 0 ]]; do
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
+        --backend-compare)
+            BACKEND_COMPARE=${2:-}
+            case "$BACKEND_COMPARE" in
+                kvm|dbi|sabre|e9patch|ptrace) ;;
+                *) echo "validate.sh: --backend-compare needs a BACKEND (kvm|dbi|sabre|e9patch)" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -119,6 +130,7 @@ only_modes=0
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+[[ -n $BACKEND_COMPARE ]] && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -133,6 +145,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
+[[ -n $BACKEND_COMPARE ]] && VALIDATION_PROFILE="backend-compare"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 
 case "$VALIDATION_PROFILE" in
@@ -144,6 +157,7 @@ case "$VALIDATION_PROFILE" in
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
+    backend-compare) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
 esac
@@ -177,7 +191,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY E9PATCH_COMPAT_ONLY
-readonly QEMU_L2_ONLY
+readonly QEMU_L2_ONLY BACKEND_COMPARE
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -253,6 +267,16 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
+# Golden logs: the canonical ptrace-backend output captured during the working
+# envelope measurement. Each envelope probe stores one complete, diff-able set
+# under $GOLDEN_LOGS_DIR/<probe-label>/ so other backends can be checked for
+# bitwise parity against the ptrace reference. Override GOLDEN_LOGS_DIR to store
+# elsewhere; keep it under target/ so it stays ignored and out of commits.
+GOLDEN_LOGS_DIR=${GOLDEN_LOGS_DIR:-"$ROOT_DIR/target/golden-logs"}
+# Non-ptrace backend captures live here, one subtree per backend
+# ($BACKEND_LOGS_DIR/<backend>/<probe>/), and are diffed against the matching
+# ptrace golden set. Also kept under target/ so it stays git-ignored.
+BACKEND_LOGS_DIR=${BACKEND_LOGS_DIR:-"$ROOT_DIR/target/backend-logs"}
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
@@ -737,6 +761,28 @@ function run_full_backend_gates {
     else
         note_backend_skip "DBI" "backend smoke did not complete successfully"
     fi
+
+    # Golden-log cross-backend parity (informational): run each available
+    # backend once per envelope probe and diff against the ptrace golden set.
+    # This surfaces divergence in the full suite without gating it; the strict
+    # gate is `validate.sh --backend-compare <backend>`, which exits nonzero on
+    # any divergence.
+    if kvm_backend_available; then
+        run_check "KVM golden-log parity (informational)" \
+            report_backend_compare_envelope kvm
+    fi
+    if dbi_backend_available; then
+        run_check "DBI golden-log parity (informational)" \
+            report_backend_compare_envelope dbi
+    fi
+}
+
+# Run the golden-log parity envelope for one backend but always succeed, so the
+# full suite reports divergence without failing on it. The strict gate lives in
+# the dedicated --backend-compare mode.
+function report_backend_compare_envelope {
+    run_backend_compare_envelope "$1" || true
+    return 0
 }
 
 function super_probe_command {
@@ -1945,6 +1991,92 @@ function _envelope_level {
         "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" $flags -- "$@" </dev/null >>"$LOG_FILE" 2>&1
 }
 
+# Run one guest once under a chosen backend and write a complete, diff-able
+# artifact set into $dir. $1 = output directory, $2 = backend name (empty means
+# the default ptrace backend), remaining args are the guest argv.
+#
+# The same flags are used for every backend so ptrace golden and non-ptrace
+# captures are directly comparable: --strict plus --detlog-heap/--detlog-stack
+# (the L3 memory fingerprints). NOTE: exactly ONE run per backend -- ptrace is
+# deterministic under --strict so its single run is the authoritative reference,
+# and each other backend is then run once and diffed against it. That is one run
+# per backend versus the two an in-backend --verify would need.
+#
+# The hermit INFO log goes to its own file via --log-file so it never mixes with
+# the guest's own stderr; stdout and stderr are captured separately. The log
+# path must live under the repo (target/), never /tmp -- the container mounts a
+# fresh tmpfs over /tmp, so a /tmp log file vanishes on teardown or fails to
+# open inside the container namespace.
+#
+# Artifacts written to $dir:
+#   command             the exact guest argv, one token per line
+#   backend             the backend name ("ptrace" when $2 is empty)
+#   hermit.log          INFO-level hermit/detcore determinism log
+#   stdout, stderr      the guest program's own streams
+#   exit_code           hermit's exit status for the run
+#   detlog-heap.hashes  DETLOG heap memory-map hash lines, timestamp-stripped
+#   detlog-stack.hashes DETLOG stack memory-map hash lines, timestamp-stripped
+# Best-effort: a failed run still records its (possibly nonzero) exit_code and
+# whatever the backend produced, and never aborts validation.
+function _capture_run {
+    local dir=$1
+    local backend=$2
+    shift 2
+    local status
+    local -a global=(--log INFO --log-file "$dir/hermit.log")
+    [[ -n $backend ]] && global+=(--backend "$backend")
+
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    printf '%s\n' "$@" >"$dir/command"
+    printf '%s\n' "${backend:-ptrace}" >"$dir/backend"
+
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" "${global[@]}" \
+        "${HERMIT_RUN_ARGS[@]}" --strict --detlog-heap --detlog-stack -- "$@" \
+        </dev/null >"$dir/stdout" 2>"$dir/stderr"
+    status=$?
+    printf '%s\n' "$status" >"$dir/exit_code"
+
+    # Split the memory-map hash lines out of the INFO log for easy diffing. The
+    # detlog! macro emits "DETLOG [memory][dtid N] <region>-><hash>"; heap and
+    # stack regions are distinguished by the region description. The per-line
+    # wall-clock timestamp prefix is stripped so the hash files diff on their
+    # deterministic content only (the region + hash), which is exactly what a
+    # cross-backend parity check compares.
+    if [[ -f "$dir/hermit.log" ]]; then
+        local mem
+        mem=$(grep -F 'DETLOG [memory]' "$dir/hermit.log" \
+            | sed 's/^.*DETLOG \[memory\]/DETLOG [memory]/') || true
+        printf '%s\n' "$mem" | grep -i '\[heap\]' >"$dir/detlog-heap.hashes" || true
+        printf '%s\n' "$mem" | grep -i '\[stack\]' >"$dir/detlog-stack.hashes" || true
+    else
+        : >"$dir/detlog-heap.hashes"
+        : >"$dir/detlog-stack.hashes"
+    fi
+    return "$status"
+}
+
+# Capture the golden ptrace reference for one probe. $1 = probe label (directory
+# name under $GOLDEN_LOGS_DIR); remaining args are the guest argv. The ptrace
+# backend is deterministic under --strict, so this single run is the reference
+# every other backend is compared against.
+function capture_golden_log {
+    local label=$1
+    shift
+    local dir="$GOLDEN_LOGS_DIR/$label"
+    local status
+
+    _capture_run "$dir" "" "$@"
+    status=$?
+
+    if ((VERBOSE == 1)); then
+        printf "  golden log: %s (exit %s) -> %s\n" "$label" "$status" "$dir"
+    fi
+    printf "golden log captured: %s (exit %s) -> %s\n" "$label" "$status" "$dir" \
+        >>"$LOG_FILE"
+}
+
 # Measure the working envelope over ENVELOPE_PROBES, write JSON to
 # $ENVELOPE_JSON, cache it in $ENVELOPE_LAST_JSON, and print a human summary.
 # This is a measurement, not a gate: known failures (e.g. an unsupported
@@ -1967,6 +2099,9 @@ function run_envelope {
         fi
         total=$((total + 1))
         local p1=0 p2=0 p3=0 p4=0 prr=0
+
+        # Store the golden ptrace reference for this probe (see capture_golden_log).
+        capture_golden_log "$label" "${cmdarr[@]}"
 
         _envelope_level "--strict" "${cmdarr[@]}" && { l1=$((l1 + 1)); p1=1; }
         _envelope_level "--strict --verify" "${cmdarr[@]}" && { l2=$((l2 + 1)); p2=1; }
@@ -2014,6 +2149,131 @@ function run_envelope {
     printf "  total e2e probes                                 : %d\n" "$total"
     printf "  JSON: %s\n" "$ENVELOPE_JSON"
     printf "  %s\n" "$ENVELOPE_LAST_JSON"
+    printf "  golden logs (ptrace reference): %s/<probe>/\n" "$GOLDEN_LOGS_DIR"
+}
+
+# --- Cross-backend parity against the ptrace golden logs ---------------------
+# The project vision is "Done = Identical": a guest must not be able to tell
+# which backend is running it. These helpers run a non-ptrace backend ONCE and
+# diff its output against the stored ptrace golden set. Bitwise-identical output
+# is a PASS; any divergence is a FAIL with the exact diff.
+
+# Compare two captured artifacts and, on any difference, append a labelled diff
+# to $LOG_FILE (and, when verbose, to the screen). $1 = human artifact name,
+# $2 = golden file, $3 = candidate file. Returns 0 when identical, 1 otherwise.
+function _diff_artifact {
+    local name=$1 golden=$2 cand=$3
+    [[ -f $golden ]] || golden=/dev/null
+    [[ -f $cand ]] || cand=/dev/null
+    if cmp -s "$golden" "$cand"; then
+        return 0
+    fi
+    {
+        printf -- '--- DIVERGENCE in %s (golden vs candidate) ---\n' "$name"
+        diff -u "$golden" "$cand" | head -n 60
+    } >>"$LOG_FILE"
+    if ((VERBOSE == 1)); then
+        printf -- '      ✗ %s differs (see %s)\n' "$name" "$LOG_FILE"
+    fi
+    return 1
+}
+
+# Compare the hermit determinism log via hermit's own log-diff, which normalizes
+# benign numeric noise (addresses, pids, RCB/timing counters) before comparing
+# the DETLOG + scheduler COMMIT stream -- the same comparison `--verify` uses.
+# stdout/stderr/exit/memory hashes are checked bitwise elsewhere; this catches
+# scheduling and syscall-sequence divergence. Returns 0 when the tool reports no
+# substantive differences, 1 otherwise. A missing log on either side is a diff.
+function _diff_hermit_log {
+    local golden=$1 cand=$2 out
+    if [[ ! -s $golden || ! -s $cand ]]; then
+        printf -- '--- DIVERGENCE in hermit.log (one side missing/empty) ---\n' >>"$LOG_FILE"
+        return 1
+    fi
+    out=$("$HERMIT_BIN" log-diff --strip-lines --no-color "$golden" "$cand" 2>&1) || true
+    if grep -q 'no substantive differences' <<<"$out"; then
+        return 0
+    fi
+    {
+        printf -- '--- DIVERGENCE in hermit.log determinism trace (log-diff) ---\n'
+        printf '%s\n' "$out" | head -n 80
+    } >>"$LOG_FILE"
+    if ((VERBOSE == 1)); then
+        printf -- '      ✗ hermit.log determinism trace differs (see %s)\n' "$LOG_FILE"
+    fi
+    return 1
+}
+
+# Run one probe under $backend once and diff every artifact against the golden
+# ptrace set. Prints one table row and returns 0 (PASS) or 1 (FAIL). The golden
+# set for $label must already exist (capture_golden_log runs first).
+# $1 = label, $2 = backend, remaining args = guest argv.
+function compare_backend_probe {
+    local label=$1 backend=$2
+    shift 2
+    local golden="$GOLDEN_LOGS_DIR/$label"
+    local bdir="$BACKEND_LOGS_DIR/$backend/$label"
+    local overall=PASS
+    local -a cols=()
+    local a
+
+    _capture_run "$bdir" "$backend" "$@" || true
+
+    # Each artifact contributes one column: ok / FAIL.
+    for a in stdout stderr exit_code detlog-heap.hashes detlog-stack.hashes; do
+        if _diff_artifact "$a" "$golden/$a" "$bdir/$a"; then
+            cols+=("ok")
+        else
+            cols+=("FAIL"); overall=FAIL
+        fi
+    done
+    if _diff_hermit_log "$golden/hermit.log" "$bdir/hermit.log"; then
+        cols+=("ok")
+    else
+        cols+=("FAIL"); overall=FAIL
+    fi
+
+    printf "  %-12s %-6s %-6s %-6s %-6s %-6s %-6s %s\n" \
+        "$label" "${cols[0]}" "${cols[1]}" "${cols[2]}" "${cols[3]}" \
+        "${cols[4]}" "${cols[5]}" "$overall"
+    [[ $overall == PASS ]]
+}
+
+# Run the full cross-backend parity envelope for one backend: (re)capture the
+# ptrace golden for every probe, run the backend once per probe, diff, and print
+# a compat table. $1 = backend. Returns 0 only if every probe is bitwise-
+# identical to its ptrace golden. This is a real gate, not a measurement.
+function run_backend_compare_envelope {
+    local backend=$1
+    local probe label cmd
+    local -a cmdarr
+    local passed=0 total=0 status=0
+
+    printf "\n== Cross-backend parity vs ptrace golden (backend: %s) ==\n" "$backend"
+    printf "  %-12s %-6s %-6s %-6s %-6s %-6s %-6s %s\n" \
+        "probe" "stdout" "stderr" "exit" "heap" "stack" "log" "overall"
+    for probe in "${ENVELOPE_PROBES[@]}"; do
+        label=${probe%%|*}
+        cmd=${probe#*|}
+        read -r -a cmdarr <<<"$cmd"
+        total=$((total + 1))
+        # Refresh the ptrace golden so the comparison uses a current reference.
+        capture_golden_log "$label" "${cmdarr[@]}"
+        if compare_backend_probe "$label" "$backend" "${cmdarr[@]}"; then
+            passed=$((passed + 1))
+        else
+            status=1
+        fi
+    done
+    printf "  --\n"
+    printf "  %s parity: %d/%d probes bitwise-identical to ptrace golden\n" \
+        "$backend" "$passed" "$total"
+    printf "  golden:  %s/<probe>/\n" "$GOLDEN_LOGS_DIR"
+    printf "  backend: %s/%s/<probe>/\n" "$BACKEND_LOGS_DIR" "$backend"
+    if ((status != 0)); then
+        printf "  divergence diffs recorded in %s\n" "$LOG_FILE"
+    fi
+    return "$status"
 }
 
 # Compare the just-measured envelope against a baseline JSON. Any count that
@@ -2314,6 +2574,36 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
     fi
     print_summary
     ((failures == 0))
+    exit $?
+fi
+
+if [[ -n $BACKEND_COMPARE ]]; then
+    # Build the debug binary that HERMIT_BIN / the capture helpers use.
+    run_check "Build Hermit for backend comparison" cargo build -p hermit
+    if ((failures != 0)); then
+        exit 1
+    fi
+    if ! backend_selector_supported; then
+        note_backend_skip "$BACKEND_COMPARE" "backend selector is unavailable"
+        exit 0
+    fi
+    # For device/SDK-gated backends, skip cleanly (exit 0) when unavailable so
+    # the mode is still runnable on any host; the comparison itself is the gate.
+    case "$BACKEND_COMPARE" in
+        kvm)
+            if ! kvm_backend_available; then
+                note_backend_skip "KVM" "/dev/kvm is not readable and writable"
+                exit 0
+            fi ;;
+        dbi)
+            if ! dbi_backend_available; then
+                note_backend_skip "DBI" "backend smoke did not complete successfully"
+                exit 0
+            fi ;;
+    esac
+    # Print the parity table directly (not via run_check) so it reaches the
+    # screen, then exit with the parity status: 0 only if every probe matched.
+    run_backend_compare_envelope "$BACKEND_COMPARE"
     exit $?
 fi
 
