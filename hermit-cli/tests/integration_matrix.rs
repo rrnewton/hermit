@@ -274,6 +274,8 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
         case(
             "threaded",
             "node",
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#565)
             // Prefer the distro ELF; /usr/local may be a telemetry wrapper.
             &["/usr/bin/node", "/bin/node", "/usr/local/bin/node"],
             &["/tmp/integration-matrix/node_worker.js"],
