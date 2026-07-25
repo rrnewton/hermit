@@ -1024,7 +1024,7 @@ function strict_compatibility_probe {
         # custom mounts intentionally reject unrelated symlinked executables.
         case "$label" in
             whoami | groups | pinky | logname | tar | chown)
-                run_args+=("--mount=type=bind,source=$E9PATCH_NSSWITCH_FILE,target=/etc/nsswitch.conf")
+                run_args+=("--mount=type=bind,source=$E9PATCH_NSSWITCH_FILE,target=/etc/nsswitch.conf,readonly")
                 ;;
         esac
         run_args+=(--strict --verify --)

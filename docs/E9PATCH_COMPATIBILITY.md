@@ -74,7 +74,8 @@ artifact failed. Rewriting the same complete 49-site set with `e9tool -O0`
 passed at L2. Hermit now uses the conservative setting and the rewrite schema
 invalidates artifacts made with the old optimizer default.
 
-A wider 45-program survey also identified exclusions that are not presented as
+Across the initial 45-program survey and two replacement probes, nine
+exclusions were identified that are not presented as
 e9patch rewrite coverage. `mount` and `umount` are intentionally rejected
 because they are privilege-bearing. `javap` and `ssh` had zero candidate sites
 but diverged on an external identity-service Unix-socket poll, so they are
