@@ -116,6 +116,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// path records them when record/replay is active. Other prctl options retain
     /// the existing unclassified policy at dispatch.
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#655): Confirm the narrow prctl passthrough policy.
     pub async fn handle_prctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
