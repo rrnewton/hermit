@@ -1186,9 +1186,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Apply a socket option to an already tracked socket. The syscall has no
-    /// output buffer; record/replay captures its result and later socket I/O is
-    /// still mediated by Detcore's nonblocking scheduler paths.
+    /// Apply a socket option to an already tracked socket. Record mode captures
+    /// the result; replay re-applies a successful option before later socket I/O,
+    /// which remains mediated by Detcore's nonblocking scheduler paths.
     pub async fn handle_setsockopt<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1197,6 +1197,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Transition an already tracked socket into listening state.
     pub async fn handle_listen<G: Guest<Self>>(
         &self,
@@ -1206,6 +1208,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Return the local address of a tracked socket.
     pub async fn handle_getsockname<G: Guest<Self>>(
         &self,
@@ -1215,6 +1219,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Return the peer address of a tracked socket.
     pub async fn handle_getpeername<G: Guest<Self>>(
         &self,
@@ -1224,6 +1230,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Return an option value from a tracked socket. Hermit only promises normal
     /// run determinism for isolated guest networking; record/replay captures the
     /// result when external socket state is part of the recording boundary.

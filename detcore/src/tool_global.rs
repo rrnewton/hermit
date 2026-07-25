@@ -520,9 +520,19 @@ impl GlobalTool for GlobalState {
                 let res = self.recv_trace_schedevent(ev, detpid).await;
                 R::TraceSchedEvent(res)
             }
-            GlobalRequest::RegisterAlarm(dpid, dtid, secs, sig) => {
-                let remaining = self.recv_register_alarm(dpid, dtid, secs, sig).await;
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#663)
+            GlobalRequest::RegisterAlarm(dpid, dtid, duration, sig) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
+                let remaining = self
+                    .recv_register_alarm(dpid, dtid, now, duration, sig)
+                    .await;
                 R::RegisterAlarm(remaining)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#663)
+            GlobalRequest::ResolveKillTargets(dpid) => {
+                R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
@@ -1132,18 +1142,21 @@ impl GlobalState {
         self.port_end_range.store(range[1], SeqCst);
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Register an alarm (delayed signal delivery) with the global scheduler.
     pub async fn recv_register_alarm(
         &self,
         detpid: DetPid,
         dettid: DetTid,
+        now: LogicalTime,
         duration: LogicalTime,
         sig: SigWrapper,
     ) -> LogicalTime {
         self.sched
             .lock()
             .unwrap()
-            .register_alarm(detpid, dettid, duration, sig.0)
+            .register_alarm(detpid, dettid, now, duration, sig.0)
     }
 }
 
@@ -1206,8 +1219,15 @@ pub enum GlobalRequest {
     /// Record scheduling event in a total order.
     TraceSchedEvent(SchedEvent, DetPid),
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Basically performs an alarm syscall, takes a logical duration.
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Query live threads before translating process-directed signal delivery.
+    ResolveKillTargets(DetPid),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -1241,7 +1261,12 @@ pub enum GlobalResponse {
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    ResolveKillTargets(Vec<DetTid>),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -1729,6 +1754,8 @@ where
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
 /// Register an alarm (delayed signal delivery) with the global scheduler.
 /// Returns the logical duration remaining until any previously scheduled alarm.
 pub async fn register_alarm<G, T>(guest: &mut G, duration: LogicalTime, sig: Signal) -> LogicalTime
@@ -1745,6 +1772,21 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
+/// Return the scheduler's live threads for a positive process ID.
+pub async fn resolve_kill_targets<G, T>(guest: &mut G, detpid: DetPid) -> Vec<DetTid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
+    match response.1 {
+        GlobalResponse::ResolveKillTargets(targets) => targets,
         _ => unreachable!(),
     }
 }

@@ -1072,6 +1072,17 @@ impl Scheduler {
                 );
             }
         }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#663)
+        let live_process_thread = self
+            .thread_tree
+            .my_thread_group(detpid)
+            .into_iter()
+            .any(|tid| self.next_turns.contains_key(&tid));
+        if !live_process_thread {
+            self.blocked.timed_waiters.remove_alarm(*detpid);
+        }
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.
@@ -1269,8 +1280,16 @@ impl Scheduler {
         }
     }
 
-    fn fire_alarm(&mut self, dtid: DetTid, dpid: DetPid, sig: Signal) {
-        let target = self.select_signal_target(dpid, Some(dtid));
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    fn fire_alarm(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+        let Some(target) = self.select_signal_target(dpid, Some(dtid)) else {
+            info!(
+                "[dpid {}] Alarm expired after its target exited; ignoring.",
+                dpid
+            );
+            return;
+        };
         info!(
             "[dtid {}] Alarm fired, delivering signal {} to guest.",
             target, sig
@@ -1280,7 +1299,13 @@ impl Scheduler {
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
     // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
-    fn select_signal_target(&mut self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    fn select_signal_target(&mut self, detpid: DetPid, m_dettid: Option<DetTid>) -> Option<DetTid> {
+        if !self.thread_tree.thread_group_leaders.contains(&detpid) {
+            return None;
+        }
+
         // Targeted chaos (T137242449): a process-directed signal may legally be
         // handled by any thread in the group that does not block it. Instead of
         // always steering it to the hinted/leader thread, pick a random eligible
@@ -1297,7 +1322,7 @@ impl Scheduler {
                     "[targeted-chaos] delivering process-directed signal to random group thread {} (of {:?})",
                     chosen, eligible
                 );
-                return chosen;
+                return Some(chosen);
             }
         }
 
@@ -1305,19 +1330,27 @@ impl Scheduler {
             match self.thread_status(dettid) {
                 ThreadStatus::Gone => {}
                 ThreadStatus::Running | ThreadStatus::NotRunning => {
-                    return dettid;
+                    return Some(dettid);
                 }
             }
         }
-        // TODO: handle changes in group leader here...
-        if let ThreadStatus::Gone = self.thread_status(detpid) {
-            panic!(
-                "Unhandled case of signal delivery to process pid={}, but group leader thread has exited",
-                detpid
-            );
-        } else {
-            detpid
+        match self.thread_status(detpid) {
+            ThreadStatus::Gone => self.process_signal_targets(detpid).into_iter().next(),
+            ThreadStatus::Running | ThreadStatus::NotRunning => Some(detpid),
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Return the scheduler's live threads for a positive process ID.
+    pub fn process_signal_targets(&mut self, detpid: DetPid) -> Vec<DetTid> {
+        if !self.thread_tree.thread_group_leaders.contains(&detpid) {
+            return Vec::new();
+        }
+        let mut targets = self.thread_tree.my_thread_group(&detpid);
+        targets.retain(|tid| self.next_turns.contains_key(tid));
+        targets.sort();
+        targets
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
@@ -2467,11 +2500,14 @@ impl Scheduler {
         print_stack
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     // Returns the logical duration until any previously scheduled alarm, if any (zero otherwise).
     pub fn register_alarm(
         &mut self,
         detpid: DetPid,
         dettid: DetTid,
+        now: LogicalTime,
         duration: LogicalTime,
         sig: Signal,
     ) -> LogicalTime {
@@ -2479,15 +2515,13 @@ impl Scheduler {
             // Alarm of 0 cancels any pending signal.
             self.blocked.timed_waiters.remove_alarm(detpid)
         } else {
-            let target_time = self.committed_time + duration;
+            let target_time = now + duration;
             self.blocked
                 .timed_waiters
                 .insert_alarm(target_time, detpid, dettid, sig)
         };
         if let Some(old_target_time) = old {
-            let remain_ns: u64 = old_target_time
-                .as_nanos()
-                .saturating_sub(self.committed_time.as_nanos());
+            let remain_ns: u64 = old_target_time.as_nanos().saturating_sub(now.as_nanos());
             LogicalTime::from_nanos(remain_ns)
         } else {
             // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
@@ -2639,5 +2673,62 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn alarm_deadline_uses_observed_logical_time() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let detpid = DetPid::from_raw(100);
+        let dettid = DetTid::from_raw(101);
+        let now = LogicalTime::from_nanos(1_000);
+        let duration = LogicalTime::from_nanos(250);
+
+        assert_eq!(
+            scheduler.register_alarm(detpid, dettid, now, duration, Signal::SIGALRM),
+            LogicalTime::ZERO
+        );
+        assert_eq!(
+            scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+            vec![(
+                LogicalTime::from_nanos(1_250),
+                TimedEvent::AlarmEvt(detpid, dettid, Signal::SIGALRM)
+            )]
+        );
+
+        let cancel_time = LogicalTime::from_nanos(1_100);
+        assert_eq!(
+            scheduler.register_alarm(
+                detpid,
+                dettid,
+                cancel_time,
+                LogicalTime::ZERO,
+                Signal::SIGALRM
+            ),
+            LogicalTime::from_nanos(150)
+        );
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn alarm_target_falls_back_to_surviving_process_thread() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        scheduler.next_turns.insert(
+            worker,
+            ThreadNextTurn {
+                dettid: worker,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert_eq!(
+            scheduler.select_signal_target(leader, Some(leader)),
+            Some(worker)
+        );
     }
 }
