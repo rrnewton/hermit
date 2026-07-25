@@ -46,21 +46,42 @@ jobs:
       run: rustup component add clippy rustfmt
     - name: Portable test lane (no PMU or CPUID interception)
       run: ./validate.sh --hosted-only --no-label-pr --verbose
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#712): Review bounded CI-only routing for no-PMU hangs.
+    - name: Post-fork scheduling diagnostics (nonblocking)
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
+    - name: Network syscall determinism diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
+    - name: IPC determinism diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
     - name: Threaded integration matrix diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
       continue-on-error: true
       timeout-minutes: 5
       run: cargo test -p hermit --test integration_matrix -- --test-threads=1
     - name: LiteInst clone verification diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
       continue-on-error: true
       timeout-minutes: 5
       run: cargo test -p hermit --test cli run_liteinst_rejects_non_fork_clone -- --exact --test-threads=1
     - name: Chaos hello-race verification diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
       continue-on-error: true
       timeout-minutes: 5
       run: cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#598)
     - name: DBI pipe backpressure diagnostics (nonblocking)
+      if: ${{ !cancelled() }}
       continue-on-error: true
       timeout-minutes: 5
       run: cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1

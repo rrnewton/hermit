@@ -30,21 +30,21 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 466 of the 868 Cargo-discovered cases:
+The selector covers exactly 462 of the 868 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
 | Workspace unit, bin, and doc baseline | 319 | Existing regular-job selection |
-| Detcore misc without CPUID probes | 21 | `tests_misc`, excluding two RDRAND/CPUID cases |
+| Detcore misc without CPUID probes | 18 | `tests_misc`, excluding two RDRAND/CPUID cases and three bounded diagnostics |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 120 | Non-KVM CLI, LiteInst, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
+| Portable Hermit integration cases | 119 | Non-KVM CLI, LiteInst, strict/verify modes, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 180-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
-The corpus is blocking except for six bounded runtime diagnostics that have
-timed out on a GitHub-hosted runner with PMU disabled: Rust, Java/Javac,
-Node.js, and the two zstd rows.
+the 181-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
+The corpus is blocking except for seven bounded diagnostics observed on a
+GitHub-hosted runner with PMU disabled: Rust, Java/Javac, Node.js, the two zstd
+rows, and `top` process-table variance.
 
 The lane also requires all six DynamoRIO DBI parity scenarios currently
 marked `pass`. Cargo builds the pinned DynamoRIO runtime and native client;
@@ -53,9 +53,9 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 402 Cargo cases are outside the blocking hosted subset. The
-per-PR hardware lane executes 318 blocking cases, ten cases run as bounded
-nonblocking diagnostics (three hosted and seven hardware), the weekly `super`
+The remaining 406 Cargo cases are outside the blocking hosted subset. The
+per-PR hardware lane executes 318 blocking cases, 14 cases run as bounded
+nonblocking diagnostics (seven hosted and seven hardware), the weekly `super`
 tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
 
 | Group | Cases | Routing | Hardware reason |
@@ -66,6 +66,7 @@ tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
 | KVM CLI cases | 17 | Per-PR | Read/write `/dev/kvm` is required |
 | DBI pipe backpressure | 1 | Per-PR diagnostic | Bounded known DBI hang from PR #598 |
 | Portable runtime diagnostics | 3 | Hosted per-PR diagnostic | Threaded Java/Node matrix, LiteInst shape ordering, and chaos hello-race gaps |
+| Portable synchronization diagnostics | 4 | Hosted per-PR diagnostic | No-PMU post-fork, network, and IPC stalls |
 | Pselect signal interruption | 1 | Per-PR diagnostic | Virtual timeout currently wins the delayed-signal race |
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
 | Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
@@ -95,9 +96,9 @@ The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
 
 The stable record/replay integration cases remain blocking. The intermittently
 flaky `record_replay_matrix`, four JVM cases, the DBI pipe-backpressure case,
-the pselect signal-interruption case, and the three hosted runtime diagnostics
+the pselect signal-interruption case, and the seven hosted diagnostics
 still execute on every pull request as bounded nonblocking diagnostics tracked
-by PRs #678, #657, #598, and #673.
+by PRs #678, #657, #598, #673, and #712.
 
 The hardware lane also gates the three record/replay working-envelope cells,
 the 128-row R/R compatibility corpus, debugger
