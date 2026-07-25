@@ -394,6 +394,8 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#658): Audit guest-internal FD and epoll classification boundaries.
     fn fd_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
         let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
         if std::fs::read_link(&path)

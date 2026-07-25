@@ -284,6 +284,8 @@ fn read_write_bytes<M: MemoryAccess>(
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#658): Audit temporary blocking and restoration for replay side effects.
 async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     guest: &mut G,
     fd: libc::c_int,
