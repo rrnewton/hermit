@@ -1448,7 +1448,7 @@ mod tests {
 
     #[test]
     fn futex_wake_op_decodes_signed_arguments_and_comparisons() {
-        let set_one_if_zero = (1_u32 << 12) | 0;
+        let set_one_if_zero = 1_u32 << 12;
         assert_eq!(apply_futex_wake_op(set_one_if_zero, 0), Ok((1, true)));
         assert_eq!(apply_futex_wake_op(set_one_if_zero, 7), Ok((1, false)));
 
