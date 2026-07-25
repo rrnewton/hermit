@@ -51,18 +51,23 @@ jobs:
     - name: Post-fork scheduling diagnostics (nonblocking)
       if: ${{ !cancelled() }}
       continue-on-error: true
-      timeout-minutes: 5
+      timeout-minutes: 3
       run: cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
     - name: Network syscall determinism diagnostic (nonblocking)
       if: ${{ !cancelled() }}
       continue-on-error: true
-      timeout-minutes: 5
+      timeout-minutes: 3
       run: cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
     - name: IPC determinism diagnostic (nonblocking)
       if: ${{ !cancelled() }}
       continue-on-error: true
-      timeout-minutes: 5
+      timeout-minutes: 3
       run: cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
+    - name: Random-source determinism diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      timeout-minutes: 3
+      run: cargo test -p hermit --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
     - name: Threaded integration matrix diagnostic (nonblocking)
       if: ${{ !cancelled() }}
       continue-on-error: true

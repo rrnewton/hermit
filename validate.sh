@@ -2662,7 +2662,7 @@ function run_hosted_only_suite {
     run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1
     run_check "Test Detcore non-PMU parallel cases" cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4
 
-    run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism
+    run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism mmap_determinism procfs_determinism python_stdlib signal_determinism thread_sync_determinism
     run_check "Portable arbitrary-binary cases" cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1
     run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --skip run_liteinst_rejects_non_fork_clone --test-threads=1
     run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1
