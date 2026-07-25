@@ -75,7 +75,7 @@ const HERMIT_VERIFY_TIMEOUT: &str = "120s";
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#651)
+// TODO-HUMAN-REVIEW(#657)
 fn hermit_verify_timeout() -> String {
     std::env::var("HERMIT_APP_VERIFY_TIMEOUT").unwrap_or_else(|_| HERMIT_VERIFY_TIMEOUT.to_owned())
 }
