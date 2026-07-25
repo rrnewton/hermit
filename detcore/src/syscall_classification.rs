@@ -25,8 +25,9 @@ pub(crate) enum SyscallClassification {
     Determinized,
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
-    /// The syscall retains the legacy fail-closed-or-forward policy pending investigation.
-    Unclassified,
+    /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
+    // TODO-HUMAN-REVIEW(PR-643): Review the issue-backed unsupported classification policy.
+    Unsupported,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -169,6 +170,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setrlimit
         | Sysno::setsockopt
         | Sysno::tgkill
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev => SyscallClassification::Determinized,
 
@@ -179,29 +181,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
         Sysno::access
         | Sysno::brk
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::chown
         | Sysno::getcwd
         | Sysno::getegid
         | Sysno::geteuid
         | Sysno::getgid
         | Sysno::getpid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
-        | Sysno::getppid
-        | Sysno::getsid
         | Sysno::gettid
         | Sysno::getuid
         | Sysno::lseek
         | Sysno::mprotect
         | Sysno::readlink
         | Sysno::set_robust_list
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::setpgid
         | Sysno::set_tid_address
         | Sysno::sigaltstack
         // capget/capset/getgroups observe or update kernel credential state that starts
@@ -237,94 +227,100 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // physical flush latency is outside guest logical time.
         | Sysno::fdatasync
         | Sysno::ftruncate
-        // Fixed credentials, process-local unlocks, and guest-owned filesystem
-        // flushes are repeatable under the fixed-container model.
-        // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fsync
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresgid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresuid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::munlock
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::munlockall
-        // These synchronous extent and pathname operations are repeatable for guest-owned
-        // files in a fixed namespace with adequate space and no external mutation.
-        // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fallocate
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::readlinkat
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::rename
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::renameat
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::truncate
-        // Stable guest-owned metadata and synchronous writeback operations are
-        // repeatable in Hermit's fixed mount namespace and filesystem image.
-        // TODO-HUMAN-REVIEW(#683): Confirm the metadata/writeback passthrough boundary.
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::faccessat
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchmod
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchmodat2
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchown
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchownat
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fgetxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::flistxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fremovexattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fsetxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::lchown
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::link
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::listxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::llistxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::lremovexattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::lsetxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::msync
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::readahead
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::symlink
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::sync_file_range
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
-        // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
-        // TODO/FIXME: These syscalls have not been classified. They temporarily use
-        // the legacy passthrough policy and may need deterministic handling. Each must
-        // be investigated and moved to DETERMINIZED or PASS-THRU.
+        // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+        // Every matching classification issue recommends PASS-THRU. These remain
+        // conditional on Hermit's fixed-container and stable-state assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::_sysctl
-        | Sysno::acct
+        | Sysno::afs_syscall
+        | Sysno::chown
+        | Sysno::chroot
+        | Sysno::create_module
+        | Sysno::faccessat
+        | Sysno::fchmod
+        | Sysno::fchmodat2
+        | Sysno::fchown
+        | Sysno::fchownat
+        | Sysno::fgetxattr
+        | Sysno::fremovexattr
+        | Sysno::fsetxattr
+        | Sysno::fsync
+        | Sysno::get_kernel_syms
+        | Sysno::get_thread_area
+        | Sysno::getpmsg
+        | Sysno::getresgid
+        | Sysno::getresuid
+        | Sysno::lchown
+        | Sysno::link
+        | Sysno::lremovexattr
+        | Sysno::lsetxattr
+        | Sysno::mbind
+        | Sysno::mknod
+        | Sysno::mknodat
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::modify_ldt
+        | Sysno::msync
+        | Sysno::munlock
+        | Sysno::munlockall
+        | Sysno::nfsservctl
+        | Sysno::personality
+        | Sysno::pkey_alloc
+        | Sysno::pkey_free
+        | Sysno::pkey_mprotect
+        | Sysno::putpmsg
+        | Sysno::query_module
+        | Sysno::readahead
+        | Sysno::readlinkat
+        | Sysno::rename
+        | Sysno::renameat
+        | Sysno::sched_get_priority_max
+        | Sysno::sched_get_priority_min
+        | Sysno::security
+        | Sysno::set_mempolicy
+        | Sysno::set_thread_area
+        | Sysno::symlink
+        | Sysno::sync
+        | Sysno::sync_file_range
+        | Sysno::syncfs
+        | Sysno::truncate
+        | Sysno::tuxcall
+        | Sysno::uselib
+        | Sysno::fallocate
+        | Sysno::flistxattr
+        | Sysno::listxattr
+        | Sysno::llistxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#663)
+        | Sysno::getpgid
+        | Sysno::getpgrp
+        | Sysno::getppid
+        | Sysno::getsid
+        | Sysno::setpgid
+        | Sysno::vserver => SyscallClassification::PassThrough,
+        // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+
+        // ===== UNSUPPORTED SYSCALLS =====
+        // These require a deterministic handler or further investigation. Normal mode
+        // records their use for an aggregate warning and preserves legacy forwarding;
+        // --panic-on-unsupported-syscalls stops at the first use.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
+        Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
-        | Sysno::afs_syscall
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::chroot
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::create_module
         | Sysno::delete_module
         | Sysno::epoll_pwait2
         | Sysno::fanotify_init
@@ -339,12 +335,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
-        | Sysno::get_kernel_syms
         | Sysno::get_mempolicy
         | Sysno::get_robust_list
-        | Sysno::get_thread_area
         | Sysno::getitimer
-        | Sysno::getpmsg
         | Sysno::init_module
         | Sysno::io_cancel
         | Sysno::io_destroy
@@ -369,16 +362,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
-        | Sysno::mbind
         | Sysno::memfd_secret
         | Sysno::migrate_pages
         | Sysno::mincore
-        | Sysno::mknod
-        | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
-        | Sysno::modify_ldt
         | Sysno::mount
         | Sysno::mount_setattr
         | Sysno::move_mount
@@ -394,29 +380,22 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgsnd
         | Sysno::name_to_handle_at
-        | Sysno::nfsservctl
         | Sysno::open_by_handle_at
         | Sysno::open_tree
         | Sysno::openat2
         | Sysno::perf_event_open
-        | Sysno::personality
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
         | Sysno::pivot_root
-        | Sysno::pkey_alloc
-        | Sysno::pkey_free
-        | Sysno::pkey_mprotect
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
         | Sysno::ptrace
-        | Sysno::putpmsg
         | Sysno::pwritev
         | Sysno::pwritev2
-        | Sysno::query_module
         | Sysno::quotactl
         | Sysno::quotactl_fd
         | Sysno::readv
@@ -427,8 +406,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_get_priority_max
-        | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
         | Sysno::sched_getparam
         | Sysno::sched_getscheduler
@@ -437,16 +414,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setparam
         | Sysno::sched_setscheduler
         | Sysno::seccomp
-        | Sysno::security
         | Sysno::select
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::set_mempolicy
         | Sysno::set_mempolicy_home_node
-        | Sysno::set_thread_area
         | Sysno::setdomainname
         | Sysno::setfsgid
         | Sysno::setfsuid
@@ -469,27 +443,22 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::statmount
         | Sysno::swapoff
         | Sysno::swapon
-        | Sysno::sync
-        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
-        | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
-        | Sysno::uselib
         | Sysno::ustat
         | Sysno::vhangup
-        | Sysno::vmsplice
-        | Sysno::vserver => SyscallClassification::Unclassified,
-        // ===== END UNCLASSIFIED =====
+        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
         // make changes to the pinned table a compile error; this arm only satisfies the
         // external-enum language requirement and deliberately fails closed.
-        _unexpected => panic!("unclassified Sysno outside pinned ABI"),
+        _unexpected => panic!("unsupported Sysno outside pinned ABI"),
     }
 }
 
@@ -505,11 +474,11 @@ mod tests {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unclassified => counts[2] += 1,
+                SyscallClassification::Unsupported => counts[2] += 1,
             }
         }
 
-        assert_eq!(counts, [128, 74, 171]);
+        assert_eq!(counts, [128, 105, 140]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -540,10 +509,6 @@ mod tests {
             SyscallClassification::Determinized
         );
         assert_eq!(
-            classify_syscall(Sysno::pwrite64),
-            SyscallClassification::Determinized
-        );
-        assert_eq!(
             classify_syscall(Sysno::madvise),
             SyscallClassification::Determinized
         );
@@ -551,6 +516,41 @@ mod tests {
             classify_syscall(Sysno::writev),
             SyscallClassification::Determinized
         );
+        for sysno in [
+            Sysno::capget,
+            Sysno::capset,
+            Sysno::chdir,
+            Sysno::chmod,
+            Sysno::faccessat2,
+            Sysno::fchdir,
+            Sysno::fchmodat,
+            Sysno::fdatasync,
+            Sysno::ftruncate,
+            Sysno::getgroups,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::lchown,
+            Sysno::link,
+            Sysno::linkat,
+            Sysno::mkdir,
+            Sysno::mkdirat,
+            Sysno::readlinkat,
+            Sysno::removexattr,
+            Sysno::renameat2,
+            Sysno::rmdir,
+            Sysno::rt_sigreturn,
+            Sysno::setxattr,
+            Sysno::symlinkat,
+            Sysno::umask,
+            Sysno::unlink,
+            Sysno::unlinkat,
+            Sysno::vserver,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
+        }
+        for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
         for sysno in [
             Sysno::clock_settime,
             Sysno::getpeername,
@@ -572,71 +572,13 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         for sysno in [
-            Sysno::capget,
-            Sysno::capset,
-            Sysno::chown,
-            Sysno::chdir,
-            Sysno::chmod,
-            Sysno::faccessat,
-            Sysno::faccessat2,
-            Sysno::fchdir,
-            Sysno::fchmod,
-            Sysno::fchmodat,
-            Sysno::fchmodat2,
-            Sysno::fchown,
-            Sysno::fchownat,
-            Sysno::fdatasync,
-            Sysno::fallocate,
-            Sysno::fgetxattr,
-            Sysno::flistxattr,
-            Sysno::fremovexattr,
-            Sysno::fsetxattr,
-            Sysno::ftruncate,
-            Sysno::fsync,
-            Sysno::getresgid,
-            Sysno::getresuid,
-            Sysno::munlock,
-            Sysno::munlockall,
-            Sysno::readlinkat,
-            Sysno::rename,
-            Sysno::renameat,
-            Sysno::getgroups,
-            Sysno::getppid,
-            Sysno::getxattr,
-            Sysno::lchown,
             Sysno::getpgid,
             Sysno::getpgrp,
+            Sysno::getppid,
             Sysno::getsid,
             Sysno::setpgid,
-            Sysno::lgetxattr,
-            Sysno::link,
-            Sysno::linkat,
-            Sysno::listxattr,
-            Sysno::llistxattr,
-            Sysno::lremovexattr,
-            Sysno::lsetxattr,
-            Sysno::mkdir,
-            Sysno::mkdirat,
-            Sysno::msync,
-            Sysno::removexattr,
-            Sysno::readahead,
-            Sysno::renameat2,
-            Sysno::readlinkat,
-            Sysno::rmdir,
-            Sysno::rt_sigreturn,
-            Sysno::setxattr,
-            Sysno::symlink,
-            Sysno::symlinkat,
-            Sysno::sync_file_range,
-            Sysno::truncate,
-            Sysno::umask,
-            Sysno::unlink,
-            Sysno::unlinkat,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
-        }
-        for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
         }
     }
 }
