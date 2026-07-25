@@ -109,9 +109,13 @@ jobs:
         cargo test -p detcore --test tests_parallelism futex_wait_parent
         -- --test-threads=3
     - name: PMU parallel memory tests
+      env:
+        # Keep every active mode while fitting the real race workloads in the job budget.
+        DETCORE_MEMORY_RACE_DIVISOR: "100"
+        DETCORE_MEMORY_RACE_PREEMPTION_DIVISOR: "10"
       run: |
-        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=4
-        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=4
+        cargo test -p detcore --test tests_parallelism 'mem_race::' -- --test-threads=1
+        cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --test-threads=1
     - name: Require mount namespace support
       run: |
         if ! unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'; then

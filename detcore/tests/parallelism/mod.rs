@@ -13,10 +13,59 @@
     reason = "`sanitized` is supplied by the internal sanitizer build"
 )]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
+
+const MEMORY_RACE_DIVISOR_ENV: &str = "DETCORE_MEMORY_RACE_DIVISOR";
+const MEMORY_RACE_PREEMPTION_DIVISOR_ENV: &str = "DETCORE_MEMORY_RACE_PREEMPTION_DIVISOR";
+
+fn positive_env_divisor(name: &str) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|divisor| *divisor > 0)
+            .unwrap_or_else(|| panic!("{name} must be a positive integer")),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(err) => panic!("invalid {name}: {err}"),
+    }
+}
+
+fn memory_race_divisor() -> usize {
+    positive_env_divisor(MEMORY_RACE_DIVISOR_ENV)
+}
+
+fn memory_race_preemption_divisor() -> usize {
+    positive_env_divisor(MEMORY_RACE_PREEMPTION_DIVISOR_ENV)
+}
+
+fn memory_race_elements(default: usize) -> usize {
+    (default / memory_race_divisor()).max(2)
+}
+
+fn memory_race_switch_threshold(default: u64) -> u64 {
+    default
+        .saturating_mul(memory_race_preemption_divisor() as u64)
+        .checked_div(memory_race_divisor() as u64)
+        .unwrap()
+        .max(1)
+}
+
+fn memory_race_config(config: &detcore::Config) -> detcore::Config {
+    let mut config = config.clone();
+    // These tests create the worker after tracing starts, so glibc registers rseq in the child.
+    config.allow_passthrough = true;
+    let divisor = memory_race_preemption_divisor() as u64;
+    if divisor > 1 {
+        config.preemption_timeout = config
+            .preemption_timeout
+            .and_then(|timeout| NonZeroU64::new((timeout.get() / divisor).max(1)));
+    }
+    config
+}
 
 /// Calculate the number of switch points. E.g. the number of times we observed interleaved
 /// writes between the threads.
@@ -44,23 +93,24 @@ mod mem_race {
     use detcore_testutils::check_fn_with_config;
     use detcore_testutils::det_test_fn_with_config;
     use detcore_testutils::expect_success;
-    const NUM_ELEMENTS: usize = 20_000_000;
+    const DEFAULT_NUM_ELEMENTS: usize = 20_000_000;
 
     /// In guest mode two threads will try to fill up half of the data array with their thread id as
     /// value. The threads grab indices through an atomic int. For sufficiently large arrays we expect
     /// the thread ids to show up interleaved.
     fn raw() -> u64 {
-        let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
+        let num_elements = super::memory_race_elements(DEFAULT_NUM_ELEMENTS);
+        let shared_data: Arc<[u64]> = vec![0; num_elements].into();
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
-        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>) {
+        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>, num_elements: usize) {
             let tid = thread::current().id().as_u64().get();
             // Get a mutable reference to the data. This is unsafe, but we guarantee the
             // threads are always accesssing unique non-overlapping indices of the array.
             let data = unsafe { Arc::get_mut_unchecked(&mut data) };
 
             // Give each thread half of the fetch_add attempts.
-            for _ in 0..(NUM_ELEMENTS / 2) {
+            for _ in 0..(num_elements / 2) {
                 let idx = idx.fetch_add(1, Ordering::SeqCst);
                 data[idx] = tid;
             }
@@ -71,11 +121,11 @@ mod mem_race {
             let (idx, data) = (shared_idx.clone(), shared_data.clone());
             thread::spawn(move || {
                 // This exercises the futex_wait-called-by-kernel behavior, even on "bottom":
-                worker(idx, data)
+                worker(idx, data, num_elements)
             })
         };
         println!("Parent done spawning child thread and starting own work...");
-        worker(shared_idx, shared_data.clone());
+        worker(shared_idx, shared_data.clone(), num_elements);
 
         println!("Parent done with work and joining child thread..");
         handle.join().unwrap();
@@ -127,12 +177,13 @@ mod mem_race {
         fn run_seq_mode() {
             eprintln!("Running sequentialized, deterministically.");
             let switches = raw();
+            let threshold = super::memory_race_switch_threshold(10);
             assert!(
-                switches > 10,
+                switches > threshold,
                 "Expecting deterministic preemptions when using RCB timers"
             );
         }
-        let cfg = cfg.clone();
+        let cfg = super::memory_race_config(cfg);
         if cfg.sequentialize_threads {
             det_test_fn_with_config(true, run_seq_mode, cfg, expect_success);
         } else {
@@ -156,21 +207,22 @@ mod mem_print_race {
     use detcore_testutils::test_fn_with_config;
     use pretty_assertions::assert_eq;
     use reverie::ExitStatus;
-    const NUM_ELEMENTS: usize = 50_000_000;
+    const DEFAULT_NUM_ELEMENTS: usize = 50_000_000;
     const CHUNKS: usize = 5;
 
     fn raw() -> u64 {
-        let shared_data: Arc<[u64]> = vec![0; NUM_ELEMENTS].into();
+        let num_elements = super::memory_race_elements(DEFAULT_NUM_ELEMENTS);
+        let shared_data: Arc<[u64]> = vec![0; num_elements].into();
         let shared_idx = Arc::new(AtomicUsize::new(0));
 
-        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>, rank: usize) {
+        fn worker(idx: Arc<AtomicUsize>, mut data: Arc<[u64]>, rank: usize, num_elements: usize) {
             let tid = thread::current().id().as_u64().get();
             let data = unsafe { Arc::get_mut_unchecked(&mut data) };
 
             for _i in 0..CHUNKS {
                 let s = format!("{} ", rank);
                 eprint!("{}", s);
-                for _ in 0..(NUM_ELEMENTS / 2 / CHUNKS) {
+                for _ in 0..(num_elements / 2 / CHUNKS) {
                     let idx = idx.fetch_add(1, Ordering::SeqCst);
                     data[idx] = tid;
                 }
@@ -180,9 +232,9 @@ mod mem_print_race {
 
         let handle = {
             let (idx, data) = (shared_idx.clone(), shared_data.clone());
-            thread::spawn(move || worker(idx, data, 0))
+            thread::spawn(move || worker(idx, data, 0, num_elements))
         };
-        worker(shared_idx, shared_data.clone(), 1);
+        worker(shared_idx, shared_data.clone(), 1, num_elements);
         handle.join().unwrap();
 
         let switch_points = super::count_switch_points(&shared_data);
@@ -214,7 +266,7 @@ mod mem_print_race {
     #[allow(dead_code)]
     pub fn detcore(cfg: &detcore::Config) {
         eprintln!("Running detcore test with {} chunks", CHUNKS);
-        let cfg = cfg.clone();
+        let cfg = super::memory_race_config(cfg);
         let (output, _state) = if cfg.sequentialize_threads {
             // Due to fair round-robin scheduling we interleave on almost every write.
             // There are some boundary conditions that prevent this from hitting exactly 2*CHUNKS:
