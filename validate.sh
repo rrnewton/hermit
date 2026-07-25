@@ -2704,7 +2704,7 @@ function run_hardware_validation {
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
     run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
-    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
+    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness writev_determinism
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
     run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
