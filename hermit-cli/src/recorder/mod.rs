@@ -276,6 +276,12 @@ impl Tool for Recorder {
     }
 }
 
+// The recorder needs no special handling for internal (pipe) fds: it injects the
+// live syscall and logs its result exactly as for any other syscall, which is what
+// the default `handle_internal_fd_syscall` does. The record-side pipe write must
+// physically happen so the paired reader observes (and records) the data.
+impl detcore::RecordOrReplay for Recorder {}
+
 impl Recorder {
     fn record_raw_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let debug_event = DebugEvent::new(syscall, &guest.memory());

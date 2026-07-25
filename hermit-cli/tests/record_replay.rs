@@ -331,6 +331,39 @@ fn record_shell_forked_external_command() {
     );
 }
 
+/// Regression test for cross-process pipe data ordering: a shell pipeline
+/// (`echo hello | cat`) forks two processes connected by a guest-created pipe.
+/// The bytes `echo` writes are read by `cat` through a container-internal pipe.
+///
+/// Those reads previously bypassed the record/replay subtool (they took
+/// Detcore's `InternalIOPolling` retry loop, which injects directly), so the
+/// transferred bytes were never recorded. On replay the reader hit EOF instead
+/// of the recorded data (the paired writer's pipe write is not physically
+/// replayed), diverging at the point `cat` would have written its output.
+/// Internal-pipe reads/writes are now recorded and replayed deterministically.
+#[test]
+fn record_shell_pipeline() {
+    let _guard = hermit_record_lock();
+
+    let shell = [Path::new("/bin/bash"), Path::new("/usr/bin/bash")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(shell) = shell else {
+        eprintln!("bash is not installed; skipping shell pipeline record coverage");
+        return;
+    };
+
+    // `echo hello | cat`: the left process writes "hello\n" into a guest-created
+    // pipe whose read end is `cat`'s stdin. Deterministic replay requires the
+    // pipe data to be recorded and the writer's write to NOT be re-injected onto
+    // the real console during replay (otherwise output is duplicated).
+    record_replay_command(
+        "shell-pipeline",
+        shell,
+        &[OsStr::new("-c"), OsStr::new("echo hello | cat")],
+    );
+}
+
 #[test]
 fn record_curl_version() {
     let _guard = hermit_record_lock();

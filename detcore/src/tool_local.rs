@@ -229,6 +229,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             // TODO: Get rid of this and make this whole function use the Error type.
             .map_err(|err| err.into_errno().unwrap())
     }
+
+    /// Like [`Detcore::record_or_replay`], but for syscalls on a container-INTERNAL
+    /// file descriptor (currently pipes).
+    ///
+    /// This delegates to the subtool's [`RecordOrReplay::handle_internal_fd_syscall`]
+    /// rather than `handle_syscall_event`. The two differ only on the replay side of a
+    /// WRITE: an internal-pipe write must return its recorded byte count WITHOUT
+    /// physically injecting anything, because the paired reader reproduces the
+    /// transferred bytes from the log (so the internal pipe carries no live data on
+    /// replay). See `handle_internal_fd_syscall` for the full rationale.
+    pub(crate) async fn record_or_replay_internal<G, S>(
+        &self,
+        guest: &mut G,
+        syscall: S,
+    ) -> Result<i64, Errno>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall>,
+    {
+        self.record_or_replay
+            .handle_internal_fd_syscall(&mut guest.into_guest(), syscall.into())
+            .await
+            // TODO: Get rid of this and make this whole function use the Error type.
+            .map_err(|err| err.into_errno().unwrap())
+    }
 }
 
 impl FileMetadata {

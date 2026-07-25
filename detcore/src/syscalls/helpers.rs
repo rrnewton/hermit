@@ -140,7 +140,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
+            if internal_fd && self.cfg.recordreplay_modes {
+                // Record/replay of a container-INTERNAL pipe. The generic retry
+                // path (below) injects each poll with `guest.inject_with_retry`,
+                // which bypasses the record/replay subtool: the transferred bytes
+                // are never logged during recording, and on replay the syscall is
+                // re-executed against a live pipe that was never written (the
+                // paired writer's pipe write returns its recorded byte count
+                // WITHOUT injecting). The reader then observes EOF instead of the
+                // recorded data and the replay diverges. Route the poll loop
+                // through the subtool instead so the read/write results (including
+                // intermediate EAGAIN polls) are recorded and replayed in lockstep.
+                Ok(self
+                    .retry_nonblocking_syscall_via_recorder(guest, call, rsrc)
+                    .await?)
+            } else {
+                Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
+            }
         } else {
             assert!(action == IOAction::PassThru);
             tracing::trace!(
@@ -149,6 +165,76 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             // Otherwise, the socket was already nonblocking, so we can safely execute it just once.
             Ok(self.record_or_replay(guest, wrapped).await?)
+        }
+    }
+
+    /// Poll-and-retry a nonblockable syscall on a container-internal fd, routing
+    /// every injection through the record/replay subtool.
+    ///
+    /// This mirrors [`retry_nonblocking_syscall`] but replaces the direct
+    /// `guest.inject_with_retry` with [`Detcore::record_or_replay_internal`]:
+    ///
+    /// - In RECORD mode the subtool injects the (physically nonblocking) syscall
+    ///   live and logs its result. Intermediate EAGAIN poll attempts are logged as
+    ///   error events and the final success logs the transferred bytes / count.
+    /// - In REPLAY mode the subtool returns those recorded results in order,
+    ///   without touching the live descriptor, so the reader observes exactly the
+    ///   recorded bytes rather than whatever the (unwritten) live pipe holds.
+    ///
+    /// Because the same poll/yield loop runs in both phases and is driven by the
+    /// recorded event stream, the number of poll iterations and the scheduler
+    /// hand-offs are reproduced identically, keeping record and replay in lockstep.
+    ///
+    /// Only used for internal pipes (see `syscall_targets_internal_fd`); external
+    /// endpoints keep the `BlockingExternalIO` protocol, and non-record/replay runs
+    /// keep the plain live retry loop.
+    async fn retry_nonblocking_syscall_via_recorder<G, C>(
+        &self,
+        guest: &mut G,
+        call0: C,
+        rsrc: Resources,
+    ) -> Result<i64, Error>
+    where
+        C: NonblockableSyscall + Into<Syscall> + Copy,
+        G: Guest<Self>,
+    {
+        // The stack-allocated memory here needs to live across the loop, which
+        // means surviving multiple syscall injections:
+        let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
+        let mut rsrc = rsrc.clone();
+
+        loop {
+            if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                let errno = call.signal_interrupt_errno();
+                tracing::trace!(
+                    "retry_nonblocking_syscall_via_recorder: interrupted by signal before retrying {}: {:?}",
+                    call.name(),
+                    errno
+                );
+                return Err(errno.into());
+            }
+            let res = self.record_or_replay_internal(guest, call).await;
+            if call.syscall_would_have_blocked(res) {
+                rsrc.poll_attempt += 1;
+                tracing::trace!(
+                    "retry_nonblocking_syscall_via_recorder: retry #{} due to result {:?}: {}",
+                    rsrc.poll_attempt,
+                    res,
+                    call.name()
+                );
+                record_retry_event(guest, call).await;
+            } else {
+                let res = call
+                    .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                    .map_err(|e| e.into());
+                tracing::trace!(
+                    "retry_nonblocking_syscall_via_recorder: completed after {} retries: {} = {:?}",
+                    rsrc.poll_attempt,
+                    call.name(),
+                    res
+                );
+                return res;
+            }
         }
     }
 

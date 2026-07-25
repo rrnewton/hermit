@@ -301,3 +301,40 @@ impl Replayer {
         next_event!(guest, Return)
     }
 }
+
+#[reverie::tool]
+impl detcore::RecordOrReplay for Replayer {
+    async fn handle_internal_fd_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        match syscall {
+            // Internal-pipe WRITE. The recorded byte count is authoritative and the
+            // transferred bytes are reproduced on the READ side, so this must return
+            // the recorded count WITHOUT physically injecting anything.
+            //
+            // Injecting would be wrong: during replay the guest's `dup2`
+            // redirections are recorded as return-value-only syscalls and are not
+            // physically applied, so a writer whose fd number happens to be 1 or 2
+            // (e.g. the left side of a shell pipeline, whose stdout was dup2'd onto a
+            // pipe) still has fd 1/2 pointing at the real console. `handle_write_family`
+            // would then push the pipe bytes onto the console and duplicate the
+            // program's output. We still run `expect_syscall` and consume the matching
+            // `Write` event so the debug and data streams stay aligned with the
+            // recorder (whose default handling injected and logged the write).
+            Syscall::Write(_)
+            | Syscall::Writev(_)
+            | Syscall::Pwrite64(_)
+            | Syscall::Pwritev(_)
+            | Syscall::Pwritev2(_) => {
+                self.expect_syscall(guest, syscall);
+                Ok(next_event!(guest, Write)?)
+            }
+            // Internal READS (and anything else) replay through the normal path:
+            // `handle_read` writes the recorded bytes straight back into the guest
+            // buffer without touching the live descriptor, which is already correct.
+            _ => self.handle_syscall_event(guest, syscall).await,
+        }
+    }
+}
