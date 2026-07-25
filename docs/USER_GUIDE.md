@@ -127,14 +127,16 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm|e9patch` to select the process instrumentation backend.
-It is a global option and belongs before the subcommand, because the backend
-governs how any subcommand instruments the guest. The default is `ptrace`, so
-existing commands are unchanged:
+Use `--backend=ptrace|dbi|kvm|e9patch` to select the process instrumentation
+backend. It is a global option and belongs before the subcommand. The default is
+`ptrace`, so existing commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
+
+The e9patch preprocessor is currently supported only by `run`; other explicit
+e9patch subcommand combinations fail closed.
 
 For backwards compatibility, `run` also accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
@@ -154,12 +156,14 @@ not enable e9patch's B0 fallback because reserving SIGILL would change guest
 signal semantics. The rewritten program is bind-mounted read-only at the
 original executable path, then runs under the ptrace Detcore backend, which
 preserves strict-mode semantics for trapped events in shared libraries, the
-vDSO, and dynamic code. Raw `RDRAND`, `RDSEED`, and TSX in code absent from the
-offline map remain unsupported. The overlay preserves the executable path and
-permission bits, but not arbitrary ownership, ACL, file capability, or xattr
-semantics; privileged executables are unsupported. This first integration
-validates rewrite coverage; it does not yet remove ptrace overhead. Put
+vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
+or TSX deterministic even when those sites are mapped, so those instructions
+remain unsupported. Privilege-bearing executables fail closed rather than
+losing set-ID or file-capability semantics. This first integration validates
+rewrite coverage; it does not yet remove ptrace overhead. Put
 `e9tool` in `PATH` or set `HERMIT_E9TOOL=/path/to/e9tool`.
+Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
+through the ptrace correctness path.
 
 `--namespace-only` bypasses instrumentation entirely. Combining it with any
 explicit `--backend` selection is rejected because the backend would be ignored.

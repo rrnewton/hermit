@@ -13,6 +13,7 @@
 mod chroot;
 mod consts;
 mod desync;
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
 pub mod e9patch;
 mod error;
 mod event;
@@ -310,6 +311,7 @@ pub enum Backend {
     /// Use the KVM backend.
     Kvm,
     /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
+    // TODO-HUMAN-REVIEW(PR-594): Review the CLI-only hybrid backend selection.
     E9patch,
 }
 
@@ -333,19 +335,22 @@ impl Backend {
         }
     }
 
-    /// Returns the backends integrated with this Hermit build and host.
+    /// Returns backends whose Hermit integration prerequisites are met.
+    ///
+    /// Some integrations use CLI launch adapters rather than direct
+    /// [`run_with_backend`] dispatch.
     pub fn available() -> impl Iterator<Item = Self> {
         Self::ALL
             .into_iter()
             .filter(|backend| backend.is_available())
     }
 
-    /// Returns whether this backend can run a Hermit guest on this host.
+    /// Returns whether this backend's integration prerequisites are met.
     pub fn is_available(self) -> bool {
         self.unavailable_reason().is_none()
     }
 
-    /// Returns an actionable error when this backend cannot run a Hermit guest.
+    /// Returns an actionable error when this backend's prerequisites are not met.
     pub fn ensure_available(self) -> Result<(), Error> {
         if let Some(reason) = self.unavailable_reason() {
             Err(anyhow!(

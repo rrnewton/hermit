@@ -13,6 +13,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -31,13 +32,16 @@ use crate::instruction_map::default_cache_dir;
 use crate::instruction_map::load_or_generate;
 
 /// Environment variable that overrides the e9tool executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch tool override.
 pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
 /// Environment variable that overrides the e9patch backend executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
 pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
 
 const REWRITE_SCHEMA_VERSION: u32 = 4;
 
 /// Result of preparing the main guest ELF for the e9patch backend.
+// TODO-HUMAN-REVIEW(PR-594): Review cached rewrite result semantics.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PreparedBinary {
     /// Original canonical executable when there are no sites, or cached rewritten ELF otherwise.
@@ -82,6 +86,7 @@ struct RewriteMetadata {
 }
 
 /// Return an actionable error when e9tool cannot be executed.
+// TODO-HUMAN-REVIEW(PR-594): Review public e9patch availability reporting.
 pub fn unavailable_reason() -> Option<String> {
     let e9tool = match resolve_e9tool() {
         Ok(e9tool) => e9tool,
@@ -93,6 +98,7 @@ pub fn unavailable_reason() -> Option<String> {
 }
 
 /// Generate or load a cached e9patch rewrite for one ELF executable.
+// TODO-HUMAN-REVIEW(PR-594): Review the public cached rewrite entry point.
 pub fn prepare(binary: impl AsRef<Path>) -> Result<PreparedBinary, Error> {
     prepare_in(binary, runtime_cache_dir())
 }
@@ -279,6 +285,27 @@ fn prepare_in(
     })
 }
 
+fn file_has_security_capability(file: &File) -> Result<bool, Error> {
+    // SAFETY: the file descriptor and static xattr name are valid, and a null
+    // value with size zero asks Linux for the attribute length without writing.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Ok(size != 0);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(error).context("failed to inspect executable file capabilities"),
+    }
+}
+
 fn snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Error> {
     let original = fs::canonicalize(binary)
         .with_context(|| format!("failed to resolve binary {}", binary.display()))?;
@@ -293,15 +320,31 @@ fn snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Er
             original.display()
         )));
     }
+    if before.mode() & 0o6000 != 0 || file_has_security_capability(&file)? {
+        return Err(Error::msg(format!(
+            "e9patch does not support privilege-bearing executable {}; refusing to discard \
+             set-ID or file-capability semantics",
+            original.display()
+        )));
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .with_context(|| format!("failed to read binary {}", original.display()))?;
     let after = file
         .metadata()
         .with_context(|| format!("failed to restat binary {}", original.display()))?;
+    if after.mode() & 0o6000 != 0 || file_has_security_capability(&file)? {
+        return Err(Error::msg(format!(
+            "e9patch input became privilege-bearing while creating its snapshot: {}",
+            original.display()
+        )));
+    }
     if before.len() != after.len()
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.mode() != after.mode()
     {
         return Err(Error::msg(format!(
             "binary changed while creating e9patch snapshot: {}",
@@ -605,6 +648,20 @@ mod tests {
             second.digest,
             true
         ));
+    }
+
+    #[test]
+    fn privilege_bearing_inputs_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("privileged");
+        fs::write(&binary, b"fixture").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o4755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert_ne!(fs::metadata(&binary).unwrap().mode() & 0o4000, 0);
+
+        let error = snapshot_binary(&binary, &directory.path().join("cache")).unwrap_err();
+        assert!(error.to_string().contains("privilege-bearing executable"));
     }
 
     #[test]
