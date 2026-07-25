@@ -255,6 +255,8 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+readonly BACKEND_COMPAT_MATRIX="$ROOT_DIR/experiments/backend-parity_20260722/matrix.tsv"
+readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
@@ -367,6 +369,7 @@ function cleanup {
         kill_process_tree "$pid" TERM
     done
     wait 2>/dev/null || true
+    print_backend_compatibility_table
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
 }
@@ -717,26 +720,96 @@ function note_backend_skip {
 }
 
 function run_full_backend_gates {
+    local -a backends=(--backend ptrace)
+
     if ! backend_selector_supported; then
-        note_backend_skip "DBI/KVM" "backend selector is unavailable"
+        note_backend_skip "KVM/DBI" "backend selector is unavailable"
+        run_check "Real backend compatibility matrix" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            "${backends[@]}" --probe-gaps --output "$BACKEND_COMPAT_RESULTS"
         return
     fi
 
     if kvm_backend_available; then
-        run_check "KVM backend parity ratchet" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-            --backend kvm --require-backend
+        backends+=(--backend kvm)
     else
         note_backend_skip "KVM" "/dev/kvm is not readable and writable"
     fi
 
     if dbi_backend_available; then
-        run_check "DBI backend parity ratchet" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-            --backend dbi --require-backend
+        backends+=(--backend dbi)
     else
         note_backend_skip "DBI" "backend smoke did not complete successfully"
     fi
+
+    run_check "Real backend compatibility matrix" \
+        python3 experiments/backend-parity_20260722/run_matrix.py \
+        "${backends[@]}" --probe-gaps --require-backend \
+        --output "$BACKEND_COMPAT_RESULTS"
+}
+
+function backend_compatibility_cell {
+    local program=$1
+    local backend=$2
+    local result
+
+    [[ -r $BACKEND_COMPAT_RESULTS ]] || { printf "N/A"; return; }
+    result=$(awk -F "\t" -v program="$program" -v backend="$backend" \
+        'NR > 1 && $1 == program && $2 == backend { print $4; exit }' \
+        "$BACKEND_COMPAT_RESULTS")
+    case "$result" in
+        PASS|XPASS) printf "PASS" ;;
+        FAIL) printf "FAIL" ;;
+        *) printf "N/A" ;;
+    esac
+}
+
+function print_backend_compatibility_table {
+    local program
+    local ptrace
+    local kvm
+    local dbi
+    local total=0
+    local ptrace_pass=0 ptrace_fail=0 ptrace_na=0
+    local kvm_pass=0 kvm_fail=0 kvm_na=0
+    local dbi_pass=0 dbi_fail=0 dbi_na=0
+
+    [[ -r $BACKEND_COMPAT_MATRIX ]] || return
+
+    printf "\n== Real Reverie backend compatibility ==\n"
+    printf "Program | ptrace | KVM | DBI\n"
+    printf "%s\n" "--- | --- | --- | ---"
+    while IFS=$'\t' read -r program _; do
+        [[ $program != test_name ]] || continue
+        [[ -n $program ]] || continue
+        ptrace=$(backend_compatibility_cell "$program" ptrace)
+        kvm=$(backend_compatibility_cell "$program" kvm)
+        dbi=$(backend_compatibility_cell "$program" dbi)
+        printf "%s | %s | %s | %s\n" "$program" "$ptrace" "$kvm" "$dbi"
+        total=$((total + 1))
+        case "$ptrace" in
+            PASS) ptrace_pass=$((ptrace_pass + 1)) ;;
+            FAIL) ptrace_fail=$((ptrace_fail + 1)) ;;
+            *) ptrace_na=$((ptrace_na + 1)) ;;
+        esac
+        case "$kvm" in
+            PASS) kvm_pass=$((kvm_pass + 1)) ;;
+            FAIL) kvm_fail=$((kvm_fail + 1)) ;;
+            *) kvm_na=$((kvm_na + 1)) ;;
+        esac
+        case "$dbi" in
+            PASS) dbi_pass=$((dbi_pass + 1)) ;;
+            FAIL) dbi_fail=$((dbi_fail + 1)) ;;
+            *) dbi_na=$((dbi_na + 1)) ;;
+        esac
+    done <"$BACKEND_COMPAT_MATRIX"
+    printf "Denominator: %s programs per backend; identical 3-run exit/stdout criteria.\n" "$total"
+    printf "Totals: ptrace %s PASS/%s FAIL/%s N/A; KVM %s PASS/%s FAIL/%s N/A; DBI %s PASS/%s FAIL/%s N/A.\n" \
+        "$ptrace_pass" "$ptrace_fail" "$ptrace_na" \
+        "$kvm_pass" "$kvm_fail" "$kvm_na" \
+        "$dbi_pass" "$dbi_fail" "$dbi_na"
+    printf "N/A means this profile or host did not measure that backend/program.\n"
+    printf "Excluded: e9patch is ptrace preprocessing; SaBRe and LiteInst do not host Detcore.\n"
 }
 
 function super_probe_command {
