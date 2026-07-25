@@ -1594,9 +1594,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Mkdirat(_)
                 | Syscall::Mprotect(_)
                 | Syscall::Readlink(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                | Syscall::Readlinkat(_)
                 | Syscall::Removexattr(_)
                 | Syscall::Renameat2(_)
                 | Syscall::Rmdir(_)
