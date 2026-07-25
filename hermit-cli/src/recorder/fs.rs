@@ -458,6 +458,15 @@ impl Recorder {
 
         if matches!(
             request,
+            ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
+        ) {
+            let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
+            let snapshot = std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("failed to snapshot cloned destination {path}: {error}")
+            });
+            self.record_event(guest, Ok(SyscallEvent::FileClone(snapshot)));
+        } else if matches!(
+            request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
             self.record_event(guest, Ok(SyscallEvent::Return(ret)));

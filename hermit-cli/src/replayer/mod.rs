@@ -182,11 +182,11 @@ impl Tool for Replayer {
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                self.handle_virtual_fd_create(guest, syscall, call.flags())
                     .await
             }
             Syscall::Openat(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                self.handle_virtual_fd_create(guest, syscall, call.flags())
                     .await
             }
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
@@ -234,8 +234,8 @@ impl Tool for Replayer {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#653)
             Syscall::Mkdir(_) => self.handle_replayed_side_effect(guest, syscall).await,
-            Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Unlink(_) => self.handle_replayed_side_effect(guest, syscall).await,
+            Syscall::Unlinkat(_) => self.handle_replayed_side_effect(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
@@ -280,11 +280,21 @@ impl Replayer {
     async fn handle_virtual_fd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        cloexec: bool,
+        syscall: Syscall,
+        flags: OFlag,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(fd) = recorded {
-            self.reserve_replay_fd(guest, fd as i32, cloexec).await;
+            if flags.contains(OFlag::O_CREAT) || flags.contains(OFlag::O_DIRECTORY) {
+                let actual = guest.inject_with_retry(syscall).await;
+                assert_eq!(
+                    actual, recorded,
+                    "replay materialized open returned a different descriptor"
+                );
+            } else {
+                self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
+                    .await;
+            }
         }
         recorded
     }

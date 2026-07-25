@@ -91,6 +91,8 @@ pub enum SyscallEvent {
     ReadV2(ReadEvent),
     ReadvV2(ReadEvent),
     FtruncateV2(FtruncateEvent),
+    /// Complete destination contents after a successful clone ioctl.
+    FileClone(Vec<u8>),
 }
 
 /// Recorded output and signal side effects of a read syscall.

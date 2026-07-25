@@ -255,8 +255,8 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly RR_COMPAT_EXPECTED=132
-# Main's 128-row ratchet plus rmdir, mkfifo, mkdir, and node.
+readonly RR_COMPAT_EXPECTED=140
+# Main's 132-row ratchet plus eight writable-filesystem programs.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=145
 readonly SABRE_COMPAT_TOTAL=151
@@ -282,6 +282,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
     [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
+    [diff]=1 [cp]=1 [install]=1 [tar]=1 [mv]=1 [rm]=1 [touch]=1 [chmod]=1
     [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1

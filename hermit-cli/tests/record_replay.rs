@@ -371,6 +371,24 @@ fn record_nested_mkdir_side_effects() {
 }
 
 #[test]
+fn record_writable_filesystem_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "writable-filesystem-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-filesystem; rm -rf \"$root\"; mkdir \"$root\"; printf 'payload\\n' >\"$root/source\"; cp \"$root/source\" \"$root/copy\"; cmp \"$root/source\" \"$root/copy\"; mv \"$root/copy\" \"$root/moved\"; chmod 640 \"$root/moved\"; touch -t 200001010000 \"$root/moved\"; tar -cf \"$root/archive.tar\" -C \"$root\" moved; tar -tf \"$root/archive.tar\"; rm -rf \"$root\"; printf 'filesystem-side-effects-ok\\n'",
+            ),
+        ],
+    );
+}
+
+#[test]
 fn record_mkfifo_in_replay_tmp() {
     let _guard = hermit_record_lock();
     let shell = Path::new("/bin/bash");

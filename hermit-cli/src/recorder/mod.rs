@@ -29,6 +29,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
@@ -143,6 +144,9 @@ pub struct Recorder {
     stderr: Option<OutputIdentity>,
     /// Pipes inherited from the Hermit launcher are external inputs/outputs, not guest IPC.
     inherited_pipes: BTreeSet<OutputIdentity>,
+    /// Regular files created by the guest and therefore materialized during replay.
+    #[serde(skip)]
+    created_files: Mutex<BTreeSet<OutputIdentity>>,
     /// Stable regular-file OFDs used for offset aliasing checks.
     #[serde(skip)]
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
@@ -161,6 +165,7 @@ impl Tool for Recorder {
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             inherited_pipes: inherited_pipe_identities(pid),
+            created_files: Mutex::new(BTreeSet::new()),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
         }
@@ -333,8 +338,8 @@ impl Tool for Recorder {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Open(call) => self.handle_open(guest, syscall, call.flags()).await,
+            Syscall::Openat(call) => self.handle_open(guest, syscall, call.flags()).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
@@ -394,6 +399,33 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    async fn handle_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        flags: OFlag,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        if flags.contains(OFlag::O_CREAT)
+            && let Ok(fd) = result
+            && let Some(identity) = OutputIdentity::for_fd(guest.pid(), fd as libc::c_int)
+        {
+            self.created_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(identity);
+        }
+        self.record_event(guest, result.map(SyscallEvent::Return));
+        result
+    }
+
+    fn is_guest_created_file(&self, identity: OutputIdentity) -> bool {
+        self.created_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&identity)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#658): Audit guest-internal FD and epoll classification boundaries.
     fn fd_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
@@ -405,17 +437,17 @@ impl Recorder {
             return true;
         }
 
-        let Some(identity) = std::fs::metadata(path)
-            .ok()
-            .filter(|metadata| metadata.file_type().is_fifo())
-            .map(|metadata| OutputIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        else {
+        let Ok(metadata) = std::fs::metadata(path) else {
             return false;
         };
-        !self.inherited_pipes.contains(&identity)
+        let identity = OutputIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        if metadata.file_type().is_file() {
+            return self.is_guest_created_file(identity);
+        }
+        metadata.file_type().is_fifo() && !self.inherited_pipes.contains(&identity)
     }
 
     fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {

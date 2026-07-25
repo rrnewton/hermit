@@ -7,6 +7,7 @@
  */
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 
 use reverie::Errno;
@@ -601,6 +602,20 @@ impl Replayer {
         }
 
         if matches!(
+            request,
+            ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
+        ) {
+            let snapshot = next_event!(guest, FileClone)?;
+            let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+                .unwrap_or_else(|error| panic!("failed to duplicate cloned replay file: {error}"));
+            let file = std::fs::File::from(duplicate);
+            file.set_len(snapshot.len() as u64)
+                .unwrap_or_else(|error| panic!("failed to size cloned replay file: {error}"));
+            file.write_all_at(&snapshot, 0).unwrap_or_else(|error| {
+                panic!("failed to materialize cloned replay file: {error}")
+            });
+            Ok(0)
+        } else if matches!(
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
