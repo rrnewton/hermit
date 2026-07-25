@@ -1,0 +1,43 @@
+Program	Command	Category	Result	Exit	Detail
+wc	/usr/bin/wc lines.txt	util	PASS	0	replay matched recording
+sort	/usr/bin/sort fruits.txt	util	PASS	0	replay matched recording
+uniq	/usr/bin/uniq sorted.txt	util	PASS	0	replay matched recording
+head	/usr/bin/head -3 lines.txt	util	PASS	0	replay matched recording
+tail	/usr/bin/tail -3 lines.txt	util	FAIL	1	thread 'main' (1) panicked at hermit-cli/src/replayer/mod.rs:391:9:
+find	/usr/bin/find srcdir	util	PASS	0	replay matched recording
+factor	/usr/bin/factor 123456	math	PASS	0	replay matched recording
+seq	/usr/bin/seq 1 100	math	PASS	0	replay matched recording
+expr	/usr/bin/expr 2 + 3	math	PASS	0	replay matched recording
+dc	/usr/bin/dc -e 2 3 + p	math	PASS	0	replay matched recording
+od	/usr/bin/od -An -tx1 DATA	math	PASS	0	replay matched recording
+hexdump	/usr/bin/hexdump -C DATA	math	PASS	0	replay matched recording
+strings	/usr/bin/strings DATA	math	PASS	0	replay matched recording
+file	/usr/bin/file DATA	math	PASS	0	replay matched recording
+stat	/usr/bin/stat DATA	math	PASS	0	replay matched recording
+du	/usr/bin/du -b DATA	math	PASS	0	replay matched recording
+awk	/usr/bin/awk {s+=$1} END{print s} nums.txt	text	PASS	0	replay matched recording
+sed	/usr/bin/sed s/foo/bar/g text.txt	text	PASS	0	replay matched recording
+xxd	/usr/bin/xxd hex-input.txt	text	PASS	0	replay matched recording
+sha256sum	/usr/bin/sha256sum DATA	hash	PASS	0	replay matched recording
+md5sum	/usr/bin/md5sum DATA	hash	PASS	0	replay matched recording
+env	/usr/bin/env	sys	PASS	0	replay matched recording
+printenv	/usr/bin/printenv	sys	PASS	0	replay matched recording
+date	/bin/date	sys	PASS	0	replay matched recording
+hostname	/bin/hostname	sys	PASS	0	replay matched recording
+uname	/bin/uname -a	sys	PASS	0	replay matched recording
+whoami	/usr/bin/whoami	sys	PASS	0	replay matched recording
+pipe_echo_wc	/usr/bin/bash -c echo hello | wc -c	pipe	PASS	0	replay matched recording
+pipe_base64	/bin/sh -c /usr/bin/base64 DATA | /usr/bin/base64 -d	pipe	PASS	0	replay matched recording
+pipe_cut_head	/usr/bin/bash -c cut -d: -f1 /etc/passwd | head -5	pipe	PASS	0	replay matched recording
+py39	/usr/bin/python3.9 -c import sys;print(sys.version_info[0])	interp	PASS	0	replay matched recording
+bash_loop	/usr/bin/bash -c for i in 1 2 3; do echo $i; done	interp	PASS	0	replay matched recording
+perl	/usr/bin/perl -e print 1+2, qq(\n)	interp	PASS	0	replay matched recording
+pth_counter	./pth_counter	thread	PASS	0	replay matched recording
+kill0	/usr/bin/bash -c kill -0 $$	sig	PASS	0	replay matched recording
+sigterm_trap	/usr/bin/bash -c trap 'echo caught' SIGTERM; kill -TERM $$; echo done	sig	PASS	0	replay matched recording
+sigpipe	/usr/bin/bash -c yes | head -100 >/dev/null; echo piped_ok	sig	PASS	0	replay matched recording
+bg_wait	/usr/bin/bash -c sleep 0.01 & wait $!	sig	PASS	0	replay matched recording
+forkexec50	/usr/bin/bash -c for i in $(seq 1 50); do /bin/true; done; echo loop_ok	sig	FAIL	1	(DETLOG) Mismatch at log messages 2202 (run 1) and 2119 (run 2): [1mDiff[0m [31m< left
+pid_virt	/usr/bin/bash -c echo $$; echo $PPID	sig	PASS	0	replay matched recording
+ulimit	/usr/bin/bash -c ulimit -n	sig	PASS	0	replay matched recording
+true_	/bin/true	sig	PASS	0	replay matched recording
