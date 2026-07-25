@@ -13,7 +13,19 @@ use crate::fd::OpenFileId;
 use crate::pid::DetTid;
 
 /// Identity of a Linux memory address space (`mm_struct`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// TODO-HUMAN-REVIEW(PR-659): Review stable address-space ordering used by futex keys.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub struct MmId {
     creator: DetTid,
     generation: u64,
@@ -52,7 +64,19 @@ impl MmId {
 }
 
 /// Identity of an object that backs a process-shared memory mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// TODO-HUMAN-REVIEW(PR-659): Review stable shared-object ordering used by futex keys.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub enum SharedMemoryObjectId {
     /// Anonymous shared mapping, identified by its deterministic allocation.
     Anonymous {
@@ -73,7 +97,19 @@ pub enum SharedMemoryObjectId {
 }
 
 /// Identity of a futex word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// TODO-HUMAN-REVIEW(PR-659): Review stable futex identity ordering used by robust wakeups.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub enum FutexID {
     /// Process-private futex, keyed by its address space and virtual address.
     Private { mm: MmId, address: usize },

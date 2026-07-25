@@ -63,6 +63,7 @@ use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
+use crate::scheduler::RobustSignalTarget;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
@@ -91,24 +92,6 @@ async fn yield_once() {
         }
     })
     .await;
-}
-
-// TODO-HUMAN-REVIEW(PR-659): Review process_vm_readv bounds and exit-time permissions.
-fn read_guest_u32(tid: DetTid, address: usize) -> Option<u32> {
-    let mut word = 0_u32;
-    let local = libc::iovec {
-        iov_base: (&raw mut word).cast(),
-        iov_len: std::mem::size_of::<u32>(),
-    };
-    let remote = libc::iovec {
-        iov_base: address as *mut libc::c_void,
-        iov_len: std::mem::size_of::<u32>(),
-    };
-    // SAFETY: process_vm_readv copies into the local initialized u32 and treats
-    // the guest-controlled remote address as fallible input. Short reads and
-    // invalid addresses are rejected below.
-    let read = unsafe { libc::process_vm_readv(tid.as_raw(), &local, 1, &remote, 1, 0) };
-    (read == std::mem::size_of::<u32>() as isize).then_some(word)
 }
 
 #[derive(Debug)]
@@ -521,11 +504,20 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
-            GlobalRequest::ReconcileRobustFutexes(exiting) => R::ReconcileRobustFutexes(
+            GlobalRequest::ResolveRobustSignal(target) => R::ResolveRobustSignal(
                 self.sched
                     .lock()
                     .unwrap()
-                    .reconcile_robust_futex_waiters(exiting, read_guest_u32),
+                    .resolve_robust_signal_target(target),
+            ),
+            GlobalRequest::AwaitRobustExits(owners) => {
+                R::AwaitRobustExits(self.recv_await_robust_exits(&owners).await)
+            }
+            GlobalRequest::ReconcileRobustFutexes(exiting, group) => R::ReconcileRobustFutexes(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .reconcile_robust_futex_waiters(exiting, group),
             ),
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -613,6 +605,17 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    async fn recv_await_robust_exits(&self, owners: &[DetTid]) {
+        while !self
+            .sched
+            .lock()
+            .unwrap()
+            .robust_signal_targets_gone(owners)
+        {
+            yield_once().await;
+        }
+    }
+
     async fn recv_request_resources(
         &self,
         from: Tid,
@@ -953,8 +956,8 @@ impl GlobalState {
                 .resp
                 .clone();
             match action {
-                FutexAction::WaitRequest { deadline, address } => {
-                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask, _init_read, address);
+                FutexAction::WaitRequest(deadline) => {
+                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask, _init_read);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -966,11 +969,18 @@ impl GlobalState {
                 }
                 FutexAction::RequeueRequest {
                     target,
+                    target_expected,
                     max_wake,
                     max_requeue,
                 } => {
-                    let num =
-                        sched.requeue_futex_waiters(dettid, futexid, target, max_wake, max_requeue);
+                    let num = sched.requeue_futex_waiters(
+                        dettid,
+                        futexid,
+                        target,
+                        target_expected,
+                        max_wake,
+                        max_requeue,
+                    );
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeOpRequest {
@@ -1236,9 +1246,17 @@ pub enum GlobalRequest {
     /// so the scheduler can aggregate it into the final run report.
     DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
-    /// Reconcile kernel robust-futex cleanup with Detcore's modeled wait queues.
-    // TODO-HUMAN-REVIEW(PR-659): Review post-exit robust reconciliation request.
-    ReconcileRobustFutexes(DetTid),
+    /// Snapshot live tasks targeted by a SIGKILL before Linux removes them.
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL target snapshotting.
+    ResolveRobustSignal(RobustSignalTarget),
+
+    /// Hold the signal sender's turn until every snapshotted target has exited.
+    // TODO-HUMAN-REVIEW(PR-659): Review the managed SIGKILL completion barrier.
+    AwaitRobustExits(Vec<DetTid>),
+
+    /// Reconcile one kernel robust-futex owner death with modeled wait queues.
+    // TODO-HUMAN-REVIEW(PR-659): Review owner-scoped robust reconciliation request.
+    ReconcileRobustFutexes(DetTid, DetPid),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1287,7 +1305,9 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
-    // TODO-HUMAN-REVIEW(PR-659): Review post-exit robust reconciliation response.
+    // TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL RPC responses.
+    ResolveRobustSignal(Vec<DetTid>),
+    AwaitRobustExits(()),
     ReconcileRobustFutexes(u64),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -1572,6 +1592,7 @@ pub async fn deregister_thread<R>(
 /// Wake modeled waiters after Linux has performed robust-futex cleanup for a killed task.
 pub async fn reconcile_robust_futexes_after_kernel_exit<R>(
     exiting: DetTid,
+    group: DetPid,
     threads_time: DetTime,
     cfg: &Config,
     reverie: &R,
@@ -1583,10 +1604,47 @@ where
         return 0;
     }
     let response = reverie
-        .send_rpc((threads_time, GlobalRequest::ReconcileRobustFutexes(exiting)))
+        .send_rpc((
+            threads_time,
+            GlobalRequest::ReconcileRobustFutexes(exiting, group),
+        ))
         .await;
     match response.1 {
         GlobalResponse::ReconcileRobustFutexes(woken) => woken,
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL target and completion RPCs.
+/// Snapshot live scheduler tasks targeted by a SIGKILL.
+pub async fn resolve_robust_signal_target<G, T>(
+    guest: &mut G,
+    target: RobustSignalTarget,
+) -> Vec<DetTid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::ResolveRobustSignal(target)).await;
+    match response {
+        GlobalResponse::ResolveRobustSignal(owners) => owners,
+        _ => unreachable!(),
+    }
+}
+
+/// Wait until all snapshotted SIGKILL targets have completed their exit hooks.
+pub async fn await_robust_signal_exits<G, T>(guest: &mut G, owners: Vec<DetTid>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if owners.is_empty() {
+        return;
+    }
+    let (_, response) = send_and_update_time(guest, GlobalRequest::AwaitRobustExits(owners)).await;
+    match response {
+        GlobalResponse::AwaitRobustExits(()) => {}
         _ => unreachable!(),
     }
 }
@@ -1596,12 +1654,7 @@ where
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
     /// Check in before a FUTEX_WAIT, including an optional timeout.
-    WaitRequest {
-        /// Optional logical timeout deadline.
-        deadline: Option<LogicalTime>,
-        /// Guest virtual address to probe if the kernel later performs robust cleanup.
-        address: usize,
-    },
+    WaitRequest(Option<LogicalTime>),
     /// Check in after a FUTEX_WAIT
     WaitFinished,
     /// Check in before a FUTEX_WAKE, parameterized by the number of threads woken.
@@ -1610,6 +1663,8 @@ pub enum FutexAction {
     RequeueRequest {
         /// Destination futex queue.
         target: FutexID,
+        /// Destination word observed while performing the atomic requeue.
+        target_expected: i32,
         /// Maximum waiters to wake from the source queue.
         max_wake: i32,
         /// Maximum remaining waiters to move to the destination queue.

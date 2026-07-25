@@ -151,6 +151,7 @@ fn validate_futex2_flags(flags: u32) -> Result<bool, Errno> {
     Ok(flags & FUTEX2_PRIVATE != 0)
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review raw futex2 address validation and errno mapping.
 fn futex2_address(raw: usize) -> Result<AddrMut<'static, u32>, Errno> {
     if raw == 0 {
         return Err(Errno::EFAULT);
@@ -161,6 +162,7 @@ fn futex2_address(raw: usize) -> Result<AddrMut<'static, u32>, Errno> {
     AddrMut::from_raw(raw).ok_or(Errno::EFAULT)
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review FUTEX_WAKE_OP 12-bit sign extension.
 fn sign_extend_12(value: u32) -> i32 {
     ((value << 20) as i32) >> 20
 }
@@ -594,14 +596,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         futexid: &crate::types::FutexID,
-        address: usize,
         initial_value: i32,
         mask: u32,
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
         let answer = futex_action(
             guest,
-            FutexAction::WaitRequest { deadline, address },
+            FutexAction::WaitRequest(deadline),
             futexid,
             initial_value,
             mask,
@@ -685,15 +686,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Error::Errno(Errno::EAGAIN));
         }
         let futexid = guest.thread_state().futex_id(address.as_raw(), private);
-        self.handle_futex_wait_result(
-            guest,
-            &futexid,
-            address.as_raw(),
-            observed as i32,
-            mask,
-            deadline,
-        )
-        .await
+        self.handle_futex_wait_result(guest, &futexid, observed as i32, mask, deadline)
+            .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -733,6 +727,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if observed != expected {
             return Err(Error::Errno(Errno::EAGAIN));
         }
+        let target_observed = guest.memory().read_value(target_address)?;
         let source = guest
             .thread_state()
             .futex_id(source_address.as_raw(), source_private);
@@ -743,6 +738,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             FutexAction::RequeueRequest {
                 target,
+                target_expected: target_observed as i32,
                 max_wake,
                 max_requeue,
             },
@@ -792,9 +788,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Error::Errno(Errno::EINVAL));
         }
-        if call.futex_op() & libc::FUTEX_CLOCK_REALTIME != 0 {
-            return Err(Error::Errno(Errno::ENOSYS));
-        }
+        let target_observed = guest.memory().read_value(target_address)?;
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
         let source = guest
             .thread_state()
@@ -806,6 +800,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             FutexAction::RequeueRequest {
                 target,
+                target_expected: target_observed,
                 max_wake,
                 max_requeue,
             },
@@ -843,9 +838,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .is_multiple_of(std::mem::align_of::<u32>())
         {
             return Err(Error::Errno(Errno::EINVAL));
-        }
-        if call.futex_op() & libc::FUTEX_CLOCK_REALTIME != 0 {
-            return Err(Error::Errno(Errno::ENOSYS));
         }
         let old = guest.memory().read_value(target_address)?;
         let (new, wake_target) = apply_futex_wake_op(call.val3() as u32, old)?;
@@ -1027,6 +1019,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Futex,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
+        let futex_command = call.futex_op() & libc::FUTEX_CMD_MASK;
+        if call.futex_op() & libc::FUTEX_CLOCK_REALTIME != 0
+            && futex_command != libc::FUTEX_WAIT_BITSET
+        {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
         let ptr = match call.uaddr() {
             None => {
                 // null pointer error:
@@ -1126,7 +1124,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.handle_futex_wait_result(
                         guest,
                         &futexid,
-                        ptr.as_raw(),
                         init_val,
                         bitset,
                         maybe_timeout_lt,

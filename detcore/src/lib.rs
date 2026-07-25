@@ -642,6 +642,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futex_wake,
                 Sysno::get_robust_list,
                 Sysno::set_robust_list,
+                Sysno::kill,
+                Sysno::tgkill,
+                Sysno::tkill,
                 Sysno::clone,
                 Sysno::clone3,
                 Sysno::fork,
@@ -1328,6 +1331,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
 
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Kill(s) => self.handle_signal_send(guest, s.into()).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Tgkill(s) => self.handle_signal_send(guest, s.into()).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Tkill(s) => self.handle_signal_send(guest, s.into()).await,
+
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
@@ -1678,6 +1688,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if matches!(exit_status, ExitStatus::Signaled(Signal::SIGKILL, _)) {
             let woken = reconcile_robust_futexes_after_kernel_exit(
                 dettid,
+                detpid,
                 thread_state.thread_logical_time.clone(),
                 &self.cfg,
                 global_state,

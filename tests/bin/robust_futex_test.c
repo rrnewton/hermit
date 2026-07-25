@@ -74,6 +74,8 @@ enum {
   WAITER_UNLOCK_FAILED = 22,
   RAW_FUTEX_WAIT_FAILED = 30,
   ROBUST_LOOKUP_FAILED = 40,
+  PROCESS_THREAD_CREATE_FAILED = 50,
+  PROCESS_KILL_FAILED = 51,
 };
 
 static pthread_mutex_t mutex;
@@ -378,6 +380,98 @@ static void check_pending_owner_zero_wake(void) {
   }
 }
 
+static void check_pending_owner_zero_sigkill_wake(void) {
+  struct pending_owner_state *state =
+      mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (state == MAP_FAILED) {
+    perror("mmap pending SIGKILL state");
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t owner = fork();
+  if (owner < 0) {
+    perror("fork pending SIGKILL owner");
+    exit(EXIT_FAILURE);
+  }
+  if (owner == 0) {
+    state->head.list.next = &state->head.list;
+    state->head.futex_offset =
+        (char *)&state->futex_word - (char *)&state->entry;
+    state->head.list_op_pending = &state->entry;
+    if (syscall(SYS_set_robust_list, &state->head, sizeof(state->head)) != 0) {
+      atomic_store_explicit(&state->owner_error,
+                            OWNER_SET_ROBUST_LIST_FAILED,
+                            memory_order_release);
+      atomic_store_explicit(&state->registered, true, memory_order_release);
+      _exit(80);
+    }
+    atomic_store_explicit(&state->registered, true, memory_order_release);
+    while (!atomic_load_explicit(&state->waiter_entered,
+                                 memory_order_acquire)) {
+      sched_yield();
+    }
+    while (atomic_load_explicit(&state->owner_error, memory_order_acquire) ==
+           0) {
+      sched_yield();
+    }
+    _exit(81);
+  }
+
+  pid_t killer = fork();
+  if (killer < 0) {
+    perror("fork pending SIGKILL killer");
+    exit(EXIT_FAILURE);
+  }
+  if (killer == 0) {
+    while (!atomic_load_explicit(&state->waiter_entered,
+                                 memory_order_acquire)) {
+      sched_yield();
+    }
+    for (int i = 0; i < 1000; ++i) {
+      sched_yield();
+    }
+    if (kill(owner, SIGKILL) != 0) {
+      atomic_store_explicit(&state->owner_error, PROCESS_KILL_FAILED,
+                            memory_order_release);
+      _exit(82);
+    }
+    _exit(0);
+  }
+
+  while (!atomic_load_explicit(&state->registered, memory_order_acquire)) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&state->owner_error, memory_order_acquire) != 0) {
+    fprintf(stderr, "pending SIGKILL owner failed to register\n");
+    exit(EXIT_FAILURE);
+  }
+  atomic_store_explicit(&state->waiter_entered, true, memory_order_release);
+  if (syscall(SYS_futex, &state->futex_word, FUTEX_WAIT, 0, NULL, NULL, 0) !=
+      0) {
+    perror("pending owner-zero SIGKILL FUTEX_WAIT");
+    exit(EXIT_FAILURE);
+  }
+
+  int owner_status = 0;
+  int killer_status = 0;
+  if (waitpid(owner, &owner_status, 0) != owner ||
+      !WIFSIGNALED(owner_status) || WTERMSIG(owner_status) != SIGKILL ||
+      waitpid(killer, &killer_status, 0) != killer ||
+      !WIFEXITED(killer_status) || WEXITSTATUS(killer_status) != 0 ||
+      state->futex_word != 0) {
+    fprintf(stderr,
+            "pending SIGKILL result owner=%#x killer=%#x word=%#x error=%d\n",
+            owner_status, killer_status, (unsigned int)state->futex_word,
+            atomic_load_explicit(&state->owner_error, memory_order_acquire));
+    exit(EXIT_FAILURE);
+  }
+  if (munmap(state, sizeof(*state)) != 0) {
+    perror("munmap pending SIGKILL state");
+    exit(EXIT_FAILURE);
+  }
+}
+
 enum wait_abi { WAIT_LEGACY, WAIT_FUTEX2 };
 
 struct raw_wait_state {
@@ -577,13 +671,20 @@ static void check_group_termination(bool fatal_signal) {
   }
   if (child == 0) {
     pthread_t owner;
-    if (pthread_create(&owner, NULL, process_owner_thread, state) != 0) {
+    int create_result = pthread_create(&owner, NULL, process_owner_thread, state);
+    if (create_result != 0) {
+      atomic_store_explicit(&state->owner_error,
+                            PROCESS_THREAD_CREATE_FAILED,
+                            memory_order_release);
       _exit(80);
     }
     if (fatal_signal) {
-      for (;;) {
+      while (atomic_load_explicit(&state->owner_error,
+                                  memory_order_acquire) == 0) {
         sched_yield();
       }
+      syscall(SYS_exit_group, 83);
+      _exit(83);
     }
     while (!atomic_load_explicit(&state->waiter_blocked, memory_order_acquire)) {
       sched_yield();
@@ -604,7 +705,12 @@ static void check_group_termination(bool fatal_signal) {
                                    memory_order_acquire)) {
         sched_yield();
       }
-      _exit(kill(child, SIGKILL) == 0 ? 0 : 82);
+      if (kill(child, SIGKILL) != 0) {
+        atomic_store_explicit(&state->owner_error, PROCESS_KILL_FAILED,
+                              memory_order_release);
+        _exit(82);
+      }
+      _exit(0);
     }
   }
 
@@ -734,6 +840,7 @@ int main(void) {
   check_blocked_and_failed_signal_preserve_owner();
   check_robust_list_lookup();
   check_pending_owner_zero_wake();
+  check_pending_owner_zero_sigkill_wake();
 
   pthread_mutexattr_t attr;
   check_pthread(pthread_mutexattr_init(&attr), "pthread_mutexattr_init");

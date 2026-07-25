@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -130,6 +131,23 @@ pub enum SchedValue {
     Value(u64),
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL target resolution.
+/// A guest signal target resolved by the scheduler before the kernel can remove it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RobustSignalTarget {
+    /// Every live thread in a process.
+    Process(DetPid),
+    /// A thread, optionally constrained to the supplied process.
+    Thread {
+        /// Expected thread-group leader for `tgkill`, or `None` for `tkill`.
+        process: Option<DetPid>,
+        /// Target thread.
+        thread: DetTid,
+    },
+    /// A conservative target for process-group and broadcast forms of `kill`.
+    All,
+}
+
 /// A single interaction between a guest and the scheduler: first, request resourcees, followed
 /// by an ACK to "go ahead".  This thread record includes a bit of thread metadata.
 #[derive(Debug, Clone)]
@@ -161,7 +179,6 @@ pub struct FutexWaiter {
     response: Ivar<SchedResponse>,
     bitset: u32,
     expected: i32,
-    address: usize,
 }
 
 /// Deterministically pick one element from `choices` using the supplied PRNG,
@@ -318,6 +335,12 @@ pub struct Scheduler {
     /// collected from each thread as it deregisters at exit. Aggregated into the
     /// final run report. BTreeMap for deterministic iteration order.
     pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
+
+    /// Robust owner deaths already reflected into modeled futex queues.
+    robust_owner_exits: HashSet<DetTid>,
+
+    /// Thread groups whose pending-owner-zero fallback has already run.
+    robust_zero_groups: HashSet<DetPid>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -515,18 +538,13 @@ impl ThreadTree {
         }
     }
 
-    /// Return the set of thread IDs in the "same process" as me (same TGID), including
-    /// myself.
-    ///
-    /// Locks: takes scheduler lock.
-    pub fn my_thread_group(&mut self, me: &DetTid) -> Vec<DetTid> {
+    // TODO-HUMAN-REVIEW(PR-659): Review fallible signal-target thread-group lookup.
+    /// Return the set of known thread IDs in one process, including `me`.
+    pub fn thread_group(&mut self, me: &DetTid) -> Option<Vec<DetTid>> {
         let root_tid: DetTid = if self.thread_group_leaders.contains(me) {
             *me
         } else {
-            *self
-                .thread_to_leader
-                .get(me)
-                .expect("thread must be in to_leader table")
+            *self.thread_to_leader.get(me)?
         };
         let mut stack: Vec<DetTid> = vec![root_tid];
         let mut acc: Vec<DetTid> = vec![];
@@ -540,8 +558,17 @@ impl ThreadTree {
             let children = self.get_children(&first);
             stack.extend_from_slice(children);
         }
-        assert!(acc.contains(me));
-        acc
+        debug_assert!(acc.contains(me));
+        Some(acc)
+    }
+
+    /// Return the set of thread IDs in the "same process" as me (same TGID), including
+    /// myself.
+    ///
+    /// Locks: takes scheduler lock.
+    pub fn my_thread_group(&mut self, me: &DetTid) -> Vec<DetTid> {
+        self.thread_group(me)
+            .expect("thread must be in to_leader table")
     }
 }
 
@@ -906,6 +933,8 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             per_thread_timeslice: Default::default(),
+            robust_owner_exits: Default::default(),
+            robust_zero_groups: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -1111,7 +1140,6 @@ impl Scheduler {
         maybe_timeout: Option<LogicalTime>,
         bitset: u32,
         expected: i32,
-        address: usize,
     ) {
         let nxt = self
             .next_turns
@@ -1123,7 +1151,6 @@ impl Scheduler {
             response: nxt.resp.clone(),
             bitset,
             expected,
-            address,
         });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
@@ -1249,6 +1276,7 @@ impl Scheduler {
         waker_dettid: DetTid,
         source: FutexID,
         target: FutexID,
+        target_expected: i32,
         max_to_wake: i32,
         max_to_requeue: i32,
     ) -> u64 {
@@ -1265,7 +1293,10 @@ impl Scheduler {
         }
 
         let num_requeued = waiters.len().min(max_to_requeue as usize);
-        let requeued = self.choose_futex_wakees(&mut waiters, num_requeued);
+        let mut requeued = self.choose_futex_wakees(&mut waiters, num_requeued);
+        for waiter in &mut requeued {
+            waiter.expected = target_expected;
+        }
         if !waiters.is_empty() {
             self.blocked.futex_waiters.insert(source, waiters);
         }
@@ -1300,32 +1331,105 @@ impl Scheduler {
         first_woken + second_woken
     }
 
-    // TODO-HUMAN-REVIEW(PR-659): Review post-kernel-exit robust futex reconciliation.
-    /// Wake one modeled waiter for each futex whose kernel-visible word changed to OWNER_DIED.
-    pub fn reconcile_robust_futex_waiters<F>(&mut self, exiting: DetTid, mut read_word: F) -> u64
-    where
-        F: FnMut(DetTid, usize) -> Option<u32>,
-    {
-        const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
-        let ready = self
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL robust-futex reconciliation.
+    /// Resolve a signal target while its tasks are still registered with the scheduler.
+    pub fn resolve_robust_signal_target(&mut self, target: RobustSignalTarget) -> Vec<DetTid> {
+        let mut owners = match target {
+            RobustSignalTarget::Process(process) => self
+                .thread_tree
+                .thread_group(&DetTid::from_raw(process.as_raw()))
+                .unwrap_or_default(),
+            RobustSignalTarget::Thread { process, thread } => {
+                if process.is_some_and(|process| {
+                    self.thread_tree.thread_to_leader.get(&thread) != Some(&process)
+                }) {
+                    Vec::new()
+                } else {
+                    self.thread_tree.thread_group(&thread).unwrap_or_default()
+                }
+            }
+            RobustSignalTarget::All => self.thread_tree.thread_to_leader.keys().copied().collect(),
+        };
+        owners.retain(|owner| !matches!(self.thread_status(*owner), ThreadStatus::Gone));
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review SIGKILL exit-barrier completion semantics.
+    /// Return true after every snapshotted signal target has left the scheduler.
+    pub fn robust_signal_targets_gone(&self, owners: &[DetTid]) -> bool {
+        owners
+            .iter()
+            .all(|owner| matches!(self.thread_status(*owner), ThreadStatus::Gone))
+    }
+
+    fn wake_one_robust_futex_waiter(
+        &mut self,
+        exiting: DetTid,
+        futexid: FutexID,
+        dying_group: &BTreeSet<DetTid>,
+        include_zero_owner: bool,
+    ) -> u64 {
+        const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+        let owner_tid = exiting.as_raw() as u32 & FUTEX_TID_MASK;
+        let Some(waiters) = self.blocked.futex_waiters.remove(&futexid) else {
+            return 0;
+        };
+        let mut eligible = Vec::new();
+        let mut retained = Vec::new();
+        for waiter in waiters {
+            let expected_owner = waiter.expected as u32 & FUTEX_TID_MASK;
+            if !dying_group.contains(&waiter.dettid)
+                && (expected_owner == owner_tid || (include_zero_owner && expected_owner == 0))
+            {
+                eligible.push(waiter);
+            } else {
+                retained.push(waiter);
+            }
+        }
+
+        let num_woken = usize::from(!eligible.is_empty());
+        let to_wake = self.choose_futex_wakees(&mut eligible, num_woken);
+        for waiter in to_wake {
+            self.wake_futex_waiter(waiter);
+        }
+        retained.extend(eligible);
+        if !retained.is_empty() {
+            self.blocked.futex_waiters.insert(futexid, retained);
+        }
+        num_woken as u64
+    }
+
+    /// Wake each robust queue once for one killed owner, in stable futex-key order.
+    pub fn reconcile_robust_futex_waiters(&mut self, exiting: DetTid, group: DetPid) -> u64 {
+        if !self.robust_owner_exits.insert(exiting) {
+            return 0;
+        }
+        let include_zero_owner = self.robust_zero_groups.insert(group);
+        let dying_group = self
+            .thread_tree
+            .thread_group(&exiting)
+            .unwrap_or_else(|| vec![exiting])
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut futexids = self
             .blocked
             .futex_waiters
-            .iter()
-            .filter_map(|(&futexid, waiters)| {
-                waiters
-                    .iter()
-                    .any(|waiter| {
-                        read_word(waiter.dettid, waiter.address).is_some_and(|current| {
-                            current != waiter.expected as u32 && current & FUTEX_OWNER_DIED != 0
-                        })
-                    })
-                    .then_some(futexid)
-            })
+            .keys()
+            .copied()
             .collect::<Vec<_>>();
-
-        ready
+        futexids.sort_unstable();
+        futexids
             .into_iter()
-            .map(|futexid| self.wake_futex_waiters(exiting, futexid, 1, u32::MAX))
+            .map(|futexid| {
+                self.wake_one_robust_futex_waiter(
+                    exiting,
+                    futexid,
+                    &dying_group,
+                    include_zero_owner,
+                )
+            })
             .sum()
     }
 
@@ -2604,7 +2708,6 @@ mod test {
             response: Ivar::new(),
             bitset,
             expected: 0,
-            address: 0x1000 + dettid as usize * 4,
         }
     }
 
@@ -2720,22 +2823,24 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX, 0, 0x1000);
+            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX, 0);
         }
 
         assert_eq!(
-            scheduler.requeue_futex_waiters(DetTid::from_raw(3), source, target, 1, 1),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), source, target, 11, 1, 1),
             2
         );
         assert!(!scheduler.blocked.futex_waiters.contains_key(&source));
         assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
         assert_eq!(scheduler.run_queue.len(), 1);
+        assert_eq!(scheduler.blocked.futex_waiters[&target][0].expected, 11);
 
         assert_eq!(
-            scheduler.requeue_futex_waiters(DetTid::from_raw(3), target, target, 0, 1),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), target, target, 12, 0, 1),
             1
         );
         assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
+        assert_eq!(scheduler.blocked.futex_waiters[&target][0].expected, 12);
     }
 
     #[test]
@@ -2757,14 +2862,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(
-                &dettid,
-                futex,
-                None,
-                u32::MAX,
-                0,
-                if raw_tid == 1 { 0x1000 } else { 0x2000 },
-            );
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, 0);
         }
 
         assert_eq!(
@@ -2789,14 +2887,25 @@ mod test {
     }
 
     #[test]
-    fn sigkill_reconciliation_wakes_only_changed_owner_died_word() {
+    fn sigkill_reconciliation_is_sorted_owner_scoped_and_idempotent() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
-        let mm = MmId::initial(DetTid::from_raw(1));
-        let changed = FutexID::private(mm, 0x1000);
-        let unchanged = FutexID::private(mm, 0x2000);
-        let expected = 0x8000_0001_u32 as i32;
-        for (raw_tid, futex, address) in [(1, changed, 0x1000), (2, unchanged, 0x2000)] {
+        let group = DetPid::from_raw(10);
+        let owner = DetTid::from_raw(11);
+        scheduler.thread_tree.add_child(group, group, true);
+        scheduler.thread_tree.add_child(group, owner, false);
+        let mm = MmId::initial(group);
+        let first = FutexID::private(mm, 0x1000);
+        let zero_owner = FutexID::private(mm, 0x2000);
+        let last = FutexID::private(mm, 0x3000);
+        let unrelated = FutexID::private(mm, 0x4000);
+        let owner_word = (0x8000_0000_u32 | owner.as_raw() as u32) as i32;
+        for (raw_tid, futex, expected) in [
+            (20, last, owner_word),
+            (21, first, owner_word),
+            (22, zero_owner, 0),
+            (23, unrelated, 99),
+        ] {
             let dettid = DetTid::from_raw(raw_tid);
             scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
             scheduler.next_turns.insert(
@@ -2808,28 +2917,22 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, expected, address);
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, expected);
         }
 
+        assert_eq!(scheduler.reconcile_robust_futex_waiters(owner, group), 3);
         assert_eq!(
-            scheduler.reconcile_robust_futex_waiters(DetTid::from_raw(3), |_tid, address| {
-                match address {
-                    0x1000 => Some(0xc000_0000),
-                    0x2000 => Some(expected as u32),
-                    _ => None,
-                }
-            },),
-            1
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            [
+                DetTid::from_raw(21),
+                DetTid::from_raw(22),
+                DetTid::from_raw(20)
+            ]
         );
-        assert!(
-            scheduler
-                .blocked
-                .futex_waiters
-                .get(&changed)
-                .is_none_or(Vec::is_empty)
-        );
-        assert_eq!(scheduler.blocked.futex_waiters[&unchanged].len(), 1);
-        assert_eq!(scheduler.run_queue.len(), 1);
+        assert_eq!(scheduler.blocked.futex_waiters[&unrelated].len(), 1);
+        assert_eq!(scheduler.reconcile_robust_futex_waiters(owner, group), 0);
+        assert_eq!(scheduler.reconcile_robust_futex_waiters(group, group), 0);
+        assert_eq!(scheduler.run_queue.len(), 3);
     }
 
     #[test]
