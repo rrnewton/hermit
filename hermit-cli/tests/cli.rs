@@ -391,6 +391,33 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#679): validate the dedicated DBI diagnostic channel.
+#[test]
+fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
+    let script = r#"set -euo pipefail; output=$(/bin/sh -c 'printf guest-stderr >&2' 2>&1); test "$output" = guest-stderr; printf 'isolated=%s\n' "$output""#;
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/bash",
+        "-c",
+        script,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "isolated=guest-stderr\n");
+    assert!(
+        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBI regression.
 #[test]
 fn run_dbi_verifies_application_mmap() {
@@ -462,6 +489,7 @@ fn run_dbi_verifies_shell_process_lifecycle() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
+// TODO-HUMAN-REVIEW(#689): Confirm the split-write case protects partial-read semantics.
 #[test]
 fn run_dbi_verifies_pipe_backpressure() {
     let args = [
@@ -473,12 +501,12 @@ fn run_dbi_verifies_pipe_backpressure() {
         "--",
         "/bin/bash",
         "-c",
-        "printf x | grep x | wc -l",
+        r#"{ printf "%4096s" x; for _ in {1..100000}; do :; done; printf "%1371s" y; } | wc -c"#,
     ];
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "1\n");
+    assert_eq!(stdout(&output), "5467\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
         "DBI determinism confirmation missing:\n{}",

@@ -151,6 +151,12 @@ jobs:
     - name: PMU and CPUID test lane
       run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
     # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#673)
+    - name: Pselect signal-interruption diagnostic (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test pselect6_simulation -- --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#678)
     - name: Record/replay matrix diagnostics (nonblocking)
       continue-on-error: true

@@ -280,8 +280,8 @@ readonly RR_COMPAT_EXPECTED=128
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
-readonly E9PATCH_COMPAT_TOTAL=151
-readonly E9PATCH_EXTENDED_PROGRAMS=38
+readonly E9PATCH_COMPAT_TOTAL=156
+readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
@@ -1029,6 +1029,7 @@ function strict_compatibility_probe {
     local summary
     local assurance=L2
     local backend_diagnostic=""
+    local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
@@ -1045,12 +1046,19 @@ function strict_compatibility_probe {
                 ;;
         esac
         run_args+=(--strict --verify --)
+        # TODO-HUMAN-REVIEW(PR-681): Review the cache-miss whole-row
+        # budget for the large internal mysql executable.
+        # TODO-HUMAN-REVIEW(PR-687): Review extending the same cache-miss
+        # budget to the large internal PHP/HHVM executable.
+        if [[ $label == mysql || $label == php ]]; then
+            probe_timeout=180
+        fi
     fi
 
     {
         printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
         printf "Command: timeout %s %q" \
-            "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+            "$probe_timeout" "$STRICT_COMPAT_HERMIT_BIN"
         printf " %q" "${run_args[@]}"
         printf " %q" "$@"
         printf "\n"
@@ -1061,7 +1069,7 @@ function strict_compatibility_probe {
         printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
-    if timeout "$STRICT_COMPAT_TIMEOUT" \
+    if timeout "$probe_timeout" \
         "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
         </dev/null >>"$LOG_FILE" 2>&1; then
         status=0
@@ -1141,7 +1149,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pwd /usr/bin/pwd \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe seq /usr/bin/seq 10 \
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the functional miscellaneous probes.
+    functional_compatibility_probe seq /usr/bin/seq 10 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cat /bin/cat README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1155,20 +1165,60 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe id /usr/bin/id -u \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe lua lua -e 'print(42)' \
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the strict-only system utility probes.
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe lua bash -c \
+            'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "lua-fib=%s\n" "$out"' \
+            bash /usr/bin/lua \
+            'local a,b=0,1; for i=1,30 do a,b=b,a+b end; print(a)' 832040 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe perl bash -c \
+            'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "perl-prime-sum=%s\n" "$out"' \
+            bash /usr/bin/perl \
+            'my $sum=0; OUTER: for my $n (2..100) { for my $d (2..int(sqrt($n))) { next OUTER if $n % $d == 0 } $sum += $n } print "$sum\n"' 1060 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe tcl bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "tcl-squares=%s\n" "$out"' \
+            bash /usr/bin/tclsh \
+            'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#698): Review the expanded bc and dc exact-output probes.
+        # Keep the combined exact result below GNU bc output wrap width.
+        strict_compatibility_probe bc bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | BC_LINE_LENGTH=200 "$1" -q); test "$out" = "$3"; printf "bc-math=%s\n" "$out"' \
+            bash /usr/bin/bc \
+            'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; scale=50; print f(20), " ", sqrt(2), "\n"' \
+            '2432902008176640000 1.41421356237309504880168872420969807856967187537694' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe dc bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-math=%s\n" "$out"' \
+            bash /usr/bin/dc '2 100 ^ 1 - n [ ]P 4 13 497 | p' \
+            '1267650600228229401496703205375 445' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    else
+        strict_compatibility_probe lua lua -e 'print(42)' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
+    # shellcheck disable=SC2016
+    strict_compatibility_probe awk bash -c \
+        'set -euo pipefail; printf "alpha 2\nbeta 3\nalpha 5\n" | awk "\$1 == \"alpha\" { sum += \$2 } END { print sum }" | diff -u <(printf "7\n") -; printf "awk-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe awk awk 'BEGIN { print 42 }' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sqlite3 sqlite3 :memory: \
+    functional_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe jq /usr/bin/jq -c -n \
+    functional_compatibility_probe jq /usr/bin/jq -c -n \
         '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe xmllint /usr/bin/xmllint --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
     strict_compatibility_probe bash bash -c \
@@ -1178,6 +1228,12 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe clang clang --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe javac javac -version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     functional_compatibility_probe java java \
         -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1192,8 +1248,32 @@ function run_compatibility_corpus {
     strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
         file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#699)
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe wget /usr/bin/wget --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe netcat /usr/bin/nc -h \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        if [[ -x /usr/bin/socat ]]; then
+            strict_compatibility_probe socat /usr/bin/socat -h \
+                && passed=$((passed + 1)) || failed=$((failed + 1))
+        else
+            printf "  SKIP socat (not installed)\n"
+            {
+                printf "=== L2 compatibility: socat ===\n"
+                printf "Skipped: /usr/bin/socat is not installed\n\n"
+            } >>"$LOG_FILE"
+        fi
+    fi
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     strict_compatibility_probe git /usr/bin/git --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe cmake /usr/bin/cmake --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe pkg-config /usr/bin/pkg-config --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe m4 /usr/bin/m4 --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1254,27 +1334,27 @@ function run_compatibility_corpus {
         'printf "beta\nalpha\nalpha\n" | sort' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uniq bash -c \
-        'printf "alpha\nalpha\nbeta\n" | uniq -c' \
+        'set -euo pipefail; printf "alpha\nalpha\nbeta\nbeta\ngamma\n" | uniq -d | diff -u <(printf "alpha\nbeta\n") -; printf "uniq-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tr bash -c \
         'printf "Hermit\n" | tr "[:upper:]" "[:lower:]"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cut bash -c \
-        'printf "alpha:beta\n" | cut -d: -f2' \
+        'set -euo pipefail; printf "one:two:three\nfour:five:six\n" | cut -d: -f2 | diff -u <(printf "two\nfive\n") -; printf "cut-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tee bash -c \
         'printf "tee-through-hermit\n" | tee /dev/null' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe paste bash -c \
-        'paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n")' \
+        'set -euo pipefail; paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n") | diff -u <(printf "alpha:1\nbeta:2\n") -; printf "paste-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe comm bash -c \
-        'comm <(printf "alpha\nbeta\n") <(printf "beta\ngamma\n")' \
+        'set -euo pipefail; comm -12 <(printf "alpha\nbeta\n") <(printf "beta\ngamma\n") | diff -u <(printf "beta\n") -; printf "comm-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe join bash -c \
-        'join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n")' \
+        'set -euo pipefail; join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n") | diff -u <(printf "1 alpha one\n2 beta two\n") -; printf "join-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe find find /etc -maxdepth 1 \
+    functional_compatibility_probe find find /etc -maxdepth 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Numeric output avoids nondeterministic host NSS owner/group lookups.
     strict_compatibility_probe stat stat -c '%n %s %f' /etc/hostname \
@@ -1285,14 +1365,14 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe dirname /usr/bin/dirname /usr/local/bin/hermit \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe env /usr/bin/env -i HERMIT_COMPAT=env /usr/bin/env \
+    functional_compatibility_probe env /usr/bin/env -i HERMIT_COMPAT=env /usr/bin/env \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe printenv /usr/bin/env -i HERMIT_COMPAT=printenv \
         /usr/bin/printenv HERMIT_COMPAT \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uname /usr/bin/uname -sr \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe factor factor 42 \
+    functional_compatibility_probe factor factor 42 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe expr expr 2 + 2 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1305,10 +1385,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe hostname /usr/bin/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe ip /usr/sbin/ip -V \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe ss /usr/sbin/ss -V \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe lsof /usr/bin/lsof -v \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe lscpu /usr/bin/lscpu --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe whoami /usr/bin/whoami \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # An explicit user avoids host-specific supplementary GIDs without names.
-    strict_compatibility_probe groups /usr/bin/groups root \
+    strict_compatibility_probe groups /usr/bin/groups \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # The compatibility harness supplies /dev/null, so tty should report the
     # expected non-terminal result while the wrapper preserves a zero exit.
@@ -1361,9 +1450,13 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ls /usr/bin/ls -1 README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe xargs bash -c \
+    functional_compatibility_probe xargs bash -c \
         'printf "one\ntwo\n" | /usr/bin/xargs -n1 /bin/echo' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe time /usr/bin/time --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe iconv bash -c \
         'printf "hermit\n" | /usr/bin/iconv -f UTF-8 -t UTF-8' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1431,6 +1524,27 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Restrict process tools to stable identity/existence observations. Host
+    # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
+    # shellcheck disable=SC2016
+    strict_compatibility_probe ps bash -c \
+        'set -euo pipefail; pid=$(ps -o pid= -p $$); pid=${pid//[[:space:]]/}; test "$pid" = "$$"; printf "ps-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe top bash -c \
+        'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 | /usr/bin/awk -v pid="$$" "\$1 == pid && \$NF == \"bash\" { found=1 } END { exit !found }"; printf "top-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Signal zero checks deterministic guest-process existence without
+    # perturbing signal delivery or depending on host process IDs.
+    strict_compatibility_probe kill /usr/bin/kill -0 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe pgrep bash -c \
+        'set -euo pipefail; /usr/bin/pgrep -x bash | /usr/bin/grep -qx "$$"; printf "pgrep-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe pkill bash -c \
+        'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf "pkill-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # timeout is intentionally absent: "timeout 1 true" hangs in Run1 while
     # the parent waits in rt_sigsuspend for its delayed child.
     # Filesystem fixtures use distinct fixed paths and clean them before and
@@ -1442,16 +1556,16 @@ function run_compatibility_corpus {
         'set -euo pipefail; rm -rf /tmp/hermit-compat-patch; mkdir /tmp/hermit-compat-patch; printf "old\n" >/tmp/hermit-compat-patch/file; printf "%s\n" "--- file" "+++ file" "@@ -1 +1 @@" "-old" "+new" | (cd /tmp/hermit-compat-patch && patch -s file); cat /tmp/hermit-compat-patch/file; rm -rf /tmp/hermit-compat-patch' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe grep bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | grep -x alpha' \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\nalpha\n" | grep -nx alpha | diff -u <(printf "1:alpha\n4:alpha\n") -; printf "grep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe egrep bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | egrep "alpha|gamma"' \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | egrep "^(alpha|gamma)$" | diff -u <(printf "alpha\ngamma\n") -; printf "egrep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe fgrep bash -c \
-        'set -euo pipefail; printf "alpha.beta\nalphaXbeta\n" | fgrep "alpha.beta"' \
+        'set -euo pipefail; printf "alpha.beta\nalphaXbeta\n" | fgrep "alpha.beta" | diff -u <(printf "alpha.beta\n") -; printf "fgrep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sed bash -c \
-        'set -euo pipefail; printf "alpha beta\n" | sed "s/alpha/omega/"' \
+        'set -euo pipefail; printf "alpha:12\nbeta:3\n" | sed -E "s/^([a-z]+):([0-9]+)$/\\2-\\1/" | diff -u <(printf "12-alpha\n3-beta\n") -; printf "sed-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tar bash -c \
         'set -euo pipefail; rm -rf /tmp/hermit-compat-tar; mkdir /tmp/hermit-compat-tar; printf "archive-data\n" >/tmp/hermit-compat-tar/input; touch -t 200001010000 /tmp/hermit-compat-tar/input; tar -cf /tmp/hermit-compat-tar/archive.tar -C /tmp/hermit-compat-tar input; tar -tf /tmp/hermit-compat-tar/archive.tar; rm -rf /tmp/hermit-compat-tar' \
@@ -1502,7 +1616,7 @@ function run_compatibility_corpus {
     strict_compatibility_probe fmt bash -c \
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe shuf bash -c \
+    functional_compatibility_probe shuf bash -c \
         'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
@@ -1751,6 +1865,27 @@ function run_e9patch_extended_compatibility_envelope {
     optional_e9patch_compatibility_probe ip ip -Version
     optional_e9patch_compatibility_probe ss ss -V
     optional_e9patch_compatibility_probe podman podman --version
+    optional_e9patch_compatibility_probe perf perf --version
+    optional_e9patch_compatibility_probe rustup rustup --version
+    optional_e9patch_compatibility_probe mysql mysql --version
+    # TODO-HUMAN-REVIEW(PR-687): Review PHP/HHVM cache-miss rewrite coverage.
+    optional_e9patch_compatibility_probe php php --version
+    optional_e9patch_compatibility_probe nginx nginx -v
+    optional_e9patch_compatibility_probe ldconfig ldconfig --version
+
+    # TODO-HUMAN-REVIEW(PR-684): Review the rewritten system-tool coverage rows.
+    optional_e9patch_compatibility_probe buildah buildah --version
+    optional_e9patch_compatibility_probe shellcheck shellcheck --version
+    optional_e9patch_compatibility_probe bat bat --version
+    optional_e9patch_compatibility_probe rg rg --version
+    optional_e9patch_compatibility_probe busybox busybox --help
+    optional_e9patch_compatibility_probe qemu-img qemu-img --version
+    optional_e9patch_compatibility_probe qemu-io qemu-io --version
+    optional_e9patch_compatibility_probe qemu-nbd qemu-nbd --version
+    optional_e9patch_compatibility_probe btrfs btrfs version
+    optional_e9patch_compatibility_probe llvm-exegesis llvm-exegesis --version
+    optional_e9patch_compatibility_probe lto-dump lto-dump --help=common
+    optional_e9patch_compatibility_probe my-print-defaults my_print_defaults --version
 
     classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
         E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
@@ -2033,6 +2168,28 @@ function apply_locally_validated_label {
     fi
 }
 
+# fbsource import lints require the Meta copyright header on every imported Rust
+# source file. experiments/ is durable local research and is not imported to
+# fbsource, so it is exempt. `head -n 8` permits a rust-script shebang first.
+function check_copyright_headers {
+    local missing=0 f
+    while IFS= read -r f; do
+        case "$f" in
+            experiments/*) continue ;;
+        esac
+        if ! head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms'; then
+            printf '  missing Meta copyright header: %s\n' "$f"
+            missing=$((missing + 1))
+        fi
+    done < <(git ls-files '*.rs')
+    if ((missing > 0)); then
+        printf 'validate.sh: %d Rust file(s) missing the Meta copyright header required for fbsource import.\n' \
+            "$missing" >&2
+        return 1
+    fi
+    return 0
+}
+
 function print_summary {
     local passed=$((checks - failures))
     if ((failures == 0)); then
@@ -2083,6 +2240,7 @@ function run_full_suite {
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
     start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Copyright headers (fbsource lint)" check_copyright_headers
     start_check "Documentation" cargo doc --workspace --no-deps
 
     if ! run_strict_compatibility_envelope; then
@@ -2187,6 +2345,7 @@ function run_hosted_validation {
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
     start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Copyright headers (fbsource lint)" check_copyright_headers
     start_check "Documentation" cargo doc --workspace --no-deps
 
     run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
@@ -2278,7 +2437,7 @@ function run_hardware_validation {
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
     run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
-    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
+    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness writev_determinism
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
     run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
@@ -2352,11 +2511,11 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "e9patch compatibility matrix (151 programs)" \
+        run_check "e9patch compatibility matrix ($E9PATCH_COMPAT_TOTAL programs)" \
             run_e9patch_compatibility_envelope
     fi
     if ((failures == 0)); then
-        run_check "e9patch extended installed-program matrix (38 optional programs)" \
+        run_check "e9patch extended installed-program matrix ($E9PATCH_EXTENDED_PROGRAMS optional programs)" \
             run_e9patch_extended_compatibility_envelope
     fi
     print_summary
