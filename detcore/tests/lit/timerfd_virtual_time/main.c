@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#246)
+
 // RUN: %me | FileCheck %s
 // CHECK: timerfd expirations=1 elapsed_ns={{[0-9]+}} requested_ns=10000000
 // CHECK: timerfd respected clock deadline
