@@ -447,6 +447,24 @@ fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
+#[test]
+fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("unsupported-syscall guest path should be UTF-8");
+    let args = ["--log", "warn", "run", "--verify", "--", program];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let warning = "syscalls getpgrp,getppid used but not yet supported";
+    assert_eq!(
+        stderr(&output).matches(warning).count(),
+        1,
+        "verify did not re-emit exactly one aggregate warning:\n{}",
+        stderr(&output)
+    );
+}
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
 #[test]
 fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
@@ -464,6 +482,17 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         normal_stderr.matches(warning).count(),
         1,
         "expected one aggregate warning:\n{normal_stderr}"
+    );
+
+    let tamper_args = ["run", "--backend", "dbi", "--", program, "report-tamper"];
+    let tamper = hermit(&tamper_args);
+    assert_success(&tamper, &tamper_args);
+    assert_eq!(stdout(&tamper), "dbi-unsupported-report-tamper-ok\n");
+    assert_eq!(
+        stderr(&tamper).matches(warning).count(),
+        1,
+        "report tampering suppressed the aggregate warning:\n{}",
+        stderr(&tamper)
     );
 
     let strict_args = ["run", "--backend", "dbi", "--strict", "--", program];
@@ -511,7 +540,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&normal_fork_exec)
     );
 
-    for mode in ["fork", "fork-exec", "exec-empty"] {
+    for mode in ["fork", "fork-exec", "fork-setsid-exec", "exec-empty"] {
         let args = ["run", "--backend", "dbi", "--strict", "--", program, mode];
         let output = hermit(&args);
         assert!(

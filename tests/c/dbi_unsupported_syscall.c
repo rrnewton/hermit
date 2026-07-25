@@ -45,6 +45,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (argc == 2 && strcmp(argv[1], "report-tamper") == 0) {
+    if (call_unsupported() != 0) {
+      return 1;
+    }
+    (void)ftruncate(199, 0);
+    puts("dbi-unsupported-report-tamper-ok");
+    return 0;
+  }
+
   if (argc == 2 && strcmp(argv[1], "fork") == 0) {
     pid_t child = fork();
     if (child < 0) {
@@ -66,13 +75,19 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (argc == 2 && strcmp(argv[1], "fork-exec") == 0) {
+  if (argc == 2 && (strcmp(argv[1], "fork-exec") == 0 ||
+                    strcmp(argv[1], "fork-setsid-exec") == 0)) {
     pid_t child = fork();
     if (child < 0) {
       perror("fork");
       return 1;
     }
     if (child == 0) {
+      if (strcmp(argv[1], "fork-setsid-exec") == 0 && setsid() < 0) {
+        perror("setsid");
+        _exit(126);
+      }
+
       char *next_argv[] = {argv[0], "after-exec", NULL};
       char *next_env[] = {NULL};
       execve(argv[0], next_argv, next_env);
@@ -84,7 +99,11 @@ int main(int argc, char **argv) {
       perror("waitpid");
       return 1;
     }
-    puts("dbi-unsupported-fork-exec-parent-ok");
+    if (strcmp(argv[1], "fork-setsid-exec") == 0) {
+      puts("dbi-unsupported-fork-setsid-exec-parent-ok");
+    } else {
+      puts("dbi-unsupported-fork-exec-parent-ok");
+    }
     return 0;
   }
 

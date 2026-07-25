@@ -27,6 +27,7 @@ use std::io::Seek as _;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -61,6 +62,7 @@ impl DbiSummary {
 struct InstalledFd {
     target: i32,
     backup: Option<i32>,
+    original_flags: Option<i32>,
 }
 
 impl InstalledFd {
@@ -84,7 +86,22 @@ impl InstalledFd {
         } else {
             Some(backup)
         };
-        let installed = Self { target, backup };
+        let original_flags = if let Some(backup_fd) = backup {
+            let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
+            if flags == -1 {
+                let error = std::io::Error::last_os_error();
+                let _ = unsafe { libc::close(backup_fd) };
+                return Err(error);
+            }
+            Some(flags)
+        } else {
+            None
+        };
+        let installed = Self {
+            target,
+            backup,
+            original_flags,
+        };
         if unsafe { libc::dup2(source, target) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -101,6 +118,9 @@ impl Drop for InstalledFd {
     fn drop(&mut self) {
         if let Some(backup) = self.backup {
             let _ = unsafe { libc::dup2(backup, self.target) };
+            if let Some(flags) = self.original_flags {
+                let _ = unsafe { libc::fcntl(self.target, libc::F_SETFD, flags) };
+            }
             let _ = unsafe { libc::close(backup) };
         } else {
             let _ = unsafe { libc::close(self.target) };
@@ -109,37 +129,54 @@ impl Drop for InstalledFd {
 }
 
 struct DbiUnsupportedSyscallReport {
-    file: tempfile::NamedTempFile,
+    reader: std::fs::File,
+    _writer: std::fs::File,
     _report_fd: InstalledFd,
 }
 
 impl DbiUnsupportedSyscallReport {
     fn new() -> std::io::Result<Self> {
-        let file = tempfile::NamedTempFile::new()?;
+        let mut descriptors = [-1; 2];
+        let result =
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 initialized both descriptors, transferring their ownership here.
+        let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
         let report_fd = InstalledFd::install(
-            file.as_file().as_raw_fd(),
+            writer.as_raw_fd(),
             detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD,
         )?;
         Ok(Self {
-            file,
+            reader,
+            _writer: writer,
             _report_fd: report_fd,
         })
     }
 
     fn emit(&mut self) -> std::io::Result<()> {
-        const MAX_REPORT_BYTES: u64 = 1024 * 1024;
-        self.file.as_file_mut().seek(SeekFrom::Start(0))?;
-        let mut contents = String::new();
-        self.file
-            .as_file_mut()
-            .take(MAX_REPORT_BYTES + 1)
-            .read_to_string(&mut contents)?;
-        if contents.len() as u64 > MAX_REPORT_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "DBI unsupported-syscall report exceeded 1 MiB",
-            ));
+        const MAX_REPORT_BYTES: usize = 1024 * 1024;
+        let mut contents = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if contents.len() + read > MAX_REPORT_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "DBI unsupported-syscall report exceeded 1 MiB",
+                        ));
+                    }
+                    contents.extend_from_slice(&buffer[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
         }
+        let contents = String::from_utf8_lossy(&contents);
         let syscalls = contents
             .lines()
             .filter_map(|line| {
@@ -218,7 +255,7 @@ pub fn run_dbi(
             ))
         })?
         .summary(true)
-        .isolated_process_group(true);
+        .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }

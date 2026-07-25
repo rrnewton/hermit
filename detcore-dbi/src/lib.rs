@@ -26,6 +26,7 @@ use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -144,6 +145,7 @@ static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+static COPIED_UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RUNTIME_PAUSED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
@@ -195,6 +197,10 @@ fn report_fd_is_available() -> bool {
 }
 
 fn append_copied_syscall_record(sysnum: i64) {
+    let report_fd = COPIED_UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
+    if report_fd == -1 {
+        return;
+    }
     let mut buffer = [0_u8; 24];
     let mut index = buffer.len() - 1;
     buffer[index] = b'\n';
@@ -360,6 +366,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
             emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
             let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
             COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
+            let copied_report_fd = unsafe {
+                libc::fcntl(
+                    UNSUPPORTED_SYSCALL_REPORT_FD,
+                    libc::F_DUPFD_CLOEXEC,
+                    UNSUPPORTED_SYSCALL_REPORT_FD + 1,
+                )
+            };
+            COPIED_UNSUPPORTED_REPORT_FD.store(copied_report_fd, Ordering::Release);
             let mut config = Config {
                 sequentialize_threads: true,
                 deterministic_io: true,
