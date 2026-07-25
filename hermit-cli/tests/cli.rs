@@ -7,9 +7,12 @@
  */
 
 use std::fs;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,6 +20,9 @@ use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
