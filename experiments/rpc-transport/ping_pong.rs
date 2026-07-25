@@ -5,7 +5,7 @@
 //! bincode = { version = "2", features = ["serde"] }
 //! detcore = { path = "../../detcore" }
 //! futures = "0.3.31"
-//! reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "99b8e50deed8b9467ad2ce65443dd240c54def7d" }
+//! reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0e77d260a84083f462ba10b986c8a72ab8f92758" }
 //! serde = { version = "1.0.219", features = ["derive"] }
 //! serde_json = "1.0.140"
 //! tarpc = { version = "0.37.0", features = ["serde-transport-bincode", "tokio1", "unix"] }
@@ -21,6 +21,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#708): Review the transport benchmark methodology.
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -209,7 +211,7 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
         .len()
         .try_into()
         .context("RPC frame exceeds u32 length prefix")?;
-    stream.write_all(&len.to_le_bytes())?;
+    stream.write_all(&len.to_be_bytes())?;
     stream.write_all(&payload)?;
     Ok(())
 }
@@ -217,7 +219,7 @@ fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
 fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     let mut len = [0_u8; 4];
     stream.read_exact(&mut len)?;
-    let mut payload = vec![0_u8; u32::from_le_bytes(len) as usize];
+    let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
     stream.read_exact(&mut payload)?;
     decode(&payload)
 }
@@ -389,6 +391,19 @@ mod tests {
         let request = sample_request().unwrap();
         let response = sample_response().unwrap();
         validate_payloads(&request, &response).unwrap();
+    }
+
+    #[test]
+    fn raw_frame_uses_shared_big_endian_length_prefix() {
+        let request = sample_request().unwrap();
+        let expected_len: u32 = encode(&request).unwrap().len().try_into().unwrap();
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+
+        write_frame(&mut writer, &request).unwrap();
+
+        let mut header = [0_u8; 4];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(header, expected_len.to_be_bytes());
     }
 
     #[test]

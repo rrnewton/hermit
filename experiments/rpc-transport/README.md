@@ -3,7 +3,8 @@
 This experiment measures the steady-state cost of two candidate transports for
 Reverie's cross-process `GlobalTool` RPC:
 
-- a blocking Unix-domain socket with a four-byte length prefix and bincode 2;
+- a blocking Unix-domain socket with the shared transport's four-byte
+  big-endian length prefix and bincode 2;
 - tarpc over a Unix-domain socket with tarpc's bincode codec.
 
 The script uses Detcore's real private RPC enums without copying or exposing
