@@ -188,7 +188,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::uselib
         | Sysno::vserver
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#PR): Deterministic EPERM for privileged mount and
+        // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
         // reconfigure mount and other namespaces, resolve files by kernel
         // handle, configure global filesystem-event notification, or set the
@@ -541,7 +541,7 @@ pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#PR): Deterministic EPERM refusal set.
+// TODO-HUMAN-REVIEW(#724): Deterministic EPERM refusal set.
 /// Privileged mount and namespace administration syscalls that create, enter,
 /// or reconfigure mount and other namespaces, resolve files by kernel handle,
 /// configure global filesystem-event notification, or set the host clock. A

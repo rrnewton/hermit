@@ -1271,7 +1271,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#PR): Deterministic EPERM for privileged mount
+            // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
             // and namespace administration syscalls (mount/umount2/mount_setattr/
             // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
             // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
