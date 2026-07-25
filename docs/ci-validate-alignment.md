@@ -30,7 +30,7 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 478 of the 803 Cargo-discovered cases:
+The selector covers exactly 410 of the 803 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
@@ -38,10 +38,10 @@ The selector covers exactly 478 of the 803 Cargo-discovered cases:
 | Detcore misc without CPUID probes | 21 | `tests_misc`, excluding two RDRAND/CPUID cases |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 171 | Non-KVM CLI, 67 non-PMU modes, apps, commands, IPC, time, memory, procfs, signals, Python, stress, and rr source contract |
+| Portable Hermit integration cases | 103 | Non-KVM CLI, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 147-row strict compatibility corpus with PMU and CPUID explicitly disabled.
+the 151-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
 The compatibility corpus retains its existing informational policy.
 
 The lane also requires all six DynamoRIO DBI parity scenarios currently
@@ -51,40 +51,48 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 325 Cargo cases require hardware. The per-PR lane executes
-310 blocking cases plus one bounded nonblocking diagnostic, the weekly `super`
-tier executes 11 long cases, and three rr cases remain documented gaps:
+The remaining 393 Cargo cases are outside the blocking hosted subset. The
+per-PR hardware lane executes 313 blocking cases, six cases run as bounded
+nonblocking diagnostics, the weekly `super` tier executes 69 long or relaxed
+cases, and five existing gaps remain explicit:
 
 | Group | Cases | Routing | Hardware reason |
 | --- | ---: | --- | --- |
 | Detcore CPUID/RDRAND probes | 2 | Per-PR | Host feature probe and deterministic masking |
 | Detcore time tests | 14 | Per-PR | Nonzero RCB preemption configuration |
 | Detcore parallel variants | 11 | Per-PR | Deterministic RCB preemption assertions |
-| KVM CLI cases | 16 | Per-PR | Read/write `/dev/kvm` is required |
+| KVM CLI cases | 17 | Per-PR | Read/write `/dev/kvm` is required |
+| DBI pipe backpressure | 1 | Per-PR diagnostic | Bounded known DBI hang from PR #598 |
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
-| Runtime, database, scheduling, and syscall targets | 46 | 45 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
-| Ignored runtime/database/analyze tiers | 14 | 11 per-PR, 3 weekly | Default PMU/CPUID configuration |
+| Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
+| Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
+| Runtime, database, scheduling, and syscall targets | 48 | 47 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
+| Ignored runtime/database/analyze tiers | 18 | 11 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
 | Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
 | rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
 
 The Detcore time and parallel commands intentionally do not pass `--ignored`.
 Those targets contain no ignored tests; the former workflow selected zero
-cases. The time target is serialized because its in-process tracee forks
-deadlock under the Rust harness's parallel test threads. The memory families
-are serialized because concurrent PMU guests caused counter contention on the
-self-hosted machine, and hardware mode uses a one-hour per-gate timeout for
-those CPU-heavy fixtures.
+cases. The miscellaneous and time targets are serialized because their
+in-process tracee forks deadlock under parallel Rust harness threads. The
+memory families are serialized because concurrent PMU guests caused counter
+contention on the self-hosted machine, and hardware mode uses a one-hour
+per-gate timeout for those CPU-heavy fixtures.
 
 The per-PR hardware lane runs LevelDB's bounded `env_posix_test`. The eight
 Buck chaos cases, PMU-skid-sensitive `analyze_hello_race`, full randomized
-LevelDB suite, and SQLite veryquick suite remain in the weekly `super` profile
-because they cannot fit the per-PR job budget on the self-hosted runner.
+LevelDB suite, SQLite veryquick suite, 53 relaxed default-mode cases, and five
+portable chaos/stress cases remain in the weekly `super` profile because they
+cannot fit the per-PR hosted budget. The two intentionally ignored default-mode
+known hangs remain explicit gaps.
+
 The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
 (host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
 
 The stable record/replay integration cases remain blocking. The intermittently
-flaky `record_replay_matrix` is still executed on every pull request, but as a
-five-minute nonblocking diagnostic tracked by follow-up review in PR #678.
+flaky `record_replay_matrix`, four JVM cases, and the DBI pipe-backpressure case
+still execute on every pull request as bounded nonblocking diagnostics tracked
+by PRs #678, #657, and #598.
 
 The hardware lane also gates the three record/replay working-envelope cells,
 the 128-row R/R compatibility corpus, debugger

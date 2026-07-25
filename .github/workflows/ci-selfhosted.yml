@@ -40,6 +40,14 @@ jobs:
     timeout-minutes: 60
 
     steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -96,6 +104,14 @@ jobs:
       DETCORE_TEST_RUST_LOG: "off"
 
     steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -134,3 +150,18 @@ jobs:
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: PMU and CPUID test lane
       run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#678)
+    - name: Record/replay matrix diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#657)
+    - name: Managed JVM strict-verify diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      env:
+        HERMIT_APP_VERIFY_TIMEOUT: "20s"
+        RUST_BACKTRACE: "1"
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test app_strict_verify java -- --ignored --test-threads=1 --nocapture

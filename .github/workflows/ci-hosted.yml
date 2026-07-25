@@ -14,6 +14,7 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
+  STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
 
 jobs:
   regular:
@@ -45,6 +46,12 @@ jobs:
       run: rustup component add clippy rustfmt
     - name: Portable test lane (no PMU or CPUID interception)
       run: ./validate.sh --hosted-only --no-label-pr --verbose
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#598)
+    - name: DBI pipe backpressure diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
     - name: Upload nextest JUnit report
       if: always()
       uses: actions/upload-artifact@v4
