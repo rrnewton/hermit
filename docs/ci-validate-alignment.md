@@ -73,11 +73,11 @@ cases, and five existing gaps remain explicit:
 
 The Detcore time and parallel commands intentionally do not pass `--ignored`.
 Those targets contain no ignored tests; the former workflow selected zero
-cases. The miscellaneous and time targets are serialized because their
-in-process tracee forks deadlock under parallel Rust harness threads. The
-memory families are serialized because concurrent PMU guests caused counter
-contention on the self-hosted machine, and hardware mode uses a one-hour
-per-gate timeout for those CPU-heavy fixtures.
+cases. Each of the 25 PMU cases runs as an exact, single-threaded Cargo test so
+a leaked tracee cannot hold a whole family harness open. Timing cases have a
+two-minute limit, futex cases five minutes, and the CPU-heavy memory cases 15
+minutes each. A family stops after its first failure, while a green run still
+executes every enumerated case.
 
 The per-PR hardware lane runs LevelDB's bounded `env_posix_test`. The eight
 Buck chaos cases, PMU-skid-sensitive `analyze_hello_race`, full randomized
