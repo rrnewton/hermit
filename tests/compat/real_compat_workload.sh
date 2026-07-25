@@ -329,6 +329,8 @@ EOF
         grep -Eq '^[[:space:]]*[1-9][0-9]*:.*compat_marker' "$WORK_DIR/coverage.c.gcov"
         printf 'gcov:covered-marker\n'
         ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the expanded miscellaneous workloads.
     seq)
         output=$(/usr/bin/seq 2 3 20 | /usr/bin/paste -sd, -)
         test "$output" = '2,5,8,11,14,17,20'

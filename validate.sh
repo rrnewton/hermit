@@ -1132,6 +1132,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pwd /usr/bin/pwd \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the functional miscellaneous probes.
     functional_compatibility_probe seq /usr/bin/seq 10 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cat /bin/cat README.md \
