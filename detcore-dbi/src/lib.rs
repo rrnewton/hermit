@@ -131,6 +131,11 @@ struct NativeThreadScratch {
     observed_syscalls: u64,
     rewritten_syscalls: u64,
     runtime_state: *mut ThreadRuntime,
+    virtual_pid: i32,
+    virtual_ppid: i32,
+    virtual_tid: i32,
+    pending_virtual_child: i32,
+    pending_clone_flags: u64,
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
@@ -393,6 +398,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(scratch: *mut c_void) {
                 observed_syscalls: 0,
                 rewritten_syscalls: 0,
                 runtime_state: std::ptr::null_mut(),
+                virtual_pid: 0,
+                virtual_ppid: 0,
+                virtual_tid: 0,
+                pending_virtual_child: 0,
+                pending_clone_flags: 0,
             });
     }
 }
