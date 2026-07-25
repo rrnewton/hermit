@@ -35,6 +35,7 @@ regex = "1.13.1"
 # sync across all crates and bump it via docs/updating-reverie.md.
 reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e" }
 reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e", default-features = false }
+reverie-e9patch = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e" }
 reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e" }
 reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e", default-features = false }
