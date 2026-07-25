@@ -197,6 +197,8 @@ EOF
         test "$result" = 'make:42'
         printf '%s\n' "$result"
         ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the fixture-backed system utility workloads.
     ip)
         output=$(/usr/sbin/ip -o -4 addr show dev lo)
         [[ $output == *" inet 127.0.0.1/8 "* ]]

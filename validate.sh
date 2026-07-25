@@ -1146,6 +1146,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe id /usr/bin/id -u \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the strict-only system utility probes.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         strict_compatibility_probe lua bash -c \
             'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "lua-fib=%s\n" "$out"' \
