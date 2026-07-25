@@ -228,7 +228,7 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     let stdin_reads = field("stdin_reads=")?
         .parse::<u64>()
         .map_err(|_| Error::msg("DBI verification failed: invalid stdin read count"))?;
-    if branches == 0 || syscalls == 0 || rewritten == 0 || rewritten > syscalls {
+    if syscalls == 0 || rewritten == 0 || rewritten > syscalls {
         return Err(Error::msg(
             "DBI verification failed: native callback counters are inconsistent",
         ));
@@ -257,4 +257,30 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::Exited(output.status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    fn output_with_summary(summary: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: format!("{summary}\n").into_bytes(),
+        }
+    }
+
+    #[test]
+    fn detcore_summary_accepts_a_disabled_branch_counter() {
+        let output = output_with_summary(
+            "reverie-dbi: tool=Detcore branches=0 syscalls=37 rewritten=36 stdin_reads=0 memory_hash=df3d244acf4e32fe",
+        );
+
+        let summary = detcore_summary(&output).unwrap();
+        assert_eq!(summary.branches, 0);
+        assert_eq!(summary.syscalls, 37);
+    }
 }
