@@ -54,13 +54,17 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (argc == 2 && strcmp(argv[1], "fork") == 0) {
+  if (argc == 2 && (strcmp(argv[1], "fork") == 0 ||
+                    strcmp(argv[1], "fork-report-tamper") == 0)) {
     pid_t child = fork();
     if (child < 0) {
       perror("fork");
       return 1;
     }
     if (child == 0) {
+      if (strcmp(argv[1], "fork-report-tamper") == 0) {
+        close(199);
+      }
       _exit(call_unsupported());
     }
     int status = 0;
@@ -71,7 +75,11 @@ int main(int argc, char **argv) {
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
       return 1;
     }
-    puts("dbi-unsupported-fork-ok");
+    if (strcmp(argv[1], "fork-report-tamper") == 0) {
+      puts("dbi-unsupported-fork-report-tamper-ok");
+    } else {
+      puts("dbi-unsupported-fork-ok");
+    }
     return 0;
   }
 

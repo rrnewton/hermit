@@ -495,6 +495,27 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&tamper)
     );
 
+    let fork_tamper_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--",
+        program,
+        "fork-report-tamper",
+    ];
+    let fork_tamper = hermit(&fork_tamper_args);
+    assert_success(&fork_tamper, &fork_tamper_args);
+    assert_eq!(
+        stdout(&fork_tamper),
+        "dbi-unsupported-fork-report-tamper-ok\n"
+    );
+    assert_eq!(
+        stderr(&fork_tamper).matches(warning).count(),
+        1,
+        "fork-child report tampering suppressed the aggregate warning:\n{}",
+        stderr(&fork_tamper)
+    );
+
     let strict_args = ["run", "--backend", "dbi", "--strict", "--", program];
     let strict = hermit(&strict_args);
     assert!(
