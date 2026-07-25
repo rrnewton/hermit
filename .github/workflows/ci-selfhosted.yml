@@ -150,3 +150,9 @@ jobs:
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: PMU and CPUID test lane
       run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#678)
+    - name: Record/replay matrix diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1

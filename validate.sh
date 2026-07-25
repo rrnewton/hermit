@@ -2084,7 +2084,8 @@ function run_hardware_validation {
     run_check "PMU parallel memory-and-print cases" cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --skip raw_run_par_mode --test-threads=1
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
-    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation record_replay redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
+    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
+    run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
     run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
