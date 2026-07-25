@@ -219,8 +219,10 @@ impl Recorder {
             guest,
             result.and_then(|length| {
                 let mut buf = vec![0; length as usize];
-                let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                guest.memory().read_exact(addr, &mut buf)?;
+                if !buf.is_empty() {
+                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+                    guest.memory().read_exact(addr, &mut buf)?;
+                }
                 Ok(SyscallEvent::ReadV2(ReadEvent {
                     consumed_sigpipe_count: consumed_sigpipe_count(
                         guest.pid().as_raw(),
@@ -246,8 +248,10 @@ impl Recorder {
             guest,
             result.and_then(|length| {
                 let mut buf = vec![0; length as usize];
-                let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                guest.memory().read_exact(addr, &mut buf)?;
+                if !buf.is_empty() {
+                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+                    guest.memory().read_exact(addr, &mut buf)?;
+                }
                 Ok(SyscallEvent::Bytes(buf))
             }),
         );

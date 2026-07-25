@@ -313,10 +313,10 @@ impl Replayer {
 
         assert!(event.bytes.len() <= syscall.len());
 
-        guest
-            .memory()
-            .write_exact(syscall.buf().unwrap(), &event.bytes)
-            .unwrap();
+        if !event.bytes.is_empty() {
+            let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(addr, &event.bytes)?;
+        }
         Ok(event.bytes.len() as i64)
     }
 
@@ -329,11 +329,10 @@ impl Replayer {
 
         assert!(buf.len() <= syscall.len());
 
-        // Write out the buffer.
-        guest
-            .memory()
-            .write_exact(syscall.buf().unwrap(), &buf)
-            .unwrap();
+        if !buf.is_empty() {
+            let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(addr, &buf)?;
+        }
         Ok(buf.len() as i64)
     }
 

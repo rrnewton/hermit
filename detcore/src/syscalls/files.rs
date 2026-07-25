@@ -225,9 +225,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Read,
     ) -> Result<i64, Error> {
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // Zero-count reads only serve to detect errors. Record their result because
+            // replay may reserve the logical fd with a different kernel object whose
+            // zero-count read has different error semantics.
+            return Ok(self.record_or_replay(guest, call).await?);
         }
 
         let needs_procfs_snapshot = guest
@@ -305,9 +306,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pread64,
     ) -> Result<i64, Error> {
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // See handle_read: replay placeholders must not determine the result.
+            return Ok(self.record_or_replay(guest, call).await?);
         }
 
         let (fd_type, resource) = guest
