@@ -30,15 +30,15 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 445 of the 843 Cargo-discovered cases:
+The selector covers exactly 469 of the 868 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
-| Workspace unit, bin, and doc baseline | 311 | Existing regular-job selection |
+| Workspace unit, bin, and doc baseline | 319 | Existing regular-job selection |
 | Detcore misc without CPUID probes | 21 | `tests_misc`, excluding two RDRAND/CPUID cases |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 107 | Non-KVM CLI, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
+| Portable Hermit integration cases | 123 | Non-KVM CLI, LiteInst, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
 the 180-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
@@ -51,8 +51,8 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 398 Cargo cases are outside the blocking hosted subset. The
-per-PR hardware lane executes 317 blocking cases, seven cases run as bounded
+The remaining 399 Cargo cases are outside the blocking hosted subset. The
+per-PR hardware lane executes 318 blocking cases, seven cases run as bounded
 nonblocking diagnostics, the weekly `super` tier executes 69 long or relaxed
 cases, and five existing gaps remain explicit:
 
@@ -67,7 +67,7 @@ cases, and five existing gaps remain explicit:
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
 | Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
 | Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
-| Runtime, database, scheduling, and syscall targets | 51 | 50 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
+| Runtime, database, scheduling, and syscall targets | 52 | 51 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
 | Ignored runtime/database/analyze tiers | 19 | 12 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
 | Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
 | rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
