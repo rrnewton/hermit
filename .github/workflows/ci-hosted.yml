@@ -44,7 +44,7 @@ jobs:
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Portable test lane (no PMU or CPUID interception)
-      run: ./validate.sh --hosted-only --no-label-pr
+      run: ./validate.sh --hosted-only --no-label-pr --verbose
     - name: Upload nextest JUnit report
       if: always()
       uses: actions/upload-artifact@v4
