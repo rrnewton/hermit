@@ -170,7 +170,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#PENDING): Deterministic ENOSYS for syscalls the pinned
+        // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
         // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
         // deterministic by construction and matches the modern kernel's own return,
         // so guest-visible behavior is unchanged while dropping the host dependency.
@@ -499,7 +499,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#PENDING): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS refusal set.
 /// Syscalls the pinned modern x86_64 kernel leaves unimplemented (routed to
 /// `sys_ni_syscall`, which returns `-ENOSYS`). Detcore refuses them with a fixed
 /// `ENOSYS` so the result is deterministic by construction rather than depending
