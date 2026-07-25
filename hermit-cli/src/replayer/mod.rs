@@ -187,11 +187,11 @@ impl Tool for Replayer {
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
-            Syscall::Dup(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup3(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
-            Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Socket(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
@@ -203,10 +203,10 @@ impl Tool for Replayer {
                     FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
                 ) =>
             {
-                self.handle_replayed_fd_operation(guest, syscall).await
+                self.handle_replayed_side_effect(guest, syscall).await
             }
             Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
-                self.handle_replayed_fd_operation(guest, syscall).await
+                self.handle_replayed_side_effect(guest, syscall).await
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
@@ -224,7 +224,8 @@ impl Tool for Replayer {
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
-            Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Mkdir(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -280,7 +281,7 @@ impl Replayer {
         recorded
     }
 
-    async fn handle_replayed_fd_operation<G: Guest<Self>>(
+    async fn handle_replayed_side_effect<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
@@ -292,13 +293,13 @@ impl Replayer {
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
-                        "replayed FD operation {:?} failed after recording returned {expected}: {error}",
+                        "replayed side-effecting operation {:?} failed after recording returned {expected}: {error}",
                         syscall
                     )
                 });
             if actual != expected {
                 panic!(
-                    "replay FD namespace diverged for {:?}: recorded {expected}, replayed {actual}",
+                    "replay side effect diverged for {:?}: recorded {expected}, replayed {actual}",
                     syscall
                 );
             }

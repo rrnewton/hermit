@@ -334,6 +334,42 @@ fn record_find_directory_tree() {
     );
 }
 
+#[test]
+fn record_mkdir_and_rmdir_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "mkdir-rmdir-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-mkdir-side-effect; rm -rf \"$root\"; mkdir \"$root\"; rmdir \"$root\"; printf 'mkdir-rmdir-side-effect-ok\\n'",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn record_mkfifo_in_replay_tmp() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "mkfifo-in-replay-tmp",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; fifo=/tmp/hermit-record-mkfifo; rm -f \"$fifo\"; mkfifo \"$fifo\"; stat -c '%F' \"$fifo\"; rm -f \"$fifo\"",
+            ),
+        ],
+    );
+}
+
 /// Regression test for issue #19: a shell that forks and execs an external
 /// binary must be able to re-exec that binary during replay. The replay chroot
 /// previously contained only the root executable, so the forked child's

@@ -537,7 +537,7 @@ impl Replayer {
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
-            self.handle_replayed_fd_operation(guest, Syscall::from(syscall))
+            self.handle_replayed_side_effect(guest, Syscall::from(syscall))
                 .await
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
