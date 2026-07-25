@@ -103,7 +103,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::poll
         | Sysno::ppoll
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-PENDING): Review scratch fd sets and scheduler polling.
+        // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
         | Sysno::pselect6
         | Sysno::prlimit64
         | Sysno::pread64

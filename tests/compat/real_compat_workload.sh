@@ -44,7 +44,7 @@ function build_assembly_object {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(PR-PENDING): Review archive reproducibility and localhost fixture cleanup.
+# TODO-HUMAN-REVIEW(#686): Review archive reproducibility and localhost fixture cleanup.
 function prepare_archive_fixture {
     mkdir -p "$WORK_DIR/source" "$WORK_DIR/output"
     printf 'Hermit archive payload\nline two\n' >"$WORK_DIR/source/payload.txt"

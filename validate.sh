@@ -1310,7 +1310,7 @@ function run_compatibility_corpus {
         'zstd -q -c README.md | sha256sum' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(PR-PENDING): Review strict-only archive/network envelope growth.
+    # TODO-HUMAN-REVIEW(#686): Review strict-only archive/network envelope growth.
     # These functional rows are measured only for ptrace strict L2. The alternate-backend
     # and record/replay ratchets retain their independently measured 151/151 and 128 rows.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
