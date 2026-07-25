@@ -1271,7 +1271,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#PR): Deterministic EPERM for privileged
+            // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
             // system-administration syscalls (module load/unload, kexec, reboot,
             // swap, raw I/O ports, root-mount pivot, host/domain name, tty
             // hangup, disk quotas). The deterministic guest does not hold the

@@ -188,7 +188,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::uselib
         | Sysno::vserver
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#PR): Deterministic EPERM for privileged
+        // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
         // system-administration syscalls that mutate global kernel/host state
         // (module load/unload, kexec, reboot, swap, raw I/O ports, root-mount
         // pivot, host/domain name, tty hangup, disk quotas). The deterministic
@@ -537,7 +537,7 @@ pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#PR): Deterministic EPERM refusal set.
+// TODO-HUMAN-REVIEW(#722): Deterministic EPERM refusal set.
 /// Privileged system-administration syscalls that mutate global kernel or host
 /// state (loading/unloading kernel modules, kexec, reboot, enabling/disabling
 /// swap, raw I/O port access, pivoting the root mount, setting the host or
