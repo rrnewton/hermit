@@ -419,7 +419,8 @@ function failure_summary {
 function run_timed_command {
     local name=$1
     local log_file=$2
-    shift 2
+    local timeout_seconds=$3
+    shift 3
 
     local started_at=$SECONDS
     local next_report=$VERBOSE_INTERVAL_SECONDS
@@ -446,7 +447,7 @@ function run_timed_command {
 
     while kill -0 "$pid" 2>/dev/null; do
         elapsed=$((SECONDS - started_at))
-        if ((elapsed >= GATE_TIMEOUT_SECONDS)); then
+        if ((elapsed >= timeout_seconds)); then
             kill_process_tree "$pid" TERM
             grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
             while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
@@ -458,15 +459,15 @@ function run_timed_command {
             wait "$pid" 2>/dev/null || true
             active_check_pid=""
             printf "Gate timed out after %ss (subprocess PID %s)\n" \
-                "$GATE_TIMEOUT_SECONDS" "$pid" >>"$log_file"
+                "$timeout_seconds" "$pid" >>"$log_file"
             printf "⏱️  %s timed out after %ss (subprocess PID %s)\n" \
-                "$name" "$GATE_TIMEOUT_SECONDS" "$pid"
+                "$name" "$timeout_seconds" "$pid"
             return 124
         fi
 
         if ((VERBOSE == 1 && elapsed >= next_report)); then
             printf "  still running: %s (PID %s, elapsed %ss/%ss)\n" \
-                "$name" "$pid" "$elapsed" "$GATE_TIMEOUT_SECONDS"
+                "$name" "$pid" "$elapsed" "$timeout_seconds"
             next_report=$((next_report + VERBOSE_INTERVAL_SECONDS))
         fi
         sleep 0.2
@@ -484,9 +485,10 @@ function run_timed_command {
     return "$status"
 }
 
-function run_check {
-    local name=$1
-    shift
+function run_check_with_timeout {
+    local timeout_seconds=$1
+    local name=$2
+    shift 2
 
     local started_at=$SECONDS
     local output_start
@@ -505,10 +507,10 @@ function run_check {
         printf "\n▶ %s\n" "$name"
         printf "  command:"
         printf " %q" "$@"
-        printf "\n  timeout: %ss\n" "$GATE_TIMEOUT_SECONDS"
+        printf "\n  timeout: %ss\n" "$timeout_seconds"
     fi
 
-    if run_timed_command "$name" "$LOG_FILE" "$@"; then
+    if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
         status=0
         printf "✅ %s (1 passed, 0 failed, %ss)\n" \
             "$name" "$((SECONDS - started_at))"
@@ -525,6 +527,10 @@ function run_check {
         printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
     } >>"$LOG_FILE"
     checks=$((checks + 1))
+}
+
+function run_check {
+    run_check_with_timeout "$GATE_TIMEOUT_SECONDS" "$@"
 }
 
 function start_check {
@@ -551,7 +557,7 @@ function start_check {
         local started_at=$SECONDS
         local status
 
-        if run_timed_command "$name" "$log_file" "$@"; then
+        if run_timed_command "$name" "$log_file" "$GATE_TIMEOUT_SECONDS" "$@"; then
             status=0
         else
             status=$?
@@ -2210,6 +2216,26 @@ function run_hosted_validation {
     ((failures == 0))
 }
 
+function run_exact_detcore_cases {
+    local label=$1
+    local target=$2
+    local timeout_seconds=$3
+    shift 3
+
+    local failures_before=$failures
+    local test_name
+
+    for test_name in "$@"; do
+        printf "Running %s: %s\n" "$label" "$test_name"
+        run_check_with_timeout "$timeout_seconds" "$label: $test_name" \
+            cargo test -p detcore --test "$target" "$test_name" -- --exact --test-threads=1
+        if ((failures > failures_before)); then
+            printf "Skipping remaining %s cases after the first failure.\n" "$label"
+            return
+        fi
+    done
+}
+
 function run_hardware_validation {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-ci"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
@@ -2218,10 +2244,37 @@ function run_hardware_validation {
     run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
     run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
     run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
-    run_check "PMU timing cases" cargo test -p detcore --test tests_time -- --test-threads=1
-    run_check "PMU parallel futex cases" cargo test -p detcore --test tests_parallelism futex_wait_parent -- --skip futex_wait_parent::raw --test-threads=3
-    run_check "PMU parallel memory cases" cargo test -p detcore --test tests_parallelism 'mem_race::' -- --skip raw_run_par_mode --skip noop_mode --skip with_signal --test-threads=1
-    run_check "PMU parallel memory-and-print cases" cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --skip raw_run_par_mode --test-threads=1
+    # Keep PMU tracees in separate harness processes. On the persistent runner,
+    # a leaked tracee can otherwise hold an entire family gate open for an hour.
+    run_exact_detcore_cases "PMU timing" tests_time 120 \
+        max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time \
+        rdtsc_deltas \
+        target_timeslice_yields_at_syscall_boundaries_without_pmu \
+        tod_clock_getres \
+        tod_clock_getres_2 \
+        tod_clock_gettime \
+        tod_from_epoch \
+        tod_gettimeofday \
+        tod_gettimeofday_delta::bottom_detcore \
+        tod_gettimeofday_delta::default_detcore \
+        tod_gettimeofday_delta::middle_detcore \
+        tod_gettimeofday_delta::top_detcore \
+        tod_is_stable \
+        tod_time
+    run_exact_detcore_cases "PMU parallel futex" tests_parallelism 300 \
+        futex_wait_parent::bottom_detcore \
+        futex_wait_parent::default_detcore \
+        futex_wait_parent::middle_detcore
+    run_exact_detcore_cases "PMU parallel memory" tests_parallelism 900 \
+        mem_race::bottom_detcore \
+        mem_race::default_detcore \
+        mem_race::middle_detcore \
+        mem_race::top_detcore
+    run_exact_detcore_cases "PMU parallel memory-and-print" tests_parallelism 900 \
+        mem_print_race::bottom_detcore \
+        mem_print_race::default_detcore \
+        mem_print_race::middle_detcore \
+        mem_print_race::top_detcore
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
     run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
