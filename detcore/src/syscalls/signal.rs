@@ -32,6 +32,7 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::cancel_prepared_sigkill;
 use crate::tool_global::fence_prepared_sigkill;
+use crate::tool_global::finalize_prepared_sigkill;
 use crate::tool_global::prepare_sigkill_target;
 use crate::tool_global::register_alarm;
 use crate::tool_global::register_sigkill_targets;
@@ -87,28 +88,81 @@ impl<T: RecordOrReplay> Detcore<T> {
         let managed_sigkill = signum == libc::SIGKILL
             && self.cfg.sequentialize_threads
             && self.cfg.debug_futex_mode == BlockingMode::Precise;
-        let prepared_targets = if managed_sigkill && target.requires_permission_probe() {
+        if managed_sigkill && target.has_ambiguous_delivery() {
             let candidates = resolve_sigkill_candidates(guest, target).await;
-            let mut eligible = Vec::new();
+            let all_targets = candidates
+                .iter()
+                .flat_map(|candidate| candidate.threads.iter().copied())
+                .collect();
+            let prepared_targets = register_sigkill_targets(guest, all_targets).await;
+            let mut delivered_targets = Vec::new();
+            let mut sender_targets = Vec::new();
             for candidate in candidates {
-                let probe = syscalls::Kill::new()
+                if candidate.threads.contains(&sender) {
+                    sender_targets.extend(candidate.threads);
+                    continue;
+                }
+
+                let direct = syscalls::Kill::new()
                     .with_pid(candidate.process.as_raw())
-                    .with_sig(0);
-                match guest.inject(probe).await {
-                    Ok(0) => eligible.extend(candidate.threads),
+                    .with_sig(libc::SIGKILL);
+                match guest.inject(direct).await {
+                    Ok(0) => delivered_targets.extend(candidate.threads),
                     Ok(result) => info!(
-                        "[detcore, dtid {}] signal-0 probe for process {} returned unexpected result {}",
+                        "[detcore, dtid {}] targeted SIGKILL for process {} returned unexpected result {}",
                         sender, candidate.process, result
                     ),
-                    Err(Errno::EPERM | Errno::ESRCH) => {}
                     Err(error) => info!(
-                        "[detcore, dtid {}] signal-0 probe for process {} returned unexpected error {}",
+                        "[detcore, dtid {}] targeted SIGKILL for process {} failed with {}",
                         sender, candidate.process, error
                     ),
                 }
             }
-            register_sigkill_targets(guest, eligible).await
-        } else if managed_sigkill {
+
+            let direct_delivery_succeeded = !delivered_targets.is_empty();
+            let mut assumed_delivered = delivered_targets.clone();
+            assumed_delivered.extend(sender_targets.iter().copied());
+            let (mut retained, cancelled, woken) =
+                finalize_prepared_sigkill(guest, prepared_targets, assumed_delivered).await;
+            info!(
+                "[detcore, dtid {}] retained {} exact SIGKILL target(s), cancelled {}, and woke {} waiter(s) before group delivery",
+                sender,
+                retained.len(),
+                cancelled,
+                woken
+            );
+
+            let group_result = guest.inject(call).await;
+            if !sender_targets.is_empty() {
+                let (surviving, cancelled, woken) =
+                    finalize_prepared_sigkill(guest, retained, delivered_targets).await;
+                retained = surviving;
+                info!(
+                    "[detcore, dtid {}] survived group SIGKILL; cancelled {} self target(s) and woke {} waiter(s)",
+                    sender, cancelled, woken
+                );
+            }
+
+            let result = match group_result {
+                Ok(result) => result,
+                Err(error) if direct_delivery_succeeded => {
+                    info!(
+                        "[detcore, dtid {}] group SIGKILL returned {} after exact managed delivery; preserving Linux success semantics",
+                        sender, error
+                    );
+                    0
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let fenced = fence_prepared_sigkill(guest, retained).await;
+            info!(
+                "[detcore, dtid {}] fenced {} exactly delivered SIGKILL target(s) pending physical exit",
+                sender, fenced
+            );
+            return Ok(result);
+        }
+
+        let prepared_targets = if managed_sigkill {
             prepare_sigkill_target(guest, target).await
         } else {
             Vec::new()

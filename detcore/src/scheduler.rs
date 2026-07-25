@@ -153,7 +153,7 @@ pub enum SigkillTarget {
 
 impl SigkillTarget {
     /// Group and broadcast selectors can succeed after delivering to only a subset of candidates.
-    pub fn requires_permission_probe(&self) -> bool {
+    pub fn has_ambiguous_delivery(&self) -> bool {
         matches!(
             self,
             Self::ProcessGroupOf(_) | Self::ProcessGroup(_) | Self::AllExceptProcess(_)
@@ -161,11 +161,11 @@ impl SigkillTarget {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review per-process SIGKILL permission-probe candidates.
+// TODO-HUMAN-REVIEW(PR-659): Review per-process SIGKILL delivery candidates.
 /// One managed process that an ambiguous group or broadcast signal may target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigkillProcessCandidate {
-    /// Kernel process ID used for the signal-0 permission probe.
+    /// Kernel process ID used for exact targeted SIGKILL delivery.
     pub process: DetPid,
     /// Live managed threads that must be fenced if this process can receive SIGKILL.
     pub threads: Vec<DetTid>,
@@ -1423,8 +1423,8 @@ impl Scheduler {
         targets
     }
 
-    // TODO-HUMAN-REVIEW(PR-659): Review deterministic candidate grouping for signal-0 probes.
-    /// Group resolved managed threads by process for kernel-authoritative permission probes.
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic candidate grouping for targeted delivery.
+    /// Group resolved managed threads by process for exact targeted SIGKILL delivery.
     pub fn resolve_sigkill_process_candidates(
         &mut self,
         target: SigkillTarget,
@@ -1445,8 +1445,8 @@ impl Scheduler {
             .collect()
     }
 
-    // TODO-HUMAN-REVIEW(PR-659): Review exact eligible-target registration after signal-0 probes.
-    /// Register the live subset that the kernel confirmed the sender may signal.
+    // TODO-HUMAN-REVIEW(PR-659): Review candidate registration before exact targeted delivery.
+    /// Register live candidates before targeted SIGKILL can trigger asynchronous exit hooks.
     pub fn register_sigkill_targets(
         &mut self,
         sender: DetTid,
@@ -1467,10 +1467,46 @@ impl Scheduler {
         targets
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review exact delivered-subset refinement.
+    /// Retain only candidates whose targeted SIGKILL actually succeeded.
+    pub fn finalize_prepared_sigkill_delivery(
+        &mut self,
+        sender: DetTid,
+        mut prepared: Vec<DetTid>,
+        mut delivered: Vec<DetTid>,
+    ) -> (Vec<DetTid>, u64, u64) {
+        prepared.sort_unstable();
+        prepared.dedup();
+        let prepared_set = prepared.iter().copied().collect::<HashSet<_>>();
+        delivered.retain(|target| prepared_set.contains(target));
+        delivered.sort_unstable();
+        delivered.dedup();
+        let delivered_set = delivered.iter().copied().collect::<HashSet<_>>();
+
+        let mut cancelled = 0;
+        for target in prepared {
+            if !delivered_set.contains(&target) {
+                cancelled += u64::from(self.pending_sigkills.remove(&target));
+            }
+        }
+
+        let sender_changed = if delivered.is_empty() || delivered.contains(&sender) {
+            self.pending_sigkill_senders.remove(&sender)
+        } else {
+            self.pending_sigkill_senders.insert(sender)
+        };
+        let woken = if cancelled > 0 || sender_changed {
+            self.wake_after_sigkill_quiesces(sender)
+        } else {
+            0
+        };
+        (delivered, cancelled, woken)
+    }
+
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL cohort registration.
     /// Resolve and register a potential SIGKILL cohort before the target can physically exit.
     pub fn prepare_sigkill_target(&mut self, sender: DetTid, target: SigkillTarget) -> Vec<DetTid> {
-        if target.requires_permission_probe() {
+        if target.has_ambiguous_delivery() {
             return Vec::new();
         }
         let targets = self.resolve_sigkill_target(target);
@@ -1525,6 +1561,16 @@ impl Scheduler {
         self.wake_after_sigkill_quiesces(sender)
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review the one-turn post-SIGKILL sender handoff.
+    /// Move a registered sender's next ordinary scheduler request ahead of unrelated peers.
+    pub fn prioritize_pending_sigkill_sender(&mut self, sender: DetTid) -> bool {
+        if !self.pending_sigkill_senders.contains(&sender) || !self.run_queue.remove_tid(sender) {
+            return false;
+        }
+        self.runqueue_push_front(sender);
+        true
+    }
+
     // TODO-HUMAN-REVIEW(PR-659): Review physical-exit completion for SIGKILL senders.
     /// Release a sender whose first post-SIGKILL boundary was an exit request.
     pub fn sigkill_sender_exited(&mut self, sender: DetTid) -> u64 {
@@ -1537,9 +1583,14 @@ impl Scheduler {
     // TODO-HUMAN-REVIEW(PR-659): Review last-exit robust-futex wake sequencing.
     /// Record one physical SIGKILL exit and wake waiters once every fenced task has exited.
     pub fn complete_sigkill_exit(&mut self, exiting: DetTid, process: DetPid) -> (u64, u64) {
+        self.run_queue.remove_tid(exiting);
+        self.remove_blocking_entries(&exiting);
         if !self.pending_sigkills.contains(&exiting) {
             let targets = self.resolve_sigkill_target(SigkillTarget::Process(process));
             for target in targets {
+                if target == exiting {
+                    continue;
+                }
                 self.pending_sigkills.insert(target);
                 self.run_queue.remove_tid(target);
                 self.remove_blocking_entries(&target);
@@ -1573,7 +1624,6 @@ impl Scheduler {
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2d_handle_empty_queue(global_time)?;
-        self.step2e_wait_for_sigkill_completion()?;
         Ok(())
     }
 
@@ -1955,42 +2005,6 @@ impl Scheduler {
             }
         }
         Ok(())
-    }
-
-    // TODO-HUMAN-REVIEW(PR-659): Review post-SIGKILL scheduler cohort barrier.
-    /// Let a registered sender reach its next boundary, then wait for physical target exits.
-    fn step2e_wait_for_sigkill_completion(&mut self) -> Result<(), SkipTurn> {
-        if self.pending_sigkills.is_empty() && self.pending_sigkill_senders.is_empty() {
-            return Ok(());
-        }
-
-        let mut ready_senders = self
-            .pending_sigkill_senders
-            .iter()
-            .copied()
-            .filter(|sender| {
-                self.run_queue.contains_tid(*sender)
-                    && self
-                        .next_turns
-                        .get(sender)
-                        .and_then(|next_turn| next_turn.req.try_read())
-                        .is_some()
-            })
-            .collect::<Vec<_>>();
-        ready_senders.sort_unstable();
-        if let Some(sender) = ready_senders.first().copied() {
-            assert!(self.run_queue.remove_tid(sender));
-            self.runqueue_push_front(sender);
-            return Ok(());
-        }
-
-        trace!(
-            "[scheduler] deferring unrelated turns for {} SIGKILL target exit(s) and {} sender boundary/exit(s)",
-            self.pending_sigkills.len(),
-            self.pending_sigkill_senders.len()
-        );
-        std::thread::yield_now();
-        Err(SkipTurn)
     }
 
     /// Step: Find the next thread to run for this scheduling run.
@@ -3163,7 +3177,7 @@ mod test {
     }
 
     #[test]
-    fn failed_sigkill_cancels_prepared_targets_without_descheduling() {
+    fn failed_sigkill_cancellation_after_target_exit_wakes_survivor() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
         let target = DetTid::from_raw(10);
@@ -3192,13 +3206,13 @@ mod test {
         assert_eq!(scheduler.cancel_prepared_sigkill(sender, targets), (0, 1));
         assert!(scheduler.pending_sigkills.is_empty());
         assert!(scheduler.pending_sigkill_senders.is_empty());
-        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(!scheduler.run_queue.contains_tid(target));
         assert!(scheduler.run_queue.contains_tid(survivor));
         assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
     }
 
     #[test]
-    fn ambiguous_broadcast_sigkill_fences_only_probe_eligible_processes() {
+    fn ambiguous_broadcast_sigkill_fences_only_exactly_delivered_processes() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
         let sender = DetTid::from_raw(10);
@@ -3239,8 +3253,12 @@ mod test {
             ]
         );
 
-        let targets = scheduler.register_sigkill_targets(sender, vec![first]);
+        let prepared = scheduler.register_sigkill_targets(sender, vec![first, second]);
+        assert_eq!(prepared, [first, second]);
+        let (targets, cancelled, woken) =
+            scheduler.finalize_prepared_sigkill_delivery(sender, prepared, vec![first]);
         assert_eq!(targets, [first]);
+        assert_eq!((cancelled, woken), (1, 0));
         assert!(scheduler.pending_sigkills.contains(&first));
         assert!(!scheduler.pending_sigkills.contains(&second));
         assert!(scheduler.pending_sigkill_senders.contains(&sender));
@@ -3371,23 +3389,72 @@ mod test {
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 1);
-        assert!(scheduler.step2e_wait_for_sigkill_completion().is_err());
-
-        let mut exit = Resources::new(sender);
-        exit.insert(
-            ResourceID::Exit {
-                group: true,
-                process: sender,
-                mm: MmId::initial(sender),
-            },
-            Permission::RW,
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            [unrelated, sender]
         );
-        scheduler.next_turns[&sender].req.put(Ok(exit));
-        assert!(scheduler.step2e_wait_for_sigkill_completion().is_ok());
+
+        let mut ordinary = Resources::new(sender);
+        ordinary.insert(
+            ResourceID::ParentContinue {
+                parent: sender,
+                child: sender,
+            },
+            Permission::W,
+        );
+        scheduler.next_turns[&sender].req.put(Ok(ordinary));
+        assert!(scheduler.prioritize_pending_sigkill_sender(sender));
+        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [sender, unrelated]
         );
+        assert!(scheduler.pending_sigkill_senders.is_empty());
+        assert!(scheduler.pending_sigkills.contains(&target));
+
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+    }
+
+    #[test]
+    fn self_sigkill_completion_never_requeues_dead_futex_member() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let leader = DetTid::from_raw(10);
+        let sibling = DetTid::from_raw(11);
+        let survivor = DetTid::from_raw(20);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        scheduler.thread_tree.add_child(leader, survivor, true);
+
+        for dettid in [leader, sibling, survivor] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+        scheduler.runqueue_push_back(leader);
+        let dead_futex = FutexID::private(MmId::initial(leader), 0x1000);
+        let live_futex = FutexID::private(MmId::initial(survivor), 0x2000);
+        scheduler.sleep_futex_waiter(&sibling, dead_futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, live_futex, None, u32::MAX);
+
+        let targets = scheduler.prepare_sigkill_target(leader, SigkillTarget::Process(leader));
+        assert_eq!(targets, [leader, sibling]);
+        assert!(scheduler.pending_sigkill_senders.is_empty());
+
+        assert_eq!(scheduler.complete_sigkill_exit(leader, leader), (1, 0));
+        scheduler.logically_kill_thread(&leader, &leader, MmId::initial(leader));
+        assert_eq!(scheduler.complete_sigkill_exit(sibling, leader), (0, 1));
+        assert!(!scheduler.run_queue.contains_tid(sibling));
+        assert!(scheduler.run_queue.contains_tid(survivor));
+        assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
     }
 
     #[test]

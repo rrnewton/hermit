@@ -523,6 +523,14 @@ impl GlobalTool for GlobalState {
                     .unwrap()
                     .register_sigkill_targets(sender, targets),
             ),
+            GlobalRequest::FinalizePreparedSigkill(sender, prepared, delivered) => {
+                let (retained, cancelled, woken) = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .finalize_prepared_sigkill_delivery(sender, prepared, delivered);
+                R::FinalizePreparedSigkill(retained, cancelled, woken)
+            }
             GlobalRequest::FencePreparedSigkill(targets) => R::FencePreparedSigkill(
                 self.sched
                     .lock()
@@ -649,6 +657,13 @@ impl GlobalState {
                 &dettid, &nextturn.req
             );
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
+            let prioritized = sched.prioritize_pending_sigkill_sender(dettid);
+            if prioritized {
+                trace!(
+                    "[detcore, dtid {}] prioritized first post-SIGKILL scheduler boundary",
+                    dettid
+                );
+            }
             // TODO-HUMAN-REVIEW(PR-659): Review post-SIGKILL sender-boundary wake ordering.
             let woken = sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some());
             if woken > 0 {
@@ -1295,12 +1310,16 @@ pub enum GlobalRequest {
     PrepareSigkillTarget(DetTid, SigkillTarget),
 
     /// Resolve ambiguous group/broadcast targets into managed process candidates.
-    // TODO-HUMAN-REVIEW(PR-659): Review signal-0 candidate-resolution RPC.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact-delivery candidate-resolution RPC.
     ResolveSigkillCandidates(SigkillTarget),
 
-    /// Register only candidates that passed the sender-context signal-0 probe.
-    // TODO-HUMAN-REVIEW(PR-659): Review exact eligible-target registration RPC.
+    /// Register candidates before targeted SIGKILL delivery.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact target registration RPC.
     RegisterSigkillTargets(DetTid, Vec<DetTid>),
+
+    /// Retain only candidates whose targeted SIGKILL succeeded.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact delivered-subset refinement RPC.
+    FinalizePreparedSigkill(DetTid, Vec<DetTid>, Vec<DetTid>),
 
     /// Fence a prepared SIGKILL cohort after successful injection.
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence RPC.
@@ -1363,10 +1382,12 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
     PrepareSigkillTarget(Vec<DetTid>),
-    // TODO-HUMAN-REVIEW(PR-659): Review signal-0 candidate-resolution response.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact-delivery candidate-resolution response.
     ResolveSigkillCandidates(Vec<SigkillProcessCandidate>),
-    // TODO-HUMAN-REVIEW(PR-659): Review exact eligible-target registration response.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact target registration response.
     RegisterSigkillTargets(Vec<DetTid>),
+    // TODO-HUMAN-REVIEW(PR-659): Review exact delivered-subset refinement response.
+    FinalizePreparedSigkill(Vec<DetTid>, u64, u64),
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence response.
     FencePreparedSigkill(u64),
     // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation response.
@@ -1713,8 +1734,8 @@ where
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review registration of signal-0-probe-eligible targets.
-/// Register the managed threads whose process passed a signal-0 permission probe.
+// TODO-HUMAN-REVIEW(PR-659): Review registration before exact targeted delivery.
+/// Register managed candidate threads before targeted SIGKILL delivery.
 pub async fn register_sigkill_targets<G, T>(guest: &mut G, targets: Vec<DetTid>) -> Vec<DetTid>
 where
     G: Guest<Detcore<T>>,
@@ -1728,6 +1749,31 @@ where
     .await;
     match response {
         GlobalResponse::RegisterSigkillTargets(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review exact delivered-subset refinement.
+/// Retain only prepared threads whose targeted SIGKILL actually succeeded.
+pub async fn finalize_prepared_sigkill<G, T>(
+    guest: &mut G,
+    prepared: Vec<DetTid>,
+    delivered: Vec<DetTid>,
+) -> (Vec<DetTid>, u64, u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sender = guest.thread_state().dettid;
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::FinalizePreparedSigkill(sender, prepared, delivered),
+    )
+    .await;
+    match response {
+        GlobalResponse::FinalizePreparedSigkill(retained, cancelled, woken) => {
+            (retained, cancelled, woken)
+        }
         _ => unreachable!(),
     }
 }
