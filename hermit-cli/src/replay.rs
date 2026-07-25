@@ -160,6 +160,7 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     chroot.create_dir_all(&metadata.current_dir)?;
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#653)
     // Successful recorded mkdir calls must have their parent in the replay root.
     chroot.create_dir_all(Path::new("/tmp"))?;
 

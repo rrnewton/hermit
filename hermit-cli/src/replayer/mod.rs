@@ -225,6 +225,7 @@ impl Tool for Replayer {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#653)
             Syscall::Mkdir(_) => self.handle_replayed_side_effect(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
