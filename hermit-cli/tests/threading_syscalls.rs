@@ -98,4 +98,58 @@ fn threading_syscalls_reach_strict_verify_l2() {
             || verify_stderr.contains("Determinism verified"),
         "Hermit omitted its determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
     );
+
+    // kill(-1) is safe only inside Hermit's isolated PID namespace. Keep this
+    // separate from the native-compatible default fixture mode.
+    let mut broadcast_command = Command::new("timeout");
+    broadcast_command
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            "--tmp=/tmp",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("--hermit-broadcast-only");
+    let broadcast_output = command_output(broadcast_command, "strict broadcast SIGKILL run");
+    let broadcast_stdout = String::from_utf8_lossy(&broadcast_output.stdout);
+    let broadcast_stderr = String::from_utf8_lossy(&broadcast_output.stderr);
+    assert!(
+        broadcast_stdout.contains("PASS: caught SIGCHLD handler preserved")
+            && broadcast_stdout.contains("PASS: broadcast SIGKILL handled deterministically"),
+        "broadcast SIGKILL guest omitted its success marker\nstdout:\n{broadcast_stdout}\nstderr:\n{broadcast_stderr}",
+    );
+
+    let mut broadcast_verify_command = Command::new("timeout");
+    broadcast_verify_command
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            "--tmp=/tmp",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("--hermit-broadcast-only");
+    let broadcast_verify_output = command_output(
+        broadcast_verify_command,
+        "strict broadcast SIGKILL verification",
+    );
+    let broadcast_verify_stdout = String::from_utf8_lossy(&broadcast_verify_output.stdout);
+    let broadcast_verify_stderr = String::from_utf8_lossy(&broadcast_verify_output.stderr);
+    assert!(
+        broadcast_verify_stdout.contains("Determinism verified")
+            || broadcast_verify_stderr.contains("Determinism verified"),
+        "Hermit omitted broadcast determinism marker\nstdout:\n{broadcast_verify_stdout}\nstderr:\n{broadcast_verify_stderr}",
+    );
 }

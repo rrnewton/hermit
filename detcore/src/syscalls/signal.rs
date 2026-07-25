@@ -132,7 +132,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 woken
             );
 
-            let group_result = guest.inject(call).await;
+            // Every live descendant in Hermit's isolated PID namespace is traced and
+            // registered with the scheduler before it can run. Once a targeted send
+            // succeeds, repeating a selector that excludes the sender cannot reach a
+            // new guest process; it can only race the resulting SIGCHLD against this
+            // syscall's return. Selectors that include the sender still need the
+            // original operation to preserve self-kill semantics.
+            let group_result = if direct_delivery_succeeded && sender_targets.is_empty() {
+                info!(
+                    "[detcore, dtid {}] exact managed SIGKILL delivery completed group selector; skipping redundant kernel send",
+                    sender
+                );
+                Ok(0)
+            } else {
+                guest.inject(call).await
+            };
             if !sender_targets.is_empty() {
                 let (surviving, cancelled, woken) =
                     finalize_prepared_sigkill(guest, retained, delivered_targets).await;

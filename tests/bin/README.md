@@ -62,6 +62,12 @@ U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
 process-shared `exit_group`, and external `SIGKILL` cleanup.
 It additionally checks that a separate process can deliver `SIGKILL` through a
 negative process-group selector without introducing wait-order divergence.
+The Hermit integration test also invokes the fixture's
+`--hermit-broadcast-only` mode inside the isolated PID namespace. That mode
+waits until a child is ready, calls `kill(-1, SIGKILL)` with SIGCHLD unmasked,
+and verifies the child status at L2. It first installs a SIGCHLD handler and
+waits for a separate child event, guarding against suppression of caught
+signals, then restores the default disposition. Do not run that mode natively.
 
 # POSIX timer signal-delivery probe
 

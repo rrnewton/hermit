@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -81,6 +82,7 @@ enum {
 static pthread_mutex_t mutex;
 static atomic_bool owner_locked = false;
 static atomic_bool waiter_started = false;
+static volatile sig_atomic_t caught_sigchld_count;
 
 static void check_pthread(int ret, const char *operation);
 
@@ -836,6 +838,89 @@ static void check_negative_process_group_sigkill(void) {
   }
 }
 
+static void on_sigchld(int signal_number) {
+  (void)signal_number;
+  ++caught_sigchld_count;
+}
+
+static void check_caught_sigchld(void) {
+  struct sigaction action = {0};
+  action.sa_handler = on_sigchld;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGCHLD, &action, NULL) != 0) {
+    perror("install SIGCHLD handler");
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork caught-SIGCHLD target");
+    exit(EXIT_FAILURE);
+  }
+  if (child == 0) {
+    _exit(7);
+  }
+  for (int attempt = 0;
+       attempt < 10000 && caught_sigchld_count == 0; ++attempt) {
+    sched_yield();
+  }
+
+  int status = 0;
+  if (caught_sigchld_count != 1 || waitpid(child, &status, 0) != child ||
+      !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
+    fprintf(stderr, "caught SIGCHLD count=%d target=%#x\n",
+            caught_sigchld_count, status);
+    exit(EXIT_FAILURE);
+  }
+
+  action.sa_handler = SIG_DFL;
+  if (sigaction(SIGCHLD, &action, NULL) != 0) {
+    perror("restore default SIGCHLD disposition");
+    exit(EXIT_FAILURE);
+  }
+}
+
+static void check_broadcast_sigkill(void) {
+  atomic_bool *ready =
+      mmap(NULL, sizeof(*ready), PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (ready == MAP_FAILED) {
+    perror("mmap broadcast state");
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork broadcast target");
+    exit(EXIT_FAILURE);
+  }
+  if (child == 0) {
+    atomic_store_explicit(ready, true, memory_order_release);
+    for (;;) {
+      pause();
+    }
+  }
+
+  while (!atomic_load_explicit(ready, memory_order_acquire)) {
+    sched_yield();
+  }
+  if (kill(-1, SIGKILL) != 0) {
+    perror("kill broadcast target");
+    exit(EXIT_FAILURE);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
+      WTERMSIG(status) != SIGKILL) {
+    fprintf(stderr, "broadcast SIGKILL target=%#x\n", status);
+    exit(EXIT_FAILURE);
+  }
+  if (munmap(ready, sizeof(*ready)) != 0) {
+    perror("munmap broadcast state");
+    exit(EXIT_FAILURE);
+  }
+}
+
 static void check_futex_variants(void) {
   int source = 0;
   int target = 7;
@@ -916,7 +1001,15 @@ static void check_pthread(int ret, const char *operation) {
   }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--hermit-broadcast-only") == 0) {
+    check_caught_sigchld();
+    check_broadcast_sigkill();
+    puts("PASS: caught SIGCHLD handler preserved");
+    puts("PASS: broadcast SIGKILL handled deterministically");
+    return EXIT_SUCCESS;
+  }
+
   check_blocked_and_failed_signal_preserve_owner();
   check_robust_list_lookup();
   check_pending_owner_zero_wake();
