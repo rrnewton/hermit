@@ -26,6 +26,7 @@ use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -35,6 +36,7 @@ use std::task::Waker;
 use detcore::Config;
 use detcore::Detcore;
 use detcore::GlobalState;
+use detcore::UnsupportedSyscallError;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Pid;
@@ -52,6 +54,11 @@ use reverie_dbi::SyscallInvoker;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
+/// Fixed inherited descriptor receiving unsupported syscall records.
+pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbi::RuntimeEmitter;
@@ -137,6 +144,8 @@ static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+static COPIED_UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RUNTIME_PAUSED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +190,38 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
+}
+
+fn report_fd_is_available() -> bool {
+    (unsafe { libc::fcntl(UNSUPPORTED_SYSCALL_REPORT_FD, libc::F_GETFD) }) != -1
+}
+
+fn append_copied_syscall_record(sysnum: i64) {
+    let report_fd = COPIED_UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
+    if report_fd == -1 {
+        return;
+    }
+    let mut buffer = [0_u8; 24];
+    let mut index = buffer.len() - 1;
+    buffer[index] = b'\n';
+    let mut value = sysnum as u64;
+    loop {
+        index -= 1;
+        buffer[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    index -= 1;
+    buffer[index] = b'@';
+    let _ = unsafe {
+        libc::write(
+            report_fd,
+            buffer[index..].as_ptr().cast(),
+            buffer.len() - index,
+        )
+    };
 }
 
 fn error_result(error: Error) -> i64 {
@@ -323,10 +364,24 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
             emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
+            let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
+            COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
+            let copied_report_fd = unsafe {
+                libc::fcntl(
+                    UNSUPPORTED_SYSCALL_REPORT_FD,
+                    libc::F_DUPFD_CLOEXEC,
+                    UNSUPPORTED_SYSCALL_REPORT_FD + 1,
+                )
+            };
+            COPIED_UNSUPPORTED_REPORT_FD.store(copied_report_fd, Ordering::Release);
             let mut config = Config {
                 sequentialize_threads: true,
                 deterministic_io: true,
                 max_timeslice: None,
+                panic_on_unsupported_syscalls,
+                exit_on_unsupported_syscall: true,
+                unsupported_syscall_report_fd: report_fd_is_available()
+                    .then_some(UNSUPPORTED_SYSCALL_REPORT_FD),
                 ..Config::default()
             };
             config.validate();
@@ -458,6 +513,22 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
         "failed exec had no Detcore runtime"
     );
     resume_paused_runtime();
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
+/// Applies unsupported-syscall policy in a copied pre-exec DBI child.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
+    if !detcore::is_unsupported_syscall(Sysno::from(sysnum as i32)) {
+        return 0;
+    }
+    if COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire) {
+        1
+    } else {
+        append_copied_syscall_record(sysnum);
+        0
+    }
 }
 
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
@@ -644,6 +715,17 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             1
         }
         Ok(DbiSyscallOutcome::AllowOriginal) => 0,
+        Err(Error::Tool(error)) => {
+            if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
+                let message = format!("detcore-dbi: {unsupported}\n");
+                unsafe { emit(message.as_ptr(), message.len()) };
+                -1
+            } else {
+                unsafe { result.write(error_result(Error::Tool(error))) };
+                TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                1
+            }
+        }
         Err(error) => {
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
