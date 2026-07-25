@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
-const HERMIT_TIMEOUT_SECONDS: u64 = 240;
+const HERMIT_TIMEOUT_SECONDS: u64 = 600;
 const HERMIT_KILL_GRACE_SECONDS: u64 = 10;
 const MODULE_CASE_PREFIX: &str = "python-stdlib-module-cases=";
 

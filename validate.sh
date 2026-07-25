@@ -1790,6 +1790,8 @@ function run_super_suite {
         printf "\n== Super stress pass rates ==\n"
         cat "$VALIDATION_TMP_DIR/super-report"
     fi
+    run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
+    run_check "PMU analyze hello-race stress" cargo test -p hermit --test analyze analyze_hello_race -- --exact --ignored --test-threads=1
     run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
     run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
@@ -1881,15 +1883,14 @@ function run_hardware_validation {
     run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
     run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
     run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
-    run_check "PMU timing cases" cargo test -p detcore --test tests_time -- --test-threads=4
+    run_check "PMU timing cases" cargo test -p detcore --test tests_time -- --test-threads=1
     run_check "PMU parallel futex cases" cargo test -p detcore --test tests_parallelism futex_wait_parent -- --skip futex_wait_parent::raw --test-threads=3
     run_check "PMU parallel memory cases" cargo test -p detcore --test tests_parallelism 'mem_race::' -- --skip raw_run_par_mode --skip noop_mode --skip with_signal --test-threads=1
     run_check "PMU parallel memory-and-print cases" cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --skip raw_run_par_mode --test-threads=1
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
-    run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
     run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation record_replay redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
-    run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --test-threads=1
+    run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
     run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
     run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1

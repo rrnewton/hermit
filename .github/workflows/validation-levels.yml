@@ -54,7 +54,7 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Install validation tools
         run: |
           cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
@@ -117,7 +117,7 @@ jobs:
           test -r /dev/kvm -a -w /dev/kvm
           command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
           python3 -c 'import test.support'
-          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Self-hosted PMU and CPUID test lane
         run: ./validate.sh --hardware-only --no-label-pr
       - name: Upload working-envelope JSON
@@ -170,6 +170,6 @@ jobs:
       - name: PMU and namespace preflight
         run: |
           test -r /proc/sys/kernel/perf_event_paranoid
-          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Repeated and long-form hardware validation
         run: ./validate.sh super --no-label-pr

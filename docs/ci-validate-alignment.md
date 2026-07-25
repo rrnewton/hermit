@@ -17,8 +17,9 @@ The Rust workflow and local validation use the same capability selectors:
 
 The default `./validate.sh` remains the developer superset. The focused modes
 exist so either CI subset can be reproduced independently. The tiered workflow
-maps `quick` to portable, `full` to per-PR hardware, and long database stress
-to the weekly self-hosted `super` profile.
+maps `quick` to portable, `full` to per-PR hardware, and long database and
+PMU chaos stress to the weekly self-hosted `super` profile.
+
 ## Portable lane
 
 The hosted job enables user and mount namespaces before starting Hermit. This
@@ -50,29 +51,34 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The self-hosted selector covers the remaining 325 Cargo cases:
+The remaining 325 Cargo cases require hardware. The per-PR selector executes
+311, the weekly `super` tier executes 11 long cases, and three rr cases remain
+documented gaps:
 
-| Group | Cases | Hardware reason |
-| --- | ---: | --- |
-| Detcore CPUID/RDRAND probes | 2 | Host feature probe and deterministic masking |
-| Detcore time tests | 14 | Nonzero RCB preemption configuration |
-| Detcore parallel variants | 11 | Deterministic RCB preemption assertions |
-| KVM CLI cases | 16 | Read/write `/dev/kvm` is required |
-| Buck chaos variants | 8 | Explicit one-million-RCB time slice |
-| Runtime, database, scheduling, and syscall targets | 46 | Default PMU/CPUID or record/replay configuration |
-| Ignored runtime/database/analyze tiers | 14 | Default PMU/CPUID configuration; the randomized full LevelDB and SQLite veryquick suites run in the weekly `super` tier |
-| Slow CAS stress | 1 | PMU preemption search and replay |
-| rr syscall corpus | 213 | Explicit 80-million-RCB time slice; the per-PR ratchet runs 210 and records three known gaps |
+| Group | Cases | Routing | Hardware reason |
+| --- | ---: | --- | --- |
+| Detcore CPUID/RDRAND probes | 2 | Per-PR | Host feature probe and deterministic masking |
+| Detcore time tests | 14 | Per-PR | Nonzero RCB preemption configuration |
+| Detcore parallel variants | 11 | Per-PR | Deterministic RCB preemption assertions |
+| KVM CLI cases | 16 | Per-PR | Read/write `/dev/kvm` is required |
+| Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
+| Runtime, database, scheduling, and syscall targets | 46 | Per-PR | Default PMU/CPUID or record/replay configuration |
+| Ignored runtime/database/analyze tiers | 14 | 11 per-PR, 3 weekly | Default PMU/CPUID configuration |
+| Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
+| rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
 
 The Detcore time and parallel commands intentionally do not pass `--ignored`.
 Those targets contain no ignored tests; the former workflow selected zero
-cases. The memory families are serialized because concurrent PMU guests caused
-counter contention on the self-hosted machine, and hardware mode uses a
-one-hour per-gate timeout for those CPU-heavy fixtures.
+cases. The time target is serialized because its in-process tracee forks
+deadlock under the Rust harness's parallel test threads. The memory families
+are serialized because concurrent PMU guests caused counter contention on the
+self-hosted machine, and hardware mode uses a one-hour per-gate timeout for
+those CPU-heavy fixtures.
 
-The per-PR hardware lane runs LevelDB's bounded `env_posix_test`; the full
-randomized LevelDB and SQLite veryquick suites remain in the weekly `super`
-profile because each takes tens of minutes on the self-hosted runner.
+The per-PR hardware lane runs LevelDB's bounded `env_posix_test`. The eight
+Buck chaos cases, PMU-skid-sensitive `analyze_hello_race`, full randomized
+LevelDB suite, and SQLite veryquick suite remain in the weekly `super` profile
+because they cannot fit the per-PR job budget on the self-hosted runner.
 The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
 (host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
 
@@ -92,7 +98,7 @@ tools, databases, and debuggers before starting the hardware selector.
 When adding a test:
 
 1. Identify whether it asserts PMU/RCB, CPUID, KVM, or another host capability.
-2. Put it in exactly one focused selector.
+2. Put it in exactly one validation tier.
 3. If it is portable, make the disabling flags explicit in its command helper.
 4. Run both focused modes on a capable host and the default full validation.
 5. Update the case totals in this document.

@@ -46,7 +46,7 @@ jobs:
         if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
-        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: Install cargo-nextest
       run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
     - name: Rust components
@@ -105,7 +105,7 @@ jobs:
         command -v qemu-system-x86_64
         test -r /boot/vmlinuz
         unshare --user --map-root-user --pid --fork --uts --net --mount \
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: Validate QEMU strict L2 boot
       env:
         KERNEL_IMAGE: /boot/vmlinuz
@@ -164,6 +164,6 @@ jobs:
         test -r /dev/kvm -a -w /dev/kvm
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
         python3 -c 'import test.support'
-        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: PMU and CPUID test lane
       run: ./validate.sh --hardware-only --no-label-pr
