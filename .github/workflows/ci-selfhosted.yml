@@ -37,6 +37,11 @@ jobs:
         inputs.qemu_l2
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 60
 
     steps:
@@ -69,7 +74,7 @@ jobs:
         command -v qemu-system-x86_64
         test -r /boot/vmlinuz
         unshare --user --map-root-user --pid --fork --uts --net --mount \
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: Validate QEMU strict L2 boot
       env:
         KERNEL_IMAGE: /boot/vmlinuz
@@ -89,6 +94,11 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 240
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -128,6 +138,6 @@ jobs:
         test -r /dev/kvm -a -w /dev/kvm
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
         python3 -c 'import test.support'
-        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: PMU and CPUID test lane
       run: ./validate.sh --hardware-only --no-label-pr
