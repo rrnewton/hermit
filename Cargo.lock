@@ -1574,7 +1574,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=1e58dd6503a81101a49149a0de5ff1f68439767f#1e58dd6503a81101a49149a0de5ff1f68439767f"
+source = "git+https://github.com/rrnewton/reverie.git?rev=c28f9c61dce51a77e1ae7466a22c1edaacefa716#c28f9c61dce51a77e1ae7466a22c1edaacefa716"
 dependencies = [
  "libc",
 ]

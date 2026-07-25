@@ -956,6 +956,8 @@ function print_compatibility_summary {
         "TOTAL" "$ptrace_pass/$total" "$kvm_pass/$total" \
         "$dbi_pass/$total" "$sabre_pass/$total"
     printf "N/A means this profile did not measure that backend/program.\n"
+}
+
 function super_probe_command {
     local probe=$1
     local iteration=$2
