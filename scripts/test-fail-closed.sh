@@ -8,6 +8,9 @@ known_failure_manifest="$repository/hermit-cli/tests/fail_closed_known_failures.
 allowed_ignore_manifest="$repository/hermit-cli/tests/fail_closed_allowed_ignores.tsv"
 cargo_args=("$@")
 cargo_bin=${CARGO:-cargo}
+
+# AUTONOMOUS-BOT-IMPLEMENTED: Prevent one scheduler hang from exhausting the hardware CI job.
+# TODO-HUMAN-REVIEW(#680): Confirm 180 seconds covers the slowest supported host.
 test_timeout_seconds=${HERMIT_FAIL_CLOSED_TEST_TIMEOUT_SECONDS:-180}
 
 fail() {
