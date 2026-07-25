@@ -7,35 +7,34 @@ Measured: 2026-07-25
 PR #696 adds the missing e9patch record CLI path and fixes replay-output
 truncation under pipe backpressure.
 
-The post-fix `validate.sh`-derived matrix passes completely:
+The 34-program post-fix `validate.sh`-derived matrix passes completely:
 
-- Ptrace: **20/20 PASS R/R**.
-- E9patch: **20/20 PASS R/R**.
-- E9patch exercised four rewritten executables: `gcc` (28 sites), `g++`
-  (28), `cpp` (28), and `gcov` (10).
-- The other 16 e9patch rows exercised the zero-site path.
-- Every passing row recorded and replayed with exit status 0 and
-  byte-identical stdout.
+- Ptrace: **34/34 PASS R/R**.
+- E9patch: **34/34 PASS R/R**.
+- E9patch exercised five rewritten executables: `gcc` (28 sites), `g++`
+  (28), `cpp` (28), `gcov` (10), and `lscpu` (1).
+- The other 29 e9patch rows exercised the zero-site path.
+- Every passing row matched record/replay exit status, stdout, and stderr.
 
 Record mode is strict by definition. These are record/replay compatibility
 results, not L1-L4 `run --verify` assurance claims.
 
 ## Snapshot
 
-- Base commit: `f0b9eff2a864cd1e683cbf56fe2af55fba28d9f2`
-  (`Expand strict scripting language coverage (#692)`).
+- Merged `origin/main`: `2327925ff9db7a05488996e3ac79f5bf2dbebe6e`.
+- Measured merge commit: `0c452c83b69b22ec719a344e555d1f983bee42ed`.
 - Branch: `impl-e9patch-rr-cli-integration-slot115`.
 - Pull request: #696, `Add e9patch record and replay integration`.
 - Host: x86_64 Linux `6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79`.
 - CPU: AMD EPYC 9D85 158-Core Processor.
 - Optimized post-fix Hermit SHA-256:
-  `1aabb311d03be200a95c7d77f857464284287405000f6f6396dd9257fe2f916d`.
+  `086bf3255af462a3b149ba4b1ff45d79b1e1505599b7608ced3effdec60b8085`.
 - e9tool SHA-256:
   `8569c9c62f2b9ad79f22903ae01b58d99abad438023f7a4d49538785419625d0`.
 - e9patch SHA-256:
   `083e7deee709d66b82ca9e3692c7cd31326e64fdcec515704c769d336320d5fe`.
-- Matrix build: post-fix debug build; final rewritten-GCC smoke also passed
-  with the optimized build above.
+- Matrix build: current-main post-fix debug build; final rewritten-GCC and
+  `cat` smokes also passed with the optimized build above.
 - Log level: default.
 - Relaxations: none.
 
@@ -53,31 +52,31 @@ results, not L1-L4 `run --verify` assurance claims.
 Replay intentionally remains backend-independent. It does not need e9tool,
 e9patch, or the instruction-map cache after recording.
 
-The shared replay output path now waits for `POLLOUT` and retries after
-`EAGAIN` instead of silently dropping the unwritten suffix. The regression
-test saturates a pipe with a 256 KiB payload and verifies every byte reaches a
-delayed reader.
+The replay output path now retries after `EAGAIN` instead of silently dropping
+the unwritten suffix. Per-stream locks preserve ordering, readiness polling
+runs in bounded blocking-pool tasks, and shared nonblocking flags are restored
+before every async suspension. Regressions cover blocking-pipe success and
+cancellation plus 256 KiB stdout and stderr record/verify flows.
 
 ## Method
 
-Each matrix row used a fresh recording home and bounded phases:
+Each current-main matrix row used a fresh recording home and a bounded inline
+record/replay comparison:
 
 ```text
-ptrace record:
-  timeout 90s hermit --backend ptrace record start \
-    --data-dir CASE/recording-home --record-timeout 75 -- PROGRAM ARGS...
+ptrace:
+  timeout 120s hermit --backend ptrace record start --verify \
+    --data-dir CASE/recording-home --record-timeout 90 -- PROGRAM ARGS...
 
-e9patch record:
+e9patch:
   HERMIT_E9TOOL=... HERMIT_E9PATCH_BACKEND=... \
-  timeout 90s hermit --backend e9patch record start \
-    --data-dir CASE/recording-home --record-timeout 75 -- PROGRAM ARGS...
-
-replay, with no e9patch environment:
-  timeout 90s hermit replay --autopilot \
-    --data-dir CASE/recording-home
+  timeout 120s hermit --backend e9patch record start --verify \
+    --data-dir CASE/recording-home --record-timeout 90 -- PROGRAM ARGS...
 ```
 
-Success required record exit 0, replay exit 0, and byte-identical stdout.
+Success required exit 0 and Hermit's comparison of record/replay status,
+stdout, stderr, and normalized logs. A separate normal e9patch record plus
+cache-independent replay checked saved-artifact behavior.
 
 ## Comparison table
 
@@ -103,6 +102,20 @@ Success required record exit 0, replay exit 0, and byte-identical stdout.
 | `make` | `--version` | PASS | PASS | 0 |
 | `cpp` | `--version` | PASS | PASS | 28 |
 | `gcov` | `--version` | PASS | PASS | 10 |
+| `jq` | range/filter JSON workload | PASS | PASS | 0 |
+| `xmllint` | `--version` | PASS | PASS | 0 |
+| `clang` | `--version` | PASS | PASS | 0 |
+| `javac` | `-version` | PASS | PASS | 0 |
+| `wget` | `--version` | PASS | PASS | 0 |
+| `netcat` | `-h` | PASS | PASS | 0 |
+| `find` | `/etc -maxdepth 1` | PASS | PASS | 0 |
+| `env` | clean environment round trip | PASS | PASS | 0 |
+| `factor` | factor 42 | PASS | PASS | 0 |
+| `ip` | `-V` | PASS | PASS | 0 |
+| `ss` | `-V` | PASS | PASS | 0 |
+| `lsof` | `-v` | PASS | PASS | 0 |
+| `lscpu` | `--version` | PASS | PASS | 1 |
+| `time` | `--version` | PASS | PASS | 0 |
 
 ## Focused evidence
 
@@ -138,25 +151,25 @@ Error: Failed to create chroot environment
 
 The identical ptrace record/replay case fails the same way, so this is an
 existing shebang replay limitation rather than an e9patch regression. The
-20-program matrix contains ELF entrypoints and is unaffected.
+34-program matrix contains ELF entrypoints and is unaffected.
 
 ## Validation
 
-- `cargo test -p hermit --lib --bin hermit`: 51 library and 62 CLI tests
+- `cargo test -p hermit --lib --bin hermit`: 52 library and 63 CLI tests
   pass.
-- `cargo test -p hermit --test record_replay -- --test-threads=1`: all 33
+- `cargo test -p hermit --test record_replay -- --test-threads=1`: all 34
   tests pass. A parallel full-package run exceeded one timeout test's
   15-second wall-clock bound under concurrent load; its isolated rerun passed
   in 1.03 seconds.
 - `cargo fmt --all -- --check`: pass.
 - `cargo clippy -p hermit --all-targets -- -D warnings`: pass.
-- Ptrace/e9patch matrix: 20/20 and 20/20 PASS R/R.
-- Optimized rewritten-GCC `record --verify`: pass.
+- Ptrace/e9patch current-main matrix: 34/34 and 34/34 PASS R/R.
+- Optimized rewritten-GCC normal record/cache-independent replay: pass.
+- Optimized 13,331-byte `cat` normal record/replay: pass.
 
 Raw local evidence:
 
-- `/tmp/e9rr-results-pr696.csv`
-- `/tmp/e9rr-matrix-pr696.GZWj3S/`
-- `/tmp/e9rr-pr696-gcc.0kGqb8/`
-- `/tmp/e9rr-pr696-cat.3HqqNW/`
-- `/tmp/e9rr-pr696-release.Gkh6A4/`
+- `/tmp/e9rr-results-pr696-main.csv`
+- `/tmp/e9rr-matrix-pr696-main.2ZeeDe/`
+- `/tmp/e9rr-pr696-final-gcc.FyT8Bf/`
+- `/tmp/e9rr-pr696-final-cat.KjQ3oe/`
