@@ -760,6 +760,8 @@ function run_full_backend_gates {
         --output "$BACKEND_COMPAT_RESULTS"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#706): Review the canonical cross-backend compatibility summary.
 function compat_summary_backend {
     case "$COMPATIBILITY_MODE" in
         strict) printf "ptrace" ;;
