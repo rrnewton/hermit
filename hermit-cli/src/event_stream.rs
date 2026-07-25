@@ -9,6 +9,8 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::io::BufRead;
+use std::io::Write;
 use std::path::Path;
 
 use reverie::Tid;
@@ -22,6 +24,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::Event;
+use crate::event::SyscallEvent;
 
 /// An event to help with debugging, but is not actually necessary for the
 /// functionality of record/replay.
@@ -168,6 +171,25 @@ impl EventReader {
         self.count += 1;
         Ok(debug_event)
     }
+
+    /// Fails if replay is ending this thread with recorded events or syscalls
+    /// left unread.
+    pub fn ensure_exhausted(&mut self) -> io::Result<()> {
+        let remaining_events = self.reader.fill_buf()?.len();
+        if remaining_events != 0 {
+            return Err(io::Error::other(format!(
+                "replay thread exited with {remaining_events} buffered event bytes unread"
+            )));
+        }
+
+        let remaining_syscalls = self.debug_events.fill_buf()?.len();
+        if remaining_syscalls != 0 {
+            return Err(io::Error::other(format!(
+                "replay thread exited with {remaining_syscalls} buffered syscall bytes unread"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for EventReader {
@@ -190,6 +212,12 @@ pub struct EventWriter {
     // The file where syscalls are stored. This is used for debugging purposes.
     #[serde(skip, default = "default_writer")]
     debug_events: io::BufWriter<fs::File>,
+
+    /// Whether this thread is currently blocked inside a recorded epoll_wait.
+    /// An exec in another thread can kill it before the injected syscall
+    /// returns, in which case on_exit_thread records an explicit cancellation.
+    #[serde(skip)]
+    pending_epoll_wait: bool,
 }
 
 fn default_writer() -> io::BufWriter<fs::File> {
@@ -208,7 +236,33 @@ impl EventWriter {
             debug_events: io::BufWriter::new(fs::File::create(
                 path.join(format!("{}.debug", thread_id)),
             )?),
+            pending_epoll_wait: false,
         })
+    }
+
+    pub fn begin_epoll_wait(&mut self) {
+        assert!(!self.pending_epoll_wait, "epoll_wait is already pending");
+        self.pending_epoll_wait = true;
+    }
+
+    pub fn complete_epoll_wait(&mut self) {
+        assert!(self.pending_epoll_wait, "epoll_wait is not pending");
+        self.pending_epoll_wait = false;
+    }
+
+    pub fn finish_thread(&mut self) -> Result<(), bincode::error::EncodeError> {
+        if std::mem::take(&mut self.pending_epoll_wait) {
+            self.push_event(Event {
+                event: Ok(SyscallEvent::EpollWaitCancelled),
+            })?;
+        }
+        self.writer
+            .flush()
+            .map_err(|inner| bincode::error::EncodeError::Io { inner, index: 0 })?;
+        self.debug_events
+            .flush()
+            .map_err(|inner| bincode::error::EncodeError::Io { inner, index: 0 })?;
+        Ok(())
     }
 
     /// Writes an event to the end of the stream.
@@ -242,8 +296,84 @@ mod tests {
     use reverie::syscalls::Syscall;
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
+    use tempfile::tempdir;
 
+    use super::DebugEvent;
+    use super::EventReader;
+    use super::EventWriter;
     use super::normalize_unused_args;
+    use crate::event::SyscallEvent;
+
+    #[test]
+    fn pending_epoll_wait_records_cancellation_at_thread_exit() {
+        let directory = tempdir().unwrap();
+        let tid = reverie::Pid::from_raw(7);
+        {
+            let mut writer = EventWriter::create(directory.path(), tid).unwrap();
+            writer.begin_epoll_wait();
+            writer.finish_thread().unwrap();
+        }
+
+        let mut reader = EventReader::open(directory.path(), tid).unwrap();
+        let event = reader.next_event().unwrap();
+        assert!(matches!(event.event, Ok(SyscallEvent::EpollWaitCancelled)));
+        reader.ensure_exhausted().unwrap();
+    }
+
+    #[test]
+    fn completed_epoll_wait_does_not_record_cancellation() {
+        let directory = tempdir().unwrap();
+        let tid = reverie::Pid::from_raw(9);
+        {
+            let mut writer = EventWriter::create(directory.path(), tid).unwrap();
+            writer.begin_epoll_wait();
+            writer.complete_epoll_wait();
+            writer.finish_thread().unwrap();
+        }
+
+        let mut reader = EventReader::open(directory.path(), tid).unwrap();
+        reader.ensure_exhausted().unwrap();
+    }
+
+    #[test]
+    fn unread_event_fails_thread_exit_check() {
+        let directory = tempdir().unwrap();
+        let tid = reverie::Pid::from_raw(11);
+        {
+            let mut writer = EventWriter::create(directory.path(), tid).unwrap();
+            writer.begin_epoll_wait();
+            writer.finish_thread().unwrap();
+        }
+
+        let mut reader = EventReader::open(directory.path(), tid).unwrap();
+        let error = reader.ensure_exhausted().unwrap_err();
+        assert!(
+            error.to_string().contains("event bytes unread"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unread_debug_syscall_fails_thread_exit_check() {
+        let directory = tempdir().unwrap();
+        let tid = reverie::Pid::from_raw(13);
+        {
+            let mut writer = EventWriter::create(directory.path(), tid).unwrap();
+            writer
+                .push_debug_event(DebugEvent {
+                    syscall: (Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0)),
+                    pretty: "getpid()".to_owned(),
+                })
+                .unwrap();
+        }
+
+        let mut reader = EventReader::open(directory.path(), tid).unwrap();
+        let error = reader.ensure_exhausted().unwrap_err();
+        assert!(
+            error.to_string().contains("syscall bytes unread"),
+            "unexpected error: {error}"
+        );
+    }
 
     fn raw(sysno: Sysno, args: SyscallArgs) -> Syscall {
         Syscall::from_raw(sysno, args)

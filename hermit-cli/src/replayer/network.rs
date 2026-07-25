@@ -20,6 +20,7 @@ use reverie::syscalls::Recvmsg;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
+use crate::event::SyscallEvent;
 
 fn write_bytes<M: MemoryAccess>(
     memory: &mut M,
@@ -58,7 +59,32 @@ impl Replayer {
         guest: &mut G,
         syscall: EpollWait,
     ) -> Result<i64, Errno> {
-        let event = next_event!(guest, EpollWait)?;
+        let thread = guest.tid();
+        let recorded = guest
+            .thread_state_mut()
+            .next_event()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Replay event stream ended unexpectedly on thread {} while expecting EpollWait after syscall event {}: {}",
+                    thread,
+                    guest.thread_state().count,
+                    error,
+                )
+            });
+        let syscall_count = guest.thread_state().count;
+        let event = match recorded.event? {
+            SyscallEvent::EpollWait(event) => event,
+            SyscallEvent::EpollWaitCancelled => {
+                let result = guest.inject(syscall).await;
+                panic!(
+                    "Replay diverged on thread {thread} at syscall event {syscall_count}: recorded epoll_wait was cancelled by thread exit, but replay returned {result:?}"
+                );
+            }
+            event => panic!(
+                "Replay event mismatch on thread {} at syscall event {}: expected EpollWait, found {:?}. The recording and replay handlers may be out of sync",
+                thread, syscall_count, event,
+            ),
+        };
         assert_eq!(
             event.events.len(),
             event.updated * std::mem::size_of::<libc::epoll_event>()

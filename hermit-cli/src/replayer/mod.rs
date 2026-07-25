@@ -19,6 +19,8 @@ use std::path::PathBuf;
 
 use reverie::Errno;
 use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
@@ -73,6 +75,17 @@ impl Tool for Replayer {
     fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         // Subscribe to the exact same events as the recorder does.
         crate::recorder::Recorder::subscriptions(config)
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Tid,
+        _global_state: &G,
+        mut thread_state: Self::ThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        thread_state.ensure_exhausted()?;
+        Ok(())
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(

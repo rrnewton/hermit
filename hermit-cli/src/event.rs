@@ -84,6 +84,9 @@ pub enum SyscallEvent {
     Poll(PollEvent),
     SockOpt(SockOptEvent),
     EpollWait(EpollWaitEvent),
+    /// The thread exited while an injected epoll_wait was still blocked, so the
+    /// syscall never produced guest-visible output or a return value.
+    EpollWaitCancelled,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

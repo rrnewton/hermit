@@ -67,7 +67,9 @@ impl Recorder {
         guest: &mut G,
         syscall: EpollWait,
     ) -> Result<i64, Errno> {
+        guest.thread_state_mut().begin_epoll_wait();
         let result = guest.inject(syscall).await;
+        guest.thread_state_mut().complete_epoll_wait();
 
         let event = result.and_then(|ret| {
             let updated = ret as usize;

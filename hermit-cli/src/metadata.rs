@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there's any breaking changes, i.e.:
 // when new syscalls are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x101);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x102);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,7 +152,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
         // Record/replay has its own exact subscription set and format. Preserve the
-        // existing partial Detcore set so this run-mode default does not change v0x101
+        // existing partial Detcore set so this run-mode default does not change v0x102
         // event streams.
         passthru_opt: true,
         deterministic_io: false,

@@ -207,6 +207,7 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            ("c_epoll_exec", "epoll_exec.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -602,6 +603,7 @@ macro_rules! record_replay_tests {
 }
 
 record_replay_tests! {
+    record_c_epoll_exec => "c_epoll_exec",
     record_c_getsockopt_null => "c_getsockopt_null",
     record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
