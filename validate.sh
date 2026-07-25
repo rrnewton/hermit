@@ -1211,6 +1211,8 @@ function run_compatibility_corpus {
     strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
         file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#699)
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         strict_compatibility_probe wget /usr/bin/wget --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
