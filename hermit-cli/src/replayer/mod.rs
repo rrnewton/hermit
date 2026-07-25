@@ -382,6 +382,12 @@ impl Replayer {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Errno> {
+        let Syscall::Lseek(call) = syscall else {
+            unreachable!("descriptor-position handler received {syscall:?}");
+        };
+        if is_replay_placeholder(guest.pid(), call.fd()) {
+            return self.handle_simple(guest, syscall).await;
+        }
         let recorded = next_event!(guest, Return);
         if let Ok(expected) = recorded {
             match guest.inject_with_retry(syscall).await {
