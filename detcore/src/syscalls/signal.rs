@@ -266,15 +266,20 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Route an unambiguous positive-PID process signal to its sole live thread.
-    /// Multithreaded process-directed delivery, process-group delivery, and
-    /// broadcast delivery are refused until Detcore models eligible signal masks.
+    /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
+    /// unambiguous positive-PID process signal to its sole live thread. Multithreaded
+    /// process-directed delivery, process-group delivery, and broadcast delivery are
+    /// refused until Detcore models eligible signal masks.
     pub async fn handle_kill<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
         if !guest.config().sequentialize_threads {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if call.sig() == 0 {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
