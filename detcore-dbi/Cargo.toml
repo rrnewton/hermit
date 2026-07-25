@@ -11,5 +11,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.186"
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "4a3f0789ed0a36f6d60c876bb48d3de99451ab8d" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "4a3f0789ed0a36f6d60c876bb48d3de99451ab8d", default-features = false }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "16abb69f94237d2ebe2db4da229515ac07d1c05c" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "16abb69f94237d2ebe2db4da229515ac07d1c05c", default-features = false }
