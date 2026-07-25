@@ -80,6 +80,8 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
 /// Run a bounded Hermit command without waiting for orphaned guest pipe FDs.
 ///
 /// If `timeout(1)` kills Hermit while a guest descendant is still alive, that
@@ -444,6 +446,8 @@ fn java_hello_is_deterministic_under_strict_verify() {
     let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#651)
     // Interpreter mode avoids nonessential JIT worker threads in this JVM
     // runtime smoke test. JIT startup has intermittently stopped making
     // progress under host contention on the shared self-hosted runner.
