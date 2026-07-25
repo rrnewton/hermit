@@ -117,24 +117,25 @@ The DynamoRIO path requires a discoverable SDK, SaBRe requires its runner,
 rewriter, and plugin artifacts, and KVM requires read-write `/dev/kvm` access
 plus its guest-kernel Linux ABI.
 
-The experimental `e9patch` selection is intentionally a hybrid backend. At
-startup it loads or generates the main ELF's cached instruction map, then runs
-`e9tool -O0` with exact file-offset matches to install semantics-preserving
-trampolines at every candidate offset that e9tool recovers as an instruction.
-The conservative optimizer setting avoids known multi-class rewrite failures.
-The linear scan can include embedded data, so Hermit reports candidate and
-recovered counts separately. Partial e9tool coverage fails closed. Hermit does
-not enable e9patch's B0 fallback because it reserves SIGILL and changes guest
-signal semantics. The rewritten ELF still runs through Detcore's ptrace backend,
-which executes the original instructions and covers trapped events in shared
-libraries, the vDSO, and dynamic code. Raw `RDRAND`, `RDSEED`, and TSX in code
-remain unsupported even when present in the offline map because this initial
-integration installs empty trampolines. Privilege-bearing executables fail
-closed rather than losing set-ID or file-capability semantics. This
-establishes the cached-rewrite pipeline but does not yet reduce ptrace events.
-Install `e9tool` in `PATH` or set `HERMIT_E9TOOL` to its executable.
-Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
-through the ptrace correctness path.
+The experimental `e9patch` selection is a correctness-first hybrid backend.
+`E9patchRewriter` snapshots the main ELF and external tools, then replaces each
+recovered `syscall` instruction with a freestanding e9patch call trampoline. The
+trampoline exposes e9tool's writable `state` register frame through an
+identifiable `SIGTRAP`; Reverie's controller converts that frame into a normal
+`Tool::handle_syscall_event` callback and supplies complete `Guest` operations.
+Ptrace remains attached for process lifecycle, signals, timers, CPUID/RDTSC,
+syscalls in the loader and shared libraries, and other slow-path events. Root-ELF
+syscalls that e9tool recovers therefore originate in the e9patch event path, but
+the current hybrid still incurs a ptrace stop at those sites; it is not yet the
+planned ptrace-free in-guest fast path.
+
+Partial e9tool coverage fails closed, and B0 is disabled because it reserves
+SIGILL. Privilege-bearing executables also fail closed instead of losing set-ID
+or file-capability semantics. `reverie-preload` and
+`reverie-rpc-transport` are dependencies for the future in-guest path, but they
+are not active there until the signal handler has a signal-safe transport and a
+generic remote-`Guest` protocol. Put `e9tool` in `PATH`, or set
+`REVERIE_E9TOOL` and `REVERIE_E9PATCH_BACKEND` to the two executables.
 
 A quick determinism check is to run the same virtual random-data read twice:
 

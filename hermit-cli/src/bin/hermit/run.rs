@@ -35,7 +35,6 @@ use reverie::process::Command;
 use reverie::process::Container;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
-use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
@@ -93,12 +92,6 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
         .set_permissions(fs::Permissions::from_mode(0o644))
         .context("Failed to set permissions on the frozen guest group database")?;
     Ok(group_file)
-}
-
-#[derive(Debug, Clone)]
-struct E9patchOverlay {
-    source: PathBuf,
-    target: PathBuf,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -299,14 +292,6 @@ pub struct RunOpts {
     /// readable format.
     #[clap(long, value_name = "path")]
     pub save_config: Option<PathBuf>,
-
-    /// Read-only overlay that exposes the rewritten ELF at its original guest path.
-    #[clap(skip)]
-    e9patch_overlay: Option<E9patchOverlay>,
-
-    /// Resolved guest executable path used after e9patch preprocessing.
-    #[clap(skip)]
-    e9patch_program: Option<PathBuf>,
 }
 
 fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -684,25 +669,12 @@ fn backend_values_parse_and_round_trip() {
 }
 
 #[test]
-fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
-    ro.e9patch_overlay = Some(E9patchOverlay {
-        source: PathBuf::from("/cache/patched-echo"),
-        target: PathBuf::from("/bin/echo"),
-    });
+fn e9patch_preserves_executable_identity_and_selects_real_backend() {
+    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     let command = ro.guest_command().unwrap();
     assert_eq!(command.get_program(), "/bin/echo");
     assert_eq!(command.get_arg0(), "/bin/echo");
-    assert_eq!(ro.runtime_backend(), Backend::Ptrace);
-
-    let tmpfs = tempfile::tempdir().unwrap();
-    let mounts = ro.mounts(tmpfs.path()).unwrap();
-    let overlay = mounts
-        .mounts
-        .iter()
-        .find(|mount| mount.get_source() == Some(Path::new("/cache/patched-echo")))
-        .unwrap();
-    assert_eq!(overlay.get_target(), Path::new("/bin/echo"));
+    assert_eq!(ro.runtime_backend(), Backend::E9patch);
 }
 
 #[test]
@@ -715,7 +687,7 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
     fs::set_permissions(&tool, permissions).unwrap();
 
     let tmp_arg = format!("--tmp={}", tmp.path().display());
-    let mut ro = RunOpts::parse_from([
+    let ro = RunOpts::parse_from([
         "fakehermit",
         "--backend",
         "e9patch",
@@ -739,9 +711,8 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
     let (guest, host) = ro.resolve_guest_and_host_program().unwrap();
     assert_eq!(guest, Path::new("/tmp/tool"));
     assert_eq!(host, tool);
-    ro.e9patch_program = Some(guest);
     let command = ro.guest_command().unwrap();
-    assert_eq!(command.get_program(), "/tmp/tool");
+    assert_eq!(command.get_program(), "tool");
     assert_eq!(command.get_arg0(), "tool");
 }
 
@@ -758,33 +729,6 @@ fn guest_path_normalization_rejects_parent_components() {
 }
 
 #[test]
-fn e9patch_mount_target_rejects_parent_components() {
-    let ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        "--mount=type=tmpfs,target=/tmp/../bin",
-        "/bin/echo",
-    ]);
-    let error = ro.validate_e9patch_mount_targets().unwrap_err().to_string();
-    assert!(error.contains("mount target cannot contain parent components"));
-}
-
-#[test]
-fn e9patch_mount_target_rejects_symlink_components() {
-    let directory = tempfile::tempdir().unwrap();
-    let link = directory.path().join("link");
-    std::os::unix::fs::symlink("/tmp", &link).unwrap();
-    let mount = format!(
-        "--mount=type=tmpfs,target={}",
-        link.join("target").display()
-    );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
-    let error = ro.validate_e9patch_mount_targets().unwrap_err();
-    assert!(error.to_string().contains("mount target traverses symlink"));
-}
-
-#[test]
 fn source_less_mount_hides_program_from_resolution() {
     let ro = RunOpts::parse_from(["fakehermit", "--mount=type=tmpfs,target=/bin", "/bin/echo"]);
     assert_eq!(
@@ -793,84 +737,6 @@ fn source_less_mount_hides_program_from_resolution() {
     );
     let error = ro.resolve_guest_and_host_program().unwrap_err().to_string();
     assert!(error.contains("not visible through the configured guest mounts"));
-}
-
-#[test]
-fn non_elf_entrypoints_skip_e9patch_preprocessing() {
-    let directory = tempfile::tempdir().unwrap();
-    let script = directory.path().join("script");
-    fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
-    let mut permissions = fs::metadata(&script).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).unwrap();
-    assert!(!is_elf_file(&script).unwrap());
-    assert!(is_elf_file(Path::new("/bin/sh")).unwrap());
-
-    let mount_link = directory.path().join("mount-link");
-    std::os::unix::fs::symlink("/var/run", &mount_link).unwrap();
-    let unrelated_mount = format!(
-        "--mount=type=tmpfs,target={}",
-        mount_link.join("target").display()
-    );
-    let tmp = format!("--tmp={}", directory.path().display());
-    let mut ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        &unrelated_mount,
-        &tmp,
-        "/tmp/script",
-    ]);
-    ro.prepare_e9patch_program().unwrap();
-    assert!(ro.e9patch_overlay.is_none());
-}
-
-#[test]
-fn e9patch_overlay_uses_canonical_target_without_custom_mounts() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo"]);
-    assert_eq!(
-        ro.resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
-            .unwrap(),
-        fs::canonicalize("/bin/echo").unwrap()
-    );
-}
-
-#[test]
-fn e9patch_rejects_symlinked_executables_through_custom_mounts() {
-    let directory = tempfile::tempdir().unwrap();
-    let executable = directory.path().join("executable");
-    let link = directory.path().join("link");
-    fs::write(&executable, b"fixture").unwrap();
-    std::os::unix::fs::symlink(&executable, &link).unwrap();
-    let mount = format!(
-        "--mount=type=bind,source={},target=/e9patch-test",
-        directory.path().display()
-    );
-    let ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        &mount,
-        "/e9patch-test/link",
-    ]);
-    let error = ro
-        .resolve_e9patch_overlay_target(Path::new("/e9patch-test/link"), &link)
-        .unwrap_err();
-    assert!(error.to_string().contains("symlinked executable"));
-}
-
-#[test]
-fn e9patch_rejects_mounts_that_change_a_symlink_target() {
-    let directory = tempfile::tempdir().unwrap();
-    let mount = format!(
-        "--mount=type=bind,source={},target=/usr",
-        directory.path().display()
-    );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
-    let error = ro
-        .resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
-        .unwrap_err();
-    assert!(error.to_string().contains("symlinked executable"));
 }
 
 #[test]
@@ -1335,40 +1201,6 @@ pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Resul
     anyhow::bail!("executable path exceeded Linux's symlink traversal limit")
 }
 
-fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
-    if !path.is_absolute() {
-        anyhow::bail!("e9patch mount target must be absolute: {}", path.display());
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        anyhow::bail!(
-            "e9patch mount target cannot contain parent components: {}",
-            path.display()
-        );
-    }
-    let mut current = PathBuf::from("/");
-    for component in path.components() {
-        let std::path::Component::Normal(part) = component else {
-            continue;
-        };
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                anyhow::bail!(
-                    "e9patch mount target traverses symlink {}",
-                    current.display()
-                );
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
@@ -1377,11 +1209,7 @@ impl RunOpts {
     }
 
     fn runtime_backend(&self) -> Backend {
-        if self.selected_backend() == Backend::E9patch {
-            Backend::Ptrace
-        } else {
-            self.selected_backend()
-        }
+        self.selected_backend()
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -1408,12 +1236,6 @@ impl RunOpts {
                  or network isolation"
             );
         }
-        if backend == Backend::E9patch && self.no_namespace {
-            anyhow::bail!(
-                "--backend=e9patch requires mount namespaces to overlay the rewritten ELF at its \
-                 original guest path"
-            );
-        }
         if self.namespace_only {
             if let Some(explicit_backend) = self.backend {
                 anyhow::bail!(
@@ -1422,20 +1244,14 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else if backend == Backend::E9patch {
-            Backend::Ptrace.ensure_available()?;
         } else if backend != Backend::Kvm {
             backend.ensure_available()?;
         }
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
-        // pre-empted by the generic availability probe above. E9patch is a CLI
-        // preprocessor and probes its ptrace runtime and tool separately.
+        // pre-empted by the generic availability probe above.
         self.validate_mount_sources()?;
         self.validate_program()?;
-        if backend == Backend::E9patch {
-            self.prepare_e9patch_program()?;
-        }
         // });
 
         // Dispatch to an alternative Reverie backend if one was requested. The
@@ -1668,75 +1484,6 @@ impl RunOpts {
         Ok(())
     }
 
-    fn validate_e9patch_mount_targets(&self) -> Result<(), Error> {
-        for bind in &self.bind {
-            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
-            validate_e9patch_mount_target(target)?;
-        }
-        for mount in &self.mount {
-            validate_e9patch_mount_target(mount.get_target())?;
-        }
-        Ok(())
-    }
-
-    fn resolve_e9patch_overlay_target(&self, guest: &Path, host: &Path) -> Result<PathBuf, Error> {
-        let canonical = fs::canonicalize(host)
-            .with_context(|| format!("failed to resolve executable {}", host.display()))?;
-        match self.mapped_host_program(guest) {
-            GuestPathMapping::Mapped(mapped) => {
-                let mapped = std::path::absolute(mapped)?;
-                if canonical != mapped {
-                    anyhow::bail!(
-                        "e9patch cannot safely overlay symlinked executable {} through a custom \
-                         guest mount; use the resolved executable path or remove the mount",
-                        guest.display()
-                    );
-                }
-                Ok(guest.to_path_buf())
-            }
-            GuestPathMapping::Unchanged => {
-                let host = std::path::absolute(host)?;
-                let symlinked = canonical != host;
-                let tmp_is_remapped =
-                    self.tmp.as_deref() != Some(Path::new(TMP_DIR)) || !self.bind.is_empty();
-                let crosses_implicit_mount = symlinked
-                    && ((tmp_is_remapped
-                        && path_resolution_visits_prefix(&host, Path::new(TMP_DIR))?)
-                        || path_resolution_visits_prefix(&host, Path::new("/proc"))?);
-                if symlinked && (!self.mount.is_empty() || crosses_implicit_mount) {
-                    anyhow::bail!(
-                        "e9patch cannot safely resolve symlinked executable {} across guest \
-                         mounts; use its resolved guest path or remove the relevant mounts",
-                        guest.display()
-                    );
-                }
-                let canonical_guest = normalize_guest_path(&canonical)?;
-                match self.mapped_host_program(&canonical_guest) {
-                    GuestPathMapping::Mapped(mapped)
-                        if std::path::absolute(&mapped)? != canonical =>
-                    {
-                        anyhow::bail!(
-                            "e9patch cannot safely resolve executable {} because a custom guest \
-                             mount changes its canonical target {}; use the resolved guest path",
-                            guest.display(),
-                            canonical_guest.display()
-                        );
-                    }
-                    GuestPathMapping::Hidden => anyhow::bail!(
-                        "Program {} is hidden by a mount after resolving symlinks",
-                        guest.display()
-                    ),
-                    GuestPathMapping::Mapped(_) | GuestPathMapping::Unchanged => {}
-                }
-                Ok(canonical_guest)
-            }
-            GuestPathMapping::Hidden => anyhow::bail!(
-                "Program {} is not visible through the configured guest mounts",
-                guest.display()
-            ),
-        }
-    }
-
     fn mapped_host_program(&self, program: &Path) -> GuestPathMapping {
         for bind in self.bind.iter().rev() {
             let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
@@ -1886,65 +1633,6 @@ impl RunOpts {
             )
         })?;
         validate_executable(&resolved, requested)
-    }
-
-    fn validate_e9patch_source_visibility(&self, source: &Path) -> Result<(), Error> {
-        for mount in &self.mount {
-            let target = mount.get_target();
-            if !target.starts_with(TMP_DIR) && source.starts_with(target) {
-                anyhow::bail!(
-                    "--mount target {} would hide the cached e9patch artifact {}; choose a more \
-                     specific mount target or a different instruction-map cache directory",
-                    target.display(),
-                    source.display()
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn prepare_e9patch_program(&mut self) -> Result<(), Error> {
-        let (guest, host) = self.resolve_guest_and_host_program()?;
-        self.e9patch_program = Some(guest.clone());
-        let overlay_target = self.resolve_e9patch_overlay_target(&guest, &host)?;
-        if !is_elf_file(&host)? {
-            eprintln!(
-                ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
-                 main_executable=non-ELF; preprocessing=not-applicable"
-            );
-            return Ok(());
-        }
-        if let Some(reason) = hermit::e9patch::unavailable_reason() {
-            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
-        }
-        let prepared = hermit::e9patch::prepare(&host)?;
-        if prepared.patched_sites != 0 {
-            self.validate_e9patch_mount_targets()?;
-            self.validate_e9patch_source_visibility(&prepared.binary)?;
-            self.e9patch_overlay = Some(E9patchOverlay {
-                source: prepared.binary,
-                target: overlay_target,
-            });
-        }
-        let rewrite_cache = if prepared.patched_sites == 0 {
-            "not-applicable"
-        } else if prepared.rewrite_cache_hit {
-            "hit"
-        } else {
-            "miss"
-        };
-        eprintln!(
-            ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
-             mapped_sites={}; b0_sites={}; \
-             instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}",
-            prepared.candidate_sites,
-            prepared.patched_sites,
-            prepared.b0_sites,
-            prepared.instruction_map_cache_status,
-            rewrite_cache,
-            prepared.artifact_sha256.as_deref().unwrap_or("none"),
-        );
-        Ok(())
     }
 
     fn tmpfs(&self) -> Result<Tmpfs<'_>, Error> {
@@ -2106,22 +1794,6 @@ impl RunOpts {
             }
         }
 
-        if let Some(overlay) = &self.e9patch_overlay {
-            let target = if let Ok(relative_path) = overlay.target.strip_prefix(TMP_DIR) {
-                tmpfs.join(relative_path)
-            } else {
-                overlay.target.clone()
-            };
-            mounts.push(
-                Mount::bind(&overlay.source, &target)
-                    .readonly()
-                    .touch_target(),
-            );
-            mounts.push(
-                Mount::new(target)
-                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
-            );
-        }
         // Bind the /tmp/tmpXXXXXX tmpfs mount over /tmp to hide it. This way,
         // we still preserve the files or directories bind-mounted inside of it
         // while hiding the real /tmp.
@@ -2204,12 +1876,8 @@ impl RunOpts {
     }
 
     fn guest_command(&self) -> Result<Command, Error> {
-        let program = self.e9patch_program.as_ref().unwrap_or(&self.program);
-        let mut command = Command::new(program);
+        let mut command = Command::new(&self.program);
         command.args(&self.args);
-        if self.e9patch_program.is_some() {
-            command.arg0(&self.program);
-        }
         if let Some(current_dir) = &self.workdir {
             command.current_dir(current_dir);
         }

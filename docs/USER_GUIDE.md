@@ -158,24 +158,24 @@ The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
 runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
 plus a guest-kernel ABI.
 
-`e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
-It uses the cached offline instruction map and conservative `e9tool -O0` mode
-to apply `before empty` trampolines at exact candidate offsets in the main ELF.
-Because the linear candidate scan
-can include embedded data, e9tool decides which candidates are instructions;
-Hermit reports both counts and rejects partial coverage of the recovered set.
-Hermit does not enable e9patch's B0 fallback because reserving SIGILL would
-change guest signal semantics. The rewritten program is bind-mounted read-only
-at the original executable path, then runs under the ptrace Detcore backend, which
-preserves strict-mode semantics for trapped events in shared libraries, the
-vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
-or TSX deterministic even when those sites are mapped, so those instructions
-remain unsupported. Privilege-bearing executables fail closed rather than
-losing set-ID or file-capability semantics. This first integration validates
-rewrite coverage; it does not yet remove ptrace overhead. Put
-`e9tool` in `PATH` or set `HERMIT_E9TOOL=/path/to/e9tool`.
-Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
-through the ptrace correctness path.
+`e9patch` is an experimental correctness-first hybrid. It snapshots the main
+ELF and external tools, then replaces each recovered `syscall` with an e9patch
+call trampoline. The trampoline sends e9tool's writable register frame through
+an identifiable `SIGTRAP`; the Reverie controller presents it to Detcore as a
+normal syscall event with complete `Guest` operations. Ptrace stays attached
+for lifecycle, signals, timers, CPUID/RDTSC, loader and shared-library syscalls,
+and other slow-path events. Rewritten root-ELF syscall events therefore originate
+in e9patch, but they still incur a ptrace stop in this implementation. This is
+not yet the planned ptrace-free in-guest fast path.
+
+Partial recovered-site coverage fails closed. B0 remains disabled because it
+reserves SIGILL, and privilege-bearing executables fail rather than silently
+losing set-ID or file-capability semantics. The shared `reverie-preload` and
+`reverie-rpc-transport` crates establish the future in-guest boundary, but are
+not active on the current event path because blocking RPC is not signal-safe
+and the generic backend needs remote `Guest` operations. Put `e9tool` in `PATH`,
+or set `REVERIE_E9TOOL=/path/to/e9tool` and
+`REVERIE_E9PATCH_BACKEND=/path/to/e9patch`.
 
 `--namespace-only` bypasses instrumentation entirely. Combining it with any
 explicit `--backend` selection is rejected because the backend would be ignored.

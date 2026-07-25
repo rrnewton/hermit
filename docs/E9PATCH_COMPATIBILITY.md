@@ -1,16 +1,20 @@
 # e9patch Compatibility
 
-The e9patch selection is a cached main-ELF preprocessor followed by Hermit's
-ptrace Detcore runtime. This report describes the measured application envelope;
-it is not a claim that e9patch is a standalone instrumentation runtime.
+The results below were collected on 2026-07-25 against the earlier cached
+empty-trampoline preprocessor followed by Hermit's ptrace Detcore runtime. They
+remain a historical compatibility baseline, not evidence for the current
+rewritten-event path. The current correctness-first hybrid replaces recovered
+root-ELF syscalls and retains ptrace for lifecycle and slow-path events. Re-run
+the matrix to measure that backend; it is not yet a claim of a ptrace-free
+in-guest runtime.
 
 ## Reproduce the matrix
 
 Build e9patch and point Hermit at both executables:
 
 ```bash
-HERMIT_E9TOOL=/path/to/e9tool \
-HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
+REVERIE_E9TOOL=/path/to/e9tool \
+REVERIE_E9PATCH_BACKEND=/path/to/e9patch \
 ./validate.sh --e9patch-compat-only
 ```
 
@@ -27,7 +31,7 @@ This keeps asynchronous host identity daemons out of the two-run comparison
 without changing the commands under test. The fixture is a stable filesystem
 input, not a determinism relaxation.
 
-## 2026-07-25 core result
+## Historical 2026-07-25 core result
 
 Environment: x86_64 CentOS Stream 9; e9patch backend; default log level;
 relaxations: none.

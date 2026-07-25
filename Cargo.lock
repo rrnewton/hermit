@@ -471,8 +471,8 @@ dependencies = [
  "rand_pcg",
  "raw-cpuid",
  "regex",
- "reverie",
- "reverie-ptrace",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-ptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
  "serde_json",
  "tempfile",
@@ -488,7 +488,7 @@ version = "0.0.0"
 dependencies = [
  "detcore",
  "libc",
- "reverie",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "reverie-dbi",
 ]
 
@@ -511,7 +511,7 @@ dependencies = [
  "libc",
  "nix",
  "pretty_assertions",
- "reverie-syscalls",
+ "reverie-syscalls 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
  "shell-words",
  "tracing",
@@ -523,8 +523,8 @@ version = "0.0.0"
 dependencies = [
  "detcore",
  "pretty_assertions",
- "reverie",
- "reverie-ptrace",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "reverie-ptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
  "test-allocator",
  "tokio",
  "tracing",
@@ -918,10 +918,11 @@ dependencies = [
  "rand",
  "rand_pcg",
  "regex",
- "reverie",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "reverie-dbi",
+ "reverie-e9patch",
  "reverie-kvm",
- "reverie-ptrace",
+ "reverie-ptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
  "serde_json",
  "shell-words",
@@ -1539,8 +1540,34 @@ dependencies = [
  "object 0.36.7",
  "procfs",
  "raw-cpuid",
- "reverie-process",
- "reverie-syscalls",
+ "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "reverie-syscalls 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "serde",
+ "syscalls",
+ "thiserror",
+ "typed-arena",
+]
+
+[[package]]
+name = "reverie"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "addr2line",
+ "anyhow",
+ "async-trait",
+ "bitflags 2.13.1",
+ "byteorder",
+ "libc",
+ "linked-hash-map",
+ "memmap2",
+ "never-say-never",
+ "nix",
+ "object 0.36.7",
+ "procfs",
+ "raw-cpuid",
+ "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-syscalls 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
  "syscalls",
  "thiserror",
@@ -1550,24 +1577,40 @@ dependencies = [
 [[package]]
 name = "reverie-dbi"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758#0e77d260a84083f462ba10b986c8a72ab8f92758"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
 dependencies = [
  "libc",
- "reverie",
- "reverie-memory",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
+]
+
+[[package]]
+name = "reverie-e9patch"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "anyhow",
+ "goblin",
+ "libc",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-preload",
+ "reverie-ptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-rpc-transport",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
 name = "reverie-kvm"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758#0e77d260a84083f462ba10b986c8a72ab8f92758"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
 dependencies = [
  "goblin",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
- "reverie",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "thiserror",
 ]
 
@@ -1588,9 +1631,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-memory"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "syscalls",
+]
+
+[[package]]
+name = "reverie-preload"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "reverie-process"
 version = "0.1.0"
 source = "git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758#0e77d260a84083f462ba10b986c8a72ab8f92758"
+dependencies = [
+ "bincode",
+ "bitflags 2.13.1",
+ "colored",
+ "futures 0.3.33",
+ "libc",
+ "nix",
+ "serde",
+ "syscalls",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "reverie-process"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1624,8 +1700,8 @@ dependencies = [
  "perf-event-open-sys",
  "procfs",
  "raw-cpuid",
- "reverie",
- "safeptrace",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "safeptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
  "serde",
  "thiserror",
  "tokio",
@@ -1633,6 +1709,50 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unwind",
+]
+
+[[package]]
+name = "reverie-ptrace"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "bytes",
+ "close-err",
+ "futures 0.3.33",
+ "goblin",
+ "iced-x86",
+ "libc",
+ "nix",
+ "num-traits",
+ "paste",
+ "perf-event-open-sys",
+ "procfs",
+ "raw-cpuid",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "safeptrace 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "unwind",
+]
+
+[[package]]
+name = "reverie-rpc-transport"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "reverie 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "serde",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1645,7 +1765,22 @@ dependencies = [
  "libc",
  "nix",
  "paste",
- "reverie-memory",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "serde",
+ "syscalls",
+]
+
+[[package]]
+name = "reverie-syscalls"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "bitflags 2.13.1",
+ "derive_more",
+ "libc",
+ "nix",
+ "paste",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "serde",
  "syscalls",
 ]
@@ -1703,8 +1838,24 @@ dependencies = [
  "libc",
  "nix",
  "parking_lot",
- "reverie-memory",
- "reverie-process",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=0e77d260a84083f462ba10b986c8a72ab8f92758)",
+ "syscalls",
+ "thiserror",
+]
+
+[[package]]
+name = "safeptrace"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028#986b4c581c1522e13bdc8c75604eaa36d8211028"
+dependencies = [
+ "bitflags 2.13.1",
+ "futures 0.3.33",
+ "libc",
+ "nix",
+ "parking_lot",
+ "reverie-memory 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
+ "reverie-process 0.1.0 (git+https://github.com/rrnewton/reverie.git?rev=986b4c581c1522e13bdc8c75604eaa36d8211028)",
  "syscalls",
  "thiserror",
 ]

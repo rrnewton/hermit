@@ -359,8 +359,8 @@ pub enum Backend {
     Sabre,
     /// Use the KVM backend.
     Kvm,
-    /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
-    // TODO-HUMAN-REVIEW(PR-594): Review the CLI-only hybrid backend selection.
+    /// Use Reverie's hybrid e9patch backend.
+    // TODO-HUMAN-REVIEW(PR-711): Review direct e9patch backend selection.
     E9patch,
 }
 
@@ -467,14 +467,8 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // The CLI probes ptrace readiness before entering its container; repeating
     // the namespace probe here would test nested namespaces instead of the host.
-    if backend == Backend::Ptrace {
+    if matches!(backend, Backend::Ptrace | Backend::E9patch) {
         return Ok(());
-    }
-    if backend == Backend::E9patch {
-        return Err(anyhow!(
-            "backend `e9patch` requires CLI preprocessing; library callers must use \
-             e9patch::prepare and then select `ptrace`"
-        ));
     }
     // The KVM backend has its own dispatch (`run_kvm`); it must not reach here.
     backend.ensure_available()?;
@@ -653,6 +647,25 @@ async fn run_with_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    // TODO-HUMAN-REVIEW(PR-711): Review direct Detcore dispatch through e9patch.
+    if backend == Backend::E9patch {
+        if config.gdbserver {
+            return Err(anyhow!(
+                "the e9patch backend does not yet support --gdbserver"
+            ));
+        }
+        let (exit_status, global_state) =
+            <reverie_e9patch::E9patchBackend as reverie::Backend>::run::<Detcore>(
+                command,
+                config.clone(),
+            )
+            .await?;
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(exit_status);
+    }
+
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -723,6 +736,22 @@ async fn run_with_output_backend_inner(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // TODO-HUMAN-REVIEW(PR-711): Review captured Detcore dispatch through e9patch.
+    if backend == Backend::E9patch {
+        if config.gdbserver {
+            return Err(anyhow!(
+                "the e9patch backend does not yet support --gdbserver"
+            ));
+        }
+        let (output, global_state) =
+            reverie_e9patch::E9patchBackend::run_with_output::<Detcore>(command, config.clone())
+                .await?;
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(output);
+    }
+
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1036,12 +1065,8 @@ mod tests {
     }
 
     #[test]
-    fn public_backend_dispatch_rejects_unprepared_e9patch() {
-        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
-        assert!(
-            error.to_string().contains("requires CLI preprocessing"),
-            "unexpected error: {error}"
-        );
+    fn public_backend_dispatch_accepts_e9patch() {
+        ensure_backend_dispatch(Backend::E9patch).unwrap();
     }
 
     #[test]
