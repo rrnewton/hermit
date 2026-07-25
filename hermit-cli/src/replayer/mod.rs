@@ -28,8 +28,10 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::Close;
+use reverie::syscalls::Dup;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
+use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
@@ -56,6 +58,8 @@ pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// The KVM personality has virtual descriptors rather than host /proc entries.
+    kvm_backend: bool,
     /// Duplicates of this guest process's captured output endpoints.
     #[serde(skip)]
     stdout: Option<std::os::fd::OwnedFd>,
@@ -73,10 +77,20 @@ impl Tool for Replayer {
     type ThreadState = EventReader;
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
-        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
-        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
+        let kvm_backend = cfg.cpuid_virtualized_by_backend;
+        let (stdout, stdout_error) = if kvm_backend {
+            (None, None)
+        } else {
+            capture_guest_fd(pid, libc::STDOUT_FILENO)
+        };
+        let (stderr, stderr_error) = if kvm_backend {
+            (None, None)
+        } else {
+            capture_guest_fd(pid, libc::STDERR_FILENO)
+        };
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
+            kvm_backend,
             stdout,
             stderr,
             stdout_error,
@@ -249,22 +263,36 @@ impl Replayer {
         fd: i32,
         cloexec: bool,
     ) {
-        let flags = if cloexec {
-            EfdFlags::EFD_CLOEXEC
+        let placeholder = if self.kvm_backend {
+            guest
+                .inject_with_retry(Dup::new().with_oldfd(libc::STDOUT_FILENO))
+                .await
         } else {
-            EfdFlags::empty()
-        };
-        let placeholder = guest
-            .inject_with_retry(Eventfd2::new().with_count(0).with_flags(flags))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("could not reserve replay FD {fd} with an eventfd: {error}")
-            });
+            let flags = if cloexec {
+                EfdFlags::EFD_CLOEXEC
+            } else {
+                EfdFlags::empty()
+            };
+            guest
+                .inject_with_retry(Eventfd2::new().with_count(0).with_flags(flags))
+                .await
+        }
+        .unwrap_or_else(|error| panic!("could not reserve replay FD {fd}: {error}"));
         if placeholder != i64::from(fd) {
             let _ = guest.inject(Close::new().with_fd(placeholder as i32)).await;
             panic!(
                 "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
             );
+        }
+        if self.kvm_backend && cloexec {
+            let result = guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(fd)
+                        .with_cmd(FcntlCmd::F_SETFD(libc::FD_CLOEXEC)),
+                )
+                .await;
+            assert_eq!(result, Ok(0), "could not set FD_CLOEXEC on replay FD {fd}");
         }
     }
 

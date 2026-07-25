@@ -445,6 +445,14 @@ impl Replayer {
         if event.generated_sigpipe {
             self.replay_sigpipe(guest).await?;
         }
+        if self.kvm_backend && event.output_fd.is_some() {
+            let actual = guest.inject(Syscall::from(syscall)).await;
+            assert_eq!(
+                actual, event.result,
+                "KVM replay output write diverged from its recording"
+            );
+            return event.result;
+        }
         if let (Ok(count), Some(output_fd)) = (event.result, event.output_fd) {
             self.replay_output(
                 guest,

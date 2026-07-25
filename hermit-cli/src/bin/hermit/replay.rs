@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
@@ -57,6 +58,32 @@ impl ReplayOpts {
                 .last_id()
                 .context("Failed to find last recording ID")?,
         };
+        let recorded_backend = hermit.recording_metadata(id)?.backend;
+        let backend = global.backend.unwrap_or(recorded_backend);
+        if backend != recorded_backend {
+            return Err(Error::msg(format!(
+                "recording requires backend `{}`, not `{}`",
+                recorded_backend.as_str(),
+                backend.as_str()
+            )));
+        }
+        match backend {
+            Backend::Ptrace => {}
+            Backend::Kvm => {
+                if !self.autopilot {
+                    return Err(Error::msg(
+                        "KVM recordings require `hermit replay --autopilot` because GDB replay is unsupported",
+                    ));
+                }
+                hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+            }
+            unsupported => {
+                return Err(Error::msg(format!(
+                    "backend `{}` does not support record/replay",
+                    unsupported.as_str()
+                )));
+            }
+        }
 
         if self.autopilot {
             let mut container = default_container(true);

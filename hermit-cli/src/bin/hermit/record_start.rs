@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use clap::Args;
 use colored::Colorize;
+use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
@@ -201,10 +202,25 @@ impl StartOpts {
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        let backend = global.backend.unwrap_or_default();
+        match backend {
+            Backend::Ptrace => {}
+            Backend::Kvm => hermit::reserve_kvm_stdin(super::startup_stdin()?)?,
+            unsupported => {
+                return Err(Error::msg(format!(
+                    "backend `{}` does not support record/replay",
+                    unsupported.as_str()
+                )));
+            }
+        }
+
         if self.verify {
-            self.record_verify(global)
+            self.record_verify(global, backend)
         } else if !self.gdbex.is_empty() {
-            self.record_verify_debug(global)
+            if backend != Backend::Ptrace {
+                return Err(Error::msg("KVM recordings do not support GDB replay"));
+            }
+            self.record_verify_debug(global, backend)
         } else {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
@@ -221,7 +237,7 @@ impl StartOpts {
                             let mut command = Command::new(self.program());
                             command.args(&self.args);
                             with_recording_deadline(timeout, || {
-                                hermit::record_to(command, &data_path)
+                                hermit::record_to_backend(command, &data_path, backend)
                             })
                             .map_err(SerializableError::from)
                         })
@@ -233,7 +249,9 @@ impl StartOpts {
                         let _guard = global.init_tracing();
                         let mut command = Command::new(self.program());
                         command.args(&self.args);
-                        hermit.record(command).map_err(SerializableError::from)
+                        hermit
+                            .record_with_backend(command, backend)
+                            .map_err(SerializableError::from)
                     })
                     .context("Container exited unexpectedly")??,
             };
@@ -250,7 +268,7 @@ impl StartOpts {
     }
 
     /// This is called when `--verify` is passed to the command line.
-    fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn record_verify(&self, global: &GlobalOpts, backend: Backend) -> Result<ExitStatus, Error> {
         let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
         let mut container = default_container(true);
@@ -270,9 +288,9 @@ impl StartOpts {
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_with_output(command, data_dir)
+                        hermit::record_with_output_backend(command, data_dir, backend)
                     }),
-                    None => hermit::record_with_output(command, data_dir),
+                    None => hermit::record_with_output_backend(command, data_dir, backend),
                 }
                 .map_err(SerializableError::from)
             })
@@ -284,7 +302,8 @@ impl StartOpts {
         let replay = container
             .run(|| {
                 let _guard = global2.init_tracing();
-                hermit::replay_with_output(data_dir).map_err(SerializableError::from)
+                hermit::replay_with_output_backend(data_dir, backend)
+                    .map_err(SerializableError::from)
             })
             .context("Container exited unexpectedly")??;
 
@@ -305,7 +324,11 @@ impl StartOpts {
         )
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
-    fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn record_verify_debug(
+        &self,
+        global: &GlobalOpts,
+        backend: Backend,
+    ) -> Result<ExitStatus, Error> {
         let mut container = default_container(true);
 
         eprintln!(":: {}", "Recording...".yellow().bold());
@@ -322,10 +345,10 @@ impl StartOpts {
                 command.args(&self.args);
 
                 match record_timeout {
-                    Some(timeout) => {
-                        with_recording_deadline(timeout, || hermit::record_to(command, data_dir))
-                    }
-                    None => hermit::record_to(command, data_dir),
+                    Some(timeout) => with_recording_deadline(timeout, || {
+                        hermit::record_to_backend(command, data_dir, backend)
+                    }),
+                    None => hermit::record_to_backend(command, data_dir, backend),
                 }
                 .map_err(SerializableError::from)
             })

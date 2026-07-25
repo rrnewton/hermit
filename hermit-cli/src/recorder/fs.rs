@@ -262,43 +262,57 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(Syscall::from(syscall)).await;
 
-        let metadata = std::fs::metadata(format!(
-            "/proc/{}/fd/{}",
-            guest.pid().as_raw(),
-            syscall.fd()
-        ))
-        .ok();
-        let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
-            let stdout_matches = self
-                .stdout
-                .is_some_and(|identity| identity.matches(metadata));
-            let stderr_matches = self
-                .stderr
-                .is_some_and(|identity| identity.matches(metadata));
-            let candidate = (metadata.file_type().is_file() && (stdout_matches || stderr_matches))
-                .then(|| crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).ok())
-                .flatten();
-            let stdout_shares = stdout_matches
-                && candidate.as_ref().is_some_and(|candidate| {
-                    self.output_ofd_matches(libc::STDOUT_FILENO, candidate)
-                });
-            let stderr_shares = stderr_matches
-                && candidate.as_ref().is_some_and(|candidate| {
-                    self.output_ofd_matches(libc::STDERR_FILENO, candidate)
-                });
+        let metadata = if self.kvm_backend {
+            None
+        } else {
+            std::fs::metadata(format!(
+                "/proc/{}/fd/{}",
+                guest.pid().as_raw(),
+                syscall.fd()
+            ))
+            .ok()
+        };
+        let (output_fd, shares_output_ofd) = if self.kvm_backend {
+            let output_fd = match syscall.fd() {
+                libc::STDOUT_FILENO => Some(libc::STDOUT_FILENO),
+                libc::STDERR_FILENO => Some(libc::STDERR_FILENO),
+                _ => None,
+            };
+            (output_fd, false)
+        } else {
+            metadata.as_ref().map_or((None, false), |metadata| {
+                let stdout_matches = self
+                    .stdout
+                    .is_some_and(|identity| identity.matches(metadata));
+                let stderr_matches = self
+                    .stderr
+                    .is_some_and(|identity| identity.matches(metadata));
+                let candidate = (metadata.file_type().is_file()
+                    && (stdout_matches || stderr_matches))
+                    .then(|| crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).ok())
+                    .flatten();
+                let stdout_shares = stdout_matches
+                    && candidate.as_ref().is_some_and(|candidate| {
+                        self.output_ofd_matches(libc::STDOUT_FILENO, candidate)
+                    });
+                let stderr_shares = stderr_matches
+                    && candidate.as_ref().is_some_and(|candidate| {
+                        self.output_ofd_matches(libc::STDERR_FILENO, candidate)
+                    });
 
-            if stdout_shares {
-                (Some(libc::STDOUT_FILENO), true)
-            } else if stderr_shares {
-                (Some(libc::STDERR_FILENO), true)
-            } else if stdout_matches {
-                (Some(libc::STDOUT_FILENO), false)
-            } else if stderr_matches {
-                (Some(libc::STDERR_FILENO), false)
-            } else {
-                (None, false)
-            }
-        });
+                if stdout_shares {
+                    (Some(libc::STDOUT_FILENO), true)
+                } else if stderr_shares {
+                    (Some(libc::STDERR_FILENO), true)
+                } else if stdout_matches {
+                    (Some(libc::STDOUT_FILENO), false)
+                } else if stderr_matches {
+                    (Some(libc::STDERR_FILENO), false)
+                } else {
+                    (None, false)
+                }
+            })
+        };
         let output_offset = match (output_fd, result, metadata.as_ref()) {
             (Some(_), Ok(count), Some(metadata)) => {
                 output_file_offset(guest.pid().as_raw(), syscall, metadata, count)

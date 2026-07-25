@@ -7,12 +7,15 @@
  */
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
 
+use crate::Backend;
+use crate::KvmToolExecution;
 use crate::consts::EXE_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
@@ -20,6 +23,7 @@ use crate::error::Error;
 use crate::metadata::Metadata;
 use crate::metadata::record_or_replay_config;
 use crate::recorder::Recorder;
+use crate::run_kvm_with_tool;
 
 type RecordTool = detcore::Detcore<Recorder>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
@@ -30,22 +34,18 @@ pub struct Record {
     tracer: Tracer,
 }
 
+fn prepare_recording(command: &Command, dir: &Path, backend: Backend) -> Result<(), Error> {
+    let metadata = Metadata::new(command, backend)?;
+    fs::copy(&metadata.exe, dir.join(EXE_NAME))
+        .with_context(|| format!("Failed to record {:?}", metadata.exe))?;
+    serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
+        .context("Failed to serialize metadata")
+}
+
 impl Record {
     /// Spawns a new recording.
     pub async fn spawn(command: Command, dir: &Path) -> Result<Self, Error> {
-        let metadata = Metadata::new(&command)?;
-
-        let exe = dir.join(EXE_NAME);
-
-        // Record the full program executable to `{hermit_data}/{id}/exe`.
-        //
-        // TODO: Handle shebang lines.
-        fs::copy(&metadata.exe, &exe)
-            .with_context(|| format!("Failed to record {:?}", metadata.exe))?;
-
-        serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
-            .context("Failed to serialize metadata")?;
-
+        prepare_recording(&command, dir, Backend::Ptrace)?;
         let config = record_or_replay_config(dir);
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
@@ -69,4 +69,23 @@ impl Record {
         global_state.clean_up(false, &None).await;
         Ok(output)
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review Recorder behavior on the KVM guest personality.
+pub async fn run_kvm(command: Command, dir: &Path, capture_output: bool) -> Result<Output, Error> {
+    prepare_recording(&command, dir, Backend::Kvm)?;
+    let config = record_or_replay_config(dir);
+    let KvmToolExecution {
+        global_state,
+        output,
+    } = run_kvm_with_tool::<RecordTool>(&command, config, capture_output, None).await?;
+    global_state.clean_up(false, &None).await;
+
+    if !capture_output {
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+    }
+
+    Ok(output)
 }

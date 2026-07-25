@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 
 use reverie::ExitStatus;
@@ -16,18 +17,19 @@ use reverie::process::Mount;
 use reverie::process::Output;
 use reverie::process::Stdio;
 
+use crate::Backend;
+use crate::KvmToolExecution;
 use crate::Shebang;
 use crate::chroot::TempChroot;
 use crate::consts::EXE_NAME;
 use crate::consts::EXEC_PATHS_NAME;
-use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::interp;
 use crate::metadata::Metadata;
-use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
 use crate::replayer::Replayer;
+use crate::run_kvm_with_tool;
 
 type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
@@ -50,23 +52,13 @@ impl Replay {
         capture_output: bool,
         gdbserver: Option<u16>,
     ) -> Result<Self, Error> {
-        let metadata_path = dir.join(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        let recording_version = &metadata.version;
-        let replayer_version = &RECORD_VERSION;
-        if !replayer_version.compatible_with(recording_version) {
-            return Err(anyhow::anyhow!(format!(
-                "Version mismatch, recording version {:?}, replayer version {:?}",
-                recording_version, replayer_version
-            )));
+        let metadata = Metadata::read_from(dir)?;
+        if metadata.backend != Backend::Ptrace {
+            return Err(anyhow::anyhow!(
+                "recording requires backend {}, not ptrace",
+                metadata.backend.as_str()
+            ));
         }
-
         let mut command = metadata.command();
 
         if capture_output {
@@ -136,6 +128,34 @@ impl Replay {
         global_state.clean_up(false, &None).await;
         Ok(output)
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review Replayer behavior on the KVM guest personality.
+pub async fn run_kvm(dir: &Path, capture_output: bool) -> Result<Output, Error> {
+    let metadata = Metadata::read_from(dir)?;
+    if metadata.backend != Backend::Kvm {
+        return Err(anyhow::anyhow!(
+            "recording requires backend {}, not kvm",
+            metadata.backend.as_str()
+        ));
+    }
+    let command = metadata.command();
+    let config = record_or_replay_config(dir);
+    let executable = dir.join(EXE_NAME);
+    let KvmToolExecution {
+        global_state,
+        output,
+    } = run_kvm_with_tool::<ReplayTool>(&command, config, capture_output, Some(&executable))
+        .await?;
+    global_state.clean_up(false, &None).await;
+
+    if !capture_output {
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+    }
+
+    Ok(output)
 }
 
 /// Creates the temporary chroot directory.

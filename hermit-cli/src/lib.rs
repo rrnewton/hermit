@@ -299,7 +299,20 @@ fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
 }
 
 /// Process instrumentation backend used to run a Hermit guest.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review record/replay backend persistence.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Deserialize,
+    Eq,
+    PartialEq,
+    Serialize,
+    ValueEnum
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
     /// Use Reverie's ptrace backend.
     #[default]
@@ -435,14 +448,22 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// Guest-physical memory available to the single-process KVM personality.
 const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Dispatch a command onto the real reverie-kvm Tool runtime.
-async fn run_kvm(
+pub(crate) struct KvmToolExecution {
+    pub(crate) global_state: detcore::GlobalState,
+    pub(crate) output: Output,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review generic KVM Tool dispatch for record/replay.
+pub(crate) async fn run_kvm_with_tool<T>(
     command: &Command,
     mut config: DetConfig,
-    print_summary: bool,
-    print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
-) -> Result<Output, Error> {
+    executable: Option<&Path>,
+) -> Result<KvmToolExecution, Error>
+where
+    T: reverie::Tool<GlobalState = detcore::GlobalState>,
+{
     let stdin = reserved_kvm_stdin()?;
     let requested_cwd = command
         .get_current_dir()
@@ -465,9 +486,12 @@ async fn run_kvm(
             cwd
         ));
     }
-    let resolved_program = command.find_program().map_err(|error| {
-        anyhow!("failed to resolve KVM guest executable {program:?} in the guest PATH: {error}")
-    })?;
+    let resolved_program = match executable {
+        Some(executable) => executable.to_path_buf(),
+        None => command.find_program().map_err(|error| {
+            anyhow!("failed to resolve KVM guest executable {program:?} in the guest PATH: {error}")
+        })?,
+    };
     let image = fs::read(&resolved_program).map_err(|error| {
         anyhow!(
             "failed to read KVM guest executable {:?}: {error}",
@@ -476,7 +500,13 @@ async fn run_kvm(
     })?;
 
     let mut argv = Vec::with_capacity(1 + command.get_args().count());
-    argv.push(program.clone());
+    argv.push(
+        command
+            .get_arg0()
+            .to_str()
+            .ok_or_else(|| anyhow!("KVM guest argv[0] is not valid UTF-8"))?
+            .to_owned(),
+    );
     for argument in command.get_args() {
         argv.push(
             argument
@@ -518,23 +548,42 @@ async fn run_kvm(
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
 
     let (global_state, code, stdout, stderr) = backend
-        .run_static_elf_with_tool::<Detcore>(config, capture_output)
+        .run_static_elf_with_tool::<T>(config, capture_output)
         .await
         .map_err(|error| anyhow!("KVM guest execution failed: {error}"))?;
+
+    Ok(KvmToolExecution {
+        global_state,
+        output: Output {
+            status: ExitStatus::Exited(code),
+            stdout,
+            stderr,
+        },
+    })
+}
+
+/// Dispatch a command onto the real reverie-kvm Tool runtime.
+async fn run_kvm(
+    command: &Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    let KvmToolExecution {
+        global_state,
+        output,
+    } = run_kvm_with_tool::<Detcore>(command, config, capture_output, None).await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
 
     if !capture_output {
-        std::io::stdout().write_all(&stdout)?;
-        std::io::stderr().write_all(&stderr)?;
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
     }
 
-    Ok(Output {
-        status: ExitStatus::Exited(code),
-        stdout,
-        stderr,
-    })
+    Ok(output)
 }
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
@@ -727,8 +776,17 @@ impl HermitData {
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
+        self.record_with_backend(command, Backend::Ptrace)
+    }
+
+    /// Records a command using the selected instrumentation backend.
+    pub fn record_with_backend(
+        &self,
+        command: Command,
+        backend: Backend,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to(command, data.path())?;
+        let exit_status = record_to_backend(command, data.path(), backend)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -796,16 +854,7 @@ impl HermitData {
 
     /// Returns the metadata of a recording.
     pub fn recording_metadata(&self, id: Id) -> Result<Metadata, Error> {
-        let mut metadata_path = self.data_dir.join(id.to_string());
-        metadata_path.push(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        Ok(metadata)
+        Metadata::read_from(&self.data_dir.join(id.to_string()))
     }
 
     /// Deletes a recording.
@@ -849,46 +898,154 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
     }
 }
 
+fn ensure_record_or_replay_backend(backend: Backend) -> Result<(), Error> {
+    match backend {
+        Backend::Ptrace => Ok(()),
+        Backend::Kvm => {
+            backend.ensure_available()?;
+            ensure_kvm_stdin_reserved()?;
+            Ok(())
+        }
+        unsupported => Err(anyhow!(
+            "backend `{}` does not support record/replay",
+            unsupported.as_str()
+        )),
+    }
+}
+
 /// Records to the specified directory, which must already exist.
+pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
+    record_to_backend(command, dir, Backend::Ptrace)
+}
+
+/// Records using the selected backend to a directory which must already exist.
+pub fn record_to_backend(
+    command: Command,
+    dir: &Path,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    ensure_record_or_replay_backend(backend)?;
+    record_to_backend_inner(command, dir, backend)
+}
+
 #[tokio::main(flavor = "current_thread")]
-pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Record::spawn(command, dir).await?.wait().await?)
+async fn record_to_backend_inner(
+    command: Command,
+    dir: &Path,
+    backend: Backend,
+) -> Result<ExitStatus, Error> {
+    match backend {
+        Backend::Ptrace => Ok(Record::spawn(command, dir).await?.wait().await?),
+        Backend::Kvm => Ok(record::run_kvm(command, dir, false).await?.status),
+        _ => unreachable!("backend was validated before creating the runtime"),
+    }
 }
 
 /// Records to the specified directory, which must already exist. The
 /// stderr/stdout of the recording is captured in `Output`.
-#[tokio::main(flavor = "current_thread")]
-pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Output, Error> {
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    Ok(Record::spawn(command, dir)
-        .await?
-        .wait_with_output()
-        .await?)
+pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
+    record_with_output_backend(command, dir, Backend::Ptrace)
 }
 
-/// Replays from the specified directory.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    Ok(Replay::spawn(dir, false, None).await?.wait().await?)
+/// Records using the selected backend and captures stderr/stdout in `Output`.
+pub fn record_with_output_backend(
+    command: Command,
+    dir: &Path,
+    backend: Backend,
+) -> Result<Output, Error> {
+    ensure_record_or_replay_backend(backend)?;
+    record_with_output_backend_inner(command, dir, backend)
 }
 
-/// Replays with a gdb server.
+#[tokio::main(flavor = "current_thread")]
+async fn record_with_output_backend_inner(
+    mut command: Command,
+    dir: &Path,
+    backend: Backend,
+) -> Result<Output, Error> {
+    match backend {
+        Backend::Ptrace => {
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            Ok(Record::spawn(command, dir)
+                .await?
+                .wait_with_output()
+                .await?)
+        }
+        Backend::Kvm => record::run_kvm(command, dir, true).await,
+        _ => unreachable!("backend was validated before creating the runtime"),
+    }
+}
+
+fn recording_backend(dir: &Path) -> Result<Backend, Error> {
+    Ok(Metadata::read_from(dir)?.backend)
+}
+
+fn ensure_recording_backend(dir: &Path, backend: Backend) -> Result<(), Error> {
+    let recorded = recording_backend(dir)?;
+    if recorded == backend {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "recording requires backend `{}`, not `{}`",
+            recorded.as_str(),
+            backend.as_str()
+        ))
+    }
+}
+
+/// Replays from the specified directory using its recorded backend.
+pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
+    replay_from_backend(dir, recording_backend(dir)?)
+}
+
+/// Replays from the specified directory using the selected backend.
+pub fn replay_from_backend(dir: &Path, backend: Backend) -> Result<ExitStatus, Error> {
+    ensure_record_or_replay_backend(backend)?;
+    ensure_recording_backend(dir, backend)?;
+    replay_from_backend_inner(dir, backend)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn replay_from_backend_inner(dir: &Path, backend: Backend) -> Result<ExitStatus, Error> {
+    match backend {
+        Backend::Ptrace => Ok(Replay::spawn(dir, false, None).await?.wait().await?),
+        Backend::Kvm => Ok(replay::run_kvm(dir, false).await?.status),
+        _ => unreachable!("backend was validated before creating the runtime"),
+    }
+}
+
+/// Replays with a gdb server. KVM recordings do not support GDB replay.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
+    ensure_recording_backend(dir, Backend::Ptrace)?;
     Ok(Replay::spawn(dir, false, Some(port)).await?.wait().await?)
 }
 
 /// Replays from the specified directory which must already exist. The
 /// stderr/stdout of the replay is captured in `Output`.
+pub fn replay_with_output(dir: &Path) -> Result<Output, Error> {
+    replay_with_output_backend(dir, recording_backend(dir)?)
+}
+
+/// Replays with the selected backend and captures stderr/stdout in `Output`.
+pub fn replay_with_output_backend(dir: &Path, backend: Backend) -> Result<Output, Error> {
+    ensure_record_or_replay_backend(backend)?;
+    ensure_recording_backend(dir, backend)?;
+    replay_with_output_backend_inner(dir, backend)
+}
+
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
-    Ok(Replay::spawn(dir, true, None)
-        .await?
-        .wait_with_output()
-        .await?)
+async fn replay_with_output_backend_inner(dir: &Path, backend: Backend) -> Result<Output, Error> {
+    match backend {
+        Backend::Ptrace => Ok(Replay::spawn(dir, true, None)
+            .await?
+            .wait_with_output()
+            .await?),
+        Backend::Kvm => replay::run_kvm(dir, true).await,
+        _ => unreachable!("backend was validated before creating the runtime"),
+    }
 }
 
 #[cfg(test)]

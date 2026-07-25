@@ -110,6 +110,8 @@ pub struct Recorder {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// The KVM personality has virtual descriptors rather than host /proc entries.
+    kvm_backend: bool,
     /// Physical output endpoints inherited by the root guest.
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
@@ -126,12 +128,26 @@ impl Tool for Recorder {
     type ThreadState = EventWriter;
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+        let kvm_backend = cfg.cpuid_virtualized_by_backend;
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
-            stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
-            stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
-            stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            kvm_backend,
+            stdout: (!kvm_backend)
+                .then(|| OutputIdentity::for_fd(pid, libc::STDOUT_FILENO))
+                .flatten(),
+            stderr: (!kvm_backend)
+                .then(|| OutputIdentity::for_fd(pid, libc::STDERR_FILENO))
+                .flatten(),
+            stdout_ofd: Mutex::new(
+                (!kvm_backend)
+                    .then(|| duplicate_regular_output(pid, libc::STDOUT_FILENO))
+                    .flatten(),
+            ),
+            stderr_ofd: Mutex::new(
+                (!kvm_backend)
+                    .then(|| duplicate_regular_output(pid, libc::STDERR_FILENO))
+                    .flatten(),
+            ),
         }
     }
 

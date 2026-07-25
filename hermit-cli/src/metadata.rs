@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -16,6 +17,9 @@ use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::Backend;
+use crate::consts::METADATA_NAME;
+use crate::error::Context;
 use crate::error::Error;
 
 /// Hermit record version. Recorded as part of hermit-record, hermit-replay
@@ -67,12 +71,17 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Instrumentation backend that created and must replay this recording.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review backend-sticky record format semantics.
+    #[serde(default)]
+    pub backend: Backend,
 }
 
 impl Metadata {
     /// Creates a new metadata object, populating it with information about a
     /// command.
-    pub fn new(command: &Command) -> Result<Self, Error> {
+    pub fn new(command: &Command, backend: Backend) -> Result<Self, Error> {
         let exe = command.find_program()?;
 
         let program = command.get_program().to_string_lossy().into_owned();
@@ -115,7 +124,32 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
+            backend,
         })
+    }
+
+    /// Reads and validates recording metadata from its data directory.
+    pub fn read_from(dir: &Path) -> Result<Self, Error> {
+        let metadata_path = dir.join(METADATA_NAME);
+        let metadata: Self = serde_json::from_reader(
+            fs::File::open(&metadata_path)
+                .with_context(|| format!("Failed to open {metadata_path:?}"))?,
+        )
+        .with_context(|| format!("Failed to parse {metadata_path:?}"))?;
+        metadata.ensure_compatible()?;
+        Ok(metadata)
+    }
+
+    fn ensure_compatible(&self) -> Result<(), Error> {
+        if RECORD_VERSION.compatible_with(&self.version) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Version mismatch, recording version {:?}, replayer version {:?}",
+                self.version,
+                RECORD_VERSION
+            ))
+        }
     }
 
     /// Constructs a command from the metadata.
