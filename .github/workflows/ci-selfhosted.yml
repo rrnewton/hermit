@@ -37,11 +37,6 @@ jobs:
         inputs.qemu_l2
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
     timeout-minutes: 60
 
     steps:
@@ -71,6 +66,7 @@ jobs:
         fi
     - name: QEMU and namespace preflight
       run: |
+        command -v flock
         command -v qemu-system-x86_64
         test -r /boot/vmlinuz
         unshare --user --map-root-user --pid --fork --uts --net --mount \
@@ -78,7 +74,7 @@ jobs:
     - name: Validate QEMU strict L2 boot
       env:
         KERNEL_IMAGE: /boot/vmlinuz
-      run: ./validate.sh --qemu-l2-only --no-label-pr
+      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --qemu-l2-only --no-label-pr
 
   hardware:
     name: PMU and CPUID tests (self-hosted)
@@ -94,11 +90,6 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
     timeout-minutes: 240
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -136,8 +127,9 @@ jobs:
       run: |
         test -r /proc/sys/kernel/perf_event_paranoid
         test -r /dev/kvm -a -w /dev/kvm
+        command -v flock
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
         python3 -c 'import test.support'
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
     - name: PMU and CPUID test lane
-      run: ./validate.sh --hardware-only --no-label-pr
+      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
