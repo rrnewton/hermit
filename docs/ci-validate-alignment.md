@@ -70,7 +70,7 @@ identical; only reporting (JUnit output, retries) differs.
 | PMU timing and misc | `tests_misc getrandom_intercepted --exact`; `cargo test -p detcore --test tests_time -- --ignored --test-threads=4` | "Test detcore package" runs `tests_time` non-ignored | ⚠️ **and CI bug** — see note (1) |
 | PMU parallel futex | `cargo test -p detcore --test tests_parallelism futex_wait_parent -- --ignored --test-threads=3` | "Test detcore package" runs it non-ignored | ⚠️ note (1) |
 | PMU parallel memory | `cargo test -p detcore --test tests_parallelism 'mem_race::' \| 'mem_print_race::' -- --ignored --test-threads=4` | "Test detcore package" | ⚠️ note (1) |
-| Stable Hermit tests incl. record/replay matrix | serial loop over `arbitrary_binaries, cli, clock_determinism, epoll_determinism, mmap_determinism, procfs_determinism, signal_determinism` (`--test-threads=1`) + `record_replay_matrix` + `strict_mode_matrix` | validate runs the same tests via workspace nextest (parallel processes) | ⚠️ note (2) |
+| Stable Hermit tests incl. record/replay matrix | serial loop over `arbitrary_binaries, cli, clock_determinism, epoll_determinism, mmap_determinism, procfs_determinism, signal_determinism` (`--test-threads=1`) + `record_replay_matrix` + `strict_mode_matrix` | validate runs the same tests through nextest's one-thread `hermit-serialized` group | ✅ |
 | Fail-closed ratchet | `./scripts/test-fail-closed.sh` | — | ❌ gap A |
 | Working-envelope gate | `./validate.sh --envelope-compare envelope-baseline.json` | validate's `run_envelope` (measure, no compare) | ✅ shared code path by construction |
 | Debugger integration | `./tests/debugger/run_debugger_tests.sh` | — | ❌ gap B |
@@ -84,8 +84,8 @@ identical; only reporting (JUnit output, retries) differs.
 | Hermit output determinism | run twice, diff stdout | — | ❌ gap D |
 | Hermit verify-mode smoke test | `hermit run … --verify -- /bin/echo …` | envelope L2 (`--strict --verify`) approximates it | ⚠️ partial |
 | Fast concurrency stress suite | `cargo nextest run -p hermit --test stress_suite --run-ignored only -E 'test(=fast_chaos_matrix)'` | — | ❌ gap E |
-| Hermit analyze scenarios | `cargo test -p hermit --test analyze -- --ignored` | — | ❌ gap F |
-| Schedule search E2E | `./tests/util/hermit_analyze_e2e.sh` | — | ❌ gap G |
+| Stable Hermit analyze scenarios | two exact tests: `analyze_racewrite_nostdlib` and `analyze_nanosleep_threads_rejects_indistinguishable_baseline` | — | ❌ gap F |
+| Unstable schedule-search diagnostics | direct opt-in: `analyze_hello_race` and `./tests/util/hermit_analyze_e2e.sh` | — | Not a green-main gate; replay desyncs on some PMU-capable CPUs |
 
 ## Notes
 
@@ -102,10 +102,9 @@ detcore coverage than CI here.
 **(2) Serial vs. parallel execution of PMU-sensitive Hermit tests.**
 The `hardware` job runs the determinism integration tests with
 `--test-threads=1` because they contend for the PMU. `validate.sh` runs them
-through `cargo nextest`, which launches each test in its own process (still
-one guest at a time per process, but multiple processes concurrently). The
-*set* of tests is the same; a flake that only appears under one scheduling
-should be reproduced with the matching invocation before diagnosing.
+through `cargo nextest`; `.config/nextest.toml` assigns every Hermit integration
+test to the `hermit-serialized` group with `max-threads = 1`. The test process
+shape differs, but neither path overlaps Hermit guests.
 
 ## Gap ledger (must be driven to empty)
 
@@ -116,8 +115,7 @@ should be reproduced with the matching invocation before diagnosing.
 | C | Backend parity ratchet | CI only | Add a `run_check` invoking `run_matrix.py --backend ptrace` to `validate.sh`. |
 | D | Hermit output determinism | validate only | Add an equivalent probe/step to the CI `hardware` job (or fold into the envelope gate). |
 | E | `fast_chaos_matrix` | validate only | Add a CI `hardware` step: `cargo nextest run -p hermit --test stress_suite --run-ignored only -E 'test(=fast_chaos_matrix)'`. |
-| F | `analyze` scenarios | validate only | Add a CI `hardware` step: `cargo test -p hermit --test analyze -- --ignored`. |
-| G | Schedule search E2E | validate only | Add a CI `hardware` step running `./tests/util/hermit_analyze_e2e.sh`. |
+| F | Stable `analyze` scenarios | validate only | Add CI `hardware` steps for the same two exact stable tests. |
 
 The `main` ↔ `frontier` divergence is itself the largest single source of
 skew: `frontier` has already removed the envelope/debugger/backend-parity

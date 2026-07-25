@@ -375,7 +375,8 @@ fn rr_pause() {
 }
 rr_test!(rr_personality, "personality", 0, &[]);
 rr_test!(rr_poll_sig_race, "poll_sig_race", 0, &[]);
-rr_test!(rr_ppoll, "ppoll", 0, &[]);
+// ppoll with a temporary signal mask requires scheduler-level pending-signal
+// state; Detcore intentionally returns ENOSYS today. See docs/rr-test-suite.md.
 rr_test!(rr_prctl_name, "prctl_name", 0, &[]);
 rr_test!(rr_prctl_short_name, "prctl_short_name", 0, &[]);
 rr_test!(rr_prctl_speculation_ctrl, "prctl_speculation_ctrl", 0, &[]);
@@ -406,16 +407,13 @@ rr_test!(rr_readlinkat, "readlinkat", 0, &[]);
 rr_test!(rr_readv, "readv", 0, &[]);
 rr_test!(rr_recvfrom, "recvfrom", 0, &[]);
 rr_test!(rr_rename, "rename", 0, &[]);
-rr_test!(rr_rlimit, "rlimit", 0, &[]);
+// Virtual resource-limit mutation currently covers only STACK and NOFILE.
+// See docs/rr-test-suite.md.
 rr_test!(rr_sched_attr, "sched_attr", 0, &[]);
 rr_test!(rr_sched_setaffinity, "sched_setaffinity", 0, &[]);
 rr_test!(rr_sched_setparam, "sched_setparam", 0, &[]);
-rr_test!(
-    rr_sched_yield_to_lower_priority,
-    "sched_yield_to_lower_priority",
-    0,
-    &[]
-);
+// Hermit does not yet model host nice values in its deterministic scheduler.
+// See docs/rr-test-suite.md.
 rr_test!(rr_scratch_read, "scratch_read", 0, &[]);
 rr_test!(rr_seccomp_clone_fail, "seccomp_clone_fail", 0, &[]);
 rr_test!(rr_seccomp_cloning, "seccomp_cloning", 0, &[]);

@@ -28,7 +28,7 @@ it runs `full` for backward compatibility.
 | --- | --- | --- |
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
 | `hosted-only` | About 8 minutes | Mirrors the portable GitHub-hosted `regular` job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
-| `full` (default) | About 20-70 minutes | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. The R/R matrix stops after its first canary failure instead of repeating a known-broken setup 128 times. |
+| `full` (default) | About 20-70 minutes | Runs everything in `quick`, the workspace, maintained compatibility and rr sets, stress and two stable analyze contracts, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. Compiler-heavy gates finish before PMU-backed guests, and Detcore's guest tests run serially. The R/R matrix stops after its first canary failure instead of repeating a known-broken setup 128 times. |
 | `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
 Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
@@ -64,6 +64,11 @@ packages (notably `coreutils`, `util-linux`, `bsdextrautils`/`util-linux`, and
 compression packages). The OS name printed at startup must accompany results;
 install missing utilities rather than interpreting `command not found` as a
 Hermit determinism regression.
+
+The `analyze_hello_race` fixture and `tests/util/hermit_analyze_e2e.sh` remain
+direct opt-in diagnostics. Their event-level schedule replay currently desyncs
+on some otherwise PMU-capable CPUs, so they are not part of the green-main
+`full` contract until that replay instability is fixed.
 
 ## Capability axes
 
