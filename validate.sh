@@ -309,14 +309,15 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
     [free]="live /proc/meminfo values differ between otherwise identical runs"
 )
+# The rustc/javac/java/node/zstd/zstd-roundtrip hosted "timeouts" were a
+# reverie-ptrace GuestStack flag leak (stack.rs:49 "already a StackGuard still
+# alive"): any guest-stack checkout dropped without a successful commit poisoned
+# the per-task flag, so the next stack() panicked and the strict-compat probe
+# hung to the 600s gate timeout on the no-PMU runner. Fixed in reverie by making
+# the checkout RAII (rrnewton/reverie#104, reverie 08f9c56, now pinned here), so
+# these rows are removed from the diagnostic mask and rejoin the blocking corpus.
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
-    [rustc]="timed out on the GitHub-hosted no-PMU runner"
-    [javac]="timed out on the GitHub-hosted no-PMU runner"
-    [java]="timed out on the GitHub-hosted no-PMU runner"
-    [node]="timed out on the GitHub-hosted no-PMU runner"
     [top]="live process-table reads differ on the GitHub-hosted runner"
-    [zstd]="timed out on the GitHub-hosted no-PMU runner"
-    [zstd-roundtrip]="timed out on the GitHub-hosted no-PMU runner"
 )
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
