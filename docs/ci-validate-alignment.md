@@ -67,7 +67,7 @@ cases, and five existing gaps remain explicit:
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
 | Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
 | Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
-| Runtime, database, scheduling, and syscall targets | 52 | 51 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
+| Runtime, database, scheduling, and syscall targets | 51 | 50 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
 | Ignored runtime/database/analyze tiers | 19 | 12 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
 | Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
 | rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
@@ -91,7 +91,8 @@ The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
 (host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
 
 The stable record/replay integration cases remain blocking. The intermittently
-flaky `record_replay_matrix`, four JVM cases, and the DBI pipe-backpressure case
+flaky `record_replay_matrix`, four JVM cases, the DBI pipe-backpressure case,
+and the pselect signal-interruption case
 still execute on every pull request as bounded nonblocking diagnostics tracked
 by PRs #678, #657, #598, and #673.
 
