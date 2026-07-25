@@ -41,7 +41,10 @@ int main(void) {
   const char* file = "/var/tmp/hermit-record-file-state/data";
   const char* source = "/var/tmp/hermit-record-file-state/source";
   const char* clone = "/var/tmp/hermit-record-file-state/clone";
+  const char* write_only_clone =
+      "/var/tmp/hermit-record-file-state/write-only-clone";
 
+  unlink(write_only_clone);
   unlink(clone);
   unlink(source);
   unlink(file);
@@ -134,7 +137,17 @@ int main(void) {
     return fail("open(clone)");
   }
 
+  const off_t source_position = lseek(source_fd, 0, SEEK_CUR);
+  if (source_position < 0) {
+    return fail("lseek(source before clone)");
+  }
+  int clone_supported = 0;
   if (ioctl(clone_fd, FICLONE, source_fd) == 0) {
+    if (lseek(source_fd, 0, SEEK_CUR) != source_position) {
+      fprintf(stderr, "clone changed source file offset\n");
+      return 1;
+    }
+    clone_supported = 1;
     char payload[8] = {0};
     if (pread(clone_fd, payload, 7, 4096) != 7 ||
         strcmp(payload, "payload") != 0) {
@@ -161,10 +174,51 @@ int main(void) {
     return fail("ioctl(FICLONE)");
   }
 
-  if (close(clone_fd) != 0 || close(source_fd) != 0) {
+  if (close(clone_fd) != 0) {
+    return fail("close(clone)");
+  }
+
+  if (clone_supported) {
+    const int write_only_fd =
+        open(write_only_clone, O_CREAT | O_TRUNC | O_WRONLY, 0200);
+    if (write_only_fd < 0) {
+      return fail("open(write-only clone)");
+    }
+    if (ioctl(write_only_fd, FICLONE, source_fd) != 0) {
+      return fail("ioctl(write-only FICLONE)");
+    }
+    struct stat clone_stat;
+    if (fstat(write_only_fd, &clone_stat) != 0) {
+      return fail("fstat(write-only clone)");
+    }
+    if ((clone_stat.st_mode & 0777) != 0200) {
+      fprintf(stderr, "write-only clone permissions changed: %#o\n",
+              clone_stat.st_mode & 0777);
+      return 1;
+    }
+    if (close(write_only_fd) != 0 || chmod(write_only_clone, 0600) != 0) {
+      return fail("close/chmod(write-only clone)");
+    }
+    const int verify_fd = open(write_only_clone, O_RDONLY);
+    if (verify_fd < 0) {
+      return fail("open(write-only clone for verify)");
+    }
+    char payload[8] = {0};
+    if (pread(verify_fd, payload, 7, 4096) != 7 ||
+        strcmp(payload, "payload") != 0) {
+      fprintf(stderr, "write-only cloned payload mismatch\n");
+      return 1;
+    }
+    if (close(verify_fd) != 0) {
+      return fail("close(write-only clone verify)");
+    }
+  }
+
+  if (close(source_fd) != 0) {
     return fail("close(clone files)");
   }
-  if (unlink(clone) != 0 || unlink(source) != 0 || rmdir(dir) != 0) {
+  if ((clone_supported && unlink(write_only_clone) != 0) ||
+      unlink(clone) != 0 || unlink(source) != 0 || rmdir(dir) != 0) {
     return fail("cleanup");
   }
 

@@ -9,6 +9,7 @@
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 use reverie::Errno;
 use reverie::Guest;
@@ -31,6 +32,7 @@ use reverie::syscalls::ioctl;
 
 use super::Recorder;
 use crate::event::FileCloneEvent;
+use crate::event::FileCloneImage;
 use crate::event::FileExtent;
 use crate::event::FtruncateEvent;
 use crate::event::ReadEvent;
@@ -181,8 +183,14 @@ fn output_file_offset(
 }
 
 const MAX_CLONE_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CLONE_SIDECAR_BYTES: u64 = 1024 * 1024 * 1024;
+const CLONE_COPY_CHUNK_BYTES: usize = 1024 * 1024;
 
-fn read_dense_clone_snapshot(file: &std::fs::File, length: u64) -> std::io::Result<FileCloneEvent> {
+fn read_dense_clone_snapshot(
+    file: &std::fs::File,
+    source_offset: u64,
+    length: u64,
+) -> std::io::Result<FileCloneImage> {
     if length > MAX_CLONE_SNAPSHOT_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
@@ -190,26 +198,31 @@ fn read_dense_clone_snapshot(file: &std::fs::File, length: u64) -> std::io::Resu
         ));
     }
     let mut bytes = vec![0; length as usize];
-    file.read_exact_at(&mut bytes, 0)?;
-    Ok(FileCloneEvent {
-        length,
-        extents: Some(
-            (!bytes.is_empty())
-                .then_some(FileExtent { offset: 0, bytes })
-                .into_iter()
-                .collect(),
-        ),
-    })
+    file.read_exact_at(&mut bytes, source_offset)?;
+    Ok(FileCloneImage::Extents(
+        (!bytes.is_empty())
+            .then_some(FileExtent { offset: 0, bytes })
+            .into_iter()
+            .collect(),
+    ))
 }
 
-fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
-    let file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
+fn clone_snapshot(
+    file: &std::fs::File,
+    source_offset: u64,
+    length: u64,
+) -> std::io::Result<FileCloneImage> {
     let mut extents = Vec::new();
     let mut total = 0u64;
-    let mut cursor = 0u64;
+    let mut cursor = source_offset;
+    let end = source_offset.checked_add(length).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clone source range overflow",
+        )
+    })?;
 
-    while cursor < length {
+    while cursor < end {
         // SAFETY: file is an owned descriptor and cursor fits off_t on x86_64.
         let data = unsafe {
             libc::lseek(
@@ -224,7 +237,7 @@ fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
                 break;
             }
             if error.raw_os_error() == Some(libc::EINVAL) {
-                return read_dense_clone_snapshot(&file, length);
+                return read_dense_clone_snapshot(file, source_offset, length);
             }
             return Err(error);
         }
@@ -238,10 +251,13 @@ fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
         }
         let data = data as u64;
         let hole = if hole == -1 {
-            length
+            end
         } else {
-            (hole as u64).min(length)
+            (hole as u64).min(end)
         };
+        if data >= end {
+            break;
+        }
         let extent_length = hole.saturating_sub(data);
         total = total.checked_add(extent_length).ok_or_else(|| {
             std::io::Error::new(
@@ -260,16 +276,184 @@ fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
         let mut bytes = vec![0; extent_length as usize];
         file.read_exact_at(&mut bytes, data)?;
         extents.push(FileExtent {
-            offset: data,
+            offset: data - source_offset,
             bytes,
         });
         cursor = hole;
     }
 
-    Ok(FileCloneEvent {
-        length,
-        extents: Some(extents),
-    })
+    Ok(FileCloneImage::Extents(extents))
+}
+
+fn spool_clone_snapshot(
+    source: &std::fs::File,
+    source_offset: u64,
+    length: u64,
+    data: &std::path::Path,
+) -> std::io::Result<FileCloneImage> {
+    let directory = data.join("clone");
+    std::fs::create_dir_all(&directory)?;
+
+    let sidecar = tempfile::Builder::new()
+        .prefix("image-")
+        .tempfile_in(&directory)?;
+    sidecar.as_file().set_len(length)?;
+
+    let mut total = 0u64;
+    let mut cursor = source_offset;
+    let end = source_offset.checked_add(length).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clone source range overflow",
+        )
+    })?;
+    let mut buffer = vec![0; CLONE_COPY_CHUNK_BYTES];
+    while cursor < end {
+        // SAFETY: source is owned and cursor fits off_t on x86_64.
+        let data_offset = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                cursor.try_into().unwrap(),
+                libc::SEEK_DATA,
+            )
+        };
+        let (data_offset, hole) = if data_offset == -1 {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENXIO) => break,
+                Some(libc::EINVAL) => (source_offset, end),
+                _ => return Err(error),
+            }
+        } else {
+            // SAFETY: source is owned and data_offset came from lseek.
+            let hole = unsafe { libc::lseek(source.as_raw_fd(), data_offset, libc::SEEK_HOLE) };
+            if hole == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENXIO) {
+                    return Err(error);
+                }
+            }
+            (
+                data_offset as u64,
+                if hole == -1 {
+                    end
+                } else {
+                    (hole as u64).min(end)
+                },
+            )
+        };
+        let extent_length = hole.saturating_sub(data_offset);
+        if data_offset >= end {
+            break;
+        }
+        total = total.checked_add(extent_length).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "clone sidecar size overflow",
+            )
+        })?;
+        if total > MAX_CLONE_SIDECAR_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "clone sidecar data exceeds {MAX_CLONE_SIDECAR_BYTES} byte recording quota"
+                ),
+            ));
+        }
+
+        let mut offset = data_offset;
+        while offset < hole {
+            let count = usize::try_from((hole - offset).min(buffer.len() as u64)).unwrap();
+            source.read_exact_at(&mut buffer[..count], offset)?;
+            sidecar
+                .as_file()
+                .write_all_at(&buffer[..count], offset - source_offset)?;
+            offset += count as u64;
+        }
+        cursor = hole;
+    }
+    sidecar.as_file().sync_data()?;
+    let (_, path) = sidecar.keep().map_err(|error| error.error)?;
+    let relative = path.strip_prefix(data).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("clone sidecar escaped recording directory: {error}"),
+        )
+    })?;
+
+    Ok(FileCloneImage::Sidecar(
+        relative.to_string_lossy().into_owned(),
+    ))
+}
+
+fn capture_clone_snapshot(
+    source: &std::fs::File,
+    source_offset: u64,
+    length: u64,
+    data: &std::path::Path,
+) -> std::io::Result<FileCloneImage> {
+    let inline_error = match clone_snapshot(source, source_offset, length) {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(error) => error,
+    };
+
+    tracing::warn!(
+        error = %inline_error,
+        "inline clone snapshot unavailable; spooling sparse replay sidecar"
+    );
+    spool_clone_snapshot(source, source_offset, length, data)
+}
+
+fn private_clone_snapshot(
+    pid: reverie::Pid,
+    destination_fd: libc::c_int,
+    source: &std::fs::File,
+    source_offset: u64,
+    length: u64,
+) -> std::io::Result<std::fs::File> {
+    let destination = std::fs::read_link(format!("/proc/{}/fd/{destination_fd}", pid.as_raw()))?;
+    let relative = destination.strip_prefix("/").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("clone destination is not an absolute path: {destination:?}"),
+        )
+    })?;
+    let parent = relative.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("clone destination has no parent: {destination:?}"),
+        )
+    })?;
+    let parent = std::path::PathBuf::from(format!("/proc/{}/root", pid.as_raw())).join(parent);
+    let private = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&parent)?;
+
+    if length == 0 {
+        return Ok(private);
+    }
+    let range = libc::file_clone_range {
+        src_fd: source.as_raw_fd() as i64,
+        src_offset: source_offset,
+        src_length: length,
+        dest_offset: 0,
+    };
+    // SAFETY: private and source are valid regular-file descriptors, and range
+    // points to an initialized file_clone_range for the duration of ioctl.
+    let result = unsafe {
+        libc::ioctl(
+            private.as_raw_fd(),
+            libc::FICLONERANGE,
+            std::ptr::addr_of!(range),
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(private)
 }
 
 impl Recorder {
@@ -567,24 +751,66 @@ impl Recorder {
             request,
             ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
         ) {
-            let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
-            let snapshot = clone_snapshot(&path).unwrap_or_else(|error| {
-                let length = std::fs::metadata(&path)
-                    .unwrap_or_else(|metadata_error| {
-                        panic!("failed to stat cloned destination {path}: {metadata_error}")
-                    })
-                    .len();
-                tracing::warn!(
-                    %error,
-                    length,
-                    "clone snapshot unavailable; replay requires physical source and destination"
-                );
-                FileCloneEvent {
-                    length,
-                    extents: None,
-                }
+            let (source_fd, source_offset, requested_length, destination_offset, truncate) =
+                match request {
+                    ioctl::Request::FICLONE(fd) => (fd, 0, None, 0, true),
+                    ioctl::Request::FICLONERANGE(Some(address)) => {
+                        let range: libc::file_clone_range = guest
+                            .memory()
+                            .read_value(address)
+                            .expect("successful FICLONERANGE has a readable argument");
+                        (
+                            range.src_fd as libc::c_int,
+                            range.src_offset,
+                            (range.src_length != 0).then_some(range.src_length),
+                            range.dest_offset,
+                            false,
+                        )
+                    }
+                    ioctl::Request::FICLONERANGE(None) => {
+                        unreachable!("successful FICLONERANGE has a non-null argument")
+                    }
+                    _ => unreachable!(),
+                };
+            let source = std::fs::File::from(
+                crate::fd::duplicate_guest_fd(guest.pid(), source_fd)
+                    .expect("failed to duplicate clone source descriptor"),
+            );
+            let source_length = source
+                .metadata()
+                .expect("failed to stat clone source descriptor")
+                .len();
+            let replacement_length = requested_length.unwrap_or_else(|| {
+                source_length
+                    .checked_sub(source_offset)
+                    .expect("successful clone source offset exceeds file length")
             });
-            self.record_event(guest, Ok(SyscallEvent::FileClone(snapshot)));
+            let private = private_clone_snapshot(
+                guest.pid(),
+                syscall.fd(),
+                &source,
+                source_offset,
+                replacement_length,
+            )
+            .unwrap_or_else(|error| panic!("failed to make private clone snapshot: {error}"));
+            let image = capture_clone_snapshot(&private, 0, replacement_length, &self.data)
+                .unwrap_or_else(|error| panic!("failed to snapshot private clone: {error}"));
+            let destination_path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
+            let length = std::fs::metadata(&destination_path)
+                .unwrap_or_else(|error| {
+                    panic!("failed to stat cloned destination {destination_path}: {error}")
+                })
+                .len();
+            self.record_event(
+                guest,
+                Ok(SyscallEvent::FileClone(FileCloneEvent {
+                    length,
+                    destination_offset,
+                    replacement_length,
+                    truncate_destination: truncate,
+                    image,
+                })),
+            );
         } else if matches!(
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)

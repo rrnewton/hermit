@@ -168,8 +168,22 @@ pub struct OpenEvent {
 pub struct FileCloneEvent {
     /// Final logical destination length.
     pub length: u64,
-    /// Allocated data extents in the final destination image.
-    pub extents: Option<Vec<FileExtent>>,
+    /// Destination offset where the recorded source image begins.
+    pub destination_offset: u64,
+    /// Logical length of the cloned source range.
+    pub replacement_length: u64,
+    /// Whether the clone replaces the complete destination image.
+    pub truncate_destination: bool,
+    /// Recorded representation of the final destination image.
+    pub image: FileCloneImage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FileCloneImage {
+    /// Allocated data extents stored directly in the event stream.
+    Extents(Vec<FileExtent>),
+    /// Path relative to the recording data directory for a streamed snapshot.
+    Sidecar(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
