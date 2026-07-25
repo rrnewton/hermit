@@ -531,11 +531,11 @@ impl GlobalTool for GlobalState {
                     .finalize_prepared_sigkill_delivery(sender, prepared, delivered);
                 R::FinalizePreparedSigkill(retained, cancelled, woken)
             }
-            GlobalRequest::FencePreparedSigkill(targets) => R::FencePreparedSigkill(
+            GlobalRequest::FencePreparedSigkill(sender, targets) => R::FencePreparedSigkill(
                 self.sched
                     .lock()
                     .unwrap()
-                    .fence_prepared_sigkill_targets(targets),
+                    .fence_prepared_sigkill_targets(sender, targets),
             ),
             GlobalRequest::CancelPreparedSigkill(sender, targets) => {
                 let (cancelled, woken) = self
@@ -664,9 +664,9 @@ impl GlobalState {
                     dettid
                 );
             }
+            sched.expire_sigkill_futex_rechecks(dettid);
             // TODO-HUMAN-REVIEW(PR-659): Review post-SIGKILL sender-boundary wake ordering.
-            let woken =
-                sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some(), false);
+            let woken = sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some());
             if woken > 0 {
                 info!(
                     "[detcore, dtid {}] post-SIGKILL boundary woke {} modeled futex waiter(s)",
@@ -1009,11 +1009,7 @@ impl GlobalState {
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
             // TODO-HUMAN-REVIEW(PR-659): Review futex RPC as a post-SIGKILL sender boundary.
-            let sigkill_woken = sched.sigkill_sender_reached_boundary(
-                dettid,
-                false,
-                matches!(action, FutexAction::WaitRequest(_)),
-            );
+            let sigkill_woken = sched.sigkill_sender_reached_boundary(dettid, false);
             if sigkill_woken > 0 {
                 info!(
                     "[detcore, dtid {}] post-SIGKILL futex boundary woke {} modeled futex waiter(s)",
@@ -1028,15 +1024,18 @@ impl GlobalState {
                 .clone();
             match action {
                 FutexAction::WaitRequest(deadline) => {
+                    sched.prepare_sigkill_futex_recheck(dettid, futexid);
                     sched.sleep_futex_waiter(&dettid, futexid, deadline, mask);
                     assert!(sched.run_queue.remove_tid(dettid));
                     sched.publish_pending_sigkill_futex_wake();
+                    sched.publish_completed_sigkill_futex_recheck(dettid, futexid);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
+                    sched.expire_sigkill_futex_rechecks(dettid);
                     let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
                     return Some(SchedValue::Value(num));
                 }
@@ -1045,6 +1044,7 @@ impl GlobalState {
                     max_wake,
                     max_requeue,
                 } => {
+                    sched.expire_sigkill_futex_rechecks(dettid);
                     let num =
                         sched.requeue_futex_waiters(dettid, futexid, target, max_wake, max_requeue);
                     return Some(SchedValue::Value(num));
@@ -1054,6 +1054,7 @@ impl GlobalState {
                     max_wake,
                     max_wake_target,
                 } => {
+                    sched.expire_sigkill_futex_rechecks(dettid);
                     let num = sched.wake_futex_waiters_two(
                         dettid,
                         futexid,
@@ -1064,6 +1065,7 @@ impl GlobalState {
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeFinished(_num_threads) => {
+                    sched.expire_sigkill_futex_rechecks(dettid);
                     return None;
                 }
             }
@@ -1328,7 +1330,7 @@ pub enum GlobalRequest {
 
     /// Fence a prepared SIGKILL cohort after successful injection.
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence RPC.
-    FencePreparedSigkill(Vec<DetTid>),
+    FencePreparedSigkill(DetTid, Vec<DetTid>),
 
     /// Cancel a prepared SIGKILL cohort after failed injection.
     // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation RPC.
@@ -1790,8 +1792,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let sender = guest.thread_state().dettid;
     let (_, response) =
-        send_and_update_time(guest, GlobalRequest::FencePreparedSigkill(targets)).await;
+        send_and_update_time(guest, GlobalRequest::FencePreparedSigkill(sender, targets)).await;
     match response {
         GlobalResponse::FencePreparedSigkill(fenced) => fenced,
         _ => unreachable!(),

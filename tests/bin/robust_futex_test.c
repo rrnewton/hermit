@@ -830,12 +830,6 @@ static void check_sigkill_does_not_wake_future_futex_wait(void) {
     perror("kill stale-credit target");
     exit(EXIT_FAILURE);
   }
-  int status = 0;
-  if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
-      WTERMSIG(status) != SIGKILL) {
-    fprintf(stderr, "unexpected stale-credit target status: %#x\n", status);
-    exit(EXIT_FAILURE);
-  }
 
   int word = 0;
   const struct timespec timeout = {.tv_sec = 0, .tv_nsec = 50000000};
@@ -847,6 +841,13 @@ static void check_sigkill_does_not_wake_future_futex_wait(void) {
             "post-SIGKILL future futex wait result=%ld errno=%d, expected "
             "ETIMEDOUT\n",
             result, errno);
+    exit(EXIT_FAILURE);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
+      WTERMSIG(status) != SIGKILL) {
+    fprintf(stderr, "unexpected stale-credit target status: %#x\n", status);
     exit(EXIT_FAILURE);
   }
 }
