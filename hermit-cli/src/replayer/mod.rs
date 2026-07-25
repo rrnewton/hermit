@@ -179,7 +179,7 @@ impl Tool for Replayer {
             Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Access(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -244,7 +244,7 @@ impl Tool for Replayer {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#653)
             Syscall::Mkdir(_) => self.handle_replayed_side_effect(guest, syscall).await,
-            Syscall::Unlink(_) => self.handle_replayed_side_effect(guest, syscall).await,
+            Syscall::Unlink(_) => self.handle_optional_path_removal(guest, syscall).await,
             Syscall::Unlinkat(call) => self.handle_unlinkat(guest, call).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
@@ -343,9 +343,67 @@ impl Replayer {
         {
             self.handle_simple(guest, syscall.into()).await
         } else {
-            self.handle_replayed_side_effect(guest, syscall.into())
+            self.handle_optional_path_removal(guest, syscall.into())
                 .await
         }
+    }
+
+    async fn handle_optional_path_removal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed path removal returned a different result"
+                ),
+                Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
+                    tracing::debug!(
+                        ?syscall,
+                        %error,
+                        "replay path unavailable; keeping path removal virtual"
+                    );
+                }
+                Err(error) => {
+                    panic!(
+                        "replayed path removal {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    async fn handle_optional_fd_position<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed descriptor position returned a different offset"
+                ),
+                Err(error @ (Errno::EBADF | Errno::ESPIPE)) => {
+                    tracing::debug!(
+                        ?syscall,
+                        %error,
+                        "replay descriptor is virtual; keeping position change virtual"
+                    );
+                }
+                Err(error) => {
+                    panic!(
+                        "replayed descriptor position {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
     }
 
     async fn handle_replayed_side_effect<G: Guest<Self>>(

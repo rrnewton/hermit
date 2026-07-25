@@ -286,7 +286,7 @@ fn read_write_bytes<M: MemoryAccess>(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#658): Audit temporary blocking and restoration for replay side effects.
+// TODO-HUMAN-REVIEW(#662): Audit temporary blocking and restoration for replay side effects.
 async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     guest: &mut G,
     fd: libc::c_int,
@@ -321,8 +321,8 @@ async fn inject_kernel_side_effect<G: Guest<Replayer>>(
 impl Replayer {
     /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
     /// scattering the recorded flattened output bytes across the guest's current
-    /// `iovec` buffers. Guest-created pipes and eventfds are also read live so
-    /// their kernel state remains aligned with the recording.
+    /// `iovec` buffers. Guest-created regular files and eventfds are also read
+    /// live so their kernel state remains aligned with the recording.
     pub(super) async fn handle_readv_family<G: Guest<Self>>(
         &self,
         guest: &mut G,

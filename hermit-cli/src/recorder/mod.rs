@@ -14,7 +14,6 @@ mod time;
 
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -71,21 +70,6 @@ impl OutputIdentity {
     }
 }
 
-fn inherited_pipe_identities(pid: Pid) -> BTreeSet<OutputIdentity> {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw())) else {
-        return BTreeSet::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            metadata.file_type().is_fifo().then_some(OutputIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        })
-        .collect()
-}
 fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
     let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
     metadata
@@ -142,8 +126,6 @@ pub struct Recorder {
     /// Physical output endpoints inherited by the root guest.
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
-    /// Pipes inherited from the Hermit launcher are external inputs/outputs, not guest IPC.
-    inherited_pipes: BTreeSet<OutputIdentity>,
     /// Regular files created by the guest and therefore materialized during replay.
     #[serde(skip)]
     created_files: Mutex<BTreeSet<OutputIdentity>>,
@@ -164,7 +146,6 @@ impl Tool for Recorder {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
-            inherited_pipes: inherited_pipe_identities(pid),
             created_files: Mutex::new(BTreeSet::new()),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
@@ -429,7 +410,7 @@ impl Recorder {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#658): Audit guest-internal FD and epoll classification boundaries.
+    // TODO-HUMAN-REVIEW(#662): Audit guest-internal FD and epoll classification boundaries.
     fn fd_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
         let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
         if std::fs::read_link(&path)
@@ -449,7 +430,7 @@ impl Recorder {
         if metadata.file_type().is_file() {
             return self.is_guest_created_file(identity);
         }
-        metadata.file_type().is_fifo() && !self.inherited_pipes.contains(&identity)
+        false
     }
 
     fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
