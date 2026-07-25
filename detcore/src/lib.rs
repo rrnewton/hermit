@@ -1118,15 +1118,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
         let dettid = guest.thread_state().dettid;
-        let prior_group = guest
-            .thread_state()
-            .robust_list_heads
-            .lock()
-            .expect("robust-list registry mutex poisoned")
-            .keys()
-            .copied()
-            .collect();
-        let woken = tool_global::complete_robust_exec(guest, prior_group).await;
+        let woken = tool_global::complete_robust_exec(guest).await;
         info!(
             "[detcore, dtid {}] successful exec reconciled {} modeled robust futex waiter(s)",
             dettid, woken

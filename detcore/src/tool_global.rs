@@ -512,11 +512,25 @@ impl GlobalTool for GlobalState {
                     .set_robust_list_owner_active(owner, active);
                 R::SetRobustListOwnerActive(())
             }
-            GlobalRequest::CompleteRobustExec(executor, group) => R::CompleteRobustExec(
+            GlobalRequest::PrepareRobustExec(executor, group) => {
                 self.sched
                     .lock()
                     .unwrap()
-                    .complete_robust_exec(executor, group),
+                    .prepare_robust_exec(executor, group);
+                R::PrepareRobustExec(())
+            }
+            GlobalRequest::CancelRobustExec(executor) => {
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .cancel_robust_exec(executor);
+                R::CancelRobustExec(())
+            }
+            GlobalRequest::CompleteRobustExec(executor) => R::CompleteRobustExec(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .complete_robust_exec(executor),
             ),
             GlobalRequest::PrepareSigkillTarget(sender, target) => R::PrepareSigkillTarget(
                 self.sched
@@ -1330,9 +1344,17 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity RPC.
     SetRobustListOwnerActive(DetTid, bool),
 
+    /// Capture a thread group and its active robust owners before entering exec.
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection exec snapshot RPC.
+    PrepareRobustExec(DetTid, Vec<DetTid>),
+
+    /// Discard a pre-exec snapshot after exec returns an error.
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-exec snapshot cancellation RPC.
+    CancelRobustExec(DetTid),
+
     /// Reconcile robust-owner futex waiters after a successful exec.
     // TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust reconciliation RPC.
-    CompleteRobustExec(DetTid, Vec<DetTid>),
+    CompleteRobustExec(DetTid),
 
     /// Resolve and register managed SIGKILL targets before injection.
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation RPC.
@@ -1411,6 +1433,10 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     // TODO-HUMAN-REVIEW(PR-659): Review boundary-observed robust-list activity response.
     SetRobustListOwnerActive(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection exec snapshot response.
+    PrepareRobustExec(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-exec snapshot cancellation response.
+    CancelRobustExec(()),
     // TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust reconciliation response.
     CompleteRobustExec(u64),
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
@@ -1752,16 +1778,48 @@ where
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust wake reconciliation.
-/// Release modeled futex waiters after Linux cleans a thread group's robust lists on exec.
-pub async fn complete_robust_exec<G, T>(guest: &mut G, group: Vec<DetTid>) -> u64
+// TODO-HUMAN-REVIEW(PR-659): Review pre-injection exec snapshot lifetime.
+/// Capture the current thread group before entering a potentially successful exec.
+pub async fn prepare_robust_exec<G, T>(guest: &mut G, group: Vec<DetTid>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let executor = guest.thread_state().dettid;
     let (_, response) =
-        send_and_update_time(guest, GlobalRequest::CompleteRobustExec(executor, group)).await;
+        send_and_update_time(guest, GlobalRequest::PrepareRobustExec(executor, group)).await;
+    match response {
+        GlobalResponse::PrepareRobustExec(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review failed-exec snapshot cancellation.
+/// Discard the current thread's pre-exec snapshot after an exec error.
+pub async fn cancel_robust_exec<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let executor = guest.thread_state().dettid;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::CancelRobustExec(executor)).await;
+    match response {
+        GlobalResponse::CancelRobustExec(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust wake reconciliation.
+/// Release modeled futex waiters after Linux cleans a thread group's robust lists on exec.
+pub async fn complete_robust_exec<G, T>(guest: &mut G) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let executor = guest.thread_state().dettid;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::CompleteRobustExec(executor)).await;
     match response {
         GlobalResponse::CompleteRobustExec(woken) => woken,
         _ => unreachable!(),

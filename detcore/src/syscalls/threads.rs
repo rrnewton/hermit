@@ -50,8 +50,10 @@ use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::cancel_robust_exec;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
+use crate::tool_global::prepare_robust_exec;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_robust_list_owner_active;
 use crate::tool_global::thread_observe_time;
@@ -1447,8 +1449,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        let exec_group = guest
+            .thread_state()
+            .robust_list_heads
+            .lock()
+            .expect("robust-list registry mutex poisoned")
+            .keys()
+            .copied()
+            .collect();
+        prepare_robust_exec(guest, exec_group).await;
+
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
+        cancel_robust_exec(guest).await;
 
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)

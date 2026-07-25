@@ -290,6 +290,13 @@ fn external_continue_id(req: &Resources) -> ExternalOpId {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review pre-exec thread-group and robust-owner snapshot lifetime.
+#[derive(Debug)]
+struct PendingRobustExec {
+    group: BTreeSet<DetTid>,
+    active_owners: BTreeSet<DetTid>,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -370,6 +377,12 @@ pub struct Scheduler {
 
     /// Threads whose registered robust-list head was active at their last boundary.
     active_robust_list_owners: HashSet<DetTid>,
+
+    /// Thread groups captured immediately before entering a potentially successful exec.
+    pending_robust_execs: HashMap<DetTid, PendingRobustExec>,
+
+    /// Siblings whose kernel-internal de_thread SIGKILL exit hook may still arrive.
+    completed_exec_siblings: HashSet<DetTid>,
 
     /// Coalesced futex reconciliation credit from a completed SIGKILL cohort.
     pending_sigkill_futex_wake: Option<DetTid>,
@@ -989,6 +1002,8 @@ impl Scheduler {
             pending_sigkills: Default::default(),
             pending_sigkill_senders: Default::default(),
             active_robust_list_owners: Default::default(),
+            pending_robust_execs: Default::default(),
+            completed_exec_siblings: Default::default(),
             pending_sigkill_futex_wake: None,
             sigkill_reconciliation_waiters: Default::default(),
             sigkill_provisional_futex_rechecks: Default::default(),
@@ -1148,6 +1163,8 @@ impl Scheduler {
 
         let removed_pending = self.pending_sigkills.remove(dtid)
             | self.pending_sigkill_senders.remove(dtid).is_some();
+        self.pending_robust_execs.remove(dtid);
+        self.completed_exec_siblings.remove(dtid);
         self.active_robust_list_owners.remove(dtid);
         self.remove_sigkill_futex_state_for_thread(dtid);
         // Remove from runnable queue:
@@ -1576,25 +1593,56 @@ impl Scheduler {
         }
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection exec cohort snapshot.
+    /// Capture the thread group and its active robust owners before entering exec.
+    pub fn prepare_robust_exec(&mut self, executor: DetTid, group: Vec<DetTid>) {
+        let mut group = group.into_iter().collect::<BTreeSet<_>>();
+        group.insert(executor);
+        let active_owners = group
+            .iter()
+            .filter(|owner| self.active_robust_list_owners.contains(owner))
+            .copied()
+            .collect();
+        self.pending_robust_execs.insert(
+            executor,
+            PendingRobustExec {
+                group,
+                active_owners,
+            },
+        );
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-exec cohort cancellation.
+    /// Discard a pre-exec snapshot without changing live robust-owner state.
+    pub fn cancel_robust_exec(&mut self, executor: DetTid) {
+        self.pending_robust_execs.remove(&executor);
+    }
+
     // TODO-HUMAN-REVIEW(PR-659): Review successful-exec robust wake reconciliation.
     /// Reconcile modeled futex waiters after Linux cleans robust owners during exec.
-    pub fn complete_robust_exec(&mut self, executor: DetTid, mut group: Vec<DetTid>) -> u64 {
-        group.sort_unstable();
-        group.dedup();
-        let mut had_active_owner = false;
-        for owner in &group {
-            had_active_owner |= self.active_robust_list_owners.remove(owner);
+    pub fn complete_robust_exec(&mut self, executor: DetTid) -> u64 {
+        let Some(pending) = self.pending_robust_execs.remove(&executor) else {
+            return 0;
+        };
+        self.completed_exec_siblings.extend(
+            pending
+                .group
+                .iter()
+                .filter(|thread| **thread != executor && self.next_turns.contains_key(thread))
+                .copied(),
+        );
+        for owner in &pending.group {
+            self.active_robust_list_owners.remove(owner);
         }
-        if !had_active_owner {
+        if pending.active_owners.is_empty() {
             return 0;
         }
 
-        let group = group.into_iter().collect::<HashSet<_>>();
         for (&futexid, waiters) in &self.blocked.futex_waiters {
             self.sigkill_reconciliation_waiters.extend(
                 waiters
                     .iter()
-                    .filter(|waiter| !group.contains(&waiter.dettid))
+                    .filter(|waiter| !pending.group.contains(&waiter.dettid))
                     .map(|waiter| (waiter.dettid, futexid)),
             );
         }
@@ -1857,7 +1905,8 @@ impl Scheduler {
             .sigkill_reconciliation_waiters
             .iter()
             .any(|(_, captured)| *captured == futexid);
-        if !matches_owner && !matches_captured_futex {
+        let matches_zero_owner = observed_owner == 0 && !pending_active_owners.is_empty();
+        if !matches_owner && !matches_captured_futex && !matches_zero_owner {
             return false;
         }
         self.sigkill_reconciliation_waiters
@@ -1931,6 +1980,18 @@ impl Scheduler {
     pub fn complete_sigkill_exit(&mut self, exiting: DetTid, process: DetPid) -> (u64, u64) {
         self.run_queue.remove_tid(exiting);
         self.remove_blocking_entries(&exiting);
+        let pending_exec_sibling = self
+            .pending_robust_execs
+            .iter()
+            .any(|(executor, pending)| {
+                *executor != exiting && pending.group.contains(&exiting)
+            });
+        let completed_exec_sibling = self.completed_exec_siblings.remove(&exiting);
+        if !self.pending_sigkills.contains(&exiting)
+            && (pending_exec_sibling || completed_exec_sibling)
+        {
+            return (self.pending_sigkills.len() as u64, 0);
+        }
         if !self.pending_sigkills.contains(&exiting) {
             let targets = self.resolve_sigkill_target(SigkillTarget::Process(process));
             for target in targets {
