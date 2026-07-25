@@ -1110,6 +1110,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
+        'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
