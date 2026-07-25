@@ -65,7 +65,8 @@ jobs:
         if: steps.namespaces.outputs.available != 'true'
         run: |
           cargo build --workspace
-          cargo test -p detcore
+          # AUTONOMOUS-BOT-IMPLEMENTED(#657): PMU integration tests run in the hardware lane.
+          cargo test -p detcore --lib --bins
           cargo test -p hermit --lib --bins
 
   full:
