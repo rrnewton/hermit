@@ -39,6 +39,48 @@ use crate::types::LogicalTime;
 const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // TODO-HUMAN-REVIEW(PR-659): Review self-directed fatal-signal cleanup before injection.
+    /// Deliver a signal while preserving precise robust-futex owner-death semantics.
+    pub async fn handle_signal_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Syscall,
+    ) -> Result<i64, Error> {
+        let current_pid = guest.thread_state().detpid.expect("detpid unset");
+        let targets_current_group = match &call {
+            syscalls::Syscall::Kill(call) => call.pid() == 0 || call.pid() == current_pid.as_raw(),
+            syscalls::Syscall::Tgkill(call) => {
+                call.tgid() == current_pid.as_raw()
+                    && guest
+                        .thread_state()
+                        .robust_list_heads
+                        .lock()
+                        .expect("robust-list registry mutex poisoned")
+                        .contains_key(&crate::types::DetTid::from_raw(call.tid()))
+            }
+            syscalls::Syscall::Tkill(call) => guest
+                .thread_state()
+                .robust_list_heads
+                .lock()
+                .expect("robust-list registry mutex poisoned")
+                .contains_key(&crate::types::DetTid::from_raw(call.tid())),
+            _ => unreachable!("signal-send handler received {call:?}"),
+        };
+        let signum = match &call {
+            syscalls::Syscall::Kill(call) => call.sig(),
+            syscalls::Syscall::Tgkill(call) => call.sig(),
+            syscalls::Syscall::Tkill(call) => call.sig(),
+            _ => unreachable!("signal-send handler received {call:?}"),
+        };
+        if targets_current_group
+            && let Ok(signal) = Signal::try_from(signum)
+            && self.signal_will_terminate_thread_group(guest, signal)
+        {
+            self.cleanup_registered_robust_lists(guest, true).await;
+        }
+        Ok(guest.inject(call).await?)
+    }
+
     /// We send the alarms to the global scheduler to handle.
     pub async fn handle_alarm<G: Guest<Self>>(
         &self,

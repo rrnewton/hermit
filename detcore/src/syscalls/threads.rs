@@ -18,6 +18,7 @@ use rand::Rng;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Signal;
 use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
@@ -98,11 +99,50 @@ fn robust_futex_address(entry: usize, offset: isize) -> Option<usize> {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-659): Review Linux robust-list PI pointer-tag decoding.
+fn decode_robust_pointer(raw: usize) -> (usize, bool) {
+    (raw & !1, raw & 1 != 0)
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review Linux default terminating-signal set.
+fn default_signal_action_terminates(signum: i32) -> bool {
+    matches!(
+        signum,
+        libc::SIGHUP
+            | libc::SIGINT
+            | libc::SIGQUIT
+            | libc::SIGILL
+            | libc::SIGTRAP
+            | libc::SIGABRT
+            | libc::SIGBUS
+            | libc::SIGFPE
+            | libc::SIGKILL
+            | libc::SIGUSR1
+            | libc::SIGSEGV
+            | libc::SIGUSR2
+            | libc::SIGPIPE
+            | libc::SIGALRM
+            | libc::SIGTERM
+            | libc::SIGSTKFLT
+            | libc::SIGPOLL
+            | libc::SIGPROF
+            | libc::SIGSYS
+            | libc::SIGVTALRM
+            | libc::SIGXCPU
+            | libc::SIGXFSZ
+            | libc::SIGPWR
+    ) || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signum)
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review futex2 U32 flag and errno policy.
 fn validate_futex2_flags(flags: u32) -> Result<bool, Errno> {
     if flags & !FUTEX2_VALID_MASK != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 || flags & (FUTEX2_NUMA | FUTEX2_MPOL) != 0 {
+    if flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (FUTEX2_NUMA | FUTEX2_MPOL) != 0 {
         return Err(Errno::ENOSYS);
     }
     Ok(flags & FUTEX2_PRIVATE != 0)
@@ -150,6 +190,15 @@ fn apply_futex_wake_op(encoded: u32, old: i32) -> Result<(i32, bool), Errno> {
         _ => return Err(Errno::ENOSYS),
     };
     Ok((new, wake_second))
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review typed futex wait completion decoding.
+fn decode_futex_wait_result(answer: Option<SchedValue>) -> Result<i64, Errno> {
+    match answer {
+        None | Some(SchedValue::Value(_)) => Ok(0),
+        Some(SchedValue::TimeOut) => Err(Errno::ETIMEDOUT),
+        Some(SchedValue::Interrupted) => Err(Errno::EINTR),
+    }
 }
 
 #[repr(C)]
@@ -255,6 +304,31 @@ fn rebase_absolute_timeout(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // TODO-HUMAN-REVIEW(PR-659): Review fatal-signal disposition detection for robust cleanup.
+    pub(crate) fn signal_will_terminate_thread_group<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        signal: Signal,
+    ) -> bool {
+        let signum = signal as i32;
+        if !default_signal_action_terminates(signum) {
+            return false;
+        }
+        if signum == libc::SIGKILL {
+            return true;
+        }
+
+        let status = match Process::new(guest.pid().as_raw()).and_then(|process| process.status()) {
+            Ok(status) => status,
+            Err(error) => {
+                debug!("could not inspect signal disposition for {signal}: {error}");
+                return false;
+            }
+        };
+        let signal_mask = 1_u64 << (signum - 1);
+        status.sigign & signal_mask == 0 && status.sigcgt & signal_mask == 0
+    }
+
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -306,8 +380,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-659): Review robust-list registration and owner-death cleanup.
-    /// Register the kernel robust list and mirror its head for deterministic exit cleanup.
+    // TODO-HUMAN-REVIEW(PR-659): Review robust-list registration mirroring.
+    /// Register the kernel robust list and mirror its head in the thread-group registry.
     pub async fn handle_set_robust_list<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -316,26 +390,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         let head = call.head().map(AddrMut::as_raw);
         let result = guest.inject(call).await?;
         if result == 0 {
-            guest.thread_state_mut().robust_list_head = head;
+            let dettid = guest.thread_state().dettid;
+            guest
+                .thread_state()
+                .robust_list_heads
+                .lock()
+                .expect("robust-list registry mutex poisoned")
+                .insert(dettid, head);
         }
         Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-659): Review deterministic self-query robust-list policy.
-    /// Return the calling thread's modeled robust-list registration.
+    // TODO-HUMAN-REVIEW(PR-659): Review same-thread-group robust-list lookup policy.
+    /// Return a modeled robust-list registration for a thread in this thread group.
     pub fn handle_get_robust_list<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::GetRobustList,
     ) -> Result<i64, Error> {
-        let dettid = guest.thread_state().dettid.as_raw();
-        if call.pid() != 0 && call.pid() != dettid {
-            return Err(Error::Errno(Errno::EPERM));
-        }
+        let current = guest.thread_state().dettid;
+        let target = if call.pid() == 0 {
+            current
+        } else {
+            DetTid::from_raw(call.pid())
+        };
         let len_ptr = call.len_ptr().ok_or(Errno::EFAULT)?;
         let head_ptr = call.head_ptr().ok_or(Errno::EFAULT)?;
-        let head = guest.thread_state().robust_list_head.unwrap_or(0);
+        let head = guest
+            .thread_state()
+            .robust_list_heads
+            .lock()
+            .expect("robust-list registry mutex poisoned")
+            .get(&target)
+            .copied()
+            .ok_or(Errno::ESRCH)?
+            .unwrap_or(0);
         guest
             .memory()
             .write_value(len_ptr, &ROBUST_LIST_HEAD_SIZE)?;
@@ -344,10 +434,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    async fn cleanup_robust_list_on_exit<G: Guest<Self>>(&self, guest: &mut G) {
-        let Some(head_address) = guest.thread_state_mut().robust_list_head.take() else {
-            return;
+    // TODO-HUMAN-REVIEW(PR-659): Review precise-mode robust owner-death lifecycle.
+    pub(crate) async fn cleanup_registered_robust_lists<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        whole_group: bool,
+    ) {
+        let current = guest.thread_state().dettid;
+        let registrations = {
+            let mut heads = guest
+                .thread_state()
+                .robust_list_heads
+                .lock()
+                .expect("robust-list registry mutex poisoned");
+            if whole_group {
+                heads
+                    .iter_mut()
+                    .filter_map(|(&owner, head)| head.take().map(|head| (owner, head)))
+                    .collect::<Vec<_>>()
+            } else {
+                heads
+                    .get_mut(&current)
+                    .and_then(Option::take)
+                    .map(|head| vec![(current, head)])
+                    .unwrap_or_default()
+            }
         };
+
+        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+            return;
+        }
+        for (owner, head) in registrations {
+            self.cleanup_robust_list_head(guest, owner, head).await;
+        }
+    }
+
+    async fn cleanup_robust_list_head<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        owner: DetTid,
+        head_address: usize,
+    ) {
         let Some(head_ptr) = Addr::<RobustListHead>::from_raw(head_address) else {
             return;
         };
@@ -359,9 +486,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
+        let (pending, pending_pi) = decode_robust_pointer(head.list_op_pending);
         let mut entries = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut current = head.list_next;
+        let (mut current, mut current_pi) = decode_robust_pointer(head.list_next);
         for _ in 0..ROBUST_LIST_LIMIT {
             if current == head_address {
                 break;
@@ -370,57 +498,77 @@ impl<T: RecordOrReplay> Detcore<T> {
                 debug!("invalid or cyclic robust list at {current:#x}");
                 break;
             }
-            entries.push(current);
+            if current != pending {
+                entries.push((current, current_pi));
+            }
             let Some(next_ptr) = Addr::<usize>::from_raw(current) else {
                 break;
             };
-            current = match guest.memory().read_value(next_ptr) {
+            let raw_next = match guest.memory().read_value(next_ptr) {
                 Ok(next) => next,
                 Err(error) => {
                     debug!("could not read robust-list entry at {current:#x}: {error}");
                     break;
                 }
             };
-        }
-        if head.list_op_pending != 0 {
-            entries.push(head.list_op_pending);
+            (current, current_pi) = decode_robust_pointer(raw_next);
         }
 
-        let owner_tid = guest.thread_state().dettid.as_raw() as u32 & FUTEX_TID_MASK;
-        let mut cleaned = BTreeSet::new();
-        let mut futexes = Vec::new();
-        for entry in entries {
-            let Some(address) = robust_futex_address(entry, head.futex_offset) else {
-                continue;
-            };
-            if !cleaned.insert(address) {
-                continue;
-            }
-            let Some(word_ptr) = AddrMut::<u32>::from_raw(address) else {
-                continue;
-            };
-            let old = match guest.memory().read_value(word_ptr) {
-                Ok(old) => old,
-                Err(_) => continue,
-            };
-            if old & FUTEX_TID_MASK != owner_tid {
-                continue;
-            }
+        for (entry, pi) in entries {
+            self.cleanup_robust_futex(guest, owner, entry, head.futex_offset, pi, false)
+                .await;
+        }
+        if pending != 0 {
+            self.cleanup_robust_futex(guest, owner, pending, head.futex_offset, pending_pi, true)
+                .await;
+        }
+    }
+
+    async fn cleanup_robust_futex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        owner: DetTid,
+        entry: usize,
+        offset: isize,
+        pi: bool,
+        pending: bool,
+    ) {
+        if pi {
+            return;
+        }
+        let Some(address) = robust_futex_address(entry, offset) else {
+            return;
+        };
+        if !address.is_multiple_of(std::mem::align_of::<u32>()) {
+            return;
+        }
+        let Some(word_ptr) = AddrMut::<u32>::from_raw(address) else {
+            return;
+        };
+        let Ok(old) = guest.memory().read_value(word_ptr) else {
+            return;
+        };
+        let owner_tid = owner.as_raw() as u32 & FUTEX_TID_MASK;
+        let old_owner = old & FUTEX_TID_MASK;
+        let wake_value = if pending && old_owner == 0 {
+            Some(old)
+        } else if old_owner == owner_tid {
             let new = (old & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
             if guest.memory().write_value(word_ptr, &new).is_err() {
-                continue;
+                return;
             }
-            if old & FUTEX_WAITERS != 0 {
-                futexes.push((guest.thread_state().futex_id(address, false), new as i32));
-            }
-        }
+            (old & FUTEX_WAITERS != 0).then_some(new)
+        } else {
+            None
+        };
 
-        for (futexid, value) in futexes {
+        if let Some(value) = wake_value {
+            let futexid = guest.thread_state().futex_id(address, false);
             let _ = futex_action(
                 guest,
                 FutexAction::WakeRequest(1),
                 &futexid,
-                value,
+                value as i32,
                 u32::MAX,
             )
             .await;
@@ -428,7 +576,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 FutexAction::WakeFinished(1),
                 &futexid,
-                value,
+                value as i32,
                 u32::MAX,
             )
             .await;
@@ -452,14 +600,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             mask,
         )
         .await;
-        let result = match answer {
-            None => Ok(0),
-            Some(SchedValue::TimeOut) => Err(Error::Errno(Errno::ETIMEDOUT)),
-            Some(SchedValue::Value(value)) if value == Errno::EINTR.into_raw() as u64 => {
-                Err(Error::Errno(Errno::EINTR))
-            }
-            Some(SchedValue::Value(value)) => Ok(value as i64),
-        };
+        let result = decode_futex_wait_result(answer).map_err(Error::Errno);
         futex_action(
             guest,
             FutexAction::WaitFinished,
@@ -495,7 +636,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .expect("futex2 wake must return a count");
         match woken {
             SchedValue::Value(value) => Ok(value as i64),
-            SchedValue::TimeOut => unreachable!("wake has no timeout"),
+            SchedValue::TimeOut | SchedValue::Interrupted => {
+                unreachable!("wake does not block")
+            }
         }
     }
 
@@ -597,7 +740,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         .expect("futex2 requeue must return a count");
         match changed {
             SchedValue::Value(value) => Ok(value as i64),
-            SchedValue::TimeOut => unreachable!("requeue has no timeout"),
+            SchedValue::TimeOut | SchedValue::Interrupted => {
+                unreachable!("requeue does not block")
+            }
         }
     }
 
@@ -649,7 +794,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         .expect("futex requeue must return a count");
         match changed {
             SchedValue::Value(value) => Ok(value as i64),
-            SchedValue::TimeOut => unreachable!("requeue has no timeout"),
+            SchedValue::TimeOut | SchedValue::Interrupted => {
+                unreachable!("requeue does not block")
+            }
         }
     }
 
@@ -693,7 +840,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         .expect("futex wake-op must return a count");
         match woken {
             SchedValue::Value(value) => Ok(value as i64),
-            SchedValue::TimeOut => unreachable!("wake-op has no timeout"),
+            SchedValue::TimeOut | SchedValue::Interrupted => {
+                unreachable!("wake-op does not block")
+            }
         }
     }
     /// Clone, clone3, fork, vfork system calls
@@ -814,9 +963,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        if self.cfg.sequentialize_threads {
-            self.cleanup_robust_list_on_exit(guest).await;
-        }
+        self.cleanup_registered_robust_lists(guest, false).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -836,6 +983,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        self.cleanup_registered_robust_lists(guest, true).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -907,7 +1055,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .expect("futex wake must return value")
                 {
                     SchedValue::Value(num) => num,
-                    SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
+                    SchedValue::TimeOut | SchedValue::Interrupted => {
+                        unreachable!("futex wake does not block")
+                    }
                 };
                 trace!(
                     "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
@@ -1447,6 +1597,36 @@ mod tests {
     }
 
     #[test]
+    fn futex_wait_results_do_not_alias_replay_timeslices_and_signals() {
+        assert_eq!(decode_futex_wait_result(None), Ok(0));
+        assert_eq!(decode_futex_wait_result(Some(SchedValue::Value(4))), Ok(0));
+        assert_eq!(
+            decode_futex_wait_result(Some(SchedValue::TimeOut)),
+            Err(Errno::ETIMEDOUT)
+        );
+        assert_eq!(
+            decode_futex_wait_result(Some(SchedValue::Interrupted)),
+            Err(Errno::EINTR)
+        );
+    }
+
+    #[test]
+    fn robust_pointer_decoding_preserves_pi_tag() {
+        assert_eq!(decode_robust_pointer(0), (0, false));
+        assert_eq!(decode_robust_pointer(0x1000), (0x1000, false));
+        assert_eq!(decode_robust_pointer(0x1001), (0x1000, true));
+    }
+
+    #[test]
+    fn only_default_terminating_signals_trigger_group_cleanup() {
+        assert!(default_signal_action_terminates(libc::SIGKILL));
+        assert!(default_signal_action_terminates(libc::SIGTERM));
+        assert!(default_signal_action_terminates(libc::SIGRTMIN()));
+        assert!(!default_signal_action_terminates(libc::SIGCHLD));
+        assert!(!default_signal_action_terminates(libc::SIGSTOP));
+    }
+
+    #[test]
     fn futex_wake_op_decodes_signed_arguments_and_comparisons() {
         let set_one_if_zero = 1_u32 << 12;
         assert_eq!(apply_futex_wake_op(set_one_if_zero, 0), Ok((1, true)));
@@ -1467,7 +1647,7 @@ mod tests {
             validate_futex2_flags(FUTEX2_SIZE_U32 | FUTEX2_PRIVATE),
             Ok(true)
         );
-        assert_eq!(validate_futex2_flags(0), Err(Errno::ENOSYS));
+        assert_eq!(validate_futex2_flags(0), Err(Errno::EINVAL));
         assert_eq!(
             validate_futex2_flags(FUTEX2_SIZE_U32 | FUTEX2_NUMA),
             Err(Errno::ENOSYS)

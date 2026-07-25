@@ -123,6 +123,9 @@ pub enum SchedResponse {
 pub enum SchedValue {
     /// The action timed out while waiting on the scheduler.
     TimeOut,
+    // TODO-HUMAN-REVIEW(PR-659): Review typed signal interruption across scheduler RPC.
+    /// The blocked action was interrupted by a signal.
+    Interrupted,
     // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
 }
@@ -2696,6 +2699,50 @@ mod test {
         );
         assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
     }
+
+    #[test]
+    fn futex_wake_op_wakes_both_queues() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let mm = MmId::initial(DetTid::from_raw(1));
+        let first = FutexID::private(mm, 0x1000);
+        let second = FutexID::private(mm, 0x2000);
+        for (raw_tid, futex) in [(1, first), (2, second)] {
+            let dettid = DetTid::from_raw(raw_tid);
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
+        }
+
+        assert_eq!(
+            scheduler.wake_futex_waiters_two(DetTid::from_raw(3), first, second, 1, 1),
+            2
+        );
+        assert!(
+            scheduler
+                .blocked
+                .futex_waiters
+                .get(&first)
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(
+            scheduler
+                .blocked
+                .futex_waiters
+                .get(&second)
+                .is_none_or(Vec::is_empty)
+        );
+        assert_eq!(scheduler.run_queue.len(), 2);
+    }
+
     #[test]
     fn test_my_thread_group1() {
         let mut tree: ThreadTree = Default::default();

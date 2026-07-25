@@ -8,6 +8,7 @@
 
 //! The process-local portion of the Detcore Reverie-tool.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
@@ -846,9 +847,9 @@ pub struct ThreadState<T> {
     /// `handle_thread_start`; the parent clears its copy when vfork returns.
     pub pending_vfork: Option<PendingVfork>,
 
-    // TODO-HUMAN-REVIEW(PR-659): Review mirrored robust-list state lifetime.
-    /// Per-thread robust-futex list registered through set_robust_list(2).
-    pub(crate) robust_list_head: Option<usize>,
+    // TODO-HUMAN-REVIEW(PR-659): Review thread-group robust-list state lifetime.
+    /// Per-thread robust-futex registrations shared within this thread group.
+    pub(crate) robust_list_heads: Arc<Mutex<BTreeMap<DetTid, Option<usize>>>>,
 
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
@@ -994,7 +995,7 @@ impl<T> ThreadState<T> {
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             clone_flags: None,
             pending_vfork: None,
-            robust_list_head: None,
+            robust_list_heads: Arc::new(Mutex::new(BTreeMap::from([(pid, None)]))),
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),

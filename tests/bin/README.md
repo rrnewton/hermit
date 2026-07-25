@@ -6,8 +6,8 @@ also compiled by `hermit-cli/tests/threading_syscalls.rs`.
 
 ## Robust futex owner death
 
-`robust_futex_test.c` checks the Linux robust-list contract for a waiter that is
-already blocked when a mutex owner exits:
+`robust_futex_test.c` checks the Linux robust-list contract for waiters that are
+already blocked when a mutex owner, thread group, or self-signaled process exits:
 
 1. Thread A explicitly re-registers glibc's robust-list head with
    `set_robust_list`, then locks a `PTHREAD_MUTEX_ROBUST` mutex.
@@ -35,7 +35,9 @@ On x86_64 Linux with glibc, the control exits 0:
 ```text
 $ timeout 10s ./robust_futex_test
 PASS: robust mutex waiter received EOWNERDEAD
+PASS: sibling robust-list lookup and ESRCH semantics
 PASS: legacy and futex2 variants handled deterministically
+PASS: exit_group and fatal-signal owner death recovered
 ```
 
 ### Hermit strict verification
@@ -51,8 +53,10 @@ $ timeout --kill-after 5s 30s target/release/hermit --log=off run \
 :: Success: deterministic. Determinism verified.
 ```
 
-The same fixture also probes legacy `FUTEX_CMP_REQUEUE` and `FUTEX_WAKE_OP`,
-plus the U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces.
+The same fixture blocks real waiters across legacy `FUTEX_CMP_REQUEUE` and the
+U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
+`FUTEX_WAKE_OP`, sibling `get_robust_list`, missing-thread `ESRCH`,
+process-shared `exit_group`, and self-directed fatal-signal cleanup.
 
 # POSIX timer signal-delivery probe
 

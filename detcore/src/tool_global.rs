@@ -646,7 +646,7 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    SchedValue::TimeOut => None,
+                    SchedValue::TimeOut | SchedValue::Interrupted => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (ResumeStatus::Normal, endtime_update)
@@ -979,7 +979,7 @@ impl GlobalState {
                 );
                 answer
             }
-            SchedResponse::Signaled() => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::Signaled() => Some(SchedValue::Interrupted),
         }
     }
 

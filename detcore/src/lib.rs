@@ -641,6 +641,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futex_wake,
                 Sysno::get_robust_list,
                 Sysno::set_robust_list,
+                Sysno::kill,
+                Sysno::tgkill,
+                Sysno::tkill,
                 Sysno::clone,
                 Sysno::clone3,
                 Sysno::fork,
@@ -881,6 +884,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
             unrecoverable_shutdown(guest).await
         } else {
+            let terminates_thread_group = self.signal_will_terminate_thread_group(guest, signal);
             self.pre_handler_hook(guest, false).await;
 
             let dettid = guest.thread_state().dettid;
@@ -914,6 +918,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Permission::RW,
             );
             resource_request(guest, request).await;
+            if terminates_thread_group {
+                self.cleanup_registered_robust_lists(guest, true).await;
+            }
             info!(
                 "[dtid {}] finish delivering signal (#{}) {}",
                 dettid, mycount, signal
@@ -948,6 +955,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
                 let (child_pedigree, _parent) = pts.1.pedigree.fork();
+                let robust_list_heads = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    let heads = Arc::clone(&pts.1.robust_list_heads);
+                    heads
+                        .lock()
+                        .expect("robust-list registry mutex poisoned")
+                        .insert(dettid, None);
+                    heads
+                } else {
+                    Arc::new(Mutex::new(std::collections::BTreeMap::from([(
+                        dettid, None,
+                    )])))
+                };
 
                 ThreadState {
                     dettid,
@@ -1007,7 +1026,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
-                    robust_list_head: None,
+                    robust_list_heads,
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -1088,7 +1107,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
-        guest.thread_state_mut().robust_list_head = None;
+        let dettid = guest.thread_state().dettid;
+        guest.thread_state_mut().robust_list_heads = Arc::new(Mutex::new(
+            std::collections::BTreeMap::from([(dettid, None)]),
+        ));
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
@@ -1307,6 +1329,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::GetRobustList(s) => self.handle_get_robust_list(guest, s),
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
+
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Kill(s) => self.handle_signal_send(guest, s.into()).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Tgkill(s) => self.handle_signal_send(guest, s.into()).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Tkill(s) => self.handle_signal_send(guest, s.into()).await,
 
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
@@ -1654,6 +1683,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
         let mm_id = thread_state.mm_id;
+        thread_state
+            .robust_list_heads
+            .lock()
+            .expect("robust-list registry mutex poisoned")
+            .remove(&dettid);
         deregister_thread(
             dettid,
             thread_state.thread_logical_time.clone(),

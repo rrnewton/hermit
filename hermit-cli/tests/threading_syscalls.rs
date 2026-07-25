@@ -65,7 +65,9 @@ fn threading_syscalls_reach_strict_verify_l2() {
     let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
     assert!(
         trace_stdout.contains("PASS: robust mutex waiter received EOWNERDEAD")
-            && trace_stdout.contains("PASS: legacy and futex2 variants handled deterministically"),
+            && trace_stdout.contains("PASS: sibling robust-list lookup and ESRCH semantics")
+            && trace_stdout.contains("PASS: legacy and futex2 variants handled deterministically")
+            && trace_stdout.contains("PASS: exit_group and fatal-signal owner death recovered"),
         "threading syscall guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
