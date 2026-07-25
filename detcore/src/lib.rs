@@ -110,8 +110,32 @@ use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
+/// Identifies an unsupported syscall that a backend must terminate without unwinding.
+#[derive(Debug)]
+pub struct UnsupportedSyscallError(pub Sysno);
+
+impl std::fmt::Display for UnsupportedSyscallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unsupported syscall: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedSyscallError {}
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+/// Returns whether the audited runtime policy classifies `sysno` as unsupported.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBI-child classification surface.
+pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
+    matches!(
+        syscall_classification::classify_syscall(sysno),
+        syscall_classification::SyscallClassification::Unsupported
+    )
+}
+
 use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
@@ -195,6 +219,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid,
                 call.display(&guest.memory()),
             );
+            if guest.config().shutdown_on_unsupported_syscall {
+                unrecoverable_shutdown(guest).await;
+            }
+            if guest.config().exit_on_unsupported_syscall {
+                return Err(Error::Tool(anyhow::Error::new(UnsupportedSyscallError(
+                    call.number(),
+                ))));
+            }
             panic!("unsupported syscall: {:?}", call);
         }
         report_unsupported_syscall(guest, call.number()).await;

@@ -26,6 +26,7 @@ use std::io::Read;
 use std::io::Seek as _;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -55,29 +56,118 @@ impl DbiSummary {
             && self.memory_hash == other.memory_hash
     }
 }
-
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review DBI run-wide warning collection and shutdown delivery.
+// TODO-HUMAN-REVIEW(PR-644): Review inherited DBI policy descriptors and bounded reports.
+struct InstalledFd {
+    target: i32,
+    backup: Option<i32>,
+}
+
+impl InstalledFd {
+    fn install(source: i32, target: i32) -> std::io::Result<Self> {
+        let backup = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 0) };
+        let backup = if backup == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                None
+            } else {
+                return Err(error);
+            }
+        } else {
+            Some(backup)
+        };
+        let installed = Self { target, backup };
+        if unsafe { libc::dup2(source, target) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            drop(installed);
+            return Err(error);
+        }
+        Ok(installed)
+    }
+}
+
+impl Drop for InstalledFd {
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup {
+            let _ = unsafe { libc::dup2(backup, self.target) };
+            let _ = unsafe { libc::close(backup) };
+        } else {
+            let _ = unsafe { libc::close(self.target) };
+        }
+    }
+}
+
 struct DbiUnsupportedSyscallReport {
     file: tempfile::NamedTempFile,
+    _policy_file: std::fs::File,
+    _policy_fd: InstalledFd,
+    _report_fd: InstalledFd,
 }
 
 impl DbiUnsupportedSyscallReport {
-    fn new() -> std::io::Result<Self> {
+    fn new(panic_on_unsupported_syscalls: bool) -> std::io::Result<Self> {
+        let mut policy_file = tempfile::tempfile()?;
+        policy_file.write_all(if panic_on_unsupported_syscalls {
+            b"1"
+        } else {
+            b"0"
+        })?;
+        let file = tempfile::NamedTempFile::new()?;
+        let policy_fd = InstalledFd::install(
+            policy_file.as_raw_fd(),
+            detcore_dbi::UNSUPPORTED_SYSCALL_POLICY_FD,
+        )?;
+        let report_fd = InstalledFd::install(
+            file.as_file().as_raw_fd(),
+            detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD,
+        )?;
         Ok(Self {
-            file: tempfile::NamedTempFile::new()?,
+            file,
+            _policy_file: policy_file,
+            _policy_fd: policy_fd,
+            _report_fd: report_fd,
         })
     }
 
-    fn path(&self) -> &Path {
-        self.file.path()
-    }
-
     fn emit(&mut self) -> std::io::Result<()> {
+        const MAX_REPORT_BYTES: u64 = 1024 * 1024;
         self.file.as_file_mut().seek(SeekFrom::Start(0))?;
         let mut contents = String::new();
-        self.file.as_file_mut().read_to_string(&mut contents)?;
-        let syscalls = contents.lines().map(str::to_owned).collect::<BTreeSet<_>>();
+        self.file
+            .as_file_mut()
+            .take(MAX_REPORT_BYTES + 1)
+            .read_to_string(&mut contents)?;
+        if contents.len() as u64 > MAX_REPORT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "DBI unsupported-syscall report exceeded 1 MiB",
+            ));
+        }
+        let syscalls = contents
+            .lines()
+            .filter_map(|line| {
+                if let Some(raw) = line.strip_prefix("@") {
+                    let sysno = raw
+                        .parse::<i32>()
+                        .ok()
+                        .map(reverie::syscalls::Sysno::from)?;
+                    detcore::is_unsupported_syscall(sysno).then(|| sysno.to_string())
+                } else if !line.is_empty()
+                    && line.len() <= 64
+                    && line
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    Some(line.to_owned())
+                } else {
+                    None
+                }
+            })
+            .take(512)
+            .collect::<BTreeSet<_>>();
         if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
             eprintln!("WARNING: {message}");
         }
@@ -141,20 +231,8 @@ pub fn run_dbi(
         drrun.display()
     );
 
-    let unsupported_report = DbiUnsupportedSyscallReport::new()?;
+    let _unsupported_report = DbiUnsupportedSyscallReport::new(panic_on_unsupported_syscalls)?;
     let mut guest = StdCommand::new(program);
-    guest.env(
-        detcore_dbi::PANIC_ON_UNSUPPORTED_SYSCALLS_ENV,
-        if panic_on_unsupported_syscalls {
-            "1"
-        } else {
-            "0"
-        },
-    );
-    guest.env(
-        detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_ENV,
-        unsupported_report.path(),
-    );
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
     }

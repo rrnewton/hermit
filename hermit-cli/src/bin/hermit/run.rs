@@ -1153,8 +1153,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "fail-closed strict deterministic mode",
+        "rejects unsupported syscalls immediately",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -1537,6 +1537,7 @@ impl RunOpts {
                  (--strict or --panic-on-unsupported-syscalls)"
             );
         }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -2262,6 +2263,7 @@ impl RunOpts {
         if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
             config.panic_on_unsupported_syscalls = true;
         }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
         config
     }
 

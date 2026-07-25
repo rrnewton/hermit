@@ -212,11 +212,24 @@ pub struct Config {
     pub panic_on_unsupported_syscalls: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-644): Review the internal cross-process warning report channel.
-    /// Internal append-only report used to aggregate unsupported syscalls across backend processes.
+    // TODO-HUMAN-REVIEW(PR-644): Review backend-safe fail-closed termination.
+    /// Return a typed Tool error instead of unwinding through a backend callback.
     #[serde(default)]
     #[clap(skip)]
-    pub unsupported_syscall_report: Option<PathBuf>,
+    pub exit_on_unsupported_syscall: bool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review process-tree shutdown for ptrace fail-closed mode.
+    /// Terminate the whole tracer when an unsupported syscall is observed.
+    #[serde(default)]
+    #[clap(skip)]
+    pub shutdown_on_unsupported_syscall: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-644): Review the internal cross-process warning report channel.
+    /// Internal inherited file descriptor used to aggregate unsupported syscalls.
+    #[serde(default)]
+    #[clap(skip)]
+    pub unsupported_syscall_report_fd: Option<i32>,
 
     /// Panic when a precise PMU timer overshoots its expected RCB target instead of logging an
     /// error and continuing through normal timer handling. Intended for Detcore debugging.

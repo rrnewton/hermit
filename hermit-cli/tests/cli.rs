@@ -459,7 +459,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
-    let warning = "syscalls getppid used but not yet supported";
+    let warning = "syscalls getpgrp,getppid used but not yet supported";
     assert_eq!(
         normal_stderr.matches(warning).count(),
         1,
@@ -474,10 +474,35 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&strict)
     );
     assert!(
-        stderr(&strict).contains("unsupported syscall: Getppid"),
+        stderr(&strict).contains("unsupported syscall: getppid"),
         "strict DBI failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
+    let normal_fork_args = ["run", "--backend", "dbi", "--verify", "--", program, "fork"];
+    let normal_fork = hermit(&normal_fork_args);
+    assert_success(&normal_fork, &normal_fork_args);
+    assert_eq!(stdout(&normal_fork), "dbi-unsupported-fork-ok\n");
+    assert_eq!(
+        stderr(&normal_fork).matches(warning).count(),
+        1,
+        "fork-child warning was not aggregated exactly once:\n{}",
+        stderr(&normal_fork)
+    );
+
+    for mode in ["fork", "exec-empty"] {
+        let args = ["run", "--backend", "dbi", "--strict", "--", program, mode];
+        let output = hermit(&args);
+        assert!(
+            !output.status.success(),
+            "strict DBI {mode} unexpectedly succeeded:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("unsupported syscall"),
+            "strict DBI {mode} omitted unsupported-syscall diagnostic:\n{}",
+            stderr(&output)
+        );
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -532,7 +557,6 @@ fn run_dbi_verifies_shell_process_lifecycle() {
         "run",
         "--backend",
         "dbi",
-        "--strict",
         "--verify",
         "--",
         "/bin/sh",
@@ -559,7 +583,6 @@ fn run_dbi_verifies_pipe_backpressure() {
         "run",
         "--backend",
         "dbi",
-        "--strict",
         "--verify",
         "--",
         "/bin/bash",
@@ -753,7 +776,6 @@ fn run_kvm_lists_host_directory_metadata() {
         "run",
         "--backend",
         "kvm",
-        "--strict",
         "--verify",
         "--base-env=minimal",
         "--tmp=/tmp",
