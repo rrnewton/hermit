@@ -25,7 +25,9 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
+use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -73,6 +75,7 @@ const FUTEX2_NUMA: u32 = 0x04;
 const FUTEX2_MPOL: u32 = 0x08;
 const FUTEX2_PRIVATE: u32 = libc::FUTEX_PRIVATE_FLAG as u32;
 const FUTEX2_VALID_MASK: u32 = FUTEX2_SIZE_MASK | FUTEX2_NUMA | FUTEX2_MPOL | FUTEX2_PRIVATE;
+const CLONE_ARGS_SIZE_VER0: usize = 64;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +144,11 @@ fn default_signal_action_terminates(signum: i32) -> bool {
 fn sanitize_clone_flags(mut flags: CloneFlags) -> CloneFlags {
     flags.remove(CloneFlags::CLONE_UNTRACED);
     flags
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review clone3's versioned size bounds.
+fn clone3_args_size_is_copyable(size: usize, page_size: usize) -> bool {
+    (CLONE_ARGS_SIZE_VER0..=page_size).contains(&size)
 }
 
 // TODO-HUMAN-REVIEW(PR-659): Review futex2 U32 flag and errno policy.
@@ -895,10 +903,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         clone_family: syscalls::family::CloneFamily,
     ) -> Result<i64, Error> {
-        let original_flags = clone_family.flags(&guest.memory());
+        let (original_flags, ctid, clone3_bytes) = match clone_family {
+            syscalls::family::CloneFamily::Clone3(call) => {
+                let max_size = usize::try_from(procfs::page_size())
+                    .expect("host page size does not fit in usize");
+                if !clone3_args_size_is_copyable(call.size(), max_size) {
+                    (CloneFlags::empty(), 0, None)
+                } else {
+                    let args_address = call.args().ok_or(Error::Errno(Errno::EFAULT))?;
+                    let mut bytes = vec![0; call.size()];
+                    guest.memory().read_exact(args_address.cast(), &mut bytes)?;
+                    let flags = CloneFlags::from_bits_retain(u64::from_ne_bytes(
+                        bytes[0..8].try_into().expect("clone3 flags prefix missing"),
+                    ));
+                    let child_tid = u64::from_ne_bytes(
+                        bytes[16..24]
+                            .try_into()
+                            .expect("clone3 child_tid prefix missing"),
+                    ) as usize;
+                    (flags, child_tid, Some(bytes))
+                }
+            }
+            other => (
+                other.flags(&guest.memory()),
+                other.child_tid(&guest.memory()),
+                None,
+            ),
+        };
         let flags = sanitize_clone_flags(original_flags);
-        let ctid = clone_family.child_tid(&guest.memory());
-        let mut clone3_stack_guard = None;
+        let mut clone3_scratch_mapping = None;
         let clone_family = if flags == original_flags {
             clone_family
         } else {
@@ -913,14 +946,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                     ))
                 }
                 syscalls::family::CloneFamily::Clone3(call) => {
-                    let args_address = call.args().ok_or(Error::Errno(Errno::EFAULT))?;
-                    let mut args: syscalls::CloneArgs = guest.memory().read_value(args_address)?;
-                    args.flags = flags;
-                    let mut stack = guest.stack().await;
-                    let sanitized_args = stack.push(args);
-                    let sanitized_args = AddrMut::from_raw(sanitized_args.as_raw())
-                        .expect("stack allocation returned a null clone3 argument address");
-                    clone3_stack_guard = Some(stack.commit()?);
+                    let mut bytes = clone3_bytes
+                        .expect("sanitized clone3 flags require a validated argument copy");
+                    bytes[0..8].copy_from_slice(&flags.bits().to_ne_bytes());
+                    let mapping_len = bytes.len();
+                    let mapped = guest
+                        .inject_with_retry(Syscall::Mmap(
+                            syscalls::Mmap::new()
+                                .with_addr(None)
+                                .with_len(mapping_len)
+                                .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                                .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                                .with_fd(-1)
+                                .with_offset(0),
+                        ))
+                        .await?;
+                    let mapped =
+                        usize::try_from(mapped).map_err(|_| Error::Errno(Errno::EFAULT))?;
+                    let mapping_addr = Addr::from_raw(mapped).ok_or(Error::Errno(Errno::EFAULT))?;
+                    let sanitized_args =
+                        AddrMut::from_raw(mapped).ok_or(Error::Errno(Errno::EFAULT))?;
+                    if let Err(write_error) =
+                        guest.memory().write_exact(sanitized_args.cast(), &bytes)
+                    {
+                        guest
+                            .inject_with_retry(Syscall::Munmap(
+                                syscalls::Munmap::new()
+                                    .with_addr(Some(mapping_addr))
+                                    .with_len(mapping_len),
+                            ))
+                            .await
+                            .unwrap_or_else(|cleanup_error| {
+                                panic!(
+                                    "failed to populate clone3 scratch ({write_error}); cleanup failed ({cleanup_error})"
+                                )
+                            });
+                        return Err(Error::Errno(write_error));
+                    }
+                    clone3_scratch_mapping = Some((mapping_addr, mapping_len));
                     syscalls::family::CloneFamily::Clone3(call.with_args(Some(sanitized_args)))
                 }
                 other => other,
@@ -968,7 +1031,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
-        drop(clone3_stack_guard);
+        if let Some((mapping_addr, mapping_len)) = clone3_scratch_mapping {
+            guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Some(mapping_addr))
+                        .with_len(mapping_len),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("failed to unmap clone3 scratch: {error}"));
+        }
 
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
@@ -1717,6 +1789,16 @@ mod tests {
             sanitize_clone_flags(flags),
             CloneFlags::CLONE_VM | CloneFlags::CLONE_CHILD_CLEARTID
         );
+    }
+
+    #[test]
+    fn clone3_copy_accepts_versioned_and_forward_compatible_sizes() {
+        let page_size = 4096;
+        assert!(!clone3_args_size_is_copyable(63, page_size));
+        for size in [64, 80, 88, 96, page_size] {
+            assert!(clone3_args_size_is_copyable(size, page_size));
+        }
+        assert!(!clone3_args_size_is_copyable(page_size + 1, page_size));
     }
 
     #[test]

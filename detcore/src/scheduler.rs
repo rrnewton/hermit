@@ -364,6 +364,9 @@ pub struct Scheduler {
     /// Prepared SIGKILL cohorts whose senders have not reached a deterministic boundary.
     pending_sigkill_senders: HashMap<DetTid, u64>,
 
+    /// Futex waiters held until SIGKILL cleanup can be published at an idle boundary.
+    pending_sigkill_futex_wake: Option<DetTid>,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -957,6 +960,7 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             pending_sigkills: Default::default(),
             pending_sigkill_senders: Default::default(),
+            pending_sigkill_futex_wake: None,
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -1564,11 +1568,13 @@ impl Scheduler {
     }
 
     fn wake_after_sigkill_quiesces(&mut self, waker: DetTid) -> u64 {
-        if self.pending_sigkills.is_empty() && self.pending_sigkill_senders.is_empty() {
-            self.wake_all_futex_waiters(waker)
-        } else {
-            0
+        if self.pending_sigkills.is_empty()
+            && self.pending_sigkill_senders.is_empty()
+            && !self.blocked.no_futex_waiters()
+        {
+            self.pending_sigkill_futex_wake.get_or_insert(waker);
         }
+        0
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review the nonblocking post-SIGKILL sender handoff.
@@ -1644,24 +1650,6 @@ impl Scheduler {
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2d_handle_empty_queue(global_time)?;
-        self.step2e_wait_for_sigkill_futex_reconciliation()?;
-        Ok(())
-    }
-
-    // TODO-HUMAN-REVIEW(PR-659): Review post-boundary robust-futex publication ordering.
-    /// Do not let an unrelated guest turn race the host-timed exit that makes robust state ready.
-    fn step2e_wait_for_sigkill_futex_reconciliation(&self) -> Result<(), SkipTurn> {
-        if !self.pending_sigkills.is_empty()
-            && self.pending_sigkill_senders.is_empty()
-            && !self.blocked.no_futex_waiters()
-        {
-            trace!(
-                "[scheduler] waiting after sender boundary for {} SIGKILL target exit(s) before publishing modeled futex wakeups",
-                self.pending_sigkills.len()
-            );
-            std::thread::yield_now();
-            return Err(SkipTurn);
-        }
         Ok(())
     }
 
@@ -2002,6 +1990,15 @@ impl Scheduler {
                     self.pending_sigkill_senders.len()
                 );
                 return Err(SkipTurn);
+            }
+            if let Some(waker) = self.pending_sigkill_futex_wake.take() {
+                let woken = self.wake_all_futex_waiters(waker);
+                trace!(
+                    "[scheduler] published {woken} deferred SIGKILL futex wake(s) at an idle boundary"
+                );
+                if !self.run_queue.is_empty() {
+                    return Ok(());
+                }
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
@@ -3201,8 +3198,9 @@ mod test {
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, true), 0);
         assert!(scheduler.pending_sigkill_senders.contains_key(&sender));
-        assert_eq!(scheduler.sigkill_sender_exited(sender), 1);
+        assert_eq!(scheduler.sigkill_sender_exited(sender), 0);
         assert!(scheduler.pending_sigkill_senders.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [survivor]
@@ -3241,10 +3239,12 @@ mod test {
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
-        assert_eq!(scheduler.cancel_prepared_sigkill(sender, targets), (0, 1));
+        assert_eq!(scheduler.cancel_prepared_sigkill(sender, targets), (0, 0));
         assert!(scheduler.pending_sigkills.is_empty());
         assert!(scheduler.pending_sigkill_senders.is_empty());
         assert!(!scheduler.run_queue.contains_tid(target));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(survivor));
         assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
     }
@@ -3351,7 +3351,7 @@ mod test {
     }
 
     #[test]
-    fn sigkill_sender_futex_boundary_releases_before_wait_registration() {
+    fn sigkill_sender_futex_boundary_defers_release_until_idle() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
         let target = DetTid::from_raw(10);
@@ -3384,15 +3384,18 @@ mod test {
         assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
         assert!(scheduler.pending_sigkill_senders.contains_key(&sender));
 
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 1);
+        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
         assert!(!scheduler.pending_sigkill_senders.contains_key(&sender));
-        assert!(scheduler.run_queue.contains_tid(survivor));
+        assert!(!scheduler.run_queue.contains_tid(survivor));
 
         let sender_futex = FutexID::private(MmId::initial(sender), 0x2000);
         scheduler.sleep_futex_waiter(&sender, sender_futex, None, u32::MAX);
         scheduler.run_queue.remove_tid(sender);
         assert!(scheduler.blocked.futex_waiters.contains_key(&sender_futex));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(survivor));
+        assert!(scheduler.run_queue.contains_tid(sender));
     }
 
     #[test]
@@ -3431,9 +3434,13 @@ mod test {
 
         assert_eq!(
             scheduler.logically_kill_thread(&target, &target, MmId::initial(target)),
-            1
+            0
         );
         assert!(scheduler.pending_sigkills.is_empty());
+        assert!(!scheduler.run_queue.contains_tid(survivor));
+        assert!(scheduler.run_queue.remove_tid(sender));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(survivor));
         assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
     }
@@ -3495,7 +3502,7 @@ mod test {
     }
 
     #[test]
-    fn post_sender_boundary_waits_for_sigkill_futex_reconciliation() {
+    fn sigkill_futex_reconciliation_does_not_block_unrelated_turns() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
         let target = DetTid::from_raw(10);
@@ -3535,18 +3542,24 @@ mod test {
         );
 
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
-        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [sender, unrelated]
         );
 
-        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 1));
+        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
-            [sender, unrelated, waiter]
+            [sender, unrelated]
         );
+        assert!(scheduler.run_queue.remove_tid(sender));
+        assert!(scheduler.run_queue.remove_tid(unrelated));
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            [waiter]
+        );
     }
 
     #[test]
@@ -3584,8 +3597,10 @@ mod test {
 
         assert_eq!(scheduler.complete_sigkill_exit(leader, leader), (1, 0));
         scheduler.logically_kill_thread(&leader, &leader, MmId::initial(leader));
-        assert_eq!(scheduler.complete_sigkill_exit(sibling, leader), (0, 1));
+        assert_eq!(scheduler.complete_sigkill_exit(sibling, leader), (0, 0));
         assert!(!scheduler.run_queue.contains_tid(sibling));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(survivor));
         assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
     }

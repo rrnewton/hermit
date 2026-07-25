@@ -63,7 +63,7 @@ struct futex_waitv_local {
   uint32_t reserved;
 };
 
-struct clone_args_local {
+struct clone_args_v0_local {
   uint64_t flags;
   uint64_t pidfd;
   uint64_t child_tid;
@@ -72,10 +72,10 @@ struct clone_args_local {
   uint64_t stack;
   uint64_t stack_size;
   uint64_t tls;
-  uint64_t set_tid;
-  uint64_t set_tid_size;
-  uint64_t cgroup;
 };
+
+_Static_assert(sizeof(struct clone_args_v0_local) == 64,
+               "clone_args v0 ABI must be 64 bytes");
 
 #if !defined(__GLIBC__)
 #error "This reproducer relies on glibc's pthread_mutex_t futex word layout"
@@ -919,12 +919,40 @@ static void check_broadcast_sigkill(void) {
     }
   }
 
-  const struct clone_args_local clone3_args = {
-      .flags = CLONE_UNTRACED,
-      .exit_signal = SIGCHLD,
-  };
-  pid_t clone3_child = syscall(SYS_clone3, &clone3_args, sizeof(clone3_args));
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size < (long)sizeof(struct clone_args_v0_local)) {
+    fprintf(stderr, "invalid page size for clone3 fixture: %ld\n", page_size);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    exit(EXIT_FAILURE);
+  }
+  void *clone3_mapping =
+      mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (clone3_mapping == MAP_FAILED ||
+      mprotect((char *)clone3_mapping + page_size, (size_t)page_size,
+               PROT_NONE) != 0) {
+    perror("clone3 boundary mapping");
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    exit(EXIT_FAILURE);
+  }
+  struct clone_args_v0_local *clone3_args =
+      (struct clone_args_v0_local *)((char *)clone3_mapping + page_size -
+                                     sizeof(*clone3_args));
+  memset(clone3_args, 0, sizeof(*clone3_args));
+  clone3_args->flags = CLONE_UNTRACED;
+  clone3_args->exit_signal = SIGCHLD;
+  pid_t clone3_child = syscall(SYS_clone3, clone3_args, sizeof(*clone3_args));
   if (clone3_child < 0) {
+    const int clone3_errno = errno;
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+      perror("cleanup legacy clone target");
+    }
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
+    }
+    munmap(clone3_mapping, (size_t)page_size * 2);
+    errno = clone3_errno;
     perror("clone3 untraced broadcast target");
     exit(EXIT_FAILURE);
   }
@@ -933,6 +961,10 @@ static void check_broadcast_sigkill(void) {
     for (;;) {
       pause();
     }
+  }
+  if (munmap(clone3_mapping, (size_t)page_size * 2) != 0) {
+    perror("munmap clone3 boundary mapping");
+    exit(EXIT_FAILURE);
   }
 
   while (atomic_load_explicit(ready, memory_order_acquire) != 2) {

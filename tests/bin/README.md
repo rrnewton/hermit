@@ -70,7 +70,9 @@ waits for a separate child event, guarding against suppression of caught
 signals, then restores the default disposition. The broadcast targets request
 `CLONE_UNTRACED` through both legacy `clone` and `clone3`; Detcore must remove
 that flag so every live guest descendant remains represented in the
-deterministic scheduler. Do not run that mode natively.
+deterministic scheduler. The `clone3` request uses the 64-byte v0 structure at
+the end of a readable page, with the following page protected, to catch fixed
+88-byte argument reads. Do not run that mode natively.
 
 # POSIX timer signal-delivery probe
 
