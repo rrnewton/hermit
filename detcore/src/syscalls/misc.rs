@@ -39,7 +39,7 @@ const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
-pub(crate) fn is_supported_prctl_option(option: libc::c_int) -> bool {
+fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
         libc::PR_SET_NAME | libc::PR_GET_NAME | libc::PR_SET_THP_DISABLE | libc::PR_GET_THP_DISABLE
@@ -109,23 +109,6 @@ fn write_random_chunk(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Preserve deterministic thread-name and transparent-huge-page controls.
-    ///
-    /// Ruby uses both controls while starting worker threads. Their results depend
-    /// only on the calling task and supplied arguments, and the shared passthrough
-    /// path records them when record/replay is active. Other prctl options retain
-    /// the existing unclassified policy at dispatch.
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#655): Confirm the narrow prctl passthrough policy.
-    pub async fn handle_prctl<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Prctl,
-    ) -> Result<i64, Error> {
-        debug_assert!(is_supported_prctl_option(call.option()));
-        self.passthrough(guest, call.into()).await
-    }
-
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -220,7 +203,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Handle deterministic process-local `prctl` options and reject the rest.
+    /// Preserve deterministic Ruby thread controls, report the container's fixed
+    /// capability bounding set, and reject options that expose unmodeled process
+    /// or host state.
     pub async fn handle_prctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -229,6 +214,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.option() {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            option if is_supported_prctl_option(option) => {
+                self.passthrough(guest, call.into()).await
+            }
             _ => Err(Errno::ENOSYS.into()),
         }
     }
