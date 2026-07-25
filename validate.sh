@@ -255,9 +255,9 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly RR_COMPAT_EXPECTED=140
-# Current main's 128-row ratchet plus four descriptor-state and eight
-# writable-filesystem programs.
+readonly RR_COMPAT_EXPECTED=141
+# Current main's 128-row ratchet plus four descriptor-state, eight
+# writable-filesystem, and one Ruby program.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
@@ -284,7 +284,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
     [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
     [diff]=1 [cp]=1 [install]=1 [tar]=1 [mv]=1 [rm]=1 [touch]=1 [chmod]=1
-    [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
+    [java]=1 [python3]=1 [ruby]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
     [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
@@ -1046,6 +1046,17 @@ function strict_compatibility_probe {
 function functional_compatibility_probe {
     local label=$1
     shift
+
+    if [[ $COMPATIBILITY_MODE == rr ]]; then
+        case "$label" in
+            gcc|make|as|ld)
+                rr_compatibility_probe "$label" env \
+                    REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
+                    bash "$REAL_COMPAT_WORKLOAD" "$label"
+                return $?
+                ;;
+        esac
+    fi
 
     if [[ $COMPATIBILITY_MODE != strict ]]; then
         strict_compatibility_probe "$label" "$@"
