@@ -191,7 +191,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review scratch fd sets and scheduler polling.
+    // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
     pub async fn handle_pselect6<G: Guest<Self>>(
         &self,
         guest: &mut G,

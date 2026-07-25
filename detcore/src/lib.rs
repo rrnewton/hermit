@@ -704,7 +704,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::getrusage,
                 Sysno::sysinfo,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-PENDING): Review scratch fd sets and scheduler polling.
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Sysno::pselect6,
                 // TODO(T137258824): add proper Select
                 // Sysno::select,
@@ -1390,7 +1390,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-PENDING): Review scratch fd sets and scheduler polling.
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
