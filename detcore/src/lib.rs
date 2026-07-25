@@ -884,6 +884,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if signal == Signal::SIGINT && self.cfg.sigint_instakill {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
             unrecoverable_shutdown(guest).await
+        } else if signal == Signal::SIGCHLD && !self.signal_has_user_handler(guest, signal) {
+            debug!(
+                "[detcore, dtid {}] suppressing uncaught SIGCHLD delivery stop",
+                guest.thread_state().dettid
+            );
+            Ok(None)
         } else {
             let terminates_thread_group = self.signal_will_terminate_thread_group(guest, signal);
             self.pre_handler_hook(guest, false).await;

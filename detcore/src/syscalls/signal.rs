@@ -34,6 +34,8 @@ use crate::tool_global::cancel_prepared_sigkill;
 use crate::tool_global::fence_prepared_sigkill;
 use crate::tool_global::prepare_sigkill_target;
 use crate::tool_global::register_alarm;
+use crate::tool_global::register_sigkill_targets;
+use crate::tool_global::resolve_sigkill_candidates;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
@@ -85,7 +87,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         let managed_sigkill = signum == libc::SIGKILL
             && self.cfg.sequentialize_threads
             && self.cfg.debug_futex_mode == BlockingMode::Precise;
-        let prepared_targets = if managed_sigkill {
+        let prepared_targets = if managed_sigkill && target.requires_permission_probe() {
+            let candidates = resolve_sigkill_candidates(guest, target).await;
+            let mut eligible = Vec::new();
+            for candidate in candidates {
+                let probe = syscalls::Kill::new()
+                    .with_pid(candidate.process.as_raw())
+                    .with_sig(0);
+                match guest.inject(probe).await {
+                    Ok(0) => eligible.extend(candidate.threads),
+                    Ok(result) => info!(
+                        "[detcore, dtid {}] signal-0 probe for process {} returned unexpected result {}",
+                        sender, candidate.process, result
+                    ),
+                    Err(Errno::EPERM | Errno::ESRCH) => {}
+                    Err(error) => info!(
+                        "[detcore, dtid {}] signal-0 probe for process {} returned unexpected error {}",
+                        sender, candidate.process, error
+                    ),
+                }
+            }
+            register_sigkill_targets(guest, eligible).await
+        } else if managed_sigkill {
             prepare_sigkill_target(guest, target).await
         } else {
             Vec::new()

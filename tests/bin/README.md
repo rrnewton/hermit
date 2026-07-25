@@ -40,6 +40,7 @@ PASS: robust mutex waiter received EOWNERDEAD
 PASS: sibling robust-list lookup and ESRCH semantics
 PASS: legacy and futex2 variants handled deterministically
 PASS: exit_group and fatal-signal owner death recovered
+PASS: negative process-group SIGKILL handled deterministically
 ```
 
 ### Hermit strict verification
@@ -59,6 +60,8 @@ The same fixture blocks real waiters across legacy `FUTEX_CMP_REQUEUE` and the
 U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
 `FUTEX_WAKE_OP`, sibling `get_robust_list`, missing-thread `ESRCH`,
 process-shared `exit_group`, and external `SIGKILL` cleanup.
+It additionally checks that a separate process can deliver `SIGKILL` through a
+negative process-group selector without introducing wait-order divergence.
 
 # POSIX timer signal-delivery probe
 

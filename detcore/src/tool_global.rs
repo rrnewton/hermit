@@ -67,6 +67,7 @@ use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
 use crate::scheduler::Seconds;
+use crate::scheduler::SigkillProcessCandidate;
 use crate::scheduler::SigkillTarget;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
@@ -510,6 +511,18 @@ impl GlobalTool for GlobalState {
                     .unwrap()
                     .prepare_sigkill_target(sender, target),
             ),
+            GlobalRequest::ResolveSigkillCandidates(target) => R::ResolveSigkillCandidates(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .resolve_sigkill_process_candidates(target),
+            ),
+            GlobalRequest::RegisterSigkillTargets(sender, targets) => R::RegisterSigkillTargets(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .register_sigkill_targets(sender, targets),
+            ),
             GlobalRequest::FencePreparedSigkill(targets) => R::FencePreparedSigkill(
                 self.sched
                     .lock()
@@ -668,7 +681,13 @@ impl GlobalState {
                     // We don't need to do anything extra for our own thread. That can use the
                     // same mechanics as a normal exit:
                     if tid != dettid {
-                        sched.logically_kill_thread(&tid, &process, mm);
+                        let woken = sched.logically_kill_thread(&tid, &process, mm);
+                        if woken > 0 {
+                            info!(
+                                "[detcore, dtid {}] exit-group cleanup woke {} post-SIGKILL futex waiter(s)",
+                                tid, woken
+                            );
+                        }
                     }
                 }
             }
@@ -947,7 +966,13 @@ impl GlobalState {
                 dettid, woken
             );
         }
-        sched.logically_kill_thread(&dettid, &detpid, mm);
+        let woken = sched.logically_kill_thread(&dettid, &detpid, mm);
+        if woken > 0 {
+            info!(
+                "[detcore, dtid {}] logical exit cleanup woke {} post-SIGKILL futex waiter(s)",
+                dettid, woken
+            );
+        }
         drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
@@ -1269,6 +1294,14 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation RPC.
     PrepareSigkillTarget(DetTid, SigkillTarget),
 
+    /// Resolve ambiguous group/broadcast targets into managed process candidates.
+    // TODO-HUMAN-REVIEW(PR-659): Review signal-0 candidate-resolution RPC.
+    ResolveSigkillCandidates(SigkillTarget),
+
+    /// Register only candidates that passed the sender-context signal-0 probe.
+    // TODO-HUMAN-REVIEW(PR-659): Review exact eligible-target registration RPC.
+    RegisterSigkillTargets(DetTid, Vec<DetTid>),
+
     /// Fence a prepared SIGKILL cohort after successful injection.
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence RPC.
     FencePreparedSigkill(Vec<DetTid>),
@@ -1330,6 +1363,10 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
     PrepareSigkillTarget(Vec<DetTid>),
+    // TODO-HUMAN-REVIEW(PR-659): Review signal-0 candidate-resolution response.
+    ResolveSigkillCandidates(Vec<SigkillProcessCandidate>),
+    // TODO-HUMAN-REVIEW(PR-659): Review exact eligible-target registration response.
+    RegisterSigkillTargets(Vec<DetTid>),
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence response.
     FencePreparedSigkill(u64),
     // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation response.
@@ -1654,6 +1691,43 @@ where
         send_and_update_time(guest, GlobalRequest::PrepareSigkillTarget(sender, target)).await;
     match response {
         GlobalResponse::PrepareSigkillTarget(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review managed group/broadcast candidate resolution.
+/// Resolve managed processes that may receive an ambiguous SIGKILL selector.
+pub async fn resolve_sigkill_candidates<G, T>(
+    guest: &mut G,
+    target: SigkillTarget,
+) -> Vec<SigkillProcessCandidate>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::ResolveSigkillCandidates(target)).await;
+    match response {
+        GlobalResponse::ResolveSigkillCandidates(candidates) => candidates,
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review registration of signal-0-probe-eligible targets.
+/// Register the managed threads whose process passed a signal-0 permission probe.
+pub async fn register_sigkill_targets<G, T>(guest: &mut G, targets: Vec<DetTid>) -> Vec<DetTid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sender = guest.thread_state().dettid;
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::RegisterSigkillTargets(sender, targets),
+    )
+    .await;
+    match response {
+        GlobalResponse::RegisterSigkillTargets(targets) => targets,
         _ => unreachable!(),
     }
 }

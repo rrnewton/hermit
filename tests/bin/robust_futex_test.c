@@ -764,6 +764,78 @@ static void check_group_termination(bool fatal_signal) {
   }
 }
 
+struct process_group_kill_state {
+  atomic_bool ready;
+  atomic_int error;
+};
+
+static void check_negative_process_group_sigkill(void) {
+  struct process_group_kill_state *state =
+      mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (state == MAP_FAILED) {
+    perror("mmap process-group state");
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t target = fork();
+  if (target < 0) {
+    perror("fork process-group target");
+    exit(EXIT_FAILURE);
+  }
+  if (target == 0) {
+    if (setsid() != getpid()) {
+      atomic_store_explicit(&state->error, errno, memory_order_release);
+      atomic_store_explicit(&state->ready, true, memory_order_release);
+      _exit(80);
+    }
+    atomic_store_explicit(&state->ready, true, memory_order_release);
+    for (;;) {
+      sched_yield();
+    }
+  }
+
+  while (!atomic_load_explicit(&state->ready, memory_order_acquire)) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&state->error, memory_order_acquire) != 0) {
+    fprintf(stderr, "process-group target setsid failed: %d\n",
+            atomic_load_explicit(&state->error, memory_order_acquire));
+    exit(EXIT_FAILURE);
+  }
+
+  pid_t killer = fork();
+  if (killer < 0) {
+    perror("fork process-group killer");
+    exit(EXIT_FAILURE);
+  }
+  if (killer == 0) {
+    if (kill(-target, SIGKILL) != 0) {
+      atomic_store_explicit(&state->error, errno, memory_order_release);
+      _exit(81);
+    }
+    _exit(0);
+  }
+
+  int target_status = 0;
+  int killer_status = 0;
+  if (waitpid(target, &target_status, 0) != target ||
+      !WIFSIGNALED(target_status) || WTERMSIG(target_status) != SIGKILL ||
+      waitpid(killer, &killer_status, 0) != killer ||
+      !WIFEXITED(killer_status) || WEXITSTATUS(killer_status) != 0 ||
+      atomic_load_explicit(&state->error, memory_order_acquire) != 0) {
+    fprintf(stderr,
+            "negative process-group SIGKILL target=%#x killer=%#x error=%d\n",
+            target_status, killer_status,
+            atomic_load_explicit(&state->error, memory_order_acquire));
+    exit(EXIT_FAILURE);
+  }
+  if (munmap(state, sizeof(*state)) != 0) {
+    perror("munmap process-group state");
+    exit(EXIT_FAILURE);
+  }
+}
+
 static void check_futex_variants(void) {
   int source = 0;
   int target = 7;
@@ -881,11 +953,13 @@ int main(void) {
   check_blocked_futex_variants();
   check_group_termination(false);
   check_group_termination(true);
+  check_negative_process_group_sigkill();
   puts("PASS: blocked and failed signals preserved live owner");
   puts("PASS: pending owner-zero robust wake preserved word");
   puts("PASS: robust mutex waiter received EOWNERDEAD");
   puts("PASS: sibling robust-list lookup and ESRCH semantics");
   puts("PASS: legacy and futex2 variants handled deterministically");
   puts("PASS: exit_group and fatal-signal owner death recovered");
+  puts("PASS: negative process-group SIGKILL handled deterministically");
   return EXIT_SUCCESS;
 }

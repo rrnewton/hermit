@@ -310,6 +310,24 @@ fn rebase_absolute_timeout(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // TODO-HUMAN-REVIEW(PR-659): Review suppression of uncaught default-ignored SIGCHLD stops.
+    pub(crate) fn signal_has_user_handler<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        signal: Signal,
+    ) -> bool {
+        let signum = signal as i32;
+        let status = match Process::new(guest.pid().as_raw()).and_then(|process| process.status()) {
+            Ok(status) => status,
+            Err(error) => {
+                debug!("could not inspect signal disposition for {signal}: {error}");
+                return true;
+            }
+        };
+        let signal_mask = 1_u64 << (signum - 1);
+        status.sigcgt & signal_mask != 0
+    }
+
     // TODO-HUMAN-REVIEW(PR-659): Review fatal-signal disposition detection for robust cleanup.
     pub(crate) fn signal_will_terminate_thread_group<G: Guest<Self>>(
         &self,
