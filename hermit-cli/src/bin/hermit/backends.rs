@@ -325,7 +325,7 @@ fn run_once<R: Read + Send + 'static>(
     input: R,
 ) -> Result<Output, Error> {
     runner
-        .output_with_reader(guest, input)
+        .output_with_detached_reader(guest, input)
         .map_err(|error| launch_error(drrun, error))
 }
 
