@@ -399,6 +399,8 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit guest-created regular-file identity tracking.
     async fn handle_open<G: Guest<Self>>(
         &self,
         guest: &mut G,

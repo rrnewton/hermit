@@ -277,6 +277,8 @@ impl Replayer {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit replay-root file and directory materialization.
     async fn handle_virtual_fd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
