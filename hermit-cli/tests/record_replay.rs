@@ -203,6 +203,7 @@ fn workloads() -> &'static [Workload] {
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_record_replay_fd_close", "record_replay_fd_close.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
+            ("c_record_replay_file_state", "record_replay_file_state.c"),
             ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -264,6 +265,32 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         "Hermit did not report deterministic replay for {name}:\n{combined_output}"
     );
 }
+fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    let record_output = command_output(record, &format!("recording for {name}"));
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replay_output = command_output(replay, &format!("replay for {name}"));
+
+    assert_eq!(
+        record_output.stdout, replay_output.stdout,
+        "replayed guest stdout did not match the recording for {name}"
+    );
+}
 
 fn record_replay(workload: &Workload) {
     record_replay_command(workload.name, &workload.path, &[]);
@@ -309,6 +336,11 @@ fn record_replay_matrix() {
     for name in BASELINE_RECORD_WORKLOADS {
         record_replay(workload(name));
     }
+}
+
+#[test]
+fn record_reopened_inherited_and_cloned_file_state() {
+    run_record_replay("c_record_replay_file_state");
 }
 
 #[test]
@@ -579,7 +611,9 @@ fn record_node_eventfd_epoll_sequence() {
         return;
     };
 
-    record_replay_command(
+    // Node's worker wake order can change the DETLOG order while preserving the
+    // recorded event stream, descriptor state, exit status, and guest output.
+    record_then_replay_command(
         "node-eventfd-epoll-sequence",
         node,
         &[OsStr::new("-e"), OsStr::new("console.log(42)")],

@@ -36,6 +36,7 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Replayer;
+use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
 
 #[repr(C)]
@@ -285,6 +286,14 @@ fn read_write_bytes<M: MemoryAccess>(
     }
 }
 
+fn vectored_offset(low: u64, high: u64) -> i64 {
+    if std::mem::size_of::<usize>() == 8 {
+        low as i64
+    } else {
+        ((high << 32) | (low & u32::MAX as u64)) as i64
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#662): Audit temporary blocking and restoration for replay side effects.
 async fn inject_kernel_side_effect<G: Guest<Replayer>>(
@@ -319,6 +328,59 @@ async fn inject_kernel_side_effect<G: Guest<Replayer>>(
 }
 
 impl Replayer {
+    fn advance_regular_file_position(&self, pid: reverie::Pid, fd: libc::c_int, length: usize) {
+        if !self.fd_is_in_replay_root(pid, fd) {
+            return;
+        }
+        let duplicate = crate::fd::duplicate_guest_fd(pid, fd)
+            .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
+        let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
+        // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
+        let result = unsafe { libc::lseek(duplicate.as_raw_fd(), offset, libc::SEEK_CUR) };
+        assert_ne!(
+            result,
+            -1,
+            "failed to advance replay file after read: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn replay_regular_file_write<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: WriteFamily,
+        count: usize,
+        offset: Option<i64>,
+        advances_offset: bool,
+    ) -> Result<(), Errno> {
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            return Ok(());
+        }
+        let offset = offset.expect("recorded regular-file write is missing its offset");
+        let offset_u64 = u64::try_from(offset).expect("recorded write used a negative offset");
+        let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
+        let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+            .unwrap_or_else(|error| panic!("failed to duplicate replay file for write: {error}"));
+        let file = std::fs::File::from(duplicate);
+        file.write_all_at(&bytes, offset_u64)
+            .unwrap_or_else(|error| panic!("failed to materialize replay write: {error}"));
+
+        if advances_offset {
+            let next = offset
+                .checked_add(i64::try_from(count).expect("recorded write length exceeds i64"))
+                .expect("recorded write offset overflow");
+            // SAFETY: file owns a duplicate of the guest open-file description.
+            let result = unsafe { libc::lseek(file.as_raw_fd(), next, libc::SEEK_SET) };
+            assert_eq!(
+                result,
+                next,
+                "failed to advance replay file after write: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
     /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
     /// scattering the recorded flattened output bytes across the guest's current
     /// `iovec` buffers. Guest-created regular files and eventfds are also read
@@ -331,19 +393,27 @@ impl Replayer {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadvV2)?;
-        if event.replay_kernel_side_effect {
-            let fd = match syscall {
-                Syscall::Readv(call) => call.fd(),
-                Syscall::Preadv(call) => call.fd(),
-                Syscall::Preadv2(call) => call.fd(),
-                _ => unreachable!("readv-family handler received {syscall:?}"),
-            };
-            let actual = inject_kernel_side_effect(guest, fd, syscall).await;
-            assert_eq!(
-                actual,
-                Ok(event.bytes.len() as i64),
-                "replayed readv kernel side effect diverged"
-            );
+        let (fd, advances_offset) = match syscall {
+            Syscall::Readv(call) => (call.fd(), true),
+            Syscall::Preadv(call) => (call.fd(), false),
+            Syscall::Preadv2(call) => {
+                (call.fd(), vectored_offset(call.pos_l(), call.pos_h()) == -1)
+            }
+            _ => unreachable!("readv-family handler received {syscall:?}"),
+        };
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual = inject_kernel_side_effect(guest, fd, syscall).await;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed readv eventfd side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile if advances_offset => {
+                self.advance_regular_file_position(guest.pid(), fd, event.bytes.len());
+            }
+            ReplayFdKind::None | ReplayFdKind::RegularFile => {}
         }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
@@ -359,13 +429,19 @@ impl Replayer {
         syscall: Read,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadV2)?;
-        if event.replay_kernel_side_effect {
-            let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
-            assert_eq!(
-                actual,
-                Ok(event.bytes.len() as i64),
-                "replayed read kernel side effect diverged"
-            );
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed read eventfd side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile => {
+                self.advance_regular_file_position(guest.pid(), syscall.fd(), event.bytes.len());
+            }
+            ReplayFdKind::None => {}
         }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
@@ -502,13 +578,27 @@ impl Replayer {
         syscall: WriteFamily,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, WriteV2)?;
-        if event.replay_kernel_side_effect {
-            let actual =
-                inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
-            assert_eq!(
-                actual, event.result,
-                "replayed write kernel side effect diverged"
-            );
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual =
+                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
+                assert_eq!(
+                    actual, event.result,
+                    "replayed eventfd write side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile => {
+                if let Ok(count) = event.result {
+                    self.replay_regular_file_write(
+                        guest,
+                        syscall,
+                        usize::try_from(count).expect("negative successful write count"),
+                        event.replay_file_offset,
+                        event.replay_file_advances_offset,
+                    )?;
+                }
+            }
+            ReplayFdKind::None => {}
         }
         if event.generated_sigpipe {
             self.replay_sigpipe(guest).await?;
@@ -546,6 +636,20 @@ impl Replayer {
                     "failed to reproduce ftruncate on captured output fd {output_fd}: {}",
                     std::io::Error::last_os_error()
                 );
+            }
+            if event.replay_regular_file
+                && event.output_fd.is_none()
+                && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
+            {
+                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to duplicate replay file for ftruncate: {error}")
+                    });
+                let file = std::fs::File::from(duplicate);
+                file.set_len(
+                    u64::try_from(event.length).expect("successful ftruncate used negative length"),
+                )
+                .unwrap_or_else(|error| panic!("failed to materialize replay ftruncate: {error}"));
             }
         }
         event.result
@@ -606,14 +710,22 @@ impl Replayer {
             ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
         ) {
             let snapshot = next_event!(guest, FileClone)?;
-            let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
-                .unwrap_or_else(|error| panic!("failed to duplicate cloned replay file: {error}"));
-            let file = std::fs::File::from(duplicate);
-            file.set_len(snapshot.len() as u64)
-                .unwrap_or_else(|error| panic!("failed to size cloned replay file: {error}"));
-            file.write_all_at(&snapshot, 0).unwrap_or_else(|error| {
-                panic!("failed to materialize cloned replay file: {error}")
-            });
+            if self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to duplicate cloned replay file: {error}")
+                    });
+                let file = std::fs::File::from(duplicate);
+                file.set_len(0)
+                    .and_then(|()| file.set_len(snapshot.length))
+                    .unwrap_or_else(|error| panic!("failed to size cloned replay file: {error}"));
+                for extent in snapshot.extents {
+                    file.write_all_at(&extent.bytes, extent.offset)
+                        .unwrap_or_else(|error| {
+                            panic!("failed to materialize cloned replay extent: {error}")
+                        });
+                }
+            }
             Ok(0)
         } else if matches!(
             request,

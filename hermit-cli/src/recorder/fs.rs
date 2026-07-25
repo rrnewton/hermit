@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
 
 use reverie::Errno;
@@ -28,8 +30,11 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Recorder;
+use crate::event::FileCloneEvent;
+use crate::event::FileExtent;
 use crate::event::FtruncateEvent;
 use crate::event::ReadEvent;
+use crate::event::ReplayFdKind;
 use crate::event::StatEvent;
 use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
@@ -175,6 +180,93 @@ fn output_file_offset(
     }
 }
 
+const MAX_CLONE_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_dense_clone_snapshot(file: &std::fs::File, length: u64) -> std::io::Result<FileCloneEvent> {
+    if length > MAX_CLONE_SNAPSHOT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("clone snapshot is {length} bytes; limit is {MAX_CLONE_SNAPSHOT_BYTES}"),
+        ));
+    }
+    let mut bytes = vec![0; length as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    Ok(FileCloneEvent {
+        length,
+        extents: (!bytes.is_empty())
+            .then_some(FileExtent { offset: 0, bytes })
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn clone_snapshot(path: &str) -> std::io::Result<FileCloneEvent> {
+    let file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut extents = Vec::new();
+    let mut total = 0u64;
+    let mut cursor = 0u64;
+
+    while cursor < length {
+        // SAFETY: file is an owned descriptor and cursor fits off_t on x86_64.
+        let data = unsafe {
+            libc::lseek(
+                file.as_raw_fd(),
+                cursor.try_into().unwrap(),
+                libc::SEEK_DATA,
+            )
+        };
+        if data == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return read_dense_clone_snapshot(&file, length);
+            }
+            return Err(error);
+        }
+        // SAFETY: file is an owned descriptor and data was returned by lseek.
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data, libc::SEEK_HOLE) };
+        if hole == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENXIO) {
+                return Err(error);
+            }
+        }
+        let data = data as u64;
+        let hole = if hole == -1 {
+            length
+        } else {
+            (hole as u64).min(length)
+        };
+        let extent_length = hole.saturating_sub(data);
+        total = total.checked_add(extent_length).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "clone snapshot size overflow",
+            )
+        })?;
+        if total > MAX_CLONE_SNAPSHOT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "clone data extents total {total} bytes; limit is {MAX_CLONE_SNAPSHOT_BYTES}"
+                ),
+            ));
+        }
+        let mut bytes = vec![0; extent_length as usize];
+        file.read_exact_at(&mut bytes, data)?;
+        extents.push(FileExtent {
+            offset: data,
+            bytes,
+        });
+        cursor = hole;
+    }
+
+    Ok(FileCloneEvent { length, extents })
+}
+
 impl Recorder {
     /// Records the vectored read family (`readv`/`preadv`/`preadv2`). Writes only
     /// need their return count (see `handle_write_family`), but vectored reads
@@ -200,8 +292,7 @@ impl Recorder {
                         fd,
                         &bytes,
                     ),
-                    replay_kernel_side_effect: self
-                        .fd_requires_replay_kernel_side_effect(guest.pid(), fd),
+                    replay_fd_kind: self.fd_replay_kind(guest.pid(), fd),
                     bytes,
                 }))
             }),
@@ -230,8 +321,7 @@ impl Recorder {
                         &buf,
                     ),
                     bytes: buf,
-                    replay_kernel_side_effect: self
-                        .fd_requires_replay_kernel_side_effect(guest.pid(), syscall.fd()),
+                    replay_fd_kind: self.fd_replay_kind(guest.pid(), syscall.fd()),
                 }))
             }),
         );
@@ -303,21 +393,29 @@ impl Recorder {
                 (None, false)
             }
         });
-        let output_offset = match (output_fd, result, metadata.as_ref()) {
-            (Some(_), Ok(count), Some(metadata)) => {
+        let file_offset = match (result, metadata.as_ref()) {
+            (Ok(count), Some(metadata)) => {
                 output_file_offset(guest.pid().as_raw(), syscall, metadata, count)
             }
             _ => None,
         };
+        let output_offset = output_fd.and(file_offset);
         let advances_output_offset =
             output_offset.is_some() && shares_output_ofd && write_advances_output_offset(syscall);
         let generated_sigpipe = result == Err(Errno::EPIPE)
             && metadata.is_some_and(|metadata| {
                 metadata.file_type().is_fifo() || metadata.file_type().is_socket()
             });
-        let replay_kernel_side_effect = result.is_ok()
-            && output_fd.is_none()
-            && self.fd_requires_replay_kernel_side_effect(guest.pid(), syscall.fd());
+        let replay_fd_kind = if result.is_ok() && output_fd.is_none() {
+            self.fd_replay_kind(guest.pid(), syscall.fd())
+        } else {
+            ReplayFdKind::None
+        };
+        let replay_file_offset = (replay_fd_kind == ReplayFdKind::RegularFile)
+            .then_some(file_offset)
+            .flatten();
+        let replay_file_advances_offset =
+            replay_file_offset.is_some() && write_advances_output_offset(syscall);
         self.record_event(
             guest,
             Ok(SyscallEvent::WriteV2(WriteEvent {
@@ -326,7 +424,9 @@ impl Recorder {
                 output_offset,
                 generated_sigpipe,
                 advances_output_offset,
-                replay_kernel_side_effect,
+                replay_fd_kind,
+                replay_file_offset,
+                replay_file_advances_offset,
             })),
         );
 
@@ -371,6 +471,8 @@ impl Recorder {
                 result,
                 output_fd,
                 length: syscall.length(),
+                replay_regular_file: result.is_ok()
+                    && metadata.is_some_and(|metadata| metadata.file_type().is_file()),
             })),
         );
         result
@@ -461,7 +563,7 @@ impl Recorder {
             ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
         ) {
             let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
-            let snapshot = std::fs::read(&path).unwrap_or_else(|error| {
+            let snapshot = clone_snapshot(&path).unwrap_or_else(|error| {
                 panic!("failed to snapshot cloned destination {path}: {error}")
             });
             self.record_event(guest, Ok(SyscallEvent::FileClone(snapshot)));
