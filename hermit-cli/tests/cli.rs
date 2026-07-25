@@ -489,7 +489,29 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&normal_fork)
     );
 
-    for mode in ["fork", "exec-empty"] {
+    let normal_fork_exec_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--verify",
+        "--",
+        program,
+        "fork-exec",
+    ];
+    let normal_fork_exec = hermit(&normal_fork_exec_args);
+    assert_success(&normal_fork_exec, &normal_fork_exec_args);
+    assert_eq!(
+        stdout(&normal_fork_exec),
+        "dbi-unsupported-exec-ok\ndbi-unsupported-fork-exec-parent-ok\n"
+    );
+    assert_eq!(
+        stderr(&normal_fork_exec).matches(warning).count(),
+        1,
+        "fork-exec warning was not aggregated exactly once:\n{}",
+        stderr(&normal_fork_exec)
+    );
+
+    for mode in ["fork", "fork-exec", "exec-empty"] {
         let args = ["run", "--backend", "dbi", "--strict", "--", program, mode];
         let output = hermit(&args);
         assert!(
@@ -503,6 +525,36 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
             stderr(&output)
         );
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review strict DBI teardown with a blocked stdin source.
+#[test]
+fn run_dbi_strict_returns_with_blocked_stdin_source() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBI unsupported-syscall guest path should be UTF-8");
+    let mut source = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to start blocked DBI stdin source");
+    let args = ["run", "--backend", "dbi", "--strict", "--", program];
+    let output = Command::new("timeout")
+        .args(["--kill-after", "2s", "10s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(source.stdout.take().expect("sleep stdout was not piped"))
+        .output()
+        .expect("failed to run strict DBI blocked-input regression");
+    let _ = source.kill();
+    let _ = source.wait();
+    assert_ne!(output.status.code(), Some(124), "strict DBI hung on stdin");
+    assert!(
+        !output.status.success(),
+        "strict DBI unexpectedly succeeded"
+    );
+    assert!(stderr(&output).contains("unsupported syscall"));
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
