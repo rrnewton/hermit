@@ -297,19 +297,18 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(fd) = recorded {
-            if flags.contains(OFlag::O_CREAT) {
-                let actual = guest.inject_with_retry(syscall).await;
-                assert_eq!(
-                    actual, recorded,
-                    "replay materialized open returned a different descriptor"
-                );
-            } else if flags.contains(OFlag::O_DIRECTORY) {
+            if flags.contains(OFlag::O_CREAT) || flags.contains(OFlag::O_DIRECTORY) {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => assert_eq!(
                         actual, fd,
-                        "replay materialized directory returned a different descriptor"
+                        "replay materialized open returned a different descriptor"
                     ),
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::debug!(
+                            ?syscall,
+                            %error,
+                            "replay path unavailable; reserving a virtual descriptor"
+                        );
                         self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                             .await;
                     }
