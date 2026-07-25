@@ -524,6 +524,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
+        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);

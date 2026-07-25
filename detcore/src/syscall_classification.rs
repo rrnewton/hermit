@@ -233,28 +233,45 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::truncate
         // Stable guest-owned metadata and synchronous writeback operations are
         // repeatable in Hermit's fixed mount namespace and filesystem image.
-        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#683): Confirm the metadata/writeback passthrough boundary.
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::faccessat
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fchmod
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fchmodat2
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fchown
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fchownat
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fgetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::flistxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fremovexattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lchown
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::link
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::listxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::llistxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lremovexattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::msync
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readahead
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::symlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::sync_file_range
-        | Sysno::syncfs
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -443,6 +460,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::swapoff
         | Sysno::swapon
         | Sysno::sync
+        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
@@ -482,7 +500,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [111, 69, 193]);
+        assert_eq!(counts, [111, 68, 194]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -574,7 +592,6 @@ mod tests {
             Sysno::symlink,
             Sysno::symlinkat,
             Sysno::sync_file_range,
-            Sysno::syncfs,
             Sysno::truncate,
             Sysno::umask,
             Sysno::unlink,

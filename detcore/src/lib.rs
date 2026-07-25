@@ -619,6 +619,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 Sysno::writev,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#683)
+                Sysno::pwrite64,
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
@@ -1470,11 +1473,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
-            // The pinned Reverie revision lists these calls as untyped, so dispatch by
-            // Sysno while retaining typed guards for every represented call.
-            SyscallClassification::PassThrough
-                if matches!(call.number(), Sysno::faccessat2 | Sysno::fchmodat2) =>
-            {
+            // The pinned Reverie revision lists this call as untyped, so dispatch by Sysno.
+            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
+                self.passthrough(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#683): Verify the untyped fchmodat2 dispatch edge.
+            SyscallClassification::PassThrough if call.number() == Sysno::fchmodat2 => {
                 self.passthrough(guest, call).await
             }
             SyscallClassification::PassThrough => match call {
@@ -1484,16 +1489,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Capset(_)
                 | Syscall::Chdir(_)
                 | Syscall::Chmod(_)
+                // TODO-HUMAN-REVIEW(#683): Verify metadata/writeback passthrough dispatch.
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Faccessat(_)
                 | Syscall::Fchdir(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fchmod(_)
                 | Syscall::Fchmodat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fchown(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fchownat(_)
                 | Syscall::Fdatasync(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fgetxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Flistxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fremovexattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fsetxattr(_)
                 | Syscall::Ftruncate(_)
                 // Fixed credentials and process-local unlocks are deterministic; fsync is
@@ -1531,20 +1545,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
                 | Syscall::Getxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Lchown(_)
                 | Syscall::Lgetxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Link(_)
                 | Syscall::Linkat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Listxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Llistxattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Lremovexattr(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Lsetxattr(_)
                 | Syscall::Lseek(_)
                 | Syscall::Mkdir(_)
                 | Syscall::Mkdirat(_)
                 | Syscall::Mprotect(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Msync(_)
                 | Syscall::Readlink(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Readahead(_)
                 | Syscall::Removexattr(_)
                 | Syscall::Renameat2(_)
@@ -1554,10 +1576,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Symlink(_)
                 | Syscall::Symlinkat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::SyncFileRange(_)
-                | Syscall::Syncfs(_)
                 | Syscall::Umask(_)
                 | Syscall::Unlink(_)
                 | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
@@ -1722,6 +1745,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::writev)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::pwrite64)
         );
     }
 }
