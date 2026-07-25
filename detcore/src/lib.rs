@@ -1119,6 +1119,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest.thread_state_mut().robust_list_heads = Arc::new(Mutex::new(
             std::collections::BTreeMap::from([(dettid, None)]),
         ));
+        tool_global::register_robust_pending_futex(guest, None).await;
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 

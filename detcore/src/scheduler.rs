@@ -79,6 +79,7 @@ use crate::types::SyscallPhase;
 use crate::util::truncated;
 
 const SIGKILL_RECONCILIATION_SPINS: u32 = 16;
+const ROBUST_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
 /// Unique identifier for an action.
 pub type ActionID = u64;
@@ -197,13 +198,14 @@ pub type SchedRequest = Result<Resources, ThreadExited>;
 #[derive(Debug, Clone)]
 pub struct ThreadExited;
 
-/// A thread waiting on a futex, including the bitset accepted by wake operations.
+/// A thread waiting on a futex, including its expected word and wake bitset.
 #[derive(Debug, Clone)]
 // TODO-HUMAN-REVIEW(PR-659): Review modeled futex wait entries used by wake/requeue operations.
 pub struct FutexWaiter {
     dettid: DetTid,
     response: Ivar<SchedResponse>,
     bitset: u32,
+    expected: i32,
 }
 
 /// Deterministically pick one element from `choices` using the supplied PRNG,
@@ -366,6 +368,9 @@ pub struct Scheduler {
 
     /// Prepared SIGKILL cohorts whose senders have not reached a deterministic boundary.
     pending_sigkill_senders: HashMap<DetTid, u64>,
+
+    /// Zero-owner robust `list_op_pending` futex identities mirrored at registration.
+    robust_pending_futexes: HashMap<DetTid, FutexID>,
 
     /// Coalesced futex reconciliation credit from a completed SIGKILL cohort.
     pending_sigkill_futex_wake: Option<DetTid>,
@@ -984,6 +989,7 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             pending_sigkills: Default::default(),
             pending_sigkill_senders: Default::default(),
+            robust_pending_futexes: Default::default(),
             pending_sigkill_futex_wake: None,
             sigkill_reconciliation_waiters: Default::default(),
             sigkill_provisional_futex_rechecks: Default::default(),
@@ -1143,6 +1149,7 @@ impl Scheduler {
 
         let removed_pending = self.pending_sigkills.remove(dtid)
             | self.pending_sigkill_senders.remove(dtid).is_some();
+        self.robust_pending_futexes.remove(dtid);
         self.remove_sigkill_futex_state_for_thread(dtid);
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
@@ -1232,12 +1239,14 @@ impl Scheduler {
         removed == 1
     }
 
+    // TODO-HUMAN-REVIEW(PR-659): Review preservation of the observed futex word.
     /// Put a Futex waiter to sleep, to be awoken by `wake_futex_waiter`.
     pub fn sleep_futex_waiter(
         &mut self,
         dettid: &DetTid,
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
+        expected: i32,
         bitset: u32,
     ) {
         let nxt = self
@@ -1249,6 +1258,7 @@ impl Scheduler {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
+            expected,
         });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
@@ -1539,14 +1549,46 @@ impl Scheduler {
         for target in &targets {
             self.pending_sigkills.insert(*target);
         }
-        for (&futexid, waiters) in &self.blocked.futex_waiters {
-            self.sigkill_reconciliation_waiters
-                .extend(waiters.iter().map(|waiter| (waiter.dettid, futexid)));
-        }
+        self.capture_current_sigkill_futex_waiters();
         if register_sender {
             *self.pending_sigkill_senders.entry(sender).or_default() += 1;
         }
         targets
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review mirrored zero-owner robust pending identity.
+    /// Replace the zero-owner `list_op_pending` futex associated with one robust owner.
+    pub fn register_robust_pending_futex(&mut self, owner: DetTid, futexid: Option<FutexID>) {
+        if let Some(futexid) = futexid {
+            self.robust_pending_futexes.insert(owner, futexid);
+        } else {
+            self.robust_pending_futexes.remove(&owner);
+        }
+    }
+
+    fn capture_current_sigkill_futex_waiters(&mut self) {
+        let owners = self
+            .pending_sigkills
+            .iter()
+            .map(|target| target.as_raw() as u32 & ROBUST_FUTEX_TID_MASK)
+            .collect::<BTreeSet<_>>();
+        let zero_owner_futexes = self
+            .pending_sigkills
+            .iter()
+            .filter_map(|target| self.robust_pending_futexes.get(target).copied())
+            .collect::<BTreeSet<_>>();
+        for (&futexid, waiters) in &self.blocked.futex_waiters {
+            self.sigkill_reconciliation_waiters.extend(
+                waiters
+                    .iter()
+                    .filter(|waiter| {
+                        let owner = waiter.expected as u32 & ROBUST_FUTEX_TID_MASK;
+                        (owner != 0 && owners.contains(&owner))
+                            || (owner == 0 && zero_owner_futexes.contains(&futexid))
+                    })
+                    .map(|waiter| (waiter.dettid, futexid)),
+            );
+        }
     }
 
     fn finish_pending_sigkill_sender_cohort(&mut self, sender: DetTid) -> bool {
@@ -1643,10 +1685,7 @@ impl Scheduler {
             self.run_queue.remove_tid(*target);
             self.remove_blocking_entries(target);
         }
-        for (&futexid, waiters) in &self.blocked.futex_waiters {
-            self.sigkill_reconciliation_waiters
-                .extend(waiters.iter().map(|waiter| (waiter.dettid, futexid)));
-        }
+        self.capture_current_sigkill_futex_waiters();
         if self_inclusive && !self.sigkill_reconciliation_waiters.is_empty() {
             self.sigkill_reconciliation_spins_remaining = SIGKILL_RECONCILIATION_SPINS;
             self.sigkill_reconciliation_waker = Some(sender);
@@ -1782,6 +1821,39 @@ impl Scheduler {
             .retain(|(waiter, futex)| *waiter != dettid || *futex == futexid);
         self.completed_sigkill_futex_rechecks
             .retain(|(waiter, futex)| *waiter != dettid || *futex == futexid);
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review late robust-owner waiter attribution.
+    /// Capture a waiter that observed one of the still-pending SIGKILL target TIDs.
+    pub fn capture_late_sigkill_futex_waiter(
+        &mut self,
+        dettid: DetTid,
+        futexid: FutexID,
+        initial_value: i32,
+    ) -> bool {
+        let owner = initial_value as u32 & ROBUST_FUTEX_TID_MASK;
+        let matches_owner = owner != 0
+            && self
+                .pending_sigkills
+                .iter()
+                .any(|target| target.as_raw() as u32 & ROBUST_FUTEX_TID_MASK == owner);
+        let matches_zero_owner_pending = owner == 0
+            && self
+                .pending_sigkills
+                .iter()
+                .any(|target| self.robust_pending_futexes.get(target).copied() == Some(futexid));
+        if !matches_owner && !matches_zero_owner_pending {
+            return false;
+        }
+        self.sigkill_reconciliation_waiters
+            .insert((dettid, futexid));
+        if self.pending_sigkill_senders.is_empty()
+            && self.sigkill_reconciliation_spins_remaining == 0
+        {
+            self.sigkill_reconciliation_spins_remaining = SIGKILL_RECONCILIATION_SPINS;
+            self.sigkill_reconciliation_waker = Some(dettid);
+        }
+        true
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review completed same-generation futex publication.
@@ -3187,6 +3259,7 @@ mod test {
             dettid: DetTid::from_raw(dettid),
             response: Ivar::new(),
             bitset,
+            expected: 0,
         }
     }
 
@@ -3302,7 +3375,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX);
+            scheduler.sleep_futex_waiter(&dettid, source, None, 0, u32::MAX);
         }
 
         assert_eq!(
@@ -3339,7 +3412,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
+            scheduler.sleep_futex_waiter(&dettid, futex, None, 0, u32::MAX);
         }
 
         assert_eq!(
@@ -3383,7 +3456,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
+            scheduler.sleep_futex_waiter(&dettid, futex, None, 0, u32::MAX);
             scheduler
                 .sigkill_reconciliation_waiters
                 .insert((dettid, futex));
@@ -3431,8 +3504,9 @@ mod test {
         }
         scheduler.runqueue_push_back(leader);
         let futex = FutexID::private(MmId::initial(leader), 0x1000);
-        scheduler.sleep_futex_waiter(&sibling, futex, None, u32::MAX);
-        scheduler.sleep_futex_waiter(&survivor, futex, None, u32::MAX);
+        let owner = leader.as_raw();
+        scheduler.sleep_futex_waiter(&sibling, futex, None, owner, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, futex, None, owner, u32::MAX);
         assert_eq!(
             scheduler.sigkill_sender_reached_boundary(DetTid::from_raw(99), false),
             0
@@ -3499,7 +3573,7 @@ mod test {
         }
         scheduler.runqueue_push_back(target);
         let futex = FutexID::private(MmId::initial(survivor), 0x1000);
-        scheduler.sleep_futex_waiter(&survivor, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, futex, None, target.as_raw(), u32::MAX);
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
@@ -3653,12 +3727,127 @@ mod test {
         assert!(scheduler.sigkill_reconciliation_waiters.is_empty());
 
         let sender_futex = FutexID::private(MmId::initial(sender), 0x2000);
-        scheduler.sleep_futex_waiter(&sender, sender_futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&sender, sender_futex, None, 0, u32::MAX);
         scheduler.run_queue.remove_tid(sender);
         assert!(scheduler.blocked.futex_waiters.contains_key(&sender_futex));
         assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 0);
         assert!(!scheduler.run_queue.contains_tid(sender));
         assert_eq!(scheduler.blocked.futex_waiters[&sender_futex].len(), 1);
+    }
+
+    #[test]
+    fn sigkill_late_waiter_is_captured_only_for_pending_owner() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(10);
+        let sender = DetTid::from_raw(20);
+        let late_waiter = DetTid::from_raw(30);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler.thread_tree.add_child(target, sender, true);
+        scheduler.thread_tree.add_child(target, late_waiter, true);
+
+        for dettid in [target, sender, late_waiter] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.runqueue_push_back(dettid);
+        }
+
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
+        assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
+        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert!(scheduler.sigkill_reconciliation_waiters.is_empty());
+
+        let unrelated = FutexID::private(MmId::initial(late_waiter), 0x1000);
+        assert!(!scheduler.capture_late_sigkill_futex_waiter(late_waiter, unrelated, 0));
+        let robust = FutexID::private(MmId::initial(late_waiter), 0x2000);
+        let observed_owner = (target.as_raw() as u32 | 0x8000_0000) as i32;
+        assert!(scheduler.capture_late_sigkill_futex_waiter(late_waiter, robust, observed_owner));
+        assert_eq!(
+            scheduler.sigkill_reconciliation_spins_remaining,
+            SIGKILL_RECONCILIATION_SPINS
+        );
+        scheduler.sleep_futex_waiter(&late_waiter, robust, None, observed_owner, u32::MAX);
+        assert!(scheduler.run_queue.remove_tid(late_waiter));
+
+        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
+        assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 1);
+        assert!(scheduler.run_queue.contains_tid(late_waiter));
+        assert!(!scheduler.run_queue.contains_tid(target));
+    }
+
+    #[test]
+    fn sigkill_capture_is_owner_scoped_and_preserves_unrelated_waiter() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(10);
+        let sender = DetTid::from_raw(20);
+        let owner_waiter = DetTid::from_raw(30);
+        let pending_waiter = DetTid::from_raw(40);
+        let unrelated_waiter = DetTid::from_raw(50);
+        scheduler.thread_tree.add_child(target, target, true);
+        for child in [sender, owner_waiter, pending_waiter, unrelated_waiter] {
+            scheduler.thread_tree.add_child(target, child, true);
+        }
+
+        for dettid in [
+            target,
+            sender,
+            owner_waiter,
+            pending_waiter,
+            unrelated_waiter,
+        ] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+        scheduler.runqueue_push_back(target);
+        scheduler.runqueue_push_back(sender);
+
+        let mm = MmId::initial(target);
+        let owner_futex = FutexID::private(mm, 0x1000);
+        let pending_futex = FutexID::private(mm, 0x2000);
+        let unrelated_futex = FutexID::private(mm, 0x3000);
+        let observed_owner = (target.as_raw() as u32 | 0x8000_0000) as i32;
+        scheduler.sleep_futex_waiter(&owner_waiter, owner_futex, None, observed_owner, u32::MAX);
+        scheduler.sleep_futex_waiter(&pending_waiter, pending_futex, None, 0, u32::MAX);
+        scheduler.sleep_futex_waiter(&unrelated_waiter, unrelated_futex, None, 0, u32::MAX);
+        scheduler.register_robust_pending_futex(target, Some(pending_futex));
+
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
+        assert_eq!(
+            scheduler.sigkill_reconciliation_waiters,
+            BTreeSet::from([(owner_waiter, owner_futex), (pending_waiter, pending_futex)])
+        );
+        assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
+        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
+        assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 2);
+
+        assert!(scheduler.run_queue.contains_tid(owner_waiter));
+        assert!(scheduler.run_queue.contains_tid(pending_waiter));
+        assert!(!scheduler.run_queue.contains_tid(unrelated_waiter));
+        assert_eq!(
+            scheduler.blocked.futex_waiters[&unrelated_futex]
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [unrelated_waiter]
+        );
     }
 
     #[test]
@@ -3687,7 +3876,7 @@ mod test {
         scheduler.runqueue_push_back(target);
         scheduler.runqueue_push_back(sender);
         let futex = FutexID::private(MmId::initial(survivor), 0x1000);
-        scheduler.sleep_futex_waiter(&survivor, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, futex, None, target.as_raw(), u32::MAX);
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
@@ -3793,7 +3982,7 @@ mod test {
         scheduler.runqueue_push_back(unrelated);
         scheduler.runqueue_push_back(sender);
         let futex = FutexID::private(MmId::initial(waiter), 0x1000);
-        scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&waiter, futex, None, target.as_raw(), u32::MAX);
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
@@ -3859,7 +4048,7 @@ mod test {
             scheduler.runqueue_push_back(dettid);
         }
         let futex = FutexID::private(MmId::initial(waiter), 0x1000);
-        scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&waiter, futex, None, target.as_raw(), u32::MAX);
         assert!(scheduler.run_queue.remove_tid(waiter));
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
@@ -3886,7 +4075,7 @@ mod test {
                 .contains(&(waiter, futex))
         );
         scheduler.prepare_sigkill_futex_recheck(waiter, futex);
-        scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&waiter, futex, None, target.as_raw(), u32::MAX);
         assert_eq!(
             scheduler.publish_completed_sigkill_futex_recheck(waiter, futex),
             1
@@ -3929,7 +4118,7 @@ mod test {
         assert!(scheduler.completed_sigkill_futex_rechecks.is_empty());
 
         let futex = FutexID::private(MmId::initial(future_waiter), 0x1000);
-        scheduler.sleep_futex_waiter(&future_waiter, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&future_waiter, futex, None, 0, u32::MAX);
         assert!(scheduler.run_queue.remove_tid(future_waiter));
         assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 0);
         assert!(!scheduler.run_queue.contains_tid(future_waiter));
@@ -3970,7 +4159,7 @@ mod test {
         }
 
         let prior_futex = FutexID::private(MmId::initial(prior_waiter), 0x1000);
-        scheduler.sleep_futex_waiter(&prior_waiter, prior_futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&prior_waiter, prior_futex, None, target.as_raw(), u32::MAX);
         assert!(scheduler.run_queue.remove_tid(prior_waiter));
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(sender, targets), 1);
@@ -3992,7 +4181,7 @@ mod test {
         assert!(scheduler.pending_sigkill_futex_wake.is_none());
 
         let future_futex = FutexID::private(MmId::initial(future_waiter), 0x2000);
-        scheduler.sleep_futex_waiter(&future_waiter, future_futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&future_waiter, future_futex, None, 0, u32::MAX);
         assert!(scheduler.run_queue.remove_tid(future_waiter));
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert!(!scheduler.run_queue.contains_tid(future_waiter));
@@ -4034,8 +4223,9 @@ mod test {
         scheduler.runqueue_push_back(peer);
         let dead_futex = FutexID::private(MmId::initial(leader), 0x1000);
         let live_futex = FutexID::private(MmId::initial(survivor), 0x2000);
-        scheduler.sleep_futex_waiter(&sibling, dead_futex, None, u32::MAX);
-        scheduler.sleep_futex_waiter(&survivor, live_futex, None, u32::MAX);
+        let owner = leader.as_raw();
+        scheduler.sleep_futex_waiter(&sibling, dead_futex, None, owner, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, live_futex, None, owner, u32::MAX);
 
         let targets = scheduler.prepare_sigkill_target(leader, SigkillTarget::Process(leader));
         assert_eq!(targets, [leader, sibling]);

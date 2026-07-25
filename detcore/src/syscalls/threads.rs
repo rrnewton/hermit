@@ -52,6 +52,7 @@ use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
+use crate::tool_global::register_robust_pending_futex;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -426,6 +427,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SetRobustList,
     ) -> Result<i64, Error> {
         let head = call.head().map(AddrMut::as_raw);
+        let pending_futex = head.and_then(|head_address| {
+            let head_ptr = Addr::<RobustListHead>::from_raw(head_address)?;
+            let head_value = guest.memory().read_value(head_ptr).ok()?;
+            let (pending, pi) = decode_robust_pointer(head_value.list_op_pending);
+            if pending == 0 || pi {
+                return None;
+            }
+            let address = robust_futex_address(pending, head_value.futex_offset)?;
+            Some(guest.thread_state().futex_id(address, false))
+        });
         let result = guest.inject(call).await?;
         if result == 0 {
             let dettid = guest.thread_state().dettid;
@@ -435,6 +446,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .lock()
                 .expect("robust-list registry mutex poisoned")
                 .insert(dettid, head);
+            register_robust_pending_futex(guest, pending_futex).await;
         }
         Ok(result)
     }

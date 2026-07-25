@@ -505,6 +505,13 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
+            GlobalRequest::RegisterRobustPendingFutex(owner, futexid) => {
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .register_robust_pending_futex(owner, futexid);
+                R::RegisterRobustPendingFutex(())
+            }
             GlobalRequest::PrepareSigkillTarget(sender, target) => R::PrepareSigkillTarget(
                 self.sched
                     .lock()
@@ -1002,7 +1009,7 @@ impl GlobalState {
         dettid: DetTid,
         action: FutexAction,
         futexid: FutexID,
-        _init_read: i32,
+        init_read: i32,
         mask: u32,
     ) -> Option<SchedValue> {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
@@ -1025,7 +1032,8 @@ impl GlobalState {
             match action {
                 FutexAction::WaitRequest(deadline) => {
                     sched.prepare_sigkill_futex_recheck(dettid, futexid);
-                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask);
+                    sched.capture_late_sigkill_futex_waiter(dettid, futexid, init_read);
+                    sched.sleep_futex_waiter(&dettid, futexid, deadline, init_read, mask);
                     assert!(sched.run_queue.remove_tid(dettid));
                     sched.publish_pending_sigkill_futex_wake();
                     sched.publish_completed_sigkill_futex_recheck(dettid, futexid);
@@ -1312,6 +1320,10 @@ pub enum GlobalRequest {
     /// so the scheduler can aggregate it into the final run report.
     DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
+    /// Mirror a zero-owner robust `list_op_pending` futex identity.
+    // TODO-HUMAN-REVIEW(PR-659): Review robust pending-futex registration RPC.
+    RegisterRobustPendingFutex(DetTid, Option<FutexID>),
+
     /// Resolve and register managed SIGKILL targets before injection.
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation RPC.
     PrepareSigkillTarget(DetTid, SigkillTarget),
@@ -1387,6 +1399,8 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
+    // TODO-HUMAN-REVIEW(PR-659): Review robust pending-futex registration response.
+    RegisterRobustPendingFutex(()),
     // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
     PrepareSigkillTarget(Vec<DetTid>),
     // TODO-HUMAN-REVIEW(PR-659): Review exact-delivery candidate-resolution response.
@@ -1703,6 +1717,25 @@ where
         .await;
     match response.1 {
         GlobalResponse::CompleteSigkillExit(remaining, woken) => (remaining, woken),
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review zero-owner robust pending-futex mirroring.
+/// Mirror the exact pending futex visible when a thread registers its robust-list head.
+pub async fn register_robust_pending_futex<G, T>(guest: &mut G, futexid: Option<FutexID>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let owner = guest.thread_state().dettid;
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::RegisterRobustPendingFutex(owner, futexid),
+    )
+    .await;
+    match response {
+        GlobalResponse::RegisterRobustPendingFutex(()) => {}
         _ => unreachable!(),
     }
 }
