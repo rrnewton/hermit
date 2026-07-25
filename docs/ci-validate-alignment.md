@@ -51,9 +51,9 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 325 Cargo cases require hardware. The per-PR selector executes
-311, the weekly `super` tier executes 11 long cases, and three rr cases remain
-documented gaps:
+The remaining 325 Cargo cases require hardware. The per-PR lane executes
+310 blocking cases plus one bounded nonblocking diagnostic, the weekly `super`
+tier executes 11 long cases, and three rr cases remain documented gaps:
 
 | Group | Cases | Routing | Hardware reason |
 | --- | ---: | --- | --- |
@@ -62,7 +62,7 @@ documented gaps:
 | Detcore parallel variants | 11 | Per-PR | Deterministic RCB preemption assertions |
 | KVM CLI cases | 16 | Per-PR | Read/write `/dev/kvm` is required |
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
-| Runtime, database, scheduling, and syscall targets | 46 | Per-PR | Default PMU/CPUID or record/replay configuration |
+| Runtime, database, scheduling, and syscall targets | 46 | 45 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
 | Ignored runtime/database/analyze tiers | 14 | 11 per-PR, 3 weekly | Default PMU/CPUID configuration |
 | Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
 | rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
@@ -81,6 +81,10 @@ LevelDB suite, and SQLite veryquick suite remain in the weekly `super` profile
 because they cannot fit the per-PR job budget on the self-hosted runner.
 The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
 (host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
+
+The stable record/replay integration cases remain blocking. The intermittently
+flaky `record_replay_matrix` is still executed on every pull request, but as a
+five-minute nonblocking diagnostic tracked by follow-up review in PR #678.
 
 The hardware lane also gates the three record/replay working-envelope cells,
 the 128-row R/R compatibility corpus, debugger
