@@ -19,6 +19,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -196,7 +197,7 @@ pub struct GlobalState {
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
     // Optional append-only sink shared by DBI fork descendants.
-    unsupported_syscall_report: Option<Mutex<File>>,
+    unsupported_syscall_report_fd: Option<Mutex<File>>,
 
     // Open file description to bound port.
     open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
@@ -265,17 +266,17 @@ impl GlobalState {
             .map(|path| PreemptionReader::new(path));
         let range = Self::read_port_range();
 
-        let unsupported_syscall_report = cfg.unsupported_syscall_report.as_ref().and_then(|path| {
-            match fs::OpenOptions::new().append(true).open(path) {
-                Ok(file) => Some(Mutex::new(file)),
-                Err(error) => {
-                    warn!(
-                        "failed to open unsupported-syscall report {}: {}",
-                        path.display(),
-                        error
-                    );
-                    None
-                }
+        let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
+            let duplicate = unsafe { libc::dup(fd) };
+            if duplicate == -1 {
+                warn!(
+                    "failed to duplicate unsupported-syscall report fd {fd}: {}",
+                    std::io::Error::last_os_error()
+                );
+                None
+            } else {
+                // SAFETY: dup returned a new owned descriptor.
+                Some(Mutex::new(unsafe { File::from_raw_fd(duplicate) }))
             }
         });
 
@@ -284,7 +285,7 @@ impl GlobalState {
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
-            unsupported_syscall_report,
+            unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
@@ -485,7 +486,7 @@ impl GlobalTool for GlobalState {
                     .unwrap()
                     .insert(name.clone());
                 if inserted
-                    && let Some(report) = &self.unsupported_syscall_report
+                    && let Some(report) = &self.unsupported_syscall_report_fd
                     && let Err(error) = writeln!(report.lock().unwrap(), "{name}")
                 {
                     warn!("failed to append unsupported-syscall report: {error}");
