@@ -55,10 +55,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI policy descriptors.
-/// Fixed inherited descriptor containing `1` when DBI strict failure is enabled.
-pub const UNSUPPORTED_SYSCALL_POLICY_FD: i32 = 198;
-
+// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
 /// Fixed inherited descriptor receiving unsupported syscall records.
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
@@ -191,19 +188,6 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
-}
-
-fn panic_on_unsupported_from_policy_fd() -> bool {
-    let mut value = 0_u8;
-    let read = unsafe {
-        libc::pread(
-            UNSUPPORTED_SYSCALL_POLICY_FD,
-            (&mut value as *mut u8).cast(),
-            1,
-            0,
-        )
-    };
-    read == 1 && value == b'1'
 }
 
 fn report_fd_is_available() -> bool {
@@ -374,7 +358,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
             emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
-            let panic_on_unsupported_syscalls = panic_on_unsupported_from_policy_fd();
+            let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
             COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
             let mut config = Config {
                 sequentialize_threads: true,

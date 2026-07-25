@@ -66,6 +66,28 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (argc == 2 && strcmp(argv[1], "fork-exec") == 0) {
+    pid_t child = fork();
+    if (child < 0) {
+      perror("fork");
+      return 1;
+    }
+    if (child == 0) {
+      char *next_argv[] = {argv[0], "after-exec", NULL};
+      char *next_env[] = {NULL};
+      execve(argv[0], next_argv, next_env);
+      perror("execve");
+      _exit(127);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+      perror("waitpid");
+      return 1;
+    }
+    puts("dbi-unsupported-fork-exec-parent-ok");
+    return 0;
+  }
+
   if (call_unsupported() != 0) {
     return 1;
   }

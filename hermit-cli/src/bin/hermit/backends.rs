@@ -65,8 +65,8 @@ struct InstalledFd {
 
 impl InstalledFd {
     fn install(source: i32, target: i32) -> std::io::Result<Self> {
-        // Keep backups above both fixed transport descriptors so installing the second channel
-        // cannot overwrite the first channel's backup.
+        // Keep the backup above the reserved transport descriptor so installing the target
+        // cannot overwrite its backup.
         let backup = unsafe {
             libc::fcntl(
                 target,
@@ -110,32 +110,18 @@ impl Drop for InstalledFd {
 
 struct DbiUnsupportedSyscallReport {
     file: tempfile::NamedTempFile,
-    _policy_file: std::fs::File,
-    _policy_fd: InstalledFd,
     _report_fd: InstalledFd,
 }
 
 impl DbiUnsupportedSyscallReport {
-    fn new(panic_on_unsupported_syscalls: bool) -> std::io::Result<Self> {
-        let mut policy_file = tempfile::tempfile()?;
-        policy_file.write_all(if panic_on_unsupported_syscalls {
-            b"1"
-        } else {
-            b"0"
-        })?;
+    fn new() -> std::io::Result<Self> {
         let file = tempfile::NamedTempFile::new()?;
-        let policy_fd = InstalledFd::install(
-            policy_file.as_raw_fd(),
-            detcore_dbi::UNSUPPORTED_SYSCALL_POLICY_FD,
-        )?;
         let report_fd = InstalledFd::install(
             file.as_file().as_raw_fd(),
             detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD,
         )?;
         Ok(Self {
             file,
-            _policy_file: policy_file,
-            _policy_fd: policy_fd,
             _report_fd: report_fd,
         })
     }
@@ -223,7 +209,7 @@ pub fn run_dbi(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
-    let runner = DbiRunner::new(&drrun, &client)
+    let mut runner = DbiRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
                 "failed to configure the DynamoRIO DBI runner (drrun={}, client={}): {error}",
@@ -233,13 +219,16 @@ pub fn run_dbi(
         })?
         .summary(true)
         .isolated_process_group(true);
+    if panic_on_unsupported_syscalls {
+        runner = runner.client_argument("-panic-on-unsupported-syscalls");
+    }
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
         drrun.display()
     );
 
-    let _unsupported_report = DbiUnsupportedSyscallReport::new(panic_on_unsupported_syscalls)?;
+    let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
     let mut guest = StdCommand::new(program);
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
@@ -329,7 +318,7 @@ pub fn run_dbi(
     Ok(ExitStatus::Exited(0))
 }
 
-fn run_once<R: Read + Send>(
+fn run_once<R: Read + Send + 'static>(
     runner: &DbiRunner,
     guest: &StdCommand,
     drrun: &Path,
