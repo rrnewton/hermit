@@ -11,6 +11,35 @@ checks.
 > earlier baseline that established the fast compatibility profile and the
 > pre-`ppoll` strict failure mode.
 
+## Strict L2 custom initramfs
+
+`strict_l2_test.sh` builds the minimal shared-futex initramfs by default. It
+can also run an existing initramfs without modifying it. The following example
+uses the memory size, CPU model, and success marker required by the staged
+sched_ext guest:
+
+```bash
+KERNEL_IMAGE=/path/to/bzImage \
+INITRAMFS_IMAGE=/path/to/initramfs-scx.cpio.gz \
+QEMU_MEMORY=1024M \
+QEMU_CPU=max \
+QEMU_L2_MARKER='HERMIT-SCX-LOADED: scx_rlfifo active' \
+QEMU_L2_PHASE_TIMEOUT_SECONDS=1200 \
+./experiments/qemu-boot-debug/strict_l2_test.sh
+```
+
+The driver first runs the exact guest under `run --strict` and requires the
+configured marker in its serial output. It then runs the same command under
+`run --strict --verify` and requires Hermit's L2 determinism marker. Available
+custom guest inputs are:
+
+- `INITRAMFS_IMAGE`: readable existing initramfs; the default minimal image is
+  generated when this is unset.
+- `QEMU_MEMORY`: QEMU `-m` value, default `256M`.
+- `QEMU_CPU`: optional QEMU `-cpu` value.
+- `QEMU_KERNEL_APPEND`: guest kernel command line.
+- `QEMU_L2_MARKER`: serial-output marker required from the strict boot oracle.
+
 Date: 2026-07-22 UTC (2026-07-21 PDT)
 
 Repository: `rrnewton/hermit`

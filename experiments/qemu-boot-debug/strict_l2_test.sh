@@ -66,6 +66,11 @@ hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
 kernel_image=${KERNEL_IMAGE:-/boot/vmlinuz}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-strict-l2}
 phase_timeout_seconds=${QEMU_L2_PHASE_TIMEOUT_SECONDS:-300}
+requested_initramfs_image=${INITRAMFS_IMAGE:-}
+qemu_memory=${QEMU_MEMORY:-256M}
+qemu_cpu=${QEMU_CPU:-}
+kernel_append=${QEMU_KERNEL_APPEND:-console=ttyS0 panic=-1 rdinit=/init}
+marker=${QEMU_L2_MARKER:-SHARED_FUTEX_QEMU_KERNEL_OK}
 qemu_bin=${QEMU_BIN:-}
 active_pid=""
 active_pgid=""
@@ -81,29 +86,37 @@ if [[ ! $phase_timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
   fail "QEMU_L2_PHASE_TIMEOUT_SECONDS must be a positive integer"
 fi
 
-for command in cpio gcc gzip grep mktemp setsid sleep tail; do
+for command in grep mktemp setsid sleep tail; do
   command -v "$command" >/dev/null || fail "required command not found: $command"
 done
 
 mkdir -p "$output_dir"
 run_dir=$(mktemp -d "$output_dir/run.XXXXXX")
-initramfs_image=${INITRAMFS_IMAGE:-$run_dir/initramfs.cpio.gz}
-init_source=$repo_root/experiments/shared-futex-verify_20260722/qemu_init.c
-initramfs_root=$run_dir/initramfs-root
 boot_stdout=$run_dir/boot.stdout
 boot_stderr=$run_dir/boot.stderr
 verifier_stdout=$run_dir/verifier.stdout
 verifier_stderr=$run_dir/verifier.stderr
-[[ -r $init_source ]] || fail "init source is not readable: $init_source"
-mkdir -p "$initramfs_root" "$(dirname -- "$initramfs_image")"
+if [[ -n $requested_initramfs_image ]]; then
+  initramfs_image=$requested_initramfs_image
+  [[ -r $initramfs_image ]] || fail "initramfs image is not readable: $initramfs_image"
+else
+  for command in cpio gcc gzip; do
+    command -v "$command" >/dev/null || fail "required command not found: $command"
+  done
+  initramfs_image=$run_dir/initramfs.cpio.gz
+  init_source=$repo_root/experiments/shared-futex-verify_20260722/qemu_init.c
+  initramfs_root=$run_dir/initramfs-root
+  [[ -r $init_source ]] || fail "init source is not readable: $init_source"
+  mkdir -p "$initramfs_root"
 
-gcc -Os -nostdlib -static -fno-stack-protector -fno-pie -no-pie \
-  "$init_source" \
-  -o "$initramfs_root/init"
-(
-  cd "$initramfs_root"
-  printf '.\n./init\n' | cpio --quiet -o -H newc
-) | gzip -9 >"$initramfs_image"
+  gcc -Os -nostdlib -static -fno-stack-protector -fno-pie -no-pie \
+    "$init_source" \
+    -o "$initramfs_root/init"
+  (
+    cd "$initramfs_root"
+    printf '.\n./init\n' | cpio --quiet -o -H newc
+  ) | gzip -9 >"$initramfs_image"
+fi
 
 printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
   "$kernel_image" "$initramfs_image" "$run_dir"
@@ -115,17 +128,22 @@ printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
 # same command under --verify for the L2 comparison.
 guest_command=(
   "$qemu_bin"
-  -m 256M
+  -m "$qemu_memory"
   -accel 'tcg,thread=single'
   -smp 1
   -icount 'shift=0,sleep=off'
+)
+if [[ -n $qemu_cpu ]]; then
+  guest_command+=(-cpu "$qemu_cpu")
+fi
+guest_command+=(
   -kernel "$kernel_image"
   -initrd "$initramfs_image"
   -display none
   -serial stdio
   -monitor none
   -no-reboot
-  -append 'console=ttyS0 panic=-1 rdinit=/init'
+  -append "$kernel_append"
 )
 boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
 verify_command=("$hermit_bin" --log info run --strict --verify -- "${guest_command[@]}")
@@ -155,7 +173,6 @@ if ((status != 0)); then
   fail "QEMU strict boot oracle exited with status $status"
 fi
 
-marker=SHARED_FUTEX_QEMU_KERNEL_OK
 if ! grep -Fq "$marker" "$boot_stdout"; then
   tail -200 "$boot_stderr" >&2
   fail "QEMU strict boot oracle exited without marker $marker"
