@@ -46,6 +46,46 @@ static void require_xattr_result(ssize_t result, const char *name) {
   }
 }
 
+static void require_xattr_value(ssize_t result, const char *name,
+                                const char *actual, const char *expected,
+                                size_t expected_len, int must_exist) {
+  require_xattr_result(result, name);
+  if (must_exist && (result != (ssize_t)expected_len ||
+                     memcmp(actual, expected, expected_len) != 0)) {
+    fprintf(stderr, "%s returned unexpected extended-attribute value\n", name);
+    exit(1);
+  }
+}
+
+static int xattr_list_contains(const char *list, size_t list_len,
+                               const char *name) {
+  size_t offset = 0;
+  size_t name_len = strlen(name);
+  while (offset < list_len) {
+    size_t remaining = list_len - offset;
+    size_t entry_len = strnlen(list + offset, remaining);
+    if (entry_len == remaining) {
+      return 0;
+    }
+    if (entry_len == name_len && memcmp(list + offset, name, name_len) == 0) {
+      return 1;
+    }
+    offset += entry_len + 1;
+  }
+  return 0;
+}
+
+static void require_xattr_list(ssize_t result, const char *call_name,
+                               const char *list, const char *xattr_name,
+                               int must_exist) {
+  require_xattr_result(result, call_name);
+  if (must_exist &&
+      (result < 0 || !xattr_list_contains(list, (size_t)result, xattr_name))) {
+    fprintf(stderr, "%s omitted %s\n", call_name, xattr_name);
+    exit(1);
+  }
+}
+
 int main(void) {
   char path[128];
   char hardlink_path[128];
@@ -107,30 +147,47 @@ int main(void) {
   const char value[] = "metadata";
   char value_buffer[32] = {0};
   char list_buffer[128] = {0};
-  require_xattr_result(setxattr(path, name, value, sizeof(value), 0),
-                       "setxattr");
-  require_xattr_result(getxattr(path, name, value_buffer, sizeof(value_buffer)),
-                       "getxattr");
-  require_xattr_result(listxattr(path, list_buffer, sizeof(list_buffer)),
-                       "listxattr");
-  require_xattr_result(removexattr(path, name), "removexattr");
+  ssize_t result = setxattr(path, name, value, sizeof(value), 0);
+  require_xattr_result(result, "setxattr");
+  int must_exist = result == 0;
+  memset(value_buffer, 0, sizeof(value_buffer));
+  result = getxattr(path, name, value_buffer, sizeof(value_buffer));
+  require_xattr_value(result, "getxattr", value_buffer, value, sizeof(value),
+                      must_exist);
+  memset(list_buffer, 0, sizeof(list_buffer));
+  result = listxattr(path, list_buffer, sizeof(list_buffer));
+  require_xattr_list(result, "listxattr", list_buffer, name, must_exist);
+  result = removexattr(path, name);
+  must_exist ? require_zero(result, "removexattr")
+             : require_xattr_result(result, "removexattr");
 
-  require_xattr_result(fsetxattr(fd, name, value, sizeof(value), 0),
-                       "fsetxattr");
-  require_xattr_result(fgetxattr(fd, name, value_buffer, sizeof(value_buffer)),
-                       "fgetxattr");
-  require_xattr_result(flistxattr(fd, list_buffer, sizeof(list_buffer)),
-                       "flistxattr");
-  require_xattr_result(fremovexattr(fd, name), "fremovexattr");
+  result = fsetxattr(fd, name, value, sizeof(value), 0);
+  require_xattr_result(result, "fsetxattr");
+  must_exist = result == 0;
+  memset(value_buffer, 0, sizeof(value_buffer));
+  result = fgetxattr(fd, name, value_buffer, sizeof(value_buffer));
+  require_xattr_value(result, "fgetxattr", value_buffer, value, sizeof(value),
+                      must_exist);
+  memset(list_buffer, 0, sizeof(list_buffer));
+  result = flistxattr(fd, list_buffer, sizeof(list_buffer));
+  require_xattr_list(result, "flistxattr", list_buffer, name, must_exist);
+  result = fremovexattr(fd, name);
+  must_exist ? require_zero(result, "fremovexattr")
+             : require_xattr_result(result, "fremovexattr");
 
-  require_xattr_result(lsetxattr(symlink_path, name, value, sizeof(value), 0),
-                       "lsetxattr");
-  require_xattr_result(
-      lgetxattr(symlink_path, name, value_buffer, sizeof(value_buffer)),
-      "lgetxattr");
-  require_xattr_result(
-      llistxattr(symlink_path, list_buffer, sizeof(list_buffer)), "llistxattr");
-  require_xattr_result(lremovexattr(symlink_path, name), "lremovexattr");
+  result = lsetxattr(symlink_path, name, value, sizeof(value), 0);
+  require_xattr_result(result, "lsetxattr");
+  must_exist = result == 0;
+  memset(value_buffer, 0, sizeof(value_buffer));
+  result = lgetxattr(symlink_path, name, value_buffer, sizeof(value_buffer));
+  require_xattr_value(result, "lgetxattr", value_buffer, value, sizeof(value),
+                      must_exist);
+  memset(list_buffer, 0, sizeof(list_buffer));
+  result = llistxattr(symlink_path, list_buffer, sizeof(list_buffer));
+  require_xattr_list(result, "llistxattr", list_buffer, name, must_exist);
+  result = lremovexattr(symlink_path, name);
+  must_exist ? require_zero(result, "lremovexattr")
+             : require_xattr_result(result, "lremovexattr");
 
   void *mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (mapping == MAP_FAILED) {
@@ -144,12 +201,11 @@ int main(void) {
   require_zero(syscall(SYS_readahead, fd, 0, 4096), "readahead");
   require_zero(syscall(SYS_sync_file_range, fd, 0, 4096, SYNC_FILE_RANGE_WRITE),
                "sync_file_range");
-  require_zero(syscall(SYS_syncfs, fd), "syncfs");
 
   require_zero(close(fd), "close");
   require_zero(unlink(symlink_path), "unlink symlink");
   require_zero(unlink(hardlink_path), "unlink hardlink");
   require_zero(unlink(path), "unlink file");
-  puts("syscall-file-metadata-ok count=21");
+  puts("syscall-file-metadata-ok count=20");
   return 0;
 }

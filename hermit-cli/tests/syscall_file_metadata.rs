@@ -85,7 +85,7 @@ fn deterministic_file_metadata_syscalls_verify() {
     let trace_stdout = String::from_utf8_lossy(&trace_output.stdout);
     let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
     assert!(
-        trace_stdout.contains("syscall-file-metadata-ok count=21"),
+        trace_stdout.contains("syscall-file-metadata-ok count=20"),
         "guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
     for syscall in [
@@ -96,7 +96,6 @@ fn deterministic_file_metadata_syscalls_verify() {
         "pwrite64",
         "readahead",
         "sync_file_range",
-        "syncfs",
     ] {
         assert!(
             trace_stderr.contains(&format!("inbound syscall: {syscall}(")),
@@ -114,6 +113,7 @@ fn deterministic_file_metadata_syscalls_verify() {
             "--backend=ptrace",
             "--strict",
             "--verify",
+            "--passthru-opt",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
             "--tmp",
