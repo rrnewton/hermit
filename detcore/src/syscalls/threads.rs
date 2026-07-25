@@ -306,7 +306,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review robust-list registration and owner-death cleanup.
+    // TODO-HUMAN-REVIEW(PR-659): Review robust-list registration and owner-death cleanup.
     /// Register the kernel robust list and mirror its head for deterministic exit cleanup.
     pub async fn handle_set_robust_list<G: Guest<Self>>(
         &self,
@@ -322,7 +322,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic self-query robust-list policy.
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic self-query robust-list policy.
     /// Return the calling thread's modeled robust-list registration.
     pub fn handle_get_robust_list<G: Guest<Self>>(
         &self,
@@ -435,7 +435,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex timeout and EINTR results.
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic futex timeout and EINTR results.
     async fn handle_futex_wait_result<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -472,7 +472,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 wake ABI and scheduler mapping.
+    // TODO-HUMAN-REVIEW(PR-659): Review raw futex2 U32 wake ABI and scheduler mapping.
     /// Wake modeled U32 futex2 waiters without entering the host scheduler.
     pub async fn handle_futex2_wake<G: Guest<Self>>(
         &self,
@@ -500,7 +500,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 wait ABI and logical timeout.
+    // TODO-HUMAN-REVIEW(PR-659): Review raw futex2 U32 wait ABI and logical timeout.
     /// Wait on a modeled U32 futex2 word using Detcore logical time.
     pub async fn handle_futex2_wait<G: Guest<Self>>(
         &self,
@@ -540,7 +540,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 U32 requeue ABI and queue ordering.
+    // TODO-HUMAN-REVIEW(PR-659): Review raw futex2 U32 requeue ABI and queue ordering.
     /// Wake and requeue modeled U32 futex2 waiters deterministically.
     pub async fn handle_futex2_requeue<G: Guest<Self>>(
         &self,
@@ -602,13 +602,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Replace fixed refusal with multi-queue wait modeling.
+    // TODO-HUMAN-REVIEW(PR-659): Replace fixed refusal with multi-queue wait modeling.
     /// Refuse vector waits until one thread can register on multiple modeled queues.
     pub fn handle_futex2_waitv(&self, _args: SyscallArgs) -> Result<i64, Error> {
         Err(Error::Errno(Errno::ENOSYS))
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review legacy futex requeue ABI and scheduler transitions.
+    // TODO-HUMAN-REVIEW(PR-659): Review legacy futex requeue ABI and scheduler transitions.
     async fn handle_futex_requeue<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -653,7 +653,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review legacy FUTEX_WAKE_OP atomicity and decoding.
+    // TODO-HUMAN-REVIEW(PR-659): Review legacy FUTEX_WAKE_OP atomicity and decoding.
     async fn handle_futex_wake_op<G: Guest<Self>>(
         &self,
         guest: &mut G,

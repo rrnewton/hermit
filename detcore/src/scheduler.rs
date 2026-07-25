@@ -1232,7 +1232,7 @@ impl Scheduler {
         num_woken as u64
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex queue migration and wake ordering.
+    // TODO-HUMAN-REVIEW(PR-659): Review deterministic futex queue migration and wake ordering.
     /// Wake some source waiters and move a deterministic subset of the rest to another futex.
     pub fn requeue_futex_waiters(
         &mut self,
@@ -1273,7 +1273,7 @@ impl Scheduler {
         (num_woken + num_requeued) as u64
     }
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review atomic two-queue wake scheduling.
+    // TODO-HUMAN-REVIEW(PR-659): Review atomic two-queue wake scheduling.
     /// Wake waiters from two futex queues as one scheduler action.
     pub fn wake_futex_waiters_two(
         &mut self,

@@ -846,7 +846,7 @@ pub struct ThreadState<T> {
     /// `handle_thread_start`; the parent clears its copy when vfork returns.
     pub pending_vfork: Option<PendingVfork>,
 
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review mirrored robust-list state lifetime.
+    // TODO-HUMAN-REVIEW(PR-659): Review mirrored robust-list state lifetime.
     /// Per-thread robust-futex list registered through set_robust_list(2).
     pub(crate) robust_list_head: Option<usize>,
 

@@ -1242,7 +1242,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         let res = match classify_syscall(call.number()) {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING): Review raw futex2 dispatch until Reverie has typed ABIs.
+            // TODO-HUMAN-REVIEW(PR-659): Review raw futex2 dispatch until Reverie has typed ABIs.
             SyscallClassification::Determinized
                 if matches!(
                     call.number(),

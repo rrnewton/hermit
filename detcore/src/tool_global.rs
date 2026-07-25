@@ -1537,7 +1537,7 @@ pub async fn deregister_thread<R>(
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-PENDING): Review the futex requeue and two-queue wake RPC contract.
+// TODO-HUMAN-REVIEW(PR-659): Review the futex requeue and two-queue wake RPC contract.
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {

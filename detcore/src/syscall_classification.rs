@@ -71,7 +71,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::futex
-        // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic futex2 classification.
+        // TODO-HUMAN-REVIEW(PR-659): Review deterministic futex2 classification.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::futex_requeue
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -85,7 +85,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         | Sysno::getrandom
-        // TODO-HUMAN-REVIEW(PR-PENDING): Review deterministic robust-list classification.
+        // TODO-HUMAN-REVIEW(PR-659): Review deterministic robust-list classification.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::get_robust_list
         | Sysno::getrusage
