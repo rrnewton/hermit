@@ -170,7 +170,27 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::tgkill
         // TODO-HUMAN-REVIEW(#547)
-        | Sysno::writev => SyscallClassification::Determinized,
+        | Sysno::writev
+        // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling policy =====
+        // Hermit presents a single deterministic virtual CPU and a single virtual
+        // NUMA node, and Detcore replaces the Linux scheduler with its own. NUMA
+        // placement policy and Linux scheduling policy/priority are therefore
+        // inoperative: they cannot change guest-visible computation. Left as
+        // passthrough their results depend on host NUMA topology, host scheduler
+        // state, and privilege (all nondeterministic). They are determinized to
+        // fixed, host-independent results; see the handlers in lib.rs.
+        // TODO-HUMAN-REVIEW(#PR)
+        | Sysno::mbind
+        | Sysno::set_mempolicy
+        | Sysno::get_mempolicy
+        | Sysno::set_mempolicy_home_node
+        | Sysno::migrate_pages
+        | Sysno::move_pages
+        | Sysno::sched_setscheduler
+        | Sysno::sched_setparam
+        | Sysno::sched_getscheduler
+        | Sysno::sched_getparam
+        | Sysno::sched_rr_get_interval => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -340,7 +360,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_kernel_syms
-        | Sysno::get_mempolicy
         | Sysno::get_robust_list
         | Sysno::get_thread_area
         | Sysno::getitimer
@@ -369,9 +388,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
-        | Sysno::mbind
         | Sysno::memfd_secret
-        | Sysno::migrate_pages
         | Sysno::mincore
         | Sysno::mknod
         | Sysno::mknodat
@@ -382,7 +399,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mount
         | Sysno::mount_setattr
         | Sysno::move_mount
-        | Sysno::move_pages
         | Sysno::mq_getsetattr
         | Sysno::mq_notify
         | Sysno::mq_open
@@ -430,12 +446,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_get_priority_max
         | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
-        | Sysno::sched_getparam
-        | Sysno::sched_getscheduler
-        | Sysno::sched_rr_get_interval
         | Sysno::sched_setattr
-        | Sysno::sched_setparam
-        | Sysno::sched_setscheduler
         | Sysno::seccomp
         | Sysno::security
         | Sysno::select
@@ -444,8 +455,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::set_mempolicy
-        | Sysno::set_mempolicy_home_node
         | Sysno::set_thread_area
         | Sysno::setdomainname
         | Sysno::setfsgid
@@ -509,7 +518,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [128, 74, 171]);
+        assert_eq!(counts, [139, 74, 160]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -637,6 +646,24 @@ mod tests {
         }
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+        }
+        // Batch 3: NUMA memory-placement and Linux CPU-scheduling policy are
+        // determinized to fixed, host-independent results (single virtual NUMA
+        // node + Detcore scheduler).
+        for sysno in [
+            Sysno::mbind,
+            Sysno::set_mempolicy,
+            Sysno::get_mempolicy,
+            Sysno::set_mempolicy_home_node,
+            Sysno::migrate_pages,
+            Sysno::move_pages,
+            Sysno::sched_setscheduler,
+            Sysno::sched_setparam,
+            Sysno::sched_getscheduler,
+            Sysno::sched_getparam,
+            Sysno::sched_rr_get_interval,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
     }
 }
