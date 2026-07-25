@@ -176,7 +176,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY E9PATCH_COMPAT_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
+readonly E9PATCH_COMPAT_ONLY
 readonly QEMU_L2_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
@@ -2166,6 +2167,16 @@ if ((SABRE_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "SaBRe compatibility ratchet (151 programs)" \
             run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+if ((LITEINST_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
+    if ((failures == 0)); then
+        run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
