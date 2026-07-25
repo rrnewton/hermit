@@ -696,6 +696,7 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let tmpfs = tempfile::tempdir().unwrap();
     let mounts = ro.mounts(tmpfs.path()).unwrap();
     let overlay = mounts
+        .mounts
         .iter()
         .find(|mount| mount.get_source() == Some(Path::new("/cache/patched-echo")))
         .unwrap();
