@@ -1253,6 +1253,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR)
+                Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
@@ -1467,9 +1470,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
-            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
-            // dispatch it by Sysno while retaining typed guards for every represented call.
-            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
+            // The pinned Reverie revision lists these calls as untyped, so dispatch by
+            // Sysno while retaining typed guards for every represented call.
+            SyscallClassification::PassThrough
+                if matches!(call.number(), Sysno::faccessat2 | Sysno::fchmodat2) =>
+            {
                 self.passthrough(guest, call).await
             }
             SyscallClassification::PassThrough => match call {
@@ -1479,9 +1484,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Capset(_)
                 | Syscall::Chdir(_)
                 | Syscall::Chmod(_)
+                | Syscall::Faccessat(_)
                 | Syscall::Fchdir(_)
+                | Syscall::Fchmod(_)
                 | Syscall::Fchmodat(_)
+                | Syscall::Fchown(_)
+                | Syscall::Fchownat(_)
                 | Syscall::Fdatasync(_)
+                | Syscall::Fgetxattr(_)
+                | Syscall::Flistxattr(_)
+                | Syscall::Fremovexattr(_)
+                | Syscall::Fsetxattr(_)
                 | Syscall::Ftruncate(_)
                 // Fixed credentials and process-local unlocks are deterministic; fsync is
                 // conditional on guest-owned files and stable filesystem state.
@@ -1518,13 +1531,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
                 | Syscall::Getxattr(_)
+                | Syscall::Lchown(_)
                 | Syscall::Lgetxattr(_)
+                | Syscall::Link(_)
                 | Syscall::Linkat(_)
+                | Syscall::Listxattr(_)
+                | Syscall::Llistxattr(_)
+                | Syscall::Lremovexattr(_)
+                | Syscall::Lsetxattr(_)
                 | Syscall::Lseek(_)
                 | Syscall::Mkdir(_)
                 | Syscall::Mkdirat(_)
                 | Syscall::Mprotect(_)
+                | Syscall::Msync(_)
                 | Syscall::Readlink(_)
+                | Syscall::Readahead(_)
                 | Syscall::Removexattr(_)
                 | Syscall::Renameat2(_)
                 | Syscall::Rmdir(_)
@@ -1533,7 +1554,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::SetRobustList(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_)
+                | Syscall::Symlink(_)
                 | Syscall::Symlinkat(_)
+                | Syscall::SyncFileRange(_)
+                | Syscall::Syncfs(_)
                 | Syscall::Umask(_)
                 | Syscall::Unlink(_)
                 | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
