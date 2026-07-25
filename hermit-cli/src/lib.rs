@@ -73,6 +73,24 @@ pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Record-mode settings that are orthogonal to the determinize-or-record boundary.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct RecordOptions {
+    /// Sources captured from the host rather than synthesized by Detcore.
+    pub record_features: RecordFeatures,
+    /// Randomize scheduling while recording, then replay the captured schedule exactly.
+    pub chaos: bool,
+}
+
+impl RecordOptions {
+    fn normalized(mut self) -> Self {
+        if self.chaos {
+            self.record_features.sched = true;
+        }
+        self
+    }
+}
+
 enum KvmStdinReservation {
     Open(fs::File),
     Closed,
@@ -668,7 +686,7 @@ impl HermitData {
     /// itself failed, then we still return a successful recording, but its exit
     /// status will be non-zero.
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
-        self.record_with_features(command, RecordFeatures::default())
+        self.record_with_options(command, RecordOptions::default())
     }
 
     /// Records the execution with an explicit determinize-or-record policy.
@@ -677,8 +695,23 @@ impl HermitData {
         command: Command,
         record_features: RecordFeatures,
     ) -> Result<Recording, Error> {
+        self.record_with_options(
+            command,
+            RecordOptions {
+                record_features,
+                ..RecordOptions::default()
+            },
+        )
+    }
+
+    /// Records the execution with explicit boundary and scheduling options.
+    pub fn record_with_options(
+        &self,
+        command: Command,
+        options: RecordOptions,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to_with_features(command, data.path(), record_features)?;
+        let exit_status = record_to_with_options(command, data.path(), options)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -802,7 +835,7 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// Records to the specified directory, which must already exist.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    Record::spawn(command, dir, RecordFeatures::default())
+    Record::spawn(command, dir, RecordOptions::default())
         .await?
         .wait()
         .await
@@ -815,10 +848,27 @@ pub async fn record_to_with_features(
     dir: &Path,
     record_features: RecordFeatures,
 ) -> Result<ExitStatus, Error> {
-    Record::spawn(command, dir, record_features)
-        .await?
-        .wait()
-        .await
+    Record::spawn(
+        command,
+        dir,
+        RecordOptions {
+            record_features,
+            ..RecordOptions::default()
+        },
+    )
+    .await?
+    .wait()
+    .await
+}
+
+/// Records with explicit determinize-or-record and scheduling options.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_to_with_options(
+    command: Command,
+    dir: &Path,
+    options: RecordOptions,
+) -> Result<ExitStatus, Error> {
+    Record::spawn(command, dir, options).await?.wait().await
 }
 
 /// Records to the specified directory, which must already exist. The
@@ -829,7 +879,7 @@ pub async fn record_with_output(mut command: Command, dir: &Path) -> Result<Outp
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    Record::spawn(command, dir, RecordFeatures::default())
+    Record::spawn(command, dir, RecordOptions::default())
         .await?
         .wait_with_output()
         .await
@@ -846,7 +896,31 @@ pub async fn record_with_output_features(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    Record::spawn(command, dir, record_features)
+    Record::spawn(
+        command,
+        dir,
+        RecordOptions {
+            record_features,
+            ..RecordOptions::default()
+        },
+    )
+    .await?
+    .wait_with_output()
+    .await
+}
+
+/// Records captured output with explicit boundary and scheduling options.
+#[tokio::main(flavor = "current_thread")]
+pub async fn record_with_output_options(
+    mut command: Command,
+    dir: &Path,
+    options: RecordOptions,
+) -> Result<Output, Error> {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    Record::spawn(command, dir, options)
         .await?
         .wait_with_output()
         .await

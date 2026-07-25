@@ -249,6 +249,27 @@ hermit record --record-time -- /bin/date
 hermit record start --record-all -- /path/to/program
 ```
 
+Presets choose a starting boundary before individual `--record-X` flags are
+added:
+
+| Preset | Captured boundary | Trace size |
+| --- | --- | --- |
+| `hermit` (default) | Determinize internal sources; capture external inputs | Small |
+| `portable` | `hermit` plus an explicit filesystem-capture policy | Medium |
+| `rr` | Capture every configurable source, equivalent to `--record-all` | Large |
+
+`--chaos` composes with the selected boundary: inputs keep their configured
+determinize-or-record policy while Detcore randomizes thread scheduling. Chaos
+always captures the chosen schedule, even when `--record-sched` was not
+specified. Replay follows that captured schedule exactly instead of making new
+random choices:
+
+```bash
+hermit record start --chaos -- /path/to/threaded-program
+hermit record start --preset portable --chaos -- /path/to/threaded-program
+hermit record start --record-all --chaos -- /path/to/threaded-program
+```
+
 `--record-signals` records the ordering of signal deliveries that Hermit observes.
 Guest-generated signals are reproduced with their generating syscalls; external
 signal sources must recur during replay because record mode does not synthesize

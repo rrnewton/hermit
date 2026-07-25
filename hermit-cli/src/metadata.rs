@@ -17,6 +17,7 @@ use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::RecordOptions;
 use crate::error::Error;
 
 /// Hermit record version. Recorded as part of hermit-record, hermit-replay
@@ -73,12 +74,15 @@ pub struct Metadata {
     /// Sources captured by this recording instead of determinized by Detcore.
     #[serde(default)]
     pub record_features: RecordFeatures,
+    /// Whether the recording used chaos scheduling before capturing its schedule.
+    #[serde(default)]
+    pub chaos: bool,
 }
 
 impl Metadata {
     /// Creates a new metadata object, populating it with information about a
     /// command.
-    pub fn new(command: &Command, record_features: RecordFeatures) -> Result<Self, Error> {
+    pub fn new(command: &Command, options: RecordOptions) -> Result<Self, Error> {
         let exe = command.find_program()?;
 
         let program = command.get_program().to_string_lossy().into_owned();
@@ -121,7 +125,8 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
-            record_features,
+            record_features: options.record_features,
+            chaos: options.chaos,
         })
     }
 
@@ -156,13 +161,16 @@ pub enum RecordReplayMode {
 
 pub fn record_or_replay_config(
     data: &Path,
-    record_features: RecordFeatures,
+    mut record_features: RecordFeatures,
+    record_chaos: bool,
     mode: RecordReplayMode,
 ) -> detcore::Config {
-    // NOTE: Record and replay should use the exact same detcore
-    // configuration. Otherwise, the behavior of the program could diverge
-    // during replay.
+    // Record and replay use the same boundary policy. Chaos itself is record-only:
+    // replay consumes the captured schedule instead of making fresh random choices.
     let default_config: detcore::Config = Default::default();
+    if record_chaos {
+        record_features.sched = true;
+    }
     let record_schedule = record_features.sched || record_features.signals;
     let schedule_path = data.join(SCHEDULE_NAME);
     let mut config = detcore::Config {
@@ -192,7 +200,7 @@ pub fn record_or_replay_config(
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
-        chaos: false,
+        chaos: record_chaos && matches!(mode, RecordReplayMode::Record),
         sigint_instakill: false,
         warn_non_zero_binds: false,
         sched_heuristic: Default::default(),
@@ -249,22 +257,36 @@ mod tests {
     #[test]
     fn record_features_default_when_reading_legacy_metadata() {
         let command = Command::new("/bin/true");
-        let metadata = Metadata::new(&command, RecordFeatures::all()).unwrap();
+        let metadata = Metadata::new(
+            &command,
+            RecordOptions {
+                record_features: RecordFeatures::all(),
+                chaos: true,
+            },
+        )
+        .unwrap();
         let mut value = serde_json::to_value(metadata).unwrap();
         value.as_object_mut().unwrap().remove("record_features");
+        value.as_object_mut().unwrap().remove("chaos");
         value["version"] = serde_json::json!(0x103);
 
         let parsed: Metadata = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.version, RecordVersion(0x103));
         assert_eq!(parsed.record_features, RecordFeatures::default());
+        assert!(!parsed.chaos);
     }
 
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
         for mode in [RecordReplayMode::Record, RecordReplayMode::Replay] {
             assert!(
-                record_or_replay_config(Path::new("replay-data"), RecordFeatures::default(), mode)
-                    .passthru_opt
+                record_or_replay_config(
+                    Path::new("replay-data"),
+                    RecordFeatures::default(),
+                    false,
+                    mode
+                )
+                .passthru_opt
             );
         }
     }
@@ -274,6 +296,7 @@ mod tests {
         let config = record_or_replay_config(
             Path::new("replay-data"),
             RecordFeatures::default(),
+            false,
             RecordReplayMode::Record,
         );
         assert!(config.virtualize_time);
@@ -286,8 +309,12 @@ mod tests {
     #[test]
     fn record_all_captures_sources_and_replays_the_schedule() {
         let features = RecordFeatures::all();
-        let record =
-            record_or_replay_config(Path::new("replay-data"), features, RecordReplayMode::Record);
+        let record = record_or_replay_config(
+            Path::new("replay-data"),
+            features,
+            false,
+            RecordReplayMode::Record,
+        );
         assert!(!record.virtualize_time);
         assert!(!record.virtualize_cpuid);
         assert!(!record.virtualize_metadata);
@@ -296,10 +323,44 @@ mod tests {
             Some(PathBuf::from("replay-data/schedule.json"))
         );
 
-        let replay =
-            record_or_replay_config(Path::new("replay-data"), features, RecordReplayMode::Replay);
+        let replay = record_or_replay_config(
+            Path::new("replay-data"),
+            features,
+            false,
+            RecordReplayMode::Replay,
+        );
         assert!(replay.replay_exhausted_panic);
         assert!(replay.die_on_desync);
+        assert_eq!(
+            replay.replay_schedule_from,
+            Some(PathBuf::from("replay-data/schedule.json"))
+        );
+    }
+
+    #[test]
+    fn chaos_recording_forces_schedule_capture_and_replay() {
+        let record = record_or_replay_config(
+            Path::new("replay-data"),
+            RecordFeatures::default(),
+            true,
+            RecordReplayMode::Record,
+        );
+        assert!(record.chaos);
+        assert!(record.record_features.sched);
+        assert_eq!(
+            record.record_preemptions_to,
+            Some(PathBuf::from("replay-data/schedule.json"))
+        );
+
+        let replay = record_or_replay_config(
+            Path::new("replay-data"),
+            RecordFeatures::default(),
+            true,
+            RecordReplayMode::Replay,
+        );
+        assert!(!replay.chaos);
+        assert!(replay.record_features.sched);
+        assert!(replay.replay_exhausted_panic);
         assert_eq!(
             replay.replay_schedule_from,
             Some(PathBuf::from("replay-data/schedule.json"))

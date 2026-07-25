@@ -312,6 +312,26 @@ fn record_direct_cli_records_and_replays_echo() {
 }
 
 #[test]
+fn record_chaos_composes_with_boundary_policies() {
+    let _guard = hermit_record_lock();
+    let workload = workload("rustbin_thread_random");
+
+    for (name, options) in [
+        ("chaos-default-boundary", &["--chaos"][..]),
+        (
+            "chaos-portable-boundary",
+            &["--preset=portable", "--chaos"][..],
+        ),
+        (
+            "chaos-record-all-boundary",
+            &["--record-all", "--chaos"][..],
+        ),
+    ] {
+        record_replay_command_with_options(name, &workload.path, &[], options);
+    }
+}
+
+#[test]
 fn record_all_captures_boundary_sources() {
     let _guard = hermit_record_lock();
     let build_dir = tempfile::tempdir().expect("failed to create boundary workload directory");

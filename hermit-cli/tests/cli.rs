@@ -1029,6 +1029,7 @@ fn record_help_lists_management_commands() {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
     for flag in [
+        "--preset",
         "--record-time",
         "--record-pids",
         "--record-sched",
@@ -1037,9 +1038,14 @@ fn record_help_lists_management_commands() {
         "--record-fs",
         "--record-signals",
         "--record-all",
+        "--chaos",
     ] {
         assert!(help.contains(flag), "missing {flag:?} in:\n{help}");
     }
+    assert!(
+        help.contains("[possible values: hermit, portable, rr]"),
+        "missing preset values in:\n{help}"
+    );
     assert!(
         !help.contains("--strict"),
         "unexpected run-only flag in:\n{help}"

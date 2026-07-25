@@ -13,6 +13,7 @@ use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
 
+use crate::RecordOptions;
 use crate::consts::EXE_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
@@ -36,9 +37,10 @@ impl Record {
     pub async fn spawn(
         command: Command,
         dir: &Path,
-        record_features: detcore::RecordFeatures,
+        options: RecordOptions,
     ) -> Result<Self, Error> {
-        let metadata = Metadata::new(&command, record_features)?;
+        let options = options.normalized();
+        let metadata = Metadata::new(&command, options)?;
 
         let exe = dir.join(EXE_NAME);
 
@@ -51,7 +53,12 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let config = record_or_replay_config(dir, record_features, RecordReplayMode::Record);
+        let config = record_or_replay_config(
+            dir,
+            options.record_features,
+            options.chaos,
+            RecordReplayMode::Record,
+        );
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)

@@ -76,8 +76,12 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let config =
-            record_or_replay_config(dir, metadata.record_features, RecordReplayMode::Replay);
+        let config = record_or_replay_config(
+            dir,
+            metadata.record_features,
+            metadata.chaos,
+            RecordReplayMode::Replay,
+        );
         let sequentialize_threads = config.sequentialize_threads;
 
         let chroot =

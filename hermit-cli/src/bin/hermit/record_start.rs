@@ -15,12 +15,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::Args;
+use clap::ValueEnum;
 use colored::Colorize;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
 use hermit::HermitData;
 use hermit::RecordFeatures;
+use hermit::RecordOptions;
 use hermit::SerializableError;
 use hermit::Shebang;
 use nix::sys::signal::SaFlags;
@@ -150,11 +152,36 @@ fn with_recording_deadline<T>(
     record()
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum RecordPreset {
+    #[default]
+    Hermit,
+    Portable,
+    Rr,
+}
+
+impl RecordPreset {
+    fn record_features(self) -> RecordFeatures {
+        match self {
+            Self::Hermit => RecordFeatures::default(),
+            Self::Portable => RecordFeatures {
+                fs: true,
+                ..RecordFeatures::default()
+            },
+            Self::Rr => RecordFeatures::all(),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct StartOpts {
     /// Program to run.
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
+
+    /// Select the baseline determinize-or-record policy. Individual record flags add to it.
+    #[clap(long, value_enum, default_value_t = RecordPreset::Hermit)]
+    preset: RecordPreset,
 
     /// Record host time instead of using Detcore's logical clock.
     #[clap(long)]
@@ -187,6 +214,10 @@ pub struct StartOpts {
     /// Record every configurable nondeterminism source.
     #[clap(long)]
     record_all: bool,
+
+    /// Randomize scheduling while recording and capture the chosen schedule for replay.
+    #[clap(long)]
+    chaos: bool,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
@@ -231,22 +262,34 @@ impl StartOpts {
     }
 
     fn det_config(&self) -> DetConfig {
-        let record_features = if self.record_all {
+        let mut record_features = if self.record_all {
             RecordFeatures::all()
         } else {
-            RecordFeatures {
-                time: self.record_time,
-                pids: self.record_pids,
-                sched: self.record_sched,
-                cpuid: self.record_cpuid,
-                rng: self.record_rng,
-                fs: self.record_fs,
-                signals: self.record_signals,
-            }
+            let mut record_features = self.preset.record_features();
+            record_features.time |= self.record_time;
+            record_features.pids |= self.record_pids;
+            record_features.sched |= self.record_sched;
+            record_features.cpuid |= self.record_cpuid;
+            record_features.rng |= self.record_rng;
+            record_features.fs |= self.record_fs;
+            record_features.signals |= self.record_signals;
+            record_features
         };
+        if self.chaos {
+            record_features.sched = true;
+        }
         DetConfig {
             record_features,
+            chaos: self.chaos,
             ..DetConfig::default()
+        }
+    }
+
+    fn record_options(&self) -> RecordOptions {
+        let config = self.det_config();
+        RecordOptions {
+            record_features: config.record_features,
+            chaos: config.chaos,
         }
     }
 
@@ -271,10 +314,10 @@ impl StartOpts {
                             let mut command = Command::new(self.program());
                             command.args(&self.args);
                             with_recording_deadline(timeout, || {
-                                hermit::record_to_with_features(
+                                hermit::record_to_with_options(
                                     command,
                                     &data_path,
-                                    self.det_config().record_features,
+                                    self.record_options(),
                                 )
                             })
                             .map_err(SerializableError::from)
@@ -288,7 +331,7 @@ impl StartOpts {
                         let mut command = Command::new(self.program());
                         command.args(&self.args);
                         hermit
-                            .record_with_features(command, self.det_config().record_features)
+                            .record_with_options(command, self.record_options())
                             .map_err(SerializableError::from)
                     })
                     .context("Container exited unexpectedly")??,
@@ -326,17 +369,11 @@ impl StartOpts {
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_with_output_features(
-                            command,
-                            data_dir,
-                            self.det_config().record_features,
-                        )
+                        hermit::record_with_output_options(command, data_dir, self.record_options())
                     }),
-                    None => hermit::record_with_output_features(
-                        command,
-                        data_dir,
-                        self.det_config().record_features,
-                    ),
+                    None => {
+                        hermit::record_with_output_options(command, data_dir, self.record_options())
+                    }
                 }
                 .map_err(SerializableError::from)
             })
@@ -354,7 +391,7 @@ impl StartOpts {
 
         // Captured schedule replay emits different Detcore bookkeeping from recording it.
         // In that mode, compare the guest-observable output and status only.
-        let features = self.det_config().record_features;
+        let features = self.record_options().record_features;
 
         compare_two_runs(
             ComparedRun {
@@ -392,17 +429,11 @@ impl StartOpts {
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_to_with_features(
-                            command,
-                            data_dir,
-                            self.det_config().record_features,
-                        )
+                        hermit::record_to_with_options(command, data_dir, self.record_options())
                     }),
-                    None => hermit::record_to_with_features(
-                        command,
-                        data_dir,
-                        self.det_config().record_features,
-                    ),
+                    None => {
+                        hermit::record_to_with_options(command, data_dir, self.record_options())
+                    }
                 }
                 .map_err(SerializableError::from)
             })
@@ -509,6 +540,85 @@ mod tests {
             parsed.opts.det_config().record_features,
             RecordFeatures::all()
         );
+    }
+
+    #[test]
+    fn record_presets_select_expected_boundaries() {
+        let hermit =
+            <TestStart as clap::Parser>::parse_from(["test", "--preset=hermit", "/bin/true"]);
+        assert_eq!(
+            hermit.opts.det_config().record_features,
+            RecordFeatures::default()
+        );
+
+        let portable =
+            <TestStart as clap::Parser>::parse_from(["test", "--preset=portable", "/bin/true"]);
+        assert_eq!(
+            portable.opts.det_config().record_features,
+            RecordFeatures {
+                fs: true,
+                ..RecordFeatures::default()
+            }
+        );
+
+        let rr = <TestStart as clap::Parser>::parse_from(["test", "--preset=rr", "/bin/true"]);
+        assert_eq!(rr.opts.det_config().record_features, RecordFeatures::all());
+    }
+
+    #[test]
+    fn chaos_forces_schedule_capture_without_changing_other_boundaries() {
+        let parsed = <TestStart as clap::Parser>::parse_from(["test", "--chaos", "/bin/true"]);
+        let config = parsed.opts.det_config();
+
+        assert!(config.chaos);
+        assert_eq!(
+            config.record_features,
+            RecordFeatures {
+                sched: true,
+                ..RecordFeatures::default()
+            }
+        );
+    }
+
+    #[test]
+    fn chaos_composes_with_presets_individual_and_record_all() {
+        let individual = <TestStart as clap::Parser>::parse_from([
+            "test",
+            "--preset=portable",
+            "--record-time",
+            "--record-rng",
+            "--chaos",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            individual.opts.det_config().record_features,
+            RecordFeatures {
+                time: true,
+                sched: true,
+                rng: true,
+                fs: true,
+                ..RecordFeatures::default()
+            }
+        );
+
+        let rr = <TestStart as clap::Parser>::parse_from([
+            "test",
+            "--preset=rr",
+            "--chaos",
+            "/bin/true",
+        ]);
+        assert!(rr.opts.det_config().chaos);
+        assert_eq!(rr.opts.det_config().record_features, RecordFeatures::all());
+
+        let all = <TestStart as clap::Parser>::parse_from([
+            "test",
+            "--record-all",
+            "--chaos",
+            "/bin/true",
+        ]);
+        let config = all.opts.det_config();
+        assert!(config.chaos);
+        assert_eq!(config.record_features, RecordFeatures::all());
     }
 
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
