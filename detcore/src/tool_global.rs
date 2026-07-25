@@ -516,12 +516,14 @@ impl GlobalTool for GlobalState {
                     .unwrap()
                     .fence_prepared_sigkill_targets(targets),
             ),
-            GlobalRequest::CancelPreparedSigkill(sender, targets) => R::CancelPreparedSigkill(
-                self.sched
+            GlobalRequest::CancelPreparedSigkill(sender, targets) => {
+                let (cancelled, woken) = self
+                    .sched
                     .lock()
                     .unwrap()
-                    .cancel_prepared_sigkill(sender, targets),
-            ),
+                    .cancel_prepared_sigkill(sender, targets);
+                R::CancelPreparedSigkill(cancelled, woken)
+            }
             GlobalRequest::CompleteSigkillExit(exiting, process) => {
                 let (remaining, woken) = self
                     .sched
@@ -965,6 +967,14 @@ impl GlobalState {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
+            // TODO-HUMAN-REVIEW(PR-659): Review futex RPC as a post-SIGKILL sender boundary.
+            let sigkill_woken = sched.sigkill_sender_reached_boundary(dettid, false);
+            if sigkill_woken > 0 {
+                info!(
+                    "[detcore, dtid {}] post-SIGKILL futex boundary woke {} modeled futex waiter(s)",
+                    dettid, sigkill_woken
+                );
+            }
             let resp_iv = sched
                 .next_turns
                 .get(&dettid)
@@ -1323,7 +1333,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence response.
     FencePreparedSigkill(u64),
     // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation response.
-    CancelPreparedSigkill(u64),
+    CancelPreparedSigkill(u64, u64),
     // TODO-HUMAN-REVIEW(PR-659): Review last-exit SIGKILL completion response.
     CompleteSigkillExit(u64, u64),
     FutexAction(Option<SchedValue>),
@@ -1665,7 +1675,7 @@ where
 
 // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cohort cancellation.
 /// Cancel the prepared targets after the kernel rejects SIGKILL.
-pub async fn cancel_prepared_sigkill<G, T>(guest: &mut G, targets: Vec<DetTid>) -> u64
+pub async fn cancel_prepared_sigkill<G, T>(guest: &mut G, targets: Vec<DetTid>) -> (u64, u64)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1674,7 +1684,7 @@ where
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::CancelPreparedSigkill(sender, targets)).await;
     match response {
-        GlobalResponse::CancelPreparedSigkill(cancelled) => cancelled,
+        GlobalResponse::CancelPreparedSigkill(cancelled, woken) => (cancelled, woken),
         _ => unreachable!(),
     }
 }

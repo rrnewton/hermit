@@ -845,15 +845,6 @@ static void check_pthread(int ret, const char *operation) {
 }
 
 int main(void) {
-  sigset_t child_signals;
-  if (sigemptyset(&child_signals) != 0 ||
-      sigaddset(&child_signals, SIGCHLD) != 0) {
-    perror("prepare SIGCHLD mask");
-    return EXIT_FAILURE;
-  }
-  check_pthread(pthread_sigmask(SIG_BLOCK, &child_signals, NULL),
-                "pthread_sigmask(SIGCHLD)");
-
   check_blocked_and_failed_signal_preserve_owner();
   check_robust_list_lookup();
   check_pending_owner_zero_wake();

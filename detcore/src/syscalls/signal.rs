@@ -94,11 +94,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(result) => result,
             Err(error) => {
                 if managed_sigkill {
-                    let cancelled = cancel_prepared_sigkill(guest, prepared_targets).await;
+                    let (cancelled, woken) = cancel_prepared_sigkill(guest, prepared_targets).await;
                     info!(
-                        "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s) after failed delivery",
+                        "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s) and woke {} waiter(s) after failed delivery",
                         guest.thread_state().dettid,
-                        cancelled
+                        cancelled,
+                        woken
                     );
                 }
                 return Err(error.into());
@@ -113,11 +114,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     fenced
                 );
             } else {
-                let cancelled = cancel_prepared_sigkill(guest, prepared_targets).await;
+                let (cancelled, woken) = cancel_prepared_sigkill(guest, prepared_targets).await;
                 info!(
-                    "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s) after result {}",
+                    "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s), woke {} waiter(s), after result {}",
                     guest.thread_state().dettid,
                     cancelled,
+                    woken,
                     result
                 );
             }

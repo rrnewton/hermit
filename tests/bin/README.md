@@ -7,7 +7,7 @@ also compiled by `hermit-cli/tests/threading_syscalls.rs`.
 ## Robust futex owner death
 
 `robust_futex_test.c` checks the Linux robust-list contract for waiters that are
-already blocked when a mutex owner, thread group, or self-signaled process exits:
+already blocked when a mutex owner, thread group, or externally killed process exits:
 
 1. Thread A explicitly re-registers glibc's robust-list head with
    `set_robust_list`, then locks a `PTHREAD_MUTEX_ROBUST` mutex.
@@ -58,7 +58,7 @@ $ timeout --kill-after 5s 30s target/release/hermit --log=off run \
 The same fixture blocks real waiters across legacy `FUTEX_CMP_REQUEUE` and the
 U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
 `FUTEX_WAKE_OP`, sibling `get_robust_list`, missing-thread `ESRCH`,
-process-shared `exit_group`, and self-directed fatal-signal cleanup.
+process-shared `exit_group`, and external `SIGKILL` cleanup.
 
 # POSIX timer signal-delivery probe
 
