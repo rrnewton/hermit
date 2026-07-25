@@ -187,6 +187,37 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::tuxcall
         | Sysno::uselib
         | Sysno::vserver
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#PR): Deterministic EPERM for privileged mount and
+        // namespace administration syscalls. These create, enter, or
+        // reconfigure mount and other namespaces, resolve files by kernel
+        // handle, configure global filesystem-event notification, or set the
+        // host clock -- global kernel state a deterministic container pins for
+        // the whole run. They are capability-gated (CAP_SYS_ADMIN /
+        // CAP_DAC_READ_SEARCH / CAP_SYS_TIME), so a fixed -EPERM is the errno an
+        // unprivileged process receives for the privileged operations and a
+        // deliberate deterministic refusal for the few unprivileged sub-modes
+        // (user-namespace unshare, non-clone open_tree) that would otherwise
+        // perturb the pinned container. Refusing in Detcore (rather than the
+        // legacy pass-through, which forwarded them to the real kernel) removes a
+        // host dependency and a global-state isolation hole, and is
+        // bitwise-identical across --verify and record/replay. Dispatched by
+        // Sysno in lib.rs before the typed match below.
+        | Sysno::mount
+        | Sysno::umount2
+        | Sysno::mount_setattr
+        | Sysno::move_mount
+        | Sysno::open_tree
+        | Sysno::fsopen
+        | Sysno::fsmount
+        | Sysno::fsconfig
+        | Sysno::fspick
+        | Sysno::unshare
+        | Sysno::setns
+        | Sysno::open_by_handle_at
+        | Sysno::fanotify_init
+        | Sysno::fanotify_mark
+        | Sysno::settimeofday
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev => SyscallClassification::Determinized,
 
@@ -342,14 +373,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::copy_file_range
         | Sysno::delete_module
         | Sysno::epoll_pwait2
-        | Sysno::fanotify_init
-        | Sysno::fanotify_mark
         | Sysno::finit_module
         | Sysno::flock
-        | Sysno::fsconfig
-        | Sysno::fsmount
-        | Sysno::fsopen
-        | Sysno::fspick
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -391,9 +416,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mlock2
         | Sysno::mlockall
         | Sysno::modify_ldt
-        | Sysno::mount
-        | Sysno::mount_setattr
-        | Sysno::move_mount
         | Sysno::move_pages
         | Sysno::mq_getsetattr
         | Sysno::mq_notify
@@ -406,8 +428,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgsnd
         | Sysno::name_to_handle_at
-        | Sysno::open_by_handle_at
-        | Sysno::open_tree
         | Sysno::openat2
         | Sysno::perf_event_open
         | Sysno::personality
@@ -461,12 +481,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setgid
         | Sysno::setgroups
         | Sysno::sethostname
-        | Sysno::setns
         | Sysno::setregid
         | Sysno::setresgid
         | Sysno::setresuid
         | Sysno::setreuid
-        | Sysno::settimeofday
         | Sysno::setuid
         | Sysno::shmat
         | Sysno::shmctl
@@ -484,8 +502,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
-        | Sysno::umount2
-        | Sysno::unshare
         | Sysno::ustat
         | Sysno::vhangup
         | Sysno::vmsplice => SyscallClassification::Unclassified,
@@ -524,6 +540,42 @@ pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#PR): Deterministic EPERM refusal set.
+/// Privileged mount and namespace administration syscalls that create, enter,
+/// or reconfigure mount and other namespaces, resolve files by kernel handle,
+/// configure global filesystem-event notification, or set the host clock. A
+/// deterministic container pins the guest's namespaces, mount hierarchy, and
+/// virtual clock for the entire run, so Detcore refuses these with a fixed
+/// `EPERM`. That is the errno an unprivileged process receives for the
+/// capability-gated operations (`CAP_SYS_ADMIN`, `CAP_DAC_READ_SEARCH`,
+/// `CAP_SYS_TIME`) and a deliberate deterministic refusal for the few
+/// unprivileged sub-modes (a user-namespace `unshare`, a non-clone
+/// `open_tree`) that would otherwise perturb the pinned container. The result
+/// is never forwarded to the host and is deterministic by construction. These
+/// are untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher
+/// matches on the `Sysno` before the typed match.
+pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::mount
+            | Sysno::umount2
+            | Sysno::mount_setattr
+            | Sysno::move_mount
+            | Sysno::open_tree
+            | Sysno::fsopen
+            | Sysno::fsmount
+            | Sysno::fsconfig
+            | Sysno::fspick
+            | Sysno::unshare
+            | Sysno::setns
+            | Sysno::open_by_handle_at
+            | Sysno::fanotify_init
+            | Sysno::fanotify_mark
+            | Sysno::settimeofday
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +592,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [141, 74, 158]);
+        assert_eq!(counts, [156, 74, 143]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -705,6 +757,50 @@ mod tests {
         // The helper must not claim any syscall outside the reviewed set.
         for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
             if is_unimplemented_enosys_syscall(sysno) {
+                assert!(
+                    refused.contains(&sysno),
+                    "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_ns_admin_syscalls_are_determinized_and_consistent() {
+        // Every syscall in the deterministic mount/namespace EPERM-refusal set
+        // must classify as Determinized, and the helper used by the dispatcher
+        // must agree exactly with that classification across the pinned table.
+        let refused = [
+            Sysno::mount,
+            Sysno::umount2,
+            Sysno::mount_setattr,
+            Sysno::move_mount,
+            Sysno::open_tree,
+            Sysno::fsopen,
+            Sysno::fsmount,
+            Sysno::fsconfig,
+            Sysno::fspick,
+            Sysno::unshare,
+            Sysno::setns,
+            Sysno::open_by_handle_at,
+            Sysno::fanotify_init,
+            Sysno::fanotify_mark,
+            Sysno::settimeofday,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic EPERM refusal)"
+            );
+            assert!(
+                is_mount_ns_admin_refused_syscall(sysno),
+                "{sysno:?} should be in the mount/namespace EPERM-refusal helper set"
+            );
+        }
+        // The helper must not claim any syscall outside the reviewed set.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_mount_ns_admin_refused_syscall(sysno) {
                 assert!(
                     refused.contains(&sysno),
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
