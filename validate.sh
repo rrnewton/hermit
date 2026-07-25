@@ -1757,7 +1757,7 @@ function run_e9patch_extended_compatibility_envelope {
     optional_e9patch_compatibility_probe qemu-nbd qemu-nbd --version
     optional_e9patch_compatibility_probe btrfs btrfs version
     optional_e9patch_compatibility_probe llvm-exegesis llvm-exegesis --version
-    optional_e9patch_compatibility_probe lto-dump lto-dump --version
+    optional_e9patch_compatibility_probe lto-dump lto-dump --help=common
     optional_e9patch_compatibility_probe my-print-defaults my_print_defaults --version
 
     classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
