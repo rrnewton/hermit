@@ -83,7 +83,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Schedule a one-shot real-time interval timer on Detcore logical time.
     pub async fn handle_setitimer<G: Guest<Self>>(
         &self,
@@ -239,7 +239,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Send a process-directed signal through the kernel. Reverie's signal event
     /// hook serializes the resulting delivery before the guest handler runs.
     pub async fn handle_kill<G: Guest<Self>>(

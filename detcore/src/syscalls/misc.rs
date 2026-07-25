@@ -219,7 +219,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Handle deterministic process-local `prctl` options and reject the rest.
     pub async fn handle_prctl<G: Guest<Self>>(
         &self,
@@ -234,7 +234,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Report the deterministic default nice value for the current process.
     pub async fn handle_getpriority<G: Guest<Self>>(
         &self,
@@ -250,7 +250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Accept the common reset-to-default request without changing host scheduling.
     pub async fn handle_setpriority<G: Guest<Self>>(
         &self,
@@ -265,7 +265,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Reject cross-process memory advice without consulting host process state.
     pub fn handle_process_madvise(pidfd: usize, flags: usize) -> Result<i64, Error> {
         if flags != 0 {

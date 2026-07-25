@@ -22,7 +22,7 @@ const MB: u64 = 1024 * 1024;
 
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#TBD)
+    // TODO-HUMAN-REVIEW(#663)
     /// Return one deterministic process resource limit through the legacy ABI.
     pub async fn handle_getrlimit<G: Guest<Self>>(
         &self,
