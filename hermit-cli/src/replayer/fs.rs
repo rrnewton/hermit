@@ -115,7 +115,15 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let request = syscall.request();
 
-        if request.direction() == ioctl::Direction::Read {
+        if matches!(
+            request,
+            ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
+        ) {
+            // These requests produce no output; the recorder stored only the
+            // return value. Mirror the recorder and avoid reverie's direction(),
+            // which panics on these requests.
+            next_event!(guest, Return)
+        } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
             Ok(0)
