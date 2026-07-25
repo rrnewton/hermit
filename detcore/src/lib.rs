@@ -1349,11 +1349,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                     }
                 }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
                 Syscall::Uname(s) => self.handle_uname(guest, s).await,
                 Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
@@ -1380,10 +1390,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
                 Syscall::Connect(s) => self.handle_connect(guest, s).await,
                 Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setsockopt(s) => self.handle_setsockopt(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Listen(s) => self.handle_listen(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
@@ -1449,8 +1469,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
 
                 Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
@@ -1465,7 +1491,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
                 Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
 
                 // POSIX per-process timers. Arming is tracked against the virtual
@@ -1516,6 +1546,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Brk(_)
                 | Syscall::Capget(_)
                 | Syscall::Capset(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Chown(_)
                 | Syscall::Chdir(_)
                 | Syscall::Chmod(_)
@@ -1559,6 +1591,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fallocate(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Readlinkat(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Rename(_)
@@ -1575,8 +1608,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Getpgid(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Getpgrp(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Getppid(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Getsid(_)
                 | Syscall::Gettid(_)
                 | Syscall::Getuid(_)
@@ -1604,13 +1643,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Readlink(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Readahead(_)
-                | Syscall::Readlinkat(_)
                 | Syscall::Removexattr(_)
                 | Syscall::Renameat2(_)
                 | Syscall::Rmdir(_)
                 | Syscall::RtSigreturn(_)
                 | Syscall::Setxattr(_)
                 | Syscall::SetRobustList(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
                 | Syscall::Setpgid(_)
                 | Syscall::SetTidAddress(_)
                 | Syscall::Sigaltstack(_)

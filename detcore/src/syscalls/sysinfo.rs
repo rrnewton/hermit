@@ -46,6 +46,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Update one virtual process resource limit through the legacy ABI.
     pub async fn handle_setrlimit<G: Guest<Self>>(
         &self,

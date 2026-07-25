@@ -29,8 +29,11 @@ use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_alarm;
+use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::types::DetPid;
+use crate::types::DetTid;
 use crate::types::LogicalTime;
 
 // NB: note kernel has different notation of sigaction, we cannot
@@ -38,6 +41,8 @@ use crate::types::LogicalTime;
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
 const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
 fn timeval_to_logical_time(value: libc::timeval) -> Result<LogicalTime, Errno> {
     let seconds = u64::try_from(value.tv_sec).map_err(|_| Errno::EINVAL)?;
     let micros = u64::try_from(value.tv_usec).map_err(|_| Errno::EINVAL)?;
@@ -51,6 +56,8 @@ fn timeval_to_logical_time(value: libc::timeval) -> Result<LogicalTime, Errno> {
     Ok(LogicalTime::from_nanos(nanos))
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
 fn logical_time_to_timeval(value: LogicalTime) -> libc::timeval {
     libc::timeval {
         tv_sec: value.as_secs() as libc::time_t,
@@ -58,7 +65,26 @@ fn logical_time_to_timeval(value: LogicalTime) -> libc::timeval {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
+fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
+    value.as_nanos().div_ceil(1_000_000_000) as i64
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#663)
+fn deterministic_kill_target(targets: &[DetTid], sig: libc::c_int) -> Result<DetTid, Errno> {
+    match targets {
+        [] => Err(Errno::ESRCH),
+        [target] => Ok(*target),
+        [target, ..] if sig == 0 => Ok(*target),
+        _ => Err(Errno::ENOSYS),
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// We send the alarms to the global scheduler to handle.
     pub async fn handle_alarm<G: Guest<Self>>(
         &self,
@@ -72,7 +98,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Signal::SIGALRM,
             )
             .await;
-            Ok(remaining.as_secs() as i64)
+            Ok(logical_time_to_alarm_seconds(remaining))
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting alarm call through...",
@@ -240,16 +266,33 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Send a process-directed signal through the kernel. Reverie's signal event
-    /// hook serializes the resulting delivery before the guest handler runs.
+    /// Route an unambiguous positive-PID process signal to its sole live thread.
+    /// Multithreaded process-directed delivery, process-group delivery, and
+    /// broadcast delivery are refused until Detcore models eligible signal masks.
     pub async fn handle_kill<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        if !guest.config().sequentialize_threads {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        let tgid = call.pid();
+        if tgid <= 0 {
+            return Err(Errno::ENOSYS.into());
+        }
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        let tid = deterministic_kill_target(&targets, call.sig())?;
+        let targeted = syscalls::Tgkill::new()
+            .with_tgid(tgid)
+            .with_tid(tid.as_raw())
+            .with_sig(call.sig());
+        Ok(self.record_or_replay(guest, targeted).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Send a thread-directed signal through the kernel. Guest PID/TID values are
     /// stable in the fresh PID namespace and delivery is scheduler-serialized.
     pub async fn handle_tgkill<G: Guest<Self>>(
@@ -260,6 +303,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
     /// Read the kernel pending-signal mask after Detcore has serialized all signal
     /// generation and delivery events that can change it.
     pub async fn handle_rt_sigpending<G: Guest<Self>>(
@@ -314,5 +359,42 @@ mod tests {
                 "invalid timeval should return EINVAL"
             );
         }
+    }
+
+    #[test]
+    fn alarm_remaining_seconds_round_up() {
+        assert_eq!(logical_time_to_alarm_seconds(LogicalTime::ZERO), 0);
+        assert_eq!(logical_time_to_alarm_seconds(LogicalTime::from_nanos(1)), 1);
+        assert_eq!(
+            logical_time_to_alarm_seconds(LogicalTime::from_nanos(999_999_999)),
+            1
+        );
+        assert_eq!(
+            logical_time_to_alarm_seconds(LogicalTime::from_nanos(1_000_000_000)),
+            1
+        );
+        assert_eq!(
+            logical_time_to_alarm_seconds(LogicalTime::from_nanos(1_000_000_001)),
+            2
+        );
+    }
+
+    #[test]
+    fn kill_targets_only_unambiguous_process_delivery() {
+        let first = DetTid::from_raw(42);
+        let second = DetTid::from_raw(43);
+        assert_eq!(
+            deterministic_kill_target(&[], libc::SIGUSR1),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            deterministic_kill_target(&[first], libc::SIGUSR1),
+            Ok(first)
+        );
+        assert_eq!(
+            deterministic_kill_target(&[first, second], libc::SIGUSR1),
+            Err(Errno::ENOSYS)
+        );
+        assert_eq!(deterministic_kill_target(&[first, second], 0), Ok(first));
     }
 }
