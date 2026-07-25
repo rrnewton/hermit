@@ -161,6 +161,27 @@ fn required_jdk_app(name: &str, fallbacks: &[&str]) -> PathBuf {
     required_app(name, fallbacks)
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Bound JVM-internal concurrency while retaining application thread coverage.
+fn java_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec!["-Xint", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+fn javac_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec![
+        "-J-Xint",
+        "-J-XX:+UseSerialGC",
+        "-J-XX:ActiveProcessorCount=1",
+    ];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
 /// Run `hermit run --strict --verify -- <program> <args>` and assert that
 /// Hermit's verifier reports a bitwise-identical repeat run (L2).
 ///
@@ -240,7 +261,8 @@ fn redis_server_version_is_deterministic_under_strict_verify() {
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JVM"]
 fn java_version_is_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
-    assert_l2_under_strict_verify(&java, &["-version"]);
+    let args = java_vm_args(&["-version"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +485,8 @@ fn java_hello_is_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Hello"]);
+    let args = java_vm_args(&["-cp", classpath, "Hello"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 #[test]
@@ -472,7 +495,8 @@ fn java_threads_are_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Threads"]);
+    let args = java_vm_args(&["-cp", classpath, "Threads"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
@@ -506,7 +530,8 @@ fn javac_is_l1_deterministic_under_strict() {
         let out_dir = build_dir(&format!("javac_l1_out{run}"));
         let out_dir_str = out_dir.to_str().expect("out dir is valid UTF-8");
         let src_str = src.to_str().expect("src path is valid UTF-8");
-        let output = run_once_under_strict(&javac, &["-d", out_dir_str, src_str]);
+        let args = javac_vm_args(&["-d", out_dir_str, src_str]);
+        let output = run_once_under_strict(&javac, &args);
         assert!(
             output.status.success(),
             "hermit run --strict javac (run {run}) failed\nstatus: {}\nstderr:\n{}",
