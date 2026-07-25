@@ -15,7 +15,6 @@ pub mod timed_waiters;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::fmt::Write;
 use std::iter::Peekable;
 use std::path::PathBuf;
@@ -78,7 +77,7 @@ use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
 use crate::util::truncated;
 
-const SIGKILL_RECONCILIATION_SPINS: u32 = 4096;
+const SIGKILL_RECONCILIATION_SPINS: u32 = 16;
 
 /// Unique identifier for an action.
 pub type ActionID = u64;
@@ -367,11 +366,17 @@ pub struct Scheduler {
     /// Prepared SIGKILL cohorts whose senders have not reached a deterministic boundary.
     pending_sigkill_senders: HashMap<DetTid, u64>,
 
-    /// One-shot futex reconciliation credits from completed SIGKILL cohorts.
-    pending_sigkill_futex_wakes: VecDeque<DetTid>,
+    /// Coalesced futex reconciliation credit from a completed SIGKILL cohort.
+    pending_sigkill_futex_wake: Option<DetTid>,
+
+    /// Senders whose in-flight futex wait raced a target that already exited.
+    pending_sigkill_futex_waiters: HashSet<DetTid>,
 
     /// Bounded scheduler passes reserved for physical SIGKILL exit hooks.
     sigkill_reconciliation_spins_remaining: u32,
+
+    /// Sender used for a provisional reconciliation credit at bounded fallback.
+    sigkill_reconciliation_waker: Option<DetTid>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -966,8 +971,10 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             pending_sigkills: Default::default(),
             pending_sigkill_senders: Default::default(),
-            pending_sigkill_futex_wakes: Default::default(),
+            pending_sigkill_futex_wake: None,
+            pending_sigkill_futex_waiters: Default::default(),
             sigkill_reconciliation_spins_remaining: 0,
+            sigkill_reconciliation_waker: None,
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -1119,6 +1126,7 @@ impl Scheduler {
 
         let removed_pending = self.pending_sigkills.remove(dtid)
             | self.pending_sigkill_senders.remove(dtid).is_some();
+        self.pending_sigkill_futex_waiters.remove(dtid);
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1576,43 +1584,98 @@ impl Scheduler {
 
     fn wake_after_sigkill_quiesces(&mut self, waker: DetTid) -> u64 {
         if self.pending_sigkills.is_empty() && self.pending_sigkill_senders.is_empty() {
-            self.pending_sigkill_futex_wakes.push_back(waker);
             self.sigkill_reconciliation_spins_remaining = 0;
+            self.sigkill_reconciliation_waker = None;
+            if !self.blocked.no_futex_waiters() {
+                self.pending_sigkill_futex_wake.get_or_insert(waker);
+            }
         }
         0
     }
 
-    fn finish_sigkill_sender_boundary(&mut self, sender: DetTid) -> u64 {
+    fn finish_sigkill_sender_boundary(&mut self, sender: DetTid, futex_wait: bool) -> u64 {
         if self.pending_sigkill_senders.remove(&sender).is_none() {
             return 0;
         }
         if self.pending_sigkills.is_empty() {
-            self.wake_after_sigkill_quiesces(sender)
+            if futex_wait && self.blocked.no_futex_waiters() {
+                self.pending_sigkill_futex_waiters.insert(sender);
+                self.sigkill_reconciliation_spins_remaining = 0;
+                self.sigkill_reconciliation_waker = None;
+                0
+            } else {
+                self.wake_after_sigkill_quiesces(sender)
+            }
         } else {
             self.sigkill_reconciliation_spins_remaining = SIGKILL_RECONCILIATION_SPINS;
+            self.sigkill_reconciliation_waker = Some(sender);
             0
         }
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review one-shot post-SIGKILL futex reconciliation credits.
     /// Publish one completed cohort at a scheduler boundary without blocking runnable peers.
-    fn publish_pending_sigkill_futex_wake(&mut self) -> u64 {
-        if self.blocked.no_futex_waiters() {
-            return 0;
+    pub fn publish_pending_sigkill_futex_wake(&mut self) -> u64 {
+        let mut woken = 0;
+        if let Some(waker) = self.pending_sigkill_futex_wake.take()
+            && !self.blocked.no_futex_waiters()
+        {
+            let current_waiters = self
+                .blocked
+                .futex_waiters
+                .values()
+                .flatten()
+                .map(|waiter| waiter.dettid)
+                .collect::<HashSet<_>>();
+            self.pending_sigkill_futex_waiters
+                .retain(|waiter| !current_waiters.contains(waiter));
+            woken += self.wake_all_futex_waiters(waker);
         }
-        let Some(waker) = self.pending_sigkill_futex_wakes.pop_front() else {
-            return 0;
-        };
-        self.wake_all_futex_waiters(waker)
+
+        let targeted = self.pending_sigkill_futex_waiters.clone();
+        if targeted.is_empty() {
+            return woken;
+        }
+        let mut futexids = self
+            .blocked
+            .futex_waiters
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        futexids.sort_unstable();
+        let mut selected = Vec::new();
+        for futexid in futexids {
+            let Some(waiters) = self.blocked.futex_waiters.remove(&futexid) else {
+                continue;
+            };
+            let (wake, keep): (Vec<_>, Vec<_>) = waiters
+                .into_iter()
+                .partition(|waiter| targeted.contains(&waiter.dettid));
+            if !keep.is_empty() {
+                self.blocked.futex_waiters.insert(futexid, keep);
+            }
+            selected.extend(wake);
+        }
+        for waiter in selected {
+            self.pending_sigkill_futex_waiters.remove(&waiter.dettid);
+            self.wake_futex_waiter(waiter);
+            woken += 1;
+        }
+        woken
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review the nonblocking post-SIGKILL sender handoff.
     /// Mark that a signal sender reached its first deterministic boundary after `kill`.
-    pub fn sigkill_sender_reached_boundary(&mut self, sender: DetTid, exiting: bool) -> u64 {
+    pub fn sigkill_sender_reached_boundary(
+        &mut self,
+        sender: DetTid,
+        exiting: bool,
+        futex_wait: bool,
+    ) -> u64 {
         if exiting {
             return 0;
         }
-        self.finish_sigkill_sender_boundary(sender)
+        self.finish_sigkill_sender_boundary(sender, futex_wait)
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review the one-turn post-SIGKILL sender handoff.
@@ -1629,7 +1692,7 @@ impl Scheduler {
     // TODO-HUMAN-REVIEW(PR-659): Review physical-exit completion for SIGKILL senders.
     /// Release a sender whose first post-SIGKILL boundary was an exit request.
     pub fn sigkill_sender_exited(&mut self, sender: DetTid) -> u64 {
-        self.finish_sigkill_sender_boundary(sender)
+        self.finish_sigkill_sender_boundary(sender, false)
     }
 
     // TODO-HUMAN-REVIEW(PR-659): Review last-exit robust-futex wake sequencing.
@@ -1697,6 +1760,11 @@ impl Scheduler {
             return Ok(());
         }
         self.sigkill_reconciliation_spins_remaining -= 1;
+        if self.sigkill_reconciliation_spins_remaining == 0
+            && let Some(waker) = self.sigkill_reconciliation_waker.take()
+        {
+            self.pending_sigkill_futex_wake.get_or_insert(waker);
+        }
         trace!(
             "[scheduler] bounded SIGKILL reconciliation handoff: {} pass(es) remain",
             self.sigkill_reconciliation_spins_remaining
@@ -3213,7 +3281,7 @@ mod test {
         scheduler.sleep_futex_waiter(&sibling, futex, None, u32::MAX);
         scheduler.sleep_futex_waiter(&survivor, futex, None, u32::MAX);
         assert_eq!(
-            scheduler.sigkill_sender_reached_boundary(DetTid::from_raw(99), false),
+            scheduler.sigkill_sender_reached_boundary(DetTid::from_raw(99), false, false),
             0
         );
         assert_eq!(scheduler.sigkill_sender_exited(DetTid::from_raw(99)), 0);
@@ -3239,7 +3307,10 @@ mod test {
         scheduler.logically_kill_thread(&sibling, &leader, MmId::initial(leader));
         assert!(scheduler.pending_sigkills.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, true), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, true, false),
+            0
+        );
         assert!(scheduler.pending_sigkill_senders.contains_key(&sender));
         assert_eq!(scheduler.sigkill_sender_exited(sender), 0);
         assert!(scheduler.pending_sigkill_senders.is_empty());
@@ -3349,7 +3420,10 @@ mod test {
         assert!(!scheduler.run_queue.contains_tid(first));
         assert!(scheduler.run_queue.contains_tid(second));
         assert_eq!(scheduler.complete_sigkill_exit(first, first), (0, 0));
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
         assert!(scheduler.pending_sigkill_senders.is_empty());
     }
 
@@ -3389,7 +3463,10 @@ mod test {
         assert!(!scheduler.pending_sigkills.contains(&second));
 
         assert_eq!(scheduler.fence_prepared_sigkill_targets(first_targets), 1);
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
         assert!(scheduler.pending_sigkill_senders.is_empty());
     }
 
@@ -3423,9 +3500,12 @@ mod test {
         assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
         assert!(scheduler.pending_sigkill_senders.contains_key(&sender));
 
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, true),
+            0
+        );
         assert!(!scheduler.pending_sigkill_senders.contains_key(&sender));
-        assert_eq!(scheduler.pending_sigkill_futex_wakes.len(), 1);
+        assert!(scheduler.pending_sigkill_futex_waiters.contains(&sender));
 
         let sender_futex = FutexID::private(MmId::initial(sender), 0x2000);
         scheduler.sleep_futex_waiter(&sender, sender_futex, None, u32::MAX);
@@ -3434,7 +3514,7 @@ mod test {
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(sender));
-        assert!(scheduler.pending_sigkill_futex_wakes.is_empty());
+        assert!(scheduler.pending_sigkill_futex_waiters.is_empty());
     }
 
     #[test]
@@ -3467,7 +3547,10 @@ mod test {
 
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 1);
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
         assert!(scheduler.pending_sigkills.contains(&target));
         assert!(scheduler.pending_sigkill_senders.is_empty());
 
@@ -3528,7 +3611,10 @@ mod test {
         );
         scheduler.next_turns[&sender].req.put(Ok(ordinary));
         assert!(scheduler.prioritize_pending_sigkill_sender(sender));
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [sender, unrelated]
@@ -3574,36 +3660,152 @@ mod test {
         let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
         assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 1);
         assert!(scheduler.prioritize_pending_sigkill_sender(sender));
-        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, false), 0);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [sender, unrelated]
         );
 
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
-        assert!(scheduler.step2_process_blocked(&global_time).is_err());
-        assert_eq!(
-            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
-            [sender, unrelated]
-        );
-        scheduler.sigkill_reconciliation_spins_remaining = 1;
-        assert!(scheduler.step2_process_blocked(&global_time).is_err());
-        assert_eq!(scheduler.sigkill_reconciliation_spins_remaining, 0);
+        for remaining in (0..SIGKILL_RECONCILIATION_SPINS).rev() {
+            assert!(scheduler.step2_process_blocked(&global_time).is_err());
+            assert_eq!(scheduler.sigkill_reconciliation_spins_remaining, remaining);
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                [sender, unrelated]
+            );
+        }
+        assert!(scheduler.pending_sigkill_futex_wake.is_some());
+        assert!(scheduler.sigkill_reconciliation_waker.is_none());
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
-            [sender, unrelated]
+            [sender, unrelated, waiter]
         );
+        assert!(scheduler.pending_sigkill_futex_wake.is_none());
 
         assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
-            [sender, unrelated]
+            [sender, unrelated, waiter]
         );
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [sender, unrelated, waiter]
+        );
+    }
+
+    #[test]
+    fn completed_sigkill_without_waiters_does_not_wake_future_wait() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(10);
+        let sender = DetTid::from_raw(20);
+        let future_waiter = DetTid::from_raw(30);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler.thread_tree.add_child(target, sender, true);
+        scheduler.thread_tree.add_child(target, future_waiter, true);
+
+        for dettid in [target, sender, future_waiter] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.runqueue_push_back(dettid);
+        }
+
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
+        assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 1);
+        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
+        assert!(scheduler.pending_sigkill_futex_wake.is_none());
+        assert!(scheduler.pending_sigkill_futex_waiters.is_empty());
+
+        let futex = FutexID::private(MmId::initial(future_waiter), 0x1000);
+        scheduler.sleep_futex_waiter(&future_waiter, futex, None, u32::MAX);
+        assert!(scheduler.run_queue.remove_tid(future_waiter));
+        assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 0);
+        assert!(!scheduler.run_queue.contains_tid(future_waiter));
+        assert_eq!(
+            scheduler.blocked.futex_waiters[&futex]
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [future_waiter]
+        );
+    }
+
+    #[test]
+    fn sigkill_credit_does_not_survive_prior_waiter_generation() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(10);
+        let sender = DetTid::from_raw(20);
+        let prior_waiter = DetTid::from_raw(30);
+        let future_waiter = DetTid::from_raw(40);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler.thread_tree.add_child(target, sender, true);
+        scheduler.thread_tree.add_child(target, prior_waiter, true);
+        scheduler.thread_tree.add_child(target, future_waiter, true);
+
+        for dettid in [target, sender, prior_waiter, future_waiter] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.runqueue_push_back(dettid);
+        }
+
+        let prior_futex = FutexID::private(MmId::initial(prior_waiter), 0x1000);
+        scheduler.sleep_futex_waiter(&prior_waiter, prior_futex, None, u32::MAX);
+        assert!(scheduler.run_queue.remove_tid(prior_waiter));
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
+        assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 1);
+        assert_eq!(scheduler.complete_sigkill_exit(target, target), (0, 0));
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(sender, false, false),
+            0
+        );
+        assert!(scheduler.pending_sigkill_futex_wake.is_some());
+
+        assert_eq!(
+            scheduler.wake_futex_waiters(sender, prior_futex, 1, u32::MAX),
+            1
+        );
+        assert!(scheduler.blocked.no_futex_waiters());
+        assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 0);
+        assert!(scheduler.pending_sigkill_futex_wake.is_none());
+
+        let future_futex = FutexID::private(MmId::initial(future_waiter), 0x2000);
+        scheduler.sleep_futex_waiter(&future_waiter, future_futex, None, u32::MAX);
+        assert!(scheduler.run_queue.remove_tid(future_waiter));
+        assert_eq!(scheduler.publish_pending_sigkill_futex_wake(), 0);
+        assert!(!scheduler.run_queue.contains_tid(future_waiter));
+        assert_eq!(
+            scheduler.blocked.futex_waiters[&future_futex]
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [future_waiter]
         );
     }
 

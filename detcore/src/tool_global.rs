@@ -665,7 +665,8 @@ impl GlobalState {
                 );
             }
             // TODO-HUMAN-REVIEW(PR-659): Review post-SIGKILL sender-boundary wake ordering.
-            let woken = sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some());
+            let woken =
+                sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some(), false);
             if woken > 0 {
                 info!(
                     "[detcore, dtid {}] post-SIGKILL boundary woke {} modeled futex waiter(s)",
@@ -1008,7 +1009,11 @@ impl GlobalState {
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
             // TODO-HUMAN-REVIEW(PR-659): Review futex RPC as a post-SIGKILL sender boundary.
-            let sigkill_woken = sched.sigkill_sender_reached_boundary(dettid, false);
+            let sigkill_woken = sched.sigkill_sender_reached_boundary(
+                dettid,
+                false,
+                matches!(action, FutexAction::WaitRequest(_)),
+            );
             if sigkill_woken > 0 {
                 info!(
                     "[detcore, dtid {}] post-SIGKILL futex boundary woke {} modeled futex waiter(s)",
@@ -1024,6 +1029,8 @@ impl GlobalState {
             match action {
                 FutexAction::WaitRequest(deadline) => {
                     sched.sleep_futex_waiter(&dettid, futexid, deadline, mask);
+                    assert!(sched.run_queue.remove_tid(dettid));
+                    sched.publish_pending_sigkill_futex_wake();
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -1060,8 +1067,6 @@ impl GlobalState {
                     return None;
                 }
             }
-            // Blocking on the FUTEX_WAIT here, remove ourselves:
-            assert!(sched.run_queue.remove_tid(dettid));
             resp_iv
         };
         // Wait for wake+scheduler response.

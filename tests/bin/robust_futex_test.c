@@ -649,6 +649,7 @@ struct process_shared_state {
   pthread_mutex_t mutex;
   atomic_bool owner_locked;
   atomic_bool waiter_blocked;
+  atomic_bool peer_ready;
   atomic_bool stop_peer;
   atomic_int owner_error;
 };
@@ -732,6 +733,8 @@ static void check_group_termination(bool fatal_signal) {
     }
     if (killer == 0) {
       while (!atomic_load_explicit(&state->waiter_blocked,
+                                   memory_order_acquire) ||
+             !atomic_load_explicit(&state->peer_ready,
                                    memory_order_acquire)) {
         if (atomic_load_explicit(&state->owner_error,
                                  memory_order_acquire) != 0) {
@@ -752,6 +755,7 @@ static void check_group_termination(bool fatal_signal) {
       exit(EXIT_FAILURE);
     }
     if (runnable_peer == 0) {
+      atomic_store_explicit(&state->peer_ready, true, memory_order_release);
       while (!atomic_load_explicit(&state->stop_peer, memory_order_acquire)) {
         sched_yield();
       }
@@ -806,6 +810,43 @@ static void check_group_termination(bool fatal_signal) {
                 "pthread_mutex_destroy shared");
   if (munmap(state, sizeof(*state)) != 0) {
     perror("munmap process-shared state");
+    exit(EXIT_FAILURE);
+  }
+}
+
+static void check_sigkill_does_not_wake_future_futex_wait(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork stale-credit target");
+    exit(EXIT_FAILURE);
+  }
+  if (child == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (kill(child, SIGKILL) != 0) {
+    perror("kill stale-credit target");
+    exit(EXIT_FAILURE);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFSIGNALED(status) ||
+      WTERMSIG(status) != SIGKILL) {
+    fprintf(stderr, "unexpected stale-credit target status: %#x\n", status);
+    exit(EXIT_FAILURE);
+  }
+
+  int word = 0;
+  const struct timespec timeout = {.tv_sec = 0, .tv_nsec = 50000000};
+  errno = 0;
+  long result = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, &timeout,
+                        NULL, 0);
+  if (result != -1 || errno != ETIMEDOUT) {
+    fprintf(stderr,
+            "post-SIGKILL future futex wait result=%ld errno=%d, expected "
+            "ETIMEDOUT\n",
+            result, errno);
     exit(EXIT_FAILURE);
   }
 }
@@ -1020,6 +1061,18 @@ static void check_broadcast_sigkill(void) {
     }
   }
   if (munmap(clone3_mapping, (size_t)page_size * 2) != 0) {
+    const int unmap_errno = errno;
+    if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+      perror("cleanup legacy clone target after munmap failure");
+    }
+    if (kill(clone3_child, SIGKILL) != 0 && errno != ESRCH) {
+      perror("cleanup clone3 target after munmap failure");
+    }
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
+    }
+    while (waitpid(clone3_child, NULL, 0) < 0 && errno == EINTR) {
+    }
+    errno = unmap_errno;
     perror("munmap clone3 boundary mapping");
     exit(EXIT_FAILURE);
   }
@@ -1183,6 +1236,7 @@ int main(int argc, char **argv) {
   check_blocked_futex_variants();
   check_group_termination(false);
   check_group_termination(true);
+  check_sigkill_does_not_wake_future_futex_wait();
   check_negative_process_group_sigkill();
   puts("PASS: blocked and failed signals preserved live owner");
   puts("PASS: pending owner-zero robust wake preserved word");
@@ -1190,6 +1244,7 @@ int main(int argc, char **argv) {
   puts("PASS: sibling robust-list lookup and ESRCH semantics");
   puts("PASS: legacy and futex2 variants handled deterministically");
   puts("PASS: exit_group and fatal-signal owner death recovered");
+  puts("PASS: completed SIGKILL did not wake a future futex wait");
   puts("PASS: negative process-group SIGKILL handled deterministically");
   return EXIT_SUCCESS;
 }
