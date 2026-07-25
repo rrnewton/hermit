@@ -65,7 +65,15 @@ struct InstalledFd {
 
 impl InstalledFd {
     fn install(source: i32, target: i32) -> std::io::Result<Self> {
-        let backup = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 0) };
+        // Keep backups above both fixed transport descriptors so installing the second channel
+        // cannot overwrite the first channel's backup.
+        let backup = unsafe {
+            libc::fcntl(
+                target,
+                libc::F_DUPFD_CLOEXEC,
+                detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD + 1,
+            )
+        };
         let backup = if backup == -1 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EBADF) {
