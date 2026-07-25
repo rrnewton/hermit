@@ -63,11 +63,11 @@ use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
-use crate::scheduler::RobustSignalTarget;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
 use crate::scheduler::Seconds;
+use crate::scheduler::SigkillTarget;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
@@ -504,21 +504,32 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
-            GlobalRequest::ResolveRobustSignal(target) => R::ResolveRobustSignal(
+            GlobalRequest::PrepareSigkillTarget(sender, target) => R::PrepareSigkillTarget(
                 self.sched
                     .lock()
                     .unwrap()
-                    .resolve_robust_signal_target(target),
+                    .prepare_sigkill_target(sender, target),
             ),
-            GlobalRequest::AwaitRobustExits(owners) => {
-                R::AwaitRobustExits(self.recv_await_robust_exits(&owners).await)
+            GlobalRequest::FencePreparedSigkill(targets) => R::FencePreparedSigkill(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .fence_prepared_sigkill_targets(targets),
+            ),
+            GlobalRequest::CancelPreparedSigkill(sender, targets) => R::CancelPreparedSigkill(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .cancel_prepared_sigkill(sender, targets),
+            ),
+            GlobalRequest::CompleteSigkillExit(exiting, process) => {
+                let (remaining, woken) = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .complete_sigkill_exit(exiting, process);
+                R::CompleteSigkillExit(remaining, woken)
             }
-            GlobalRequest::ReconcileRobustFutexes(exiting, group) => R::ReconcileRobustFutexes(
-                self.sched
-                    .lock()
-                    .unwrap()
-                    .reconcile_robust_futex_waiters(exiting, group),
-            ),
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
                     .await,
@@ -605,17 +616,6 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
-    async fn recv_await_robust_exits(&self, owners: &[DetTid]) {
-        while !self
-            .sched
-            .lock()
-            .unwrap()
-            .robust_signal_targets_gone(owners)
-        {
-            yield_once().await;
-        }
-    }
-
     async fn recv_request_resources(
         &self,
         from: Tid,
@@ -634,6 +634,14 @@ impl GlobalState {
                 &dettid, &nextturn.req
             );
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
+            // TODO-HUMAN-REVIEW(PR-659): Review post-SIGKILL sender-boundary wake ordering.
+            let woken = sched.sigkill_sender_reached_boundary(dettid, rs.exit_identity().is_some());
+            if woken > 0 {
+                info!(
+                    "[detcore, dtid {}] post-SIGKILL boundary woke {} modeled futex waiter(s)",
+                    dettid, woken
+                );
+            }
             nextturn.resp
         };
         trace!(
@@ -929,6 +937,14 @@ impl GlobalState {
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
         sched.record_timeslice_stats(dettid, timeslice_stats);
+        // TODO-HUMAN-REVIEW(PR-659): Review physical-exit completion for SIGKILL senders.
+        let woken = sched.sigkill_sender_exited(dettid);
+        if woken > 0 {
+            info!(
+                "[detcore, dtid {}] SIGKILL sender exit woke {} modeled futex waiter(s)",
+                dettid, woken
+            );
+        }
         sched.logically_kill_thread(&dettid, &detpid, mm);
         drop(sched);
         trace!(
@@ -957,7 +973,7 @@ impl GlobalState {
                 .clone();
             match action {
                 FutexAction::WaitRequest(deadline) => {
-                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask, _init_read);
+                    sched.sleep_futex_waiter(&dettid, futexid, deadline, mask);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -969,18 +985,11 @@ impl GlobalState {
                 }
                 FutexAction::RequeueRequest {
                     target,
-                    target_expected,
                     max_wake,
                     max_requeue,
                 } => {
-                    let num = sched.requeue_futex_waiters(
-                        dettid,
-                        futexid,
-                        target,
-                        target_expected,
-                        max_wake,
-                        max_requeue,
-                    );
+                    let num =
+                        sched.requeue_futex_waiters(dettid, futexid, target, max_wake, max_requeue);
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeOpRequest {
@@ -1246,17 +1255,21 @@ pub enum GlobalRequest {
     /// so the scheduler can aggregate it into the final run report.
     DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
 
-    /// Snapshot live tasks targeted by a SIGKILL before Linux removes them.
-    // TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL target snapshotting.
-    ResolveRobustSignal(RobustSignalTarget),
+    /// Resolve and register managed SIGKILL targets before injection.
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation RPC.
+    PrepareSigkillTarget(DetTid, SigkillTarget),
 
-    /// Hold the signal sender's turn until every snapshotted target has exited.
-    // TODO-HUMAN-REVIEW(PR-659): Review the managed SIGKILL completion barrier.
-    AwaitRobustExits(Vec<DetTid>),
+    /// Fence a prepared SIGKILL cohort after successful injection.
+    // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence RPC.
+    FencePreparedSigkill(Vec<DetTid>),
 
-    /// Reconcile one kernel robust-futex owner death with modeled wait queues.
-    // TODO-HUMAN-REVIEW(PR-659): Review owner-scoped robust reconciliation request.
-    ReconcileRobustFutexes(DetTid, DetPid),
+    /// Cancel a prepared SIGKILL cohort after failed injection.
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation RPC.
+    CancelPreparedSigkill(DetTid, Vec<DetTid>),
+
+    /// Retire one physically exited SIGKILL target and wake after the final exit.
+    // TODO-HUMAN-REVIEW(PR-659): Review last-exit SIGKILL completion RPC.
+    CompleteSigkillExit(DetTid, DetPid),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1305,10 +1318,14 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
-    // TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL RPC responses.
-    ResolveRobustSignal(Vec<DetTid>),
-    AwaitRobustExits(()),
-    ReconcileRobustFutexes(u64),
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL preparation response.
+    PrepareSigkillTarget(Vec<DetTid>),
+    // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL fence response.
+    FencePreparedSigkill(u64),
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cancellation response.
+    CancelPreparedSigkill(u64),
+    // TODO-HUMAN-REVIEW(PR-659): Review last-exit SIGKILL completion response.
+    CompleteSigkillExit(u64, u64),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -1588,63 +1605,76 @@ pub async fn deregister_thread<R>(
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review SIGKILL exit reconciliation RPC.
-/// Wake modeled waiters after Linux has performed robust-futex cleanup for a killed task.
-pub async fn reconcile_robust_futexes_after_kernel_exit<R>(
+// TODO-HUMAN-REVIEW(PR-659): Review last-exit SIGKILL completion RPC.
+/// Retire one dying task and wake waiters after every fenced task completed kernel cleanup.
+pub async fn complete_sigkill_exit<R>(
     exiting: DetTid,
-    group: DetPid,
+    process: DetPid,
     threads_time: DetTime,
     cfg: &Config,
     reverie: &R,
-) -> u64
+) -> (u64, u64)
 where
     R: GlobalRPC<GlobalState>,
 {
     if !cfg.sequentialize_threads || cfg.debug_futex_mode != BlockingMode::Precise {
-        return 0;
+        return (0, 0);
     }
     let response = reverie
         .send_rpc((
             threads_time,
-            GlobalRequest::ReconcileRobustFutexes(exiting, group),
+            GlobalRequest::CompleteSigkillExit(exiting, process),
         ))
         .await;
     match response.1 {
-        GlobalResponse::ReconcileRobustFutexes(woken) => woken,
+        GlobalResponse::CompleteSigkillExit(remaining, woken) => (remaining, woken),
         _ => unreachable!(),
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL target and completion RPCs.
-/// Snapshot live scheduler tasks targeted by a SIGKILL.
-pub async fn resolve_robust_signal_target<G, T>(
-    guest: &mut G,
-    target: RobustSignalTarget,
-) -> Vec<DetTid>
+// TODO-HUMAN-REVIEW(PR-659): Review pre-injection managed SIGKILL preparation.
+/// Resolve and register a managed signal target before the kernel can remove it.
+pub async fn prepare_sigkill_target<G, T>(guest: &mut G, target: SigkillTarget) -> Vec<DetTid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sender = guest.thread_state().dettid;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PrepareSigkillTarget(sender, target)).await;
+    match response {
+        GlobalResponse::PrepareSigkillTarget(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-659): Review post-injection atomic SIGKILL scheduler fence.
+/// Fence the prepared targets after SIGKILL succeeds.
+pub async fn fence_prepared_sigkill<G, T>(guest: &mut G, targets: Vec<DetTid>) -> u64
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let (_, response) =
-        send_and_update_time(guest, GlobalRequest::ResolveRobustSignal(target)).await;
+        send_and_update_time(guest, GlobalRequest::FencePreparedSigkill(targets)).await;
     match response {
-        GlobalResponse::ResolveRobustSignal(owners) => owners,
+        GlobalResponse::FencePreparedSigkill(fenced) => fenced,
         _ => unreachable!(),
     }
 }
 
-/// Wait until all snapshotted SIGKILL targets have completed their exit hooks.
-pub async fn await_robust_signal_exits<G, T>(guest: &mut G, owners: Vec<DetTid>)
+// TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cohort cancellation.
+/// Cancel the prepared targets after the kernel rejects SIGKILL.
+pub async fn cancel_prepared_sigkill<G, T>(guest: &mut G, targets: Vec<DetTid>) -> u64
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if owners.is_empty() {
-        return;
-    }
-    let (_, response) = send_and_update_time(guest, GlobalRequest::AwaitRobustExits(owners)).await;
+    let sender = guest.thread_state().dettid;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::CancelPreparedSigkill(sender, targets)).await;
     match response {
-        GlobalResponse::AwaitRobustExits(()) => {}
+        GlobalResponse::CancelPreparedSigkill(cancelled) => cancelled,
         _ => unreachable!(),
     }
 }
@@ -1663,8 +1693,6 @@ pub enum FutexAction {
     RequeueRequest {
         /// Destination futex queue.
         target: FutexID,
-        /// Destination word observed while performing the atomic requeue.
-        target_expected: i32,
         /// Maximum waiters to wake from the source queue.
         max_wake: i32,
         /// Maximum remaining waiters to move to the destination queue.

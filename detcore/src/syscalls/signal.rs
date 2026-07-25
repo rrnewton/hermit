@@ -27,12 +27,13 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::scheduler::RobustSignalTarget;
+use crate::scheduler::SigkillTarget;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
-use crate::tool_global::await_robust_signal_exits;
+use crate::tool_global::cancel_prepared_sigkill;
+use crate::tool_global::fence_prepared_sigkill;
+use crate::tool_global::prepare_sigkill_target;
 use crate::tool_global::register_alarm;
-use crate::tool_global::resolve_robust_signal_target;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
@@ -43,59 +44,83 @@ use crate::types::LogicalTime;
 const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
 
 impl<T: RecordOrReplay> Detcore<T> {
-    // TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL target snapshot and exit barrier.
-    /// Forward a signal while keeping robust owner-death wakeups before later guest turns.
+    // TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL preparation and scheduler fence.
+    /// Forward a signal while atomically tracking its potential scheduler targets.
     pub async fn handle_signal_send<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Syscall,
     ) -> Result<i64, Error> {
+        let sender = guest.thread_state().dettid;
+        let sender_process = guest.thread_state().detpid.expect("detpid unset");
         let (signum, target) = match &call {
             syscalls::Syscall::Kill(call) => (
                 call.sig(),
                 if call.pid() > 0 {
-                    Some(RobustSignalTarget::Process(crate::types::DetPid::from_raw(
-                        call.pid(),
-                    )))
+                    SigkillTarget::Process(crate::types::DetPid::from_raw(call.pid()))
+                } else if call.pid() == 0 {
+                    SigkillTarget::ProcessGroupOf(sender)
                 } else if call.pid() == -1 {
-                    Some(RobustSignalTarget::All)
+                    SigkillTarget::AllExceptProcess(sender_process)
                 } else {
-                    None
+                    SigkillTarget::ProcessGroup(-i64::from(call.pid()))
                 },
             ),
             syscalls::Syscall::Tgkill(call) => (
                 call.sig(),
-                Some(RobustSignalTarget::Thread {
+                SigkillTarget::Thread {
                     process: Some(crate::types::DetPid::from_raw(call.tgid())),
                     thread: crate::types::DetTid::from_raw(call.tid()),
-                }),
+                },
             ),
             syscalls::Syscall::Tkill(call) => (
                 call.sig(),
-                Some(RobustSignalTarget::Thread {
+                SigkillTarget::Thread {
                     process: None,
                     thread: crate::types::DetTid::from_raw(call.tid()),
-                }),
+                },
             ),
             _ => unreachable!("signal-send handler received {call:?}"),
         };
         let managed_sigkill = signum == libc::SIGKILL
             && self.cfg.sequentialize_threads
             && self.cfg.debug_futex_mode == BlockingMode::Precise;
-        let mut owners = if managed_sigkill {
-            match target {
-                Some(target) => resolve_robust_signal_target(guest, target).await,
-                None => Vec::new(),
-            }
+        let prepared_targets = if managed_sigkill {
+            prepare_sigkill_target(guest, target).await
         } else {
             Vec::new()
         };
-
-        let result = guest.inject(call).await?;
-        if result == 0 && managed_sigkill {
-            let sender = guest.thread_state().dettid;
-            owners.retain(|owner| *owner != sender);
-            await_robust_signal_exits(guest, owners).await;
+        let result = match guest.inject(call).await {
+            Ok(result) => result,
+            Err(error) => {
+                if managed_sigkill {
+                    let cancelled = cancel_prepared_sigkill(guest, prepared_targets).await;
+                    info!(
+                        "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s) after failed delivery",
+                        guest.thread_state().dettid,
+                        cancelled
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if managed_sigkill {
+            if result == 0 {
+                let fenced = fence_prepared_sigkill(guest, prepared_targets).await;
+                info!(
+                    "[detcore, dtid {}] fenced {} SIGKILL target(s) pending physical exit",
+                    guest.thread_state().dettid,
+                    fenced
+                );
+            } else {
+                let cancelled = cancel_prepared_sigkill(guest, prepared_targets).await;
+                info!(
+                    "[detcore, dtid {}] cancelled {} prepared SIGKILL target(s) after result {}",
+                    guest.thread_state().dettid,
+                    cancelled,
+                    result
+                );
+            }
         }
         Ok(result)
     }

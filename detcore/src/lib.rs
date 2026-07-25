@@ -105,10 +105,10 @@ pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
+use tool_global::complete_sigkill_exit;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
-use tool_global::reconcile_robust_futexes_after_kernel_exit;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 use tool_local::PosixTimers;
@@ -1684,9 +1684,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
         let mm_id = thread_state.mm_id;
-        // TODO-HUMAN-REVIEW(PR-659): Review SIGKILL post-kernel robust-futex reconciliation.
+        // TODO-HUMAN-REVIEW(PR-659): Review SIGKILL exit completion and conservative futex wake.
         if matches!(exit_status, ExitStatus::Signaled(Signal::SIGKILL, _)) {
-            let woken = reconcile_robust_futexes_after_kernel_exit(
+            let (remaining, woken) = complete_sigkill_exit(
                 dettid,
                 detpid,
                 thread_state.thread_logical_time.clone(),
@@ -1695,8 +1695,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
             .await;
             info!(
-                "[detcore, dtid {}] reconciled {} modeled robust-futex waiter(s) after SIGKILL",
-                dettid, woken
+                "[detcore, dtid {}] completed SIGKILL exit with {} fenced target(s) remaining and woke {} modeled futex waiter(s)",
+                dettid, remaining, woken
             );
         }
         thread_state

@@ -727,7 +727,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if observed != expected {
             return Err(Error::Errno(Errno::EAGAIN));
         }
-        let target_observed = guest.memory().read_value(target_address)?;
         let source = guest
             .thread_state()
             .futex_id(source_address.as_raw(), source_private);
@@ -738,7 +737,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             FutexAction::RequeueRequest {
                 target,
-                target_expected: target_observed as i32,
                 max_wake,
                 max_requeue,
             },
@@ -788,7 +786,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Error::Errno(Errno::EINVAL));
         }
-        let target_observed = guest.memory().read_value(target_address)?;
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
         let source = guest
             .thread_state()
@@ -800,7 +797,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             FutexAction::RequeueRequest {
                 target,
-                target_expected: target_observed,
                 max_wake,
                 max_requeue,
             },

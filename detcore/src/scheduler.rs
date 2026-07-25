@@ -13,7 +13,6 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -131,21 +130,25 @@ pub enum SchedValue {
     Value(u64),
 }
 
-// TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL target resolution.
-/// A guest signal target resolved by the scheduler before the kernel can remove it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RobustSignalTarget {
-    /// Every live thread in a process.
+// TODO-HUMAN-REVIEW(PR-659): Review managed SIGKILL target resolution and snapshot semantics.
+/// A guest SIGKILL target represented in deterministic scheduler identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SigkillTarget {
+    /// Every live thread in one process.
     Process(DetPid),
-    /// A thread, optionally constrained to the supplied process.
+    /// A thread's process, optionally constrained to the supplied thread-group leader.
     Thread {
         /// Expected thread-group leader for `tgkill`, or `None` for `tkill`.
         process: Option<DetPid>,
         /// Target thread.
         thread: DetTid,
     },
-    /// A conservative target for process-group and broadcast forms of `kill`.
-    All,
+    /// Every managed process in the current host process group of this task.
+    ProcessGroupOf(DetTid),
+    /// Every managed process in this host process group.
+    ProcessGroup(i64),
+    /// Every managed process except the sender's process, matching `kill(-1, ...)`.
+    AllExceptProcess(DetPid),
 }
 
 /// A single interaction between a guest and the scheduler: first, request resourcees, followed
@@ -173,12 +176,11 @@ pub struct ThreadExited;
 
 /// A thread waiting on a futex, including the bitset accepted by wake operations.
 #[derive(Debug, Clone)]
-// TODO-HUMAN-REVIEW(PR-659): Review waiter address/value probes used after kernel owner death.
+// TODO-HUMAN-REVIEW(PR-659): Review modeled futex wait entries used by wake/requeue operations.
 pub struct FutexWaiter {
     dettid: DetTid,
     response: Ivar<SchedResponse>,
     bitset: u32,
-    expected: i32,
 }
 
 /// Deterministically pick one element from `choices` using the supplied PRNG,
@@ -336,11 +338,11 @@ pub struct Scheduler {
     /// final run report. BTreeMap for deterministic iteration order.
     pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
 
-    /// Robust owner deaths already reflected into modeled futex queues.
-    robust_owner_exits: HashSet<DetTid>,
+    /// Prepared or successfully signaled SIGKILL targets tracked through physical exit.
+    pending_sigkills: HashSet<DetTid>,
 
-    /// Thread groups whose pending-owner-zero fallback has already run.
-    robust_zero_groups: HashSet<DetPid>,
+    /// Signal senders that have not reached their first deterministic boundary after SIGKILL.
+    pending_sigkill_senders: HashSet<DetTid>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -538,8 +540,17 @@ impl ThreadTree {
         }
     }
 
+    /// Return the set of thread IDs in the "same process" as me (same TGID), including
+    /// myself.
+    ///
+    /// Locks: takes scheduler lock.
+    pub fn my_thread_group(&mut self, me: &DetTid) -> Vec<DetTid> {
+        self.thread_group(me)
+            .expect("thread must be in to_leader table")
+    }
+
     // TODO-HUMAN-REVIEW(PR-659): Review fallible signal-target thread-group lookup.
-    /// Return the set of known thread IDs in one process, including `me`.
+    /// Return the known thread IDs in one process, including `me`.
     pub fn thread_group(&mut self, me: &DetTid) -> Option<Vec<DetTid>> {
         let root_tid: DetTid = if self.thread_group_leaders.contains(me) {
             *me
@@ -560,15 +571,6 @@ impl ThreadTree {
         }
         debug_assert!(acc.contains(me));
         Some(acc)
-    }
-
-    /// Return the set of thread IDs in the "same process" as me (same TGID), including
-    /// myself.
-    ///
-    /// Locks: takes scheduler lock.
-    pub fn my_thread_group(&mut self, me: &DetTid) -> Vec<DetTid> {
-        self.thread_group(me)
-            .expect("thread must be in to_leader table")
     }
 }
 
@@ -933,8 +935,8 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             per_thread_timeslice: Default::default(),
-            robust_owner_exits: Default::default(),
-            robust_zero_groups: Default::default(),
+            pending_sigkills: Default::default(),
+            pending_sigkill_senders: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -1083,6 +1085,8 @@ impl Scheduler {
             dtid, detpid
         );
 
+        self.pending_sigkills.remove(dtid);
+        self.pending_sigkill_senders.remove(dtid);
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1139,7 +1143,6 @@ impl Scheduler {
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
         bitset: u32,
-        expected: i32,
     ) {
         let nxt = self
             .next_turns
@@ -1150,7 +1153,6 @@ impl Scheduler {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
-            expected,
         });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
@@ -1276,7 +1278,6 @@ impl Scheduler {
         waker_dettid: DetTid,
         source: FutexID,
         target: FutexID,
-        target_expected: i32,
         max_to_wake: i32,
         max_to_requeue: i32,
     ) -> u64 {
@@ -1293,10 +1294,7 @@ impl Scheduler {
         }
 
         let num_requeued = waiters.len().min(max_to_requeue as usize);
-        let mut requeued = self.choose_futex_wakees(&mut waiters, num_requeued);
-        for waiter in &mut requeued {
-            waiter.expected = target_expected;
-        }
+        let requeued = self.choose_futex_wakees(&mut waiters, num_requeued);
         if !waiters.is_empty() {
             self.blocked.futex_waiters.insert(source, waiters);
         }
@@ -1331,88 +1329,9 @@ impl Scheduler {
         first_woken + second_woken
     }
 
-    // TODO-HUMAN-REVIEW(PR-659): Review deterministic SIGKILL robust-futex reconciliation.
-    /// Resolve a signal target while its tasks are still registered with the scheduler.
-    pub fn resolve_robust_signal_target(&mut self, target: RobustSignalTarget) -> Vec<DetTid> {
-        let mut owners = match target {
-            RobustSignalTarget::Process(process) => self
-                .thread_tree
-                .thread_group(&DetTid::from_raw(process.as_raw()))
-                .unwrap_or_default(),
-            RobustSignalTarget::Thread { process, thread } => {
-                if process.is_some_and(|process| {
-                    self.thread_tree.thread_to_leader.get(&thread) != Some(&process)
-                }) {
-                    Vec::new()
-                } else {
-                    self.thread_tree.thread_group(&thread).unwrap_or_default()
-                }
-            }
-            RobustSignalTarget::All => self.thread_tree.thread_to_leader.keys().copied().collect(),
-        };
-        owners.retain(|owner| !matches!(self.thread_status(*owner), ThreadStatus::Gone));
-        owners.sort_unstable();
-        owners.dedup();
-        owners
-    }
-
-    // TODO-HUMAN-REVIEW(PR-659): Review SIGKILL exit-barrier completion semantics.
-    /// Return true after every snapshotted signal target has left the scheduler.
-    pub fn robust_signal_targets_gone(&self, owners: &[DetTid]) -> bool {
-        owners
-            .iter()
-            .all(|owner| matches!(self.thread_status(*owner), ThreadStatus::Gone))
-    }
-
-    fn wake_one_robust_futex_waiter(
-        &mut self,
-        exiting: DetTid,
-        futexid: FutexID,
-        dying_group: &BTreeSet<DetTid>,
-        include_zero_owner: bool,
-    ) -> u64 {
-        const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
-        let owner_tid = exiting.as_raw() as u32 & FUTEX_TID_MASK;
-        let Some(waiters) = self.blocked.futex_waiters.remove(&futexid) else {
-            return 0;
-        };
-        let mut eligible = Vec::new();
-        let mut retained = Vec::new();
-        for waiter in waiters {
-            let expected_owner = waiter.expected as u32 & FUTEX_TID_MASK;
-            if !dying_group.contains(&waiter.dettid)
-                && (expected_owner == owner_tid || (include_zero_owner && expected_owner == 0))
-            {
-                eligible.push(waiter);
-            } else {
-                retained.push(waiter);
-            }
-        }
-
-        let num_woken = usize::from(!eligible.is_empty());
-        let to_wake = self.choose_futex_wakees(&mut eligible, num_woken);
-        for waiter in to_wake {
-            self.wake_futex_waiter(waiter);
-        }
-        retained.extend(eligible);
-        if !retained.is_empty() {
-            self.blocked.futex_waiters.insert(futexid, retained);
-        }
-        num_woken as u64
-    }
-
-    /// Wake each robust queue once for one killed owner, in stable futex-key order.
-    pub fn reconcile_robust_futex_waiters(&mut self, exiting: DetTid, group: DetPid) -> u64 {
-        if !self.robust_owner_exits.insert(exiting) {
-            return 0;
-        }
-        let include_zero_owner = self.robust_zero_groups.insert(group);
-        let dying_group = self
-            .thread_tree
-            .thread_group(&exiting)
-            .unwrap_or_else(|| vec![exiting])
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    // TODO-HUMAN-REVIEW(PR-659): Review conservative SIGKILL futex wake ordering.
+    /// Wake all modeled futex waiters in stable futex-key order.
+    pub fn wake_all_futex_waiters(&mut self, waker: DetTid) -> u64 {
         let mut futexids = self
             .blocked
             .futex_waiters
@@ -1423,14 +1342,143 @@ impl Scheduler {
         futexids
             .into_iter()
             .map(|futexid| {
-                self.wake_one_robust_futex_waiter(
-                    exiting,
-                    futexid,
-                    &dying_group,
-                    include_zero_owner,
-                )
+                let waiters = self.blocked.futex_waiters[&futexid].len();
+                let max_to_wake = i32::try_from(waiters).unwrap_or(i32::MAX);
+                self.wake_futex_waiters(waker, futexid, max_to_wake, u32::MAX)
             })
             .sum()
+    }
+
+    fn host_process_group(dettid: DetTid) -> Option<i64> {
+        // SAFETY: getpgid only reads kernel process metadata for this numeric task ID.
+        let pgid = unsafe { libc::getpgid(dettid.as_raw()) };
+        (pgid >= 0).then_some(i64::from(pgid))
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review process-group queries and managed-target filtering.
+    /// Resolve a SIGKILL selector before injection so later scheduler changes use the same targets.
+    pub fn resolve_sigkill_target(&mut self, target: SigkillTarget) -> Vec<DetTid> {
+        let mut targets = match target {
+            SigkillTarget::Process(process) => self
+                .thread_tree
+                .thread_group(&DetTid::from_raw(process.as_raw()))
+                .unwrap_or_default(),
+            SigkillTarget::Thread { process, thread } => {
+                let actual_process = self.thread_tree.thread_to_leader.get(&thread).copied();
+                if actual_process.is_none()
+                    || process.is_some_and(|expected| Some(expected) != actual_process)
+                {
+                    Vec::new()
+                } else {
+                    self.thread_tree.thread_group(&thread).unwrap_or_default()
+                }
+            }
+            SigkillTarget::ProcessGroupOf(member) => Self::host_process_group(member)
+                .map(|pgid| self.resolve_sigkill_target(SigkillTarget::ProcessGroup(pgid)))
+                .unwrap_or_default(),
+            SigkillTarget::ProcessGroup(pgid) => self
+                .next_turns
+                .keys()
+                .copied()
+                .filter(|thread| Self::host_process_group(*thread) == Some(pgid))
+                .collect(),
+            SigkillTarget::AllExceptProcess(excluded) => self
+                .thread_tree
+                .thread_to_leader
+                .iter()
+                .filter_map(|(thread, process)| (*process != excluded).then_some(*thread))
+                .collect(),
+        };
+        targets.retain(|thread| {
+            self.next_turns.contains_key(thread) && !self.pending_sigkills.contains(thread)
+        });
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review pre-injection SIGKILL cohort registration.
+    /// Resolve and register a potential SIGKILL cohort before the target can physically exit.
+    pub fn prepare_sigkill_target(&mut self, sender: DetTid, target: SigkillTarget) -> Vec<DetTid> {
+        let targets = self.resolve_sigkill_target(target);
+        let sender_survives = !targets.contains(&sender);
+        for target in &targets {
+            self.pending_sigkills.insert(*target);
+        }
+        if !targets.is_empty() && sender_survives {
+            self.pending_sigkill_senders.insert(sender);
+        }
+        targets
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review post-injection SIGKILL scheduler fencing.
+    /// Prevent live members of a successfully sent SIGKILL cohort from consuming another turn.
+    pub fn fence_prepared_sigkill_targets(&mut self, mut targets: Vec<DetTid>) -> u64 {
+        targets.sort_unstable();
+        targets.dedup();
+        targets.retain(|target| {
+            self.pending_sigkills.contains(target) && self.next_turns.contains_key(target)
+        });
+        for target in &targets {
+            self.run_queue.remove_tid(*target);
+            self.remove_blocking_entries(target);
+        }
+        targets.len() as u64
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review failed-SIGKILL cohort cancellation.
+    /// Cancel a prepared cohort when the kernel rejects the signal send.
+    pub fn cancel_prepared_sigkill(&mut self, sender: DetTid, targets: Vec<DetTid>) -> u64 {
+        let mut removed = 0;
+        for target in targets {
+            removed += u64::from(self.pending_sigkills.remove(&target));
+        }
+        self.pending_sigkill_senders.remove(&sender);
+        removed
+    }
+
+    fn wake_after_sigkill_quiesces(&mut self, waker: DetTid) -> u64 {
+        if self.pending_sigkills.is_empty() && self.pending_sigkill_senders.is_empty() {
+            self.wake_all_futex_waiters(waker)
+        } else {
+            0
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review the nonblocking post-SIGKILL sender handoff.
+    /// Mark that a signal sender reached its first deterministic boundary after `kill`.
+    pub fn sigkill_sender_reached_boundary(&mut self, sender: DetTid, exiting: bool) -> u64 {
+        if exiting || !self.pending_sigkill_senders.remove(&sender) {
+            return 0;
+        }
+        self.wake_after_sigkill_quiesces(sender)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review physical-exit completion for SIGKILL senders.
+    /// Release a sender whose first post-SIGKILL boundary was an exit request.
+    pub fn sigkill_sender_exited(&mut self, sender: DetTid) -> u64 {
+        if !self.pending_sigkill_senders.remove(&sender) {
+            return 0;
+        }
+        self.wake_after_sigkill_quiesces(sender)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-659): Review last-exit robust-futex wake sequencing.
+    /// Record one physical SIGKILL exit and wake waiters once every fenced task has exited.
+    pub fn complete_sigkill_exit(&mut self, exiting: DetTid, process: DetPid) -> (u64, u64) {
+        if !self.pending_sigkills.contains(&exiting) {
+            let targets = self.resolve_sigkill_target(SigkillTarget::Process(process));
+            for target in targets {
+                self.pending_sigkills.insert(target);
+                self.run_queue.remove_tid(target);
+                self.remove_blocking_entries(&target);
+            }
+        }
+        self.pending_sigkills.remove(&exiting);
+        self.pending_sigkill_senders.remove(&exiting);
+        let remaining = self.pending_sigkills.len() as u64;
+        let woken = self.wake_after_sigkill_quiesces(exiting);
+        (remaining, woken)
     }
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
@@ -1556,6 +1604,13 @@ impl Scheduler {
     /// Send a signal to the guest, which should be blocked on the scheduler when this is sent.
     /// (I.e. the signal is physically delivered when the scheduler resumes the thread's execution.)
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
+        if self.pending_sigkills.contains(&dettid) {
+            trace!(
+                "[dtid {}] suppressing signal delivery to a task already fenced for SIGKILL",
+                dettid
+            );
+            return;
+        }
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
@@ -1785,6 +1840,14 @@ impl Scheduler {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
+                if !self.pending_sigkills.is_empty() || !self.pending_sigkill_senders.is_empty() {
+                    trace!(
+                        "[scheduler] waiting for {} SIGKILL target exit(s) and {} sender boundary/exit(s)",
+                        self.pending_sigkills.len(),
+                        self.pending_sigkill_senders.len()
+                    );
+                    return Err(SkipTurn);
+                }
                 panic!(
                     "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n \
                  queue: {:?}\n  next_turns: {:?}\n  blocked: {:?} \n",
@@ -2707,7 +2770,6 @@ mod test {
             dettid: DetTid::from_raw(dettid),
             response: Ivar::new(),
             bitset,
-            expected: 0,
         }
     }
 
@@ -2823,24 +2885,22 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX, 0);
+            scheduler.sleep_futex_waiter(&dettid, source, None, u32::MAX);
         }
 
         assert_eq!(
-            scheduler.requeue_futex_waiters(DetTid::from_raw(3), source, target, 11, 1, 1),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), source, target, 1, 1),
             2
         );
         assert!(!scheduler.blocked.futex_waiters.contains_key(&source));
         assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
         assert_eq!(scheduler.run_queue.len(), 1);
-        assert_eq!(scheduler.blocked.futex_waiters[&target][0].expected, 11);
 
         assert_eq!(
-            scheduler.requeue_futex_waiters(DetTid::from_raw(3), target, target, 12, 0, 1),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(3), target, target, 0, 1),
             1
         );
         assert_eq!(scheduler.blocked.futex_waiters[&target].len(), 1);
-        assert_eq!(scheduler.blocked.futex_waiters[&target][0].expected, 12);
     }
 
     #[test]
@@ -2862,7 +2922,7 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, 0);
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
         }
 
         assert_eq!(
@@ -2887,25 +2947,14 @@ mod test {
     }
 
     #[test]
-    fn sigkill_reconciliation_is_sorted_owner_scoped_and_idempotent() {
+    fn sigkill_completion_wakes_all_in_stable_queue_order() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
-        let group = DetPid::from_raw(10);
-        let owner = DetTid::from_raw(11);
-        scheduler.thread_tree.add_child(group, group, true);
-        scheduler.thread_tree.add_child(group, owner, false);
-        let mm = MmId::initial(group);
+        let mm = MmId::initial(DetTid::from_raw(10));
         let first = FutexID::private(mm, 0x1000);
-        let zero_owner = FutexID::private(mm, 0x2000);
+        let middle = FutexID::private(mm, 0x2000);
         let last = FutexID::private(mm, 0x3000);
-        let unrelated = FutexID::private(mm, 0x4000);
-        let owner_word = (0x8000_0000_u32 | owner.as_raw() as u32) as i32;
-        for (raw_tid, futex, expected) in [
-            (20, last, owner_word),
-            (21, first, owner_word),
-            (22, zero_owner, 0),
-            (23, unrelated, 99),
-        ] {
+        for (raw_tid, futex) in [(20, last), (21, first), (24, first), (22, middle)] {
             let dettid = DetTid::from_raw(raw_tid);
             scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
             scheduler.next_turns.insert(
@@ -2917,22 +2966,118 @@ mod test {
                     resp: Ivar::new(),
                 },
             );
-            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX, expected);
+            scheduler.sleep_futex_waiter(&dettid, futex, None, u32::MAX);
         }
 
-        assert_eq!(scheduler.reconcile_robust_futex_waiters(owner, group), 3);
+        assert_eq!(scheduler.wake_all_futex_waiters(DetTid::from_raw(30)), 4);
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             [
                 DetTid::from_raw(21),
+                DetTid::from_raw(24),
                 DetTid::from_raw(22),
                 DetTid::from_raw(20)
             ]
         );
-        assert_eq!(scheduler.blocked.futex_waiters[&unrelated].len(), 1);
-        assert_eq!(scheduler.reconcile_robust_futex_waiters(owner, group), 0);
-        assert_eq!(scheduler.reconcile_robust_futex_waiters(group, group), 0);
-        assert_eq!(scheduler.run_queue.len(), 3);
+        assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
+        assert_eq!(scheduler.wake_all_futex_waiters(DetTid::from_raw(31)), 0);
+        assert_eq!(scheduler.run_queue.len(), 4);
+    }
+
+    #[test]
+    fn sigkill_fence_deschedules_target_group_before_waking_survivors() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let leader = DetTid::from_raw(10);
+        let sibling = DetTid::from_raw(11);
+        let survivor = DetTid::from_raw(20);
+        let sender = DetTid::from_raw(30);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        scheduler.thread_tree.add_child(leader, survivor, true);
+
+        for dettid in [leader, sibling, survivor] {
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+        scheduler.runqueue_push_back(leader);
+        let futex = FutexID::private(MmId::initial(leader), 0x1000);
+        scheduler.sleep_futex_waiter(&sibling, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&survivor, futex, None, u32::MAX);
+        assert_eq!(
+            scheduler.sigkill_sender_reached_boundary(DetTid::from_raw(99), false),
+            0
+        );
+        assert_eq!(scheduler.sigkill_sender_exited(DetTid::from_raw(99)), 0);
+        assert_eq!(scheduler.blocked.futex_waiters[&futex].len(), 2);
+
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(leader));
+        assert_eq!(targets, [leader, sibling]);
+        assert!(scheduler.run_queue.contains_tid(leader));
+        assert_eq!(scheduler.blocked.futex_waiters[&futex].len(), 2);
+        assert_eq!(scheduler.fence_prepared_sigkill_targets(targets), 2);
+        assert!(scheduler.run_queue.is_empty());
+        assert!(scheduler.pending_sigkills.contains(&leader));
+        assert!(scheduler.pending_sigkills.contains(&sibling));
+        assert!(!scheduler.pending_sigkills.contains(&survivor));
+        assert!(scheduler.pending_sigkill_senders.contains(&sender));
+        assert_eq!(scheduler.blocked.futex_waiters[&futex].len(), 1);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+
+        assert_eq!(scheduler.complete_sigkill_exit(leader, leader), (1, 0));
+        scheduler.logically_kill_thread(&leader, &leader, MmId::initial(leader));
+        assert_eq!(scheduler.complete_sigkill_exit(sibling, leader), (0, 0));
+        scheduler.logically_kill_thread(&sibling, &leader, MmId::initial(leader));
+        assert!(scheduler.pending_sigkills.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(scheduler.sigkill_sender_reached_boundary(sender, true), 0);
+        assert!(scheduler.pending_sigkill_senders.contains(&sender));
+        assert_eq!(scheduler.sigkill_sender_exited(sender), 1);
+        assert!(scheduler.pending_sigkill_senders.is_empty());
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            [survivor]
+        );
+        assert!(scheduler.blocked.futex_waiters.values().all(Vec::is_empty));
+        assert_eq!(
+            scheduler.fence_prepared_sigkill_targets(vec![leader, sibling]),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_sigkill_cancels_prepared_targets_without_descheduling() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(10);
+        let sender = DetTid::from_raw(20);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler.priorities.insert(target, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            target,
+            ThreadNextTurn {
+                dettid: target,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        scheduler.runqueue_push_back(target);
+
+        let targets = scheduler.prepare_sigkill_target(sender, SigkillTarget::Process(target));
+        assert_eq!(scheduler.cancel_prepared_sigkill(sender, targets), 1);
+        assert!(scheduler.pending_sigkills.is_empty());
+        assert!(scheduler.pending_sigkill_senders.is_empty());
+        assert!(scheduler.run_queue.contains_tid(target));
     }
 
     #[test]
