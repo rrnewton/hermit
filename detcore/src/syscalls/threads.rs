@@ -112,7 +112,7 @@ fn futex2_address(raw: usize) -> Result<AddrMut<'static, u32>, Errno> {
     if raw == 0 {
         return Err(Errno::EFAULT);
     }
-    if raw % std::mem::align_of::<u32>() != 0 {
+    if !raw.is_multiple_of(std::mem::align_of::<u32>()) {
         return Err(Errno::EINVAL);
     }
     AddrMut::from_raw(raw).ok_or(Errno::EFAULT)
