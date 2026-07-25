@@ -8,16 +8,17 @@ known_failure_manifest="$repository/hermit-cli/tests/fail_closed_known_failures.
 allowed_ignore_manifest="$repository/hermit-cli/tests/fail_closed_allowed_ignores.tsv"
 cargo_args=("$@")
 cargo_bin=${CARGO:-cargo}
+test_timeout_seconds=${HERMIT_FAIL_CLOSED_TEST_TIMEOUT_SECONDS:-180}
 
 fail() {
   printf 'fail-closed ratchet: %s\n' "$*" >&2
   exit 1
 }
 
-run_cargo() {
+run_command() {
   local stderr_file status
   stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-fail-closed-cargo.XXXXXX")
-  if "$cargo_bin" "$@" 2>"$stderr_file"; then
+  if "$@" 2>"$stderr_file"; then
     rm -f "$stderr_file"
   else
     status=$?
@@ -25,6 +26,10 @@ run_cargo() {
     rm -f "$stderr_file"
     return "$status"
   fi
+}
+
+run_cargo() {
+  run_command "$cargo_bin" "$@"
 }
 
 cd "$repository"
@@ -138,7 +143,8 @@ for target in "${targets[@]}"; do
     fi
 
     printf '\n==> Fail-closed: %s\n' "$key"
-    run_cargo test -p hermit --test "$target" "${cargo_args[@]}" "$test" \
+    run_command timeout --kill-after=10s "${test_timeout_seconds}s" \
+      "$cargo_bin" test -p hermit --test "$target" "${cargo_args[@]}" "$test" \
       -- --exact --test-threads=1
     passed=$((passed + 1))
   done
