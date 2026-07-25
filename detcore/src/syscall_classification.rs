@@ -105,7 +105,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::prlimit64
         | Sysno::pread64
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR): Confirm positional-write ordering and replay semantics.
+        // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
         | Sysno::pwrite64
         | Sysno::read
         | Sysno::recvfrom
@@ -234,7 +234,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // Stable guest-owned metadata and synchronous writeback operations are
         // repeatable in Hermit's fixed mount namespace and filesystem image.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR): Confirm the metadata/writeback passthrough boundary.
+        // TODO-HUMAN-REVIEW(#683): Confirm the metadata/writeback passthrough boundary.
         | Sysno::faccessat
         | Sysno::fchmod
         | Sysno::fchmodat2
