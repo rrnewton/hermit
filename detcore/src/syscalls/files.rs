@@ -514,7 +514,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR): Confirm positional-write ordering and replay semantics.
+    // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
     /// SYS_pwrite64 system call.
     pub async fn handle_pwrite64<G: Guest<Self>>(
         &self,
