@@ -82,7 +82,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -142,7 +142,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"

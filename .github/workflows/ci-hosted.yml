@@ -33,7 +33,7 @@ jobs:
     - name: Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 tcl time unzip util-linux vim-common wget xz-utils zip zlib1g-dev zstd
+        sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 tcl time unzip util-linux vim-common wget xz-utils zip zlib1g-dev zstd
     - name: Enable unprivileged user and mount namespaces
       run: |
         if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -46,6 +46,18 @@ jobs:
       run: rustup component add clippy rustfmt
     - name: Portable test lane (no PMU or CPUID interception)
       run: ./validate.sh --hosted-only --no-label-pr --verbose
+    - name: Threaded integration matrix diagnostic (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test integration_matrix -- --test-threads=1
+    - name: LiteInst clone verification diagnostic (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test cli run_liteinst_rejects_non_fork_clone -- --exact --test-threads=1
+    - name: Chaos hello-race verification diagnostic (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#598)
     - name: DBI pipe backpressure diagnostics (nonblocking)
