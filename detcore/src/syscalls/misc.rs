@@ -464,7 +464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// is bitwise-identical across the two --verify runs and under record/replay,
     /// removing the host-NUMA-topology dependence a passthrough would introduce.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#720)
     pub async fn handle_get_mempolicy<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -484,7 +484,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// answer is a fixed constant, so it is deterministic across --verify and
     /// record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#720)
     pub async fn handle_move_pages<G: Guest<Self>>(
         &self,
         guest: &mut G,

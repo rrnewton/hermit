@@ -900,7 +900,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (never injected), so it is identical across --verify runs and
     /// record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#720)
     pub async fn handle_sched_getparam<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -918,7 +918,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// interval. Being a constant, it is deterministic across --verify and
     /// record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#720)
     pub async fn handle_sched_rr_get_interval<G: Guest<Self>>(
         &self,
         guest: &mut G,

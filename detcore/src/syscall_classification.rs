@@ -179,7 +179,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // passthrough their results depend on host NUMA topology, host scheduler
         // state, and privilege (all nondeterministic). They are determinized to
         // fixed, host-independent results; see the handlers in lib.rs.
-        // TODO-HUMAN-REVIEW(#PR)
+        // TODO-HUMAN-REVIEW(#720)
         | Sysno::mbind
         | Sysno::set_mempolicy
         | Sysno::get_mempolicy

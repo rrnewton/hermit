@@ -1257,7 +1257,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#PR)
+            // TODO-HUMAN-REVIEW(#720)
             // set_mempolicy_home_node is untyped in the pinned Reverie revision.
             // Hermit exposes a single virtual NUMA node, so setting a memory
             // range's home node has no observable effect: a deterministic no-op.
@@ -1477,7 +1477,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // count-returning calls are no-ops; getters emulate a default
                 // single-node / SCHED_OTHER answer.
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#PR)
+                // TODO-HUMAN-REVIEW(#720)
                 Syscall::Mbind(_) => Ok(0),
                 Syscall::SetMempolicy(_) => Ok(0),
                 Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
