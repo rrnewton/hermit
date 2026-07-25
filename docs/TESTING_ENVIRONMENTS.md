@@ -105,7 +105,9 @@ CI is split into two independent workflows:
   `[self-hosted, Linux, X64, hermit, pmu]`. New commits cancel older runs for
   the same pull request or branch. It executes
   `./validate.sh --hardware-only --no-label-pr` and also owns the manually
-  dispatched QEMU strict-L2 job.
+  dispatched QEMU strict-L2 job. PMU and QEMU commands take the host-local
+  `/tmp/hermit-self-hosted-pmu.lock` with `flock`, which serializes runner
+  processes on the same machine without discarding older pending pull requests.
 
 The merge gate requires only the GitHub-hosted workflow. Self-hosted results are
 reported separately as a best-effort hardware signal. Exact test ownership is

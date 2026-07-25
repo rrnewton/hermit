@@ -81,11 +81,6 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -120,11 +115,12 @@ jobs:
         run: |
           test -r /proc/sys/kernel/perf_event_paranoid
           test -r /dev/kvm -a -w /dev/kvm
+          command -v flock
           command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
           python3 -c 'import test.support'
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Self-hosted PMU and CPUID test lane
-        run: ./validate.sh --hardware-only --no-label-pr
+        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
       - name: Upload working-envelope JSON
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,11 +141,6 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -180,6 +171,7 @@ jobs:
       - name: PMU and namespace preflight
         run: |
           test -r /proc/sys/kernel/perf_event_paranoid
+          command -v flock
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Repeated and long-form hardware validation
-        run: ./validate.sh super --no-label-pr
+        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh super --no-label-pr
