@@ -1029,7 +1029,7 @@ function strict_compatibility_probe {
                 ;;
         esac
         run_args+=(--strict --verify --)
-        # TODO-HUMAN-REVIEW(PR-681): Review the cache-miss preprocessing
+        # TODO-HUMAN-REVIEW(PR-681): Review the cache-miss whole-row
         # budget for the large internal mysql executable.
         if [[ $label == mysql ]]; then
             probe_timeout=180

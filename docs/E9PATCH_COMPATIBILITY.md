@@ -70,8 +70,8 @@ The five added cache-miss rewrites recovered and patched `perf` 9/9 sites,
 `ldconfig` 183/183 sites. Rustup's unrecovered offsets are data according to
 e9tool, so its 24/24 recovered instructions are complete coverage. The large
 internal mysql executable took about 95 seconds to preprocess on this host and
-then passed at L2 from cache; its row has a 180-second preprocessing budget.
-The other rows retain the default 60-second bound.
+then passed at L2 from cache; its complete row has a 180-second bound. The
+other rows retain the default 60-second bound.
 
 The initial full Go rewrite exposed an e9tool optimizer interaction. The
 default O2 artifact patched all 49 candidates and ran directly on the host, but
