@@ -55,11 +55,6 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
-/// Fixed inherited descriptor receiving unsupported syscall records.
-pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
-
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbi::RuntimeEmitter;
 type Idler = reverie_dbi::RuntimeIdler;
@@ -145,7 +140,7 @@ static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-static COPIED_UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
+static UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RUNTIME_PAUSED: AtomicBool = AtomicBool::new(false);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
@@ -192,15 +187,7 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
 }
 
-fn report_fd_is_available() -> bool {
-    (unsafe { libc::fcntl(UNSUPPORTED_SYSCALL_REPORT_FD, libc::F_GETFD) }) != -1
-}
-
-fn append_copied_syscall_record(sysnum: i64) {
-    let report_fd = COPIED_UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
-    if report_fd == -1 {
-        return;
-    }
+fn append_unsupported_syscall_record(report_fd: i32, sysnum: i64) {
     let mut buffer = [0_u8; 24];
     let mut index = buffer.len() - 1;
     buffer[index] = b'\n';
@@ -356,6 +343,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
     let emit = callbacks.emit;
+    COPIED_PANIC_ON_UNSUPPORTED.store(
+        callbacks.panic_on_unsupported_syscalls != 0,
+        Ordering::Release,
+    );
+    UNSUPPORTED_REPORT_FD.store(callbacks.unsupported_report_fd, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
@@ -364,24 +356,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
             emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
-            let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
-            COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
-            let copied_report_fd = unsafe {
-                libc::fcntl(
-                    UNSUPPORTED_SYSCALL_REPORT_FD,
-                    libc::F_DUPFD_CLOEXEC,
-                    UNSUPPORTED_SYSCALL_REPORT_FD + 1,
-                )
-            };
-            COPIED_UNSUPPORTED_REPORT_FD.store(copied_report_fd, Ordering::Release);
             let mut config = Config {
                 sequentialize_threads: true,
                 deterministic_io: true,
                 max_timeslice: None,
-                panic_on_unsupported_syscalls,
+                panic_on_unsupported_syscalls: callbacks.panic_on_unsupported_syscalls != 0,
                 exit_on_unsupported_syscall: true,
-                unsupported_syscall_report_fd: report_fd_is_available()
-                    .then_some(UNSUPPORTED_SYSCALL_REPORT_FD),
+                unsupported_syscall_report_fd: None,
                 ..Config::default()
             };
             config.validate();
@@ -517,18 +498,23 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
-/// Applies unsupported-syscall policy in a copied pre-exec DBI child.
+fn copied_syscall_action(sysno: Sysno, strict: bool) -> i32 {
+    if detcore::is_unsupported_syscall(sysno) {
+        return if strict { 1 } else { 2 };
+    }
+    if strict && detcore::copied_child_syscall_requires_runtime(sysno) {
+        return 1;
+    }
+    0
+}
+
+/// Applies copied-child policy: 0 allows, 1 terminates, and 2 records then allows.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
-    if !detcore::is_unsupported_syscall(Sysno::from(sysnum as i32)) {
-        return 0;
-    }
-    if COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire) {
-        1
-    } else {
-        append_copied_syscall_record(sysnum);
-        0
-    }
+    copied_syscall_action(
+        Sysno::from(sysnum as i32),
+        COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire),
+    )
 }
 
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
@@ -600,6 +586,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = current_runtime();
+    if detcore::is_unsupported_syscall(Sysno::from(sysnum as i32))
+        && !runtime.config.panic_on_unsupported_syscalls
+    {
+        let report_fd = UNSUPPORTED_REPORT_FD.load(Ordering::Acquire);
+        if report_fd >= 0 {
+            append_unsupported_syscall_record(report_fd, sysnum);
+        }
+    }
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(Pid::from_raw(pid), &runtime.config));
@@ -762,6 +756,44 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_children_fail_closed_before_bypassing_determinized_syscalls() {
+        for sysnum in [libc::SYS_getrandom, libc::SYS_clock_gettime] {
+            let sysno = Sysno::from(sysnum as i32);
+            assert_eq!(copied_syscall_action(sysno, false), 0);
+            assert_eq!(copied_syscall_action(sysno, true), 1);
+        }
+        for sysnum in [
+            libc::SYS_close,
+            libc::SYS_dup2,
+            libc::SYS_execve,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
+            libc::SYS_rt_sigprocmask,
+        ] {
+            let sysno = Sysno::from(sysnum as i32);
+            assert_eq!(copied_syscall_action(sysno, false), 0);
+            assert_eq!(copied_syscall_action(sysno, true), 0);
+        }
+        let pass_through = Sysno::from(libc::SYS_getpid as i32);
+        assert_eq!(copied_syscall_action(pass_through, false), 0);
+        assert_eq!(copied_syscall_action(pass_through, true), 0);
+        for sysnum in [
+            libc::SYS_clone,
+            libc::SYS_ioctl,
+            libc::SYS_newfstatat,
+            libc::SYS_pipe2,
+            libc::SYS_wait4,
+        ] {
+            let sysno = Sysno::from(sysnum as i32);
+            assert_eq!(copied_syscall_action(sysno, false), 0);
+            assert_eq!(copied_syscall_action(sysno, true), 1);
+        }
+        let unsupported = Sysno::from(libc::SYS_getppid as i32);
+        assert_eq!(copied_syscall_action(unsupported, false), 2);
+        assert_eq!(copied_syscall_action(unsupported, true), 1);
+    }
 
     #[test]
     fn only_dynamorio_managed_process_lifecycle_stays_native() {

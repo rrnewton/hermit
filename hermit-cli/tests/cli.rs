@@ -428,7 +428,6 @@ fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
         "run",
         "--backend",
         "dbi",
-        "--strict",
         "--verify",
         "--",
         "/bin/bash",

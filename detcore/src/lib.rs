@@ -136,6 +136,39 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// Returns whether a copied DBI child must re-enter Detcore for `sysno`.
+///
+/// Copied children do not own the Detcore runtime. Strict mode permits only
+/// audited pass-through calls and the minimal fd/signal/exec bootstrap needed to
+/// install a new image; other determinized calls fail closed.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review copied-child fail-closed classification.
+pub fn copied_child_syscall_requires_runtime(sysno: Sysno) -> bool {
+    use syscall_classification::SyscallClassification;
+
+    match syscall_classification::classify_syscall(sysno) {
+        SyscallClassification::PassThrough => false,
+        SyscallClassification::Unsupported => true,
+        SyscallClassification::Determinized => !matches!(
+            sysno,
+            Sysno::close
+                | Sysno::dup
+                | Sysno::dup2
+                | Sysno::dup3
+                | Sysno::execve
+                | Sysno::execveat
+                | Sysno::exit
+                | Sysno::exit_group
+                | Sysno::fcntl
+                | Sysno::rt_sigaction
+                | Sysno::rt_sigprocmask
+                | Sysno::set_robust_list
+                | Sysno::set_tid_address
+                | Sysno::sigaltstack
+        ),
+    }
+}
+
 use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
@@ -1524,7 +1557,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     )
                     .await
                 }
-            }
+            },
         };
 
         detlog!(

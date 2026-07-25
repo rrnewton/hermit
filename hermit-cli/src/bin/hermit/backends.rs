@@ -32,6 +32,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::process::Output;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use hermit::Error;
 use hermit::ExitStatus;
@@ -58,80 +60,10 @@ impl DbiSummary {
     }
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review inherited DBI policy descriptors and bounded reports.
-struct InstalledFd {
-    target: i32,
-    backup: Option<i32>,
-    original_flags: Option<i32>,
-}
-
-impl InstalledFd {
-    fn install(source: i32, target: i32) -> std::io::Result<Self> {
-        // Keep the backup above the reserved transport descriptor so installing the target
-        // cannot overwrite its backup.
-        let backup = unsafe {
-            libc::fcntl(
-                target,
-                libc::F_DUPFD_CLOEXEC,
-                detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD + 1,
-            )
-        };
-        let backup = if backup == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                None
-            } else {
-                return Err(error);
-            }
-        } else {
-            Some(backup)
-        };
-        let original_flags = if let Some(backup_fd) = backup {
-            let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
-            if flags == -1 {
-                let error = std::io::Error::last_os_error();
-                let _ = unsafe { libc::close(backup_fd) };
-                return Err(error);
-            }
-            Some(flags)
-        } else {
-            None
-        };
-        let installed = Self {
-            target,
-            backup,
-            original_flags,
-        };
-        if unsafe { libc::dup2(source, target) } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } == -1 {
-            let error = std::io::Error::last_os_error();
-            drop(installed);
-            return Err(error);
-        }
-        Ok(installed)
-    }
-}
-
-impl Drop for InstalledFd {
-    fn drop(&mut self) {
-        if let Some(backup) = self.backup {
-            let _ = unsafe { libc::dup2(backup, self.target) };
-            if let Some(flags) = self.original_flags {
-                let _ = unsafe { libc::fcntl(self.target, libc::F_SETFD, flags) };
-            }
-            let _ = unsafe { libc::close(backup) };
-        } else {
-            let _ = unsafe { libc::close(self.target) };
-        }
-    }
-}
-
+// TODO-HUMAN-REVIEW(PR-644): Review private DBI report transport and bounds.
 struct DbiUnsupportedSyscallReport {
     reader: std::fs::File,
-    _writer: std::fs::File,
-    _report_fd: InstalledFd,
+    writer: std::fs::File,
 }
 
 impl DbiUnsupportedSyscallReport {
@@ -145,15 +77,16 @@ impl DbiUnsupportedSyscallReport {
         // SAFETY: pipe2 initialized both descriptors, transferring their ownership here.
         let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
         let writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
-        let report_fd = InstalledFd::install(
-            writer.as_raw_fd(),
-            detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD,
-        )?;
-        Ok(Self {
-            reader,
-            _writer: writer,
-            _report_fd: report_fd,
-        })
+        Ok(Self { reader, writer })
+    }
+
+    fn writer_path(&self) -> std::path::PathBuf {
+        format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.writer.as_raw_fd()
+        )
+        .into()
     }
 
     fn emit(&mut self) -> std::io::Result<()> {
@@ -214,17 +147,36 @@ impl Drop for DbiUnsupportedSyscallReport {
     }
 }
 
-struct TeeReader<R, W> {
-    input: R,
-    replay: W,
+struct ReplayCapture {
+    replay: fs::File,
+    active: bool,
 }
 
-impl<R: Read, W: Write> Read for TeeReader<R, W> {
+struct TeeReader<R> {
+    input: R,
+    replay: Arc<Mutex<ReplayCapture>>,
+}
+
+impl<R: Read> Read for TeeReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.input.read(buffer)?;
-        self.replay.write_all(&buffer[..read])?;
+        let mut replay = self
+            .replay
+            .lock()
+            .map_err(|_| std::io::Error::other("DBI replay capture lock poisoned"))?;
+        if replay.active {
+            replay.replay.write_all(&buffer[..read])?;
+        }
         Ok(read)
     }
+}
+
+fn deactivate_replay_capture(replay: &Arc<Mutex<ReplayCapture>>) -> std::io::Result<()> {
+    let mut replay = replay
+        .lock()
+        .map_err(|_| std::io::Error::other("DBI replay capture lock poisoned"))?;
+    replay.active = false;
+    replay.replay.flush()
 }
 
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
@@ -246,6 +198,8 @@ pub fn run_dbi(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
+    let unsupported_report = DbiUnsupportedSyscallReport::new()?;
+    let unsupported_report_path = unsupported_report.writer_path();
     let mut runner = DbiRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
@@ -255,6 +209,8 @@ pub fn run_dbi(
             ))
         })?
         .summary(true)
+        .client_argument("-unsupported-report-path")
+        .client_argument(unsupported_report_path)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -265,7 +221,7 @@ pub fn run_dbi(
         drrun.display()
     );
 
-    let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
+    let _unsupported_report = unsupported_report;
     let mut guest = StdCommand::new(program);
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
@@ -293,11 +249,17 @@ pub fn run_dbi(
     eprintln!(":: DBI Run1...");
     let first = match replay.as_mut() {
         Some(replay) => {
+            let replay_capture = Arc::new(Mutex::new(ReplayCapture {
+                replay: replay.try_clone()?,
+                active: true,
+            }));
             let first_input = TeeReader {
                 input: std::io::stdin(),
-                replay: replay.try_clone()?,
+                replay: Arc::clone(&replay_capture),
             };
-            run_once(&runner, &guest, &drrun, first_input)?
+            let first = run_once(&runner, &guest, &drrun, first_input);
+            deactivate_replay_capture(&replay_capture)?;
+            first?
         }
         None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
@@ -673,6 +635,30 @@ mod tests {
             stdin_reads: 0,
             memory_hash: "4b5e0e70f3050157".to_owned(),
         }
+    }
+
+    #[test]
+    fn replay_capture_stops_writes_before_second_run() {
+        let replay = tempfile::tempfile().unwrap();
+        let capture = Arc::new(Mutex::new(ReplayCapture {
+            replay: replay.try_clone().unwrap(),
+            active: true,
+        }));
+        let mut input = TeeReader {
+            input: std::io::Cursor::new(b"firstsecond"),
+            replay: Arc::clone(&capture),
+        };
+        let mut first = [0_u8; 5];
+        input.read_exact(&mut first).unwrap();
+        deactivate_replay_capture(&capture).unwrap();
+        let mut ignored = Vec::new();
+        input.read_to_end(&mut ignored).unwrap();
+
+        let mut replay = replay;
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        let mut recorded = Vec::new();
+        replay.read_to_end(&mut recorded).unwrap();
+        assert_eq!(recorded, b"first");
     }
 
     #[test]
