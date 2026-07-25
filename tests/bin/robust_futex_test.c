@@ -77,6 +77,11 @@ struct clone_args_v0_local {
 _Static_assert(sizeof(struct clone_args_v0_local) == 64,
                "clone_args v0 ABI must be 64 bytes");
 
+struct broadcast_state {
+  atomic_int ready;
+  atomic_int clone3_map_delta;
+};
+
 #if !defined(__GLIBC__)
 #error "This reproducer relies on glibc's pthread_mutex_t futex word layout"
 #endif
@@ -644,6 +649,7 @@ struct process_shared_state {
   pthread_mutex_t mutex;
   atomic_bool owner_locked;
   atomic_bool waiter_blocked;
+  atomic_bool stop_peer;
   atomic_int owner_error;
 };
 
@@ -717,6 +723,7 @@ static void check_group_termination(bool fatal_signal) {
   }
 
   pid_t killer = -1;
+  pid_t runnable_peer = -1;
   if (fatal_signal) {
     killer = fork();
     if (killer < 0) {
@@ -739,6 +746,17 @@ static void check_group_termination(bool fatal_signal) {
       }
       _exit(0);
     }
+    runnable_peer = fork();
+    if (runnable_peer < 0) {
+      perror("fork runnable peer");
+      exit(EXIT_FAILURE);
+    }
+    if (runnable_peer == 0) {
+      while (!atomic_load_explicit(&state->stop_peer, memory_order_acquire)) {
+        sched_yield();
+      }
+      _exit(0);
+    }
   }
 
   while (!atomic_load_explicit(&state->owner_locked, memory_order_acquire)) {
@@ -758,6 +776,7 @@ static void check_group_termination(bool fatal_signal) {
                 "pthread_mutex_consistent shared");
   check_pthread(pthread_mutex_unlock(&state->mutex),
                 "pthread_mutex_unlock shared");
+  atomic_store_explicit(&state->stop_peer, true, memory_order_release);
 
   int status = 0;
   if (waitpid(child, &status, 0) != child ||
@@ -772,6 +791,14 @@ static void check_group_termination(bool fatal_signal) {
     if (waitpid(killer, &killer_status, 0) != killer ||
         !WIFEXITED(killer_status) || WEXITSTATUS(killer_status) != 0) {
       fprintf(stderr, "unexpected killer status: %#x\n", killer_status);
+      exit(EXIT_FAILURE);
+    }
+  }
+  if (runnable_peer > 0) {
+    int peer_status = 0;
+    if (waitpid(runnable_peer, &peer_status, 0) != runnable_peer ||
+        !WIFEXITED(peer_status) || WEXITSTATUS(peer_status) != 0) {
+      fprintf(stderr, "unexpected runnable peer status: %#x\n", peer_status);
       exit(EXIT_FAILURE);
     }
   }
@@ -897,11 +924,29 @@ static void check_caught_sigchld(void) {
   }
 }
 
+static int count_proc_maps(void) {
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (maps == NULL) {
+    return -1;
+  }
+  char *line = NULL;
+  size_t capacity = 0;
+  int count = 0;
+  while (getline(&line, &capacity, maps) >= 0) {
+    ++count;
+  }
+  free(line);
+  if (fclose(maps) != 0) {
+    return -1;
+  }
+  return count;
+}
+
 static void check_broadcast_sigkill(void) {
-  atomic_int *ready =
-      mmap(NULL, sizeof(*ready), PROT_READ | PROT_WRITE,
+  struct broadcast_state *state =
+      mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  if (ready == MAP_FAILED) {
+  if (state == MAP_FAILED) {
     perror("mmap broadcast state");
     exit(EXIT_FAILURE);
   }
@@ -913,7 +958,7 @@ static void check_broadcast_sigkill(void) {
     exit(EXIT_FAILURE);
   }
   if (child == 0) {
-    atomic_fetch_add_explicit(ready, 1, memory_order_release);
+    atomic_fetch_add_explicit(&state->ready, 1, memory_order_release);
     for (;;) {
       pause();
     }
@@ -943,6 +988,13 @@ static void check_broadcast_sigkill(void) {
   memset(clone3_args, 0, sizeof(*clone3_args));
   clone3_args->flags = CLONE_UNTRACED;
   clone3_args->exit_signal = SIGCHLD;
+  const int maps_before_clone3 = count_proc_maps();
+  if (maps_before_clone3 < 0) {
+    perror("count maps before clone3");
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    exit(EXIT_FAILURE);
+  }
   pid_t clone3_child = syscall(SYS_clone3, clone3_args, sizeof(*clone3_args));
   if (clone3_child < 0) {
     const int clone3_errno = errno;
@@ -957,7 +1009,12 @@ static void check_broadcast_sigkill(void) {
     exit(EXIT_FAILURE);
   }
   if (clone3_child == 0) {
-    atomic_fetch_add_explicit(ready, 1, memory_order_release);
+    const int child_maps = count_proc_maps();
+    atomic_store_explicit(&state->clone3_map_delta,
+                          child_maps < 0 ? INT_MIN
+                                         : child_maps - maps_before_clone3,
+                          memory_order_release);
+    atomic_fetch_add_explicit(&state->ready, 1, memory_order_release);
     for (;;) {
       pause();
     }
@@ -967,8 +1024,18 @@ static void check_broadcast_sigkill(void) {
     exit(EXIT_FAILURE);
   }
 
-  while (atomic_load_explicit(ready, memory_order_acquire) != 2) {
+  while (atomic_load_explicit(&state->ready, memory_order_acquire) != 2) {
     sched_yield();
+  }
+  const int clone3_map_delta = atomic_load_explicit(
+      &state->clone3_map_delta, memory_order_acquire);
+  if (clone3_map_delta != 0) {
+    fprintf(stderr, "clone3 child map delta=%d\n", clone3_map_delta);
+    kill(child, SIGKILL);
+    kill(clone3_child, SIGKILL);
+    waitpid(child, NULL, 0);
+    waitpid(clone3_child, NULL, 0);
+    exit(EXIT_FAILURE);
   }
   if (kill(-1, SIGKILL) != 0) {
     perror("kill broadcast target");
@@ -985,7 +1052,7 @@ static void check_broadcast_sigkill(void) {
       exit(EXIT_FAILURE);
     }
   }
-  if (munmap(ready, sizeof(*ready)) != 0) {
+  if (munmap(state, sizeof(*state)) != 0) {
     perror("munmap broadcast state");
     exit(EXIT_FAILURE);
   }

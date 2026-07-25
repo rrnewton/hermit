@@ -60,6 +60,9 @@ The same fixture blocks real waiters across legacy `FUTEX_CMP_REQUEUE` and the
 U32 `futex_wait`, `futex_wake`, and `futex_requeue` interfaces. It also probes
 `FUTEX_WAKE_OP`, sibling `get_robust_list`, missing-thread `ESRCH`,
 process-shared `exit_group`, and external `SIGKILL` cleanup.
+The external `SIGKILL` case keeps an unrelated process continuously runnable
+with `sched_yield` until the robust waiter observes `EOWNERDEAD`, preventing
+reconciliation from depending on global run-queue idleness.
 It additionally checks that a separate process can deliver `SIGKILL` through a
 negative process-group selector without introducing wait-order divergence.
 The Hermit integration test also invokes the fixture's
@@ -72,7 +75,9 @@ signals, then restores the default disposition. The broadcast targets request
 that flag so every live guest descendant remains represented in the
 deterministic scheduler. The `clone3` request uses the 64-byte v0 structure at
 the end of a readable page, with the following page protected, to catch fixed
-88-byte argument reads. Do not run that mode natively.
+88-byte argument reads. Its child also verifies that the sanitizer's scratch
+mapping is not inherited through the fork-like clone. Do not run that mode
+natively.
 
 # POSIX timer signal-delivery probe
 

@@ -983,6 +983,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                             });
                         return Err(Error::Errno(write_error));
                     }
+                    let mapping_addr_mut = AddrMut::from_raw(mapped)
+                        .expect("clone3 scratch mmap returned a null mutable address");
+                    // TODO-HUMAN-REVIEW(PR-659): Review non-inheritance of clone3 scratch VMAs.
+                    if let Err(advice_error) = guest
+                        .inject_with_retry(Syscall::Madvise(
+                            syscalls::Madvise::new()
+                                .with_addr(Some(mapping_addr_mut))
+                                .with_len(mapping_len)
+                                .with_advice(libc::MADV_DONTFORK),
+                        ))
+                        .await
+                    {
+                        guest
+                            .inject_with_retry(Syscall::Munmap(
+                                syscalls::Munmap::new()
+                                    .with_addr(Some(mapping_addr))
+                                    .with_len(mapping_len),
+                            ))
+                            .await
+                            .unwrap_or_else(|cleanup_error| {
+                                panic!(
+                                    "failed to mark clone3 scratch MADV_DONTFORK ({advice_error}); cleanup failed ({cleanup_error})"
+                                )
+                            });
+                        return Err(Error::Errno(advice_error));
+                    }
                     clone3_scratch_mapping = Some((mapping_addr, mapping_len));
                     syscalls::family::CloneFamily::Clone3(call.with_args(Some(sanitized_args)))
                 }
