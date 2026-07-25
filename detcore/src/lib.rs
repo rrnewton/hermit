@@ -1258,7 +1258,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#PENDING): Deterministic ENOSYS for syscalls the pinned
+            // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
             // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
             // deterministic by construction and identical to the modern kernel's own
             // return, so no guest-visible behavior changes versus the legacy
