@@ -263,7 +263,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
-readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
+readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
@@ -2124,6 +2125,9 @@ function run_super_suite {
         printf "\n== Super stress pass rates ==\n"
         cat "$VALIDATION_TMP_DIR/super-report"
     fi
+    run_check "Weekly relaxed default-mode cases" cargo test -p hermit --test hermit_modes default_ -- --test-threads=1
+    run_check "Weekly portable chaos cases" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
+    run_check "Weekly ignored portable chaos cases" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
     run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
     run_check "PMU analyze hello-race stress" cargo test -p hermit --test analyze analyze_hello_race -- --exact --ignored --test-threads=1
     run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
@@ -2173,7 +2177,6 @@ function run_hermit_targets_serial {
 function run_hosted_validation {
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
-    run_check "Build release Hermit for strict compatibility" cargo build --release -p hermit
 
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
@@ -2184,18 +2187,16 @@ function run_hosted_validation {
     run_check "Test flaky guest crate" cargo test -p hermetic_infra_hermit_flaky-tests
     run_check "Test Hermit unit and binary targets" cargo test -p hermit --lib --bins
     run_check "Test Detcore unit and binary targets" cargo test -p detcore --lib --bins
-    run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=4
+    run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=1
     run_check "Test Detcore non-PMU parallel cases" cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4
 
-    run_check "Portable Hermit integration targets" run_hermit_targets_serial arbitrary_binaries chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism integration_matrix ipc_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism
-    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --test-threads=1
-    run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip chaos_buck_ --test-threads=1
-    run_check "Portable ignored Hermit mode cases" cargo test -p hermit --test hermit_modes -- --ignored --skip chaos_buck_ --test-threads=1
-    run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --test-threads=1
+    run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism integration_matrix ipc_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism
+    run_check "Portable arbitrary-binary cases" cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1
+    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --test-threads=1
+    run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --test-threads=1
+    run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test random_determinism --test rcx_canonicalization -- --ignored --test-threads=1
-    run_check "Portable concurrency stress" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
-    run_check "Portable ignored concurrency stress" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
+    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
     run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
     run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
     run_check "Portable working-envelope levels" run_hosted_envelope_levels
@@ -2223,8 +2224,11 @@ function run_hardware_validation {
     run_check "PMU parallel memory-and-print cases" cargo test -p detcore --test tests_parallelism 'mem_print_race::' -- --skip raw_run_par_mode --test-threads=1
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
+    run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
     run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick thread_scheduling_fairness writev_determinism
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
+    run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
+    run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
     run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
     run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1

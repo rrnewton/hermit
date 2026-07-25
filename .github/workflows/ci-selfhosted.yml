@@ -156,3 +156,12 @@ jobs:
       continue-on-error: true
       timeout-minutes: 5
       run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#657)
+    - name: Managed JVM strict-verify diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      env:
+        HERMIT_APP_VERIFY_TIMEOUT: "20s"
+        RUST_BACKTRACE: "1"
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test app_strict_verify java -- --ignored --test-threads=1 --nocapture

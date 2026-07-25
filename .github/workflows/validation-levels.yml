@@ -39,6 +39,8 @@ jobs:
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
