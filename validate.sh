@@ -1209,6 +1209,8 @@ function run_compatibility_corpus {
     strict_compatibility_probe bash bash -c \
         'for i in 1 2 3; do echo "$i"; done' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#701): Review the complex shell-build L2 workload.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         strict_compatibility_probe shell-build bash "$COMPLEX_SHELL_WORKLOAD" \
             && passed=$((passed + 1)) || failed=$((failed + 1))
