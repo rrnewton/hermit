@@ -1485,7 +1485,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Ftruncate(_)
                 // Fixed credentials and process-local unlocks are deterministic; fsync is
                 // conditional on guest-owned files and stable filesystem state.
-                // TODO-HUMAN-REVIEW(PR-PENDING): Verify deterministic passthrough assumptions.
+                // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Fsync(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED

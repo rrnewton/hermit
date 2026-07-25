@@ -204,7 +204,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ftruncate
         // Fixed credentials, process-local unlocks, and guest-owned filesystem
         // flushes are repeatable under the fixed-container model.
-        // TODO-HUMAN-REVIEW(PR-PENDING): Verify deterministic passthrough assumptions.
+        // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsync
         // AUTONOMOUS-BOT-IMPLEMENTED
