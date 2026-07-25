@@ -1162,6 +1162,8 @@ function run_compatibility_corpus {
             bash /usr/bin/tclsh \
             'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#698): Review the expanded bc and dc exact-output probes.
         # Keep the combined exact result below GNU bc output wrap width.
         strict_compatibility_probe bc bash -c \
             'set -euo pipefail; out=$(printf "%s\n" "$2" | BC_LINE_LENGTH=200 "$1" -q); test "$out" = "$3"; printf "bc-math=%s\n" "$out"' \
