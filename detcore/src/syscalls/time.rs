@@ -155,6 +155,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(secs)
     }
 
+    /// `times` under Hermit. The `struct tms` CPU-time fields (user/system time
+    /// for the calling process and its waited-for children) depend on host
+    /// scheduling and are not modeled by Detcore, so report a zeroed `tms` -- the
+    /// same deterministic zeros [`Self::handle_getrusage`] returns for CPU time.
+    /// The return value on Linux is clock ticks since an arbitrary epoch; derive
+    /// it from the virtual clock (in USER_HZ ticks) so it is deterministic and
+    /// nondecreasing across a run rather than depending on host uptime.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#785)
+    pub async fn handle_times<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Times,
+    ) -> Result<i64, Error> {
+        // The standard USER_HZ on x86_64 Linux; `sysconf(_SC_CLK_TCK)` == 100.
+        const USER_HZ: u64 = 100;
+
+        let time_ns = thread_observe_time(guest).await;
+
+        if let Some(buf) = call.buf() {
+            // SAFETY: `libc::tms` is plain-old-data and valid when zero-filled.
+            let tms: libc::tms = unsafe { std::mem::zeroed() };
+            guest.memory().write_value(buf, &tms)?;
+        }
+
+        Ok((time_ns.as_nanos() / (1_000_000_000 / USER_HZ)) as i64)
+    }
+
     /// clock_gettime
     pub async fn handle_clock_gettime<G: Guest<Self>>(
         &self,

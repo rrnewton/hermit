@@ -1652,6 +1652,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#785): CPU-time accounting is not modeled, so
+                // report a zeroed `struct tms` with a virtual-clock-derived return.
+                Syscall::Times(s) => self.handle_times(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#785): the kernel log buffer is host-global
+                // shared state, so present an empty deterministic log.
+                Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
                 Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED

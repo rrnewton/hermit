@@ -248,6 +248,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#785): Process CPU-time accounting and the kernel
+        // log buffer. `times` reports per-process user/system CPU tick counts,
+        // which depend on host scheduling and are nondeterministic; Detcore does
+        // not model CPU-time accounting, so it reports a zeroed `struct tms`
+        // (matching the deterministic zeros getrusage already returns) with a
+        // return value derived from the virtual clock. `syslog` reads (or sizes)
+        // the shared kernel ring buffer, whose contents are host-global and
+        // vary run to run; a deterministic container exposes no kernel log, so
+        // Detcore reports an empty buffer of zero size. Both are dispatched by
+        // the typed match in lib.rs.
+        | Sysno::times
+        | Sysno::syslog
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
         // reconfigure mount and other namespaces, resolve files by kernel
@@ -458,6 +471,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#785): copy_file_range moves bytes between two
+        // regular-file descriptors (the kernel rejects pipes/sockets with
+        // EINVAL). The data it copies is the guest's own file content -- there
+        // is no host-varying or host-global state involved -- and the bytes-
+        // copied return value is a deterministic function of the input files,
+        // so forwarding it produces identical results under --strict --verify.
+        // This is the same reasoning applied to the other issue-reviewed
+        // file/socket pass-throughs. Record/replay does not yet account for the
+        // data movement through this path; see the TODO for a determinized
+        // I/O-aware handler.
+        | Sysno::copy_file_range
         | Sysno::get_thread_area
         | Sysno::mknod
         | Sysno::mknodat
@@ -490,7 +515,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::close_range
-        | Sysno::copy_file_range
         | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
@@ -559,9 +583,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
-        | Sysno::syslog
         | Sysno::tee
-        | Sysno::times
         | Sysno::tkill
         | Sysno::ustat
         | Sysno::vmsplice => SyscallClassification::Unsupported,
@@ -727,7 +749,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [200, 91, 82]);
+        assert_eq!(counts, [202, 92, 79]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -787,6 +809,8 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+            Sysno::times,
+            Sysno::syslog,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
@@ -859,6 +883,7 @@ mod tests {
         }
         for sysno in [
             Sysno::chroot,
+            Sysno::copy_file_range,
             Sysno::get_thread_area,
             Sysno::mknod,
             Sysno::mknodat,

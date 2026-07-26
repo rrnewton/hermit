@@ -195,6 +195,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// `syslog`/`klogctl` under Hermit. The kernel log ring buffer is host-global
+    /// shared state whose contents vary from run to run, so a deterministic
+    /// container exposes an empty log: every read/size action reports zero bytes
+    /// available and the caller's buffer is left untouched (nothing is copied);
+    /// the console-control and open/close actions are accepted as no-ops. Actions
+    /// outside the defined `SYSLOG_ACTION_*` range get the kernel's `EINVAL`.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#785)
+    pub async fn handle_syslog<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Syslog,
+    ) -> Result<i64, Error> {
+        // `SYSLOG_ACTION_CLOSE`(0) .. `SYSLOG_ACTION_SIZE_BUFFER`(10).
+        const SYSLOG_ACTION_MAX: i32 = 10;
+        match call.priority() {
+            0..=SYSLOG_ACTION_MAX => Ok(0),
+            _ => Err(Errno::EINVAL.into()),
+        }
+    }
+
     /// The guest's peak resident set size ("high water mark") in kibibytes, matching the units of
     /// Linux `getrusage`'s `ru_maxrss`. Reads procfs like [`Self::free_ram`]; always returns a
     /// positive value so guests can rely on a nonzero maximum RSS even if the read fails.
