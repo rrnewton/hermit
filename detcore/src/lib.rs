@@ -1391,20 +1391,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#792): BATCH 56. flock(2) is an advisory
-            // whole-file lock and is untyped (Syscall::Other) in the pinned
-            // Reverie. Detcore serializes all guest threads/processes onto one
-            // logical CPU with a deterministic scheduler, so there is no true
-            // concurrency for an advisory lock to arbitrate; granting every
-            // request with a fixed success (and treating LOCK_UN as a no-op)
-            // is deterministic by construction, never blocks, and never depends
-            // on host lock state (unlike a raw pass-through, which could block
-            // on a lock held by an external host process or deadlock two guest
-            // processes under sequentialization). This mirrors the existing
-            // advisory fixed-success treatment of fadvise64. In an isolated
-            // container only one instance runs, so `flock -n` "am I alone"
-            // probes correctly see success.
-            SyscallClassification::Determinized if call.number() == Sysno::flock => Ok(0),
+            // TODO-HUMAN-REVIEW(#792): BATCH 56. bpf(2) is untyped
+            // (Syscall::Other) in the pinned Reverie. It loads eBPF programs and
+            // creates maps in global kernel state that is shared across the host,
+            // persistent, and observed by the kernel outside the guest's logical
+            // time, so forwarding it is nondeterministic and a
+            // container-isolation hole. A fixed -ENOSYS is the errno a kernel
+            // built without CONFIG_BPF_SYSCALL returns; bpftool and other
+            // consumers feature-probe and degrade against it. Never forwarded to
+            // the host; identical across --verify and record/replay.
+            SyscallClassification::Determinized if call.number() == Sysno::bpf => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#792): BATCH 56. Kernel keyring syscalls
             // (keyctl/add_key/request_key) are untyped (Syscall::Other) in the

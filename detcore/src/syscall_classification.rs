@@ -317,18 +317,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#792): BATCH 56. flock is an advisory whole-file
-        // lock; keyctl/add_key/request_key manipulate global kernel keyrings;
-        // perf_event_open opens a hardware/software performance counter. All
-        // three are untyped (Syscall::Other) in the pinned Reverie and are
-        // given deterministic policies by the dispatcher (fixed success for the
-        // advisory lock, ENOSYS for the keyring and perf-counter facilities)
-        // before the typed match; see lib.rs. Classified Determinized so plain
-        // --strict no longer fail-closes on them.
-        | Sysno::flock
+        // TODO-HUMAN-REVIEW(#792): BATCH 56. keyctl/add_key/request_key
+        // manipulate global kernel keyrings; bpf loads programs/maps into global
+        // kernel state; perf_event_open opens a hardware/software performance
+        // counter. All are untyped (Syscall::Other) in the pinned Reverie and
+        // are refused with a deterministic ENOSYS by the dispatcher (see lib.rs)
+        // before the typed match: each touches global, host-shared kernel state
+        // or an inherently nondeterministic counter that Detcore cannot model
+        // reproducibly. Classified Determinized so plain --strict no longer
+        // fail-closes on them.
         | Sysno::keyctl
         | Sysno::add_key
         | Sysno::request_key
+        | Sysno::bpf
         | Sysno::perf_event_open => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
@@ -501,11 +502,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
         | Sysno::adjtimex
-        | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
+        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -960,14 +961,18 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
-        // Batch 56: the advisory whole-file lock flock and perf_event_open are
-        // determinized (fixed success and deterministic ENOSYS respectively) via
-        // dedicated dispatch arms; they use neither the keyring nor the async-IPC
-        // helper.
-        for sysno in [Sysno::flock, Sysno::perf_event_open] {
+        // Batch 56: bpf and perf_event_open are determinized (deterministic
+        // ENOSYS) via dedicated dispatch arms; they use neither the keyring nor
+        // the async-IPC helper. flock remains Unsupported (its determinization
+        // is handled by a separate change).
+        for sysno in [Sysno::bpf, Sysno::perf_event_open] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
             assert!(!is_kernel_keyring_syscall(sysno));
         }
+        assert_eq!(
+            classify_syscall(Sysno::flock),
+            SyscallClassification::Unsupported
+        );
     }
 
     #[test]
@@ -1102,15 +1107,15 @@ mod tests {
     }
 
     #[test]
-    fn batch56_flock_keyring_perf_syscalls_are_determinized() {
-        // flock (advisory lock, fixed success), the keyring family and
-        // perf_event_open (both deterministic ENOSYS refusals) must all
-        // classify as Determinized so plain --strict does not fail-close.
+    fn batch56_keyring_bpf_perf_syscalls_are_determinized() {
+        // The keyring family, bpf, and perf_event_open (all deterministic
+        // ENOSYS refusals) must classify as Determinized so plain --strict does
+        // not fail-close.
         let determinized = [
-            Sysno::flock,
             Sysno::keyctl,
             Sysno::add_key,
             Sysno::request_key,
+            Sysno::bpf,
             Sysno::perf_event_open,
         ];
         for sysno in determinized {
@@ -1138,9 +1143,9 @@ mod tests {
             }
         }
 
-        // flock and perf_event_open take dedicated dispatch arms, not the
-        // keyring helper.
-        assert!(!is_kernel_keyring_syscall(Sysno::flock));
+        // bpf and perf_event_open take dedicated dispatch arms, not the keyring
+        // helper.
+        assert!(!is_kernel_keyring_syscall(Sysno::bpf));
         assert!(!is_kernel_keyring_syscall(Sysno::perf_event_open));
     }
 }
