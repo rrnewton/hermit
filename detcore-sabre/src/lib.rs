@@ -23,7 +23,7 @@ pub const RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
 
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review the Hermit-to-SaBRe plugin artifact boundary.
+// TODO-HUMAN-REVIEW(PR-738): Review the Hermit-to-SaBRe plugin artifact boundary.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or_else(|| {

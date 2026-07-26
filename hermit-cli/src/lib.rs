@@ -491,7 +491,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// Run one command with the Detcore tool executing inside a SaBRe plugin and
 /// the single GlobalState hosted by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review SaBRe coordinator lifetime and artifact loading.
+// TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
 async fn run_sabre(
     mut command: Command,
     config: DetConfig,
