@@ -1436,7 +1436,7 @@ impl RunOpts {
         // (via `run_in_container`), whose own dispatch routes it to `run_kvm`
         // and returns an accurate, program-specific error.
         match backend {
-            Backend::Ptrace | Backend::Kvm | Backend::E9patch => {}
+            Backend::Ptrace | Backend::Sabre | Backend::Kvm | Backend::E9patch => {}
             Backend::Dbi => {
                 return super::backends::run_dbi(
                     &self.program,
@@ -1450,15 +1450,6 @@ impl RunOpts {
                 return super::backends::run_liteinst(
                     || Ok(self.guest_command()?.into_std_lossy()),
                     self.liteinst_guest_preload(),
-                    self.verify,
-                    global.log,
-                );
-            }
-            // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
-            Backend::Sabre => {
-                return super::backends::run_sabre(
-                    &self.program,
-                    &self.args,
                     self.verify,
                     global.log,
                 );
