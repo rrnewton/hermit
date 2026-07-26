@@ -213,7 +213,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// runs. This matches the in-process KVM guest executor, which also reports
     /// full residency.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-165): Review deterministic mincore residency emulation.
+    // TODO-HUMAN-REVIEW(#775): Review deterministic mincore residency emulation.
     pub async fn handle_mincore<G: Guest<Self>>(
         &self,
         guest: &mut G,
