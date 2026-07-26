@@ -546,7 +546,7 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review the bounded SaBRe RPC disconnect drain.
+// TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
 const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn wait_for_sabre_rpc_disconnects<T>(
