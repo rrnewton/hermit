@@ -288,7 +288,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=181
-readonly RR_COMPAT_EXPECTED=131
+# Current main's 131-row ratchet (which already includes ruby/dc/tcl from
+# PR #729) plus four descriptor-state and eight writable-filesystem programs
+# adopted from PR #662.
+readonly RR_COMPAT_EXPECTED=143
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -308,6 +311,17 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
     [free]="live /proc/meminfo values differ between otherwise identical runs"
+    # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
+    # programs each require a syscall Detcore does not yet determinize, so they
+    # correctly abort under fail-closed --strict; they only passed the envelope
+    # previously because --strict used to forward unsupported syscalls.
+    [chrt]="fail-closed --strict rejects the unsupported sched_getattr syscall"
+    [flock]="fail-closed --strict rejects the unsupported flock syscall"
+    [ionice]="fail-closed --strict rejects the unsupported ioprio_set syscall"
+    [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
+    [make]="fail-closed --strict rejects the unsupported setresuid syscall"
+    [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
+    [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [rustc]="timed out on the GitHub-hosted no-PMU runner"
@@ -321,8 +335,8 @@ declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
 
-# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
-# strict corpus below; this set only selects the rows known to pass R/R.
+# Commands remain owned by the strict corpus below; this exact set only selects
+# rows measured to pass R/R.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -340,7 +354,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [tsort]=1 [ptx]=1 [pinky]=1 [logname]=1 [users]=1 [uptime]=1
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
-    [split]=1 [cmp]=1
+    [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
+    [diff]=1 [cp]=1 [install]=1 [tar]=1 [mv]=1 [rm]=1 [touch]=1 [chmod]=1
     [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
@@ -348,6 +363,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
     [ruby]=1 [dc]=1 [tcl]=1
 )
+# mktemp remains excluded: SIGCHLD delivery can race the command-substitution pipe EOF
+# during replay, changing deterministic log order while preserving output and exit status.
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
@@ -1461,6 +1478,34 @@ function functional_compatibility_probe {
         REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
         bash "$REAL_COMPAT_WORKLOAD" "$label"
 }
+# Route a compatibility probe whose failure under fail-closed --strict is an
+# accepted unsupported-syscall gap (see COMPAT_SUMMARY_KNOWN_FAILURES; PR #644).
+# In strict mode such a failure is nonblocking known-flaky and the row keeps
+# running so the gap stays visible (mirroring the gcc vfork precedent); other
+# modes tally it as an ordinary failure. Uses namerefs to update the caller's
+# passed/failed/known_flaky counters.
+function tally_known_failclosed_probe {
+    local -n _tkfp_passed=$1
+    local -n _tkfp_failed=$2
+    local -n _tkfp_known=$3
+    local label=$4
+    shift 4
+
+    if "$@"; then
+        _tkfp_passed=$((_tkfp_passed + 1))
+        if [[ $COMPATIBILITY_MODE == strict ]]; then
+            printf "  WARN %s unexpectedly passed fail-closed --strict; drop it from COMPAT_SUMMARY_KNOWN_FAILURES\n" \
+                "$label"
+        fi
+    elif [[ $COMPATIBILITY_MODE == strict ]]; then
+        _tkfp_known=$((_tkfp_known + 1))
+        printf "  WARN %s known fail-closed under --strict (%s; PR #644; nonblocking)\n" \
+            "$label" "${COMPAT_SUMMARY_KNOWN_FAILURES[$label]:-unsupported syscall}"
+    else
+        _tkfp_failed=$((_tkfp_failed + 1))
+    fi
+}
+
 function run_compatibility_corpus {
     local passed=0
     local failed=0
@@ -1567,8 +1612,16 @@ function run_compatibility_corpus {
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#701): Review the complex shell-build L2 workload.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
+        # Give the workload a per-run-unique work directory so concurrent
+        # validate.sh runs never collide on a shared path under --verify. The
+        # path is identical across this probe's two --verify runs (fixed argv),
+        # keeping it L2-stable, but unique across processes (host mktemp).
+        local shell_build_dir
+        shell_build_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-shell-build.XXXXXX")
         strict_compatibility_probe shell-build bash "$COMPLEX_SHELL_WORKLOAD" \
+            "$shell_build_dir" \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+        rm -rf "$shell_build_dir"
     fi
     functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1638,8 +1691,8 @@ function run_compatibility_corpus {
     fi
     functional_compatibility_probe g++ g++ --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe make make --version \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    tally_known_failclosed_probe passed failed known_flaky make \
+        functional_compatibility_probe make make --version
     functional_compatibility_probe ar /usr/bin/ar --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe as /usr/bin/as --version \
@@ -1701,10 +1754,10 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe cpio-roundtrip /usr/bin/cpio --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe wget-localhost /usr/bin/wget --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe curl-localhost /usr/bin/curl --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        tally_known_failclosed_probe passed failed known_flaky wget-localhost \
+            functional_compatibility_probe wget-localhost /usr/bin/wget --version
+        tally_known_failclosed_probe passed failed known_flaky curl-localhost \
+            functional_compatibility_probe curl-localhost /usr/bin/curl --version
     fi
     strict_compatibility_probe zip-unzip bash -c \
         'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
@@ -1771,8 +1824,8 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe ss /usr/sbin/ss -V \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe lsof /usr/bin/lsof -v \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        tally_known_failclosed_probe passed failed known_flaky lsof \
+            functional_compatibility_probe lsof /usr/bin/lsof -v
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
@@ -1850,20 +1903,20 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe nice /usr/bin/nice -n 1 /bin/echo nice-ok \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    tally_known_failclosed_probe passed failed known_flaky ionice \
+        strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
     strict_compatibility_probe taskset bash -c \
         'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    strict_compatibility_probe chrt bash -c \
-        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe flock bash -c \
-        'set -euo pipefail; f=$(mktemp); flock -x "$f" -c "printf \"flock-ok\\n\""; rm -f "$f"' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    tally_known_failclosed_probe passed failed known_flaky chrt \
+        strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"'
+    tally_known_failclosed_probe passed failed known_flaky flock \
+        strict_compatibility_probe flock bash -c \
+        'set -euo pipefail; f=$(mktemp); flock -x "$f" -c "printf \"flock-ok\\n\""; rm -f "$f"'
     # Capture logger's wall-clock prefix and assert only its semantic payload.
     strict_compatibility_probe logger bash -c \
         'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \
@@ -2807,7 +2860,7 @@ function run_full_suite {
         printf "❌ Strict compatibility envelope regressed; failing validation (matches the now-blocking CI gate).\n"
         failures=$((failures + 1))
     fi
-    run_check "Record/replay compatibility baseline (128 programs)" \
+    run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
         run_rr_compatibility_envelope
     # Nextest runs most package unit and Cargo integration targets in parallel.
     # Detcore's PMU tests depend on same-binary coordination; nextest would launch
@@ -2930,7 +2983,7 @@ if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
     if ((failures == 0)); then
-        run_check "Record/replay compatibility baseline (128 programs)" \
+        run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
     fi
     print_summary
