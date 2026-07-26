@@ -352,7 +352,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
-        | Sysno::sched_getattr => SyscallClassification::Determinized,
+        | Sysno::sched_getattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-787): Deterministic time-discipline and kernel-log
+        // syscalls. adjtimex/clock_adjtime query or adjust the kernel NTP clock
+        // discipline; left as passthrough they leak the host's live discipline
+        // state (offset, frequency, current time) and are capability-gated, all
+        // nondeterministic. Detcore has no real clock discipline, so it reports a
+        // fixed, unsynchronized snapshot carrying only the virtual clock time and
+        // treats any adjustment request as a deterministic no-op. syslog(2) reads
+        // or controls the kernel ring buffer -- host state Hermit cannot
+        // reproduce -- so Detcore presents a deterministic empty log (read/size
+        // actions return zero; control actions are no-ops). All three are
+        // bitwise-identical across --verify and record/replay; see the handlers
+        // in detcore/src/syscalls/time.rs and misc.rs.
+        | Sysno::adjtimex
+        | Sysno::clock_adjtime
+        | Sysno::syslog => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -486,6 +502,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::symlink
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::sync_file_range
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-787): copy_file_range(2) copies bytes between two
+        // regular files (the kernel rejects pipes/sockets with EINVAL), so both
+        // ends carry deterministic, guest-owned filesystem content and there is
+        // no external or blocking endpoint. Under Hermit's stable-filesystem
+        // model the copy is repeatable, matching the rationale for the other
+        // guest-owned file operations above. Left Unsupported it fail-closes
+        // modern coreutils cp/mv/install and language-runtime io.Copy fast paths.
+        | Sysno::copy_file_range
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -524,12 +549,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
         | Sysno::add_key
-        | Sysno::adjtimex
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::clock_adjtime
         | Sysno::close_range
-        | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -591,7 +613,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
-        | Sysno::syslog
         | Sysno::tee
         | Sysno::ustat
         | Sysno::vmsplice => SyscallClassification::Unsupported,
@@ -757,7 +778,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [212, 92, 69]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -849,6 +870,9 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+            Sysno::adjtimex,
+            Sysno::clock_adjtime,
+            Sysno::syslog,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
@@ -924,6 +948,7 @@ mod tests {
             Sysno::umask,
             Sysno::unlink,
             Sysno::unlinkat,
+            Sysno::copy_file_range,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }

@@ -194,6 +194,61 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-787): adjtimex(2) NTP clock-discipline query/adjust.
+    /// adjtimex — report a deterministic, host-independent clock-discipline
+    /// snapshot. Hermit runs no real kernel NTP discipline, so every field is
+    /// fixed: the clock is reported unsynchronized (`STA_UNSYNC`) with a default
+    /// tick, zero offset/frequency, and only the virtual clock's current time.
+    /// Any adjustment request (`modes != 0`) is a deterministic no-op — Hermit
+    /// must not perturb the host clock — and the same snapshot is returned. This
+    /// is bitwise-identical across `--verify` and record/replay.
+    pub async fn handle_adjtimex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Adjtimex,
+    ) -> Result<i64, Error> {
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-787): clock_adjtime(2) — per-clock adjtimex variant.
+    /// clock_adjtime — the clock-id-parameterized form of adjtimex. Hermit models
+    /// a single deterministic clock, so the clock id is ignored and the same
+    /// deterministic discipline snapshot is reported. See [`Self::handle_adjtimex`].
+    pub async fn handle_clock_adjtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockAdjtime,
+    ) -> Result<i64, Error> {
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    /// Write a fixed, host-independent `struct timex` into the guest buffer and
+    /// return `TIME_OK`. Shared by adjtimex and clock_adjtime.
+    async fn write_deterministic_timex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::timex>>,
+    ) -> Result<i64, Error> {
+        let buf = buf.ok_or(Errno::EFAULT)?;
+        let now: Timespec = thread_observe_time(guest).await.into();
+
+        // SAFETY: `libc::timex` is a C struct of integer fields; all-zero is a
+        // valid, well-defined value.
+        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+        tx.status = libc::STA_UNSYNC;
+        // Default kernel tick for the common USER_HZ=100 configuration (µs).
+        tx.tick = 10_000;
+        tx.time = libc::timeval {
+            tv_sec: now.tv_sec,
+            tv_usec: now.tv_nsec / 1000,
+        };
+
+        guest.memory().write_value(buf, &tx)?;
+        Ok(libc::TIME_OK as i64)
+    }
+
     /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
     /// Return 0 or EINTR respectively.
     async fn wait_and_return<R: Guest<Self>>(
