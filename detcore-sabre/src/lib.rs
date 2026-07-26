@@ -101,13 +101,13 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review SaBRe RDTSC virtualization.
+    // TODO-HUMAN-REVIEW(PR-740): Review SaBRe RDTSC virtualization.
     fn rdtsc(&self) -> u64 {
         self.adapter.handle_rdtsc().unwrap_or(0)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review SaBRe clock_gettime VDSO virtualization.
+    // TODO-HUMAN-REVIEW(PR-740): Review SaBRe clock_gettime VDSO virtualization.
     fn vdso_clock_gettime(&self, clockid: libc::clockid_t, tp: *mut libc::timespec) -> i32 {
         self.handle_vdso(
             Sysno::clock_gettime,
@@ -116,7 +116,7 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review SaBRe getcpu VDSO virtualization.
+    // TODO-HUMAN-REVIEW(PR-740): Review SaBRe getcpu VDSO virtualization.
     fn vdso_getcpu(&self, cpu: *mut u32, node: *mut u32, unused: usize) -> i32 {
         self.handle_vdso(
             Sysno::getcpu,
@@ -125,7 +125,7 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review SaBRe gettimeofday VDSO virtualization.
+    // TODO-HUMAN-REVIEW(PR-740): Review SaBRe gettimeofday VDSO virtualization.
     fn vdso_gettimeofday(&self, tv: *mut libc::timeval, tz: *mut libc::timezone) -> i32 {
         self.handle_vdso(
             Sysno::gettimeofday,
@@ -134,7 +134,7 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review SaBRe time VDSO virtualization.
+    // TODO-HUMAN-REVIEW(PR-740): Review SaBRe time VDSO virtualization.
     fn vdso_time(&self, tloc: *mut libc::time_t) -> i32 {
         self.handle_vdso(Sysno::time, SyscallArgs::new(tloc as usize, 0, 0, 0, 0, 0))
     }
