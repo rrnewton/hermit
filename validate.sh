@@ -292,8 +292,8 @@ readonly RR_COMPAT_EXPECTED=131
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=151
-readonly SABRE_COMPAT_TOTAL=151
+readonly SABRE_COMPAT_EXPECTED=159
+readonly SABRE_COMPAT_TOTAL=159
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -1661,8 +1661,8 @@ function run_compatibility_corpus {
             unavailable=$((unavailable + 1))
         fi
     fi
-    # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
-    functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
+    # Avoid PATH-wrapper telemetry; the Meta custom ELF interpreter is unsupported.
+    functional_compatibility_probe git /usr/bin/git --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe cmake /usr/bin/cmake --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1964,13 +1964,15 @@ function run_compatibility_corpus {
     strict_compatibility_probe top bash -c \
         'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf "top-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Signal zero checks deterministic guest-process existence without
-    # perturbing signal delivery or depending on host process IDs.
-    strict_compatibility_probe kill /usr/bin/kill -0 1 \
+    # Signal zero checks an owned guest process without
+    # perturbing signal delivery or assuming ownership of host PID 1.
+    strict_compatibility_probe kill bash -c \
+        'set -euo pipefail; /usr/bin/kill -0 "$$"; printf "kill-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
+    # SaBRe leaves comm as "sabre"; test the process relation, not that known gap.
     strict_compatibility_probe pgrep bash -c \
-        'set -euo pipefail; /usr/bin/pgrep -x bash | /usr/bin/grep -qx "$$"; printf "pgrep-ok\n"' \
+        'set -euo pipefail; /usr/bin/pgrep -P "$PPID" | /usr/bin/grep -qx "$$"; printf "pgrep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pkill bash -c \
         'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf "pkill-ok\n"' \
@@ -2031,7 +2033,8 @@ function run_compatibility_corpus {
     strict_compatibility_probe ln bash -c \
         'set -euo pipefail; d=$(mktemp -d); printf "link-data\n" >"$d/source"; ln "$d/source" "$d/hard"; ln -s source "$d/sym"; stat -c "%h" "$d/source"; cat "$d/hard" "$d/sym"; rm -rf "$d"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe date /usr/bin/date -u +'%Y-%m-%dT%H:%M:%SZ' \
+    # Fixed input tests date formatting; SaBRe does not virtualize host wall time.
+    strict_compatibility_probe date /usr/bin/date -u --date=@946684800 +'%Y-%m-%dT%H:%M:%SZ' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cal /usr/bin/cal 1 2000 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2936,7 +2939,7 @@ if ((SABRE_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "SaBRe compatibility ratchet (151 programs)" \
+        run_check "SaBRe compatibility ratchet (159 programs)" \
             run_sabre_compatibility_envelope
     fi
     print_summary
