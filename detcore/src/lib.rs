@@ -1390,7 +1390,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#767): close_range closes a whole descriptor
+            // TODO-HUMAN-REVIEW(#780): close_range closes a whole descriptor
             // range; it is untyped (Syscall::Other) in the pinned Reverie, so
             // dispatch on the Sysno before the typed match below.
             SyscallClassification::Determinized if call.number() == Sysno::close_range => {
