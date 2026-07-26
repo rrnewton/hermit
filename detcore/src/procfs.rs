@@ -20,6 +20,11 @@ enum ProcfsKind {
     Cpuinfo,
     Loadavg,
     Uptime,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-761): system-wide memory/scheduler counters.
+    Meminfo,
+    SystemStat,
+    Vmstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -39,6 +44,11 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-761)
+            "/proc/meminfo" => ProcfsKind::Meminfo,
+            "/proc/stat" => ProcfsKind::SystemStat,
+            "/proc/vmstat" => ProcfsKind::Vmstat,
             _ => return None,
         };
         Some(Self {
@@ -68,6 +78,11 @@ impl ProcfsFile {
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-761)
+            ProcfsKind::Meminfo => sanitize_meminfo(&contents),
+            ProcfsKind::SystemStat => sanitize_system_stat(&contents),
+            ProcfsKind::Vmstat => sanitize_vmstat(&contents),
         });
         self.offset = 0;
     }
@@ -214,6 +229,80 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-761)
+/// Zeroes every run of decimal digits that follows the first whitespace on each
+/// line, preserving the leading label token and all surrounding formatting
+/// (whitespace, unit suffixes such as `kB`). A line whose leading token matches
+/// `keep_labels` is emitted verbatim so stable host-configuration values (for
+/// example total memory) survive. This yields a snapshot that is identical
+/// across two otherwise-identical runs regardless of the live counter values,
+/// matching the "zero the volatile counters" approach used by `sanitize_stat`.
+fn zero_line_counters(contents: &[u8], keep_labels: &[&[u8]]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+
+        match body.iter().position(|byte| byte.is_ascii_whitespace()) {
+            // A line with no value (or an empty line) carries no counter.
+            None => normalized.extend_from_slice(body),
+            Some(split) => {
+                let label = &body[..split];
+                if keep_labels.contains(&label) {
+                    normalized.extend_from_slice(body);
+                } else {
+                    normalized.extend_from_slice(label);
+                    let mut in_digits = false;
+                    for &byte in &body[split..] {
+                        if byte.is_ascii_digit() {
+                            if !in_digits {
+                                normalized.push(b'0');
+                                in_digits = true;
+                            }
+                        } else {
+                            normalized.push(byte);
+                            in_digits = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-761)
+/// Normalizes `/proc/meminfo`. Total memory and swap are stable host
+/// configuration and are preserved; every other counter (free, cached,
+/// available, dirty, ...) is volatile between runs and is zeroed.
+fn sanitize_meminfo(contents: &[u8]) -> Vec<u8> {
+    const STABLE_FIELDS: &[&[u8]] = &[b"MemTotal:", b"SwapTotal:"];
+    zero_line_counters(contents, STABLE_FIELDS)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-761)
+/// Normalizes system-wide `/proc/stat`. All per-line counters (CPU jiffies,
+/// interrupts, context switches, boot time, running/blocked process counts) are
+/// volatile between runs; each line keeps its leading label and zeroes the rest.
+fn sanitize_system_stat(contents: &[u8]) -> Vec<u8> {
+    zero_line_counters(contents, &[])
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-761)
+/// Normalizes `/proc/vmstat`, whose every `key value` pair is a volatile
+/// kernel counter; the value is zeroed while the key is preserved.
+fn sanitize_vmstat(contents: &[u8]) -> Vec<u8> {
+    zero_line_counters(contents, &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +339,51 @@ mod tests {
                 .kind,
             ProcfsKind::Uptime
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Meminfo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/stat")).unwrap().kind,
+            ProcfsKind::SystemStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Vmstat
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+    }
+
+    #[test]
+    fn meminfo_zeroes_volatile_counters_but_keeps_totals() {
+        let input = b"MemTotal:       791462432 kB\nMemFree:        36900584 kB\nMemAvailable:   461321680 kB\nBuffers:            5308 kB\nSwapTotal:      136218616 kB\nSwapFree:       61380512 kB\nHugePages_Total:       0\n";
+        assert_eq!(
+            sanitize_meminfo(input),
+            b"MemTotal:       791462432 kB\nMemFree:        0 kB\nMemAvailable:   0 kB\nBuffers:            0 kB\nSwapTotal:      136218616 kB\nSwapFree:       0 kB\nHugePages_Total:       0\n"
+        );
+    }
+
+    #[test]
+    fn system_stat_zeroes_all_counters_but_keeps_labels() {
+        let input =
+            b"cpu  123 45 678 9012 34 0 56 0 0 0\ncpu0 12 3 45 678 9 0 1 0 0 0\nctxt 987654\nbtime 1719000000\nprocs_running 3\nprocs_blocked 1\n";
+        assert_eq!(
+            sanitize_system_stat(input),
+            b"cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nctxt 0\nbtime 0\nprocs_running 0\nprocs_blocked 0\n"
+        );
+    }
+
+    #[test]
+    fn vmstat_zeroes_every_counter_value() {
+        let input = b"nr_free_pages 9225146\nnr_zone_inactive_anon 68842549\npgfault 123456789\n";
+        assert_eq!(
+            sanitize_vmstat(input),
+            b"nr_free_pages 0\nnr_zone_inactive_anon 0\npgfault 0\n"
+        );
     }
 
     #[test]
