@@ -93,6 +93,13 @@ jobs:
       continue-on-error: true
       timeout-minutes: 5
       run: cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#736): Review bounded hosted-only routing for DBI failed-exec stalls.
+    - name: DBI failed-exec recovery diagnostic (nonblocking)
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      timeout-minutes: 3
+      run: cargo test -p hermit --test cli run_dbi_recovers_after_failed_exec -- --exact --test-threads=1
     - name: Upload nextest JUnit report
       if: always()
       uses: actions/upload-artifact@v4
