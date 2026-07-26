@@ -1041,4 +1041,51 @@ mod tests {
             assert!(!requires_native_lifecycle(sysnum));
         }
     }
+
+    #[test]
+    fn native_thread_init_uses_the_expanded_success_returning_abi() {
+        unsafe extern "C" fn invoke_syscall(
+            _context: usize,
+            _sysnum: i64,
+            _args: *const u64,
+        ) -> i64 {
+            0
+        }
+        unsafe extern "C" fn read_registers(
+            _context: usize,
+            _registers: *mut libc::user_regs_struct,
+        ) -> i32 {
+            0
+        }
+
+        let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
+        let status = unsafe {
+            reverie_dbi_runtime_thread_init(
+                scratch.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+                7,
+                7,
+                99,
+                1,
+                invoke_syscall,
+                read_registers,
+            )
+        };
+
+        assert_eq!(status, 0);
+        let scratch = unsafe { scratch.assume_init() };
+        assert_eq!(scratch.branches, 99);
+        assert_eq!(scratch.observed_syscalls, 0);
+        assert_eq!(scratch.rewritten_syscalls, 0);
+        assert!(scratch.runtime_state.is_null());
+        assert_eq!(scratch.pending_thread_clone, 0);
+        assert_eq!(scratch.thread_clone_flags, 0);
+        assert_eq!(scratch.thread_clone_ctid, 0);
+        assert_eq!(scratch.pending_thread_start, 0);
+        assert_eq!(scratch.virtual_pid, 0);
+        assert_eq!(scratch.virtual_ppid, 0);
+        assert_eq!(scratch.virtual_tid, 0);
+        assert_eq!(scratch.pending_virtual_child, 0);
+        assert_eq!(scratch.pending_clone_flags, 0);
+    }
 }
