@@ -964,7 +964,7 @@ pub struct ThreadState<T> {
     /// followed by `getpriority` on the caller's own process reads back
     /// consistently (e.g. `renice -p $$`). See `handle_getpriority`/
     /// `handle_setpriority` in `syscalls/misc.rs`.
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#809)
     #[serde(default)]
     pub(crate) nice: i32,
 }

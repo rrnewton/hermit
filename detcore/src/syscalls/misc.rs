@@ -238,7 +238,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#809)
     /// A `(which, who)` pair that targets the caller's own process, either via the
     /// `who == 0` "current process" sentinel or by naming the caller's own
     /// virtualized pid. `renice -p $$` reads and writes its own priority through
@@ -250,7 +250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#809)
     /// Report the deterministic nice value for the caller's own process. Accept
     /// both the `who == 0` sentinel and the caller naming its own pid explicitly
     /// (e.g. `renice -p $$`, which reads back its own priority after setting it);
@@ -271,7 +271,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#809)
     /// Accept a nice change that targets the caller's own process without changing
     /// host scheduling. The nice level has no effect on Detcore's deterministic
     /// scheduler, but the requested value is recorded so a subsequent
