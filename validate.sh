@@ -113,7 +113,7 @@ while [[ $# -gt 0 ]]; do
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
-        # TODO-HUMAN-REVIEW(#730): Review the full cross-backend compatibility matrix CLI.
+        # TODO-HUMAN-REVIEW(#732): Review the full cross-backend compatibility matrix CLI.
         --full-backend-matrix) FULL_BACKEND_MATRIX=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
@@ -776,7 +776,7 @@ function liteinst_backend_available {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#730): Review the release-binary backend smoke used by the
+# TODO-HUMAN-REVIEW(#732): Review the release-binary backend smoke used by the
 # full backend matrix. Probes the release hermit ($STRICT_COMPAT_HERMIT_BIN)
 # rather than the debug $HERMIT_BIN, and allows a longer timeout because the DBI
 # backend compiles its native client on the first run.
@@ -2187,7 +2187,7 @@ function run_sabre_compatibility_envelope {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#730): Review full-corpus KVM/DBI compatibility measurement.
+# TODO-HUMAN-REVIEW(#732): Review full-corpus KVM/DBI compatibility measurement.
 # Run the identical strict L2 corpus under the KVM backend as a non-blocking
 # measurement. The corpus reporting path returns 0 for this mode; the observed
 # per-program cells feed the cross-backend COMPAT SUMMARY matrix.
@@ -2201,7 +2201,7 @@ function run_kvm_compatibility_envelope {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#730): Review full-corpus KVM/DBI compatibility measurement.
+# TODO-HUMAN-REVIEW(#732): Review full-corpus KVM/DBI compatibility measurement.
 # Run the identical strict L2 corpus under the DBI backend as a non-blocking
 # measurement (see run_kvm_compatibility_envelope).
 function run_dbi_compatibility_envelope {
@@ -3006,7 +3006,7 @@ if ((RR_COMPAT_ONLY == 1)); then
 fi
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(#730): Review the full cross-backend compatibility matrix.
+# TODO-HUMAN-REVIEW(#732): Review the full cross-backend compatibility matrix.
 # Run the complete strict L2 corpus under ptrace (authoritative), then under KVM
 # and DBI as non-blocking measurements, and print the per-backend COMPAT SUMMARY
 # matrix. Unlike the default `full` profile -- which only spot-checks four
