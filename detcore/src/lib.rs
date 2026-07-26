@@ -1456,6 +1456,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#781)
+                Syscall::Readv(s) => self.handle_readv(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)

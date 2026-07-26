@@ -329,6 +329,104 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    /// SYS_readv system call.
+    ///
+    /// `readv` is the vectored form of `read`; only the scalar `read`/`pread64`
+    /// siblings were determinized, so a program issuing a scatter read aborted
+    /// under `--strict` on every backend (readv was classified Unsupported).
+    /// Route it through the same deterministic machinery as `read`/`writev`. A
+    /// single injected `readv` preserves regular-file offset atomicity and
+    /// datagram-socket message boundaries; socket and pipe endpoints take the
+    /// deterministic nonblocking-poll path. RNG descriptors are filled from
+    /// Detcore's per-thread deterministic byte stream rather than live host
+    /// entropy.
+    ///
+    /// A `readv` on a procfs descriptor bypasses the identity/procfs snapshot
+    /// applied to scalar `read`; standard libraries read procfs with `read`, so
+    /// this is deferred (see TODO-HUMAN-REVIEW) rather than duplicated here.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#781): Deterministic vectored read; procfs-via-readv deferred.
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        if call.len() == 0 {
+            // An empty iovec array only serves to detect argument errors.
+            let res = guest.inject(Syscall::from(call)).await?;
+            return Ok(res);
+        }
+
+        let (fd_type, resource) = guest
+            .thread_state_mut()
+            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = match fd_type {
+            FdType::Rng => {
+                trace!("Readv call RNG fd {}, simulating...", call.fd());
+                let res = self.fill_random_iovecs(guest, call);
+                resource_release_all(guest).await;
+                return res;
+            }
+            FdType::Signalfd
+            | FdType::Eventfd
+            | FdType::Timerfd
+            | FdType::Inotify
+            | FdType::Socket
+            | FdType::Pipe => {
+                trace!(
+                    "Possibly blocking readv call on fd {}, type {:?}",
+                    call.fd(),
+                    fd_type
+                );
+                self.execute_nonblockable_fd_syscall(guest, call).await
+            }
+            FdType::Regular
+            | FdType::Memfd
+            | FdType::Pidfd
+            | FdType::Userfaultfd
+            | FdType::Epoll => Ok(self.record_or_replay(guest, call).await?),
+        };
+        resource_release_all(guest).await;
+        res
+    }
+
+    /// Fill a `readv` on an RNG descriptor from the deterministic per-thread
+    /// stream, iovec by iovec, so `/dev/[u]random` scatter reads reproduce
+    /// bitwise across runs like their scalar `read` counterpart.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#781): Deterministic RNG fill for vectored reads.
+    fn fill_random_iovecs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let iov_addr = call.iov().ok_or(Errno::EFAULT)?;
+        let mut raw_iovecs = vec![
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            };
+            call.len()
+        ];
+        guest.memory().read_values(iov_addr, &mut raw_iovecs)?;
+
+        let mut total: usize = 0;
+        for iovec in &raw_iovecs {
+            if iovec.iov_len == 0 {
+                continue;
+            }
+            let buf = AddrMut::<u8>::from_raw(iovec.iov_base as usize).ok_or(Errno::EFAULT)?;
+            total += self.fill_random_bytes(guest, buf, iovec.iov_len, "/dev/[u]random")?;
+        }
+        Ok(total as i64)
+    }
+
     /// SYS_pread64 system call.
     pub async fn handle_pread64<G: Guest<Self>>(
         &self,

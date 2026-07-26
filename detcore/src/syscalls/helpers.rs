@@ -842,6 +842,24 @@ impl NonblockableSyscall for reverie::syscalls::Read {
     }
 }
 
+/// Vectored reads have the same blocking behavior as scalar reads on pipes and
+/// sockets.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#781)
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Readv {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
 /// While the read syscall is quite general, this nonblocking capacity is used
 /// ONLY for sockets and pipes.
 #[async_trait]
