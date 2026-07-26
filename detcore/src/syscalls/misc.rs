@@ -58,6 +58,21 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // "keep process capabilities failed: Function not implemented".
             | libc::PR_SET_KEEPCAPS
             | libc::PR_GET_KEEPCAPS
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#819)
+            //
+            // PR_{SET,GET}_NO_NEW_PRIVS only read/toggle the calling thread's
+            // write-once "no_new_privs" bit, which forbids privilege escalation
+            // (setuid/setgid/file capabilities) on a later execve. The bit is a
+            // pure function of the guest's own prior prctl calls (0/1), never
+            // host state, so passthrough is deterministic and bitwise-identical
+            // across runs. The real kernel still enforces the arg2==1 /
+            // arg3..arg5==0 validation identically each run. Supporting it lets
+            // modern `setpriv --no-new-privs` (and privilege-drop wrappers that
+            // set it before exec) run under --strict instead of aborting with
+            // "disallow granting new privileges failed: Function not implemented".
+            | libc::PR_SET_NO_NEW_PRIVS
+            | libc::PR_GET_NO_NEW_PRIVS
     )
 }
 
@@ -571,11 +586,16 @@ mod tests {
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,
+            // Deterministic per-thread no-new-privileges bit used by setpriv.
+            libc::PR_SET_NO_NEW_PRIVS,
+            libc::PR_GET_NO_NEW_PRIVS,
         ] {
             assert!(is_supported_prctl_option(option));
         }
 
-        assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
+        // An unmodeled prctl option must still fault with ENOSYS rather than
+        // silently passing through host/process state.
+        assert!(!is_supported_prctl_option(libc::PR_SET_CHILD_SUBREAPER));
     }
 
     #[test]
