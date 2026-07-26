@@ -49,7 +49,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clone3
         | Sysno::close
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#batch18): close_range has a Detcore handler that
+        // TODO-HUMAN-REVIEW(#777): close_range has a Detcore handler that
         // injects the real syscall and syncs the Detcore fd table.
         | Sysno::close_range
         | Sysno::connect
@@ -63,7 +63,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::epoll_ctl_old
         | Sysno::epoll_pwait
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#batch18): epoll_pwait2 is handled like epoll_pwait
+        // TODO-HUMAN-REVIEW(#777): epoll_pwait2 is handled like epoll_pwait
         // (untyped in the pinned Reverie, dispatched via Syscall::Other).
         | Sysno::epoll_pwait2
         | Sysno::epoll_wait
@@ -459,7 +459,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#batch18): flock is an advisory whole-file lock with no
+        // TODO-HUMAN-REVIEW(#777): flock is an advisory whole-file lock with no
         // data/time/identity/host-entropy input; for the sequentialized single guest
         // it is a deterministic pass-through.
         | Sysno::flock

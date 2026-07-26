@@ -1390,7 +1390,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#batch18): epoll_pwait2 is epoll_pwait with a
+            // TODO-HUMAN-REVIEW(#777): epoll_pwait2 is epoll_pwait with a
             // struct timespec timeout instead of an int-millisecond one; the
             // kernel enforces the timeout. It is untyped (Syscall::Other) in the
             // pinned Reverie, so dispatch on the Sysno and handle it exactly like
@@ -1399,7 +1399,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_epoll_pwait2(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#batch18): close_range closes every fd in an
+            // TODO-HUMAN-REVIEW(#777): close_range closes every fd in an
             // inclusive range. It is untyped (Syscall::Other) in the pinned
             // Reverie, so dispatch on the Sysno; the handler injects the real
             // syscall and then syncs Detcore's per-thread fd table.

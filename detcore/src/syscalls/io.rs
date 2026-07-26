@@ -632,7 +632,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// raw `Syscall::Other` and is handled exactly like [`Self::handle_epoll_pwait`]
     /// (an empty resource request followed by record/replay of the raw call).
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#batch18)
+    // TODO-HUMAN-REVIEW(#777)
     pub async fn handle_epoll_pwait2<G: Guest<Self>>(
         &self,
         guest: &mut G,

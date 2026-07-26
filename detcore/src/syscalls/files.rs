@@ -205,7 +205,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// flag (it does not close the fds), so the fd table is left untouched in
     /// that case.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#batch18)
+    // TODO-HUMAN-REVIEW(#777)
     pub async fn handle_close_range<G: Guest<Self>>(
         &self,
         guest: &mut G,
