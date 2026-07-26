@@ -1,0 +1,19 @@
+[package]
+name = "detcore-sabre"
+version = "0.0.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+detcore = { version = "0.0.0", path = "../detcore" }
+libc = "0.2.186"
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+reverie-memory = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+reverie-rpc-transport = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+reverie-sabre = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+reverie-syscalls = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+syscalls = { version = "0.6.7", features = ["serde"] }
