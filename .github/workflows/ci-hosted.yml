@@ -2,6 +2,7 @@ name: CI (GitHub-hosted)
 
 on:
   push:
+    branches: ["main"]
   # Keep stacked pull requests covered before they are retargeted to main.
   pull_request:
   workflow_dispatch:
