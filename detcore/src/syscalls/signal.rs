@@ -309,7 +309,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#812)
     /// Send a thread-directed signal through the older two-argument `tkill`.
     /// Like its `tgkill` sibling, the target thread is addressed by a guest TID
     /// that is stable in the fresh PID namespace and delivery is
@@ -323,7 +323,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#812)
     /// Queue a thread-directed signal with an accompanying `siginfo_t`. Like
     /// `tgkill`, the target is a specific thread named by stable guest TGID/TID
     /// and delivery is scheduler-serialized; the guest-supplied siginfo is
@@ -337,7 +337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(#812)
     /// Queue a process-directed signal with an accompanying `siginfo_t`. Mirrors
     /// `handle_kill`: a signal-zero existence check forwards unchanged, and an
     /// unambiguous positive-PID target is routed to its sole live thread via

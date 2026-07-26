@@ -193,7 +193,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-PENDING): signal-sending siblings of the already
+        // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
         // Determinized kill/tgkill. tkill is the two-argument thread-directed
         // predecessor of tgkill; rt_sigqueueinfo/rt_tgsigqueueinfo are the
         // data-carrying sigqueue forms. Signal generation/delivery is
