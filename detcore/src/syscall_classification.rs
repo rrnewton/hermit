@@ -119,6 +119,20 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
         | Sysno::pwrite64
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#792): Scatter/gather I/O. readv/preadv/preadv2/
+        // pwritev/pwritev2 are the vectored forms of read/pread64/pwrite64 and
+        // writev (which are already determinized). They carry no host-varying or
+        // host-global state beyond the file content the scalar forms already
+        // handle, so they are determinized the same way: open-file resource
+        // ordering plus record/replay of the single kernel operation (readv adds
+        // the nonblocking-fd scheduler integration used by read/writev). Handled
+        // by the typed match in lib.rs.
+        | Sysno::readv
+        | Sysno::preadv
+        | Sysno::preadv2
+        | Sysno::pwritev
+        | Sysno::pwritev2
         | Sysno::read
         | Sysno::recvfrom
         | Sysno::recvmsg
@@ -520,15 +534,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
-        | Sysno::preadv
-        | Sysno::preadv2
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
         | Sysno::ptrace
-        | Sysno::pwritev
-        | Sysno::pwritev2
-        | Sysno::readv
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
         | Sysno::request_key
@@ -728,7 +737,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [201, 91, 81]);
+        assert_eq!(counts, [206, 91, 76]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -792,6 +801,11 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+            Sysno::readv,
+            Sysno::preadv,
+            Sysno::preadv2,
+            Sysno::pwritev,
+            Sysno::pwritev2,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
