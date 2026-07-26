@@ -202,10 +202,17 @@ def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] |
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGTERM)
         try:
-            process.communicate(timeout=2)
+            stdout, stderr = process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            stdout, stderr = process.communicate()
+        if stdout:
+            print("timed-out guest stdout:", file=sys.stderr)
+            sys.stderr.buffer.write(stdout[-8192:])
+        if stderr:
+            print("timed-out hermit stderr:", file=sys.stderr)
+            sys.stderr.buffer.write(stderr[-8192:])
+        sys.stderr.flush()
         return None
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
