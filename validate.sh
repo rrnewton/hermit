@@ -1404,7 +1404,7 @@ function run_liteinst_compatibility_envelope {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(PR-pending): Review SaBRe compatibility process-group teardown.
+# TODO-HUMAN-REVIEW(PR-808): Review SaBRe compatibility process-group teardown.
 function terminate_sabre_compatibility_group {
     local pid=$1
     local grace_deadline
