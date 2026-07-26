@@ -342,7 +342,27 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
-        | Sysno::sched_getattr => SyscallClassification::Determinized,
+        | Sysno::sched_getattr
+        // ===== BATCH 106: deterministic EOPNOTSUPP for name_to_handle_at =====
+        // name_to_handle_at previously fail-closed --strict, aborting real
+        // programs such as `systemctl status`, `systemctl list-units`, and
+        // `networkctl list`, which call it on /proc/1/root and / to obtain a
+        // file handle and mount ID. Both outputs are inherently host state: the
+        // opaque handle bytes are filesystem-internal (inode/generation based)
+        // and the mount ID comes from the host mount table's ordering, so
+        // forwarding the call (the legacy pass-through) is nondeterministic
+        // across hosts, runs, and record/replay. Detcore refuses it with a fixed
+        // EOPNOTSUPP: exactly the errno the kernel returns for a filesystem that
+        // does not support decoding a pathname into a file handle. That is a
+        // documented, well-trodden outcome every correct caller must handle, so
+        // glibc and systemd fall back (to /proc/self/mountinfo and fdinfo) and
+        // proceed. The result is never forwarded to the host and is bitwise-
+        // identical across --verify and record/replay. Its decoding sibling
+        // open_by_handle_at is already refused (with EPERM) under #724. Handled
+        // by Sysno in lib.rs before the typed match below.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-NNN)
+        | Sysno::name_to_handle_at => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -539,7 +559,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::map_shadow_stack
         | Sysno::memfd_secret
         | Sysno::mincore
-        | Sysno::name_to_handle_at
         | Sysno::openat2
         | Sysno::perf_event_open
         | Sysno::pidfd_getfd
@@ -750,7 +769,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [206, 91, 76]);
+        assert_eq!(counts, [207, 91, 75]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -814,6 +833,13 @@ mod tests {
         for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
+        // BATCH 106: name_to_handle_at previously fail-closed --strict; it is
+        // now determinized (refused with a fixed EOPNOTSUPP in lib.rs) so the
+        // systemd/networkctl toolchain can run under --strict.
+        assert_eq!(
+            classify_syscall(Sysno::name_to_handle_at),
+            SyscallClassification::Determinized
+        );
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
         assert_eq!(

@@ -1411,6 +1411,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-NNN): Deterministic EOPNOTSUPP for
+            // name_to_handle_at. It returns a filesystem-internal opaque handle
+            // plus a mount ID from the host mount table; both are host state, so
+            // forwarding it (the legacy pass-through) is nondeterministic across
+            // hosts, runs, and record/replay, and it fail-closed real programs
+            // (systemctl status/list-units, networkctl list) under --strict.
+            // EOPNOTSUPP is exactly the errno the kernel returns for a
+            // filesystem that cannot decode a pathname into a file handle: a
+            // documented outcome every correct caller must handle, so glibc and
+            // systemd fall back (to /proc/self/mountinfo and fdinfo) and
+            // proceed. Never forwarded to the host; identical across --verify and
+            // record/replay. Its decoding sibling open_by_handle_at is already
+            // refused with EPERM (#724). Dispatched by Sysno because the pinned
+            // Reverie's typed variant is not needed for a fixed-errno refusal.
+            SyscallClassification::Determinized if call.number() == Sysno::name_to_handle_at => {
+                Err(Error::Errno(Errno::EOPNOTSUPP))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
             // in the pinned Reverie revision. It is epoll_pwait with a
             // `struct timespec *` timeout; recent glibc routes epoll_wait/
