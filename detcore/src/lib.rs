@@ -1613,6 +1613,31 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
+                // Advisory file locks, I/O-priority hints, and the extended
+                // sched_attr interface. Detcore serializes guest threads under
+                // one deterministic scheduler, so advisory whole-file locks and
+                // I/O-priority hints are inoperative and modeled as fixed
+                // no-ops (mirrors SchedSetscheduler/Fadvise64). The extended
+                // sched_getattr/sched_setattr interface is deliberately not
+                // provided (deterministic ENOSYS): guests fall back to the
+                // classic sched_{get,set}scheduler/param calls above, which
+                // return the fixed SCHED_OTHER default (verified with chrt).
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#764)
+                Syscall::Flock(_) => Ok(0),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#764)
+                Syscall::IoprioGet(_) => Ok(0),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#764)
+                Syscall::IoprioSet(_) => Ok(0),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#764)
+                Syscall::SchedGetattr(_) => Err(Error::Errno(Errno::ENOSYS)),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#764)
+                Syscall::SchedSetattr(_) => Err(Error::Errno(Errno::ENOSYS)),
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,

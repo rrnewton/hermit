@@ -240,6 +240,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#764): Advisory file locks, I/O-priority hints, and
+        // the extended sched_attr scheduling interface. Detcore serializes guest
+        // threads under one deterministic scheduler, so advisory whole-file locks
+        // (flock) and I/O-priority hints (ioprio_get/ioprio_set) are inoperative
+        // and modeled as fixed, host-independent no-ops. The extended
+        // sched_getattr/sched_setattr interface is deliberately not provided
+        // (deterministic ENOSYS); guests fall back to the classic
+        // sched_{get,set}scheduler / sched_{get,set}param interface already
+        // determinized above (verified with util-linux chrt). See lib.rs.
+        | Sysno::flock
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
+        | Sysno::sched_getattr
+        | Sysno::sched_setattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
         // reconfigure mount and other namespaces, resolve files by kernel
@@ -484,15 +499,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::epoll_pwait2
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -526,8 +538,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
@@ -720,7 +730,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [204, 91, 78]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -918,6 +928,19 @@ mod tests {
         for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
+        }
+        // Batch: advisory file locks, I/O-priority hints, and the extended
+        // sched_attr scheduling interface are determinized (flock/ioprio_* to
+        // fixed no-ops; sched_{get,set}attr to a deterministic ENOSYS). These
+        // unblock flock, ionice, and chrt under fail-closed --strict.
+        for sysno in [
+            Sysno::flock,
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
+            Sysno::sched_getattr,
+            Sysno::sched_setattr,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
     }
 
