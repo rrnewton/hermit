@@ -319,6 +319,7 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [top]="live process-table reads differ on the GitHub-hosted runner"
     [javac]="heavyweight JIT diverges under ptrace on the no-PMU GitHub-hosted runner"
+    [java]="flaky on the no-PMU GitHub-hosted runner (exit 124 timeout / intermittent)"
     [node]="heavyweight JIT diverges under ptrace on the no-PMU GitHub-hosted runner"
 )
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
