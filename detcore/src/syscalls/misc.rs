@@ -42,7 +42,21 @@ const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
-        libc::PR_SET_NAME | libc::PR_GET_NAME | libc::PR_SET_THP_DISABLE | libc::PR_GET_THP_DISABLE
+        libc::PR_SET_NAME
+            | libc::PR_GET_NAME
+            | libc::PR_SET_THP_DISABLE
+            | libc::PR_GET_THP_DISABLE
+            // BATCH 78: the "keep capabilities across a UID change" flag is a
+            // per-thread boolean that needs no privilege and consults no host
+            // nondeterministic state. Setting/getting it round-trips through the
+            // guest thread deterministically, so it is safe to pass through
+            // instead of returning ENOSYS. Re-enables `capsh --keep=1` and
+            // removes the first fail-closed blocker for `setpriv`/Meta's date
+            // wrapper (which then also need setresuid, still Unsupported).
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#797)
+            | libc::PR_SET_KEEPCAPS
+            | libc::PR_GET_KEEPCAPS
     )
 }
 
@@ -512,6 +526,9 @@ mod tests {
             libc::PR_GET_NAME,
             libc::PR_SET_THP_DISABLE,
             libc::PR_GET_THP_DISABLE,
+            // BATCH 78: keep-capabilities flag, needed by setpriv.
+            libc::PR_SET_KEEPCAPS,
+            libc::PR_GET_KEEPCAPS,
         ] {
             assert!(is_supported_prctl_option(option));
         }

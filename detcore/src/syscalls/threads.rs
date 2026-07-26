@@ -995,6 +995,70 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(0)
     }
+
+    /// ioprio_get under Hermit. The read sibling of `handle_ioprio_set`: Detcore
+    /// serializes guest threads onto one virtual CPU, so the block-layer I/O
+    /// scheduling class/priority is inert. Report a fixed, host-independent
+    /// best-effort priority (class IOPRIO_CLASS_BE, level 4) for the standard
+    /// query targets, so the value is identical across --verify runs and
+    /// record/replay. Re-enables `ionice -p` under --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#797)
+    pub async fn handle_ioprio_get<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::IoprioGet,
+    ) -> Result<i64, Error> {
+        // ioprio "who" selectors (uapi linux/ioprio.h). Mirror the kernel's
+        // rejection of an unknown class so callers see faithful EINVAL behavior.
+        const IOPRIO_WHO_PROCESS: i32 = 1;
+        const IOPRIO_WHO_PGRP: i32 = 2;
+        const IOPRIO_WHO_USER: i32 = 3;
+        // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4): the conventional default.
+        const IOPRIO_CLASS_BE: i64 = 2;
+        const IOPRIO_CLASS_SHIFT: i64 = 13;
+        const DEFAULT_IOPRIO: i64 = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4;
+        match call.which() {
+            IOPRIO_WHO_PROCESS | IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => {
+                info!(
+                    "Emulating ioprio_get(which={}, who={}): fixed best-effort priority 4",
+                    call.which(),
+                    call.who()
+                );
+                Ok(DEFAULT_IOPRIO)
+            }
+            _ => Err(Errno::EINVAL.into()),
+        }
+    }
+
+    /// sched_setattr under Hermit. The write sibling of `handle_sched_getattr`:
+    /// Detcore replaces the Linux scheduler with its own deterministic one, so a
+    /// thread's Linux scheduling attributes cannot change guest-visible
+    /// computation. Accept and suppress the request as a deterministic no-op
+    /// success, mirroring how `sched_setscheduler`/`sched_setparam` are handled.
+    /// Re-enables `chrt`'s attribute-setting policies (e.g. -d/deadline) under
+    /// --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#797)
+    pub async fn handle_sched_setattr<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::SchedSetattr,
+    ) -> Result<i64, Error> {
+        // `flags` is reserved and must be zero; the kernel rejects anything else.
+        if call.flags() != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        // A NULL attribute pointer is invalid, matching the kernel's EINVAL.
+        if call.attr().is_none() {
+            return Err(Errno::EINVAL.into());
+        }
+        info!(
+            "Suppressing sched_setattr(pid={}); Linux scheduling attributes are virtual",
+            call.pid()
+        );
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

@@ -1640,6 +1640,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
+                // ===== BATCH 78: read/write siblings of the BATCH 51 inert
+                // scheduling/priority syscalls above. Both are inert under
+                // Detcore's single-vCPU serialized scheduler, so they are
+                // emulated to fixed, host-independent results; re-enables
+                // `ionice -p` and `chrt`'s attribute-setting policies under --strict.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#797)
+                Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#797)
+                Syscall::SchedSetattr(s) => self.handle_sched_setattr(guest, s).await,
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
