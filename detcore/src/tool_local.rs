@@ -377,6 +377,51 @@ impl FileMetadata {
         self
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe post-exec descriptor reconstruction.
+    fn from_current_process_after_exec(pid: Pid, owner: DetTid) -> Self {
+        let mut metadata = Self::new(owner).setup_stdio(pid, owner);
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return metadata;
+        };
+        let fds = entries
+            .filter_map(|entry| {
+                entry
+                    .ok()?
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<RawFd>()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+
+        for fd in fds.into_iter().filter(|fd| *fd > 2) {
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if fd_flags == -1 || status_flags == -1 {
+                continue;
+            }
+            let Ok(raw_stat) = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }) else {
+                continue;
+            };
+            let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
+            let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
+                FdType::Pipe
+            } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+                FdType::Socket
+            } else {
+                FdType::Regular
+            };
+            let mut flags = OFlag::from_bits_truncate(status_flags);
+            if fd_flags & libc::FD_CLOEXEC != 0 {
+                flags.insert(OFlag::O_CLOEXEC);
+            }
+            let _ = metadata.add_fd(owner, fd, flags, ty, Some(raw_stat.into()));
+        }
+
+        metadata
+    }
+
     /// get detfd from rawfd, rawfd must be added or dup-ed first.
     fn with_detfd<F, U>(&mut self, fd: RawFd, mut f: F) -> Result<U, Errno>
     where
@@ -560,7 +605,24 @@ mod resource_limits_tests {
 
 #[cfg(test)]
 mod file_metadata_tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
+
+    #[test]
+    fn post_exec_reconstruction_discovers_live_descriptors() {
+        let owner = DetTid::from_raw(9);
+        let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+        let fd = file.as_raw_fd();
+        let mut metadata = FileMetadata::from_current_process_after_exec(Pid::this(), owner);
+
+        assert_eq!(
+            metadata
+                .with_detfd(fd, |detfd| detfd.ty())
+                .expect("live descriptor should be reconstructed"),
+            FdType::Regular
+        );
+    }
 
     #[test]
     fn fork_copies_slots_but_preserves_open_file_aliases() {
@@ -1025,6 +1087,13 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 impl<T> ThreadState<T> {
+    pub(crate) fn restore_file_metadata_after_exec(&mut self, pid: Pid) {
+        self.file_metadata = Arc::new(Mutex::new(FileMetadata::from_current_process_after_exec(
+            pid,
+            self.dettid,
+        )));
+    }
+
     pub(crate) fn account_process_cpu_time(&mut self) {
         let user = self.thread_logical_time.user_cpu_time();
         let system = self.thread_logical_time.system_cpu_time();

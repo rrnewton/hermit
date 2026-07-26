@@ -1135,7 +1135,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            create_child_thread(guest, new_dettid, 0, None).await;
+            let reconnected_after_exec = create_child_thread(guest, new_dettid, 0, None).await;
+            if reconnected_after_exec {
+                let pid = guest.pid();
+                guest
+                    .thread_state_mut()
+                    .restore_file_metadata_after_exec(pid.into());
+            }
         } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
