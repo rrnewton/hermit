@@ -358,7 +358,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the experimental LiteInst preload compatibility backend.
+    /// Use the LiteInst in-process backend with the Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -440,6 +440,34 @@ impl Backend {
     }
 }
 
+const SABRE_RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
+
+// TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+fn sabre_runtime_library_path() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    [
+        directory.join("libdetcore_sabre.so"),
+        directory.join("deps/libdetcore_sabre.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "libdetcore_sabre.so was not built beside {}",
+                executable.display()
+            ),
+        )
+    })
+}
+
 fn sabre_runtime_unavailable_reason() -> Option<String> {
     let variable = "HERMIT_SABRE_BINARY";
     let Some(value) = std::env::var_os(variable) else {
@@ -461,7 +489,7 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
             ));
         }
     }
-    detcore_sabre::runtime_library_path().err().map(|error| {
+    sabre_runtime_library_path().err().map(|error| {
         format!(
             "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
         )
@@ -502,7 +530,7 @@ async fn run_sabre(
 ) -> Result<Output, Error> {
     let sabre = std::env::var_os("HERMIT_SABRE_BINARY")
         .ok_or_else(|| anyhow!("HERMIT_SABRE_BINARY is not set"))?;
-    let plugin = detcore_sabre::runtime_library_path()
+    let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
     let program = command.find_program().map_err(|error| {
         anyhow!(
@@ -528,7 +556,7 @@ async fn run_sabre(
 
     command.prepend_args([plugin.as_os_str(), OsStr::new("--"), program.as_os_str()]);
     command.program(&sabre);
-    command.env(detcore_sabre::RPC_SOCKET_ENV, &socket_path);
+    command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
 
@@ -872,6 +900,14 @@ pub fn run_with_backend(
     )
 }
 
+// TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
+fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
+    matches!(
+        status,
+        ExitStatus::Exited(123..=126) | ExitStatus::Signaled(_, _)
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
     command: Command,
@@ -904,6 +940,20 @@ async fn run_with_backend_inner(
         )
         .await?
         .status);
+    }
+    if backend == Backend::Liteinst {
+        let preload = liteinst_runtime_library_path()?;
+        let (exit_status, global_state) = reverie_liteinst::LiteinstBackend::run_with_preload::<
+            Detcore,
+        >(command, config, preload)
+        .await?;
+        if liteinst_requires_forced_shutdown(exit_status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
 
@@ -987,6 +1037,27 @@ async fn run_with_output_backend_inner(
             true,
         )
         .await;
+    }
+    if backend == Backend::Liteinst {
+        command.stdin(Stdio::null());
+        let preload = liteinst_runtime_library_path()?;
+        let (output, global_state) =
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+                command, config, preload,
+            )
+            .await?;
+        let status = output.status.into();
+        if liteinst_requires_forced_shutdown(status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(Output {
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
     ensure_backend_dispatch(backend)?;
 
