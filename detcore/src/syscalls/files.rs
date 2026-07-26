@@ -1321,6 +1321,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#818)
+    /// Half-close an already tracked socket. `shutdown(2)` only changes the
+    /// direction(s) in which a socket may transfer data and returns 0 or an
+    /// errno with no nondeterministic payload, so it is handled exactly like its
+    /// socket-family siblings (listen/setsockopt): forward through
+    /// record_or_replay, which passes through in normal run mode and captures the
+    /// result at the record/replay boundary.
+    pub async fn handle_shutdown<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Shutdown,
+    ) -> Result<i64, Error> {
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Return the local address of a tracked socket.
     pub async fn handle_getsockname<G: Guest<Self>>(

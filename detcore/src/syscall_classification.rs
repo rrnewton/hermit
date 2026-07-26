@@ -203,6 +203,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#818): shutdown(2) is the last socket-family member
+        // left Unsupported while every sibling (socket/socketpair/connect/bind/
+        // listen/accept/send*/recv*/getsockopt/setsockopt/getsockname) is already
+        // Determinized. It only half-closes an already-tracked socket fd and
+        // returns 0 or an errno with no nondeterministic payload, so it is routed
+        // through the same record_or_replay path as listen/setsockopt.
+        | Sysno::shutdown
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
         // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
         // deterministic by construction and matches the modern kernel's own return,
@@ -587,7 +595,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
@@ -757,7 +764,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [210, 91, 72]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -848,6 +855,9 @@ mod tests {
             Sysno::process_madvise,
             Sysno::setrlimit,
             Sysno::setsockopt,
+            // shutdown is the socket-family sibling of the above; it half-closes
+            // a tracked socket and must stay Determinized (regression for #818).
+            Sysno::shutdown,
             Sysno::tgkill,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
