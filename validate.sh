@@ -2392,7 +2392,7 @@ function run_e9patch_extended_compatibility_envelope {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(PR-pending): Review the focused SaBRe artifact contract.
+# TODO-HUMAN-REVIEW(PR-799): Review the focused SaBRe artifact contract.
 function require_sabre_artifacts {
     local binary=${HERMIT_SABRE_BINARY:-}
     if [[ -z $binary || ! -f $binary || ! -x $binary ]]; then
