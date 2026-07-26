@@ -448,6 +448,7 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+// TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
 fn resolve_sabre_binary_from(
     override_path: Option<&OsStr>,
     executable: &Path,
