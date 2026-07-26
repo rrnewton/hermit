@@ -1353,7 +1353,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#727): Deterministic EPERM for privileged
+            // TODO-HUMAN-REVIEW(#728): Deterministic EPERM for privileged
             // cross-process introspection, control, and kernel-tracing syscalls
             // (ptrace, process_vm_readv/writev, kcmp, bpf, perf_event_open).
             // Detcore does not model these; forwarding them admits host-specific,
@@ -1388,7 +1388,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS for optional kernel
+            // TODO-HUMAN-REVIEW(#728): Deterministic ENOSYS for optional kernel
             // subsystems Detcore does not provide (kernel keyring, Landlock, the
             // LSM self-attribute interface, secret memory, page-cache statistics,
             // and CET shadow-stack mapping). These already return -ENOSYS wherever

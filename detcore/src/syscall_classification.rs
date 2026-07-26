@@ -217,7 +217,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl
         | Sysno::quotactl_fd
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#727): Deterministic EPERM for privileged cross-process
+        // TODO-HUMAN-REVIEW(#728): Deterministic EPERM for privileged cross-process
         // introspection, control, and kernel-tracing syscalls that Detcore does not
         // model (ptrace of another task, reading/writing another task's memory,
         // comparing kernel objects across tasks, loading BPF programs, and opening
@@ -235,7 +235,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::perf_event_open
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS for optional kernel
+        // TODO-HUMAN-REVIEW(#728): Deterministic ENOSYS for optional kernel
         // subsystems Detcore does not provide, refused as if the running kernel
         // lacks the feature: the kernel keyring (add_key/request_key/keyctl), the
         // Landlock and LSM self-attribute interfaces, secret memory, page-cache
@@ -688,7 +688,7 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#727): Deterministic EPERM refusal set.
+// TODO-HUMAN-REVIEW(#728): Deterministic EPERM refusal set.
 /// Privileged cross-process introspection, control, and kernel-tracing syscalls
 /// that Detcore does not model: tracing another task (`ptrace`), reading or
 /// writing another task's address space (`process_vm_readv`/`process_vm_writev`),
@@ -754,7 +754,7 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#728): Deterministic ENOSYS refusal set.
 /// Optional kernel subsystems Detcore does not provide, refused as if the running
 /// kernel lacks the feature: the kernel keyring (`add_key`/`request_key`/
 /// `keyctl`), the Landlock sandbox interface, the LSM self-attribute interface,
