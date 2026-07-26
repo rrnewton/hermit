@@ -102,6 +102,16 @@ pub fn unavailable_reason() -> Option<String> {
         .map(|error| error.to_string())
 }
 
+/// Resolve the configured e9patch tool aliases to absolute paths.
+// TODO-HUMAN-REVIEW(PR-711): Review the public namespace tool-mount API.
+pub fn tool_paths() -> Result<(PathBuf, PathBuf), Error> {
+    let e9tool = std::path::absolute(resolve_e9tool()?)
+        .context("failed to make the configured e9tool path absolute")?;
+    let backend = std::path::absolute(resolve_e9patch_backend(&e9tool)?)
+        .context("failed to make the configured e9patch backend path absolute")?;
+    Ok((e9tool, backend))
+}
+
 /// Generate or load a cached e9patch rewrite for one ELF executable.
 // TODO-HUMAN-REVIEW(PR-594): Review the public cached rewrite entry point.
 pub fn prepare(binary: impl AsRef<Path>) -> Result<PreparedBinary, Error> {

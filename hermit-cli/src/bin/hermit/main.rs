@@ -152,14 +152,11 @@ impl Subcommand {
             );
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-696): Review the expanded e9patch CLI scope.
-        let starts_e9patch_guest = matches!(self, Subcommand::Run(_))
-            || matches!(self, Subcommand::Record(record) if record.starts_recording());
-        if backend == Some(hermit::Backend::E9patch) && !starts_e9patch_guest {
+        // TODO-HUMAN-REVIEW(PR-711): Review the real e9patch backend CLI scope.
+        if backend == Some(hermit::Backend::E9patch) && !matches!(self, Subcommand::Run(_)) {
             anyhow::bail!(
-                "the e9patch preprocessor is available only through `hermit --backend e9patch \
-                 run` and `hermit --backend e9patch record`; other subcommands do not \
-                 preprocess their guest"
+                "the e9patch backend is available only through `hermit --backend e9patch run`; \
+                 record/replay still uses the ptrace recorder"
             );
         }
         if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
@@ -271,10 +268,18 @@ mod tests {
     }
 
     #[test]
-    fn e9patch_is_allowed_for_recording_but_rejected_for_management_and_replay() {
+    fn e9patch_is_rejected_outside_run() {
         use hermit::Backend;
 
         for command in [
+            vec![
+                "hermit",
+                "--backend",
+                "e9patch",
+                "record",
+                "--",
+                "/bin/true",
+            ],
             vec![
                 "hermit",
                 "--backend",
@@ -288,23 +293,6 @@ mod tests {
                 "hermit",
                 "--backend",
                 "e9patch",
-                "record",
-                "--",
-                "/bin/true",
-            ],
-        ] {
-            let args = Args::try_parse_from(command).unwrap();
-            args.command
-                .validate_backend_scope(Some(Backend::E9patch))
-                .unwrap();
-        }
-
-        for command in [
-            vec!["hermit", "--backend", "e9patch", "record", "list"],
-            vec![
-                "hermit",
-                "--backend",
-                "e9patch",
                 "replay",
                 "0123456789abcdef0123456789abcdef",
             ],
@@ -314,7 +302,7 @@ mod tests {
                 .command
                 .validate_backend_scope(Some(Backend::E9patch))
                 .unwrap_err();
-            assert!(error.to_string().contains("only through"));
+            assert!(error.to_string().contains("available only through"));
         }
     }
 

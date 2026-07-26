@@ -655,7 +655,7 @@ async fn run_with_backend_inner(
             ));
         }
         let (exit_status, global_state) =
-            <reverie_e9patch::E9patchBackend as reverie::Backend>::run::<Detcore>(
+            reverie_e9patch::E9patchBackend::run_preserving_executable::<Detcore>(
                 command,
                 config.clone(),
             )
@@ -744,8 +744,11 @@ async fn run_with_output_backend_inner(
             ));
         }
         let (output, global_state) =
-            reverie_e9patch::E9patchBackend::run_with_output::<Detcore>(command, config.clone())
-                .await?;
+            reverie_e9patch::E9patchBackend::run_with_output_preserving_executable::<Detcore>(
+                command,
+                config.clone(),
+            )
+            .await?;
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;

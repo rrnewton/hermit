@@ -1405,7 +1405,7 @@ function strict_compatibility_probe {
             grep -m1 '^:: Backend: e9patch' || true)
         if [[ $backend_diagnostic == *"main_executable=non-ELF"* ]]; then
             ((E9PATCH_COMPAT_NON_ELF += 1))
-        elif [[ $backend_diagnostic =~ candidate_sites=([0-9]+).*mapped_sites=([0-9]+) ]]; then
+        elif [[ $backend_diagnostic =~ recovered_sites=([0-9]+).*patched_sites=([0-9]+) ]]; then
             if ((BASH_REMATCH[2] > 0)); then
                 ((E9PATCH_COMPAT_REWRITTEN += 1))
             elif ((BASH_REMATCH[1] > 0)); then
