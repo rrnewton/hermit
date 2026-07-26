@@ -1428,7 +1428,7 @@ function run_sabre_compatibility_command {
         local pid=""
         local status
 
-        trap 'if [[ -n $pid ]]; then terminate_sabre_compatibility_group "$pid"; wait "$pid" 2>/dev/null || true; fi; exit 143' INT TERM HUP
+        trap 'if [[ -n $pid ]]; then kill -KILL -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; exit 143' INT TERM HUP
         setsid "$@" </dev/null >>"$LOG_FILE" 2>&1 &
         pid=$!
         while kill -0 "$pid" 2>/dev/null; do
