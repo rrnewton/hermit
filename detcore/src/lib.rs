@@ -1411,7 +1411,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-NNN): Deterministic EOPNOTSUPP for
+            // TODO-HUMAN-REVIEW(PR-817): Deterministic EOPNOTSUPP for
             // name_to_handle_at. It returns a filesystem-internal opaque handle
             // plus a mount ID from the host mount table; both are host state, so
             // forwarding it (the legacy pass-through) is nondeterministic across

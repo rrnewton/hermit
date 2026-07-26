@@ -361,7 +361,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // open_by_handle_at is already refused (with EPERM) under #724. Handled
         // by Sysno in lib.rs before the typed match below.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-NNN)
+        // TODO-HUMAN-REVIEW(PR-817)
         | Sysno::name_to_handle_at => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
