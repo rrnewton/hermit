@@ -20,6 +20,8 @@ enum ProcfsKind {
     Cpuinfo,
     Loadavg,
     Uptime,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    Meminfo,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -39,6 +41,9 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-722)
+            "/proc/meminfo" => ProcfsKind::Meminfo,
             _ => return None,
         };
         Some(Self {
@@ -61,6 +66,8 @@ impl ProcfsFile {
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            ProcfsKind::Meminfo => sanitize_meminfo(&contents),
         });
         self.offset = 0;
     }
@@ -166,6 +173,59 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-722)
+/// Normalizes `/proc/meminfo`. Every reported quantity except the physically
+/// fixed machine totals (`MemTotal`, `SwapTotal`) fluctuates run-to-run as the
+/// host allocates and frees memory, so `free`, `vmstat`, and similar tools
+/// diverge under `--verify`. Preserve the stable totals verbatim and zero every
+/// other value, keeping each line's key, spacing, and unit suffix intact. Using
+/// an allowlist of stable keys (rather than a denylist of volatile ones)
+/// guarantees a newly introduced volatile field cannot silently reintroduce
+/// nondeterminism.
+fn sanitize_meminfo(contents: &[u8]) -> Vec<u8> {
+    const STABLE_KEYS: &[&[u8]] = &[b"MemTotal:", b"SwapTotal:"];
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+
+        if STABLE_KEYS.iter().any(|key| body.starts_with(key)) {
+            normalized.extend_from_slice(body);
+        } else if let Some(colon) = body.iter().position(|byte| *byte == b':') {
+            // Split each "Key:<spaces><digits><rest>" line and rewrite only the
+            // numeric value, so alignment and the optional " kB" suffix survive.
+            let (key, after) = body.split_at(colon + 1);
+            let spaces = after
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            let (leading, value_and_rest) = after.split_at(spaces);
+            let digits = value_and_rest
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits == 0 {
+                // No numeric value to normalize; keep the line verbatim.
+                normalized.extend_from_slice(body);
+            } else {
+                normalized.extend_from_slice(key);
+                normalized.extend_from_slice(leading);
+                normalized.push(b'0');
+                normalized.extend_from_slice(&value_and_rest[digits..]);
+            }
+        } else {
+            normalized.extend_from_slice(body);
+        }
+
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +262,49 @@ mod tests {
                 .kind,
             ProcfsKind::Uptime
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Meminfo
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-722)
+    #[test]
+    fn meminfo_zeroes_volatile_fields_and_keeps_totals() {
+        let input = b"MemTotal:       791462432 kB\n\
+MemFree:         63838604 kB\n\
+MemAvailable:   616884056 kB\n\
+Buffers:          1234567 kB\n\
+Cached:         559670332 kB\n\
+Shmem:             946444 kB\n\
+SwapTotal:      136218616 kB\n\
+SwapFree:        66940748 kB\n\
+HugePages_Total:        0\n\
+Hugepagesize:        2048 kB\n";
+        let expected = b"MemTotal:       791462432 kB\n\
+MemFree:         0 kB\n\
+MemAvailable:   0 kB\n\
+Buffers:          0 kB\n\
+Cached:         0 kB\n\
+Shmem:             0 kB\n\
+SwapTotal:      136218616 kB\n\
+SwapFree:        0 kB\n\
+HugePages_Total:        0\n\
+Hugepagesize:        0 kB\n";
+        assert_eq!(sanitize_meminfo(input), expected);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-722)
+    #[test]
+    fn meminfo_is_stable_across_differing_snapshots() {
+        let run1 = b"MemTotal:       791462432 kB\nMemFree:         63838604 kB\nCached:         559670332 kB\nSwapTotal:      136218616 kB\n";
+        let run2 = b"MemTotal:       791462432 kB\nMemFree:         63836552 kB\nCached:         559679200 kB\nSwapTotal:      136218616 kB\n";
+        assert_eq!(sanitize_meminfo(run1), sanitize_meminfo(run2));
     }
 
     #[test]

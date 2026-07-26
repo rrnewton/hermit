@@ -287,7 +287,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=182
 readonly RR_COMPAT_EXPECTED=128
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
@@ -307,7 +307,6 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 # executable corpus. They remain in the canonical denominator and table.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
-    [free]="live /proc/meminfo values differ between otherwise identical runs"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [rustc]="timed out on the GitHub-hosted no-PMU runner"
@@ -1905,6 +1904,12 @@ function run_compatibility_corpus {
     strict_compatibility_probe users /usr/bin/users \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#722): free reads /proc/meminfo, whose volatile fields
+    # are now normalized by Detcore (only MemTotal/SwapTotal survive), so its
+    # whole memory table is L2-deterministic. Previously a known failure.
+    strict_compatibility_probe free /usr/bin/free \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Restrict process tools to stable identity/existence observations. Host
     # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
