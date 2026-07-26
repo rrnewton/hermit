@@ -155,7 +155,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// and are reported disarmed. The interval field is always zero because only
     /// one-shot timers are supported (see handle_setitimer).
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     pub async fn handle_getitimer<G: Guest<Self>>(
         &self,
         guest: &mut G,

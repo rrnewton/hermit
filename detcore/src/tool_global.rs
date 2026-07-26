@@ -592,7 +592,7 @@ impl GlobalTool for GlobalState {
                 R::RegisterAlarm(remaining)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-batch35)
+            // TODO-HUMAN-REVIEW(PR-786)
             GlobalRequest::QueryAlarm(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let remaining = self.recv_query_alarm(dpid, now).await;
@@ -1229,7 +1229,7 @@ impl GlobalState {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     /// Read the remaining time on a process's pending alarm without disturbing
     /// it (for getitimer).
     pub async fn recv_query_alarm(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {
@@ -1306,7 +1306,7 @@ pub enum GlobalRequest {
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     /// Read-only query of the remaining time on a process's pending alarm
     /// (for getitimer); does not disturb the alarm.
     QueryAlarm(DetPid),
@@ -1354,7 +1354,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     QueryAlarm(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -1897,7 +1897,7 @@ where
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-batch35)
+// TODO-HUMAN-REVIEW(PR-786)
 /// Query the remaining time on the current process's pending alarm without
 /// rescheduling it. Returns zero when no alarm is pending. Used by getitimer.
 pub async fn query_alarm<G, T>(guest: &mut G) -> LogicalTime

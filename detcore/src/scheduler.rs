@@ -2530,7 +2530,7 @@ impl Scheduler {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     // Return the logical time remaining until this process's pending alarm, if
     // any (zero otherwise), WITHOUT rescheduling it. Used by getitimer.
     pub fn peek_alarm(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {

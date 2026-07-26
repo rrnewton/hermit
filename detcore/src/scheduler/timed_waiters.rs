@@ -122,7 +122,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     /// Return the absolute target time of the pending alarm on this process,
     /// if any, without disturbing it. Used by getitimer to report the remaining
     /// ITIMER_REAL time.

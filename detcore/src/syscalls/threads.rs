@@ -941,7 +941,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// injected), so it is identical across --verify runs and record/replay.
     /// Mirrors handle_sched_getparam / SchedGetscheduler => SCHED_OTHER.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     pub async fn handle_sched_getattr<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1006,7 +1006,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// across --verify runs and record/replay. ioprio_set is a no-op (see
     /// lib.rs).
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch35)
+    // TODO-HUMAN-REVIEW(PR-786)
     pub async fn handle_ioprio_get<G: Guest<Self>>(
         &self,
         _guest: &mut G,

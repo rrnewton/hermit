@@ -174,7 +174,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigpending
         | Sysno::setitimer
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-batch35): getitimer pairs with the already
+        // TODO-HUMAN-REVIEW(PR-786): getitimer pairs with the already
         // determinized setitimer/alarm handling. setitimer arms a one-shot
         // ITIMER_REAL against the virtual clock, so getitimer must report that
         // deterministic remaining time rather than fail-close; the handler in
@@ -255,7 +255,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-batch35): Extends the #720 family. The extended
+        // TODO-HUMAN-REVIEW(PR-786): Extends the #720 family. The extended
         // scheduling-attribute calls (sched_getattr/sched_setattr) and the I/O
         // scheduling-priority calls (ioprio_get/ioprio_set) are equally
         // inoperative: Detcore replaces the Linux CPU scheduler and serializes
@@ -802,7 +802,7 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
-            // PR-batch35: extended scheduling attributes, I/O priority, and the
+            // PR-786: extended scheduling attributes, I/O priority, and the
             // getitimer reader are now determinized (were Unsupported).
             Sysno::sched_getattr,
             Sysno::sched_setattr,

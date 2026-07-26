@@ -1628,7 +1628,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // inoperative. Setters are no-ops; getters emulate a fixed
                 // host-independent default (see syscall_classification.rs).
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-batch35)
+                // TODO-HUMAN-REVIEW(PR-786)
                 Syscall::SchedSetattr(_) => Ok(0),
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
                 Syscall::IoprioSet(_) => Ok(0),
@@ -1638,7 +1638,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // and reports the remaining ITIMER_REAL time from the virtual
                 // alarm state rather than fail-closing.
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-batch35)
+                // TODO-HUMAN-REVIEW(PR-786)
                 Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,

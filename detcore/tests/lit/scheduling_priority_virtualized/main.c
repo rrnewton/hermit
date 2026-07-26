@@ -7,9 +7,9 @@
  */
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-batch35)
+// TODO-HUMAN-REVIEW(PR-786)
 
-// Regression for PR-batch35. Detcore virtualizes the inoperative I/O-priority
+// Regression for PR-786. Detcore virtualizes the inoperative I/O-priority
 // (ioprio_get/ioprio_set) and extended CPU-scheduling (sched_getattr/
 // sched_setattr) syscalls to fixed, host-independent results, and pairs
 // getitimer with the already-determinized setitimer/alarm handling. Without
