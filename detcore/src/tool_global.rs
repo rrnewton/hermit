@@ -356,7 +356,19 @@ impl GlobalState {
     pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
-            handle.await.expect("Global scheduler clean shutdown");
+            if self.sched.lock().unwrap().started_up.try_read().is_none() {
+                // TODO-HUMAN-REVIEW(PR-744): Review cleanup before first scheduler registration.
+                handle.abort();
+                let error = handle
+                    .await
+                    .expect_err("unstarted scheduler task should be cancelled");
+                assert!(
+                    error.is_cancelled(),
+                    "unstarted scheduler task panicked: {error}"
+                );
+            } else {
+                handle.await.expect("Global scheduler clean shutdown");
+            }
             debug!("Global state cleanup, continuing...");
         }
         let banner =
