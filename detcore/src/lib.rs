@@ -1665,6 +1665,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
+                // ioprio_get is the read sibling of ioprio_set: I/O priority is
+                // virtual under Hermit, so report a fixed best-effort default
+                // instead of fail-closing (re-enables `ionice -p` under --strict).
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#831)
+                Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,

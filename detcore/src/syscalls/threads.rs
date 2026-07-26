@@ -1033,6 +1033,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(0)
     }
+
+    /// ioprio_get under Hermit, the read sibling of `handle_ioprio_set`. Detcore
+    /// serializes guest threads onto one virtual CPU and treats `ioprio_set` as an
+    /// inert no-op, so there is no per-target I/O priority to report and the raw
+    /// host value would leak nondeterministic block-layer state. Return a fixed,
+    /// host-independent priority — `IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4)`, the
+    /// best-effort class at Linux's nice-0 default level — so queries such as
+    /// `ionice -p <pid>` produce a stable answer. Re-enables `ionice -p` under
+    /// --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#831)
+    pub async fn handle_ioprio_get<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::IoprioGet,
+    ) -> Result<i64, Error> {
+        // IOPRIO_PRIO_VALUE(class, data) = (class << IOPRIO_CLASS_SHIFT) | data.
+        const IOPRIO_CLASS_SHIFT: i64 = 13;
+        const IOPRIO_CLASS_BE: i64 = 2;
+        const IOPRIO_NORM: i64 = 4;
+        info!(
+            "Emulating ioprio_get(which={}, who={}): fixed best-effort priority 4",
+            call.which(),
+            call.who()
+        );
+        Ok((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_NORM)
+    }
 }
 
 #[cfg(test)]

@@ -356,13 +356,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // priority (ioprio_set) and its Linux scheduling attributes (sched_getattr)
         // are inert, and an advisory whole-file lock (flock) is never contended
         // within the serialized container. They are determinized to fixed,
-        // host-independent results; see the handlers in lib.rs. sched_setattr and
-        // ioprio_get remain Unsupported until a task owns their write/read pair.
+        // host-independent results; see the handlers in lib.rs. sched_setattr
+        // remains Unsupported until a task owns its write path.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
-        | Sysno::sched_getattr => SyscallClassification::Determinized,
+        | Sysno::sched_getattr
+        // ioprio_get is the read sibling of ioprio_set: with a virtual I/O
+        // scheduler the query returns a fixed best-effort default rather than a
+        // nondeterministic host value (re-enables `ionice -p` under --strict).
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#831)
+        | Sysno::ioprio_get => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -546,7 +552,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -766,7 +771,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [210, 91, 72]);
+        assert_eq!(counts, [211, 91, 71]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -823,11 +828,19 @@ mod tests {
             SyscallClassification::Determinized
         );
         // BATCH 51: these previously fail-closed --strict; now determinized.
-        for sysno in [Sysno::flock, Sysno::ioprio_set, Sysno::sched_getattr] {
+        // ioprio_get (batch 146) is the read sibling of ioprio_set and is now
+        // determinized too, re-enabling `ionice -p` under --strict.
+        for sysno in [
+            Sysno::flock,
+            Sysno::ioprio_set,
+            Sysno::ioprio_get,
+            Sysno::sched_getattr,
+        ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
-        // Their read/write siblings deliberately remain Unsupported for now.
-        for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
+        // sched_setattr (the write path for scheduling attributes) deliberately
+        // remains Unsupported for now.
+        for sysno in [Sysno::sched_setattr] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
         // recvmmsg is the multi-message sibling of recvmsg and must stay
