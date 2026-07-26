@@ -305,7 +305,27 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgget
         | Sysno::msgsnd
         | Sysno::msgrcv
-        | Sysno::msgctl => SyscallClassification::Determinized,
+        | Sysno::msgctl
+        // ===== BATCH 24: scheduling/priority policy and fd-range close =====
+        // sched_getattr/sched_setattr are the combined-attribute form of the
+        // Linux CPU-scheduling policy syscalls already determinized above (see
+        // the #720 group): Detcore replaces the Linux scheduler, so a task's
+        // scheduling class, priority, nice, and deadline parameters are
+        // inoperative. ioprio_get/ioprio_set are the block-layer I/O-priority
+        // analogue, equally inoperative under Hermit's single deterministic
+        // execution. Forwarding any of them leaks host scheduler/priority state
+        // (nondeterministic), so they are emulated to fixed, host-independent
+        // results. close_range closes a contiguous descriptor range; Detcore
+        // owns the deterministic fd table, so it is determinized by closing
+        // exactly the tracked fds in range (see handle_close_range) rather than
+        // forwarding a raw range that would desync the model.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#767)
+        | Sysno::sched_getattr
+        | Sysno::sched_setattr
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
+        | Sysno::close_range => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -481,7 +501,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::epoll_pwait2
         | Sysno::flock
@@ -491,8 +510,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -526,8 +543,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
@@ -720,7 +735,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [204, 91, 78]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -912,6 +927,19 @@ mod tests {
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
             assert!(is_unsupported_async_ipc_syscall(sysno));
+        }
+        // Batch 24: combined scheduling-attribute and I/O-priority policy plus
+        // fd-range close are determinized (inoperative scheduling/priority under
+        // Detcore's own scheduler; close_range reconciled against the modeled fd
+        // table). Previously fail-closed as Unsupported under --strict.
+        for sysno in [
+            Sysno::sched_getattr,
+            Sysno::sched_setattr,
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
+            Sysno::close_range,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         // System V semaphores and shared memory are deliberately still
         // unsupported (intra-container primitives pending a dedicated decision).

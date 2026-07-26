@@ -412,6 +412,19 @@ impl FileMetadata {
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
+    /// Every tracked raw fd in the inclusive range `[first, last]`, sorted
+    /// ascending. Used to determinize `close_range` against the modeled table.
+    fn fds_in_range(&self, first: RawFd, last: RawFd) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .file_handles
+            .keys()
+            .copied()
+            .filter(|&fd| fd >= first && fd <= last)
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
     /// dup raw fds.
     fn dup_fd(
         &mut self,
@@ -1122,6 +1135,11 @@ impl<T> ThreadState<T> {
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
+    }
+
+    /// Tracked raw fds in the inclusive range `[first, last]`, sorted ascending.
+    pub fn fds_in_range(&self, first: RawFd, last: RawFd) -> Vec<RawFd> {
+        self.metadata().fds_in_range(first, last)
     }
 
     /// dup raw fds.

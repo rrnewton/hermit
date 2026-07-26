@@ -325,10 +325,7 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
     # previously because --strict used to forward unsupported syscalls.
-    [chrt]="fail-closed --strict rejects the unsupported sched_getattr syscall"
     [flock]="fail-closed --strict rejects the unsupported flock syscall"
-    [ionice]="fail-closed --strict rejects the unsupported ioprio_set syscall"
-    [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
     [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
     [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
@@ -1834,8 +1831,8 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe ss /usr/sbin/ss -V \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        tally_known_failclosed_probe passed failed known_flaky lsof \
-            functional_compatibility_probe lsof /usr/bin/lsof -v
+        functional_compatibility_probe lsof /usr/bin/lsof -v \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
@@ -1913,17 +1910,17 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe nice /usr/bin/nice -n 1 /bin/echo nice-ok \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    tally_known_failclosed_probe passed failed known_flaky ionice \
-        strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok
+    strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
     strict_compatibility_probe taskset bash -c \
         'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    tally_known_failclosed_probe passed failed known_flaky chrt \
-        strict_compatibility_probe chrt bash -c \
-        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"'
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     tally_known_failclosed_probe passed failed known_flaky flock \
         strict_compatibility_probe flock bash -c \
         'set -euo pipefail; f=$(mktemp); flock -x "$f" -c "printf \"flock-ok\\n\""; rm -f "$f"'

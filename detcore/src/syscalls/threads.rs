@@ -933,6 +933,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(0)
     }
+
+    /// sched_getattr under Hermit. This is the combined-attribute form of
+    /// sched_getscheduler/sched_getparam, which are already determinized because
+    /// Detcore replaces the Linux scheduler and a task's scheduling class and
+    /// parameters are inert. Report a fixed SCHED_OTHER policy with zero flags,
+    /// nice, priority, and deadline parameters. The struct is emulated (never
+    /// injected), so it is identical across --verify and record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#767)
+    pub async fn handle_sched_getattr<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetattr,
+    ) -> Result<i64, Error> {
+        // Minimum size the kernel accepts for a sched_attr buffer
+        // (SCHED_ATTR_SIZE_VER0). Reject a shorter buffer with the same EINVAL
+        // the kernel returns, so guest-visible behavior is unchanged.
+        const SCHED_ATTR_SIZE_VER0: u32 = 48;
+        if call.size() < SCHED_ATTR_SIZE_VER0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if let Some(attr) = call.attr() {
+            // struct sched_attr, version 0 (48 bytes). All zeros == SCHED_OTHER
+            // with default nice/priority, matching the determinized
+            // sched_getscheduler (SCHED_OTHER) and sched_getparam (priority 0).
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct SchedAttr {
+                size: u32,
+                sched_policy: u32,
+                sched_flags: u64,
+                sched_nice: i32,
+                sched_priority: u32,
+                sched_runtime: u64,
+                sched_deadline: u64,
+                sched_period: u64,
+            }
+            let attr_val = SchedAttr {
+                size: SCHED_ATTR_SIZE_VER0,
+                sched_policy: 0, // SCHED_OTHER
+                sched_flags: 0,
+                sched_nice: 0,
+                sched_priority: 0,
+                sched_runtime: 0,
+                sched_deadline: 0,
+                sched_period: 0,
+            };
+            guest
+                .memory()
+                .write_value(attr.cast::<SchedAttr>(), &attr_val)?;
+        }
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

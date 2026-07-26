@@ -1317,6 +1317,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#767): close_range is untyped (Syscall::Other) in
+            // the pinned Reverie revision. Detcore owns the deterministic
+            // descriptor table, so forwarding a raw fd range to the host would
+            // leave the model out of sync; emulate by closing exactly the tracked
+            // fds in [first, last] via the normal (record/replay-aware) close
+            // path. Dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                self.handle_close_range(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
             // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
             // deterministic by construction and identical to the modern kernel's own
@@ -1612,6 +1622,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetscheduler(_) => Ok(0),
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
+
+                // BATCH 24: sched_getattr/sched_setattr are the combined-attribute
+                // form of the scheduling-policy syscalls above, and ioprio_get/
+                // ioprio_set are the block-layer I/O-priority analogue. All are
+                // inoperative under Detcore (own scheduler, single deterministic
+                // execution), so setters are no-ops and getters report fixed,
+                // host-independent defaults. See syscall_classification.rs.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#767)
+                Syscall::SchedSetattr(_) => Ok(0),
+                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                Syscall::IoprioSet(_) => Ok(0),
+                // Report a fixed best-effort class at the default priority level
+                // (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4)); the true value depends
+                // on host scheduler state, so a constant keeps it deterministic.
+                Syscall::IoprioGet(_) => Ok(((2i64) << 13) | 4),
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,

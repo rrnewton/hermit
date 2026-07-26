@@ -194,6 +194,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    /// close_range(first, last, flags) under Hermit. Detcore owns the
+    /// deterministic descriptor table, so forwarding a raw fd range to the host
+    /// would leave the model out of sync with the kernel. Instead close exactly
+    /// the tracked fds in the inclusive range [first, last] through the normal
+    /// close path, which is record/replay-aware and releases the deterministic
+    /// ports each descriptor holds. close_range never fails on gaps in the
+    /// range, so per-fd EBADF is ignored. CLOSE_RANGE_CLOEXEC does not close any
+    /// descriptor; it only sets the close-on-exec flag, which has no host-varying
+    /// result and is forwarded deterministically. CLOSE_RANGE_UNSHARE only
+    /// affects a shared fd table, which the serialized model never exposes, so it
+    /// is a no-op modifier here.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#767)
+    pub async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+        let args = match call {
+            Syscall::Other(_, args) => args,
+            _ => unreachable!("close_range unexpectedly gained a typed variant"),
+        };
+        let first = args.arg0 as u32;
+        let last = args.arg1 as u32;
+        let flags = args.arg2 as u32;
+        if first > last {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            // Only sets O_CLOEXEC across the range; nothing is closed, so the
+            // deterministic fd table is unchanged. Setting a flag on already-open
+            // descriptors has no host-varying result.
+            return self.passthrough(guest, call).await;
+        }
+        let first = first as RawFd;
+        let last = last.min(RawFd::MAX as u32) as RawFd;
+        for fd in guest.thread_state().fds_in_range(first, last) {
+            match self
+                .handle_close(guest, syscalls::Close::new().with_fd(fd))
+                .await
+            {
+                Ok(_) | Err(Error::Errno(Errno::EBADF)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(0)
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
