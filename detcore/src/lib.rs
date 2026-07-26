@@ -1419,6 +1419,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
                 self.handle_epoll_pwait2(guest, call).await
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#767): close_range closes a whole descriptor
+            // range; it is untyped (Syscall::Other) in the pinned Reverie, so
+            // dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                self.handle_close_range(guest, call).await
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED

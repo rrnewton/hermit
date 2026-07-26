@@ -354,6 +354,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_set
         | Sysno::sched_getattr => SyscallClassification::Determinized,
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#767): close_range(first, last, flags) closes every
+        // open descriptor in [first, last] (or CLOSE_RANGE_CLOEXEC-marks them).
+        // Detcore determinizes it by injecting the real syscall (record/replay-
+        // aware, so the host result is captured and reproduced) and then pruning
+        // its own per-thread descriptor table for the same range, mirroring the
+        // single-fd `close` handler. The effect is bounded to the guest's own
+        // descriptors and is bitwise-identical across --verify and record/replay.
+        // Untyped (Syscall::Other) in the pinned Reverie, so the dispatcher
+        // matches on the Sysno before the typed match below.
+        | Sysno::close_range => SyscallClassification::Determinized,
+
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
         // Hermit's fixed-container, stable-filesystem, and serialization assumptions.
@@ -528,7 +540,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
@@ -757,7 +768,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [210, 91, 72]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1000,6 +1011,12 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
+        // close_range is determinized via a dedicated handler that injects the
+        // real syscall and prunes Detcore's descriptor table for the range.
+        assert_eq!(
+            classify_syscall(Sysno::close_range),
+            SyscallClassification::Determinized
+        );
     }
 
     #[test]

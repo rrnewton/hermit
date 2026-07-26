@@ -413,6 +413,22 @@ impl FileMetadata {
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
+    /// remove every tracked rawfd in the inclusive range `[first, last]`,
+    /// returning the `OpenFileId`s whose final alias was dropped so the caller
+    /// can release their ports (mirrors `remove_fd` over a range).
+    fn remove_fds_in_range(&mut self, first: RawFd, last: RawFd) -> Vec<OpenFileId> {
+        let in_range: Vec<RawFd> = self
+            .file_handles
+            .keys()
+            .copied()
+            .filter(|&fd| fd >= first && fd <= last)
+            .collect();
+        in_range
+            .into_iter()
+            .filter_map(|fd| self.remove_fd(fd))
+            .collect()
+    }
+
     /// dup raw fds.
     fn dup_fd(
         &mut self,
@@ -1249,6 +1265,12 @@ impl<T> ThreadState<T> {
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
+    }
+
+    /// remove every tracked rawfd in the inclusive range `[first, last]`,
+    /// returning the `OpenFileId`s whose final alias was dropped.
+    pub fn remove_fds_in_range(&self, first: RawFd, last: RawFd) -> Vec<OpenFileId> {
+        self.metadata().remove_fds_in_range(first, last)
     }
 
     /// dup raw fds.

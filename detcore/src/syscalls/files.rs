@@ -216,6 +216,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#767)
+    /// SYS_close_range: close every open descriptor in the inclusive range
+    /// `[first, last]`.
+    ///
+    /// Untyped (`Syscall::Other`) in the pinned Reverie revision, so the raw
+    /// arguments are read out of the call here. The real syscall is injected
+    /// (record/replay-aware) so the guest's own descriptors are actually closed
+    /// -- or, for `CLOSE_RANGE_CLOEXEC`, close-on-exec-marked -- by the host
+    /// kernel; Detcore then prunes its per-thread descriptor table for the same
+    /// range so its bookkeeping stays consistent, mirroring the single-fd
+    /// `close` handler. The effect is bounded to the guest's descriptors and is
+    /// bitwise-identical across `--verify` and record/replay.
+    pub async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        // CLOSE_RANGE_CLOEXEC only sets close-on-exec; it does not close the
+        // descriptors, so the Detcore table must not be pruned in that case.
+        const CLOSE_RANGE_CLOEXEC: usize = 0x4;
+        let (first, last, flags) = match &call {
+            Syscall::Other(_, args) => (args.arg0, args.arg1, args.arg2),
+            _ => unreachable!("close_range unexpectedly gained a typed variant"),
+        };
+        let res = self.record_or_replay(guest, call).await;
+        if res.is_ok() && (flags & CLOSE_RANGE_CLOEXEC) == 0 {
+            let first = first.min(RawFd::MAX as usize) as RawFd;
+            let last = last.min(RawFd::MAX as usize) as RawFd;
+            for open_file_id in guest.thread_state_mut().remove_fds_in_range(first, last) {
+                self.release_port_for_open_file(guest, open_file_id).await;
+            }
+        }
+        res.map_err(Error::from)
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
