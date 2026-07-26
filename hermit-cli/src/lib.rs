@@ -27,15 +27,20 @@ mod record;
 mod recorder;
 mod replay;
 mod replayer;
+mod sabre_ptrace;
 mod script;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
@@ -65,6 +70,7 @@ use metadata::Metadata;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
+use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
 pub use reverie::process::Mount;
@@ -353,7 +359,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the experimental LiteInst preload compatibility backend.
+    /// Use the LiteInst in-process backend with the Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -435,33 +441,107 @@ impl Backend {
     }
 }
 
-fn sabre_runtime_unavailable_reason() -> Option<String> {
-    for (variable, description) in [
-        ("HERMIT_SABRE_RUNNER", "Reverie SaBRe runner"),
-        ("HERMIT_SABRE_BINARY", "SaBRe executable"),
-        ("HERMIT_SABRE_PLUGIN", "Reverie SaBRe plugin"),
-    ] {
-        let Some(value) = std::env::var_os(variable) else {
-            return Some(format!("set {variable} to the {description} path"));
-        };
-        let path = Path::new(&value);
-        match fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                return Some(format!(
-                    "{variable}={} is not a regular file",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                return Some(format!(
-                    "cannot access {variable}={}: {error}",
-                    path.display()
-                ));
-            }
+const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+// TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+fn resolve_sabre_binary_from(
+    override_path: Option<&OsStr>,
+    executable: &Path,
+    path_env: &OsStr,
+) -> Result<PathBuf, Error> {
+    if let Some(requested) = override_path {
+        if requested.is_empty() {
+            return Err(anyhow!("{SABRE_BINARY_ENV} is empty"));
         }
+        let path = PathBuf::from(requested);
+        return is_executable_file(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{SABRE_BINARY_ENV}={} is not an executable file",
+                    path.display()
+                )
+            });
     }
-    None
+
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("Hermit executable has no parent directory"))?;
+    let sibling = directory.join("sabre");
+    let target_build = directory.parent().map(|target| target.join("sabre/sabre"));
+
+    if is_executable_file(&sibling) {
+        return Ok(sibling);
+    }
+    if let Some(candidate) = &target_build
+        && is_executable_file(candidate)
+    {
+        return Ok(candidate.clone());
+    }
+    if !path_env.is_empty()
+        && let Some(candidate) = std::env::split_paths(path_env)
+            .map(|directory| directory.join("sabre"))
+            .find(|candidate| is_executable_file(candidate))
+    {
+        return Ok(candidate);
+    }
+
+    Err(anyhow!(
+        "SaBRe executable was not found beside {} or in PATH; set {SABRE_BINARY_ENV} or build the pinned loader as target/sabre/sabre",
+        executable.display()
+    ))
+}
+
+fn resolve_sabre_binary() -> Result<PathBuf, Error> {
+    let executable =
+        std::env::current_exe().context("failed to locate running Hermit executable")?;
+    let override_path = std::env::var_os(SABRE_BINARY_ENV);
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    resolve_sabre_binary_from(override_path.as_deref(), &executable, &path_env)
+}
+
+const SABRE_RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
+
+// TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+fn sabre_runtime_library_path() -> io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    [
+        directory.join("libdetcore_sabre.so"),
+        directory.join("deps/libdetcore_sabre.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "libdetcore_sabre.so was not built beside {}",
+                executable.display()
+            ),
+        )
+    })
+}
+
+fn sabre_runtime_unavailable_reason() -> Option<String> {
+    if let Err(error) = resolve_sabre_binary() {
+        return Some(error.to_string());
+    }
+    sabre_runtime_library_path().err().map(|error| {
+        format!(
+            "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
+        )
+    })
 }
 
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
@@ -485,6 +565,106 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     ))
 }
 
+/// Run one command with the Detcore tool executing inside a SaBRe plugin and
+/// the single GlobalState hosted by this Hermit coordinator process.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
+async fn run_sabre(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    let sabre = resolve_sabre_binary()?;
+    let plugin = sabre_runtime_library_path()
+        .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
+    let program = command.find_program().map_err(|error| {
+        anyhow!(
+            "failed to resolve SaBRe guest executable {:?}: {error}",
+            command.get_program()
+        )
+    })?;
+
+    let socket_dir = tempfile::Builder::new()
+        .prefix("hermit-sabre-rpc-")
+        .tempdir()?;
+    let socket_path = socket_dir.path().join("coordinator.sock");
+    let fallback_ready = Arc::new(AtomicBool::new(false));
+    let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
+    let server = reverie_rpc_transport::RpcServer::bind_with_readiness(
+        &socket_path,
+        global.clone(),
+        config.clone(),
+        fallback_ready.clone(),
+    )
+    .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
+    let server_task = tokio::spawn(async move { server.serve().await });
+
+    command.prepend_args([plugin.as_os_str(), OsStr::new("--"), program.as_os_str()]);
+    command.program(&sabre);
+    command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove("SABRE_BINARY");
+    command.env_remove("SABRE_PLUGIN");
+
+    tracing::info!(
+        target: "hermit::sabre",
+        guest = %program.display(),
+        plugin = %plugin.display(),
+        socket = %socket_path.display(),
+        "launching Detcore guest through SaBRe with coordinator RPC",
+    );
+
+    let supervised = match sabre_ptrace::run(
+        command.into_std_lossy(),
+        PathBuf::from(&sabre),
+        plugin.clone(),
+        fallback_ready,
+        capture_output,
+    )
+    .await
+    {
+        Ok(supervised) => supervised,
+        Err(error) => {
+            global.force_shutdown_with_error();
+            server_task.abort();
+            let _ = server_task.await;
+            return Err(error);
+        }
+    };
+    if !supervised.status.success() {
+        global.force_shutdown_with_error();
+    }
+    tracing::info!(
+        target: "hermit::sabre::fallback",
+        patched_sites = supervised.patched_sites,
+        "SaBRe ptrace fallback completed",
+    );
+    let output = Output {
+        status: supervised.status.into(),
+        stdout: supervised.stdout,
+        stderr: supervised.stderr,
+    };
+
+    server_task.abort();
+    let _ = server_task.await;
+    for _ in 0..100 {
+        if Arc::strong_count(&global) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let global = Arc::try_unwrap(global).map_err(|global| {
+        anyhow!(
+            "SaBRe coordinator stopped with {} live RPC reference(s)",
+            Arc::strong_count(&global) - 1
+        )
+    })?;
+    global
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+    Ok(output)
+}
 /// Guest-physical memory available to the single-process KVM personality.
 const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
@@ -767,6 +947,14 @@ pub fn run_with_backend(
     )
 }
 
+// TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
+fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
+    matches!(
+        status,
+        ExitStatus::Exited(123..=126) | ExitStatus::Signaled(_, _)
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
     command: Command,
@@ -788,6 +976,31 @@ async fn run_with_backend_inner(
     }
     if backend == Backend::Dbi {
         return Ok(run_dbi(command, config, print_summary, false).await?.status);
+    }
+    if backend == Backend::Sabre {
+        return Ok(run_sabre(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            false,
+        )
+        .await?
+        .status);
+    }
+    if backend == Backend::Liteinst {
+        let preload = liteinst_runtime_library_path()?;
+        let (exit_status, global_state) = reverie_liteinst::LiteinstBackend::run_with_preload::<
+            Detcore,
+        >(command, config, preload)
+        .await?;
+        if liteinst_requires_forced_shutdown(exit_status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
 
@@ -858,6 +1071,40 @@ async fn run_with_output_backend_inner(
     }
     if backend == Backend::Dbi {
         return run_dbi(command, config, print_summary, true).await;
+    }
+    if backend == Backend::Sabre {
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        return run_sabre(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            true,
+        )
+        .await;
+    }
+    if backend == Backend::Liteinst {
+        command.stdin(Stdio::null());
+        let preload = liteinst_runtime_library_path()?;
+        let (output, global_state) =
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+                command, config, preload,
+            )
+            .await?;
+        let status = output.status.into();
+        if liteinst_requires_forced_shutdown(status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(Output {
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
     ensure_backend_dispatch(backend)?;
 
@@ -1086,7 +1333,9 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::Backend;
@@ -1097,6 +1346,7 @@ mod tests {
     use super::kvm_device_unavailable_reason;
     use super::liteinst_runtime_unavailable_reason;
     use super::resolve_kvm_shebang;
+    use super::resolve_sabre_binary_from;
     use super::sabre_runtime_unavailable_reason;
 
     #[test]
@@ -1140,6 +1390,51 @@ mod tests {
         let reason = kvm_device_unavailable_reason(temp.path())
             .expect("a directory must not pass the read-write KVM device probe");
         assert!(reason.contains("read-write"));
+    }
+
+    fn write_test_executable(path: &std::path::Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"test loader").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn sabre_binary_resolver_finds_cargo_target_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let loader = temp.path().join("target/sabre/sabre");
+        write_test_executable(&loader);
+
+        assert_eq!(
+            resolve_sabre_binary_from(None, &executable, OsStr::new("")).unwrap(),
+            loader
+        );
+    }
+
+    #[test]
+    fn sabre_binary_resolver_prefers_and_validates_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let discovered = temp.path().join("target/sabre/sabre");
+        let requested = temp.path().join("requested-sabre");
+        write_test_executable(&discovered);
+        write_test_executable(&requested);
+
+        assert_eq!(
+            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
+                .unwrap(),
+            requested
+        );
+
+        let mut permissions = fs::metadata(&requested).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&requested, permissions).unwrap();
+        let error =
+            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
+                .unwrap_err();
+        assert!(error.to_string().contains("is not an executable file"));
     }
 
     #[test]
