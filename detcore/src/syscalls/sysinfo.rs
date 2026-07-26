@@ -210,7 +210,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review logical tick and zero-CPU accounting semantics.
+    // TODO-HUMAN-REVIEW(#783): Review logical tick and zero-CPU accounting semantics.
     /// Return deterministic elapsed ticks and process CPU accounting for `times(2)`.
     ///
     /// Linux's host boot epoch and scheduler CPU counters are nondeterministic. Detcore instead
