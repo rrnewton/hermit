@@ -590,7 +590,7 @@ where
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review complete SaBRe RPC shutdown ordering.
+// TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
 async fn shutdown_sabre_rpc<T, E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
     global: &Arc<T>,
