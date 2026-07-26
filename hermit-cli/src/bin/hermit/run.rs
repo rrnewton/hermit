@@ -8,7 +8,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
-use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -1364,13 +1363,6 @@ impl RunOpts {
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
         let backend = self.selected_backend();
-        if backend == Backend::Liteinst && !self.no_namespace {
-            anyhow::bail!(
-                "--backend=liteinst requires --no-namespace because the preload compatibility \
-                 path runs directly on the host and does not implement Hermit's namespace, mount, \
-                 or network isolation"
-            );
-        }
         if backend == Backend::E9patch && self.no_namespace {
             anyhow::bail!(
                 "--backend=e9patch requires mount namespaces to overlay the rewritten ELF at its \
@@ -1401,14 +1393,10 @@ impl RunOpts {
         }
         // });
 
-        // Dispatch to an alternative Reverie backend if one was requested. The
-        // DBI prototype is handled entirely outside the ptrace container
-        // machinery below. KVM falls through to the normal run/verify path: it
-        // skips `ensure_available()` above and reaches `hermit::run_with_backend`
-        // (via `run_in_container`), whose own dispatch routes it to `run_kvm`
-        // and returns an accurate, program-specific error.
+        // DBI and SaBRe use dedicated launch adapters. LiteInst, KVM, e9patch,
+        // and ptrace use the common container plus run/verify machinery below.
         match backend {
-            Backend::Ptrace | Backend::Kvm | Backend::E9patch => {}
+            Backend::Ptrace | Backend::Liteinst | Backend::Kvm | Backend::E9patch => {}
             Backend::Dbi => {
                 return super::backends::run_dbi(
                     &self.program,
@@ -1416,14 +1404,6 @@ impl RunOpts {
                     self.verify,
                     global.log,
                     &self.effective_det_config(),
-                );
-            }
-            Backend::Liteinst => {
-                return super::backends::run_liteinst(
-                    || Ok(self.guest_command()?.into_std_lossy()),
-                    self.liteinst_guest_preload(),
-                    self.verify,
-                    global.log,
                 );
             }
             // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
@@ -1435,6 +1415,10 @@ impl RunOpts {
                     global.log,
                 );
             }
+        }
+
+        if backend == Backend::Liteinst {
+            eprintln!("hermit: [liteinst backend] Detcore Tool active");
         }
 
         if self.no_namespace {
@@ -2018,8 +2002,13 @@ impl RunOpts {
             },
         )?;
 
-        if self.selected_backend() == Backend::Kvm {
-            eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
+        let backend_banner = match self.selected_backend() {
+            Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
+            Backend::Liteinst => Some("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+            _ => None,
+        };
+        if let Some(backend_banner) = backend_banner {
+            eprintln!(":: Backend: {backend_banner}");
             std::io::stdout().write_all(&out1.stdout)?;
             std::io::stderr().write_all(&out1.stderr)?;
         }
@@ -2147,10 +2136,6 @@ impl RunOpts {
         Ok(())
     }
 
-    fn liteinst_guest_preload(&self) -> Option<OsString> {
-        resolve_liteinst_guest_preload(&self.base_env, &self.env, std::env::var_os("LD_PRELOAD"))
-    }
-
     fn guest_command(&self) -> Result<Command, Error> {
         let program = self.e9patch_program.as_ref().unwrap_or(&self.program);
         let mut command = Command::new(program);
@@ -2274,20 +2259,6 @@ enum Tmpfs<'a> {
     Temp(tempfile::TempDir),
 }
 
-fn resolve_liteinst_guest_preload(
-    base_env: &BaseEnv,
-    env: &[(String, Option<String>)],
-    host_preload: Option<OsString>,
-) -> Option<OsString> {
-    if let Some((_, value)) = env.iter().rev().find(|(name, _)| name == "LD_PRELOAD") {
-        return value.as_ref().map(OsString::from).or(host_preload);
-    }
-    match base_env {
-        BaseEnv::Host => host_preload,
-        BaseEnv::Empty | BaseEnv::Minimal => None,
-    }
-}
-
 impl<'a> Tmpfs<'a> {
     /// Returns the path to `/tmp`.
     pub fn path(&self) -> &Path {
@@ -2295,50 +2266,5 @@ impl<'a> Tmpfs<'a> {
             Self::Path(path) => path,
             Self::Temp(temp) => temp.path(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn liteinst_guest_preload_follows_guest_environment_policy() {
-        let host = Some(OsString::from("/host/libpreload.so"));
-        assert_eq!(
-            resolve_liteinst_guest_preload(&BaseEnv::Empty, &[], host.clone()),
-            None
-        );
-        assert_eq!(
-            resolve_liteinst_guest_preload(&BaseEnv::Minimal, &[], host.clone()),
-            None
-        );
-        assert_eq!(
-            resolve_liteinst_guest_preload(&BaseEnv::Host, &[], host.clone()),
-            host
-        );
-
-        let explicit = [(
-            "LD_PRELOAD".to_owned(),
-            Some("/guest/libpreload.so".to_owned()),
-        )];
-        assert_eq!(
-            resolve_liteinst_guest_preload(
-                &BaseEnv::Empty,
-                &explicit,
-                Some(OsString::from("/host/libpreload.so")),
-            ),
-            Some(OsString::from("/guest/libpreload.so"))
-        );
-
-        let passthrough = [("LD_PRELOAD".to_owned(), None)];
-        assert_eq!(
-            resolve_liteinst_guest_preload(
-                &BaseEnv::Empty,
-                &passthrough,
-                Some(OsString::from("/host/libpreload.so")),
-            ),
-            Some(OsString::from("/host/libpreload.so"))
-        );
     }
 }

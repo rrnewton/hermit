@@ -353,7 +353,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the experimental LiteInst preload compatibility backend.
+    /// Use the LiteInst in-process backend with the Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -717,6 +717,21 @@ async fn run_with_backend_inner(
         .await?
         .status);
     }
+    if backend == Backend::Liteinst {
+        let preload = liteinst_runtime_library_path()?;
+        let (exit_status, global_state) = reverie_liteinst::LiteinstBackend::run_with_preload::<
+            Detcore,
+        >(command, config, preload)
+        .await?;
+        if !exit_status.success() {
+            global_state.force_shutdown_with_error();
+            return Ok(exit_status);
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(exit_status);
+    }
     ensure_backend_dispatch(backend)?;
 
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
@@ -783,6 +798,31 @@ async fn run_with_output_backend_inner(
             true,
         )
         .await;
+    }
+    if backend == Backend::Liteinst {
+        command.stdin(Stdio::null());
+        let preload = liteinst_runtime_library_path()?;
+        let (output, global_state) =
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+                command, config, preload,
+            )
+            .await?;
+        if !output.status.success() {
+            global_state.force_shutdown_with_error();
+            return Ok(Output {
+                status: output.status.into(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(Output {
+            status: output.status.into(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
     ensure_backend_dispatch(backend)?;
 
