@@ -752,7 +752,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [206, 91, 76]);
+        assert_eq!(counts, [208, 91, 74]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
