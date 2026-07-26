@@ -154,6 +154,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_host_state_introspection_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1407,6 +1408,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // before the typed match below.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for host-state
+            // introspection syscalls Detcore cannot reproduce: cachestat (host
+            // page-cache residency, the modern superset of mincore), kcmp
+            // (kernel-object identity whose not-equal ordering leaks host kernel
+            // pointer values), and the obsolete ustat (a filesystem's live
+            // free-block/free-inode counts by device number, superseded by
+            // statfs). Each reports or compares host-specific state that is not
+            // reproducible in a deterministic container and otherwise
+            // fail-closes under --strict. A fixed -ENOSYS is the errno each
+            // returns on a kernel lacking the feature, so a probing guest falls
+            // back to a portable path; never forwarded to the host and identical
+            // across --verify and record/replay. Untyped (Syscall::Other) in the
+            // pinned Reverie, so dispatch on the Sysno before the typed match
+            // below.
+            SyscallClassification::Determinized
+                if is_host_state_introspection_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::ENOSYS))
             }

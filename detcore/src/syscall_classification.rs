@@ -348,6 +348,28 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgsnd
         | Sysno::msgrcv
         | Sysno::msgctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for host-state
+        // introspection syscalls Detcore cannot reproduce. cachestat(2) reports
+        // which pages of a file range are resident in the host page cache (live
+        // host VM state, the modern superset of mincore); kcmp(2) compares two
+        // kernel objects for identity and, for the not-equal case, returns an
+        // ordering derived from kernel pointer values (nondeterministic across
+        // runs, leaks host kernel-object layout); ustat(2) is an obsolete call
+        // returning a mounted filesystem's live free-block/free-inode counts by
+        // device number (nondeterministic host filesystem state, superseded by
+        // statfs). All three currently fail-closed under --strict. A fixed
+        // -ENOSYS is exactly the errno each returns on a kernel that lacks the
+        // feature (cachestat < 6.5, kcmp without CONFIG_CHECKPOINT_RESTORE,
+        // ustat removed for a filesystem), so a guest that probes the syscall
+        // falls back to a portable path (fadvise/mincore, an equality heuristic,
+        // statfs) instead of aborting. Never forwarded to the host and identical
+        // across --verify and record/replay. Untyped (Syscall::Other) in the
+        // pinned Reverie, so the dispatcher matches on the Sysno before the typed
+        // match below.
+        | Sysno::cachestat
+        | Sysno::kcmp
+        | Sysno::ustat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -536,7 +558,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::add_key
         | Sysno::adjtimex
         | Sysno::bpf
-        | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
@@ -547,7 +568,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::get_robust_list
         | Sysno::getitimer
         | Sysno::ioprio_get
-        | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
@@ -602,7 +622,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
-        | Sysno::ustat
         | Sysno::vmsplice => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
@@ -750,6 +769,26 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS refusal set.
+/// Host-state introspection syscalls whose results Detcore cannot reproduce
+/// deterministically: `cachestat` (host page-cache residency of a file range,
+/// the modern superset of `mincore`), `kcmp` (kernel-object identity whose
+/// not-equal ordering is derived from host kernel pointer values), and the
+/// obsolete `ustat` (a mounted filesystem's live free-block/free-inode counts
+/// by device number, superseded by `statfs`). Each reports or compares
+/// host-specific page-cache, kernel-object, or filesystem state that is not
+/// reproducible in a deterministic container, and each otherwise fail-closes
+/// under `--strict`. Detcore refuses them with a fixed `ENOSYS` — the errno each
+/// returns on a kernel that lacks the feature — so a probing guest falls back to
+/// a portable path instead of aborting. The result is never forwarded to the
+/// host and is bitwise-identical across `--verify` and record/replay. These are
+/// untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches
+/// on the `Sysno` before the typed match.
+pub(crate) const fn is_host_state_introspection_syscall(sysno: Sysno) -> bool {
+    matches!(sysno, Sysno::cachestat | Sysno::kcmp | Sysno::ustat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,7 +805,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [210, 91, 72]);
+        assert_eq!(counts, [213, 91, 69]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1014,6 +1053,14 @@ mod tests {
         for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
+        }
+        // Batch 149 (#825): host-state introspection syscalls Detcore cannot
+        // reproduce are refused with a deterministic ENOSYS (cachestat page-cache
+        // residency, kcmp kernel-object identity ordering, obsolete ustat
+        // filesystem free counts); see is_host_state_introspection_syscall.
+        for sysno in [Sysno::cachestat, Sysno::kcmp, Sysno::ustat] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_host_state_introspection_syscall(sysno));
         }
     }
 
