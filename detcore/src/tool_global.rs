@@ -1893,8 +1893,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
+    use super::GlobalState;
     use super::format_unsupported_syscall_warning;
+    use crate::config::Config;
 
     #[test]
     fn unsupported_syscall_warning_is_sorted_and_aggregated() {
@@ -1909,5 +1912,23 @@ mod tests {
             Some("syscalls getppid,vmsplice used but not yet supported")
         );
         assert_eq!(format_unsupported_syscall_warning(&BTreeSet::new()), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_wait_for_an_unstarted_scheduler() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, true);
+        let summary_path = None;
+        let cleanup = state.clean_up(false, &summary_path);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cleanup)
+                .await
+                .is_ok(),
+            "cleanup waited for a scheduler whose guest never registered"
+        );
     }
 }
