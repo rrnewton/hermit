@@ -213,7 +213,7 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-763)
+// TODO-HUMAN-REVIEW(PR-764)
 /// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
 /// instantaneous core frequency is a live hardware reading that varies between
 /// otherwise identical runs, so replace it with a fixed value. This mirrors the
