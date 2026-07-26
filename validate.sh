@@ -1482,7 +1482,7 @@ function run_sabre_compatibility_command {
         local pid=""
         local status
 
-        # TODO-HUMAN-REVIEW(PR-pending): Review immediate abort on outer-gate termination.
+        # TODO-HUMAN-REVIEW(PR-814): Review immediate abort on outer-gate termination.
         trap 'if [[ -n $pid ]]; then kill -KILL -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; exit 143' INT TERM HUP
         setsid "$@" </dev/null >>"$LOG_FILE" 2>&1 &
         pid=$!
