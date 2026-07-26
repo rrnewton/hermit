@@ -203,7 +203,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#818): shutdown(2) is the last socket-family member
+        // TODO-HUMAN-REVIEW(#823): shutdown(2) is the last socket-family member
         // left Unsupported while every sibling (socket/socketpair/connect/bind/
         // listen/accept/send*/recv*/getsockopt/setsockopt/getsockname) is already
         // Determinized. It only half-closes an already-tracked socket fd and
@@ -856,7 +856,7 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             // shutdown is the socket-family sibling of the above; it half-closes
-            // a tracked socket and must stay Determinized (regression for #818).
+            // a tracked socket and must stay Determinized (regression for #823).
             Sysno::shutdown,
             Sysno::tgkill,
         ] {

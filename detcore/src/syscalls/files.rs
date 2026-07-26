@@ -1321,7 +1321,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#818)
+    // TODO-HUMAN-REVIEW(#823)
     /// Half-close an already tracked socket. `shutdown(2)` only changes the
     /// direction(s) in which a socket may transfer data and returns 0 or an
     /// errno with no nondeterministic payload, so it is handled exactly like its
