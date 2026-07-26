@@ -127,6 +127,8 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_deterministically_refused;
+use crate::syscall_classification::is_extra_passthrough;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1256,6 +1258,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
                 }
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#715): Review deterministic ENOSYS refusal of obsolete syscalls.
+            // Obsolete/removed/never-implemented x86_64 syscalls: the real kernel
+            // returns ENOSYS, so refusing them deterministically is faithful and
+            // needs no typed dispatch arm.
+            SyscallClassification::Determinized if is_deterministically_refused(call.number()) => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1531,6 +1541,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#715): Review audited non-blocking deterministic passthroughs.
+            // Audited safe passthroughs forwarded by Sysno; several have no typed
+            // `Syscall` variant in the pinned Reverie revision.
+            SyscallClassification::PassThrough if is_extra_passthrough(call.number()) => {
+                self.passthrough(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
             // The pinned Reverie revision lists this call as untyped, so dispatch by Sysno.
             SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
@@ -1672,7 +1689,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
-            SyscallClassification::Unclassified => {
+            SyscallClassification::Unimplemented => {
                 self.handle_unclassified_syscall(
                     guest,
                     call,

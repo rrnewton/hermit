@@ -25,8 +25,12 @@ pub(crate) enum SyscallClassification {
     Determinized,
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
-    /// The syscall retains the legacy fail-closed-or-forward policy pending investigation.
-    Unclassified,
+    /// The syscall has been audited but its deterministic handler is not yet
+    /// implemented. It retains the fail-closed-or-forward policy (panic under
+    /// `panic_on_unsupported_syscalls`, otherwise forward) until the tracked
+    /// determinization work lands. Each member has a `Syscall classification: <name>`
+    /// issue on rrnewton/hermit and is owned by the syscall-implementation backlog.
+    Unimplemented,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -170,7 +174,33 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::tgkill
         // TODO-HUMAN-REVIEW(#547)
-        | Sysno::writev => SyscallClassification::Determinized,
+        | Sysno::writev
+        // ----- Deterministic refusal (ENOSYS) -----
+        // These syscalls are obsolete, removed, or never implemented on modern
+        // x86_64 Linux. Refusing them with a deterministic ENOSYS via
+        // `is_deterministically_refused` is a Determinized outcome ("explicit
+        // deterministic refusal policy"). Every entry was verified to already
+        // return ENOSYS on the reference host; several (e.g. sysfs, uselib,
+        // lookup_dcookie) are kernel-config/version dependent, so deterministic
+        // refusal makes their result host-independent rather than a passthrough
+        // that varies per host. `ustat` is intentionally NOT here: it is still
+        // implemented, so it stays in the fail-closed backlog.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#715): Review deterministic ENOSYS refusal for obsolete syscalls.
+        | Sysno::_sysctl
+        | Sysno::afs_syscall
+        | Sysno::create_module
+        | Sysno::get_kernel_syms
+        | Sysno::getpmsg
+        | Sysno::lookup_dcookie
+        | Sysno::nfsservctl
+        | Sysno::putpmsg
+        | Sysno::query_module
+        | Sysno::security
+        | Sysno::sysfs
+        | Sysno::tuxcall
+        | Sysno::uselib
+        | Sysno::vserver => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -306,25 +336,57 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sync_file_range
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
-        | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
+        | Sysno::rt_sigreturn
+        // ----- Audited safe passthroughs (non-blocking, deterministic) -----
+        // These syscalls are non-blocking and produce results that are repeatable
+        // under Hermit's fixed-container identity, stable filesystem, and serialized
+        // single-CPU model. Forwarding them is deterministic and lets them run under
+        // --strict instead of hitting the fail-closed backlog. `is_extra_passthrough`
+        // forwards them by Sysno (the pinned Reverie revision exposes several as raw
+        // calls without a typed `Syscall` variant).
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#715): Review audited non-blocking deterministic passthroughs.
+        | Sysno::close_range
+        | Sysno::get_robust_list
+        | Sysno::get_thread_area
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::remap_file_pages
+        | Sysno::set_thread_area
+        | Sysno::setfsgid
+        | Sysno::setfsuid
+        | Sysno::setgid
+        | Sysno::setgroups
+        | Sysno::setregid
+        | Sysno::setresgid
+        | Sysno::setresuid
+        | Sysno::setreuid
+        | Sysno::setuid
+        | Sysno::shutdown
+        | Sysno::sync
+        | Sysno::syncfs => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
-        // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
-        // TODO/FIXME: These syscalls have not been classified. They temporarily use
-        // the legacy passthrough policy and may need deterministic handling. Each must
-        // be investigated and moved to DETERMINIZED or PASS-THRU.
-        Sysno::_sysctl
-        | Sysno::acct
+        // ===== UNIMPLEMENTED (AUDITED; DETERMINIZATION PENDING) =====
+        // These syscalls have been audited but do not yet have a deterministic
+        // handler. Most are potentially blocking or expose host/scheduler/timer
+        // state, so they stay fail-closed under --strict (panic) and forward
+        // otherwise, exactly as before. Each has a `Syscall classification: <name>`
+        // issue on rrnewton/hermit and is owned by the syscall-implementation
+        // backlog (impl-syscall-implement-batch2). Do not promote one to PassThrough
+        // without confirming it is non-blocking and deterministic; do not silently
+        // ENOSYS one that real programs depend on.
+        Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
-        | Sysno::afs_syscall
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::chroot
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::create_module
         | Sysno::delete_module
         | Sysno::epoll_pwait2
         | Sysno::fanotify_init
@@ -339,12 +401,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
-        | Sysno::get_kernel_syms
         | Sysno::get_mempolicy
-        | Sysno::get_robust_list
-        | Sysno::get_thread_area
         | Sysno::getitimer
-        | Sysno::getpmsg
         | Sysno::init_module
         | Sysno::io_cancel
         | Sysno::io_destroy
@@ -354,8 +412,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::io_submit
         | Sysno::ioperm
         | Sysno::iopl
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::kexec_file_load
         | Sysno::kexec_load
@@ -364,7 +420,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
         | Sysno::listmount
-        | Sysno::lookup_dcookie
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
@@ -375,9 +430,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mincore
         | Sysno::mknod
         | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
         | Sysno::modify_ldt
         | Sysno::mount
         | Sysno::mount_setattr
@@ -394,7 +446,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgsnd
         | Sysno::name_to_handle_at
-        | Sysno::nfsservctl
         | Sysno::open_by_handle_at
         | Sysno::open_tree
         | Sysno::openat2
@@ -413,16 +464,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
         | Sysno::ptrace
-        | Sysno::putpmsg
         | Sysno::pwritev
         | Sysno::pwritev2
-        | Sysno::query_module
         | Sysno::quotactl
         | Sysno::quotactl_fd
         | Sysno::readv
         | Sysno::reboot
         | Sysno::recvmmsg
-        | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
@@ -437,7 +485,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setparam
         | Sysno::sched_setscheduler
         | Sysno::seccomp
-        | Sysno::security
         | Sysno::select
         | Sysno::semctl
         | Sysno::semget
@@ -446,44 +493,29 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sendfile
         | Sysno::set_mempolicy
         | Sysno::set_mempolicy_home_node
-        | Sysno::set_thread_area
         | Sysno::setdomainname
-        | Sysno::setfsgid
-        | Sysno::setfsuid
-        | Sysno::setgid
-        | Sysno::setgroups
         | Sysno::sethostname
         | Sysno::setns
-        | Sysno::setregid
-        | Sysno::setresgid
-        | Sysno::setresuid
-        | Sysno::setreuid
         | Sysno::settimeofday
-        | Sysno::setuid
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
         | Sysno::swapoff
         | Sysno::swapon
-        | Sysno::sync
-        | Sysno::syncfs
-        | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
-        | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
-        | Sysno::uselib
+        // Still implemented on modern kernels (returns EINVAL for bad args, not
+        // ENOSYS), so it is kept fail-closed rather than deterministically refused.
         | Sysno::ustat
         | Sysno::vhangup
-        | Sysno::vmsplice
-        | Sysno::vserver => SyscallClassification::Unclassified,
+        | Sysno::vmsplice => SyscallClassification::Unimplemented,
         // ===== END UNCLASSIFIED =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
@@ -491,6 +523,73 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // external-enum language requirement and deliberately fails closed.
         _unexpected => panic!("unclassified Sysno outside pinned ABI"),
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#715): Review the deterministic ENOSYS refusal set.
+/// Subset of [`SyscallClassification::Determinized`] that Detcore refuses with a
+/// deterministic `ENOSYS`. These syscalls are obsolete, removed, or never
+/// implemented on modern x86_64 Linux, so the kernel itself returns `ENOSYS`;
+/// refusing them deterministically is a no-op relative to a real kernel and
+/// removes them from the fail-closed backlog without any behavior regression.
+/// Keep this list in sync with the "Deterministic refusal" block of
+/// [`classify_syscall`]; a unit test enforces that every member classifies as
+/// `Determinized`.
+pub(crate) const fn is_deterministically_refused(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::_sysctl
+            | Sysno::afs_syscall
+            | Sysno::create_module
+            | Sysno::get_kernel_syms
+            | Sysno::getpmsg
+            | Sysno::lookup_dcookie
+            | Sysno::nfsservctl
+            | Sysno::putpmsg
+            | Sysno::query_module
+            | Sysno::security
+            | Sysno::sysfs
+            | Sysno::tuxcall
+            | Sysno::uselib
+            | Sysno::vserver
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#715): Review the audited safe-passthrough set.
+/// Subset of [`SyscallClassification::PassThrough`] that is forwarded by `Sysno`
+/// rather than through the typed `Syscall` dispatch table, because the pinned
+/// Reverie revision exposes several of these only as raw calls. Every member is
+/// non-blocking and deterministic under Hermit's fixed-container identity, stable
+/// filesystem, and serialized single-CPU model. Keep this list in sync with the
+/// "Audited safe passthroughs" block of [`classify_syscall`]; a unit test
+/// enforces that every member classifies as `PassThrough`.
+pub(crate) const fn is_extra_passthrough(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::close_range
+            | Sysno::get_robust_list
+            | Sysno::get_thread_area
+            | Sysno::ioprio_get
+            | Sysno::ioprio_set
+            | Sysno::mlock
+            | Sysno::mlock2
+            | Sysno::mlockall
+            | Sysno::remap_file_pages
+            | Sysno::set_thread_area
+            | Sysno::setfsgid
+            | Sysno::setfsuid
+            | Sysno::setgid
+            | Sysno::setgroups
+            | Sysno::setregid
+            | Sysno::setresgid
+            | Sysno::setresuid
+            | Sysno::setreuid
+            | Sysno::setuid
+            | Sysno::shutdown
+            | Sysno::sync
+            | Sysno::syncfs
+    )
 }
 
 #[cfg(test)]
@@ -505,12 +604,43 @@ mod tests {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unclassified => counts[2] += 1,
+                SyscallClassification::Unimplemented => counts[2] += 1,
             }
         }
 
-        assert_eq!(counts, [128, 74, 171]);
+        // 128 handled + 14 deterministic-ENOSYS-refusal = 142 Determinized;
+        // 74 existing + 22 audited safe passthroughs = 96 PassThrough;
+        // 135 audited determinization backlog = Unimplemented.
+        assert_eq!(counts, [142, 96, 135]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
+    }
+
+    #[test]
+    fn refusal_and_extra_passthrough_helpers_match_the_table() {
+        // Every deterministically-refused syscall must classify as Determinized so
+        // the dispatch guard in lib.rs is only ever reached for a Determinized call.
+        // Every extra passthrough must classify as PassThrough for the same reason.
+        // The two helper sets must also be disjoint.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_deterministically_refused(sysno) {
+                assert_eq!(
+                    classify_syscall(sysno),
+                    SyscallClassification::Determinized,
+                    "{sysno:?} is refused but not Determinized",
+                );
+                assert!(
+                    !is_extra_passthrough(sysno),
+                    "{sysno:?} is both refused and extra-passthrough",
+                );
+            }
+            if is_extra_passthrough(sysno) {
+                assert_eq!(
+                    classify_syscall(sysno),
+                    SyscallClassification::PassThrough,
+                    "{sysno:?} is extra-passthrough but not PassThrough",
+                );
+            }
+        }
     }
 
     #[test]
@@ -635,8 +765,22 @@ mod tests {
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
+        // Audited determinization backlog stays fail-closed under --strict.
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Unimplemented
+            );
+        }
+        // Obsolete/removed syscalls are Determinized via deterministic ENOSYS refusal.
+        for sysno in [Sysno::_sysctl, Sysno::uselib, Sysno::vserver] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_deterministically_refused(sysno));
+        }
+        // Audited safe, non-blocking, deterministic passthroughs.
+        for sysno in [Sysno::setuid, Sysno::close_range, Sysno::sync] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
+            assert!(is_extra_passthrough(sysno));
         }
     }
 }
