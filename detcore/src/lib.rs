@@ -227,6 +227,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-762): Initialized procfs snapshots own their
+        // logical open-file offset. The initial capture consumes the host fd,
+        // so forwarding a later seek would update the wrong offset. This is
+        // required by procps 4, which primes /proc/meminfo and then rewinds the
+        // same fd before selecting vmstat fields.
+        if let Syscall::Lseek(seek) = call {
+            let result = guest.thread_state().with_detfd(seek.fd(), |detfd| {
+                detfd.seek_procfs(seek.offset(), seek.whence())
+            })?;
+            if let Some(result) = result {
+                return result.map_err(Error::from);
+            }
+        }
         Ok(self.record_or_replay(guest, call).await?)
     }
 
