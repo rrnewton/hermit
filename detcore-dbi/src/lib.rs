@@ -134,6 +134,7 @@ fn load_dbi_config() -> (Config, ConfigSource) {
 }
 
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
+// TODO-HUMAN-REVIEW(PR-743): Review native clone scheduling and registration ordering.
 fn requires_native_lifecycle(sysnum: i64) -> bool {
     match sysnum {
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -198,6 +199,7 @@ struct ThreadRuntime {
     post_exec_pending: bool,
 }
 
+// TODO-HUMAN-REVIEW(PR-743): Review the scratch ABI shared with DynamoRIO.
 #[repr(C)]
 struct NativeThreadScratch {
     branches: u64,
@@ -535,6 +537,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 ///
 /// The native client must pass a valid writable `scratch` pointer, a live
 /// DynamoRIO `context`, and callback pointers valid for this application.
+// TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -622,6 +625,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 ///
 /// `scratch` must name the initialized parent state, `context` must be its
 /// live DynamoRIO context, and callback pointers must remain valid.
+// TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(

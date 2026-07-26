@@ -203,6 +203,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// The caller must initialize the child's local thread state from the same
     /// parent state and clone flags before the child enters its start hook.
+    // TODO-HUMAN-REVIEW(PR-743): Review the backend-neutral native child registration API.
     pub async fn register_external_child<G: Guest<Self>>(
         &self,
         guest: &mut G,
