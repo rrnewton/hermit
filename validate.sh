@@ -37,6 +37,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix;
 #                                            # STRICT_COMPAT_HERMIT_BIN reuses
 #                                            # an existing executable
+#   ./validate.sh --hosted-strict-compat-only # hosted L2 matrix with bounded diagnostics
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
@@ -73,6 +74,7 @@ function select_validation_level {
     VALIDATION_LEVEL_EXPLICIT=1
 }
 STRICT_COMPAT_ONLY=0
+HOSTED_STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
@@ -101,6 +103,9 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
+        # TODO-HUMAN-REVIEW(#719): Review the focused hosted compatibility CLI.
+        --hosted-strict-compat-only)
+            STRICT_COMPAT_ONLY=1; HOSTED_STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#688): Review the focused LiteInst compatibility CLI.
@@ -143,6 +148,7 @@ fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
 [[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
+((HOSTED_STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="hosted-strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
@@ -156,6 +162,7 @@ case "$VALIDATION_PROFILE" in
     full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
     super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
     strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    hosted-strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     liteinst-compat-only) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
@@ -197,7 +204,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
+readonly STRICT_COMPAT_ONLY HOSTED_STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
 readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
@@ -1365,7 +1372,7 @@ function strict_compatibility_probe {
     local nonblocking=0
     local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --)
-    if [[ $VALIDATION_PROFILE == hosted-only ]]; then
+    if [[ $VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1 ]]; then
         run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
         if [[ -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
             probe_timeout=20
@@ -1422,7 +1429,7 @@ function strict_compatibility_probe {
         printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
             "$label" "$assurance" "$status" "$summary"
         record_compatibility_result "$label" FAIL "exit $status: $summary"
-        if [[ $VALIDATION_PROFILE == hosted-only && -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
+        if [[ ($VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1) && -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
             nonblocking=1
             HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=$((HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT + 1))
             printf "  WARN %s is a bounded hosted diagnostic: %s\n" \

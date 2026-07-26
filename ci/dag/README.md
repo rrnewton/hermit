@@ -85,7 +85,7 @@ moving parts:
 
 - **Composite envelope gates reuse `validate.sh`'s own standalone entrypoints**
   so there is one source of truth: `test.strict_compat` runs
-  `./validate.sh --strict-compat-only`, and (hardware) `rr.compat_baseline`
+  `./validate.sh --hosted-strict-compat-only`, and (hardware) `rr.compat_baseline`
   runs `./validate.sh --rr-compat-only`. The hardware flag builds release;
   hosted strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
