@@ -218,6 +218,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl_fd
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#775): close_range(first, last, flags) bulk-closes the
+        // guest's own descriptor range. It is a deterministic descriptor-table
+        // operation with no host-varying result: Detcore forwards the close to the
+        // kernel and mirrors it in its virtual fd table (releasing pipe/socket
+        // ports), exactly as handle_close does for a single fd. Untyped
+        // (Syscall::Other) in the pinned Reverie, so dispatched on the Sysno in
+        // lib.rs before the typed match below.
+        | Sysno::close_range
         // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling policy =====
         // Hermit presents a single deterministic virtual CPU and a single virtual
         // NUMA node, and Detcore replaces the Linux scheduler with its own. NUMA
@@ -466,6 +475,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::set_thread_area
         | Sysno::sync
         | Sysno::syncfs
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#775): shutdown(sockfd, how) is a guest-owned socket
+        // half-close. Hermit does not virtualize the network, so it forwards to the
+        // real (loopback/UNIX) socket; the return is a deterministic function of the
+        // fd and how argument with no host-varying data written to guest memory,
+        // matching how the rest of the socket family is handled. Pass-through keeps
+        // the kernel's socket state authoritative for the subsequent recv/send that
+        // Detcore already forwards.
+        | Sysno::shutdown
         => SyscallClassification::PassThrough,
         // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
 
@@ -481,7 +499,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::epoll_pwait2
         | Sysno::flock
@@ -548,7 +565,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
@@ -720,7 +736,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [200, 92, 81]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -779,6 +795,8 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+            // Batch 21: bulk descriptor close mirrored into the virtual fd table.
+            Sysno::close_range,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
@@ -867,6 +885,8 @@ mod tests {
             Sysno::set_thread_area,
             Sysno::sync,
             Sysno::syncfs,
+            // Batch 21: socket half-close forwarded to the non-virtualized network.
+            Sysno::shutdown,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }

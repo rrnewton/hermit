@@ -194,6 +194,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#775): close_range(first, last, flags) bulk-closes the
+    // guest's descriptor range. Forward it to the kernel (record/replay aware) and,
+    // on success, mirror the effect in Detcore's virtual fd table by releasing the
+    // pipe/socket port for every tracked descriptor in range, exactly as
+    // handle_close does for a single fd. CLOSE_RANGE_CLOEXEC only marks the range
+    // close-on-exec without closing it, so the descriptors stay in the table.
+    /// Handle `close_range`, mirroring every closed descriptor into the fd table.
+    pub async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        // CLOSE_RANGE_CLOEXEC == 0x2 (see <linux/close_range.h>).
+        const CLOSE_RANGE_CLOEXEC: u32 = 0x2;
+        let (first, last, flags) = match &call {
+            Syscall::Other(_, args) => (args.arg0 as u32, args.arg1 as u32, args.arg2 as u32),
+            _ => unreachable!("close_range unexpectedly gained a typed variant"),
+        };
+
+        let res = self.record_or_replay(guest, call).await;
+        let closed_ok = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
+        if closed_ok && (flags & CLOSE_RANGE_CLOEXEC) == 0 {
+            let fds = guest.thread_state().fds_in_range(first, last);
+            for fd in fds {
+                if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+                trace!("Closed {} via close_range", fd);
+            }
+        }
+        res.map_err(Error::from)
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

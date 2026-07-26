@@ -412,6 +412,17 @@ impl FileMetadata {
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
+    /// List every tracked fd within the inclusive `[first, last]` range. The
+    /// bounds are unsigned because `close_range` accepts `~0u32` for "to the
+    /// highest fd"; tracked fds are always non-negative.
+    fn fds_in_range(&self, first: u32, last: u32) -> Vec<RawFd> {
+        self.file_handles
+            .keys()
+            .copied()
+            .filter(|&fd| fd >= 0 && (fd as u32) >= first && (fd as u32) <= last)
+            .collect()
+    }
+
     /// dup raw fds.
     fn dup_fd(
         &mut self,
@@ -1122,6 +1133,11 @@ impl<T> ThreadState<T> {
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
+    }
+
+    /// List every tracked fd within the inclusive `[first, last]` range.
+    pub fn fds_in_range(&self, first: u32, last: u32) -> Vec<RawFd> {
+        self.metadata().fds_in_range(first, last)
     }
 
     /// dup raw fds.

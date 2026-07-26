@@ -1354,6 +1354,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Ok(0)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#775): close_range is untyped in the pinned Reverie
+            // revision, so dispatch on the Sysno before the typed match below. The
+            // handler forwards the bulk close to the kernel and mirrors it in
+            // Detcore's virtual fd table, releasing pipe/socket ports for every
+            // closed descriptor exactly as handle_close does for a single fd.
+            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                self.handle_close_range(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
             // and namespace administration syscalls (mount/umount2/mount_setattr/
             // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
