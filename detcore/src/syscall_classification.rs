@@ -99,6 +99,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::madvise
         | Sysno::membarrier
         | Sysno::memfd_create
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-165): Deterministic mincore emulation (all-resident).
+        | Sysno::mincore
         | Sysno::mmap
         | Sysno::mremap
         | Sysno::munmap
@@ -548,7 +551,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
         | Sysno::memfd_secret
-        | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::openat2
         | Sysno::perf_event_open
@@ -757,7 +759,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [210, 91, 72]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -803,6 +805,12 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::madvise),
+            SyscallClassification::Determinized
+        );
+        // mincore is deterministically emulated (all pages resident) rather than
+        // aborting under --strict; it must not slip back to Unsupported.
+        assert_eq!(
+            classify_syscall(Sysno::mincore),
             SyscallClassification::Determinized
         );
         assert_eq!(
