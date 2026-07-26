@@ -112,7 +112,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::membarrier
         | Sysno::memfd_create
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-165): Deterministic mincore emulation (all-resident).
+        // TODO-HUMAN-REVIEW(#775): Deterministic mincore emulation (all-resident).
         | Sysno::mincore
         | Sysno::mmap
         | Sysno::mremap

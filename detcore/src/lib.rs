@@ -1632,7 +1632,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
                 Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-165)
+                // TODO-HUMAN-REVIEW(#775)
                 Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
