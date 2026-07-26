@@ -19,7 +19,7 @@ use reverie_syscalls::Errno;
 use reverie_syscalls::Syscall;
 
 /// Environment variable containing the coordinator's Unix-domain socket path.
-// TODO-HUMAN-REVIEW(PR-PENDING): Review the private SaBRe exec environment contract.
+// TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
