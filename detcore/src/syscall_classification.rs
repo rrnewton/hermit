@@ -48,6 +48,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clone
         | Sysno::clone3
         | Sysno::close
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#batch18): close_range has a Detcore handler that
+        // injects the real syscall and syncs the Detcore fd table.
+        | Sysno::close_range
         | Sysno::connect
         | Sysno::creat
         | Sysno::dup
@@ -58,6 +62,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::epoll_ctl
         | Sysno::epoll_ctl_old
         | Sysno::epoll_pwait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#batch18): epoll_pwait2 is handled like epoll_pwait
+        // (untyped in the pinned Reverie, dispatched via Syscall::Other).
+        | Sysno::epoll_pwait2
         | Sysno::epoll_wait
         | Sysno::epoll_wait_old
         | Sysno::eventfd
@@ -450,6 +458,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#batch18): flock is an advisory whole-file lock with no
+        // data/time/identity/host-entropy input; for the sequentialized single guest
+        // it is a deterministic pass-through.
+        | Sysno::flock
         | Sysno::get_thread_area
         | Sysno::mknod
         | Sysno::mknodat
@@ -481,10 +494,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::epoll_pwait2
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -720,7 +730,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [201, 92, 80]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -761,6 +771,20 @@ mod tests {
         assert_eq!(
             classify_syscall(Sysno::writev),
             SyscallClassification::Determinized
+        );
+        // batch18: close_range and epoll_pwait2 gained deterministic handlers
+        // (dispatched via Syscall::Other); flock is a reviewed pass-through.
+        assert_eq!(
+            classify_syscall(Sysno::close_range),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::epoll_pwait2),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::flock),
+            SyscallClassification::PassThrough
         );
         for sysno in [
             Sysno::clock_settime,

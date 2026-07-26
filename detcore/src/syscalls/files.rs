@@ -194,6 +194,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    /// `close_range(first, last, flags)` closes every open fd in the inclusive
+    /// range `[first, last]`. The pinned Reverie revision has no typed
+    /// representation, so it arrives as a raw `Syscall::Other`.
+    ///
+    /// The real syscall is injected so the kernel actually closes the host fds,
+    /// then Detcore's per-thread fd table is synchronised: every tracked fd in
+    /// the range is removed and its open-file port released, mirroring
+    /// [`Self::handle_close`]. `CLOSE_RANGE_CLOEXEC` only sets the close-on-exec
+    /// flag (it does not close the fds), so the fd table is left untouched in
+    /// that case.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#batch18)
+    pub async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        // CLOSE_RANGE_CLOEXEC (1 << 2) sets O_CLOEXEC rather than closing.
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+        let (first, last, flags) = match &call {
+            Syscall::Other(_, args) => (args.arg0 as u32, args.arg1 as u32, args.arg2 as u32),
+            _ => unreachable!("close_range unexpectedly gained a typed variant"),
+        };
+        let res = self.record_or_replay(guest, call).await?;
+        if flags & CLOSE_RANGE_CLOEXEC == 0 {
+            for fd in guest.thread_state().fds_in_range(first, last) {
+                if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+            }
+        }
+        Ok(res)
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

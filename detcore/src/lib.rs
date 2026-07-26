@@ -1389,6 +1389,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 Err(Error::Errno(Errno::ENOSYS))
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#batch18): epoll_pwait2 is epoll_pwait with a
+            // struct timespec timeout instead of an int-millisecond one; the
+            // kernel enforces the timeout. It is untyped (Syscall::Other) in the
+            // pinned Reverie, so dispatch on the Sysno and handle it exactly like
+            // epoll_pwait (empty resource request + record/replay of the raw call).
+            SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
+                self.handle_epoll_pwait2(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#batch18): close_range closes every fd in an
+            // inclusive range. It is untyped (Syscall::Other) in the pinned
+            // Reverie, so dispatch on the Sysno; the handler injects the real
+            // syscall and then syncs Detcore's per-thread fd table.
+            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                self.handle_close_range(guest, call).await
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED

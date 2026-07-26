@@ -624,6 +624,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    /// epoll_pwait2 syscall (MAYHANG).
+    ///
+    /// `epoll_pwait2` is `epoll_pwait` with a `struct timespec` timeout instead
+    /// of an int-millisecond one; the kernel still enforces the timeout. The
+    /// pinned Reverie revision has no typed representation, so it arrives as a
+    /// raw `Syscall::Other` and is handled exactly like [`Self::handle_epoll_pwait`]
+    /// (an empty resource request followed by record/replay of the raw call).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#batch18)
+    pub async fn handle_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await; // empty request
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
     /// epoll_wait syscall (MAYHANG)
     pub async fn handle_epoll_wait<G: Guest<Self>>(
         &self,

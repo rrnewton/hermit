@@ -1124,6 +1124,18 @@ impl<T> ThreadState<T> {
         self.metadata().remove_fd(fd)
     }
 
+    /// Return every tracked raw fd in the inclusive range `[first, last]`.
+    /// Used by `close_range` to synchronise the fd table after the kernel
+    /// closes a range of descriptors.
+    pub fn fds_in_range(&self, first: u32, last: u32) -> Vec<RawFd> {
+        self.metadata()
+            .file_handles
+            .keys()
+            .copied()
+            .filter(|&fd| fd >= 0 && (fd as u32) >= first && (fd as u32) <= last)
+            .collect()
+    }
+
     /// dup raw fds.
     pub fn dup_fd(
         &mut self,
