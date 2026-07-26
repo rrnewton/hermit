@@ -86,8 +86,10 @@ moving parts:
 - **Composite envelope gates reuse `validate.sh`'s own standalone entrypoints**
   so there is one source of truth: `test.strict_compat` runs
   `./validate.sh --strict-compat-only`, and (hardware) `rr.compat_baseline`
-  runs `./validate.sh --rr-compat-only`. These flags build the release binary
-  themselves.
+  runs `./validate.sh --rr-compat-only`. The hardware flag builds release;
+  hosted strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
+  preceding workspace build. Without that override, the strict flag builds
+  release as before.
 - **Serial per-target loops are inlined** as a `for` loop with `set -e`
   (`test.hermit_integration`, `hw.integration`, and the `pmu.*` exact-case
   gates), matching `run_hermit_targets_serial` / `run_exact_detcore_cases`

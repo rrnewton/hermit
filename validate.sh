@@ -34,7 +34,9 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
-#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix
+#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix;
+#                                            # STRICT_COMPAT_HERMIT_BIN reuses
+#                                            # an existing executable
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
@@ -272,7 +274,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
-STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
+readonly DEFAULT_STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$DEFAULT_STRICT_COMPAT_HERMIT_BIN"}
 readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
@@ -2906,9 +2909,16 @@ if ((HARDWARE_ONLY == 1)); then
 fi
 
 if ((STRICT_COMPAT_ONLY == 1)); then
-    run_check "Build release Hermit for strict compatibility" \
-        cargo build --release -p hermit
-    if ((failures != 0)); then
+    # TODO-HUMAN-REVIEW(#719): Review reuse of a caller-provided Hermit binary.
+    if [[ $STRICT_COMPAT_HERMIT_BIN == "$DEFAULT_STRICT_COMPAT_HERMIT_BIN" ]]; then
+        run_check "Build release Hermit for strict compatibility" \
+            cargo build --release -p hermit
+        if ((failures != 0)); then
+            exit 1
+        fi
+    elif [[ ! -x $STRICT_COMPAT_HERMIT_BIN ]]; then
+        printf "Configured strict compatibility Hermit is not executable: %s\n" \
+            "$STRICT_COMPAT_HERMIT_BIN" >&2
         exit 1
     fi
     run_strict_compatibility_envelope
