@@ -81,7 +81,7 @@ SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 HARDWARE_ONLY=0
-# TODO-HUMAN-REVIEW(PR-732): Review the focused full-corpus backend compatibility CLI.
+# TODO-HUMAN-REVIEW(PR-734): Review the focused full-corpus backend compatibility CLI.
 BACKEND_COMPAT_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -115,7 +115,7 @@ while [[ $# -gt 0 ]]; do
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
-        # TODO-HUMAN-REVIEW(PR-732): Review the focused full-corpus backend compatibility CLI.
+        # TODO-HUMAN-REVIEW(PR-734): Review the focused full-corpus backend compatibility CLI.
         --backend-compat-only) BACKEND_COMPAT_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
@@ -308,7 +308,7 @@ readonly SABRE_COMPAT_TOTAL=151
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
-# TODO-HUMAN-REVIEW(PR-732): When non-empty (ptrace|kvm|dbi), the strict corpus runs
+# TODO-HUMAN-REVIEW(PR-734): When non-empty (ptrace|kvm|dbi), the strict corpus runs
 # with COMPATIBILITY_MODE=strict (so the FULL ~181-program set is exercised) but each
 # probe is executed under `--backend $COMPAT_BACKEND` with a 30s/program cap, and the
 # corpus result is recorded per backend and reported non-blocking. Empty = default
@@ -772,7 +772,7 @@ function hermit_record_replay_smoke {
 }
 
 function backend_selector_supported {
-    # TODO-HUMAN-REVIEW(PR-732): Accept an explicit binary so callers that only built the
+    # TODO-HUMAN-REVIEW(PR-734): Accept an explicit binary so callers that only built the
     # release binary (e.g. --backend-compat-only) probe the same binary the corpus uses.
     local bin=${1:-$HERMIT_BIN}
     "$bin" run --help 2>&1 | grep -q -- '--backend'
@@ -783,7 +783,7 @@ function kvm_backend_available {
 }
 
 function dbi_backend_available {
-    # TODO-HUMAN-REVIEW(PR-732): Accept an explicit binary (release for --backend-compat-only).
+    # TODO-HUMAN-REVIEW(PR-734): Accept an explicit binary (release for --backend-compat-only).
     local bin=${1:-$HERMIT_BIN}
     timeout "$HERMIT_SMOKE_TIMEOUT" \
         "$bin" run --backend dbi -- /bin/true \
@@ -801,7 +801,7 @@ function note_backend_skip {
     printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason" >>"$LOG_FILE"
 }
 
-# TODO-HUMAN-REVIEW(PR-732): Run the entire strict compatibility corpus under one
+# TODO-HUMAN-REVIEW(PR-734): Run the entire strict compatibility corpus under one
 # alternate backend and report real numbers without blocking. This replaces the old
 # 4-program spot-check as the source of the KVM/DBI columns in the COMPAT SUMMARY.
 function run_backend_compatibility_report {
@@ -868,7 +868,7 @@ function run_full_backend_gates {
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#706): Review the canonical cross-backend compatibility summary.
 function compat_summary_backend {
-    # TODO-HUMAN-REVIEW(PR-732): A non-empty COMPAT_BACKEND overrides the mode->backend
+    # TODO-HUMAN-REVIEW(PR-734): A non-empty COMPAT_BACKEND overrides the mode->backend
     # mapping so the full strict corpus can be attributed to ptrace/kvm/dbi cells.
     if [[ -n $COMPAT_BACKEND ]]; then
         printf "%s" "$COMPAT_BACKEND"
@@ -1448,7 +1448,7 @@ function strict_compatibility_probe {
         fi
     fi
 
-    # TODO-HUMAN-REVIEW(PR-732): Full-corpus alternate-backend probe. Runs the same
+    # TODO-HUMAN-REVIEW(PR-734): Full-corpus alternate-backend probe. Runs the same
     # strict L2 command under an explicit backend selector with a bounded per-program
     # timeout so KVM/DBI exercise the whole corpus instead of a 4-program spot-check.
     if [[ -n $COMPAT_BACKEND ]]; then
@@ -1546,7 +1546,7 @@ function run_compatibility_corpus {
     HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
     if [[ -n $COMPAT_BACKEND ]]; then
-        # TODO-HUMAN-REVIEW(PR-732): Observational full-corpus run on one backend.
+        # TODO-HUMAN-REVIEW(PR-734): Observational full-corpus run on one backend.
         printf "\n== %s full compatibility corpus (L2, observational, non-blocking) ==\n" "$COMPAT_BACKEND"
         printf "=== %s full compatibility corpus (L2, observational, non-blocking) ===\n" \
             "$COMPAT_BACKEND" >>"$LOG_FILE"
@@ -2132,7 +2132,7 @@ function run_compatibility_corpus {
     fi
 
     total=$((passed + failed + known_flaky + unavailable))
-    # TODO-HUMAN-REVIEW(PR-732): Alternate-backend corpus is observational visibility,
+    # TODO-HUMAN-REVIEW(PR-734): Alternate-backend corpus is observational visibility,
     # not a blocking floor. Report the real per-backend pass/total and always succeed so
     # a partially-compatible backend (e.g. KVM at 138/180) cannot red the whole run.
     if [[ -n $COMPAT_BACKEND ]]; then
@@ -3041,7 +3041,7 @@ if ((QEMU_L2_ONLY == 1)); then
     exit $?
 fi
 
-# TODO-HUMAN-REVIEW(PR-732): Focused full-corpus backend compatibility report. Runs the
+# TODO-HUMAN-REVIEW(PR-734): Focused full-corpus backend compatibility report. Runs the
 # entire strict corpus under every available backend and prints real per-backend
 # pass/total (via the COMPAT SUMMARY emitted on exit). Observational: the exit status
 # reflects only build/harness failures, not per-backend compatibility gaps.
