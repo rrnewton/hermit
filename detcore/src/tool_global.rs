@@ -346,8 +346,10 @@ impl GlobalState {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-744): Review explicit abnormal-backend scheduler cancellation.
-    /// Cancels the scheduler after a backend reports that its guest exited abnormally.
-    pub async fn cancel_scheduler(&mut self) {
+    /// Cancels the internally spawned scheduler task after a backend guest exits abnormally.
+    ///
+    /// External-scheduler states do not own a task and are left unchanged.
+    pub async fn cancel_internal_scheduler(&mut self) {
         if let Some(handle) = self.sched_handle.take() {
             handle.abort();
             match handle.await {
@@ -1939,7 +1941,7 @@ mod tests {
             ..Config::default()
         };
         let mut state = GlobalState::initialize(&config, true);
-        state.cancel_scheduler().await;
+        state.cancel_internal_scheduler().await;
         let summary_path = None;
         let cleanup = state.clean_up(false, &summary_path);
 
@@ -1976,7 +1978,7 @@ mod tests {
         }
         tokio::task::yield_now().await;
 
-        state.cancel_scheduler().await;
+        state.cancel_internal_scheduler().await;
         let summary_path = None;
         assert!(
             tokio::time::timeout(

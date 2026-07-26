@@ -771,7 +771,7 @@ pub fn run_with_backend(
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     matches!(
         status,
-        ExitStatus::Exited(123..=126) | ExitStatus::Signaled(_, _)
+        ExitStatus::Exited(122..=127) | ExitStatus::Signaled(_, _)
     )
 }
 
@@ -806,7 +806,7 @@ async fn run_with_backend_inner(
             .await?;
         if liteinst_requires_forced_shutdown(exit_status) {
             global_state.force_shutdown_with_error();
-            global_state.cancel_scheduler().await;
+            global_state.cancel_internal_scheduler().await;
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
@@ -894,7 +894,7 @@ async fn run_with_output_backend_inner(
         let status = output.status.into();
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
-            global_state.cancel_scheduler().await;
+            global_state.cancel_internal_scheduler().await;
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
@@ -1136,14 +1136,27 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Backend;
+    use super::ExitStatus;
     use super::dbi_runtime_unavailable_reason;
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
+    use super::liteinst_requires_forced_shutdown;
     use super::liteinst_runtime_unavailable_reason;
     use super::resolve_kvm_shebang;
     use super::sabre_runtime_unavailable_reason;
+
+    #[test]
+    fn liteinst_reserved_failures_require_scheduler_cancellation() {
+        for status in 122..=127 {
+            assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(
+                status
+            )));
+        }
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
+        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+    }
 
     #[test]
     fn default_and_available_backends_reflect_host_probes() {
