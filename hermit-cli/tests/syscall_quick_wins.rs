@@ -43,55 +43,57 @@ fn deterministic_passthrough_syscalls_verify() {
         .arg(&guest);
     command_output(compile, "syscall quick-wins guest compilation");
 
-    let mut trace = Command::new("timeout");
-    trace
-        .args(["--kill-after", "5s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=trace",
-            "run",
-            "--backend=ptrace",
-            "--strict",
-            "--panic-on-unsupported-syscalls",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest);
-    let trace_output = command_output(trace, "strict syscall quick-wins trace");
-    let trace_stdout = String::from_utf8_lossy(&trace_output.stdout);
-    let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
-    assert!(
-        trace_stdout.contains("syscall-quick-wins-ok"),
-        "guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
-    );
-    for syscall in ["getresuid", "getresgid", "munlock", "munlockall", "fsync"] {
+    let mut backends = vec!["ptrace"];
+    if Path::new("/dev/kvm").exists() {
+        backends.push("kvm");
+    }
+    for backend in backends {
+        let mut trace = Command::new("timeout");
+        trace
+            .args(["--kill-after", "5s", "60s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=trace", "run"])
+            .arg(format!("--backend={backend}"))
+            .args(["--strict", "--panic-on-unsupported-syscalls", "--tmp=/tmp"]);
+        trace.args(["--base-env=minimal", "--"]).arg(&guest);
+        let trace_output =
+            command_output(trace, &format!("{backend} strict syscall quick-wins trace"));
+        let trace_stdout = String::from_utf8_lossy(&trace_output.stdout);
+        let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
         assert!(
-            trace_stderr.contains(&format!("inbound syscall: {syscall}(")),
-            "trace omitted {syscall}\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+            trace_stdout.contains("syscall-quick-wins-ok"),
+            "{backend} guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+        );
+        for syscall in ["getresuid", "getresgid", "munlock", "munlockall", "fsync"] {
+            assert!(
+                trace_stderr.contains(&format!("inbound syscall: {syscall}(")),
+                "{backend} trace omitted {syscall}\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+            );
+        }
+
+        let mut verify = Command::new("timeout");
+        verify
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "run"])
+            .arg(format!("--backend={backend}"))
+            .args([
+                "--strict",
+                "--verify",
+                "--panic-on-unsupported-syscalls",
+                "--tmp=/tmp",
+            ]);
+        verify.args(["--base-env=minimal", "--"]).arg(&guest);
+        let verify_output = command_output(
+            verify,
+            &format!("{backend} strict syscall quick-wins verification"),
+        );
+        let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
+        let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+        assert!(
+            verify_stdout.contains("Determinism verified")
+                || verify_stderr.contains("Determinism verified"),
+            "{backend} Hermit omitted its determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
         );
     }
-
-    let mut verify = Command::new("timeout");
-    verify
-        .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=off",
-            "run",
-            "--backend=ptrace",
-            "--strict",
-            "--verify",
-            "--panic-on-unsupported-syscalls",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest);
-    let verify_output = command_output(verify, "strict syscall quick-wins verification");
-    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
-    let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
-    assert!(
-        verify_stdout.contains("Determinism verified")
-            || verify_stderr.contains("Determinism verified"),
-        "Hermit omitted its determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
-    );
 }
