@@ -93,6 +93,9 @@ moving parts:
 - **The DBI stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
+- **Hosted strict compatibility starts after every non-guest Cargo node** so
+  its `shell-build` run1/run2 comparison cannot observe concurrent target or
+  cache mutation. Those short nodes still run in parallel before the barrier.
 - **Serial per-target loops are inlined** as a `for` loop with `set -e`
   (`test.hermit_integration`, `hw.integration`, and the `pmu.*` exact-case
   gates), matching `run_hermit_targets_serial` / `run_exact_detcore_cases`
