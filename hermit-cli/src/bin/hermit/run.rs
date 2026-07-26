@@ -644,6 +644,19 @@ fn backend_values_parse_and_round_trip() {
 }
 
 #[test]
+fn e9patch_rejects_no_namespace() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--backend",
+        "e9patch",
+        "--no-namespace",
+        "/bin/true",
+    ]);
+    let error = ro.validate_args_with_perf_support(true).unwrap_err();
+    assert!(error.to_string().contains("private mount namespace"));
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_selects_real_backend() {
     let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     let command = ro.guest_command().unwrap();
@@ -1317,6 +1330,12 @@ impl RunOpts {
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let liteinst_backend = self.selected_backend() == Backend::Liteinst;
+        if self.selected_backend() == Backend::E9patch && self.no_namespace {
+            anyhow::bail!(
+                "--backend=e9patch requires Hermit's private mount namespace so the rewritten \
+                 executable can retain its original path; --no-namespace is unsupported"
+            );
+        }
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = !self.no_namespace;
@@ -1822,6 +1841,19 @@ impl RunOpts {
                      effect; files outside /tmp are already visible unless another mount hides them",
                     bind.target.to_string_lossy()
                 );
+            }
+        }
+
+        if self.selected_backend() == Backend::E9patch {
+            let (e9tool, e9patch) = hermit::e9patch::tool_paths()?;
+            for tool in [e9tool, e9patch] {
+                if let Ok(relative_path) = tool.strip_prefix(TMP_DIR) {
+                    mounts.push(
+                        Mount::bind(&tool, tmpfs.join(relative_path))
+                            .readonly()
+                            .touch_target(),
+                    );
+                }
             }
         }
 

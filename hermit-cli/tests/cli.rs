@@ -1847,3 +1847,79 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         assert_failure_contains(&output, &expected);
     }
 }
+
+#[test]
+fn run_e9patch_preserves_executable_identity_at_l2() {
+    if std::env::var_os("REVERIE_E9TOOL").is_none() {
+        return;
+    }
+
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e9patch-identity");
+    fs::create_dir_all(&build_root).expect("failed to create e9patch identity fixture directory");
+    let source = build_root.join("identity.c");
+    let guest = build_root.join("identity");
+    fs::write(
+        &source,
+        r#"
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+__attribute__((noinline)) static long direct_getpid(void) {
+  register long result __asm__("rax") = SYS_getpid;
+  __asm__ volatile("syscall" : "+a"(result) : : "rcx", "r11", "memory");
+  return result;
+}
+
+int main(int argc, char **argv) {
+  char path[PATH_MAX];
+  if (argc != 1 || direct_getpid() <= 0) {
+    return 2;
+  }
+  ssize_t length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (length < 0 || (size_t)length >= sizeof(path)) {
+    return 3;
+  }
+  path[length] = '\0';
+  if (strcmp(path, argv[0]) != 0) {
+    fprintf(stderr, "executable identity mismatch: %s != %s\n", path, argv[0]);
+    return 4;
+  }
+  return 0;
+}
+"#,
+    )
+    .expect("failed to write e9patch identity fixture");
+    let compile = Command::new("cc")
+        .args(["-O0", "-fno-pie", "-no-pie", "-fno-stack-protector"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile e9patch identity fixture");
+    assert_success(&compile, &["cc", "e9patch identity fixture"]);
+
+    let guest = guest.to_str().expect("fixture path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "e9patch",
+        "--strict",
+        "--verify",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains(
+            "recovered_sites=1; patched_sites=1; b0_sites=0; event_source=injected-trap; controller=ptrace"
+        ),
+        "e9patch backend diagnostic missing:\n{}",
+        stderr(&output),
+    );
+    assert!(stderr(&output).contains("Success: deterministic."));
+}

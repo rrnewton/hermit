@@ -176,6 +176,11 @@ and other slow-path events. Rewritten root-ELF syscall events therefore originat
 in e9patch, but they still incur a ptrace stop in this implementation. This is
 not yet the planned ptrace-free in-guest fast path.
 
+E9patch requires Hermit's private mount namespace. The rewritten image is
+mounted read-only at the resolved original executable path for the duration of
+the run, preserving `/proc/self/exe`, `AT_EXECFN`, and `$ORIGIN`; therefore
+`--no-namespace` is rejected. Record/replay remains on the ptrace backend.
+
 Partial recovered-site coverage fails closed. B0 remains disabled because it
 reserves SIGILL, and privilege-bearing executables fail rather than silently
 losing set-ID or file-capability semantics. The shared `reverie-preload` and
