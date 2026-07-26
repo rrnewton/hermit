@@ -18,11 +18,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// These two syscalls are classified Unsupported by Detcore but still forward to
-// the host under the default (non-strict) policy, so they succeed here while
-// exercising the aggregate unsupported-syscall warning. Both return
-// deterministic results across repeat runs, keeping --verify stable: an unset
-// ITIMER_REAL reports zeros, and the robust-list head is fixed for the thread.
+// getitimer is now determinized by Detcore (PR-786): an unset ITIMER_REAL
+// deterministically reports zeros, so this call succeeds and is NOT counted as
+// unsupported. get_robust_list remains classified Unsupported but still forwards
+// to the host under the default (non-strict) policy, so it succeeds here while
+// exercising the aggregate unsupported-syscall warning; its robust-list head is
+// fixed for the thread, keeping --verify stable. Under --strict, getitimer
+// succeeds and get_robust_list is the syscall that fail-closes the guest.
 static int call_unsupported(void) {
   struct itimerval itv;
   if (syscall(SYS_getitimer, ITIMER_REAL, &itv) < 0) {
