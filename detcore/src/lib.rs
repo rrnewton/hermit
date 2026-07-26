@@ -1612,6 +1612,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetscheduler(_) => Ok(0),
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#763): sched_setattr/sched_getattr are the
+                // extensible successors to the sched_set*/sched_get* calls
+                // above. The setter is a no-op; the getter reports a fixed
+                // default SCHED_OTHER attribute block. Deterministic by
+                // construction under --verify and record/replay.
+                Syscall::SchedSetattr(_) => Ok(0),
+                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#763): I/O scheduling priority is
+                // inoperative on Hermit's single serialized virtual CPU. The
+                // setter is a no-op and the getter reports the fixed default
+                // class (0), so both are host-independent and deterministic.
+                Syscall::IoprioSet(_) => Ok(0),
+                Syscall::IoprioGet(_) => Ok(0),
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,

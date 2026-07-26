@@ -913,6 +913,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// sched_getattr under Hermit. Detcore replaces the Linux scheduler with its
+    /// own deterministic one, so a thread's Linux scheduling attributes are
+    /// inert. Report a fixed default SCHED_OTHER attribute block. The value is
+    /// emulated (never injected), so it is identical across --verify runs and
+    /// record/replay. This is the extensible-struct counterpart to
+    /// handle_sched_getparam above.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#763)
+    pub async fn handle_sched_getattr<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetattr,
+    ) -> Result<i64, Error> {
+        // Layout of the Linux uapi `struct sched_attr`. A fixed, zeroed block
+        // with policy SCHED_OTHER (0) reports the deterministic default.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SchedAttr {
+            size: u32,
+            sched_policy: u32,
+            sched_flags: u64,
+            sched_nice: i32,
+            sched_priority: u32,
+            sched_runtime: u64,
+            sched_deadline: u64,
+            sched_period: u64,
+        }
+        if let Some(attr) = call.attr() {
+            let struct_size = std::mem::size_of::<SchedAttr>() as u32;
+            // The caller advertises its buffer size in `size`. Refuse a
+            // too-small buffer with E2BIG exactly as Linux would, rather than
+            // writing past the guest's allocation.
+            if call.size() < struct_size {
+                return Err(Error::Errno(Errno::E2BIG));
+            }
+            let value = SchedAttr {
+                size: struct_size,
+                sched_policy: 0, // SCHED_OTHER
+                sched_flags: 0,
+                sched_nice: 0,
+                sched_priority: 0,
+                sched_runtime: 0,
+                sched_deadline: 0,
+                sched_period: 0,
+            };
+            guest.memory().write_value(attr.cast::<SchedAttr>(), &value)?;
+        }
+        Ok(0)
+    }
+
     /// sched_rr_get_interval under Hermit. The round-robin quantum is a property
     /// of the Linux scheduler, which Detcore does not use, so report a fixed zero
     /// interval. Being a constant, it is deterministic across --verify and

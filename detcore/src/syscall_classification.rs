@@ -240,6 +240,30 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#763): sched_setattr/sched_getattr are the modern
+        // extensible successors to sched_setscheduler/sched_setparam and
+        // sched_getscheduler/sched_getparam, which Batch 3 (#720) already
+        // determinizes above. Detcore replaces the Linux scheduler, so a
+        // thread's Linux scheduling attributes are inert: the setter is a no-op
+        // and the getter emulates a fixed default SCHED_OTHER attribute block
+        // (see the handlers in lib.rs / threads.rs). Left as passthrough their
+        // results depend on host scheduler state and privilege; determinized
+        // they are fixed and host-independent, so this unblocks chrt under
+        // fail-closed --strict.
+        | Sysno::sched_setattr
+        | Sysno::sched_getattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#763): I/O scheduling priority (ioprio_set/
+        // ioprio_get) is the I/O-side analogue of the CPU-scheduling policy
+        // above. Hermit presents a single deterministic virtual CPU and
+        // serializes guest threads, so per-thread/-process I/O priority cannot
+        // change guest-visible computation. Left as passthrough the getter's
+        // result depends on host I/O-scheduler state and privilege; determinized
+        // the setter is a no-op and the getter reports a fixed default, so this
+        // unblocks ionice under fail-closed --strict.
+        | Sysno::ioprio_set
+        | Sysno::ioprio_get
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
         // reconfigure mount and other namespaces, resolve files by kernel
@@ -466,6 +490,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::set_thread_area
         | Sysno::sync
         | Sysno::syncfs
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#763): flock places a BSD advisory lock on an open
+        // file description. For a guest-owned file in Hermit's fixed mount
+        // namespace and stable filesystem image, with no external mutation, the
+        // lock acquires/releases with a repeatable result (the same
+        // stable-filesystem assumption already applied to fsync/fdatasync/
+        // ftruncate/fallocate above). It returns no host-varying data, so
+        // forwarding it is deterministic under --verify and unblocks flock under
+        // fail-closed --strict.
+        | Sysno::flock
         => SyscallClassification::PassThrough,
         // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
 
@@ -484,15 +518,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::epoll_pwait2
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -526,8 +557,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
@@ -720,7 +749,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [203, 92, 78]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -867,6 +896,9 @@ mod tests {
             Sysno::set_thread_area,
             Sysno::sync,
             Sysno::syncfs,
+            // flock is a guest-owned-file advisory lock, repeatable under the
+            // stable-filesystem assumption (see #763).
+            Sysno::flock,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
@@ -885,6 +917,12 @@ mod tests {
             Sysno::sched_getscheduler,
             Sysno::sched_getparam,
             Sysno::sched_rr_get_interval,
+            // sched_setattr/getattr and ioprio_set/get extend the same
+            // inoperative-scheduling-policy rationale (see #763).
+            Sysno::sched_setattr,
+            Sysno::sched_getattr,
+            Sysno::ioprio_set,
+            Sysno::ioprio_get,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
