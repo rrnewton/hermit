@@ -139,7 +139,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
         | Sysno::pwrite64
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#792): Scatter/gather I/O. readv/preadv/preadv2/
+        // TODO-HUMAN-REVIEW(#794): Scatter/gather I/O. readv/preadv/preadv2/
         // pwritev/pwritev2 are the vectored forms of read/pread64/pwrite64 and
         // writev (which are already determinized). They carry no host-varying or
         // host-global state beyond the file content the scalar forms already
