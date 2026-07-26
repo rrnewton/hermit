@@ -263,16 +263,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.option() {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-769): PR_SET_KEEPCAPS is a per-thread flag
-            // controlling whether capabilities are preserved across a UID change.
-            // Under Detcore credentials are virtualized and this flag has no
-            // host-observable effect, so accept it as a deterministic no-op
-            // rather than returning ENOSYS. setpriv(1) (used by Meta's
-            // /usr/local/bin tool wrappers) calls prctl(PR_SET_KEEPCAPS, ...)
-            // and aborts with "keep process capabilities failed: Function not
-            // implemented" when it fails.
-            libc::PR_SET_KEEPCAPS => Ok(0),
             option if is_supported_prctl_option(option) => {
                 self.passthrough(guest, call.into()).await
             }

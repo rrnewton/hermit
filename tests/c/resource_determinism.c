@@ -129,6 +129,7 @@ static void check_limit_queries(void) {
 static void check_limit_mutations(void) {
   struct rlimit original = {0};
   struct rlimit raw_original = {0};
+  struct rlimit core_original = {0};
   struct rlimit changed = {0};
   struct rlimit observed = {0};
   struct rlimit previous = {0};
@@ -200,11 +201,55 @@ static void check_limit_mutations(void) {
     fail("restore after SYS_prlimit64");
   }
 
-  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &observed) != 0) {
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &core_original) != 0) {
     fail("SYS_prlimit64 RLIMIT_CORE query");
   }
-  require_prlimit_error(
-      0, RLIMIT_CORE, &observed, EPERM, "dangerous prlimit64 mutation");
+  changed = core_original;
+  changed.rlim_cur = 0;
+  if (syscall(SYS_setrlimit, RLIMIT_CORE, &changed) != 0) {
+    fail("SYS_setrlimit RLIMIT_CORE");
+  }
+  if (syscall(SYS_getrlimit, RLIMIT_CORE, &observed) != 0) {
+    fail("SYS_getrlimit after RLIMIT_CORE mutation");
+  }
+  require_limit("setrlimit RLIMIT_CORE mutation", &observed, &changed);
+  printf(
+      "setrlimit core %" PRIu64 ":%" PRIu64 "\n",
+      (uint64_t)observed.rlim_cur,
+      (uint64_t)observed.rlim_max);
+  if (syscall(SYS_setrlimit, RLIMIT_CORE, &core_original) != 0) {
+    fail("restore after SYS_setrlimit RLIMIT_CORE");
+  }
+
+  if (syscall(
+          SYS_prlimit64,
+          0,
+          RLIMIT_CORE,
+          &changed,
+          &previous) != 0) {
+    fail("SYS_prlimit64 RLIMIT_CORE mutation");
+  }
+  require_limit("prlimit64 RLIMIT_CORE previous", &previous, &core_original);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &observed) != 0) {
+    fail("SYS_prlimit64 after RLIMIT_CORE mutation");
+  }
+  require_limit("prlimit64 RLIMIT_CORE mutation", &observed, &changed);
+  printf(
+      "prlimit64 core old=%" PRIu64 ":%" PRIu64 " new=%" PRIu64
+      ":%" PRIu64 "\n",
+      (uint64_t)previous.rlim_cur,
+      (uint64_t)previous.rlim_max,
+      (uint64_t)observed.rlim_cur,
+      (uint64_t)observed.rlim_max);
+  if (syscall(
+          SYS_prlimit64,
+          0,
+          RLIMIT_CORE,
+          &core_original,
+          NULL) != 0) {
+    fail("restore after SYS_prlimit64 RLIMIT_CORE");
+  }
+
   require_prlimit_error(
       getpid() + 1, RLIMIT_NOFILE, NULL, EPERM, "other-pid prlimit64 query");
   require_prlimit_error(

@@ -471,6 +471,8 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "setrlimit libc",
             "setrlimit syscall",
             "prlimit64",
+            "setrlimit core",
+            "prlimit64 core",
             "prlimit64 refusals deterministic",
             "prlimit64 fork inheritance deterministic",
             "rusage self maxrss",
