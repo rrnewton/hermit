@@ -353,7 +353,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the experimental LiteInst preload compatibility backend.
+    /// Use the LiteInst in-process backend with the Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -698,6 +698,14 @@ pub fn run_with_backend(
     )
 }
 
+// TODO-HUMAN-REVIEW(PR-pending): Review reserved LiteInst runtime failure statuses.
+fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
+    matches!(
+        status,
+        ExitStatus::Exited(123..=126) | ExitStatus::Signaled(_, _)
+    )
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
     command: Command,
@@ -716,6 +724,20 @@ async fn run_with_backend_inner(
         )
         .await?
         .status);
+    }
+    if backend == Backend::Liteinst {
+        let preload = liteinst_runtime_library_path()?;
+        let (exit_status, global_state) = reverie_liteinst::LiteinstBackend::run_with_preload::<
+            Detcore,
+        >(command, config, preload)
+        .await?;
+        if liteinst_requires_forced_shutdown(exit_status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
 
@@ -783,6 +805,27 @@ async fn run_with_output_backend_inner(
             true,
         )
         .await;
+    }
+    if backend == Backend::Liteinst {
+        command.stdin(Stdio::null());
+        let preload = liteinst_runtime_library_path()?;
+        let (output, global_state) =
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+                command, config, preload,
+            )
+            .await?;
+        let status = output.status.into();
+        if liteinst_requires_forced_shutdown(status) {
+            global_state.force_shutdown_with_error();
+        }
+        global_state
+            .clean_up(print_summary, print_summary_to_json_file)
+            .await;
+        return Ok(Output {
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
     }
     ensure_backend_dispatch(backend)?;
 
