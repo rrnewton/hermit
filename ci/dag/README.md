@@ -4,8 +4,8 @@ This directory holds a declarative migration of Hermit's CI validation lanes
 onto [`safe-ci-dag-runner`](../../agent-utils/common/docs/safe-ci-dag-runner/README.md)
 (from the `agent-utils` submodule). Each validation *gate* becomes a DAG node
 with explicit dependencies and resource limits, so the scheduler can run
-independent gates concurrently while boxing each one under its own cgroup
-(memory cap + full process-subtree teardown).
+independent gates concurrently. On hosts with delegated cgroup v2 support, it
+can also box each node for memory limits and full process-subtree teardown.
 
 - [`hosted.json`](hosted.json) — mirrors `validate.sh`'s **`--hosted-only`**
   lane (`run_hosted_only_suite`), the GitHub-hosted `regular` job in
@@ -20,35 +20,49 @@ Run a lane with the wrapper:
 
 ```sh
 ci/run-dag.sh hosted   --max-mem 32G          # memory-aware -j
-ci/run-dag.sh hardware -j 1                    # PMU lane, one gate at a time
+ci/run-dag.sh hardware -j 2                    # PMU lane, one gate at a time
 ci/run-dag.sh hosted   ascii                   # visualize instead of run
 ```
 
-## Status: additive, not yet the blocking gate
+## Status: active validation lanes
 
-This is a **parallel, opt-in** path. `validate.sh` remains the single source of
-truth for gate *commands* and the current *blocking* CI checks. Nothing here
-changes what gates CI requires today. The intent is to let a human compare the
-DAG runner's results against `validate.sh` before flipping any required check
-over to it. The opt-in workflow
-[`.github/workflows/ci-dag.yml`](../../.github/workflows/ci-dag.yml) runs on
-`workflow_dispatch` only, so it adds no per-PR load until deliberately invoked.
+`hosted.json` drives the required `Regular tests (GitHub-hosted)` job, and
+`hardware.json` drives both self-hosted PMU entrypoints. Existing job names,
+the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
+internal scheduler changes. `validate.sh` remains the source of truth for
+individual gate commands.
 
-### Hard dependency: the `agent-utils` submodule must land first
+The `Validation Levels` workflow no longer launches a second copy of
+`--hosted-only` for every pull request. Its quick lane remains available by
+manual dispatch, while merge-group hardware and scheduled super validation are
+unchanged. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
+workflow runs either DAG on demand.
 
-The runner lives in the `agent-utils` submodule. **As of this branch's base,
-`agent-utils` is not yet committed on `rrnewton/hermit:main`** — it exists only
-as a staged submodule addition in the primary checkout (pointing at
-`rrnewton/agent-utils`). This DAG path cannot run in CI until:
+### Runner dependency
 
-1. `agent-utils` is landed as a submodule on `rrnewton/hermit:main` (with an
-   HTTPS URL in `.gitmodules` so GitHub-hosted runners can clone it), and
-2. CI checks out submodules (`ci-dag.yml` uses `submodules: recursive`).
+This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Hosted
+CI initializes only `agent-utils` instead of all submodules, then executes the
+dependency-free Python runner so per-node performance CSVs are available
+without an install step. `ci/run-dag.sh` also accepts
+`SAFE_CI_DAG_RUNNER` for local or preinstalled binaries.
 
-`ci/run-dag.sh` prefers the compiled Rust binary
-(`agent-utils/rs/bin/safe-ci-dag-runner`, built by `agent-utils/setup`) and
-falls back to the Python entrypoint (`agent-utils/py/bin/safe-ci-dag-runner`),
-which is the only 0.1 implementation with Linux cgroup boxing + perf logging.
+## Speed-to-signal audit
+
+A successful PR run on 2026-07-26 provided the baseline:
+
+- The blocking hosted validation took 14 minutes after setup.
+- Eight nonblocking diagnostics then ran serially for another 20 minutes,
+  extending the required workflow from useful signal at minute 17 to completion
+  at minute 37.
+- `Validation Levels` independently repeated the same 14-minute hosted suite,
+  consuming another GitHub-hosted runner.
+
+The diagnostics now run in the scheduled `super` tier. The required lane uses a 14 GiB memory budget, which the current model
+maps to `-j 2` on the 16 GiB hosted runner. Compile, lint, documentation, unit,
+and contract nodes may overlap when dependencies allow, while Hermit guest
+executions retain the
+`hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
+every required run so estimates can be replaced with measurements.
 
 ## How gates map onto the DAG
 
@@ -80,8 +94,8 @@ moving parts:
   including their per-case `timeout`s.
 - **The hosted `envelope_levels` gate is inlined** (L1–L4 over the three
   `ENVELOPE_PROBES`: `true`, `echo`, `date`) because it has no standalone
-  `validate.sh` flag. It mirrors `run_hosted_envelope_levels` (validate.sh
-  ~line 2573). If `ENVELOPE_PROBES` changes in `validate.sh`, update this node.
+  `validate.sh` flag. It mirrors `run_hosted_envelope_levels` in `validate.sh`.
+  If `ENVELOPE_PROBES` changes in `validate.sh`, update this node.
 
 ## Resource model (outer + inner limits)
 

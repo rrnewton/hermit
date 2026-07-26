@@ -1,12 +1,8 @@
-name: CI (DAG runner, opt-in)
+name: CI (DAG runner, manual)
 
-# Opt-in migration of the validation lanes onto safe-ci-dag-runner. This runs
-# ONLY on manual dispatch so it adds no per-PR load and does not gate any PR.
-# It exists so a human can compare the DAG runner's results against validate.sh
-# before flipping a required check over to this path. See ci/dag/README.md.
-#
-# NOTE: requires the `agent-utils` submodule to be landed on main first (it
-# carries the runner). Until then this workflow will fail at the build step.
+# Manual entrypoint for comparing or debugging the hosted and hardware DAGs.
+# The required GitHub-hosted lane uses the same hosted DAG directly from
+# ci-hosted.yml; this workflow adds no per-PR load.
 on:
   workflow_dispatch:
     inputs:
@@ -38,8 +34,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Initialize safe-ci-dag-runner
+        run: git submodule update --init agent-utils
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -58,8 +54,6 @@ jobs:
         run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
       - name: Rust components
         run: rustup component add clippy rustfmt
-      - name: Build safe-ci-dag-runner
-        run: (cd agent-utils && ./setup rs)
       - name: Run hosted lane as a DAG
         run: ci/run-dag.sh hosted ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
 
@@ -83,10 +77,8 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - name: Build safe-ci-dag-runner
-        run: (cd agent-utils && ./setup rs)
       # PMU access is a single serialized host resource; hold the same lock the
       # validate.sh self-hosted lane uses. The DAG's own {"pmu": 1} cap keeps
       # gates one-at-a-time within this run.
       - name: Run hardware lane as a DAG
-        run: flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 1 -v
+        run: flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 -v

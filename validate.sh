@@ -288,7 +288,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=181
-readonly RR_COMPAT_EXPECTED=128
+readonly RR_COMPAT_EXPECTED=131
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -346,6 +346,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
     [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
+    [ruby]=1 [dc]=1 [tcl]=1
 )
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
@@ -2838,12 +2839,45 @@ function run_full_suite {
     run_envelope
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
+function run_super_diagnostic_suite {
+    # These probes are useful for trend detection but do not gate PRs. On the
+    # hosted runner they consumed about 20 minutes after the blocking suite had
+    # already passed, so keep their signal in the scheduled super tier.
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#712): Review bounded routing for no-PMU hangs.
+    run_check_with_timeout 180 "Post-fork scheduling diagnostics" \
+        cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
+    run_check_with_timeout 180 "Network syscall determinism diagnostic" \
+        cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
+    run_check_with_timeout 180 "IPC determinism diagnostic" \
+        cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
+    run_check_with_timeout 180 "Random-source determinism diagnostic" \
+        cargo test -p hermit --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
+    run_check_with_timeout 300 "Threaded integration matrix diagnostic" \
+        cargo test -p hermit --test integration_matrix -- --test-threads=1
+    run_check_with_timeout 300 "LiteInst python3 verify diagnostics" \
+        cargo test -p hermit --test cli -- \
+        run_liteinst_rejects_non_fork_clone \
+        run_liteinst_handles_inherited_ignored_sigchld \
+        run_liteinst_verifies_forked_guest \
+        run_liteinst_verifies_raw_fork_guest --test-threads=1
+    run_check_with_timeout 300 "Chaos hello-race verification diagnostic" \
+        cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#598)
+    run_check_with_timeout 300 "DBI pipe backpressure diagnostic" \
+        cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+}
+
 function run_super_suite {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
 
     run_check "Build workspace" cargo build --workspace
     run_check "Build release Hermit" cargo build --release -p hermit
+    run_super_diagnostic_suite
     run_check "Super repeated determinism probes" run_super_stress_suite
     if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then
         printf "\n== Super stress pass rates ==\n"

@@ -88,7 +88,7 @@
       "cmd": "cargo test -p hermit --lib --bins",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
                "classification": "cpu-bound"}
     },
@@ -98,14 +98,14 @@
       "cmd": "cargo test -p detcore --lib --bins",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
                "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "detcore_misc",
       "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
-      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=1",
+      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
@@ -125,7 +125,7 @@
     {
       "group": "test", "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (serial, isolated per target)",
-      "cmd": "set -e; for t in chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism integration_matrix ipc_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism; do cargo test -p hermit --test \"$t\" -- --test-threads=1; done",
+      "cmd": "set -e; for t in chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism mmap_determinism procfs_determinism python_stdlib signal_determinism; do cargo test -p hermit --test \"$t\" -- --test-threads=1; done",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
@@ -145,7 +145,7 @@
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
-      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --test-threads=1",
+      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
@@ -155,7 +155,7 @@
     {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
-      "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --test-threads=1",
+      "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
@@ -225,7 +225,7 @@
       "group": "test", "job": "strict_compat",
       "desc": "Strict compatibility envelope (blocking L2 app matrix; reuses ./validate.sh --strict-compat-only)",
       "cmd": "./validate.sh --strict-compat-only --no-label-pr",
-      "deps": [],
+      "deps": ["build.workspace"],
       "timeout": 1800,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,

@@ -127,6 +127,9 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
+use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1256,6 +1259,60 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
                 }
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
+            // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
+            // deterministic by construction and identical to the modern kernel's own
+            // return, so no guest-visible behavior changes versus the legacy
+            // pass-through. These are untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_unimplemented_enosys_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
+            // system-administration syscalls (module load/unload, kexec, reboot,
+            // swap, raw I/O ports, root-mount pivot, host/domain name, tty
+            // hangup, disk quotas). The deterministic guest does not hold the
+            // capabilities these require against the host kernel, so a fixed
+            // -EPERM matches the unprivileged errno, never perturbs global host
+            // state, and is identical across --verify and record/replay. These
+            // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on
+            // the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_privileged_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#720): set_mempolicy_home_node is untyped in the
+            // pinned Reverie revision. Hermit exposes a single virtual NUMA node,
+            // so setting a memory range's home node has no observable effect: a
+            // deterministic no-op.
+            SyscallClassification::Determinized
+                if call.number() == Sysno::set_mempolicy_home_node =>
+            {
+                Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
+            // and namespace administration syscalls (mount/umount2/mount_setattr/
+            // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
+            // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
+            // deterministic container pins the guest's namespaces, mount
+            // hierarchy, and virtual clock for the whole run, so these are
+            // refused with a fixed -EPERM: the unprivileged errno for the
+            // capability-gated operations and a deliberate deterministic refusal
+            // otherwise. Never forwarded to the host; identical across --verify
+            // and record/replay. Untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_mount_ns_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1458,6 +1515,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
                 Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
+
+                // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
+                // policy. Hermit exposes a single virtual NUMA node and replaces
+                // the Linux scheduler with Detcore, so these are inoperative and
+                // are virtualized to fixed, host-independent results (see the
+                // determinism argument in syscall_classification.rs). Setters and
+                // count-returning calls are no-ops; getters emulate a default
+                // single-node / SCHED_OTHER answer.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#720)
+                Syscall::Mbind(_) => Ok(0),
+                Syscall::SetMempolicy(_) => Ok(0),
+                Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
+                Syscall::MigratePages(_) => Ok(0),
+                Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
+                Syscall::SchedSetscheduler(_) => Ok(0),
+                Syscall::SchedSetparam(_) => Ok(0),
+                // Report the fixed default policy SCHED_OTHER (0).
+                Syscall::SchedGetscheduler(_) => Ok(0),
+                Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
+                Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
