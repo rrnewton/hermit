@@ -1109,6 +1109,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // We only get to the point of creating child threads if we're past the first execve.
                     past_global_first_execve: true,
                     interrupt_at: self.cfg.interrupts_for_thread(dettid),
+                    // Both a forked process and a new thread inherit the parent's
+                    // nice value in Linux.
+                    nice: pts.1.nice,
                 }
             }
         }

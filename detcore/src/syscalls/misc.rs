@@ -238,15 +238,32 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Report the deterministic default nice value for the current process.
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// A `(which, who)` pair that targets the caller's own process, either via the
+    /// `who == 0` "current process" sentinel or by naming the caller's own
+    /// virtualized pid. `renice -p $$` reads and writes its own priority through
+    /// an explicit pid, so it never uses the sentinel.
+    fn priority_targets_self(&self, which: i32, who: libc::id_t) -> bool {
+        which == libc::PRIO_PROCESS as i32
+            && (who == 0 || who == self.detpid.as_raw() as libc::id_t)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Report the deterministic nice value for the caller's own process. Accept
+    /// both the `who == 0` sentinel and the caller naming its own pid explicitly
+    /// (e.g. `renice -p $$`, which reads back its own priority after setting it);
+    /// reject other targets to avoid leaking unmodeled host process state. The raw
+    /// Linux `getpriority` syscall returns `20 - nice`, so the deterministic
+    /// default nice of 0 is reported as 20.
     pub async fn handle_getpriority<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::Getpriority,
     ) -> Result<i64, Error> {
-        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 {
-            // The raw Linux syscall returns 20 - nice, so nice 0 is reported as 20.
-            Ok(20)
+        if self.priority_targets_self(call.which(), call.who()) {
+            Ok((20 - guest.thread_state().nice) as i64)
         } else {
             Err(Errno::EPERM.into())
         }
@@ -254,13 +271,21 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Accept the common reset-to-default request without changing host scheduling.
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Accept a nice change that targets the caller's own process without changing
+    /// host scheduling. The nice level has no effect on Detcore's deterministic
+    /// scheduler, but the requested value is recorded so a subsequent
+    /// `getpriority` reads back deterministically (e.g. `renice -p $$` prints the
+    /// new priority it just set). The value is clamped to the Linux nice range
+    /// `[-20, 19]`; the container runs privileged (uid 0) so any in-range change
+    /// is permitted. Reject targets other than the caller's own process.
     pub async fn handle_setpriority<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::Setpriority,
     ) -> Result<i64, Error> {
-        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 && call.prio() == 0 {
+        if self.priority_targets_self(call.which(), call.who()) {
+            guest.thread_state_mut().nice = call.prio().clamp(-20, 19);
             Ok(0)
         } else {
             Err(Errno::EPERM.into())

@@ -248,6 +248,54 @@ fn prctl_keepcaps_round_trips_deterministically() {
 }
 
 #[test]
+fn getpriority_setpriority_round_trip_for_self() {
+    // `renice -p $$` reads its own priority (getpriority), sets it (setpriority),
+    // then reads it back to print the new value -- all through an explicit pid,
+    // never the `who == 0` sentinel. Detcore must accept the caller naming its own
+    // virtualized pid and remember the value, instead of returning EPERM (which
+    // made renice abort with "failed to get priority for <pid>: Operation not
+    // permitted"). The nice level has no effect on the deterministic scheduler, so
+    // the set/get round trip is deterministic.
+    det_test_fn_sequential_without_pmu(|| {
+        // glibc getpriority() returns the nice value directly (not 20 - nice).
+        let get = |who: libc::id_t| unsafe { libc::getpriority(libc::PRIO_PROCESS, who) };
+        let set = |who: libc::id_t, prio: i32| unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, who, prio)
+        };
+        let errno = || unsafe { *libc::__errno_location() };
+
+        let my_pid = unsafe { libc::getpid() } as libc::id_t;
+
+        // The default nice is 0 via both the sentinel and the explicit-self pid.
+        assert_eq!(get(0), 0);
+        assert_eq!(get(my_pid), 0);
+
+        // A change made via the sentinel is visible through the explicit-self pid.
+        assert_eq!(set(0, 5), 0);
+        assert_eq!(get(0), 5);
+        assert_eq!(get(my_pid), 5);
+
+        // A change made via the explicit-self pid (the renice path) round-trips.
+        assert_eq!(set(my_pid, 10), 0);
+        assert_eq!(get(my_pid), 10);
+
+        // An out-of-range value is clamped to the Linux nice range, like the kernel.
+        assert_eq!(set(0, 100), 0);
+        assert_eq!(get(0), 19);
+        assert_eq!(set(0, -100), 0);
+        assert_eq!(get(0), -20);
+
+        // A different process is not modeled; detcore refuses it deterministically
+        // rather than leaking unmodeled host process state.
+        unsafe { *libc::__errno_location() = 0 };
+        assert_eq!(get(0x7fff_fffe), -1);
+        assert_eq!(errno(), libc::EPERM);
+        assert_eq!(set(0x7fff_fffe, 0), -1);
+        assert_eq!(errno(), libc::EPERM);
+    });
+}
+
+#[test]
 fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
     det_test_fn_sequential_without_pmu(|| {
         const VIRTUAL_CPUSET_BYTES: usize = 16;

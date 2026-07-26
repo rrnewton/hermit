@@ -957,6 +957,16 @@ pub struct ThreadState<T> {
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
+
+    /// Deterministic process nice value (scheduling priority) for this thread, in
+    /// the Linux range `[-20, 19]`, default 0. The nice level has no effect on
+    /// Detcore's deterministic scheduler; it is tracked only so a `setpriority`
+    /// followed by `getpriority` on the caller's own process reads back
+    /// consistently (e.g. `renice -p $$`). See `handle_getpriority`/
+    /// `handle_setpriority` in `syscalls/misc.rs`.
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[serde(default)]
+    pub(crate) nice: i32,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -1130,6 +1140,7 @@ impl<T> ThreadState<T> {
             preemption_points: None,
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
+            nice: 0,
         }
     }
 
