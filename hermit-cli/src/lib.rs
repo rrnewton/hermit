@@ -799,12 +799,14 @@ async fn run_with_backend_inner(
     }
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
-        let (exit_status, global_state) = reverie_liteinst::LiteinstBackend::run_with_preload::<
-            Detcore,
-        >(command, config, preload)
-        .await?;
+        let (exit_status, mut global_state) =
+            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+                command, config, preload,
+            )
+            .await?;
         if liteinst_requires_forced_shutdown(exit_status) {
             global_state.force_shutdown_with_error();
+            global_state.cancel_scheduler().await;
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
@@ -884,7 +886,7 @@ async fn run_with_output_backend_inner(
     if backend == Backend::Liteinst {
         command.stdin(Stdio::null());
         let preload = liteinst_runtime_library_path()?;
-        let (output, global_state) =
+        let (output, mut global_state) =
             reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
@@ -892,6 +894,7 @@ async fn run_with_output_backend_inner(
         let status = output.status.into();
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
+            global_state.cancel_scheduler().await;
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
