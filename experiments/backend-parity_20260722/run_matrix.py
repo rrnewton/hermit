@@ -200,6 +200,23 @@ def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] |
     try:
         stdout, stderr = process.communicate(timeout=30)
     except subprocess.TimeoutExpired:
+        print(f"timed-out command: {command!r}", file=sys.stderr)
+        for proc in sorted(Path("/proc").glob("[0-9]*"), key=lambda path: int(path.name)):
+            try:
+                stat = (proc / "stat").read_text(encoding="utf-8").split()
+                if int(stat[4]) != process.pid:
+                    continue
+                command_line = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    errors="replace"
+                )
+                wait_channel = (proc / "wchan").read_text(encoding="utf-8").strip()
+                print(
+                    f"timed-out process: pid={proc.name} state={stat[2]} "
+                    f"wchan={wait_channel} command={command_line}",
+                    file=sys.stderr,
+                )
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
         os.killpg(process.pid, signal.SIGTERM)
         try:
             stdout, stderr = process.communicate(timeout=2)
