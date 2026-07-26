@@ -248,7 +248,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#785): Process CPU-time accounting and the kernel
+        // TODO-HUMAN-REVIEW(#790): Process CPU-time accounting and the kernel
         // log buffer. `times` reports per-process user/system CPU tick counts,
         // which depend on host scheduling and are nondeterministic; Detcore does
         // not model CPU-time accounting, so it reports a zeroed `struct tms`
@@ -472,7 +472,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#785): copy_file_range moves bytes between two
+        // TODO-HUMAN-REVIEW(#790): copy_file_range moves bytes between two
         // regular-file descriptors (the kernel rejects pipes/sockets with
         // EINVAL). The data it copies is the guest's own file content -- there
         // is no host-varying or host-global state involved -- and the bytes-

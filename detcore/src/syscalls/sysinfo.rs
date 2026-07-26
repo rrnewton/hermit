@@ -202,7 +202,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the console-control and open/close actions are accepted as no-ops. Actions
     /// outside the defined `SYSLOG_ACTION_*` range get the kernel's `EINVAL`.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#785)
+    // TODO-HUMAN-REVIEW(#790)
     pub async fn handle_syslog<G: Guest<Self>>(
         &self,
         _guest: &mut G,

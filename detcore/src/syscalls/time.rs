@@ -163,7 +163,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it from the virtual clock (in USER_HZ ticks) so it is deterministic and
     /// nondecreasing across a run rather than depending on host uptime.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#785)
+    // TODO-HUMAN-REVIEW(#790)
     pub async fn handle_times<G: Guest<Self>>(
         &self,
         guest: &mut G,
