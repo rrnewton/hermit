@@ -466,48 +466,54 @@ fn waitid_polls_until_child_exit_and_supports_wnohang() {
 
         let pidfd =
             unsafe { libc::syscall(libc::SYS_pidfd_open, child, libc::O_NONBLOCK) } as libc::c_int;
-        assert!(pidfd >= 0, "pidfd_open with O_NONBLOCK should succeed");
-        let mut pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let pidfd_wait = unsafe {
-            libc::syscall(
-                libc::SYS_waitid,
-                libc::P_PIDFD,
-                pidfd,
-                &mut pidfd_info,
-                libc::WEXITED,
-                std::ptr::null_mut::<libc::rusage>(),
-            )
-        };
-        assert_eq!(pidfd_wait, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EAGAIN)
-        );
-        assert_eq!(unsafe { libc::close(pidfd) }, 0);
-
-        let blocking_pidfd =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
-        assert!(blocking_pidfd >= 0, "blocking pidfd_open should succeed");
-        let mut blocking_pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe {
+        if pidfd == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSYS),
+                "pidfd_open may only be unavailable through deterministic ENOSYS refusal"
+            );
+        } else {
+            let mut pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let pidfd_wait = unsafe {
                 libc::syscall(
                     libc::SYS_waitid,
                     libc::P_PIDFD,
-                    blocking_pidfd,
-                    &mut blocking_pidfd_info,
+                    pidfd,
+                    &mut pidfd_info,
                     libc::WEXITED,
                     std::ptr::null_mut::<libc::rusage>(),
                 )
-            },
-            -1
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EOPNOTSUPP)
-        );
-        assert_eq!(unsafe { libc::close(blocking_pidfd) }, 0);
+            };
+            assert_eq!(pidfd_wait, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+            assert_eq!(unsafe { libc::close(pidfd) }, 0);
 
+            let blocking_pidfd =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) } as libc::c_int;
+            assert!(blocking_pidfd >= 0, "blocking pidfd_open should succeed");
+            let mut blocking_pidfd_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_waitid,
+                        libc::P_PIDFD,
+                        blocking_pidfd,
+                        &mut blocking_pidfd_info,
+                        libc::WEXITED,
+                        std::ptr::null_mut::<libc::rusage>(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            assert_eq!(unsafe { libc::close(blocking_pidfd) }, 0);
+        }
         assert_eq!(
             unsafe {
                 libc::syscall(
