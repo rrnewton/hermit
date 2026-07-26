@@ -315,7 +315,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgget
         | Sysno::msgsnd
         | Sysno::msgrcv
-        | Sysno::msgctl => SyscallClassification::Determinized,
+        | Sysno::msgctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#788): BATCH 56. flock is an advisory whole-file
+        // lock; keyctl/add_key/request_key manipulate global kernel keyrings;
+        // perf_event_open opens a hardware/software performance counter. All
+        // three are untyped (Syscall::Other) in the pinned Reverie and are
+        // given deterministic policies by the dispatcher (fixed success for the
+        // advisory lock, ENOSYS for the keyring and perf-counter facilities)
+        // before the typed match; see lib.rs. Classified Determinized so plain
+        // --strict no longer fail-closes on them.
+        | Sysno::flock
+        | Sysno::keyctl
+        | Sysno::add_key
+        | Sysno::request_key
+        | Sysno::perf_event_open => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -486,14 +500,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
-        | Sysno::add_key
         | Sysno::adjtimex
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -503,7 +515,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_get
         | Sysno::ioprio_set
         | Sysno::kcmp
-        | Sysno::keyctl
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
@@ -516,7 +527,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::openat2
-        | Sysno::perf_event_open
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
@@ -531,7 +541,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::readv
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
-        | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
@@ -712,6 +721,22 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#788): Deterministic ENOSYS refusal set.
+/// Kernel keyring syscalls (`keyctl`, `add_key`, `request_key`). The keyrings
+/// they manipulate (thread/process/session/user/user-session and persistent
+/// keyrings) are global kernel objects shared across the host and persistent
+/// across runs, so forwarding them is nondeterministic and a container-isolation
+/// hole. Detcore refuses them with a fixed `ENOSYS`: the errno a kernel built
+/// without `CONFIG_KEYS` returns, which glibc and PAM consumers degrade against
+/// gracefully. The result is never forwarded to the host and is
+/// bitwise-identical across `--verify` and record/replay. These are untyped
+/// (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches on the
+/// `Sysno` before the typed match.
+pub(crate) const fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
+    matches!(sysno, Sysno::keyctl | Sysno::add_key | Sysno::request_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,7 +753,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [201, 91, 81]);
+        assert_eq!(counts, [206, 91, 76]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -859,8 +884,11 @@ mod tests {
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
+        // Batch 56: kernel keyring syscalls are now refused with a deterministic
+        // ENOSYS (global host-shared keyrings); see is_kernel_keyring_syscall.
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_kernel_keyring_syscall(sysno));
         }
         for sysno in [
             Sysno::chroot,
@@ -931,6 +959,14 @@ mod tests {
         for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
+        }
+        // Batch 56: the advisory whole-file lock flock and perf_event_open are
+        // determinized (fixed success and deterministic ENOSYS respectively) via
+        // dedicated dispatch arms; they use neither the keyring nor the async-IPC
+        // helper.
+        for sysno in [Sysno::flock, Sysno::perf_event_open] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(!is_kernel_keyring_syscall(sysno));
         }
     }
 
@@ -1063,5 +1099,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn batch56_flock_keyring_perf_syscalls_are_determinized() {
+        // flock (advisory lock, fixed success), the keyring family and
+        // perf_event_open (both deterministic ENOSYS refusals) must all
+        // classify as Determinized so plain --strict does not fail-close.
+        let determinized = [
+            Sysno::flock,
+            Sysno::keyctl,
+            Sysno::add_key,
+            Sysno::request_key,
+            Sysno::perf_event_open,
+        ];
+        for sysno in determinized {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized"
+            );
+        }
+
+        // The keyring helper must match exactly the reviewed keyring set.
+        let keyring = [Sysno::keyctl, Sysno::add_key, Sysno::request_key];
+        for sysno in keyring {
+            assert!(
+                is_kernel_keyring_syscall(sysno),
+                "{sysno:?} should be in the kernel-keyring helper set"
+            );
+        }
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_kernel_keyring_syscall(sysno) {
+                assert!(
+                    keyring.contains(&sysno),
+                    "{sysno:?} is flagged by the keyring helper but not in the reviewed set"
+                );
+            }
+        }
+
+        // flock and perf_event_open take dedicated dispatch arms, not the
+        // keyring helper.
+        assert!(!is_kernel_keyring_syscall(Sysno::flock));
+        assert!(!is_kernel_keyring_syscall(Sysno::perf_event_open));
     }
 }

@@ -153,6 +153,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1387,6 +1388,49 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
             {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#788): BATCH 56. flock(2) is an advisory
+            // whole-file lock and is untyped (Syscall::Other) in the pinned
+            // Reverie. Detcore serializes all guest threads/processes onto one
+            // logical CPU with a deterministic scheduler, so there is no true
+            // concurrency for an advisory lock to arbitrate; granting every
+            // request with a fixed success (and treating LOCK_UN as a no-op)
+            // is deterministic by construction, never blocks, and never depends
+            // on host lock state (unlike a raw pass-through, which could block
+            // on a lock held by an external host process or deadlock two guest
+            // processes under sequentialization). This mirrors the existing
+            // advisory fixed-success treatment of fadvise64. In an isolated
+            // container only one instance runs, so `flock -n` "am I alone"
+            // probes correctly see success.
+            SyscallClassification::Determinized if call.number() == Sysno::flock => Ok(0),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#788): BATCH 56. Kernel keyring syscalls
+            // (keyctl/add_key/request_key) are untyped (Syscall::Other) in the
+            // pinned Reverie. The keyrings they touch are global kernel objects
+            // shared across the host and persistent across runs, so forwarding
+            // them is nondeterministic and a container-isolation hole. A fixed
+            // -ENOSYS is the errno a kernel built without CONFIG_KEYS returns;
+            // glibc and PAM consumers degrade against it gracefully. Never
+            // forwarded to the host; identical across --verify and
+            // record/replay.
+            SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#788): BATCH 56. perf_event_open(2) is untyped
+            // (Syscall::Other) in the pinned Reverie. It opens a hardware or
+            // software performance counter whose reads (retired instructions,
+            // cycles, cache misses, ...) are inherently nondeterministic, and
+            // Detcore itself owns the PMU to count retired conditional branches
+            // for deterministic preemption, so a guest counter would both
+            // diverge and contend with the scheduler. A fixed -ENOSYS is the
+            // errno a kernel built without CONFIG_PERF_EVENTS returns; perf and
+            // other consumers feature-probe and degrade against it. Never
+            // forwarded to the host; identical across --verify and
+            // record/replay.
+            SyscallClassification::Determinized if call.number() == Sysno::perf_event_open => {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
