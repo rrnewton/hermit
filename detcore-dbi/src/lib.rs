@@ -547,6 +547,9 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// Copied process runtimes retain scratch-only state until exec installs a new
 /// scheduler owned by that process.
 ///
+/// Returns a positive retry status when a native child's parent snapshot is not
+/// published yet, so the client can retry outside DynamoRIO's thread-init path.
+///
 /// # Safety
 ///
 /// The native client must pass a valid writable `scratch` pointer, a live
@@ -594,16 +597,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let parent = if tid == pid {
         None
     } else {
-        Some(loop {
-            if let Some(parent) = PENDING_THREAD_PARENTS
-                .lock()
-                .expect("pending DBI thread parent lock poisoned")
-                .remove(&tid)
-            {
-                break parent;
-            }
-            std::thread::yield_now();
-        })
+        let parent = PENDING_THREAD_PARENTS
+            .lock()
+            .expect("pending DBI thread parent lock poisoned")
+            .remove(&tid);
+        let Some(parent) = parent else {
+            return 1;
+        };
+        Some(parent)
     };
     let parent_ref = parent
         .as_ref()
