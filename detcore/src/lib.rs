@@ -155,7 +155,9 @@ use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_privileged_introspection_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
+use crate::syscall_classification::is_unprovided_feature_refused_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
@@ -1351,6 +1353,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#727): Deterministic EPERM for privileged
+            // cross-process introspection, control, and kernel-tracing syscalls
+            // (ptrace, process_vm_readv/writev, kcmp, bpf, perf_event_open).
+            // Detcore does not model these; forwarding them admits host-specific,
+            // nondeterministic cross-process behavior. A deterministic container is
+            // an unprivileged, restricted context, so a fixed -EPERM matches the
+            // errno it already returns, never perturbs host state, and is identical
+            // across --verify and record/replay. These are untyped (Syscall::Other)
+            // or handled uniformly in the pinned Reverie, so dispatch on the Sysno
+            // before the typed match below.
+            SyscallClassification::Determinized
+                if is_privileged_introspection_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
             // asynchronous and message-passing I/O and IPC interfaces Detcore
             // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
@@ -1366,6 +1384,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // before the typed match below.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS for optional kernel
+            // subsystems Detcore does not provide (kernel keyring, Landlock, the
+            // LSM self-attribute interface, secret memory, page-cache statistics,
+            // and CET shadow-stack mapping). These already return -ENOSYS wherever
+            // the corresponding kernel config or CPU feature is absent, so a fixed
+            // -ENOSYS is a legitimate guest-observable value that removes the host
+            // dependency of the legacy pass-through and lets feature-probing
+            // programs fall back exactly as on a kernel without the feature. These
+            // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on the
+            // Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_unprovided_feature_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::ENOSYS))
             }

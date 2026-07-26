@@ -216,6 +216,47 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::vhangup
         | Sysno::quotactl
         | Sysno::quotactl_fd
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#727): Deterministic EPERM for privileged cross-process
+        // introspection, control, and kernel-tracing syscalls that Detcore does not
+        // model (ptrace of another task, reading/writing another task's memory,
+        // comparing kernel objects across tasks, loading BPF programs, and opening
+        // perf events). Forwarding them (the legacy Unclassified pass-through) both
+        // leaks host-specific state and admits nondeterministic cross-process
+        // behavior. A deterministic Hermit container is an unprivileged, restricted
+        // context, so a fixed -EPERM is the errno such a context already returns for
+        // these operations; it is never forwarded to the host and is bitwise-identical
+        // across --verify and record/replay. Dispatched by Sysno in lib.rs before the
+        // typed match below.
+        | Sysno::ptrace
+        | Sysno::process_vm_readv
+        | Sysno::process_vm_writev
+        | Sysno::kcmp
+        | Sysno::bpf
+        | Sysno::perf_event_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS for optional kernel
+        // subsystems Detcore does not provide, refused as if the running kernel
+        // lacks the feature: the kernel keyring (add_key/request_key/keyctl), the
+        // Landlock and LSM self-attribute interfaces, secret memory, page-cache
+        // statistics, and CET shadow-stack mapping. On any host these already return
+        // -ENOSYS when the corresponding config/feature is absent, so a fixed -ENOSYS
+        // is a value the guest can legitimately observe; it removes the host-kernel
+        // dependency (Unclassified previously forwarded them, leaking host state),
+        // and programs that probe these features fall back exactly as they do on a
+        // kernel without them. Dispatched by Sysno in lib.rs before the typed match.
+        | Sysno::add_key
+        | Sysno::request_key
+        | Sysno::keyctl
+        | Sysno::landlock_create_ruleset
+        | Sysno::landlock_add_rule
+        | Sysno::landlock_restrict_self
+        | Sysno::lsm_get_self_attr
+        | Sysno::lsm_list_modules
+        | Sysno::lsm_set_self_attr
+        | Sysno::memfd_secret
+        | Sysno::cachestat
+        | Sysno::map_shadow_stack
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev
         // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling policy =====
@@ -476,10 +517,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
-        | Sysno::add_key
         | Sysno::adjtimex
-        | Sysno::bpf
-        | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
@@ -493,36 +531,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getitimer
         | Sysno::ioprio_get
         | Sysno::ioprio_set
-        | Sysno::kcmp
-        | Sysno::keyctl
-        | Sysno::landlock_add_rule
-        | Sysno::landlock_create_ruleset
-        | Sysno::landlock_restrict_self
         | Sysno::listmount
-        | Sysno::lsm_get_self_attr
-        | Sysno::lsm_list_modules
-        | Sysno::lsm_set_self_attr
-        | Sysno::map_shadow_stack
-        | Sysno::memfd_secret
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::openat2
-        | Sysno::perf_event_open
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
-        | Sysno::process_vm_readv
-        | Sysno::process_vm_writev
-        | Sysno::ptrace
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
-        | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
@@ -665,6 +688,32 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#727): Deterministic EPERM refusal set.
+/// Privileged cross-process introspection, control, and kernel-tracing syscalls
+/// that Detcore does not model: tracing another task (`ptrace`), reading or
+/// writing another task's address space (`process_vm_readv`/`process_vm_writev`),
+/// comparing kernel objects across tasks (`kcmp`), loading BPF programs (`bpf`),
+/// and opening performance-monitoring events (`perf_event_open`). These are
+/// privileged operations that an unprivileged, restricted context cannot perform,
+/// and forwarding them admits host-specific, nondeterministic cross-process
+/// behavior, so Detcore refuses them with a fixed `EPERM`. That is the errno such
+/// a context already returns, it is never forwarded to the host, and it is
+/// deterministic by construction. These are untyped (`Syscall::Other`) or handled
+/// uniformly in the pinned Reverie, so the dispatcher matches on the `Sysno`
+/// before the typed match.
+pub(crate) const fn is_privileged_introspection_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::ptrace
+            | Sysno::process_vm_readv
+            | Sysno::process_vm_writev
+            | Sysno::kcmp
+            | Sysno::bpf
+            | Sysno::perf_event_open
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
 /// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
 /// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
@@ -704,6 +753,37 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#727): Deterministic ENOSYS refusal set.
+/// Optional kernel subsystems Detcore does not provide, refused as if the running
+/// kernel lacks the feature: the kernel keyring (`add_key`/`request_key`/
+/// `keyctl`), the Landlock sandbox interface, the LSM self-attribute interface,
+/// secret memory (`memfd_secret`), page-cache statistics (`cachestat`), and CET
+/// shadow-stack mapping (`map_shadow_stack`). On any host these already return
+/// `-ENOSYS` when the corresponding kernel config or CPU feature is absent, so a
+/// fixed `ENOSYS` is a value the guest can legitimately observe; it removes the
+/// host-kernel dependency of the legacy pass-through and lets feature-probing
+/// programs fall back exactly as they do on a kernel without the feature. These
+/// are untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches
+/// on the `Sysno` before the typed match.
+pub(crate) const fn is_unprovided_feature_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::add_key
+            | Sysno::request_key
+            | Sysno::keyctl
+            | Sysno::landlock_create_ruleset
+            | Sysno::landlock_add_rule
+            | Sysno::landlock_restrict_self
+            | Sysno::lsm_get_self_attr
+            | Sysno::lsm_list_modules
+            | Sysno::lsm_set_self_attr
+            | Sysno::memfd_secret
+            | Sysno::cachestat
+            | Sysno::map_shadow_stack
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,7 +800,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [217, 91, 65]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -845,9 +925,6 @@ mod tests {
             Sysno::unlinkat,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
-        }
-        for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
         for sysno in [
             Sysno::chroot,
@@ -1044,6 +1121,82 @@ mod tests {
         // The helper must not claim any syscall outside the reviewed set.
         for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
             if is_mount_ns_admin_refused_syscall(sysno) {
+                assert!(
+                    refused.contains(&sysno),
+                    "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn privileged_introspection_syscalls_are_determinized_and_consistent() {
+        // Every syscall in the deterministic EPERM introspection-refusal set must
+        // classify as Determinized, and the helper used by the dispatcher must agree
+        // exactly with that classification across the whole pinned table.
+        let refused = [
+            Sysno::ptrace,
+            Sysno::process_vm_readv,
+            Sysno::process_vm_writev,
+            Sysno::kcmp,
+            Sysno::bpf,
+            Sysno::perf_event_open,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic EPERM refusal)"
+            );
+            assert!(
+                is_privileged_introspection_refused_syscall(sysno),
+                "{sysno:?} should be in the EPERM introspection-refusal helper set"
+            );
+        }
+        // The helper must not claim any syscall outside the reviewed set.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_privileged_introspection_refused_syscall(sysno) {
+                assert!(
+                    refused.contains(&sysno),
+                    "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unprovided_feature_syscalls_are_determinized_and_consistent() {
+        // Every syscall in the deterministic ENOSYS unprovided-feature set must
+        // classify as Determinized, and the helper used by the dispatcher must agree
+        // exactly with that classification across the whole pinned table.
+        let refused = [
+            Sysno::add_key,
+            Sysno::request_key,
+            Sysno::keyctl,
+            Sysno::landlock_create_ruleset,
+            Sysno::landlock_add_rule,
+            Sysno::landlock_restrict_self,
+            Sysno::lsm_get_self_attr,
+            Sysno::lsm_list_modules,
+            Sysno::lsm_set_self_attr,
+            Sysno::memfd_secret,
+            Sysno::cachestat,
+            Sysno::map_shadow_stack,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_unprovided_feature_refused_syscall(sysno),
+                "{sysno:?} should be in the ENOSYS unprovided-feature helper set"
+            );
+        }
+        // The helper must not claim any syscall outside the reviewed set.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_unprovided_feature_refused_syscall(sysno) {
                 assert!(
                     refused.contains(&sysno),
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
