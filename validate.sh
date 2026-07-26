@@ -39,6 +39,10 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
+#   ./validate.sh --backend-compat-only       # run the FULL strict corpus on every
+#                                            # available backend (ptrace/KVM/DBI) and
+#                                            # print real per-backend pass/total; this
+#                                            # is observational and never blocks
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
 #   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
@@ -77,6 +81,8 @@ SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 HARDWARE_ONLY=0
+# TODO-HUMAN-REVIEW(PR-732): Review the focused full-corpus backend compatibility CLI.
+BACKEND_COMPAT_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -109,6 +115,8 @@ while [[ $# -gt 0 ]]; do
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
+        # TODO-HUMAN-REVIEW(PR-732): Review the focused full-corpus backend compatibility CLI.
+        --backend-compat-only) BACKEND_COMPAT_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -129,6 +137,7 @@ only_modes=0
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+((BACKEND_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((HARDWARE_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -146,6 +155,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+((BACKEND_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="backend-compat-only"
 ((HARDWARE_ONLY == 1)) && VALIDATION_PROFILE="hardware-only"
 
 case "$VALIDATION_PROFILE" in
@@ -158,6 +168,7 @@ case "$VALIDATION_PROFILE" in
     liteinst-compat-only) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
+    backend-compat-only) VALIDATION_ESTIMATE="about 15-45 minutes; full corpus per available backend, 30s/program" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     hardware-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
@@ -196,7 +207,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
-readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY
+readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY BACKEND_COMPAT_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -297,6 +308,18 @@ readonly SABRE_COMPAT_TOTAL=151
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
+# TODO-HUMAN-REVIEW(PR-732): When non-empty (ptrace|kvm|dbi), the strict corpus runs
+# with COMPATIBILITY_MODE=strict (so the FULL ~181-program set is exercised) but each
+# probe is executed under `--backend $COMPAT_BACKEND` with a 30s/program cap, and the
+# corpus result is recorded per backend and reported non-blocking. Empty = default
+# (ptrace, blocking strict gate).
+COMPAT_BACKEND=""
+BACKEND_COMPAT_PROBE_TIMEOUT=${BACKEND_COMPAT_PROBE_TIMEOUT:-30}
+if [[ ! $BACKEND_COMPAT_PROBE_TIMEOUT =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: BACKEND_COMPAT_PROBE_TIMEOUT must be a positive integer" >&2
+    exit 2
+fi
+readonly BACKEND_COMPAT_PROBE_TIMEOUT
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
 E9PATCH_COMPAT_CANDIDATE_ONLY=0
@@ -749,7 +772,10 @@ function hermit_record_replay_smoke {
 }
 
 function backend_selector_supported {
-    "$HERMIT_BIN" run --help 2>&1 | grep -q -- '--backend'
+    # TODO-HUMAN-REVIEW(PR-732): Accept an explicit binary so callers that only built the
+    # release binary (e.g. --backend-compat-only) probe the same binary the corpus uses.
+    local bin=${1:-$HERMIT_BIN}
+    "$bin" run --help 2>&1 | grep -q -- '--backend'
 }
 
 function kvm_backend_available {
@@ -757,8 +783,10 @@ function kvm_backend_available {
 }
 
 function dbi_backend_available {
+    # TODO-HUMAN-REVIEW(PR-732): Accept an explicit binary (release for --backend-compat-only).
+    local bin=${1:-$HERMIT_BIN}
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" run --backend dbi -- /bin/true \
+        "$bin" run --backend dbi -- /bin/true \
         </dev/null >/dev/null 2>&1
 }
 
@@ -773,8 +801,24 @@ function note_backend_skip {
     printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason" >>"$LOG_FILE"
 }
 
+# TODO-HUMAN-REVIEW(PR-732): Run the entire strict compatibility corpus under one
+# alternate backend and report real numbers without blocking. This replaces the old
+# 4-program spot-check as the source of the KVM/DBI columns in the COMPAT SUMMARY.
+function run_backend_compatibility_report {
+    local backend=$1
+    local status
+
+    COMPAT_BACKEND=$backend
+    run_compatibility_corpus
+    status=$?
+    COMPAT_BACKEND=""
+    return "$status"
+}
+
 function run_full_backend_gates {
     local -a backends=(--backend ptrace)
+    local kvm_ok=0
+    local dbi_ok=0
 
     if ! backend_selector_supported; then
         note_backend_skip "KVM/DBI" "backend selector is unavailable"
@@ -786,12 +830,14 @@ function run_full_backend_gates {
 
     if kvm_backend_available; then
         backends+=(--backend kvm)
+        kvm_ok=1
     else
         note_backend_skip "KVM" "/dev/kvm is not readable and writable"
     fi
 
     if dbi_backend_available; then
         backends+=(--backend dbi)
+        dbi_ok=1
     else
         note_backend_skip "DBI" "backend smoke did not complete successfully"
     fi
@@ -800,6 +846,21 @@ function run_full_backend_gates {
         python3 experiments/backend-parity_20260722/run_matrix.py \
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
+
+    # Full corpus per alternate backend so the COMPAT SUMMARY shows real per-backend
+    # pass/total instead of the 4-program parity spot-check. These are observational
+    # (non-blocking): a backend below 100% must not red the run. Each program is capped
+    # at BACKEND_COMPAT_PROBE_TIMEOUT (30s) so a hung guest cannot stall the gate. The
+    # whole-gate budget is generous because the corpus is ~181 programs.
+    if ((kvm_ok == 1)); then
+        run_check_with_timeout 2400 "KVM full compatibility corpus (observational)" \
+            run_backend_compatibility_report kvm
+    fi
+    if ((dbi_ok == 1)); then
+        run_check_with_timeout 2400 "DBI full compatibility corpus (observational)" \
+            run_backend_compatibility_report dbi
+    fi
+
     run_check "LiteInst backend smoke" liteinst_backend_available
     run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
 }
@@ -807,6 +868,12 @@ function run_full_backend_gates {
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#706): Review the canonical cross-backend compatibility summary.
 function compat_summary_backend {
+    # TODO-HUMAN-REVIEW(PR-732): A non-empty COMPAT_BACKEND overrides the mode->backend
+    # mapping so the full strict corpus can be attributed to ptrace/kvm/dbi cells.
+    if [[ -n $COMPAT_BACKEND ]]; then
+        printf "%s" "$COMPAT_BACKEND"
+        return 0
+    fi
     case "$COMPATIBILITY_MODE" in
         strict) printf "ptrace" ;;
         sabre) printf "sabre" ;;
@@ -1381,6 +1448,15 @@ function strict_compatibility_probe {
         fi
     fi
 
+    # TODO-HUMAN-REVIEW(PR-732): Full-corpus alternate-backend probe. Runs the same
+    # strict L2 command under an explicit backend selector with a bounded per-program
+    # timeout so KVM/DBI exercise the whole corpus instead of a 4-program spot-check.
+    if [[ -n $COMPAT_BACKEND ]]; then
+        assurance="${COMPAT_BACKEND} L2"
+        run_args=(run --backend "$COMPAT_BACKEND" --strict --verify --)
+        probe_timeout=$BACKEND_COMPAT_PROBE_TIMEOUT
+    fi
+
     {
         printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
         printf "Command: timeout %s %q" \
@@ -1469,7 +1545,12 @@ function run_compatibility_corpus {
     local total=0
     HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
-    if [[ $COMPATIBILITY_MODE == rr ]]; then
+    if [[ -n $COMPAT_BACKEND ]]; then
+        # TODO-HUMAN-REVIEW(PR-732): Observational full-corpus run on one backend.
+        printf "\n== %s full compatibility corpus (L2, observational, non-blocking) ==\n" "$COMPAT_BACKEND"
+        printf "=== %s full compatibility corpus (L2, observational, non-blocking) ===\n" \
+            "$COMPAT_BACKEND" >>"$LOG_FILE"
+    elif [[ $COMPATIBILITY_MODE == rr ]]; then
         printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
         printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
@@ -2051,6 +2132,14 @@ function run_compatibility_corpus {
     fi
 
     total=$((passed + failed + known_flaky + unavailable))
+    # TODO-HUMAN-REVIEW(PR-732): Alternate-backend corpus is observational visibility,
+    # not a blocking floor. Report the real per-backend pass/total and always succeed so
+    # a partially-compatible backend (e.g. KVM at 138/180) cannot red the whole run.
+    if [[ -n $COMPAT_BACKEND ]]; then
+        printf "ℹ️  %s full compatibility corpus: %s/%s passed L2 (%s failed; observational, non-blocking)\n" \
+            "$COMPAT_BACKEND" "$passed" "$total" "$failed"
+        return 0
+    fi
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         if ((total != SABRE_COMPAT_TOTAL)); then
             printf "❌ SaBRe compatibility corpus selected %s rows; expected %s\n" \
@@ -2946,6 +3035,40 @@ if ((QEMU_L2_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "QEMU strict L2 boot (heavyweight)" \
             ./experiments/qemu-boot-debug/strict_l2_test.sh
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+# TODO-HUMAN-REVIEW(PR-732): Focused full-corpus backend compatibility report. Runs the
+# entire strict corpus under every available backend and prints real per-backend
+# pass/total (via the COMPAT SUMMARY emitted on exit). Observational: the exit status
+# reflects only build/harness failures, not per-backend compatibility gaps.
+if ((BACKEND_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit for backend compatibility" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        # This focused mode only builds the release binary, so probe backend support and
+        # availability against that same binary rather than the (unbuilt) debug binary.
+        run_check_with_timeout 2400 "ptrace full compatibility corpus (observational)" \
+            run_backend_compatibility_report ptrace
+        if backend_selector_supported "$STRICT_COMPAT_HERMIT_BIN"; then
+            if kvm_backend_available; then
+                run_check_with_timeout 2400 "KVM full compatibility corpus (observational)" \
+                    run_backend_compatibility_report kvm
+            else
+                note_backend_skip "KVM" "/dev/kvm is not readable and writable"
+            fi
+            if dbi_backend_available "$STRICT_COMPAT_HERMIT_BIN"; then
+                run_check_with_timeout 2400 "DBI full compatibility corpus (observational)" \
+                    run_backend_compatibility_report dbi
+            else
+                note_backend_skip "DBI" "backend smoke did not complete successfully"
+            fi
+        else
+            note_backend_skip "KVM/DBI" "backend selector is unavailable"
+        fi
     fi
     print_summary
     ((failures == 0))
