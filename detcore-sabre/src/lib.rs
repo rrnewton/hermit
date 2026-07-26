@@ -51,7 +51,7 @@ fn remember_coordinator_socket(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review fail-closed SaBRe RDTSC errors.
+// TODO-HUMAN-REVIEW(PR-779): Review fail-closed SaBRe RDTSC errors.
 fn require_virtual_rdtsc(result: Result<u64, Errno>) -> u64 {
     result.expect("SaBRe RDTSC virtualization failed")
 }
