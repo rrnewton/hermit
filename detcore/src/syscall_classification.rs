@@ -317,7 +317,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#788): BATCH 56. flock is an advisory whole-file
+        // TODO-HUMAN-REVIEW(#792): BATCH 56. flock is an advisory whole-file
         // lock; keyctl/add_key/request_key manipulate global kernel keyrings;
         // perf_event_open opens a hardware/software performance counter. All
         // three are untyped (Syscall::Other) in the pinned Reverie and are
@@ -722,7 +722,7 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#788): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#792): Deterministic ENOSYS refusal set.
 /// Kernel keyring syscalls (`keyctl`, `add_key`, `request_key`). The keyrings
 /// they manipulate (thread/process/session/user/user-session and persistent
 /// keyrings) are global kernel objects shared across the host and persistent

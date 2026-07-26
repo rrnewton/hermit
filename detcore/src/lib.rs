@@ -1391,7 +1391,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#788): BATCH 56. flock(2) is an advisory
+            // TODO-HUMAN-REVIEW(#792): BATCH 56. flock(2) is an advisory
             // whole-file lock and is untyped (Syscall::Other) in the pinned
             // Reverie. Detcore serializes all guest threads/processes onto one
             // logical CPU with a deterministic scheduler, so there is no true
@@ -1406,7 +1406,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // probes correctly see success.
             SyscallClassification::Determinized if call.number() == Sysno::flock => Ok(0),
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#788): BATCH 56. Kernel keyring syscalls
+            // TODO-HUMAN-REVIEW(#792): BATCH 56. Kernel keyring syscalls
             // (keyctl/add_key/request_key) are untyped (Syscall::Other) in the
             // pinned Reverie. The keyrings they touch are global kernel objects
             // shared across the host and persistent across runs, so forwarding
@@ -1419,7 +1419,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#788): BATCH 56. perf_event_open(2) is untyped
+            // TODO-HUMAN-REVIEW(#792): BATCH 56. perf_event_open(2) is untyped
             // (Syscall::Other) in the pinned Reverie. It opens a hardware or
             // software performance counter whose reads (retired instructions,
             // cycles, cache misses, ...) are inherently nondeterministic, and
