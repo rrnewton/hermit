@@ -218,6 +218,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl_fd
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#781): Vectored read sibling of the determinized writev.
+        | Sysno::readv
         // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling policy =====
         // Hermit presents a single deterministic virtual CPU and a single virtual
         // NUMA node, and Detcore replaces the Linux scheduler with its own. NUMA
@@ -519,7 +522,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ptrace
         | Sysno::pwritev
         | Sysno::pwritev2
-        | Sysno::readv
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
         | Sysno::request_key
@@ -720,7 +722,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [200, 91, 82]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -760,6 +762,12 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::writev),
+            SyscallClassification::Determinized
+        );
+        // readv is the vectored read sibling of writev and must share its
+        // determinized policy rather than aborting under --strict.
+        assert_eq!(
+            classify_syscall(Sysno::readv),
             SyscallClassification::Determinized
         );
         for sysno in [
