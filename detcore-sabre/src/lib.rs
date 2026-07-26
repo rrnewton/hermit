@@ -56,12 +56,9 @@ struct Plugin {
 
 impl Plugin {
     fn connect() -> Self {
-        let socket = std::env::var_os(RPC_SOCKET_ENV)
+        // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+        let socket = unsafe { sabre::take_private_env(RPC_SOCKET_ENV) }
             .unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
-        // SaBRe caches reserved settings before plugin initialization and
-        // restores them around exec. Initialization runs before guest threads,
-        // so consuming the setting cannot race with guest environment access.
-        unsafe { std::env::remove_var(RPC_SOCKET_ENV) };
 
         let adapter = RemoteReverieAdapter::connect(socket)
             .expect("failed to connect Detcore SaBRe plugin to coordinator");
