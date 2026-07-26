@@ -114,6 +114,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
         | Sysno::pselect6
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+        | Sysno::select
         | Sysno::prlimit64
         | Sysno::pread64
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -122,6 +125,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::read
         | Sysno::recvfrom
         | Sysno::recvmsg
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#788): Vectored datagram-receive sibling of recvmsg.
+        // recvmsg/recvfrom are already Determinized and recvmmsg is just their
+        // multi-message form; it shares the same NonblockableSyscall impl
+        // (network_comm_syscall) and executes atomically on a temporarily
+        // nonblocking fd, so the kernel fills the mmsghdr array itself. Its
+        // timeout argument is ignored (the fd is nonblocking and the Detcore
+        // scheduler owns blocking), matching recvmsg's determinism model.
+        | Sysno::recvmmsg
         | Sysno::rseq
         | Sysno::rt_sigaction
         | Sysno::rt_sigprocmask
@@ -546,13 +558,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
-        | Sysno::recvmmsg
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::sched_setattr
         | Sysno::seccomp
-        | Sysno::select
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
@@ -764,6 +774,16 @@ mod tests {
             classify_syscall(Sysno::ppoll),
             SyscallClassification::Determinized
         );
+        // select is the timeval sibling of pselect6 and must stay Determinized
+        // (routed through handle_select); regression for #800.
+        assert_eq!(
+            classify_syscall(Sysno::select),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::pselect6),
+            SyscallClassification::Determinized
+        );
         assert_eq!(
             classify_syscall(Sysno::arch_prctl),
             SyscallClassification::Determinized
@@ -796,6 +816,16 @@ mod tests {
         for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
+        // recvmmsg is the multi-message sibling of recvmsg and must stay
+        // Determinized (routed through handle_sendrecv); regression for #788.
+        assert_eq!(
+            classify_syscall(Sysno::recvmmsg),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::recvmsg),
+            SyscallClassification::Determinized
+        );
         for sysno in [
             Sysno::epoll_pwait2,
             Sysno::clock_settime,

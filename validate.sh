@@ -40,7 +40,8 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --hosted-strict-compat-only # hosted L2 matrix with bounded diagnostics
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
-#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
+#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix;
+#                                            # needs executable HERMIT_SABRE_BINARY
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
@@ -302,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=29
+readonly LITEINST_COMPAT_EXPECTED=97
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -827,7 +828,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (97 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1341,6 +1342,74 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe g++ /usr/bin/g++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe make /usr/bin/make --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe openssl /usr/bin/openssl dgst -sha256 /etc/hostname && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe basename /usr/bin/basename /tmp/foo.txt .txt && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dirname /usr/bin/dirname /tmp/foo.txt && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pwd /usr/bin/pwd && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe realpath /usr/bin/realpath README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe md5sum /usr/bin/md5sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha1sum /usr/bin/sha1sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cut /usr/bin/cut -c 1-20 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uniq /usr/bin/uniq README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe paste /usr/bin/paste README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nl /usr/bin/nl -ba README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ls /usr/bin/ls -ld README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe date /usr/bin/date -u +%s && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe grep /usr/bin/grep -n Hermit README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sed /usr/bin/sed -n '1,20p' README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe find /usr/bin/find hermit-cli -maxdepth 1 -type f -printf '%f\n' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe git /usr/bin/git --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmake /usr/bin/cmake --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tar /usr/bin/tar --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gzip /usr/bin/gzip --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ldd /usr/bin/ldd --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lscpu /usr/bin/lscpu && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uptime /usr/bin/uptime -p && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe base32 /usr/bin/base32 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha224sum /usr/bin/sha224sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha384sum /usr/bin/sha384sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha512sum /usr/bin/sha512sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe b2sum /usr/bin/b2sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cksum /usr/bin/cksum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sum /usr/bin/sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fold /usr/bin/fold -w 40 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fmt /usr/bin/fmt -w 60 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tac /usr/bin/tac README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rev /usr/bin/rev README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe od /usr/bin/od -An -tx1 -N32 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xxd /usr/bin/xxd -l 32 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe strings /usr/bin/strings -n 8 /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nm /usr/bin/nm -D /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe objdump /usr/bin/objdump -f /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe readelf /usr/bin/readelf -h /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe size /usr/bin/size /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe addr2line /usr/bin/addr2line -e /bin/true 0 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe c++filt /usr/bin/c++filt _Z3foov && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe expand /usr/bin/expand -t 4 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unexpand /usr/bin/unexpand -a README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe printenv /usr/bin/printenv PATH && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe whoami /usr/bin/whoami && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe groups /usr/bin/groups && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bash /bin/bash -c 'printf "bash-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sh /bin/sh -c 'printf "sh-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmp /usr/bin/cmp README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe diff /usr/bin/diff README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pr /usr/bin/pr -t README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe test /usr/bin/test -f README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bracket '/usr/bin/[' -f README.md ']' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe users /usr/bin/users && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pinky /usr/bin/pinky -l root && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ptx /usr/bin/ptx README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tsort /usr/bin/tsort /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe column /usr/bin/column README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hexdump /usr/bin/hexdump -C -n 32 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe iconv /usr/bin/iconv -f UTF-8 -t UTF-8 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe jq /usr/bin/jq -n '{answer: 42}' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lua /usr/bin/lua -e 'print(42)' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dc /usr/bin/dc -e '2 2 + p' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cal /usr/bin/cal 1 2000 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sleep /usr/bin/sleep 0 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe logger /usr/bin/logger --stderr --no-act -t hermit-compat logger-ok && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -1353,6 +1422,56 @@ function run_liteinst_compatibility_envelope {
     fi
     printf "❌ LiteInst compatibility baseline (%s/%s passed, %s regressed)\n" "$passed" "$total" "$failed"
     return 1
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-808): Review SaBRe compatibility process-group teardown.
+function terminate_sabre_compatibility_group {
+    local pid=$1
+    local grace_deadline
+
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+    while kill -0 -- "-$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+        sleep 0.2
+    done
+    if kill -0 -- "-$pid" 2>/dev/null; then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+}
+
+function run_sabre_compatibility_command {
+    (
+        local timeout_seconds=$1
+        shift
+
+        local started_at=$SECONDS
+        local pid=""
+        local status
+
+        trap 'if [[ -n $pid ]]; then terminate_sabre_compatibility_group "$pid"; wait "$pid" 2>/dev/null || true; fi; exit 143' INT TERM HUP
+        setsid "$@" </dev/null >>"$LOG_FILE" 2>&1 &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            if ((SECONDS - started_at >= timeout_seconds)); then
+                terminate_sabre_compatibility_group "$pid"
+                wait "$pid" 2>/dev/null || true
+                exit 124
+            fi
+            sleep 0.2
+        done
+
+        if wait "$pid"; then
+            status=0
+        else
+            status=$?
+        fi
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            terminate_sabre_compatibility_group "$pid"
+        fi
+        trap - INT TERM HUP
+        exit "$status"
+    )
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1421,15 +1540,22 @@ function strict_compatibility_probe {
         printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
-    if timeout "$probe_timeout" \
-        "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
-        </dev/null >>"$LOG_FILE" 2>&1; then
-        status=0
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        run_sabre_compatibility_command "$probe_timeout" \
+            "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@"
+        status=$?
+    else
+        timeout "$probe_timeout" \
+            "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
+            </dev/null >>"$LOG_FILE" 2>&1
+        status=$?
+    fi
+
+    if ((status == 0)); then
         printf "  ✅ %-12s PASS %s (%ss)\n" \
             "$label" "$assurance" "$((SECONDS - started_at))"
         record_compatibility_result "$label" PASS "$assurance"
     else
-        status=$?
         summary=$(failure_summary "$output_start")
         printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
             "$label" "$assurance" "$status" "$summary"
@@ -2390,15 +2516,14 @@ function run_e9patch_extended_compatibility_envelope {
     return "$status"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-799): Review the focused SaBRe artifact contract.
 function require_sabre_artifacts {
-    local variable
-    for variable in HERMIT_SABRE_RUNNER HERMIT_SABRE_BINARY HERMIT_SABRE_PLUGIN; do
-        if [[ -z ${!variable:-} || ! -f ${!variable} ]]; then
-            printf "validate.sh: %s must name a regular file for SaBRe compatibility\n" \
-                "$variable" >&2
-            return 1
-        fi
-    done
+    local binary=${HERMIT_SABRE_BINARY:-}
+    if [[ -z $binary || ! -f $binary || ! -x $binary ]]; then
+        printf "validate.sh: HERMIT_SABRE_BINARY must name an executable SaBRe loader\n" >&2
+        return 1
+    fi
 }
 
 function run_rr_compatibility_envelope {
@@ -3026,8 +3151,8 @@ fi
 if ((SABRE_COMPAT_ONLY == 1)); then
     run_check "SaBRe artifacts configured" require_sabre_artifacts
     if ((failures == 0)); then
-        run_check "Build release Hermit for SaBRe compatibility" \
-            cargo build --release -p hermit
+        run_check "Build release Hermit and Detcore plugin for SaBRe compatibility" \
+            cargo build --release -p hermit -p detcore-sabre
     fi
     if ((failures == 0)); then
         run_check "SaBRe compatibility ratchet (151 programs)" \
@@ -3041,7 +3166,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (97 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
