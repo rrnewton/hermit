@@ -248,7 +248,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#778): Linux I/O-scheduling priority and the extended
+        // TODO-HUMAN-REVIEW(#784): Linux I/O-scheduling priority and the extended
         // sched_{get,set}attr scheduling interface. Same argument as the CPU
         // scheduling-policy group above: Detcore replaces the Linux scheduler and
         // presents a single deterministic virtual CPU, so I/O priority and the
@@ -476,7 +476,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#778): flock(2) advisory whole-file locking. Hermit
+        // TODO-HUMAN-REVIEW(#784): flock(2) advisory whole-file locking. Hermit
         // does not virtualize the filesystem, so an advisory lock on the guest's
         // own open file is forwarded to the same non-virtualized resource the file
         // itself lives on. For the deterministic container's own descriptors the

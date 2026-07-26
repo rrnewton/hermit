@@ -1623,7 +1623,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#778): Linux I/O-scheduling priority and the
+                // TODO-HUMAN-REVIEW(#784): Linux I/O-scheduling priority and the
                 // extended sched_attr scheduling interface. Same rationale as the
                 // CPU scheduling-policy group above: Detcore replaces the Linux
                 // scheduler and exposes a single virtual CPU, so I/O priority and

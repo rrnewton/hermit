@@ -941,7 +941,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// size field set to the number of bytes filled. The value is emulated (never
     /// injected), so it is identical across --verify runs and record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#778)
+    // TODO-HUMAN-REVIEW(#784)
     pub async fn handle_sched_getattr<G: Guest<Self>>(
         &self,
         guest: &mut G,
