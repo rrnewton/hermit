@@ -34,7 +34,10 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
-#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix
+#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix;
+#                                            # STRICT_COMPAT_HERMIT_BIN reuses
+#                                            # an existing executable
+#   ./validate.sh --hosted-strict-compat-only # hosted L2 matrix with bounded diagnostics
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
@@ -71,6 +74,7 @@ function select_validation_level {
     VALIDATION_LEVEL_EXPLICIT=1
 }
 STRICT_COMPAT_ONLY=0
+HOSTED_STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
@@ -99,6 +103,9 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
+        # TODO-HUMAN-REVIEW(#719): Review the focused hosted compatibility CLI.
+        --hosted-strict-compat-only)
+            STRICT_COMPAT_ONLY=1; HOSTED_STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#688): Review the focused LiteInst compatibility CLI.
@@ -141,6 +148,7 @@ fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
 [[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
+((HOSTED_STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="hosted-strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
@@ -154,6 +162,7 @@ case "$VALIDATION_PROFILE" in
     full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
     super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
     strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    hosted-strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     liteinst-compat-only) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
@@ -195,7 +204,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
+readonly STRICT_COMPAT_ONLY HOSTED_STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
 readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
@@ -272,7 +281,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
-STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
+readonly DEFAULT_STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$DEFAULT_STRICT_COMPAT_HERMIT_BIN"}
 readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
@@ -288,7 +298,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=181
-readonly RR_COMPAT_EXPECTED=131
+# Current main's 131-row ratchet (which already includes ruby/dc/tcl from
+# PR #729) plus four descriptor-state and eight writable-filesystem programs
+# adopted from PR #662.
+readonly RR_COMPAT_EXPECTED=143
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -332,8 +345,8 @@ declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
 
-# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
-# strict corpus below; this set only selects the rows known to pass R/R.
+# Commands remain owned by the strict corpus below; this exact set only selects
+# rows measured to pass R/R.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -351,7 +364,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [tsort]=1 [ptx]=1 [pinky]=1 [logname]=1 [users]=1 [uptime]=1
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
-    [split]=1 [cmp]=1
+    [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
+    [diff]=1 [cp]=1 [install]=1 [tar]=1 [mv]=1 [rm]=1 [touch]=1 [chmod]=1
     [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
@@ -359,6 +373,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
     [ruby]=1 [dc]=1 [tcl]=1
 )
+# mktemp remains excluded: SIGCHLD delivery can race the command-substitution pipe EOF
+# during replay, changing deterministic log order while preserving output and exit status.
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
@@ -1362,7 +1378,7 @@ function strict_compatibility_probe {
     local nonblocking=0
     local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --)
-    if [[ $VALIDATION_PROFILE == hosted-only ]]; then
+    if [[ $VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1 ]]; then
         run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
         if [[ -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
             probe_timeout=20
@@ -1419,7 +1435,7 @@ function strict_compatibility_probe {
         printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
             "$label" "$assurance" "$status" "$summary"
         record_compatibility_result "$label" FAIL "exit $status: $summary"
-        if [[ $VALIDATION_PROFILE == hosted-only && -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
+        if [[ ($VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1) && -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
             nonblocking=1
             HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=$((HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT + 1))
             printf "  WARN %s is a bounded hosted diagnostic: %s\n" \
@@ -2719,7 +2735,9 @@ function run_hosted_only_suite {
     # bounded, observable hosted diagnostic instead of the blocking gate; the
     # non-python3 LiteInst cases (/bin/echo, /bin/sh, /bin/cat, workdir, stdin,
     # exit/signal, orphan reaping) stay blocking here.
-    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1
+    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1
+    run_check_with_timeout 120 "DBI diagnostics stay out of guest stderr" \
+        cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
     run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1
     run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
@@ -2854,7 +2872,7 @@ function run_full_suite {
         printf "❌ Strict compatibility envelope regressed; failing validation (matches the now-blocking CI gate).\n"
         failures=$((failures + 1))
     fi
-    run_check "Record/replay compatibility baseline (128 programs)" \
+    run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
         run_rr_compatibility_envelope
     # Nextest runs most package unit and Cargo integration targets in parallel.
     # Detcore's PMU tests depend on same-binary coordination; nextest would launch
@@ -2886,12 +2904,52 @@ function run_full_suite {
     run_envelope
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
+function run_super_diagnostic_suite {
+    # These probes are useful for trend detection but do not gate PRs. On the
+    # hosted runner they consumed about 20 minutes after the blocking suite had
+    # already passed, so keep their signal in the scheduled super tier.
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#712): Review bounded routing for no-PMU hangs.
+    run_check_with_timeout 180 "Post-fork scheduling diagnostics" \
+        cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
+    run_check_with_timeout 180 "Network syscall determinism diagnostic" \
+        cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
+    run_check_with_timeout 180 "IPC determinism diagnostic" \
+        cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
+    run_check_with_timeout 180 "Random-source determinism diagnostic" \
+        cargo test -p hermit --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
+    run_check_with_timeout 300 "Threaded integration matrix diagnostic" \
+        cargo test -p hermit --test integration_matrix -- --test-threads=1
+    run_check_with_timeout 300 "LiteInst python3 verify diagnostics" \
+        cargo test -p hermit --test cli -- \
+        run_liteinst_rejects_non_fork_clone \
+        run_liteinst_handles_inherited_ignored_sigchld \
+        run_liteinst_verifies_forked_guest \
+        run_liteinst_verifies_raw_fork_guest --test-threads=1
+    run_check_with_timeout 300 "Chaos hello-race verification diagnostic" \
+        cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#598)
+    run_check_with_timeout 300 "DBI pipe backpressure diagnostic" \
+        cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+    # This test exercises verify, tampered reports, fork/exec, and strict DBI
+    # teardown in one case. Keep its coverage, but do not let a backend
+    # lifecycle deadlock consume the hosted PR gate.
+    run_check_with_timeout 180 "DBI unsupported-syscall aggregation diagnostic" \
+        cargo test -p hermit --test cli run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
+    run_check_with_timeout 30 "DBI strict blocked-stdin teardown diagnostic" \
+        cargo test -p hermit --test cli run_dbi_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
+}
+
 function run_super_suite {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
 
     run_check "Build workspace" cargo build --workspace
     run_check "Build release Hermit" cargo build --release -p hermit
+    run_super_diagnostic_suite
     run_check "Super repeated determinism probes" run_super_stress_suite
     if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then
         printf "\n== Super stress pass rates ==\n"
@@ -2920,9 +2978,16 @@ if ((HARDWARE_ONLY == 1)); then
 fi
 
 if ((STRICT_COMPAT_ONLY == 1)); then
-    run_check "Build release Hermit for strict compatibility" \
-        cargo build --release -p hermit
-    if ((failures != 0)); then
+    # TODO-HUMAN-REVIEW(#719): Review reuse of a caller-provided Hermit binary.
+    if [[ $STRICT_COMPAT_HERMIT_BIN == "$DEFAULT_STRICT_COMPAT_HERMIT_BIN" ]]; then
+        run_check "Build release Hermit for strict compatibility" \
+            cargo build --release -p hermit
+        if ((failures != 0)); then
+            exit 1
+        fi
+    elif [[ ! -x $STRICT_COMPAT_HERMIT_BIN ]]; then
+        printf "Configured strict compatibility Hermit is not executable: %s\n" \
+            "$STRICT_COMPAT_HERMIT_BIN" >&2
         exit 1
     fi
     run_strict_compatibility_envelope
@@ -2977,7 +3042,7 @@ if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
     if ((failures == 0)); then
-        run_check "Record/replay compatibility baseline (128 programs)" \
+        run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
     fi
     print_summary
