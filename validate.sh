@@ -318,6 +318,8 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
 # these rows are removed from the diagnostic mask and rejoin the blocking corpus.
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [top]="live process-table reads differ on the GitHub-hosted runner"
+    [javac]="heavyweight JIT diverges under ptrace on the no-PMU GitHub-hosted runner"
+    [node]="heavyweight JIT diverges under ptrace on the no-PMU GitHub-hosted runner"
 )
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
