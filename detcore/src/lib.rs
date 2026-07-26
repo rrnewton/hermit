@@ -1315,7 +1315,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING): Deterministic ENOSYS for the
+            // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
             // asynchronous and message-passing I/O and IPC interfaces Detcore
             // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
             // io_cancel/io_getevents/io_pgetevents), POSIX message queues

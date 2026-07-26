@@ -270,7 +270,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fanotify_mark
         | Sysno::settimeofday
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-PENDING): Deterministic ENOSYS for the
+        // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
         // asynchronous and message-passing I/O and IPC interfaces Detcore does
         // not model. Linux native AIO (io_setup/io_destroy/io_submit/io_cancel/
         // io_getevents/io_pgetevents) has kernel-driven asynchronous completion
@@ -654,7 +654,7 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
 /// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
 /// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
 /// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and System V
