@@ -369,6 +369,28 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::capget
         | Sysno::capset
         | Sysno::getgroups
+        // The credential-setting family updates the same fixed-container identity
+        // that capset (above) and getuid/getgid/getresuid/getgroups (read side)
+        // already treat as deterministic passthrough. Hermit runs the guest in a
+        // single-uid user namespace (uid_map "0 <host-uid> 1"), so these writes
+        // resolve against a fixed mapping on every run: setting the mapped id
+        // succeeds and setting any unmapped id fails identically each time. They
+        // are process-local (no host-global state, unlike the refused mount/ns
+        // admin syscalls) and forward deterministically under --verify and
+        // record/replay, re-enabling runuser, setpriv, and su-style privilege
+        // transitions under --strict. Previously Unsupported, which fail-closed
+        // --strict and aborted those programs.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#801)
+        | Sysno::setuid
+        | Sysno::setgid
+        | Sysno::setreuid
+        | Sysno::setregid
+        | Sysno::setresuid
+        | Sysno::setresgid
+        | Sysno::setfsuid
+        | Sysno::setfsgid
+        | Sysno::setgroups
         // chdir/fchdir/faccessat2/umask are deterministic process-state transitions or
         // checks given a fixed namespace, credential set, and filesystem image.
         | Sysno::chdir
@@ -556,15 +578,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::setfsgid
-        | Sysno::setfsuid
-        | Sysno::setgid
-        | Sysno::setgroups
-        | Sysno::setregid
-        | Sysno::setresgid
-        | Sysno::setresuid
-        | Sysno::setreuid
-        | Sysno::setuid
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
@@ -740,7 +753,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [204, 91, 78]);
+        assert_eq!(counts, [204, 100, 69]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -793,6 +806,21 @@ mod tests {
         // Their read/write siblings deliberately remain Unsupported for now.
         for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
+        // The credential-setting family now passes through like capset and the
+        // getuid/getgid/getresuid/getgroups read side (re-enables runuser/setpriv).
+        for sysno in [
+            Sysno::setuid,
+            Sysno::setgid,
+            Sysno::setreuid,
+            Sysno::setregid,
+            Sysno::setresuid,
+            Sysno::setresgid,
+            Sysno::setfsuid,
+            Sysno::setfsgid,
+            Sysno::setgroups,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         for sysno in [
             Sysno::epoll_pwait2,

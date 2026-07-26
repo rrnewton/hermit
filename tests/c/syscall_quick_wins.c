@@ -40,6 +40,27 @@ int main(void) {
     return 1;
   }
 
+  /*
+   * Credential-setting family. Hermit runs the guest as uid 0 inside a
+   * single-uid user namespace, so setting the mapped id 0 succeeds and is
+   * deterministic on every run. These previously classified as Unsupported and
+   * fail-closed --strict (aborting runuser/setpriv/su); they now pass through
+   * like the getresuid/getresgid read side and capset above. setgroups is
+   * deliberately excluded: a single-uid user namespace pins /proc/self/setgroups
+   * to "deny", so it returns EPERM (faithfully and deterministically) rather
+   * than succeeding.
+   */
+  require_zero(syscall(SYS_setuid, 0), "setuid");
+  require_zero(syscall(SYS_setgid, 0), "setgid");
+  require_zero(syscall(SYS_setreuid, 0, 0), "setreuid");
+  require_zero(syscall(SYS_setregid, 0, 0), "setregid");
+  require_zero(syscall(SYS_setresuid, 0, 0, 0), "setresuid");
+  require_zero(syscall(SYS_setresgid, 0, 0, 0), "setresgid");
+  /* setfsuid/setfsgid never fail; they return the previous id, so just run them
+   * to confirm they are no longer fail-closed. */
+  syscall(SYS_setfsuid, 0);
+  syscall(SYS_setfsgid, 0);
+
   size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
   void *page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
