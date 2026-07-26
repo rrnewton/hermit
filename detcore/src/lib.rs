@@ -154,6 +154,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_lsm_self_attr_refused_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1407,6 +1408,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // before the typed match below.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for the kernel-6.8
+            // Linux Security Module self-attribute syscalls (lsm_get_self_attr/
+            // lsm_set_self_attr/lsm_list_modules). The active-LSM set and the
+            // returned per-process security context are host-configuration-
+            // dependent global state; forwarding them (the legacy pass-through) is
+            // nondeterministic and leaks the host security posture, and the setter
+            // would perturb state the deterministic container pins for the whole
+            // run. A fixed -ENOSYS is exactly the errno every pre-6.8 kernel
+            // returns, so callers fall back to /proc/self/attr or
+            // /sys/kernel/security/lsm; never forwarded to the host and identical
+            // across --verify and record/replay. Untyped (Syscall::Other) in the
+            // pinned Reverie, so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_lsm_self_attr_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::ENOSYS))
             }

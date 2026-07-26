@@ -338,6 +338,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgsnd
         | Sysno::msgrcv
         | Sysno::msgctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for the kernel-6.8 Linux
+        // Security Module self-attribute API. lsm_list_modules reports the set of
+        // LSMs active on the host (e.g. capability/selinux/bpf), lsm_get_self_attr
+        // returns the caller's per-LSM security context, and lsm_set_self_attr
+        // mutates that security state. The active-module set and returned
+        // attributes are host-configuration-dependent global state: forwarding
+        // them (the legacy pass-through) is nondeterministic and leaks the host's
+        // security posture into the guest, and lsm_set_self_attr would perturb
+        // state the deterministic container pins for the whole run. A fixed
+        // -ENOSYS is exactly the errno every pre-6.8 kernel returns for these
+        // syscalls, so callers fall back to their older-kernel path
+        // (/proc/self/attr, /sys/kernel/security/lsm); it is never forwarded to
+        // the host and is bitwise-identical across --verify and record/replay,
+        // mirroring the #715 and #731 ENOSYS refusals. These are untyped
+        // (Syscall::Other) in the pinned Reverie, so the dispatcher matches on the
+        // Sysno before the typed match below.
+        | Sysno::lsm_get_self_attr
+        | Sysno::lsm_set_self_attr
+        | Sysno::lsm_list_modules
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -543,9 +563,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
         | Sysno::listmount
-        | Sysno::lsm_get_self_attr
-        | Sysno::lsm_list_modules
-        | Sysno::lsm_set_self_attr
         | Sysno::map_shadow_stack
         | Sysno::memfd_secret
         | Sysno::mincore
@@ -741,6 +758,27 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS refusal set.
+/// The kernel-6.8 Linux Security Module self-attribute syscalls. `lsm_list_modules`
+/// reports which LSMs are active on the host, `lsm_get_self_attr` returns the
+/// calling process's per-LSM security context, and `lsm_set_self_attr` mutates
+/// that security state. The active-module set and returned attributes are
+/// host-configuration-dependent global state, so forwarding them is
+/// nondeterministic and leaks the host's security posture, and the setter would
+/// perturb state the deterministic container pins for the whole run. Detcore
+/// refuses them with a fixed `ENOSYS`: exactly the errno every pre-6.8 kernel
+/// returns, so callers fall back to their older-kernel path. The result is never
+/// forwarded to the host and is bitwise-identical across `--verify` and
+/// record/replay. These are untyped (`Syscall::Other`) in the pinned Reverie, so
+/// the dispatcher matches on the `Sysno` before the typed match.
+pub(crate) const fn is_lsm_self_attr_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::lsm_get_self_attr | Sysno::lsm_set_self_attr | Sysno::lsm_list_modules
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,7 +795,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [212, 91, 70]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1000,6 +1038,17 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
+        // Batch 145: the kernel-6.8 LSM self-attribute syscalls are refused with a
+        // deterministic ENOSYS (host-dependent security posture); see
+        // is_lsm_self_attr_refused_syscall.
+        for sysno in [
+            Sysno::lsm_get_self_attr,
+            Sysno::lsm_set_self_attr,
+            Sysno::lsm_list_modules,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_lsm_self_attr_refused_syscall(sysno));
+        }
     }
 
     #[test]
@@ -1125,6 +1174,38 @@ mod tests {
         // The helper must not claim any syscall outside the reviewed set.
         for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
             if is_mount_ns_admin_refused_syscall(sysno) {
+                assert!(
+                    refused.contains(&sysno),
+                    "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lsm_self_attr_syscalls_are_determinized_and_consistent() {
+        // Every syscall in the deterministic LSM ENOSYS-refusal set must classify
+        // as Determinized, and the helper used by the dispatcher must agree exactly
+        // with that classification across the whole pinned table.
+        let refused = [
+            Sysno::lsm_get_self_attr,
+            Sysno::lsm_set_self_attr,
+            Sysno::lsm_list_modules,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_lsm_self_attr_refused_syscall(sysno),
+                "{sysno:?} should be in the LSM ENOSYS-refusal helper set"
+            );
+        }
+        // The helper must not claim any syscall outside the reviewed set.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_lsm_self_attr_refused_syscall(sysno) {
                 assert!(
                     refused.contains(&sysno),
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
