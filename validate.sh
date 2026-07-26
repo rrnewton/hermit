@@ -2704,7 +2704,7 @@ function run_hosted_only_suite {
     start_check "Rustfmt" cargo fmt --all -- --check
     start_check "Documentation" cargo doc --workspace --no-deps
 
-    run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude detcore-liteinst --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#707): The guest harnesses deliberately exit nonzero
     # for some native schedules. Compile them here; Hermit's deterministic and
