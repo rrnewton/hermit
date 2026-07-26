@@ -649,7 +649,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#792)
+    // TODO-HUMAN-REVIEW(#794)
     /// SYS_readv system call: the vectored form of `read`.
     ///
     /// Mirrors [`Self::handle_writev`] for the read direction. Detcore adds
@@ -684,7 +684,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#792)
+    // TODO-HUMAN-REVIEW(#794)
     /// SYS_preadv system call: the vectored form of `pread64`.
     ///
     /// Positioned reads target seekable files and do not block, so this mirrors
@@ -710,7 +710,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#792)
+    // TODO-HUMAN-REVIEW(#794)
     /// SYS_preadv2 system call: `preadv` with a trailing per-call flags argument,
     /// which record/replay forwards unchanged.
     pub async fn handle_preadv2<G: Guest<Self>>(
@@ -733,7 +733,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#792)
+    // TODO-HUMAN-REVIEW(#794)
     /// SYS_pwritev system call: the vectored form of `pwrite64`.
     ///
     /// Positioned writes target seekable files and do not block, so this mirrors
@@ -766,7 +766,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#792)
+    // TODO-HUMAN-REVIEW(#794)
     /// SYS_pwritev2 system call: `pwritev` with a trailing per-call flags
     /// argument, which record/replay forwards unchanged.
     pub async fn handle_pwritev2<G: Guest<Self>>(

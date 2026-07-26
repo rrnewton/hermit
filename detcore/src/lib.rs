@@ -1410,7 +1410,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#792): vectored scatter/gather I/O, mirroring
+                // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
                 // read/pread64/pwrite64/writev.
                 Syscall::Readv(s) => self.handle_readv(guest, s).await,
                 Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
