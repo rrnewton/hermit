@@ -90,6 +90,9 @@ moving parts:
   hosted strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
   release as before.
+- **The DBI stderr-isolation CLI case is a separate 120-second node** so a
+  backend hang fails quickly without consuming the aggregate CLI budget. The
+  aggregate node skips that case, so the test set remains unchanged.
 - **Serial per-target loops are inlined** as a `for` loop with `set -e`
   (`test.hermit_integration`, `hw.integration`, and the `pmu.*` exact-case
   gates), matching `run_hermit_targets_serial` / `run_exact_detcore_cases`

@@ -18,7 +18,7 @@
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
       "timeout": 600,
-      "hint": {"est_duration_s": 155, "rss_baseline_bytes": 536870912,
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}
     },
     {
@@ -145,10 +145,20 @@
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
-      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
+      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "cli_dbi_diagnostics",
+      "desc": "DBI diagnostics stay out of guest stderr (isolated bounded gate)",
+      "cmd": "cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 120,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 10,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
