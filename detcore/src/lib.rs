@@ -1410,8 +1410,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch65)
+                Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch65)
+                Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch65)
+                Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch65)
+                Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,

@@ -648,6 +648,126 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// Shared implementation for positioned vectored reads (`preadv`/`preadv2`).
+    ///
+    /// Positioned I/O supplies the offset explicitly and does not mutate the open
+    /// file's cursor, so the only shared state that needs deterministic ordering is
+    /// the file-contents resource. Like `writev`, the vectored transfer is issued
+    /// as one kernel operation so the iovec order stays intact; regular-file reads
+    /// return short only at EOF, which the guest already handles.
+    async fn deterministic_positioned_readv<G, S>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        call: S,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall>,
+    {
+        let resource = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.resource())?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+
+        resource_release_all(guest).await;
+        result
+    }
+
+    /// Shared implementation for positioned vectored writes (`pwritev`/`pwritev2`).
+    ///
+    /// Mirrors `deterministic_positioned_readv` for writes: acquire the
+    /// file-contents resource for W, issue the vectored write as one operation, and
+    /// bump the deterministic mtime when metadata virtualization is on.
+    async fn deterministic_positioned_writev<G, S>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        call: S,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall>,
+    {
+        let (resource, raw_ino) = guest.thread_state().with_detfd(fd, |detfd| {
+            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        })?;
+        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+
+        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            touch_file(guest, inode).await;
+        }
+
+        resource_release_all(guest).await;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch65): Positioned vectored read; deterministic
+    // single-shot with FileContents resource ordering (sibling of pread64/readv).
+    /// SYS_preadv system call.
+    pub async fn handle_preadv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        self.deterministic_positioned_readv(guest, fd, call).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch65): preadv2 adds RWF_* flags, forwarded to the
+    // kernel via record_or_replay; determinism handling is identical to preadv.
+    /// SYS_preadv2 system call.
+    pub async fn handle_preadv2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv2,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        self.deterministic_positioned_readv(guest, fd, call).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch65): Positioned vectored write; deterministic
+    // single-shot with FileContents resource ordering (sibling of pwrite64/writev).
+    /// SYS_pwritev system call.
+    pub async fn handle_pwritev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwritev,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        self.deterministic_positioned_writev(guest, fd, call).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch65): pwritev2 adds RWF_* flags, forwarded to the
+    // kernel via record_or_replay; determinism handling is identical to pwritev.
+    /// SYS_pwritev2 system call.
+    pub async fn handle_pwritev2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwritev2,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        self.deterministic_positioned_writev(guest, fd, call).await
+    }
+
     /// SYS_mmap system call.
     pub async fn handle_mmap<G: Guest<Self>>(
         &self,
