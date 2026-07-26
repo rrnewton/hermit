@@ -148,6 +148,10 @@ jobs:
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
         python3 -c 'import test.support'
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+    - name: Build hardware artifacts outside the PMU critical section
+      run: |
+        cargo build --workspace
+        cargo build --release -p hermit
     - name: PMU and CPUID test lane
       run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
     # AUTONOMOUS-BOT-IMPLEMENTED
