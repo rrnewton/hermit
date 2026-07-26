@@ -39,6 +39,9 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
+#   ./validate.sh --full-backend-matrix       # measure the full L2 corpus under
+#                                            # ptrace, KVM, and DBI and print the
+#                                            # per-backend compatibility matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
 #   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
@@ -75,6 +78,7 @@ RR_COMPAT_ONLY=0
 LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
+FULL_BACKEND_MATRIX=0
 QEMU_L2_ONLY=0
 HARDWARE_ONLY=0
 LABEL_PR=1
@@ -108,6 +112,9 @@ while [[ $# -gt 0 ]]; do
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#730): Review the full cross-backend compatibility matrix CLI.
+        --full-backend-matrix) FULL_BACKEND_MATRIX=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
@@ -128,6 +135,7 @@ only_modes=0
 ((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((FULL_BACKEND_MATRIX == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((HARDWARE_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
@@ -145,6 +153,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
+((FULL_BACKEND_MATRIX == 1)) && VALIDATION_PROFILE="full-backend-matrix"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((HARDWARE_ONLY == 1)) && VALIDATION_PROFILE="hardware-only"
 
@@ -158,6 +167,7 @@ case "$VALIDATION_PROFILE" in
     liteinst-compat-only) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
+    full-backend-matrix) VALIDATION_ESTIMATE="about 30-120 minutes; each unavailable/unsupported program under KVM or DBI costs up to one per-probe timeout" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     hardware-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
@@ -196,7 +206,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
-readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY
+readonly E9PATCH_COMPAT_ONLY FULL_BACKEND_MATRIX QEMU_L2_ONLY HARDWARE_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -765,6 +775,19 @@ function liteinst_backend_available {
     timeout "$HERMIT_SMOKE_TIMEOUT" "$HERMIT_BIN" run --backend liteinst --no-namespace -- /bin/true </dev/null >/dev/null 2>&1
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#730): Review the release-binary backend smoke used by the
+# full backend matrix. Probes the release hermit ($STRICT_COMPAT_HERMIT_BIN)
+# rather than the debug $HERMIT_BIN, and allows a longer timeout because the DBI
+# backend compiles its native client on the first run.
+function strict_backend_smoke_ok {
+    local backend=$1
+    local smoke_timeout=${2:-$HERMIT_SMOKE_TIMEOUT}
+    timeout "$smoke_timeout" \
+        "$STRICT_COMPAT_HERMIT_BIN" run --backend "$backend" -- /bin/true \
+        </dev/null >/dev/null 2>&1
+}
+
 function note_backend_skip {
     local backend=$1
     local reason=$2
@@ -808,6 +831,8 @@ function run_full_backend_gates {
 function compat_summary_backend {
     case "$COMPATIBILITY_MODE" in
         strict) printf "ptrace" ;;
+        kvm) printf "kvm" ;;
+        dbi) printf "dbi" ;;
         sabre) printf "sabre" ;;
         *) return 1 ;;
     esac
@@ -1356,7 +1381,13 @@ function strict_compatibility_probe {
             probe_timeout=20
         fi
     fi
-    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+    if [[ $COMPATIBILITY_MODE == kvm ]]; then
+        assurance="KVM L2"
+        run_args=(run --backend kvm --strict --verify --)
+    elif [[ $COMPATIBILITY_MODE == dbi ]]; then
+        assurance="DBI L2"
+        run_args=(run --backend dbi --strict --verify --)
+    elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
         run_args=(run --backend sabre --strict --verify --)
     elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
@@ -2050,6 +2081,16 @@ function run_compatibility_corpus {
     fi
 
     total=$((passed + failed + known_flaky + unavailable))
+    if [[ $COMPATIBILITY_MODE == kvm || $COMPATIBILITY_MODE == dbi ]]; then
+        # Measurement, not a blocking gate: the KVM and DBI backends have
+        # documented long-tail compatibility gaps. Report the observed pass
+        # count and always succeed so the cross-backend matrix is produced
+        # without failing validation on an already-known gap.
+        local backend_label=${COMPATIBILITY_MODE^^}
+        printf "📊 %s compatibility measurement (%s/%s passed L2, %s failed; %s known-flaky, %s unavailable; non-blocking)\n" \
+            "$backend_label" "$passed" "$total" "$failed" "$known_flaky" "$unavailable"
+        return 0
+    fi
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         if ((total != SABRE_COMPAT_TOTAL)); then
             printf "❌ SaBRe compatibility corpus selected %s rows; expected %s\n" \
@@ -2140,6 +2181,33 @@ function run_sabre_compatibility_envelope {
     local status=0
 
     COMPATIBILITY_MODE=sabre
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#730): Review full-corpus KVM/DBI compatibility measurement.
+# Run the identical strict L2 corpus under the KVM backend as a non-blocking
+# measurement. The corpus reporting path returns 0 for this mode; the observed
+# per-program cells feed the cross-backend COMPAT SUMMARY matrix.
+function run_kvm_compatibility_envelope {
+    local status=0
+
+    COMPATIBILITY_MODE=kvm
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#730): Review full-corpus KVM/DBI compatibility measurement.
+# Run the identical strict L2 corpus under the DBI backend as a non-blocking
+# measurement (see run_kvm_compatibility_envelope).
+function run_dbi_compatibility_envelope {
+    local status=0
+
+    COMPATIBILITY_MODE=dbi
     run_compatibility_corpus || status=$?
     COMPATIBILITY_MODE=strict
     return "$status"
@@ -2932,6 +3000,46 @@ if ((RR_COMPAT_ONLY == 1)); then
         run_check "Record/replay compatibility baseline (128 programs)" \
             run_rr_compatibility_envelope
     fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#730): Review the full cross-backend compatibility matrix.
+# Run the complete strict L2 corpus under ptrace (authoritative), then under KVM
+# and DBI as non-blocking measurements, and print the per-backend COMPAT SUMMARY
+# matrix. Unlike the default `full` profile -- which only spot-checks four
+# programs (echo/printf/true/cat) under the alternate backends via run_matrix.py
+# -- this measures every corpus program under each available backend.
+if ((FULL_BACKEND_MATRIX == 1)); then
+    run_check "Build release Hermit for full backend matrix" \
+        cargo build --release -p hermit
+    if ((failures != 0)); then
+        exit 1
+    fi
+
+    # ptrace is the authoritative corpus and the only blocking backend here.
+    # run_strict_compatibility_envelope prepares the functional fixtures itself.
+    run_check_with_timeout 1800 "Strict compatibility corpus (ptrace, $STRICT_COMPAT_TOTAL programs)" \
+        run_strict_compatibility_envelope
+
+    if kvm_backend_available && strict_backend_smoke_ok kvm 60; then
+        run_check_with_timeout 5400 "Full compatibility corpus (KVM, measurement)" \
+            run_kvm_compatibility_envelope
+    else
+        note_backend_skip "KVM" "/dev/kvm unavailable or backend smoke failed"
+    fi
+
+    if strict_backend_smoke_ok dbi 300; then
+        run_check_with_timeout 5400 "Full compatibility corpus (DBI, measurement)" \
+            run_dbi_compatibility_envelope
+    else
+        note_backend_skip "DBI" "backend smoke did not complete successfully"
+    fi
+
+    # The cross-backend COMPAT SUMMARY matrix is emitted by the EXIT trap
+    # (print_compatibility_summary) using the cells recorded above.
     print_summary
     ((failures == 0))
     exit $?
