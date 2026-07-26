@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use reverie::syscalls::Errno;
+use reverie::syscalls::Whence;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -101,9 +103,36 @@ impl ProcfsFile {
         self.offset = 0;
     }
 
+    // TODO-HUMAN-REVIEW(PR-762): Review virtual seek semantics for procfs snapshots.
+    /// Seek within an initialized normalized snapshot.
+    pub(crate) fn seek(
+        &mut self,
+        offset: libc::off_t,
+        whence: Whence,
+    ) -> Option<Result<i64, Errno>> {
+        let contents = self.contents.as_ref()?;
+        let base = match whence {
+            Whence::SEEK_SET => 0_i64,
+            Whence::SEEK_CUR => i64::try_from(self.offset).ok()?,
+            Whence::SEEK_END => i64::try_from(contents.len()).ok()?,
+            _ => return Some(Err(Errno::EINVAL)),
+        };
+        let Some(next) = base.checked_add(offset) else {
+            return Some(Err(Errno::EINVAL));
+        };
+        let Ok(next_offset) = usize::try_from(next) else {
+            return Some(Err(Errno::EINVAL));
+        };
+        self.offset = next_offset;
+        Some(Ok(next))
+    }
+
     /// Returns the next bytes from the normalized snapshot.
     pub(crate) fn take(&mut self, maximum: usize) -> Option<Vec<u8>> {
         let contents = self.contents.as_ref()?;
+        if self.offset >= contents.len() {
+            return Some(Vec::new());
+        }
         let end = self.offset.saturating_add(maximum).min(contents.len());
         let bytes = contents[self.offset..end].to_vec();
         self.offset = end;
@@ -469,6 +498,21 @@ mod tests {
         file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 3, 1);
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
+        assert!(file.take(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_seek_rewinds_and_rejects_invalid_offsets() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/meminfo")).unwrap();
+        file.initialize(b"MemTotal: 123 kB\n".to_vec(), 120, 3, 1);
+
+        assert_eq!(file.take(9).unwrap(), b"MemTotal:");
+        assert_eq!(file.seek(0, Whence::SEEK_SET), Some(Ok(0)));
+        assert_eq!(file.take(128).unwrap(), b"MemTotal: 0 kB\n");
+        assert_eq!(file.seek(-1, Whence::SEEK_END), Some(Ok(14)));
+        assert_eq!(file.take(8).unwrap(), b"\n");
+        assert_eq!(file.seek(-16, Whence::SEEK_SET), Some(Err(Errno::EINVAL)));
+        assert_eq!(file.seek(4, Whence::SEEK_END), Some(Ok(19)));
         assert!(file.take(1).unwrap().is_empty());
     }
 }

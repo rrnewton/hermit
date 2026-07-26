@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use nix::fcntl::OFlag;
+use reverie::syscalls::Errno;
+use reverie::syscalls::Whence;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -306,6 +308,16 @@ impl DetFd {
             .procfs
             .as_mut()
             .and_then(|procfs| procfs.take(maximum))
+    }
+
+    // TODO-HUMAN-REVIEW(PR-762): Review shared procfs snapshot seek state.
+    /// Seek an initialized deterministic procfs snapshot, if one is attached.
+    pub(crate) fn seek_procfs(
+        &self,
+        offset: libc::off_t,
+        whence: Whence,
+    ) -> Option<Result<i64, Errno>> {
+        self.description().procfs.as_mut()?.seek(offset, whence)
     }
 
     /// Cached stat data attached to the backing object.
