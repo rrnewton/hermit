@@ -69,7 +69,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if requested.current > requested.maximum {
             return Err(Errno::EINVAL.into());
         }
-        // TODO-HUMAN-REVIEW(PR-PENDING): allow lowering any virtual limit.
+        // TODO-HUMAN-REVIEW(PR-769): allow lowering any virtual limit.
         // These limits are virtual compatibility state, not a host-enforced
         // sandbox boundary. An unprivileged process may set the soft limit and
         // may irreversibly lower the hard limit for ANY resource; only raising
@@ -135,7 +135,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if requested.current > requested.maximum {
                     return Err(Errno::EINVAL.into());
                 }
-                // TODO-HUMAN-REVIEW(PR-PENDING): allow lowering any virtual limit.
+                // TODO-HUMAN-REVIEW(PR-769): allow lowering any virtual limit.
                 // Virtual limits are guest-observable compatibility state, not a
                 // host-enforced boundary, so lowering the soft limit or hard
                 // limit of ANY resource is unprivileged; only raising the hard

@@ -215,7 +215,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING): PR_SET_KEEPCAPS is a per-thread flag
+            // TODO-HUMAN-REVIEW(PR-769): PR_SET_KEEPCAPS is a per-thread flag
             // controlling whether capabilities are preserved across a UID change.
             // Under Detcore credentials are virtualized and this flag has no
             // host-observable effect, so accept it as a deterministic no-op
