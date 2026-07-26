@@ -17,6 +17,7 @@ clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "w
 colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
 detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
+detcore-sabre = { version = "0.0.0", path = "../detcore-sabre" }
 diff = "0.1.13"
 digest = { version = "0.0.0", path = "../common/digest" }
 dirs = "6.0"
@@ -33,10 +34,11 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f", default-features = false }
-reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2ce0115b82e58499b2edb72a4ec7f21e966b221f" }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "157f02b3d51d6228e18e18ff7e9ca5c00724c2dd" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "157f02b3d51d6228e18e18ff7e9ca5c00724c2dd", default-features = false }
+reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "157f02b3d51d6228e18e18ff7e9ca5c00724c2dd" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "157f02b3d51d6228e18e18ff7e9ca5c00724c2dd" }
+reverie-rpc-transport = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "157f02b3d51d6228e18e18ff7e9ca5c00724c2dd" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
