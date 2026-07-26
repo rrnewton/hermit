@@ -1623,19 +1623,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // classic sched_{get,set}scheduler/param calls above, which
                 // return the fixed SCHED_OTHER default (verified with chrt).
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#764)
+                // TODO-HUMAN-REVIEW(#765)
                 Syscall::Flock(_) => Ok(0),
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#764)
+                // TODO-HUMAN-REVIEW(#765)
                 Syscall::IoprioGet(_) => Ok(0),
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#764)
+                // TODO-HUMAN-REVIEW(#765)
                 Syscall::IoprioSet(_) => Ok(0),
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#764)
+                // TODO-HUMAN-REVIEW(#765)
                 Syscall::SchedGetattr(_) => Err(Error::Errno(Errno::ENOSYS)),
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#764)
+                // TODO-HUMAN-REVIEW(#765)
                 Syscall::SchedSetattr(_) => Err(Error::Errno(Errno::ENOSYS)),
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,

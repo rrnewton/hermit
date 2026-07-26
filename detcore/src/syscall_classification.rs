@@ -240,7 +240,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#764): Advisory file locks, I/O-priority hints, and
+        // TODO-HUMAN-REVIEW(#765): Advisory file locks, I/O-priority hints, and
         // the extended sched_attr scheduling interface. Detcore serializes guest
         // threads under one deterministic scheduler, so advisory whole-file locks
         // (flock) and I/O-priority hints (ioprio_get/ioprio_set) are inoperative
