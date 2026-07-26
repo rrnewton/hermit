@@ -657,7 +657,7 @@ async fn run_kvm(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PLACEHOLDER): Review public DBI dispatch and child environment ownership.
+// TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
 async fn run_dbi(
     command: Command,
