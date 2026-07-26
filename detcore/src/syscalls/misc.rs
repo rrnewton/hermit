@@ -238,6 +238,30 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-787): syslog(2) / klogctl kernel ring-buffer access.
+    /// syslog — present a deterministic, empty kernel log. The real kernel ring
+    /// buffer is host state Hermit cannot reproduce (its contents and size vary
+    /// per boot/host), and reading it is capability-gated. Detcore therefore
+    /// reports an empty log: read actions (READ/READ_ALL/READ_CLEAR) return zero
+    /// bytes without touching the guest buffer, size queries (SIZE_UNREAD/
+    /// SIZE_BUFFER) return zero, and control actions (CLOSE/OPEN/CLEAR/console
+    /// level) are deterministic no-ops. An out-of-range action returns EINVAL,
+    /// matching the kernel. This is bitwise-identical across --verify and
+    /// record/replay.
+    pub async fn handle_syslog<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Syslog,
+    ) -> Result<i64, Error> {
+        // `priority` is the klog action selector. Valid actions are 0..=10
+        // (SYSLOG_ACTION_CLOSE .. SYSLOG_ACTION_SIZE_BUFFER).
+        match call.priority() {
+            0..=10 => Ok(0),
+            _ => Err(Errno::EINVAL.into()),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Accept the common reset-to-default request without changing host scheduling.
     pub async fn handle_setpriority<G: Guest<Self>>(

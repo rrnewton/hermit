@@ -1497,6 +1497,43 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-787): adjtimex/clock_adjtime report a
+                // deterministic, unsynchronized clock-discipline snapshot (see
+                // handle_adjtimex). Gated on time virtualization like the other
+                // clock readers so a --no-virtualize-time run keeps host behavior.
+                Syscall::Adjtimex(s) => {
+                    if virtualize_time {
+                        self.handle_adjtimex(guest, s).await
+                    } else {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-787)
+                Syscall::ClockAdjtime(s) => {
+                    if virtualize_time {
+                        self.handle_clock_adjtime(guest, s).await
+                    } else {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-787): syslog(2) presents a deterministic
+                // empty kernel ring buffer (see handle_syslog).
+                Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)

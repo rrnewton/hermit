@@ -1,0 +1,4 @@
+RUN: %hermit run --strict -- %me | FileCheck %s
+CHECK: adjtimex rc=0 status=64
+CHECK: clock_adjtime rc=0 status=64 tick=10000
+CHECK: syslog size_buffer=0

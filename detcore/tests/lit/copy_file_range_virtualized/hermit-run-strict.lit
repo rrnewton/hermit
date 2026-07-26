@@ -1,0 +1,2 @@
+RUN: %hermit run --strict -- %me | FileCheck %s
+CHECK: copy_file_range n=16 off_in=16
