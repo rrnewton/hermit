@@ -37,6 +37,7 @@ reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", 
 reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "99b8e50deed8b9467ad2ce65443dd240c54def7d", default-features = false }
 reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "99b8e50deed8b9467ad2ce65443dd240c54def7d" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "99b8e50deed8b9467ad2ce65443dd240c54def7d" }
+reverie-liteinst = { version = "0.1.0", path = "../../../worktrees_reverie/slot111/reverie-liteinst", default-features = false }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

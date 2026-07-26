@@ -18,3 +18,11 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# Temporary local integration until the corresponding Reverie changes land.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie = { path = "../../worktrees_reverie/slot111/reverie" }
+reverie-dbi = { path = "../../worktrees_reverie/slot111/reverie-dbi" }
+reverie-kvm = { path = "../../worktrees_reverie/slot111/reverie-kvm" }
+reverie-ptrace = { path = "../../worktrees_reverie/slot111/reverie-ptrace" }
+reverie-syscalls = { path = "../../worktrees_reverie/slot111/reverie-syscalls" }
