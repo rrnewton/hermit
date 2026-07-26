@@ -573,7 +573,7 @@ async fn wait_for_sabre_rpc_disconnects<T>(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review SaBRe RPC server shutdown errors.
+// TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
 async fn stop_sabre_rpc_server<E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
 ) -> Result<(), Error>
