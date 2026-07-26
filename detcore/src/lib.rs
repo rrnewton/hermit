@@ -1631,13 +1631,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // host-independent results (see syscall_classification.rs); re-enables
                 // chrt, ionice, and flock under --strict.
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#PR)
+                // TODO-HUMAN-REVIEW(#791)
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#PR)
+                // TODO-HUMAN-REVIEW(#791)
                 Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#PR)
+                // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,

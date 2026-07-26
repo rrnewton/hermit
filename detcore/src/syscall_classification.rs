@@ -327,7 +327,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // host-independent results; see the handlers in lib.rs. sched_setattr and
         // ioprio_get remain Unsupported until a task owns their write/read pair.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#PR)
+        // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
         | Sysno::sched_getattr => SyscallClassification::Determinized,

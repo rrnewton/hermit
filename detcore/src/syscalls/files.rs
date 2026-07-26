@@ -202,7 +202,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// deterministic no-op success, mirroring how sched_setaffinity/ioprio_set are
     /// suppressed. Re-enables `flock` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#791)
     pub async fn handle_flock<G: Guest<Self>>(
         &self,
         _guest: &mut G,

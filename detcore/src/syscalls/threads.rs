@@ -940,7 +940,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// value is emulated (never injected), so it is identical across --verify runs
     /// and record/replay. Re-enables `chrt` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#791)
     pub async fn handle_sched_getattr<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -981,7 +981,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// deterministic no-op success, mirroring how sched_setaffinity is handled.
     /// Re-enables `ionice` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#PR)
+    // TODO-HUMAN-REVIEW(#791)
     pub async fn handle_ioprio_set<G: Guest<Self>>(
         &self,
         _guest: &mut G,
