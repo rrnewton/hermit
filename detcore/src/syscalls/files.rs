@@ -195,7 +195,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#775): close_range(first, last, flags) bulk-closes the
+    // TODO-HUMAN-REVIEW(#776): close_range(first, last, flags) bulk-closes the
     // guest's descriptor range. Forward it to the kernel (record/replay aware) and,
     // on success, mirror the effect in Detcore's virtual fd table by releasing the
     // pipe/socket port for every tracked descriptor in range, exactly as

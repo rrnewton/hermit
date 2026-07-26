@@ -219,7 +219,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#775): close_range(first, last, flags) bulk-closes the
+        // TODO-HUMAN-REVIEW(#776): close_range(first, last, flags) bulk-closes the
         // guest's own descriptor range. It is a deterministic descriptor-table
         // operation with no host-varying result: Detcore forwards the close to the
         // kernel and mirrors it in its virtual fd table (releasing pipe/socket
@@ -476,7 +476,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sync
         | Sysno::syncfs
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#775): shutdown(sockfd, how) is a guest-owned socket
+        // TODO-HUMAN-REVIEW(#776): shutdown(sockfd, how) is a guest-owned socket
         // half-close. Hermit does not virtualize the network, so it forwards to the
         // real (loopback/UNIX) socket; the return is a deterministic function of the
         // fd and how argument with no host-varying data written to guest memory,

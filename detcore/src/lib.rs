@@ -1354,7 +1354,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Ok(0)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#775): close_range is untyped in the pinned Reverie
+            // TODO-HUMAN-REVIEW(#776): close_range is untyped in the pinned Reverie
             // revision, so dispatch on the Sysno before the typed match below. The
             // handler forwards the bulk close to the kernel and mirrors it in
             // Detcore's virtual fd table, releasing pipe/socket ports for every
