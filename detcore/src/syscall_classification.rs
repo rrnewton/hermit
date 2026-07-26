@@ -320,7 +320,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // exactly the tracked fds in range (see handle_close_range) rather than
         // forwarding a raw range that would desync the model.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#767)
+        // TODO-HUMAN-REVIEW(#778)
         | Sysno::sched_getattr
         | Sysno::sched_setattr
         | Sysno::ioprio_get

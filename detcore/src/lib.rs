@@ -1317,7 +1317,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#767): close_range is untyped (Syscall::Other) in
+            // TODO-HUMAN-REVIEW(#778): close_range is untyped (Syscall::Other) in
             // the pinned Reverie revision. Detcore owns the deterministic
             // descriptor table, so forwarding a raw fd range to the host would
             // leave the model out of sync; emulate by closing exactly the tracked
@@ -1630,7 +1630,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // execution), so setters are no-ops and getters report fixed,
                 // host-independent defaults. See syscall_classification.rs.
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#767)
+                // TODO-HUMAN-REVIEW(#778)
                 Syscall::SchedSetattr(_) => Ok(0),
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
                 Syscall::IoprioSet(_) => Ok(0),

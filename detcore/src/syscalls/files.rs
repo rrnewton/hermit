@@ -206,7 +206,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// affects a shared fd table, which the serialized model never exposes, so it
     /// is a no-op modifier here.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#767)
+    // TODO-HUMAN-REVIEW(#778)
     pub async fn handle_close_range<G: Guest<Self>>(
         &self,
         guest: &mut G,

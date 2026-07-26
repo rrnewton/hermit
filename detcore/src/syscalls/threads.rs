@@ -941,7 +941,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// nice, priority, and deadline parameters. The struct is emulated (never
     /// injected), so it is identical across --verify and record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#767)
+    // TODO-HUMAN-REVIEW(#778)
     pub async fn handle_sched_getattr<G: Guest<Self>>(
         &self,
         guest: &mut G,
