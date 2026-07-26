@@ -152,6 +152,7 @@ fn dbi_wait_guest() -> &'static Path {
     })
 }
 
+// TODO-HUMAN-REVIEW(PR-723): Review the DBI PID fixture build.
 fn dbi_pid_guest() -> &'static Path {
     DBI_PID_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -712,6 +713,7 @@ fn run_dbi_verifies_process_wait_lifecycle() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-723): Review DBI PID virtualization L2 coverage.
 #[test]
 fn run_dbi_virtualizes_process_identities() {
     let program = dbi_pid_guest()

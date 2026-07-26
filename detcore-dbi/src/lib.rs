@@ -189,6 +189,7 @@ struct NativeThreadScratch {
     observed_syscalls: u64,
     rewritten_syscalls: u64,
     runtime_state: *mut ThreadRuntime,
+    // TODO-HUMAN-REVIEW(PR-723): Review virtual-identity scratch ABI alignment.
     virtual_pid: i32,
     virtual_ppid: i32,
     virtual_tid: i32,

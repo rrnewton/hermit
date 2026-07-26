@@ -57,6 +57,7 @@ static int print_proc_identity(void) {
              : 3;
 }
 
+// TODO-HUMAN-REVIEW(PR-723): Review guest-visible PID lifecycle expectations.
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--exec-child") == 0) {
     print_identity("exec-child");

@@ -285,6 +285,7 @@ impl DetFd {
     }
 
     /// Initialize the deterministic snapshot shared by all aliases.
+    // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     pub(crate) fn initialize_procfs(
         &self,
         contents: Vec<u8>,

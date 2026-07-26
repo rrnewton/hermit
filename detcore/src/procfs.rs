@@ -54,6 +54,7 @@ impl ProcfsFile {
     }
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
+    // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
     pub(crate) fn initialize(
         &mut self,
         contents: Vec<u8>,
@@ -81,6 +82,7 @@ impl ProcfsFile {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
 fn sanitize_stat(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8> {
     const VOLATILE_FIELDS: &[usize] = &[10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44];
 
@@ -114,6 +116,7 @@ fn sanitize_stat(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
+// TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
 fn sanitize_status(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8> {
     const TGID: &[u8] = b"Tgid:";
     const PID: &[u8] = b"Pid:";
@@ -153,8 +156,7 @@ fn sanitize_status(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<
             normalized.extend_from_slice(b":\t0");
         } else if body.starts_with(SIGQ) {
             normalized.extend_from_slice(SIGQ);
-            normalized.extend_from_slice(b"\t0/");
-            normalized.extend_from_slice(body.split(|byte| *byte == b'/').nth(1).unwrap_or(b"0"));
+            normalized.extend_from_slice(b"\t0/0");
         } else if body.starts_with(CPUS_ALLOWED) {
             normalized.extend_from_slice(CPUS_ALLOWED);
             normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001");
@@ -272,7 +274,7 @@ mod tests {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, 3, 1),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/2042342\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
