@@ -329,6 +329,8 @@ and licensing guidelines.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.
+- [SaBRe Compatibility](docs/SABRE_COMPATIBILITY.md): measured program envelope,
+  execution-path classification, and known limits.
 - [e9patch Compatibility](docs/E9PATCH_COMPATIBILITY.md): measured application
   envelope, preprocessing classifications, and known limits.
 - [Error Catalog](docs/ERROR_CATALOG.md): errors, triggers, and remediations.

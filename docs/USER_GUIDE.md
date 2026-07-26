@@ -158,6 +158,12 @@ The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
 runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
 plus a guest-kernel ABI.
 
+SaBRe verification is a two-run output compatibility check, not an L1 or L2
+guarantee. The focused gate currently passes all 159 installed program rows;
+24 additional matrix rows are unavailable or unmeasured. See
+[SaBRe Compatibility Status](SABRE_COMPATIBILITY.md) for exact revisions,
+commands, architecture classification, and known limits.
+
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode
 to apply `before empty` trampolines at exact candidate offsets in the main ELF.
