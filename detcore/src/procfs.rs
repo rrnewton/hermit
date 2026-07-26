@@ -21,6 +21,11 @@ enum ProcfsKind {
     Loadavg,
     Uptime,
     ScalingCurFreq,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+    Meminfo,
+    SystemStat,
+    Vmstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -40,6 +45,11 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+            "/proc/meminfo" => ProcfsKind::Meminfo,
+            "/proc/stat" => ProcfsKind::SystemStat,
+            "/proc/vmstat" => ProcfsKind::Vmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -82,6 +92,11 @@ impl ProcfsFile {
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+            ProcfsKind::Meminfo | ProcfsKind::SystemStat | ProcfsKind::Vmstat => {
+                sanitize_columnar(&contents)
+            }
         });
         self.offset = 0;
     }
@@ -243,6 +258,46 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-batch1-procfs)
+/// Normalizes label/value procfs tables such as `/proc/meminfo`, `/proc/stat`,
+/// and `/proc/vmstat`. Every one of these files is a sequence of lines whose
+/// first whitespace-delimited token is a stable label and whose remaining
+/// numeric tokens are volatile counters (free memory, CPU jiffies, context
+/// switches, boot time, and so on). We keep each label and any non-numeric
+/// suffix (for example meminfo's `kB` unit) but replace every integer field
+/// with `0`, mirroring the volatile-field zeroing already done for
+/// `/proc/self/stat`. This yields byte-identical snapshots across otherwise
+/// identical strict runs without inventing plausible-looking values.
+fn sanitize_columnar(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+
+        let mut tokens = body.split_whitespace();
+        if let Some(label) = tokens.next() {
+            normalized.push_str(label);
+            for token in tokens {
+                normalized.push(' ');
+                if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+                    normalized.push('0');
+                } else {
+                    normalized.push_str(token);
+                }
+            }
+        }
+        if has_newline {
+            normalized.push('\n');
+        }
+    }
+    normalized.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +334,22 @@ mod tests {
                 .kind,
             ProcfsKind::Uptime
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Meminfo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/stat")).unwrap().kind,
+            ProcfsKind::SystemStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Vmstat
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -308,6 +379,42 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn meminfo_zeros_volatile_values_and_keeps_units() {
+        let input =
+            b"MemTotal:       791462432 kB\nMemFree:         49634276 kB\nHugePages_Total:       0\n";
+        assert_eq!(
+            sanitize_columnar(input),
+            b"MemTotal: 0 kB\nMemFree: 0 kB\nHugePages_Total: 0\n"
+        );
+    }
+
+    #[test]
+    fn system_stat_zeros_counters_but_keeps_cpu_labels() {
+        let input = b"cpu  123 45 678 9 0 1 2 3 4 5\ncpu0 12 3 45 6\nintr 999 1 2 3\nctxt 55555\nbtime 1700000000\nprocesses 4242\nprocs_running 3\nprocs_blocked 1\n";
+        assert_eq!(
+            sanitize_columnar(input),
+            b"cpu 0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0\nintr 0 0 0 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n"
+        );
+    }
+
+    #[test]
+    fn vmstat_zeros_every_counter() {
+        let input = b"nr_free_pages 6758591\nnr_zone_inactive_anon 12345\npgfault 987654321\n";
+        assert_eq!(
+            sanitize_columnar(input),
+            b"nr_free_pages 0\nnr_zone_inactive_anon 0\npgfault 0\n"
+        );
+    }
+
+    #[test]
+    fn columnar_preserves_blank_lines_and_missing_newline() {
+        assert_eq!(
+            sanitize_columnar(b"cpu 1 2\n\nctxt 9"),
+            b"cpu 0 0\n\nctxt 0"
+        );
     }
 
     #[test]
