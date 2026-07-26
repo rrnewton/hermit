@@ -269,6 +269,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#751)
+    /// Deterministic, argument-aware policy for `seccomp(2)` that never forwards to
+    /// the host and never installs guest seccomp policy.
+    ///
+    /// `operation`/`flags` are the raw `seccomp(op, flags, args)` arguments;
+    /// `has_filter` is whether the `args` (sock_fprog) pointer is non-NULL. The one
+    /// behavior real guests depend on at startup is the libseccomp/QEMU capability
+    /// probe `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, NULL)`:
+    /// the native kernel validates the flags, then faults copying the `sock_fprog`
+    /// from the NULL pointer and returns `EFAULT`, which the probe reads as "filter
+    /// mode with TSYNC is available". Reproducing that exact `EFAULT`
+    /// deterministically lets a program like QEMU proceed without any policy being
+    /// installed.
+    ///
+    /// A real filter install (non-NULL program), `SECCOMP_SET_MODE_STRICT`, or any
+    /// other operation would mutate the guest's syscall-dispatch policy. Detcore
+    /// does not model that and it would perturb Reverie's own interception, so it
+    /// is refused with a fixed `ENOSYS` rather than forwarded. Every path is
+    /// host-independent and identical across `--verify` and record/replay.
+    pub fn handle_seccomp(operation: usize, flags: usize, has_filter: bool) -> Result<i64, Error> {
+        // seccomp(2) operations.
+        const SECCOMP_SET_MODE_FILTER: usize = 1;
+        // Union of the defined SECCOMP_FILTER_FLAG_* bits (TSYNC, LOG, SPEC_ALLOW,
+        // NEW_LISTENER, TSYNC_ESRCH, WAIT_KILLABLE_RECV).
+        const SECCOMP_FILTER_FLAG_MASK: usize = 0x3f;
+
+        if operation == SECCOMP_SET_MODE_FILTER {
+            // The kernel validates the flag bits before dereferencing the filter.
+            if flags & !SECCOMP_FILTER_FLAG_MASK != 0 {
+                return Err(Errno::EINVAL.into());
+            }
+            // Capability probe: a NULL sock_fprog faults on copy_from_user. Return
+            // the same deterministic EFAULT so detection succeeds without a policy.
+            if !has_filter {
+                return Err(Errno::EFAULT.into());
+            }
+        }
+
+        // Real filter installs, strict mode, and every other operation are refused
+        // deterministically; guest seccomp policy is never applied.
+        Err(Errno::ENOSYS.into())
+    }
+
     /// Fill guest memory from the deterministic PRNG owned by the current thread.
     pub(super) fn fill_random_bytes<G: Guest<Self>>(
         &self,
@@ -570,6 +614,52 @@ mod tests {
         assert!(matches!(
             Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 0),
             Err(Error::Errno(Errno::EPERM))
+        ));
+    }
+
+    #[test]
+    fn seccomp_probe_returns_efault_and_real_installs_are_refused() {
+        type D = Detcore<crate::record_or_replay::NoopTool>;
+        const SET_MODE_STRICT: usize = 0;
+        const SET_MODE_FILTER: usize = 1;
+        const GET_ACTION_AVAIL: usize = 2;
+        const FILTER_FLAG_TSYNC: usize = 1;
+
+        // The QEMU/libseccomp capability probe: SET_MODE_FILTER + TSYNC + NULL
+        // filter (has_filter=false) must return the native EFAULT so detection
+        // succeeds.
+        assert!(matches!(
+            D::handle_seccomp(SET_MODE_FILTER, FILTER_FLAG_TSYNC, false),
+            Err(Error::Errno(Errno::EFAULT))
+        ));
+        // A NULL filter with no flags is still the copy-from-user fault path.
+        assert!(matches!(
+            D::handle_seccomp(SET_MODE_FILTER, 0, false),
+            Err(Error::Errno(Errno::EFAULT))
+        ));
+
+        // A real filter install (non-NULL sock_fprog) is refused, never applied.
+        assert!(matches!(
+            D::handle_seccomp(SET_MODE_FILTER, FILTER_FLAG_TSYNC, true),
+            Err(Error::Errno(Errno::ENOSYS))
+        ));
+
+        // Invalid flag bits are rejected before the filter is read, matching the
+        // kernel's validation order.
+        assert!(matches!(
+            D::handle_seccomp(SET_MODE_FILTER, 0x40, false),
+            Err(Error::Errno(Errno::EINVAL))
+        ));
+
+        // Strict mode and capability-query operations are also refused
+        // deterministically rather than mutating guest policy.
+        assert!(matches!(
+            D::handle_seccomp(SET_MODE_STRICT, 0, false),
+            Err(Error::Errno(Errno::ENOSYS))
+        ));
+        assert!(matches!(
+            D::handle_seccomp(GET_ACTION_AVAIL, 0, true),
+            Err(Error::Errno(Errno::ENOSYS))
         ));
     }
 }

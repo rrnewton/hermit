@@ -122,6 +122,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getaffinity
         | Sysno::sched_setaffinity
         | Sysno::sched_yield
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#751): seccomp is Determinized with an argument-aware
+        // deterministic policy (see Detcore::handle_seccomp): the NULL-filter TSYNC
+        // capability probe returns a fixed EFAULT like the native kernel, while any
+        // real filter/strict-mode install is refused with ENOSYS so guest seccomp
+        // policy never mutates syscall dispatch or perturbs Reverie interception.
+        | Sysno::seccomp
         | Sysno::sendmmsg
         | Sysno::sendmsg
         | Sysno::sendto
@@ -528,7 +535,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_getattr
         | Sysno::sched_setattr
-        | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
         | Sysno::semget
@@ -720,12 +726,18 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [200, 91, 82]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
     #[test]
     fn representative_policies_stay_in_their_reviewed_sections() {
+        // seccomp is Determinized: its capability probe returns a deterministic
+        // EFAULT and real filter installs are refused, never forwarded.
+        assert_eq!(
+            classify_syscall(Sysno::seccomp),
+            SyscallClassification::Determinized
+        );
         assert_eq!(
             classify_syscall(Sysno::futex),
             SyscallClassification::Determinized

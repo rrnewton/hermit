@@ -1473,6 +1473,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#751): Deterministic, argument-aware seccomp
+                // policy. The NULL-filter TSYNC capability probe returns EFAULT
+                // (matching native) so libseccomp/QEMU detection succeeds; real
+                // filter installs are refused with ENOSYS and never forwarded, so
+                // guest seccomp policy never mutates syscall dispatch.
+                Syscall::Seccomp(s) => {
+                    Self::handle_seccomp(s.op() as usize, s.flags() as usize, s.args().is_some())
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
