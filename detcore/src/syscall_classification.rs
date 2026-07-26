@@ -354,7 +354,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_set
         | Sysno::sched_getattr
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#784): BATCH 38. openat2(2) is a modern superset of
+        // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2(2) is a modern superset of
         // openat(2); callers are required to fall back to openat on ENOSYS
         // (kernels before 5.6 lack it). Detcore already determinizes openat, so a
         // fixed -ENOSYS for openat2 routes those programs (for example GNU tar's
@@ -719,7 +719,7 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#784): Deterministic no-op success set.
+// TODO-HUMAN-REVIEW(#787): Deterministic no-op success set.
 /// Credential-setting syscalls (`setuid`/`setgid` and their `re-`, `res-`, and
 /// `fs-` variants, and `setgroups`). Detcore presents a fixed virtual-root
 /// identity: `getuid`/`geteuid`/`getgid`/`getegid` are virtualized to `0` and
