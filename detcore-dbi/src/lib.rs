@@ -210,6 +210,11 @@ struct NativeThreadScratch {
     thread_clone_flags: u64,
     thread_clone_ctid: u64,
     pending_thread_start: u64,
+    virtual_pid: i32,
+    virtual_ppid: i32,
+    virtual_tid: i32,
+    pending_virtual_child: i32,
+    pending_clone_flags: u64,
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
@@ -563,6 +568,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
                 thread_clone_flags: 0,
                 thread_clone_ctid: 0,
                 pending_thread_start: 0,
+                virtual_pid: 0,
+                virtual_ppid: 0,
+                virtual_tid: 0,
+                pending_virtual_child: 0,
+                pending_clone_flags: 0,
             });
     }
     if defer_runtime != 0 {
