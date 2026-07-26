@@ -54,7 +54,7 @@ fn is_valid_prio_which(which: i32) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#805)
+// TODO-HUMAN-REVIEW(#806)
 /// Deterministic raw `getpriority(2)` result under Hermit's inert-nice model.
 ///
 /// Returns `20 - nice` (nice 0 -> 20) for any valid target regardless of `who`,
@@ -69,7 +69,7 @@ fn getpriority_result(which: i32) -> Result<i64, Errno> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#805)
+// TODO-HUMAN-REVIEW(#806)
 /// Deterministic raw `setpriority(2)` result: accept any priority change for a
 /// valid target as an inert no-op (returns 0), `EINVAL` for an unknown `which`.
 fn setpriority_result(which: i32) -> Result<i64, Errno> {
@@ -256,7 +256,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#805)
+    // TODO-HUMAN-REVIEW(#806)
     /// Report the deterministic default nice value for any scheduling target.
     ///
     /// Under Hermit the Linux nice value is inert: the scheduler is virtualized
@@ -276,7 +276,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#805)
+    // TODO-HUMAN-REVIEW(#806)
     /// Accept any priority change as a deterministic no-op.
     ///
     /// Nice values are inert under Hermit's virtualized, serialized scheduler,
