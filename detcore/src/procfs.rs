@@ -22,7 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+    // TODO-HUMAN-REVIEW(PR-762)
     Meminfo,
     SystemStat,
     Vmstat,
@@ -46,7 +46,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+            // TODO-HUMAN-REVIEW(PR-762)
             "/proc/meminfo" => ProcfsKind::Meminfo,
             "/proc/stat" => ProcfsKind::SystemStat,
             "/proc/vmstat" => ProcfsKind::Vmstat,
@@ -93,7 +93,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-batch1-procfs)
+            // TODO-HUMAN-REVIEW(PR-762)
             ProcfsKind::Meminfo | ProcfsKind::SystemStat | ProcfsKind::Vmstat => {
                 sanitize_columnar(&contents)
             }
@@ -259,7 +259,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-batch1-procfs)
+// TODO-HUMAN-REVIEW(PR-762)
 /// Normalizes label/value procfs tables such as `/proc/meminfo`, `/proc/stat`,
 /// and `/proc/vmstat`. Every one of these files is a sequence of lines whose
 /// first whitespace-delimited token is a stable label and whose remaining
