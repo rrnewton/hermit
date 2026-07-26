@@ -1658,8 +1658,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#770): Paired setter is inert under Detcore.
+                Syscall::SchedSetattr(_) => Ok(0),
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#770): Report the fixed default I/O priority.
+                Syscall::IoprioGet(_) => Ok(0),
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
