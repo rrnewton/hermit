@@ -592,6 +592,14 @@ impl GlobalTool for GlobalState {
                 R::RegisterAlarm(remaining)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+            GlobalRequest::UpdatePosixTimer(dpid, dtid, timer_id, duration, sig) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
+                self.recv_update_posix_timer(dpid, dtid, timer_id, now, duration, sig)
+                    .await;
+                R::UpdatePosixTimer(())
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
@@ -1220,6 +1228,28 @@ impl GlobalState {
             .unwrap()
             .register_alarm(detpid, dettid, now, duration, sig.0)
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+    /// Arm, rearm, or disarm one process-local POSIX timer in the scheduler.
+    pub async fn recv_update_posix_timer(
+        &self,
+        detpid: DetPid,
+        dettid: DetTid,
+        timer_id: i32,
+        now: LogicalTime,
+        duration: Option<LogicalTime>,
+        notification: Option<(i32, u64)>,
+    ) {
+        self.sched.lock().unwrap().update_posix_timer(
+            detpid,
+            dettid,
+            timer_id,
+            now,
+            duration,
+            notification,
+        );
+    }
 }
 
 /// Messages to the global object.
@@ -1291,6 +1321,11 @@ pub enum GlobalRequest {
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+    /// Arm, rearm, or disarm a process-local POSIX timer.
+    UpdatePosixTimer(DetPid, DetTid, i32, Option<LogicalTime>, Option<(i32, u64)>),
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
@@ -1332,6 +1367,9 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+    UpdatePosixTimer(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
@@ -1868,6 +1906,31 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+/// Arm, rearm, or disarm one process-local POSIX timer in the global scheduler.
+pub async fn update_posix_timer<G, T>(
+    guest: &mut G,
+    timer_id: i32,
+    duration: Option<LogicalTime>,
+    notification: Option<(i32, u64)>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::UpdatePosixTimer(detpid, dettid, timer_id, duration, notification),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::UpdatePosixTimer(()) => {}
         _ => unreachable!(),
     }
 }

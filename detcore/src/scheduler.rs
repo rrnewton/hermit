@@ -28,6 +28,7 @@ use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use procfs::process::Process;
 use rand::RngExt as _;
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;
@@ -52,6 +53,7 @@ use tracing::debug;
 use tracing::enabled;
 use tracing::info;
 use tracing::trace;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
@@ -830,6 +832,19 @@ enum ThreadStatus {
     NotRunning,
 }
 
+/// Linux x86_64 `siginfo_t` payload for a POSIX timer expiration.
+#[repr(C, align(8))]
+struct PosixTimerSiginfo {
+    signo: libc::c_int,
+    errno: libc::c_int,
+    code: libc::c_int,
+    _align: libc::c_int,
+    timer_id: libc::c_int,
+    overrun: libc::c_int,
+    value: u64,
+    _padding: [u8; 96],
+}
+
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
@@ -1082,6 +1097,7 @@ impl Scheduler {
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
             self.blocked.timed_waiters.remove_alarm(*detpid);
+            self.blocked.timed_waiters.remove_posix_timers(*detpid);
         }
     }
 
@@ -1276,6 +1292,9 @@ impl Scheduler {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
                 TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
+                TimedEvent::PosixTimer(dpid, dtid, timer_id, sig, value) => {
+                    self.fire_posix_timer(dpid, dtid, timer_id, sig, value)
+                }
             }
         }
     }
@@ -1295,6 +1314,97 @@ impl Scheduler {
             target, sig
         );
         self.signal_guest(target, sig);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review blocked-signal and external-I/O timer delivery.
+    fn fire_posix_timer(
+        &mut self,
+        dpid: DetPid,
+        dtid: DetTid,
+        timer_id: i32,
+        sig: i32,
+        value: u64,
+    ) {
+        let Some(target) = self.select_signal_target(dpid, Some(dtid)) else {
+            info!(
+                "[dpid {}] POSIX timer expired after its target exited; ignoring.",
+                dpid
+            );
+            return;
+        };
+        info!(
+            "[dtid {}] POSIX timer fired, delivering signal {} to guest.",
+            target, sig
+        );
+
+        let parked = self
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .is_some();
+        let status = self.thread_status(target);
+        if matches!(status, ThreadStatus::Gone) {
+            info!(
+                "[dtid {}] POSIX timer target exited before physical delivery; ignoring.",
+                target
+            );
+            return;
+        }
+
+        // Unlike alarm(2), POSIX timers are commonly consumed synchronously
+        // through sigtimedwait(2) or signalfd(2) while the signal is blocked.
+        // Read the kernel-maintained mask while the target is quiescent so a
+        // blocked signal becomes pending instead of spuriously interrupting an
+        // emulated wait. The mask is guest state, not host-derived input.
+        let signal_bit = 1_u64 << (sig - 1);
+        let blocked = match Process::new(target.as_raw()).and_then(|process| process.status()) {
+            Ok(status) => status.sigblk & signal_bit != 0,
+            Err(error) => {
+                warn!(
+                    "[dtid {}] unable to inspect signal mask for POSIX timer {}: {}; treating it as unblocked",
+                    target, sig, error
+                );
+                false
+            }
+        };
+
+        let info = PosixTimerSiginfo {
+            signo: sig,
+            errno: 0,
+            code: libc::SI_TIMER,
+            _align: 0,
+            timer_id,
+            overrun: 0,
+            value,
+            _padding: [0; 96],
+        };
+        // SAFETY: `PosixTimerSiginfo` has the 128-byte Linux x86_64 siginfo_t
+        // layout, the target was just confirmed live, and the kernel copies the
+        // payload during this syscall.
+        let queued =
+            unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, target.as_raw(), sig, &info) };
+        assert_eq!(
+            queued,
+            0,
+            "rt_sigqueueinfo for POSIX timer failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        if !blocked && parked {
+            // Internally parked waits need the scheduler interruption protocol
+            // so an unblocked timer signal produces EINTR promptly. The signal
+            // itself was already queued above with its SI_TIMER metadata.
+            let mut rsrcs = Resources::new(target);
+            rsrcs.insert(
+                ResourceID::InboundSignal(SigWrapper(
+                    Signal::try_from(sig)
+                        .expect("unblocked realtime timer was rejected at arm time"),
+                )),
+                Permission::W,
+            );
+            self.force_unblock_thread(target, rsrcs);
+        }
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -1644,6 +1754,9 @@ impl Scheduler {
                 match evt {
                     TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
                     TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
+                    TimedEvent::PosixTimer(dpid, dtid, timer_id, sig, value) => {
+                        self.fire_posix_timer(dpid, dtid, timer_id, sig, value)
+                    }
                 }
                 return Err(SkipTurn);
             }
@@ -2298,6 +2411,7 @@ impl Scheduler {
                         }
                     }
                     TimedEvent::AlarmEvt(_, _, _) => {}
+                    TimedEvent::PosixTimer(..) => {}
                 }
             }
             if self.blocked.external_io_blockers.contains_key(&dtid) {
@@ -2528,11 +2642,42 @@ impl Scheduler {
             LogicalTime::ZERO
         }
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review independent one-shot POSIX timer delivery.
+    pub fn update_posix_timer(
+        &mut self,
+        detpid: DetPid,
+        dettid: DetTid,
+        timer_id: i32,
+        now: LogicalTime,
+        duration: Option<LogicalTime>,
+        notification: Option<(i32, u64)>,
+    ) {
+        let deadline = duration.map(|duration| now + duration);
+        self.blocked.timed_waiters.update_posix_timer(
+            deadline,
+            detpid,
+            dettid,
+            timer_id,
+            notification,
+        );
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn posix_timer_siginfo_matches_linux_x86_64_abi() {
+        assert_eq!(std::mem::size_of::<PosixTimerSiginfo>(), 128);
+        assert_eq!(std::mem::align_of::<PosixTimerSiginfo>(), 8);
+        assert_eq!(std::mem::offset_of!(PosixTimerSiginfo, code), 8);
+        assert_eq!(std::mem::offset_of!(PosixTimerSiginfo, timer_id), 16);
+        assert_eq!(std::mem::offset_of!(PosixTimerSiginfo, overrun), 20);
+        assert_eq!(std::mem::offset_of!(PosixTimerSiginfo, value), 24);
+    }
 
     fn futex_waiter(dettid: i32, bitset: u32) -> FutexWaiter {
         FutexWaiter {

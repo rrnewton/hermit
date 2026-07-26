@@ -10,10 +10,10 @@
  * Exercises the POSIX per-process timer family that Detcore emulates under
  * --strict: timer_create / timer_settime / timer_gettime / timer_delete.
  *
- * The timer is armed for a long interval so it never fires within the run
- * (Detcore tracks a timer's arming against the virtual clock but does not
- * deliver expiration signals). The remaining time reported by timer_gettime is
- * therefore driven by the deterministic virtual clock and must be reproducible.
+ * The realtime-signal timer is armed for a long interval so it never fires
+ * within the run. Its arming and remaining time are tracked against the
+ * deterministic virtual clock and must be reproducible. One-shot standard
+ * signal delivery is covered separately by posix_timer_delivery.c.
  */
 
 #include <signal.h>

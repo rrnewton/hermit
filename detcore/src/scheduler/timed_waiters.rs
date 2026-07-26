@@ -28,6 +28,9 @@ pub struct TimedEvents {
     // There is only one alarm allowed at a time per process, so we keep track of the current alarm
     // for each process and replace it if any other is inserted.
     alarm_times: BTreeMap<DetPid, LogicalTime>,
+
+    // POSIX timers are independent and keyed by their deterministic process-local id.
+    posix_timer_times: BTreeMap<(DetPid, i32), LogicalTime>,
 }
 
 /// An event that occurs at a particular time in the execution, typically at an offset in the future.
@@ -36,6 +39,9 @@ pub enum TimedEvent {
     // An upcoming alarm, destined for particular pids, with a designated tid in that process (if it
     // still exists).
     AlarmEvt(DetPid, DetTid, Signal),
+
+    // A one-shot POSIX timer expiration, independent of alarm(2).
+    PosixTimer(DetPid, DetTid, i32, i32, u64),
 
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
@@ -46,6 +52,9 @@ impl fmt::Display for TimedEvent {
         match self {
             TimedEvent::ThreadEvt(dt) => write!(f, "ThreadEvt({})", dt),
             TimedEvent::AlarmEvt(dp, dt, sig) => write!(f, "AlarmEvt({},{},{})", dp, dt, sig),
+            TimedEvent::PosixTimer(dp, dt, id, sig, value) => {
+                write!(f, "PosixTimer({},{},{},{},{})", dp, dt, id, sig, value)
+            }
         }
     }
 }
@@ -121,6 +130,64 @@ impl TimedEvents {
         old
     }
 
+    /// Arm, rearm, or disarm one process-local POSIX timer.
+    pub fn update_posix_timer(
+        &mut self,
+        ns: Option<LogicalTime>,
+        dp: DetPid,
+        dt: DetTid,
+        timer_id: i32,
+        notification: Option<(i32, u64)>,
+    ) {
+        let key = (dp, timer_id);
+        if let Some(old) = self.posix_timer_times.remove(&key) {
+            self.clear_posix_timer(key, old);
+        }
+
+        if let Some(ns) = ns {
+            let (sig, value) = notification.expect("an armed POSIX timer needs a signal");
+            assert!(self.posix_timer_times.insert(key, ns).is_none());
+            let event = TimedEvent::PosixTimer(dp, dt, timer_id, sig, value);
+            assert!(
+                self.map.entry(ns).or_default().insert(event),
+                "POSIX timer event already registered: {event}"
+            );
+        }
+    }
+
+    fn clear_posix_timer(&mut self, key: (DetPid, i32), time: LogicalTime) {
+        let Some(set) = self.map.get_mut(&time) else {
+            return;
+        };
+        let event = set
+            .iter()
+            .find(|event| {
+                matches!(event, TimedEvent::PosixTimer(dp, _, id, _, _) if (*dp, *id) == key)
+            })
+            .copied();
+        if let Some(event) = event {
+            assert!(set.remove(&event));
+        }
+        if set.is_empty() {
+            self.map.remove(&time);
+        }
+    }
+
+    /// Cancel every POSIX timer owned by a process that has exited.
+    pub fn remove_posix_timers(&mut self, dp: DetPid) {
+        let keys = self
+            .posix_timer_times
+            .keys()
+            .filter(|(event_dp, _)| *event_dp == dp)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(time) = self.posix_timer_times.remove(&key) {
+                self.clear_posix_timer(key, time);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -149,6 +216,11 @@ impl TimedEvents {
                     && self.alarm_times.get(&dp) == Some(&time_ns)
                 {
                     self.alarm_times.remove(&dp);
+                }
+                if let TimedEvent::PosixTimer(dp, _, id, _, _) = evt
+                    && self.posix_timer_times.get(&(dp, id)) == Some(&time_ns)
+                {
+                    self.posix_timer_times.remove(&(dp, id));
                 }
                 Some((time_ns, evt))
             } else {
@@ -308,5 +380,91 @@ mod test {
             Some((at(2000), TimedEvent::AlarmEvt(p, tid(100), Signal::SIGALRM)))
         );
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn independent_posix_timers_fire_in_deadline_order() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+
+        ev.update_posix_timer(Some(at(2_000)), p, tid(100), 0, Some((libc::SIGUSR1, 0)));
+        ev.update_posix_timer(Some(at(1_000)), p, tid(100), 1, Some((libc::SIGUSR2, 0)));
+
+        assert_eq!(
+            ev.pop(),
+            Some((
+                at(1_000),
+                TimedEvent::PosixTimer(p, tid(100), 1, Signal::SIGUSR2, 0)
+            ))
+        );
+        assert_eq!(
+            ev.pop(),
+            Some((
+                at(2_000),
+                TimedEvent::PosixTimer(p, tid(100), 0, Signal::SIGUSR1, 0)
+            ))
+        );
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn rearm_and_disarm_affect_only_the_selected_posix_timer() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.update_posix_timer(Some(at(1_000)), p, tid(100), 0, Some((libc::SIGUSR1, 0)));
+        ev.update_posix_timer(Some(at(1_500)), p, tid(100), 1, Some((libc::SIGUSR2, 0)));
+
+        ev.update_posix_timer(Some(at(2_000)), p, tid(100), 0, Some((libc::SIGUSR1, 0)));
+        ev.update_posix_timer(None, p, tid(100), 1, None);
+
+        assert_eq!(
+            ev.iter().collect::<Vec<_>>(),
+            vec![(
+                at(2_000),
+                TimedEvent::PosixTimer(p, tid(100), 0, Signal::SIGUSR1, 0)
+            )]
+        );
+    }
+
+    #[test]
+    fn posix_timer_can_be_rearmed_after_it_fires() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.update_posix_timer(Some(at(1_000)), p, tid(100), 0, Some((libc::SIGUSR1, 0)));
+        assert!(matches!(ev.pop(), Some((_, TimedEvent::PosixTimer(..)))));
+
+        ev.update_posix_timer(Some(at(2_000)), p, tid(100), 0, Some((libc::SIGUSR1, 0)));
+        assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn process_exit_removes_only_its_posix_timers() {
+        let mut ev = TimedEvents::default();
+        let exited = pid(100);
+        let live = pid(200);
+        ev.update_posix_timer(
+            Some(at(1_000)),
+            exited,
+            tid(100),
+            0,
+            Some((libc::SIGUSR1, 0)),
+        );
+        ev.update_posix_timer(
+            Some(at(1_000)),
+            exited,
+            tid(100),
+            1,
+            Some((libc::SIGUSR2, 0)),
+        );
+        ev.update_posix_timer(Some(at(1_000)), live, tid(200), 0, Some((libc::SIGUSR1, 0)));
+
+        ev.remove_posix_timers(exited);
+        assert_eq!(
+            ev.iter().collect::<Vec<_>>(),
+            vec![(
+                at(1_000),
+                TimedEvent::PosixTimer(live, tid(200), 0, Signal::SIGUSR1, 0)
+            )]
+        );
     }
 }

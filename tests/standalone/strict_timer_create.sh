@@ -13,8 +13,8 @@
 # second blocker, membarrier, appeared right after.
 #
 # Detcore now emulates timer_create/timer_settime/timer_gettime/timer_getoverrun/
-# timer_delete (arming tracked against the virtual clock; expiration signals are
-# not delivered) and treats membarrier as a no-op (guest threads are serialized
+# timer_delete (arming tracked against the virtual clock; one-shot standard
+# signals delivered by the scheduler) and treats membarrier as a no-op (guest threads are serialized
 # onto one logical CPU, so barriers are trivially satisfied). This test guards
 # that a program using the timer family runs to completion AND verifies as
 # deterministic under --strict, with no GLIBC_TUNABLES workaround.

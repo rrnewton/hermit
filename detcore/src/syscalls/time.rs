@@ -9,6 +9,8 @@
 //! System calls for dealing with threads and concurrency.
 use std::time::Duration;
 
+use nix::sys::signal::Signal;
+use procfs::process::Process;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
@@ -22,6 +24,7 @@ use reverie::syscalls::family::NanosleepFamily;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
+use tracing::warn;
 
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
@@ -33,6 +36,7 @@ use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::update_posix_timer;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
 
@@ -51,12 +55,14 @@ fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     None
 }
 
-/// Flatten a `timespec` to nanoseconds. Negative fields are not valid for the
-/// timer syscalls we handle; treat them as zero rather than panicking.
-fn timespec_to_ns(ts: libc::timespec) -> u64 {
-    let secs = ts.tv_sec.max(0) as u64;
-    let nsec = ts.tv_nsec.max(0) as u64;
-    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+/// Validate and flatten a timer `timespec` to nanoseconds.
+fn timespec_to_ns(ts: libc::timespec) -> Result<u64, Errno> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64))
 }
 
 /// Inverse of [`timespec_to_ns`].
@@ -314,9 +320,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// timer_create: allocate a per-process POSIX timer and hand back a
-    /// deterministic id. The timer's arming is tracked (in the process-local
-    /// `PosixTimers` table) but expiration signals are not delivered.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic one-shot SIGEV_SIGNAL delivery.
+    /// Allocate a deterministic process-local timer id and retain its notification mode.
     pub async fn handle_timer_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -325,18 +331,52 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
+        match clockid {
+            libc::CLOCK_REALTIME | libc::CLOCK_MONOTONIC => {}
+            libc::CLOCK_PROCESS_CPUTIME_ID | libc::CLOCK_THREAD_CPUTIME_ID => {
+                warn!("timer_create clock {clockid} is not virtualized for expiration delivery");
+                return Err(Errno::ENOSYS.into());
+            }
+            _ => return Err(Errno::EINVAL.into()),
+        }
+
+        let default_signal = call.sevp().is_none();
+        let notification = if let Some(event_ptr) = call.sevp() {
+            let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
+            match event.sigev_notify {
+                libc::SIGEV_NONE => None,
+                libc::SIGEV_SIGNAL => {
+                    let signal = event.sigev_signo;
+                    let standard = Signal::try_from(signal).is_ok();
+                    let realtime = (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&signal);
+                    if !standard && !realtime {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    let value = event.sigev_value.sival_ptr as usize as u64;
+                    Some((signal, value))
+                }
+                _ => return Err(Errno::ENOSYS.into()),
+            }
+        } else {
+            None
+        };
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create()
+            if default_signal {
+                timers.create_default_signal()
+            } else {
+                timers.create(notification)
+            }
         };
         guest
             .memory()
             .write_value(timerid_ptr, &(id as libc::c_int))?;
         detlog!(
-            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {} (arming tracked; signal delivery not emulated)",
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {} signal {:?}",
             guest.thread_state().dettid,
             clockid,
             id,
+            notification,
         );
         Ok(0)
     }
@@ -349,10 +389,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerSettime,
     ) -> Result<i64, Error> {
         let id = call.timerid();
+        if call.flags() & !libc::TIMER_ABSTIME != 0 {
+            return Err(Errno::EINVAL.into());
+        }
         let new_ptr = call.new_value().ok_or(Errno::EINVAL)?;
         let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
-        let interval_ns = timespec_to_ns(new.it_interval);
-        let value_ns = timespec_to_ns(new.it_value);
+        let interval_ns = timespec_to_ns(new.it_interval)?;
+        let value_ns = timespec_to_ns(new.it_value)?;
+        let configured_signal = {
+            let timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.signal(id)
+        }
+        .ok_or(Errno::EINVAL)?;
+        if interval_ns != 0 {
+            return Err(Errno::ENOSYS.into());
+            if value_ns != 0
+                && let Some((signal, _)) = configured_signal
+                && Signal::try_from(signal).is_err()
+            {
+                let dettid = guest.thread_state().dettid;
+                let status = Process::new(dettid.as_raw())
+                    .and_then(|process| process.status())
+                    .map_err(|error| {
+                        warn!("[dtid {dettid}] cannot inspect realtime timer signal mask: {error}");
+                        Errno::ENOSYS
+                    })?;
+                let signal_bit = 1_u64 << (signal - 1);
+                if status.sigblk & signal_bit == 0 && status.sigign & signal_bit == 0 {
+                    warn!(
+                        "[dtid {dettid}] unblocked realtime POSIX timer signal {signal} is unsupported by the active backend"
+                    );
+                    return Err(Errno::ENOSYS.into());
+                }
+            }
+        }
 
         let now = thread_observe_time(guest).await;
         let deadline = if value_ns == 0 {
@@ -378,12 +448,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.memory().write_value(old_ptr, &old_spec)?;
         }
 
+        let duration = if configured_signal.is_some() {
+            deadline.map(|deadline| {
+                LogicalTime::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+            })
+        } else {
+            None
+        };
+        update_posix_timer(guest, id, duration, configured_signal).await;
+
         detlog!(
-            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock (not delivered)",
+            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) updated scheduler deadline {:?}",
             guest.thread_state().dettid,
             id,
             interval_ns,
             value_ns,
+            deadline,
         );
         Ok(0)
     }
@@ -411,8 +491,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// timer_getoverrun: we never deliver expirations, so the overrun count is
-    /// always 0 for a live timer.
+    /// timer_getoverrun: one-shot timers cannot overrun, and periodic signal
+    /// timers are rejected until deterministic reload accounting is modeled.
     pub async fn handle_timer_getoverrun<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -444,6 +524,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             timers.remove(id)
         };
         if existed {
+            update_posix_timer(guest, id, None, None).await;
             detlog!(
                 "[dtid {}] timer_delete(id={})",
                 guest.thread_state().dettid,
