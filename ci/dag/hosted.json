@@ -224,8 +224,8 @@
     {
       "group": "test", "job": "strict_compat",
       "desc": "Strict compatibility envelope (blocking L2 app matrix; reuses ./validate.sh --strict-compat-only)",
-      "cmd": "./validate.sh --strict-compat-only --no-label-pr",
-      "deps": ["build.workspace"],
+      "cmd": "./validate.sh --strict-compat-only --no-label-pr --verbose",
+      "deps": ["build.workspace", "lint.clippy"],
       "timeout": 1800,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
