@@ -25,8 +25,9 @@ pub(crate) enum SyscallClassification {
     Determinized,
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
-    /// The syscall retains the legacy fail-closed-or-forward policy pending investigation.
-    Unclassified,
+    /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
+    // TODO-HUMAN-REVIEW(PR-643): Review the issue-backed unsupported classification policy.
+    Unsupported,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -268,7 +269,43 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::open_by_handle_at
         | Sysno::fanotify_init
         | Sysno::fanotify_mark
-        | Sysno::settimeofday => SyscallClassification::Determinized,
+        | Sysno::settimeofday
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
+        // asynchronous and message-passing I/O and IPC interfaces Detcore does
+        // not model. Linux native AIO (io_setup/io_destroy/io_submit/io_cancel/
+        // io_getevents/io_pgetevents) has kernel-driven asynchronous completion
+        // that lives outside the guest's logical time; POSIX message queues
+        // (mq_*) and System V message queues (msg*) are global, key/name-
+        // addressed kernel objects that persist across runs and are shared with
+        // the whole host. Forwarding any of them (the legacy pass-through) is
+        // nondeterministic and a container-isolation hole. A fixed -ENOSYS is
+        // exactly the errno a kernel built without AIO, CONFIG_POSIX_MQUEUE, or
+        // CONFIG_SYSVIPC returns, so guest-visible behavior is unchanged versus
+        // such a kernel; it is never forwarded to the host and is bitwise-
+        // identical across --verify and record/replay. This mirrors the
+        // existing io_uring ENOSYS refusal. These are untyped (Syscall::Other)
+        // in the pinned Reverie, so the dispatcher matches on the Sysno before
+        // the typed match below. System V semaphores (sem*) and shared memory
+        // (shm*) are deliberately left unclassified: they are common
+        // intra-container synchronization/sharing primitives whose refusal would
+        // be a real capability regression and needs a dedicated decision.
+        | Sysno::io_setup
+        | Sysno::io_destroy
+        | Sysno::io_submit
+        | Sysno::io_cancel
+        | Sysno::io_getevents
+        | Sysno::io_pgetevents
+        | Sysno::mq_open
+        | Sysno::mq_unlink
+        | Sysno::mq_timedsend
+        | Sysno::mq_timedreceive
+        | Sysno::mq_notify
+        | Sysno::mq_getsetattr
+        | Sysno::msgget
+        | Sysno::msgsnd
+        | Sysno::msgrcv
+        | Sysno::msgctl => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -407,16 +444,42 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
-        // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
-        // TODO/FIXME: These syscalls have not been classified. They temporarily use
-        // the legacy passthrough policy and may need deterministic handling. Each must
-        // be investigated and moved to DETERMINIZED or PASS-THRU.
+        // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+        // Every matching classification issue recommends PASS-THRU. These remain
+        // conditional on Hermit's fixed-container and stable-state assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
+        Sysno::chroot
+        | Sysno::get_thread_area
+        | Sysno::mknod
+        | Sysno::mknodat
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::modify_ldt
+        | Sysno::personality
+        | Sysno::pkey_alloc
+        | Sysno::pkey_free
+        | Sysno::pkey_mprotect
+        | Sysno::sched_get_priority_max
+        | Sysno::sched_get_priority_min
+        | Sysno::set_thread_area
+        | Sysno::sync
+        | Sysno::syncfs
+        => SyscallClassification::PassThrough,
+        // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+
+        // ===== UNSUPPORTED SYSCALLS =====
+        // These require a deterministic handler or further investigation. Normal mode
+        // records their use for an aggregate warning and preserves legacy forwarding;
+        // --panic-on-unsupported-syscalls stops at the first use.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::chroot
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
@@ -427,14 +490,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
-        | Sysno::get_thread_area
         | Sysno::getitimer
-        | Sysno::io_cancel
-        | Sysno::io_destroy
-        | Sysno::io_getevents
-        | Sysno::io_pgetevents
-        | Sysno::io_setup
-        | Sysno::io_submit
         | Sysno::ioprio_get
         | Sysno::ioprio_set
         | Sysno::kcmp
@@ -449,32 +505,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::map_shadow_stack
         | Sysno::memfd_secret
         | Sysno::mincore
-        | Sysno::mknod
-        | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
-        | Sysno::modify_ldt
-        | Sysno::mq_getsetattr
-        | Sysno::mq_notify
-        | Sysno::mq_open
-        | Sysno::mq_timedreceive
-        | Sysno::mq_timedsend
-        | Sysno::mq_unlink
-        | Sysno::msgctl
-        | Sysno::msgget
-        | Sysno::msgrcv
-        | Sysno::msgsnd
         | Sysno::name_to_handle_at
         | Sysno::openat2
         | Sysno::perf_event_open
-        | Sysno::personality
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
-        | Sysno::pkey_alloc
-        | Sysno::pkey_free
-        | Sysno::pkey_mprotect
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
@@ -490,8 +526,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_get_priority_max
-        | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
         | Sysno::sched_setattr
         | Sysno::seccomp
@@ -501,7 +535,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::set_thread_area
         | Sysno::setfsgid
         | Sysno::setfsuid
         | Sysno::setgid
@@ -518,16 +551,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
-        | Sysno::sync
-        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
         | Sysno::ustat
-        | Sysno::vmsplice => SyscallClassification::Unclassified,
-        // ===== END UNCLASSIFIED =====
+        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
         // make changes to the pinned table a compile error; this arm only satisfies the
@@ -633,6 +664,46 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
+/// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
+/// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
+/// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and System V
+/// message queues (`msg*`). AIO completion is kernel-driven and lives outside
+/// the guest's logical time, and the message-queue families operate on global,
+/// key/name-addressed kernel objects that persist across runs and are shared
+/// with the whole host. Forwarding them (the legacy pass-through) is
+/// nondeterministic and a container-isolation hole, so Detcore refuses them with
+/// a fixed `ENOSYS`: exactly the errno a kernel built without AIO,
+/// `CONFIG_POSIX_MQUEUE`, or `CONFIG_SYSVIPC` returns. The result is never
+/// forwarded to the host and is bitwise-identical across `--verify` and
+/// record/replay, mirroring the existing `io_uring` ENOSYS refusal. System V
+/// semaphores and shared memory are deliberately excluded (common
+/// intra-container primitives that need a dedicated decision). These are untyped
+/// (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches on the
+/// `Sysno` before the typed match.
+pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::io_setup
+            | Sysno::io_destroy
+            | Sysno::io_submit
+            | Sysno::io_cancel
+            | Sysno::io_getevents
+            | Sysno::io_pgetevents
+            | Sysno::mq_open
+            | Sysno::mq_unlink
+            | Sysno::mq_timedsend
+            | Sysno::mq_timedreceive
+            | Sysno::mq_notify
+            | Sysno::mq_getsetattr
+            | Sysno::msgget
+            | Sysno::msgsnd
+            | Sysno::msgrcv
+            | Sysno::msgctl
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,11 +716,11 @@ mod tests {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unclassified => counts[2] += 1,
+                SyscallClassification::Unsupported => counts[2] += 1,
             }
         }
 
-        assert_eq!(counts, [183, 74, 116]);
+        assert_eq!(counts, [199, 91, 83]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -776,7 +847,28 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
+        for sysno in [
+            Sysno::chroot,
+            Sysno::get_thread_area,
+            Sysno::mknod,
+            Sysno::mknodat,
+            Sysno::mlock,
+            Sysno::mlock2,
+            Sysno::mlockall,
+            Sysno::modify_ldt,
+            Sysno::personality,
+            Sysno::pkey_alloc,
+            Sysno::pkey_free,
+            Sysno::pkey_mprotect,
+            Sysno::sched_get_priority_max,
+            Sysno::sched_get_priority_min,
+            Sysno::set_thread_area,
+            Sysno::sync,
+            Sysno::syncfs,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         // Batch 3: NUMA memory-placement and Linux CPU-scheduling policy are
         // determinized to fixed, host-independent results (single virtual NUMA
@@ -795,6 +887,37 @@ mod tests {
             Sysno::sched_rr_get_interval,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+        // Batch 7: asynchronous and message-passing I/O and IPC interfaces
+        // Detcore does not model are refused with a deterministic ENOSYS (Linux
+        // native AIO, POSIX message queues, System V message queues); see
+        // is_unsupported_async_ipc_syscall.
+        for sysno in [
+            Sysno::io_setup,
+            Sysno::io_destroy,
+            Sysno::io_submit,
+            Sysno::io_cancel,
+            Sysno::io_getevents,
+            Sysno::io_pgetevents,
+            Sysno::mq_open,
+            Sysno::mq_unlink,
+            Sysno::mq_timedsend,
+            Sysno::mq_timedreceive,
+            Sysno::mq_notify,
+            Sysno::mq_getsetattr,
+            Sysno::msgget,
+            Sysno::msgsnd,
+            Sysno::msgrcv,
+            Sysno::msgctl,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_unsupported_async_ipc_syscall(sysno));
+        }
+        // System V semaphores and shared memory are deliberately still
+        // unsupported (intra-container primitives pending a dedicated decision).
+        for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+            assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
     }
 
