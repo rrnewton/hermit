@@ -248,6 +248,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#778): Linux I/O-scheduling priority and the extended
+        // sched_{get,set}attr scheduling interface. Same argument as the CPU
+        // scheduling-policy group above: Detcore replaces the Linux scheduler and
+        // presents a single deterministic virtual CPU, so I/O priority and the
+        // sched_attr policy/priority/deadline knobs are inoperative and cannot
+        // change guest-visible computation. Left as passthrough their results
+        // depend on host scheduler/block-layer state and privilege (all
+        // nondeterministic). They are determinized to fixed, host-independent
+        // results: the setters are no-ops and the getters report a default
+        // (IOPRIO_CLASS_NONE / SCHED_OTHER) answer; see the handlers in lib.rs.
+        // Untyped (Syscall::Other) in the pinned Reverie, so dispatched by Sysno
+        // in lib.rs before the typed match below.
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
+        | Sysno::sched_getattr
+        | Sysno::sched_setattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
         // reconfigure mount and other namespaces, resolve files by kernel
@@ -458,6 +475,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#778): flock(2) advisory whole-file locking. Hermit
+        // does not virtualize the filesystem, so an advisory lock on the guest's
+        // own open file is forwarded to the same non-virtualized resource the file
+        // itself lives on. For the deterministic container's own descriptors the
+        // call returns 0 with no host-varying data (flock yields only success or
+        // an errno, never a buffer), so it is bitwise-identical across --verify and
+        // record/replay -- the same treatment as the other socket/filesystem
+        // pass-through calls in this group.
+        | Sysno::flock
         | Sysno::get_thread_area
         | Sysno::mknod
         | Sysno::mknodat
@@ -491,15 +518,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -533,8 +557,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
@@ -727,7 +749,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [200, 91, 82]);
+        assert_eq!(counts, [204, 92, 77]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -859,6 +881,8 @@ mod tests {
         }
         for sysno in [
             Sysno::chroot,
+            // Batch 37: advisory whole-file locking on the guest's own fd.
+            Sysno::flock,
             Sysno::get_thread_area,
             Sysno::mknod,
             Sysno::mknodat,
@@ -893,6 +917,13 @@ mod tests {
             Sysno::sched_getscheduler,
             Sysno::sched_getparam,
             Sysno::sched_rr_get_interval,
+            // Batch 37: I/O-scheduling priority and the sched_attr interface are
+            // inoperative under Detcore's scheduler; determinized like the group
+            // above.
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
+            Sysno::sched_getattr,
+            Sysno::sched_setattr,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }

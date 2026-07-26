@@ -1622,6 +1622,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#778): Linux I/O-scheduling priority and the
+                // extended sched_attr scheduling interface. Same rationale as the
+                // CPU scheduling-policy group above: Detcore replaces the Linux
+                // scheduler and exposes a single virtual CPU, so I/O priority and
+                // the sched_attr policy/priority/deadline knobs are inoperative.
+                // The setters are deterministic no-ops; ioprio_get reports the
+                // fixed IOPRIO_CLASS_NONE (0) default and sched_getattr fills a
+                // fixed SCHED_OTHER sched_attr. Emulated, never injected, so they
+                // are identical across --verify and record/replay.
+                Syscall::IoprioSet(_) => Ok(0),
+                Syscall::IoprioGet(_) => Ok(0),
+                Syscall::SchedSetattr(_) => Ok(0),
+                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,

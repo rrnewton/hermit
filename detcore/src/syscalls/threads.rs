@@ -933,6 +933,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(0)
     }
+
+    /// sched_getattr under Hermit. Detcore replaces the Linux scheduler with its
+    /// own deterministic one, so a thread's `sched_attr` policy, priority, nice,
+    /// and deadline parameters are inert. Report a zeroed `struct sched_attr`
+    /// (SCHED_OTHER, nice 0, priority 0, no deadline parameters) with the leading
+    /// size field set to the number of bytes filled. The value is emulated (never
+    /// injected), so it is identical across --verify runs and record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#778)
+    pub async fn handle_sched_getattr<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetattr,
+    ) -> Result<i64, Error> {
+        // Oldest sched_attr ABI size, and the current pinned-kernel size
+        // (SCHED_ATTR_SIZE_VER1, including sched_util_min / sched_util_max).
+        const SCHED_ATTR_SIZE_VER0: usize = 48;
+        const SCHED_ATTR_SIZE: usize = 56;
+        let user_size = call.size() as usize;
+        // The kernel rejects a nonzero flags argument or a buffer smaller than the
+        // oldest sched_attr ABI.
+        if call.flags() != 0 || user_size < SCHED_ATTR_SIZE_VER0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let Some(attr) = call.attr() else {
+            return Err(Errno::EINVAL.into());
+        };
+        let write_len = user_size.min(SCHED_ATTR_SIZE);
+        let mut buf = vec![0u8; write_len];
+        // sched_attr.size is the leading __u32; report the size we filled.
+        buf[..4].copy_from_slice(&(write_len as u32).to_le_bytes());
+        let addr = AddrMut::<u8>::from_raw(attr.as_raw()).ok_or(Errno::EFAULT)?;
+        guest.memory().write(addr, &buf)?;
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
