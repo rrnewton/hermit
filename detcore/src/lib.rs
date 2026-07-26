@@ -759,7 +759,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Preserve queued-signal policy in passthru-opt mode.
+                // TODO-HUMAN-REVIEW(#813): Preserve queued-signal policy in passthru-opt mode.
                 Sysno::rt_sigqueueinfo,
                 Sysno::rt_tgsigqueueinfo,
                 Sysno::execve,
@@ -1689,10 +1689,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+                // TODO-HUMAN-REVIEW(#813): Review deterministic queued-signal delivery.
                 Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+                // TODO-HUMAN-REVIEW(#813): Review deterministic queued-signal delivery.
                 Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)

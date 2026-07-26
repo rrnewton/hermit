@@ -178,7 +178,7 @@ impl Tool for Recorder {
             Sysno::recvfrom,
             Sysno::recvmsg,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Queued signals are live side effects in
+            // TODO-HUMAN-REVIEW(#813): Queued signals are live side effects in
             // record/replay, but must be intercepted so outer Detcore target
             // validation and scheduler serialization are never bypassed.
             Sysno::rt_sigqueueinfo,

@@ -187,7 +187,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::prctl
         | Sysno::rt_sigpending
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+        // TODO-HUMAN-REVIEW(#813): Review deterministic queued-signal delivery.
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
         | Sysno::setitimer

@@ -309,7 +309,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Preserve Linux validation precedence for scheduler nonmembers.
+    // TODO-HUMAN-REVIEW(#813): Preserve Linux validation precedence for scheduler nonmembers.
     fn validate_queued_signal_nonmember<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -334,7 +334,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic process-queued signal delivery.
+    // TODO-HUMAN-REVIEW(#813): Review deterministic process-queued signal delivery.
     /// Inject a process-directed queued signal only when target selection is unambiguous,
     /// retaining both the caller-provided `siginfo_t` and process-pending semantics. Detcore refuses
     /// ambiguous multithreaded delivery until it models signal-mask eligibility.
@@ -363,7 +363,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+    // TODO-HUMAN-REVIEW(#813): Review deterministic queued-signal delivery.
     /// Send a thread-directed queued signal through the serialized record/replay path.
     /// The fixed PID namespace makes the guest's process and thread IDs stable.
     pub async fn handle_rt_tgsigqueueinfo<G: Guest<Self>>(
