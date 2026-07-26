@@ -349,7 +349,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for host-state
+        // TODO-HUMAN-REVIEW(#829): Deterministic ENOSYS for host-state
         // introspection syscalls Detcore cannot reproduce. cachestat(2) reports
         // which pages of a file range are resident in the host page cache (live
         // host VM state, the modern superset of mincore); kcmp(2) compares two
@@ -770,7 +770,7 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#829): Deterministic ENOSYS refusal set.
 /// Host-state introspection syscalls whose results Detcore cannot reproduce
 /// deterministically: `cachestat` (host page-cache residency of a file range,
 /// the modern superset of `mincore`), `kcmp` (kernel-object identity whose
@@ -1054,7 +1054,7 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
-        // Batch 149 (#825): host-state introspection syscalls Detcore cannot
+        // Batch 149 (#829): host-state introspection syscalls Detcore cannot
         // reproduce are refused with a deterministic ENOSYS (cachestat page-cache
         // residency, kcmp kernel-object identity ordering, obsolete ustat
         // filesystem free counts); see is_host_state_introspection_syscall.

@@ -1412,7 +1412,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#825): Deterministic ENOSYS for host-state
+            // TODO-HUMAN-REVIEW(#829): Deterministic ENOSYS for host-state
             // introspection syscalls Detcore cannot reproduce: cachestat (host
             // page-cache residency, the modern superset of mincore), kcmp
             // (kernel-object identity whose not-equal ordering leaks host kernel
