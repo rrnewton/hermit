@@ -27,7 +27,7 @@ use reverie_syscalls::Sysno;
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review fork-inherited SaBRe coordinator discovery.
+// TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
 static RPC_SOCKET: OnceLock<PathBuf> = OnceLock::new();
 
 fn coordinator_socket() -> Option<PathBuf> {
