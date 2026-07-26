@@ -756,6 +756,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::recvfrom,
                 Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-TBD): Preserve queued-signal policy in passthru-opt mode.
+                Sysno::rt_sigqueueinfo,
+                Sysno::rt_tgsigqueueinfo,
                 Sysno::execve,
                 Sysno::execveat,
                 Sysno::rseq,
@@ -1654,6 +1658,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+                Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+                Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Kill(s) => self.handle_kill(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1840,6 +1850,16 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::clock_gettime)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::rt_sigqueueinfo)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::rt_tgsigqueueinfo)
         );
         assert!(
             subscriptions

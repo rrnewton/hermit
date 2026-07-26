@@ -174,6 +174,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::listen
         | Sysno::prctl
         | Sysno::rt_sigpending
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+        | Sysno::rt_sigqueueinfo
+        | Sysno::rt_tgsigqueueinfo
         | Sysno::setitimer
         | Sysno::setpriority
         | Sysno::process_madvise
@@ -546,8 +550,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::rt_sigqueueinfo
-        | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
@@ -740,7 +742,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [204, 91, 78]);
+        assert_eq!(counts, [206, 91, 76]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -806,6 +808,8 @@ mod tests {
             Sysno::listen,
             Sysno::prctl,
             Sysno::rt_sigpending,
+            Sysno::rt_sigqueueinfo,
+            Sysno::rt_tgsigqueueinfo,
             Sysno::setitimer,
             Sysno::setpriority,
             Sysno::process_madvise,

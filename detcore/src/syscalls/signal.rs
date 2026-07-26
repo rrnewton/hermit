@@ -309,6 +309,86 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Preserve Linux validation precedence for scheduler nonmembers.
+    fn validate_queued_signal_nonmember<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        tgid: libc::pid_t,
+        tid: Option<libc::pid_t>,
+        siginfo: Option<AddrMut<libc::siginfo_t>>,
+    ) -> Result<(), Error> {
+        let address = siginfo.ok_or(Errno::EFAULT)?;
+        let info: libc::siginfo_t = guest.memory().read_value(address)?;
+        let restricted_code = info.si_code >= 0 || info.si_code == libc::SI_TKILL;
+        if let Some(tid) = tid {
+            if tgid <= 0 || tid <= 0 {
+                return Err(Errno::EINVAL.into());
+            }
+            if restricted_code {
+                return Err(Errno::EPERM.into());
+            }
+        } else if restricted_code && tgid != guest.pid().as_raw() {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic process-queued signal delivery.
+    /// Inject a process-directed queued signal only when target selection is unambiguous,
+    /// retaining both the caller-provided `siginfo_t` and process-pending semantics. Detcore refuses
+    /// ambiguous multithreaded delivery until it models signal-mask eligibility.
+    pub async fn handle_rt_sigqueueinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigqueueinfo,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        let tgid = call.tgid();
+        if tgid <= 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        match targets.as_slice() {
+            [] => {
+                self.validate_queued_signal_nonmember(guest, tgid, None, call.siginfo())?;
+                Err(Errno::ESRCH.into())
+            }
+            [_] => Ok(self.record_or_replay(guest, call).await?),
+            _ => Err(Errno::ENOSYS.into()),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic queued-signal delivery.
+    /// Send a thread-directed queued signal through the serialized record/replay path.
+    /// The fixed PID namespace makes the guest's process and thread IDs stable.
+    pub async fn handle_rt_tgsigqueueinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtTgsigqueueinfo,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(call.tgid())).await;
+        if targets.contains(&DetTid::from_raw(call.tid())) {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        self.validate_queued_signal_nonmember(
+            guest,
+            call.tgid(),
+            Some(call.tid()),
+            call.siginfo(),
+        )?;
+        Err(Errno::ESRCH.into())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Read the kernel pending-signal mask after Detcore has serialized all signal
     /// generation and delivery events that can change it.

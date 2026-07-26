@@ -177,6 +177,12 @@ impl Tool for Recorder {
             Sysno::preadv2,
             Sysno::recvfrom,
             Sysno::recvmsg,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Queued signals are live side effects in
+            // record/replay, but must be intercepted so outer Detcore target
+            // validation and scheduler serialization are never bypassed.
+            Sysno::rt_sigqueueinfo,
+            Sysno::rt_tgsigqueueinfo,
             Sysno::write,
             Sysno::pwrite64,
             Sysno::writev,
@@ -646,5 +652,26 @@ impl Recorder {
         self.record_event(guest, result.map(SyscallEvent::Return));
 
         result
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[test]
+    fn queued_signals_are_intercepted_during_record_and_replay() {
+        let subscriptions = Recorder::subscriptions(&detcore::Config::default());
+
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::rt_sigqueueinfo)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::rt_tgsigqueueinfo)
+        );
     }
 }

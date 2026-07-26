@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -45,6 +46,12 @@ static int nonrestartable_signal;
 static volatile sig_atomic_t nonrestartable_deliveries;
 static volatile sig_atomic_t nonrestartable_handler_failed;
 
+static volatile sig_atomic_t queued_signal_deliveries;
+static volatile sig_atomic_t queued_signal_value;
+static volatile sig_atomic_t queued_signal_code;
+static volatile sig_atomic_t queued_signal_tid;
+static volatile sig_atomic_t queued_target_tid;
+
 static void write_message(const char* message, size_t length) {
   (void)write(STDOUT_FILENO, message, length);
 }
@@ -55,6 +62,309 @@ static int signal_is_blocked(int signal_number) {
     return -1;
   }
   return sigismember(&current, signal_number);
+}
+
+static void queued_signal_handler(int signal_number, siginfo_t* info,
+                                  void* context) {
+  (void)context;
+  if (signal_number != SIGUSR1 || info == NULL) {
+    queued_signal_code = 1;
+    return;
+  }
+  queued_signal_value = info->si_value.sival_int;
+  queued_signal_code = info->si_code;
+  queued_signal_tid = (sig_atomic_t)syscall(SYS_gettid);
+  ++queued_signal_deliveries;
+}
+
+static int prepare_queued_signal(void) {
+  queued_signal_deliveries = 0;
+  queued_signal_value = 0;
+  queued_signal_code = 0;
+  queued_signal_tid = 0;
+  queued_target_tid = 0;
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_sigaction = queued_signal_handler;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction queued signal");
+    return 1;
+  }
+  return 0;
+}
+
+static int check_queued_signal(const char* kind, int expected_value) {
+  if (queued_signal_deliveries != 1 ||
+      queued_signal_value != expected_value || queued_signal_code != SI_QUEUE) {
+    fprintf(stderr,
+            "%s queued signal mismatch: deliveries=%d value=%d code=%d\n",
+            kind, queued_signal_deliveries, queued_signal_value,
+            queued_signal_code);
+    return 1;
+  }
+  printf("%s queued signal value=%d code=SI_QUEUE\n", kind, expected_value);
+  return 0;
+}
+
+static int test_process_queued_signal(void) {
+  if (prepare_queued_signal() != 0) {
+    return 1;
+  }
+  const union sigval value = {.sival_int = 83};
+  if (sigqueue(getpid(), SIGUSR1, value) != 0) {
+    perror("sigqueue");
+    return 1;
+  }
+  return check_queued_signal("process", value.sival_int);
+}
+
+static int queued_target_ready[2];
+
+static void* queued_signal_target(void* argument) {
+  (void)argument;
+  queued_target_tid = (sig_atomic_t)syscall(SYS_gettid);
+  if (write(queued_target_ready[1], "r", 1) != 1) {
+    return (void*)1;
+  }
+  while (queued_signal_deliveries == 0) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+static int test_thread_queued_signal(void) {
+  if (prepare_queued_signal() != 0 || pipe(queued_target_ready) != 0) {
+    perror("prepare queued target");
+    return 1;
+  }
+  pthread_t target;
+  int error = pthread_create(&target, NULL, queued_signal_target, NULL);
+  if (error != 0) {
+    errno = error;
+    perror("pthread_create queued target");
+    return 1;
+  }
+  char ready;
+  if (read(queued_target_ready[0], &ready, 1) != 1) {
+    perror("read queued target readiness");
+    return 1;
+  }
+  const union sigval value = {.sival_int = 834};
+  error = pthread_sigqueue(target, SIGUSR1, value);
+  if (error != 0) {
+    errno = error;
+    perror("pthread_sigqueue");
+    return 1;
+  }
+  void* thread_result = NULL;
+  error = pthread_join(target, &thread_result);
+  if (error != 0 || thread_result != NULL) {
+    if (error != 0) errno = error;
+    perror("pthread_join queued target");
+    return 1;
+  }
+  if (queued_signal_tid != queued_target_tid) {
+    fprintf(stderr, "queued signal reached tid %d instead of target tid %d\n",
+            queued_signal_tid, queued_target_tid);
+    return 1;
+  }
+  return check_queued_signal("thread-target", value.sival_int);
+}
+
+struct queued_pending_result {
+  int signal;
+  int value;
+  int code;
+};
+
+static void* consume_process_pending_signal(void* opaque) {
+  struct queued_pending_result* result = opaque;
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  const struct timespec no_wait = {0};
+  result->signal = sigtimedwait(&set, &info, &no_wait);
+  result->value = info.si_value.sival_int;
+  result->code = info.si_code;
+  return NULL;
+}
+
+static int test_process_queued_signal_stays_process_pending(void) {
+  if (prepare_queued_signal() != 0) return 1;
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  const int mask_error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+  if (mask_error != 0) {
+    errno = mask_error;
+    perror("block queued signal");
+    return 1;
+  }
+  const union sigval value = {.sival_int = 835};
+  if (sigqueue(getpid(), SIGUSR1, value) != 0) {
+    perror("queue blocked process signal");
+    return 1;
+  }
+  struct queued_pending_result result = {0};
+  pthread_t consumer;
+  int error = pthread_create(&consumer, NULL, consume_process_pending_signal,
+                             &result);
+  if (error == 0) error = pthread_join(consumer, NULL);
+  const int restore_error = pthread_sigmask(SIG_SETMASK, &previous, NULL);
+  if (error != 0 || restore_error != 0) {
+    errno = error != 0 ? error : restore_error;
+    perror("consume process-pending signal");
+    return 1;
+  }
+  if (result.signal != SIGUSR1 || result.value != value.sival_int ||
+      result.code != SI_QUEUE) {
+    fprintf(stderr,
+            "process-pending signal mismatch: signal=%d value=%d code=%d\n",
+            result.signal, result.value, result.code);
+    return 1;
+  }
+  puts("process queued signal remained process-pending");
+  return 0;
+}
+
+struct queued_gate {
+  int ready_fd;
+  int release_fd;
+};
+
+static void* queued_blocking_thread(void* opaque) {
+  const struct queued_gate* gate = opaque;
+  char byte;
+  if (write(gate->ready_fd, "r", 1) != 1 ||
+      read(gate->release_fd, &byte, 1) != 1) {
+    return (void*)1;
+  }
+  return NULL;
+}
+
+static int test_multithreaded_process_queue_is_refused(void) {
+  if (prepare_queued_signal() != 0) return 1;
+  int ready[2];
+  int release[2];
+  if (pipe(ready) != 0 || pipe(release) != 0) {
+    perror("queued ambiguity pipes");
+    return 1;
+  }
+  const struct queued_gate gate = {.ready_fd = ready[1],
+                                   .release_fd = release[0]};
+  pthread_t blocker;
+  int error = pthread_create(&blocker, NULL, queued_blocking_thread,
+                             (void*)&gate);
+  if (error != 0) {
+    errno = error;
+    perror("pthread_create queued blocker");
+    return 1;
+  }
+  char byte;
+  if (read(ready[0], &byte, 1) != 1) error = errno;
+  const union sigval value = {.sival_int = 836};
+  errno = 0;
+  const int result = sigqueue(getpid(), SIGUSR1, value);
+  const int queue_errno = errno;
+  void* thread_result = NULL;
+  if (write(release[1], "x", 1) != 1 ||
+      pthread_join(blocker, &thread_result) != 0 || thread_result != NULL) {
+    perror("release queued blocker");
+    return 1;
+  }
+  if (error != 0 || result != -1 || queue_errno != ENOSYS) {
+    fprintf(stderr,
+            "ambiguous queued signal result=%d errno=%d thread_error=%d\n",
+            result, queue_errno, error);
+    return 1;
+  }
+  puts("multithreaded process queued signal refused with ENOSYS");
+  return 0;
+}
+
+static int expect_errno(const char* name, long result, int actual,
+                        int expected) {
+  if (result != -1 || actual != expected) {
+    fprintf(stderr, "%s returned %ld errno=%d, expected -1/%d\n", name,
+            result, actual, expected);
+    return 1;
+  }
+  return 0;
+}
+
+static int test_queued_signal_errors(void) {
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.si_signo = SIGUSR1;
+  info.si_code = SI_QUEUE;
+  info.si_pid = getpid();
+  info.si_uid = getuid();
+
+  errno = 0;
+  long result = syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, NULL);
+  if (expect_errno("null siginfo", result, errno, EFAULT) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, 999999, SIGUSR1,
+                   (siginfo_t*)(uintptr_t)1);
+  if (expect_errno("bad siginfo precedence", result, errno, EFAULT) != 0)
+    return 1;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, 999999, NSIG,
+                   (siginfo_t*)(uintptr_t)1);
+  if (expect_errno("invalid signal bad pointer", result, errno, EFAULT) != 0)
+    return 1;
+
+  siginfo_t forbidden = info;
+  forbidden.si_code = SI_KERNEL;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, 999999, SIGUSR1, &forbidden);
+  if (expect_errno("forbidden si_code", result, errno, EPERM) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, getpid(), NSIG, &info);
+  if (expect_errno("invalid signal", result, errno, EINVAL) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, 999999, syscall(SYS_gettid),
+                   SIGUSR1, &info);
+  if (expect_errno("tgid/tid mismatch", result, errno, ESRCH) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, 999999, SIGUSR1, &info);
+  if (expect_errno("process scheduler nonmember", result, errno, ESRCH) != 0)
+    return 1;
+  errno = 0;
+  result = syscall(SYS_rt_sigqueueinfo, 999999, NSIG, &info);
+  if (expect_errno("nonmember invalid signal", result, errno, ESRCH) != 0)
+    return 1;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, 999999, 999998, NSIG,
+                   (siginfo_t*)(uintptr_t)1);
+  if (expect_errno("thread invalid signal bad pointer", result, errno,
+                   EFAULT) != 0)
+    return 1;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, 0, syscall(SYS_gettid), SIGUSR1,
+                   &info);
+  if (expect_errno("nonpositive tgid", result, errno, EINVAL) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, getpid(), 0, SIGUSR1, &info);
+  if (expect_errno("nonpositive tid", result, errno, EINVAL) != 0) return 1;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, getpid(), 999999, SIGUSR1,
+                   &forbidden);
+  if (expect_errno("thread forbidden si_code", result, errno, EPERM) != 0)
+    return 1;
+  siginfo_t tkill = info;
+  tkill.si_code = SI_TKILL;
+  errno = 0;
+  result = syscall(SYS_rt_tgsigqueueinfo, getpid(), 999999, SIGUSR1, &tkill);
+  if (expect_errno("thread SI_TKILL", result, errno, EPERM) != 0) return 1;
+  puts("queued signal errno boundaries match Linux");
+  return 0;
 }
 
 static void alarm_handler(int signal_number) {
@@ -783,6 +1093,21 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "itimer-delivery") == 0) {
     return test_itimer_delivery();
+  }
+  if (strcmp(argv[1], "process-sigqueue") == 0) {
+    return test_process_queued_signal();
+  }
+  if (strcmp(argv[1], "thread-sigqueue") == 0) {
+    return test_thread_queued_signal();
+  }
+  if (strcmp(argv[1], "process-sigqueue-pending") == 0) {
+    return test_process_queued_signal_stays_process_pending();
+  }
+  if (strcmp(argv[1], "process-sigqueue-ambiguous") == 0) {
+    return test_multithreaded_process_queue_is_refused();
+  }
+  if (strcmp(argv[1], "sigqueue-errors") == 0) {
+    return test_queued_signal_errors();
   }
   if (strcmp(argv[1], "itimer-exit") == 0) {
     return test_itimer_is_discarded_on_process_exit();

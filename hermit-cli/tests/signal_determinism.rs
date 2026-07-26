@@ -112,6 +112,17 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
     }
 }
 
+fn run_strict_verified_signal_scenario(scenario: &str) {
+    let _guard = hermit_signal_lock();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args(["--backend", "ptrace", "run", "--strict", "--verify", "--"]);
+    command.arg(signal_guest()).arg(scenario);
+    command_output(
+        command,
+        &format!("strict verified signal scenario {scenario}"),
+    );
+}
+
 #[test]
 fn sigalrm_itimer_delivery_is_deterministic() {
     run_signal_scenario(
@@ -123,6 +134,31 @@ fn sigalrm_itimer_delivery_is_deterministic() {
 #[test]
 fn armed_itimer_is_discarded_on_process_exit() {
     run_signal_scenario("itimer-exit", "timer discarded after process exit\n");
+}
+
+#[test]
+fn process_queued_signal_preserves_siginfo_payload() {
+    run_strict_verified_signal_scenario("process-sigqueue");
+}
+
+#[test]
+fn thread_queued_signal_preserves_siginfo_payload() {
+    run_strict_verified_signal_scenario("thread-sigqueue");
+}
+
+#[test]
+fn blocked_process_queued_signal_remains_process_pending() {
+    run_strict_verified_signal_scenario("process-sigqueue-pending");
+}
+
+#[test]
+fn multithreaded_process_queued_signal_is_refused() {
+    run_strict_verified_signal_scenario("process-sigqueue-ambiguous");
+}
+
+#[test]
+fn queued_signal_error_boundaries_match_linux() {
+    run_strict_verified_signal_scenario("sigqueue-errors");
 }
 
 #[test]
