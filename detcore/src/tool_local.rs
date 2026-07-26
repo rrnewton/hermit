@@ -807,7 +807,7 @@ pub struct PendingVfork {
     pub child_priority_entropy: Option<u64>,
 }
 
-// TODO-HUMAN-REVIEW(#783): Review process-wide logical CPU aggregation.
+// TODO-HUMAN-REVIEW(#797): Review process-wide logical CPU aggregation.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct ProcessCpuSnapshot {
     pub user: LogicalTime,

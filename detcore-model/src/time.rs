@@ -539,7 +539,7 @@ impl DetTime {
         LogicalTime(t1 - (self.starting_micros * 1000))
     }
 
-    // TODO-HUMAN-REVIEW(#783): Review logical user/system CPU-time projections.
+    // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
     /// Guest-execution time that corresponds to user-space instructions.
     pub fn user_cpu_time(&self) -> LogicalDuration {
         LogicalTime(
@@ -549,7 +549,7 @@ impl DetTime {
         )
     }
 
-    // TODO-HUMAN-REVIEW(#783): Review logical user/system CPU-time projections.
+    // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
     /// Synthetic time charged for intercepted syscall execution.
     pub fn system_cpu_time(&self) -> LogicalDuration {
         let syscall_nanos = self
