@@ -20,6 +20,9 @@ enum ProcfsKind {
     Cpuinfo,
     Loadavg,
     Uptime,
+    Meminfo,
+    SystemStat,
+    Vmstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -39,6 +42,11 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#763)
+            "/proc/meminfo" => ProcfsKind::Meminfo,
+            "/proc/stat" => ProcfsKind::SystemStat,
+            "/proc/vmstat" => ProcfsKind::Vmstat,
             _ => return None,
         };
         Some(Self {
@@ -68,6 +76,11 @@ impl ProcfsFile {
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#763)
+            ProcfsKind::Meminfo | ProcfsKind::SystemStat | ProcfsKind::Vmstat => {
+                sanitize_counter_lines(&contents)
+            }
         });
         self.offset = 0;
     }
@@ -214,6 +227,51 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#763)
+/// Normalizes systemwide counter files (`/proc/meminfo`, `/proc/stat`,
+/// `/proc/vmstat`) whose every field is a live, monotonically changing kernel
+/// counter. These files leak host memory pressure, CPU jiffies, context-switch
+/// counts, and boot time into the guest, so two otherwise identical runs read
+/// different values (breaking `--verify`) and different hosts diverge entirely.
+///
+/// The label structure of each line is preserved so consumers such as `free`
+/// and `vmstat` still parse the file; only the numeric counter tokens are
+/// replaced with `0`. The first whitespace-delimited token on each line is the
+/// key (for example `MemTotal:`, `cpu0`, `nr_free_pages`) and is always kept
+/// verbatim, so keys that embed digits (`cpu10`) are not corrupted. Non-numeric
+/// tokens such as the `kB` unit are also preserved.
+fn sanitize_counter_lines(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut tokens = body.split_whitespace();
+        if let Some(key) = tokens.next() {
+            normalized.push_str(key);
+            for token in tokens {
+                normalized.push(' ');
+                if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()) {
+                    normalized.push('0');
+                } else {
+                    normalized.push_str(token);
+                }
+            }
+        } else {
+            // Preserve blank lines verbatim.
+            normalized.push_str(body);
+        }
+        if has_newline {
+            normalized.push('\n');
+        }
+    }
+    normalized.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +308,61 @@ mod tests {
                 .kind,
             ProcfsKind::Uptime
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Meminfo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/stat")).unwrap().kind,
+            ProcfsKind::SystemStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Vmstat
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+    }
+
+    #[test]
+    fn meminfo_zeros_counters_but_keeps_labels_and_units() {
+        let input = b"MemTotal:       791462432 kB\nMemFree:        17940536 kB\nHugePages_Total:       0\nHugepagesize:       2048 kB\n";
+        assert_eq!(
+            sanitize_counter_lines(input),
+            b"MemTotal: 0 kB\nMemFree: 0 kB\nHugePages_Total: 0\nHugepagesize: 0 kB\n"
+        );
+    }
+
+    #[test]
+    fn system_stat_zeros_counters_but_keeps_cpu_indices() {
+        let input =
+            b"cpu  2470196081 6068598 670747785\ncpu10 7964270 10044 3306475\nbtime 1784767801\nprocs_running 547\n";
+        assert_eq!(
+            sanitize_counter_lines(input),
+            b"cpu 0 0 0\ncpu10 0 0 0\nbtime 0\nprocs_running 0\n"
+        );
+    }
+
+    #[test]
+    fn vmstat_zeros_every_value() {
+        let input = b"nr_free_pages 4480094\nnr_zone_active_anon 3127798\n";
+        assert_eq!(
+            sanitize_counter_lines(input),
+            b"nr_free_pages 0\nnr_zone_active_anon 0\n"
+        );
+    }
+
+    #[test]
+    fn counter_lines_preserve_blank_and_trailing_lines() {
+        // A missing trailing newline on the last line must be preserved.
+        let input = b"MemFree: 17940536 kB\n\nCommitLimit: 100 kB";
+        assert_eq!(
+            sanitize_counter_lines(input),
+            b"MemFree: 0 kB\n\nCommitLimit: 0 kB"
+        );
     }
 
     #[test]
