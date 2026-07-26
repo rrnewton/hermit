@@ -123,7 +123,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_setaffinity
         | Sysno::sched_yield
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#751): seccomp is Determinized with an argument-aware
+        // TODO-HUMAN-REVIEW(#752): seccomp is Determinized with an argument-aware
         // deterministic policy (see Detcore::handle_seccomp): the NULL-filter TSYNC
         // capability probe returns a fixed EFAULT like the native kernel, while any
         // real filter/strict-mode install is refused with ENOSYS so guest seccomp

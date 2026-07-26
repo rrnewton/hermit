@@ -270,7 +270,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#751)
+    // TODO-HUMAN-REVIEW(#752)
     /// Deterministic, argument-aware policy for `seccomp(2)` that never forwards to
     /// the host and never installs guest seccomp policy.
     ///
