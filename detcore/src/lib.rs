@@ -1568,6 +1568,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-820)
+                Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,

@@ -191,6 +191,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_madvise
         | Sysno::setrlimit
         | Sysno::setsockopt
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-820): shutdown is the socket half-close control
+        // op and the last socket-family syscall that was fail-closing under
+        // --strict. Its siblings (socket/connect/bind/listen/accept/send*/recv*/
+        // getsockname/getpeername/get-setsockopt) are already Determinized, so it
+        // is routed the same way (handle_shutdown -> record_or_replay): forwarded
+        // to the host socket and captured for record/replay, deterministic across
+        // --verify by construction.
+        | Sysno::shutdown
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
@@ -587,7 +596,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
@@ -757,7 +765,9 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        // shutdown moved Unsupported -> Determinized (PR-820), so the
+        // Determinized bucket gains one and the Unsupported bucket loses one.
+        assert_eq!(counts, [210, 91, 72]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -848,6 +858,10 @@ mod tests {
             Sysno::process_madvise,
             Sysno::setrlimit,
             Sysno::setsockopt,
+            // shutdown is the socket half-close control op; it must stay
+            // Determinized (routed through handle_shutdown) rather than
+            // fail-closing under --strict. Regression for PR-820.
+            Sysno::shutdown,
             Sysno::tgkill,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);

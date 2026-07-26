@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -67,7 +68,24 @@ int main(void) {
     perror("close/unlink");
     return 1;
   }
-  printf("syscall-quick-wins-ok uids=%u:%u:%u gids=%u:%u:%u vm=ok fs=ok\n",
+
+  /* shutdown(2): the socket half-close control op. It previously fail-closed
+   * under --strict as an unsupported syscall even though every other
+   * socket-family syscall was already determinized. Half-close the write end of
+   * a connected AF_UNIX stream socketpair; the call must return 0. */
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    perror("socketpair");
+    return 1;
+  }
+  require_zero(syscall(SYS_shutdown, sv[0], SHUT_WR), "shutdown");
+  if (close(sv[0]) != 0 || close(sv[1]) != 0) {
+    perror("close socketpair");
+    return 1;
+  }
+
+  printf("syscall-quick-wins-ok uids=%u:%u:%u gids=%u:%u:%u vm=ok fs=ok "
+         "net=ok\n",
          ruid, euid, suid, rgid, egid, sgid);
   return 0;
 }
