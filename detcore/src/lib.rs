@@ -154,9 +154,11 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
+use crate::syscall_classification::is_pidfd_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
+use crate::syscall_classification::is_zero_copy_io_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1387,6 +1389,52 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
             {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#795): Deterministic EPERM for ptrace. Nested
+            // tracing is unsupported: the guest is already traced/instrumented
+            // by Reverie, and forwarding ptrace to the host would both escape
+            // the deterministic model (a guest tracer observing raw scheduling
+            // and signals) and be impossible against the Reverie-owned tracing
+            // relationship. EPERM is the faithful errno the real kernel returns
+            // here: PTRACE_TRACEME fails with EPERM when the caller is already
+            // being traced, and PTRACE_ATTACH/PTRACE_SEIZE fail with EPERM
+            // without CAP_SYS_PTRACE / under yama. It is never forwarded to the
+            // host and is identical across --verify and record/replay. ptrace is
+            // untyped (Syscall::Other) in the pinned Reverie, so dispatch on the
+            // Sysno before the typed match below.
+            SyscallClassification::Determinized if call.number() == Sysno::ptrace => {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS for the zero-copy
+            // data-movement family (sendfile/splice/tee/vmsplice). Detcore
+            // records and sequentializes guest I/O by interposing on read/write;
+            // these move bytes directly between descriptors inside the kernel,
+            // so a forwarded copy escapes record/replay data capture and, when
+            // either end is a pipe or socket, is not deterministically ordered.
+            // A fixed -ENOSYS is the errno a kernel without these features
+            // returns; callers use them as an optimization and fall back to a
+            // read/write loop Detcore already determinizes. copy_file_range
+            // (regular-file only) is deliberately excluded. Untyped
+            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+            // before the typed match below.
+            SyscallClassification::Determinized if is_zero_copy_io_syscall(call.number()) => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS for the pidfd
+            // process-handle family (pidfd_open/pidfd_getfd/pidfd_send_signal).
+            // Each keys on a host-visible pid or reaches into another live
+            // process, but Detcore virtualizes guest pids, sequentializes
+            // processes, and owns process lifetime and signal delivery through
+            // its scheduler; a real pidfd would leak host pids and race that
+            // model. A fixed -ENOSYS is the errno a pre-5.3 kernel returns;
+            // callers feature-probe and fall back to kill/waitpid, which Detcore
+            // already determinizes. Untyped (Syscall::Other) in the pinned
+            // Reverie, so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized if is_pidfd_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
