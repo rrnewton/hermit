@@ -450,7 +450,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#767): flock/ioprio_get/ioprio_set forwarded as
+        // container-scoped hints. ioprio_{get,set} are pure I/O-priority hints
+        // with no guest-visible nondeterminism (like sched_get_priority_*).
+        // flock is advisory locking: deterministic for the single-container,
+        // uncontended case; cross-guest contention is the same pre-existing
+        // limitation as other forwarded blocking I/O. Unblocks flock and ionice
+        // under fail-closed --strict (were Unsupported).
+        | Sysno::flock
         | Sysno::get_thread_area
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
         | Sysno::mknod
         | Sysno::mknodat
         | Sysno::mlock
@@ -484,15 +495,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::epoll_pwait2
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -720,7 +728,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [199, 94, 80]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -783,6 +791,9 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         for sysno in [
+            Sysno::flock,
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
             Sysno::capget,
             Sysno::capset,
             Sysno::chown,
