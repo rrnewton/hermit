@@ -1622,6 +1622,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
+                // Extended scheduling attributes and I/O scheduling priority.
+                // Same rationale as the #720 family above: Detcore replaces the
+                // Linux CPU scheduler and serializes guest I/O, so these are
+                // inoperative. Setters are no-ops; getters emulate a fixed
+                // host-independent default (see syscall_classification.rs).
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch35)
+                Syscall::SchedSetattr(_) => Ok(0),
+                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                Syscall::IoprioSet(_) => Ok(0),
+                Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
+
+                // getitimer pairs with the determinized setitimer/alarm handling
+                // and reports the remaining ITIMER_REAL time from the virtual
+                // alarm state rather than fail-closing.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-batch35)
+                Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,

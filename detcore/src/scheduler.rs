@@ -2528,6 +2528,20 @@ impl Scheduler {
             LogicalTime::ZERO
         }
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    // Return the logical time remaining until this process's pending alarm, if
+    // any (zero otherwise), WITHOUT rescheduling it. Used by getitimer.
+    pub fn peek_alarm(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {
+        match self.blocked.timed_waiters.peek_alarm(detpid) {
+            Some(target_time) => {
+                let remain_ns: u64 = target_time.as_nanos().saturating_sub(now.as_nanos());
+                LogicalTime::from_nanos(remain_ns)
+            }
+            None => LogicalTime::ZERO,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -592,6 +592,13 @@ impl GlobalTool for GlobalState {
                 R::RegisterAlarm(remaining)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-batch35)
+            GlobalRequest::QueryAlarm(dpid) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
+                let remaining = self.recv_query_alarm(dpid, now).await;
+                R::QueryAlarm(remaining)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
@@ -1220,6 +1227,14 @@ impl GlobalState {
             .unwrap()
             .register_alarm(detpid, dettid, now, duration, sig.0)
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    /// Read the remaining time on a process's pending alarm without disturbing
+    /// it (for getitimer).
+    pub async fn recv_query_alarm(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {
+        self.sched.lock().unwrap().peek_alarm(detpid, now)
+    }
 }
 
 /// Messages to the global object.
@@ -1291,6 +1306,12 @@ pub enum GlobalRequest {
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    /// Read-only query of the remaining time on a process's pending alarm
+    /// (for getitimer); does not disturb the alarm.
+    QueryAlarm(DetPid),
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
@@ -1332,6 +1353,9 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    QueryAlarm(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
@@ -1868,6 +1892,23 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-batch35)
+/// Query the remaining time on the current process's pending alarm without
+/// rescheduling it. Returns zero when no alarm is pending. Used by getitimer.
+pub async fn query_alarm<G, T>(guest: &mut G) -> LogicalTime
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(guest, GlobalRequest::QueryAlarm(detpid)).await;
+    match resp.1 {
+        GlobalResponse::QueryAlarm(x) => x,
         _ => unreachable!(),
     }
 }

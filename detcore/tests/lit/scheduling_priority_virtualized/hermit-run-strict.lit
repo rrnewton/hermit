@@ -1,0 +1,5 @@
+RUN: %hermit run --strict -- %me | FileCheck %s
+CHECK: ioprio class 2 data 4
+CHECK: sched_getattr rc 0 policy 0
+CHECK: itimer disarmed 0.000000
+CHECK: itimer armed sec 4

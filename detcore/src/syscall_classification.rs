@@ -173,6 +173,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::prctl
         | Sysno::rt_sigpending
         | Sysno::setitimer
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-batch35): getitimer pairs with the already
+        // determinized setitimer/alarm handling. setitimer arms a one-shot
+        // ITIMER_REAL against the virtual clock, so getitimer must report that
+        // deterministic remaining time rather than fail-close; the handler in
+        // lib.rs reads it back from the virtual alarm state.
+        | Sysno::getitimer
         | Sysno::setpriority
         | Sysno::process_madvise
         | Sysno::setrlimit
@@ -247,6 +254,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getscheduler
         | Sysno::sched_getparam
         | Sysno::sched_rr_get_interval
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-batch35): Extends the #720 family. The extended
+        // scheduling-attribute calls (sched_getattr/sched_setattr) and the I/O
+        // scheduling-priority calls (ioprio_get/ioprio_set) are equally
+        // inoperative: Detcore replaces the Linux CPU scheduler and serializes
+        // guest I/O, so neither CPU-scheduling attributes nor per-process I/O
+        // priority can change guest-visible computation. Passed through, their
+        // results depend on host scheduler state and privilege (nondeterministic);
+        // determinized to fixed, host-independent results (handlers in lib.rs).
+        | Sysno::sched_getattr
+        | Sysno::sched_setattr
+        | Sysno::ioprio_get
+        | Sysno::ioprio_set
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount and
         // namespace administration syscalls. These create, enter, or
@@ -497,9 +517,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
-        | Sysno::getitimer
-        | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -533,8 +550,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
         | Sysno::semctl
@@ -727,7 +742,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [200, 91, 82]);
+        assert_eq!(counts, [205, 91, 77]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -787,6 +802,13 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+            // PR-batch35: extended scheduling attributes, I/O priority, and the
+            // getitimer reader are now determinized (were Unsupported).
+            Sysno::sched_getattr,
+            Sysno::sched_setattr,
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
+            Sysno::getitimer,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }

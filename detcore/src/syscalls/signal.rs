@@ -28,6 +28,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::query_alarm;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
@@ -142,6 +143,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             guest.memory().write_value(old_value, &old_timer)?;
         }
+        Ok(0)
+    }
+
+    /// getitimer under Hermit. Reports the deterministic remaining time of the
+    /// interval timer. It pairs with handle_setitimer/handle_alarm, which arm a
+    /// one-shot ITIMER_REAL against the virtual clock, so the remaining
+    /// ITIMER_REAL time is read back from the virtual alarm state (never from
+    /// the host), keeping it bitwise-identical across --verify and
+    /// record/replay. ITIMER_VIRTUAL and ITIMER_PROF are not armed by Detcore
+    /// and are reported disarmed. The interval field is always zero because only
+    /// one-shot timers are supported (see handle_setitimer).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    pub async fn handle_getitimer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getitimer,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            info!(
+                "[dtid {}] Running without scheduler, so letting getitimer call through...",
+                guest.thread_state().dettid
+            );
+            return Ok(guest.inject(call).await?);
+        }
+        let remaining = match call.which() {
+            libc::ITIMER_REAL => query_alarm(guest).await,
+            libc::ITIMER_VIRTUAL | libc::ITIMER_PROF => LogicalTime::ZERO,
+            _ => return Err(Error::Errno(Errno::EINVAL)),
+        };
+        let value = call.value().ok_or(Errno::EFAULT)?;
+        let timer = libc::itimerval {
+            it_interval: logical_time_to_timeval(LogicalTime::ZERO),
+            it_value: logical_time_to_timeval(remaining),
+        };
+        guest.memory().write_value(value, &timer)?;
         Ok(0)
     }
 

@@ -933,6 +933,90 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(0)
     }
+
+    /// sched_getattr under Hermit. Detcore replaces the Linux scheduler with its
+    /// own deterministic one, so a thread's Linux scheduling attributes are
+    /// inert. Report the fixed default policy SCHED_OTHER with zeroed
+    /// nice/priority/runtime/deadline/period. The struct is emulated (never
+    /// injected), so it is identical across --verify runs and record/replay.
+    /// Mirrors handle_sched_getparam / SchedGetscheduler => SCHED_OTHER.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    pub async fn handle_sched_getattr<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetattr,
+    ) -> Result<i64, Error> {
+        // Layout of the kernel's `struct sched_attr` (SCHED_ATTR_SIZE_VER0).
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SchedAttr {
+            size: u32,
+            sched_policy: u32,
+            sched_flags: u64,
+            sched_nice: i32,
+            sched_priority: u32,
+            sched_runtime: u64,
+            sched_deadline: u64,
+            sched_period: u64,
+        }
+        const HDR: usize = std::mem::size_of::<SchedAttr>();
+        let user_size = call.size() as usize;
+        // The kernel rejects a buffer smaller than its ver0 struct with EINVAL.
+        if user_size < HDR {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        // Cap the write to guard against a bogus size argument.
+        const MAX_ATTR: usize = 4096;
+        if user_size > MAX_ATTR {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        if let Some(attr) = call.attr() {
+            let header = SchedAttr {
+                size: HDR as u32,
+                sched_policy: 0, // SCHED_OTHER
+                sched_flags: 0,
+                sched_nice: 0,
+                sched_priority: 0,
+                sched_runtime: 0,
+                sched_deadline: 0,
+                sched_period: 0,
+            };
+            // Build the exact user_size buffer: the ver0 header followed by
+            // zeros for any newer trailing fields, so every byte the caller
+            // reads is deterministic. Written in one shot.
+            let mut buf = vec![0u8; user_size];
+            // SAFETY: `SchedAttr` is `#[repr(C)]` with naturally-aligned fields
+            // and no trailing padding, so its `HDR` bytes are a valid copy source.
+            let hbytes = unsafe {
+                std::slice::from_raw_parts((&header as *const SchedAttr) as *const u8, HDR)
+            };
+            buf[..HDR].copy_from_slice(hbytes);
+            let bytes: AddrMut<u8> = attr.cast();
+            guest.memory().write_values(bytes, &buf)?;
+        }
+        Ok(0)
+    }
+
+    /// ioprio_get under Hermit. Detcore serializes guest I/O, so per-process I/O
+    /// scheduling priority is inoperative and cannot change guest-visible
+    /// computation. Report a fixed best-effort priority (IOPRIO_CLASS_BE, level
+    /// 4) instead of the host's (privilege- and nice-dependent, and therefore
+    /// nondeterministic) value. The constant is emulated, so it is identical
+    /// across --verify runs and record/replay. ioprio_set is a no-op (see
+    /// lib.rs).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    pub async fn handle_ioprio_get<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _call: syscalls::IoprioGet,
+    ) -> Result<i64, Error> {
+        // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4): (class << IOPRIO_CLASS_SHIFT) | data.
+        const IOPRIO_CLASS_SHIFT: i64 = 13;
+        const IOPRIO_CLASS_BE: i64 = 2;
+        Ok((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4)
+    }
 }
 
 #[cfg(test)]

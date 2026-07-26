@@ -121,6 +121,15 @@ impl TimedEvents {
         old
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-batch35)
+    /// Return the absolute target time of the pending alarm on this process,
+    /// if any, without disturbing it. Used by getitimer to report the remaining
+    /// ITIMER_REAL time.
+    pub fn peek_alarm(&self, dp: DetPid) -> Option<LogicalTime> {
+        self.alarm_times.get(&dp).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
