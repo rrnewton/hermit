@@ -154,11 +154,37 @@ preemption. Its implementation is split between `tool_local`, which handles
 events near each guest task, and `tool_global`, which owns shared deterministic
 state; the two communicate through RPC.
 
-Hermit can drive the guest through more than one instrumentation backend. The
-`ptrace` backend is the default and best-tested path. Alternative backends
-(dynamic binary instrumentation and KVM) exist at varying maturity; always state
-which backend a result came from, because behavior and coverage differ between
-them.
+## Backend Definition
+
+In this repository, a **backend** is a complete execution path that loads the
+shared Detcore tool through Reverie as `Detcore<XxxGuest>`, where `XxxGuest` is
+the backend-specific guest implementation. Every real backend runs the same
+copy of the Detcore determinism code; a separate reimplementation or a command
+that merely launches a program is not a backend.
+
+The `ptrace` backend is the default and best-tested path. DBI and KVM are real
+backends only where they execute this full Detcore tool path. Use these terms
+precisely:
+
+- e9patch is **not** a backend. It is binary-rewriting preprocessing used with
+  the ptrace backend. A CLI spelling such as `--backend=e9patch` does not change
+  this architectural classification.
+- A prototype, stub, launch adapter, preprocessing tool, or compatibility shim
+  is **not** a backend. Report it by its actual category and state explicitly
+  whether it ever loads Detcore as a Reverie tool.
+- There is one shared copy of Detcore behavior. Do not describe backend-local
+  syscall emulation or a second determinism engine as Detcore parity.
+
+Never make an unqualified "pass", "deterministic", or "L2" claim. Every result
+must name the exact backend and exact test or guest command, including relevant
+flags. For preprocessing and prototype results, say what executed underneath;
+for example, "e9patch preprocessing with the ptrace backend" rather than
+"e9patch backend".
+
+A feature is **done** only when the exact test produces bitwise-identical output
+across **all backends**. A pass on one backend is evidence for that backend
+only, not a project-wide completion claim. If a backend cannot run the test,
+report that gap explicitly instead of weakening the definition of done.
 
 Start investigations in these locations:
 
@@ -271,3 +297,74 @@ The proxy is an environment requirement, not an authentication workaround. If
 `gh auth status` fails without it, retry with `HTTPS_PROXY` before concluding
 that the token is invalid. Create, edit, or close issues only when the task
 explicitly calls for that repository-side change.
+
+## Task Closure Policy
+
+A task is not finished when the code is written; it is finished when the change
+is on `main`. Phantom closures — tasks marked closed while the work never landed
+— are a recurring, expensive failure mode. Do not create one. The rules below
+are mandatory for every implementation and review agent.
+
+1. **Agents MUST NOT close tasks.** Never run `tg update <task> --status
+   closed` (or any equivalent close/complete transition). Closing is reserved
+   for the coordinator, who does it only after confirming the work is on
+   `main`. An agent that closes its own task is asserting a landing it cannot
+   witness.
+2. **When your work is complete, set the task to `IMPLEMENTED` and post the PR
+   link.** "Complete" means the feature branch is pushed and a pull request is
+   open against `rrnewton/hermit:main`. Record the transition and evidence:
+
+   ```bash
+   tg update <task> --status implemented
+   tg note <task> "Implemented: https://github.com/rrnewton/hermit/pull/<n> \
+     | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
+     | validation: <exact commands + results, assurance level, backend>"
+   ```
+
+   The PR link and the exact tested SHA are required, not optional. A branch
+   name alone is not evidence.
+3. **Adversarial review confirms the work exists in the PR.** Before a task is
+   trusted as `IMPLEMENTED`, a reviewer independently verifies that the claimed
+   change is actually present in the pull request diff, that the cited tests
+   exist and were run at the PR head SHA, and that the reported assurance level
+   (L0–L4), backend, and relaxations match reality. A claim that does not
+   survive this check is not `IMPLEMENTED`.
+4. **The task stays `IMPLEMENTED` until the PR lands on `main`.** Open,
+   in-review, CI-red, awaiting-merge, and blocked-on-a-dependency PRs are all
+   still `IMPLEMENTED`, never `closed`. If the branch stops fast-forwarding, or
+   CI goes red, or a required check is not green at the PR head, the task
+   remains `IMPLEMENTED` (or moves back to `in_progress`) — it does not advance.
+5. **Only the coordinator closes tasks, after landing confirmation.** The
+   coordinator closes a task only after verifying the PR is merged into
+   `rrnewton/hermit:main` (both required checks green at the merged head, the
+   commit reachable from `main`), and, when relevant, that the parent gitlink
+   was updated. Landing confirmation is a merge commit on `main`, not a green
+   local run.
+
+### Done vs. Not Done
+
+Use these concrete examples to decide the correct status. When in doubt, choose
+the lower status and say why in a task note.
+
+**Done (coordinator may close):**
+
+- PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
+  and both required checks were green at that head.
+- A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
+  updated to the exact landed SHAs, and the pair revalidated.
+
+**`IMPLEMENTED` (agent's terminal state — do NOT close):**
+
+- Branch pushed, PR open, CI green, awaiting coordinator merge.
+- PR open but CI red, or a required check missing/queued/stale — still
+  `IMPLEMENTED`; report the exact failure, do not close.
+- Work committed and pushed but blocked on another PR or a reverie pin bump —
+  `IMPLEMENTED` with the blocker and dependency SHAs named.
+
+**Not done (stays `in_progress`, never `IMPLEMENTED` or `closed`):**
+
+- Code written but uncommitted, stashed, or not pushed.
+- "It builds/tests pass locally" with no pushed branch and no open PR.
+- A green local `cargo test` presented as project completion — a local run is
+  not a landing, and one backend passing is not "done" across all backends.
+- Tests marked `#[ignore]`, masked, or deleted to make a checkout look green.

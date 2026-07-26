@@ -53,9 +53,10 @@ Before landing a key change:
 
 ## 2. Labels
 
-- `human-review` — marks a PR the human still wants to look at. **Never
-  auto-close or auto-land a `human-review` PR.** Under post-facto mode these
-  stay open for the human even though other work lands around them.
+- `human-review` — marks a PR the human still wants to look at post-facto.
+  Under post-facto mode, human-review PRs are STILL LANDED — they also receive
+  the `post-facto-review` label so the human can find and review them after
+  landing. human-review is informational, NOT a landing blocker.
 - `post-facto-review` — marks a PR that landed autonomously and is awaiting the
   human's after-the-fact review.
 - **Never apply `human-approved`.** That label means a human actually approved,

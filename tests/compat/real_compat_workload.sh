@@ -43,7 +43,122 @@ function build_assembly_object {
     /usr/bin/as --64 "$WORK_DIR/add.s" -o "$WORK_DIR/add.o"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#686): Review archive reproducibility and localhost fixture cleanup.
+function prepare_archive_fixture {
+    mkdir -p "$WORK_DIR/source" "$WORK_DIR/output"
+    printf 'Hermit archive payload\nline two\n' >"$WORK_DIR/source/payload.txt"
+    touch -t 200001010000 "$WORK_DIR/source/payload.txt"
+}
+
+function verify_archive_roundtrip {
+    local archive=$1
+    local archive_digest
+    local payload_digest
+
+    cmp "$WORK_DIR/source/payload.txt" "$WORK_DIR/output/payload.txt"
+    archive_digest=$(sha256sum "$archive" | cut -d' ' -f1)
+    payload_digest=$(sha256sum "$WORK_DIR/output/payload.txt" | cut -d' ' -f1)
+    printf '%s:%s:%s\n' "$PROGRAM" "$archive_digest" "$payload_digest"
+}
+
+function fetch_localhost_payload {
+    (
+        local client=$1
+        local server_pid=
+        local status=0
+        local ready=0
+        local attempt
+
+        trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
+        prepare_archive_fixture
+        /usr/bin/python3 -B -c \
+            'import functools, http.server, pathlib, sys; handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1]); server = http.server.HTTPServer(("127.0.0.1", 18765), handler); pathlib.Path(sys.argv[2]).touch(); server.handle_request()' \
+            "$WORK_DIR/source" "$WORK_DIR/ready" >"$WORK_DIR/server.log" 2>&1 &
+        server_pid=$!
+
+        for ((attempt = 0; attempt < 500; attempt += 1)); do
+            if [[ -e $WORK_DIR/ready ]]; then
+                ready=1
+                break
+            fi
+            sleep 0.01
+        done
+        if ((ready == 0)); then
+            printf 'localhost fixture did not become ready\n' >&2
+            status=1
+        elif [[ $client == wget ]]; then
+            /usr/bin/wget --quiet \
+                --output-document="$WORK_DIR/output/payload.txt" \
+                http://127.0.0.1:18765/payload.txt || status=$?
+        else
+            /usr/bin/curl --fail --silent --show-error \
+                --output "$WORK_DIR/output/payload.txt" \
+                http://127.0.0.1:18765/payload.txt || status=$?
+        fi
+
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        server_pid=
+        if ((status != 0)); then
+            return "$status"
+        fi
+
+        cmp "$WORK_DIR/source/payload.txt" "$WORK_DIR/output/payload.txt"
+        printf '%s:' "$PROGRAM"
+        sha256sum "$WORK_DIR/output/payload.txt" | cut -d' ' -f1
+    )
+}
+
 case "$PROGRAM" in
+    gzip-roundtrip)
+        prepare_archive_fixture
+        gzip -n -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.gz"
+        gzip -dc "$WORK_DIR/archive.gz" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.gz"
+        ;;
+    bzip2-roundtrip)
+        prepare_archive_fixture
+        bzip2 -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.bz2"
+        bzip2 -dc "$WORK_DIR/archive.bz2" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.bz2"
+        ;;
+    xz-roundtrip)
+        prepare_archive_fixture
+        xz -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.xz"
+        xz -dc "$WORK_DIR/archive.xz" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.xz"
+        ;;
+    zstd-roundtrip)
+        prepare_archive_fixture
+        zstd -q -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.zst"
+        zstd -q -d -c "$WORK_DIR/archive.zst" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.zst"
+        ;;
+    tar-roundtrip)
+        prepare_archive_fixture
+        tar --format=ustar --sort=name --mtime=@946684800 \
+            --owner=0 --group=0 --numeric-owner \
+            -cf "$WORK_DIR/archive.tar" -C "$WORK_DIR/source" payload.txt
+        tar -xf "$WORK_DIR/archive.tar" -C "$WORK_DIR/output"
+        verify_archive_roundtrip "$WORK_DIR/archive.tar"
+        ;;
+    cpio-roundtrip)
+        prepare_archive_fixture
+        (
+            cd "$WORK_DIR/source"
+            printf 'payload.txt\n' | cpio --quiet --reproducible \
+                --renumber-inodes -o -H newc
+        ) >"$WORK_DIR/archive.cpio"
+        (cd "$WORK_DIR/output" && cpio --quiet -id <"$WORK_DIR/archive.cpio")
+        verify_archive_roundtrip "$WORK_DIR/archive.cpio"
+        ;;
+    wget-localhost)
+        fetch_localhost_payload wget
+        ;;
+    curl-localhost)
+        fetch_localhost_payload curl
+        ;;
     cargo)
         mkdir -p "$WORK_DIR/src"
         cat >"$WORK_DIR/Cargo.toml" <<'EOF'
@@ -74,22 +189,69 @@ EOF
         printf 'cargo:metadata-and-package-list\n'
         ;;
     rustc)
-        cat >"$WORK_DIR/lib.rs" <<'EOF'
-#[no_mangle]
-pub extern "C" fn hermit_weighted(values: *const u64, len: usize) -> u64 {
-    let values = unsafe { std::slice::from_raw_parts(values, len) };
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (index as u64 + 1) * value)
-        .sum()
+        cat >"$WORK_DIR/main.rs" <<'EOF'
+fn main() {
+    let sum: u64 = (1..=100).map(|value| value * value).sum();
+    assert_eq!(sum, 338350);
+    println!("rustc:{sum}");
 }
 EOF
-        rustc --crate-name hermit_real_compat --crate-type lib --emit=obj \
-            -C opt-level=1 -C metadata=hermit-real-compat \
-            "$WORK_DIR/lib.rs" -o "$WORK_DIR/lib.o"
-        nm -g --defined-only "$WORK_DIR/lib.o" | grep -q ' T hermit_weighted$'
-        printf 'rustc:object-with-hermit_weighted\n'
+        # GCC's linker driver races vfork/pipe completion under L2.
+        # Clang keeps the ordering stable; suppress its build ID as well.
+        rustc --crate-name hermit_real_compat -C opt-level=1 -C debuginfo=0 \
+            -C metadata=hermit-real-compat -C linker=/usr/bin/clang \
+            -C link-arg=-Wl,--build-id=none \
+            "$WORK_DIR/main.rs" -o "$WORK_DIR/program"
+        "$WORK_DIR/program"
+        ;;
+    clang)
+        cat >"$WORK_DIR/main.c" <<'EOF'
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    uint64_t factorial = 1;
+    for (uint64_t value = 2; value <= 20; ++value) {
+        factorial *= value;
+    }
+    if (factorial != UINT64_C(2432902008176640000)) {
+        return 1;
+    }
+    printf("clang:%" PRIu64 "\n", factorial);
+    return 0;
+}
+EOF
+        /usr/bin/clang -O2 -Wl,--build-id=none \
+            "$WORK_DIR/main.c" -o "$WORK_DIR/program"
+        "$WORK_DIR/program"
+        ;;
+    javac)
+        cat >"$WORK_DIR/CompilerCompat.java" <<'EOF'
+public final class CompilerCompat {
+    public static void main(String[] args) {
+        long previous = 0;
+        long current = 1;
+        for (int index = 0; index < 30; ++index) {
+            long next = previous + current;
+            previous = current;
+            current = next;
+        }
+        if (previous != 832040) {
+            throw new AssertionError(previous);
+        }
+        System.out.println("javac:" + previous);
+    }
+}
+EOF
+        # Avoid live NSS queries while the JVM initializes user properties.
+        javac -J-Duser.name=hermit -J-Duser.home="$WORK_DIR" \
+            -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
+            -g:none -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
+        # Direct execution avoids a parent/child command-substitution pipe.
+        java -Duser.name=hermit -Duser.home="$WORK_DIR" \
+            -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -cp "$WORK_DIR" CompilerCompat
         ;;
     java)
         cat >"$WORK_DIR/Compat.java" <<'EOF'
@@ -131,7 +293,11 @@ EOF
             -cp "$WORK_DIR" Compat
         ;;
     git)
-        readonly GIT=/usr/local/bin/git.meta.real
+        if [[ -x /usr/local/bin/git.meta.real ]]; then
+            readonly GIT=/usr/local/bin/git.meta.real
+        else
+            readonly GIT=/usr/bin/git
+        fi
         mkdir -p "$WORK_DIR/home" "$WORK_DIR/repo"
         export HOME="$WORK_DIR/home"
         export GIT_CONFIG_NOSYSTEM=1
@@ -150,6 +316,103 @@ EOF
         subject=$("$GIT" -C "$WORK_DIR/repo" log -1 --format=%s)
         blob=$("$GIT" -C "$WORK_DIR/repo" rev-parse HEAD:data.txt)
         printf 'git:%s:%s\n' "$subject" "$blob"
+        ;;
+    sqlite3)
+        output=$(
+            /usr/bin/sqlite3 -batch -noheader -separator : :memory: <<'EOF'
+CREATE TABLE measurements(category TEXT NOT NULL, value INTEGER NOT NULL);
+INSERT INTO measurements VALUES
+    ('alpha', 6), ('beta', 7), ('alpha', 15), ('beta', 14);
+SELECT category, count(*), sum(value)
+FROM measurements
+GROUP BY category
+ORDER BY category;
+EOF
+        )
+        test "$output" = $'alpha:2:21\nbeta:2:21'
+        printf 'sqlite3:groups-ok\n'
+        ;;
+    jq)
+        cat >"$WORK_DIR/input.json" <<'EOF'
+[
+  {"name": "gamma", "value": 21},
+  {"name": "beta", "value": 6},
+  {"name": "alpha", "value": 15}
+]
+EOF
+        output=$(/usr/bin/jq -c \
+            '{total: (map(.value) | add), selected: ([.[] | select(.value >= 10) | .name] | sort)}' \
+            "$WORK_DIR/input.json")
+        test "$output" = '{"total":42,"selected":["alpha","gamma"]}'
+        printf 'jq:aggregate-ok\n'
+        ;;
+    xmllint)
+        cat >"$WORK_DIR/inventory.xml" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE inventory [
+<!ELEMENT inventory (item+)>
+<!ELEMENT item EMPTY>
+<!ATTLIST item name CDATA #REQUIRED value CDATA #REQUIRED>
+]>
+<inventory>
+  <item name="alpha" value="6"/>
+  <item name="beta" value="15"/>
+  <item name="gamma" value="21"/>
+</inventory>
+EOF
+        /usr/bin/xmllint --nonet --valid --noout "$WORK_DIR/inventory.xml"
+        count=$(/usr/bin/xmllint --xpath 'count(/inventory/item)' \
+            "$WORK_DIR/inventory.xml")
+        sum=$(/usr/bin/xmllint --xpath 'sum(/inventory/item/@value)' \
+            "$WORK_DIR/inventory.xml")
+        test "$count:$sum" = '3:42'
+        printf 'xmllint:valid:count=%s:sum=%s\n' "$count" "$sum"
+        ;;
+    cmake)
+        cat >"$WORK_DIR/workload.cmake" <<'EOF'
+math(EXPR product "6 * 7")
+if(NOT product EQUAL 42)
+  message(FATAL_ERROR "unexpected product: ${product}")
+endif()
+file(WRITE "${OUTPUT_PATH}" "cmake=${product}\n")
+EOF
+        /usr/bin/cmake -DOUTPUT_PATH="$WORK_DIR/result.txt" \
+            -P "$WORK_DIR/workload.cmake"
+        grep -Fxq 'cmake=42' "$WORK_DIR/result.txt"
+        printf 'cmake:script-product-42\n'
+        ;;
+    pkg-config)
+        mkdir -p "$WORK_DIR/pkgconfig"
+        cat >"$WORK_DIR/pkgconfig/hermit-compat.pc" <<'EOF'
+prefix=/opt/hermit-compat
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: hermit-compat
+Description: Hermit pkg-config compatibility fixture
+Version: 1.2.3
+Libs: -L${libdir} -lhermit_compat
+Cflags: -I${includedir} -DHERMIT_COMPAT=42
+EOF
+        export PKG_CONFIG_PATH="$WORK_DIR/pkgconfig"
+        version=$(/usr/bin/pkg-config --modversion hermit-compat)
+        flags=$(/usr/bin/pkg-config --cflags --libs hermit-compat)
+        flags=${flags% }
+        test "$version" = '1.2.3'
+        test "$flags" = \
+            '-I/opt/hermit-compat/include -DHERMIT_COMPAT=42 -L/opt/hermit-compat/lib -lhermit_compat'
+        /usr/bin/pkg-config --atleast-version=1.2 hermit-compat
+        printf 'pkg-config:%s:%s\n' "$version" "$flags"
+        ;;
+    m4)
+        cat >"$WORK_DIR/input.m4" <<'EOF'
+define(`PRODUCT', `eval($1 * $2)')dnl
+product=PRODUCT(6, 7)
+EOF
+        /usr/bin/m4 "$WORK_DIR/input.m4" >"$WORK_DIR/output.txt"
+        grep -Fxq 'product=42' "$WORK_DIR/output.txt"
+        printf 'm4:product-42\n'
         ;;
     gcc)
         cat >"$WORK_DIR/fixture.c" <<'EOF'
@@ -196,6 +459,62 @@ EOF
         IFS= read -r result <"$WORK_DIR/result.txt"
         test "$result" = 'make:42'
         printf '%s\n' "$result"
+        ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the fixture-backed system utility workloads.
+    ip)
+        output=$(/usr/sbin/ip -o -4 addr show dev lo)
+        [[ $output == *" inet 127.0.0.1/8 "* ]]
+        [[ $output == *" scope host lo"* ]]
+        printf 'ip:loopback-ipv4-ok\n'
+        ;;
+    ss)
+        if [[ -x /usr/sbin/ss ]]; then
+            readonly SS=/usr/sbin/ss
+        else
+            readonly SS=/usr/bin/ss
+        fi
+        output=$("$SS" -H -ltn 'sport = :0')
+        test -z "$output"
+        printf 'ss:no-port-zero-listener\n'
+        ;;
+    lscpu)
+        readonly root="$WORK_DIR/sysroot"
+        mkdir -p "$root/proc" \
+            "$root/sys/devices/system/cpu/cpu0/topology"
+        cat >"$root/proc/cpuinfo" <<'EOF'
+processor : 0
+vendor_id : GenuineIntel
+cpu family : 6
+model : 85
+model name : Hermit Virtual CPU
+stepping : 7
+cpu MHz : 1000.000
+cache size : 1024 KB
+physical id : 0
+siblings : 1
+core id : 0
+cpu cores : 1
+flags : fpu
+EOF
+        for file in online possible present; do
+            printf '0\n' >"$root/sys/devices/system/cpu/$file"
+        done
+        printf '0\n' >"$root/sys/devices/system/cpu/cpu0/topology/core_id"
+        printf '0\n' \
+            >"$root/sys/devices/system/cpu/cpu0/topology/physical_package_id"
+        output=$(/usr/bin/lscpu --sysroot "$root" -p=CPU,ONLINE)
+        [[ $output == *"# CPU,Online"* ]]
+        [[ $output == *"0,Y"* ]]
+        printf 'lscpu:cpu0-online\n'
+        ;;
+    lsof)
+        printf 'lsof-fixture\n' >"$WORK_DIR/input.txt"
+        exec 9<"$WORK_DIR/input.txt"
+        output=$(/usr/bin/lsof -O -w -p $$ -a -d 9 -Ffn)
+        [[ $output == *f9* ]]
+        [[ $output == *"$WORK_DIR/input.txt"* ]]
+        printf 'lsof:fd9-ok\n'
         ;;
     ar)
         archive=$(gcc -print-file-name=libgcc.a)
@@ -328,6 +647,54 @@ EOF
         grep -q 'compat_marker' "$WORK_DIR/coverage.c.gcov"
         grep -Eq '^[[:space:]]*[1-9][0-9]*:.*compat_marker' "$WORK_DIR/coverage.c.gcov"
         printf 'gcov:covered-marker\n'
+        ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the expanded miscellaneous workloads.
+    seq)
+        output=$(/usr/bin/seq 2 3 20 | /usr/bin/paste -sd, -)
+        test "$output" = '2,5,8,11,14,17,20'
+        printf 'seq:stepped-range-ok\n'
+        ;;
+    find)
+        readonly tree="$WORK_DIR/tree"
+        mkdir -p "$tree/a" "$tree/b/nested"
+        printf 'alpha\n' >"$tree/a/alpha.txt"
+        printf 'beta\n' >"$tree/b/beta.log"
+        printf 'gamma\n' >"$tree/b/nested/gamma.txt"
+        output=$(/usr/bin/find "$tree" -type f -name '*.txt' -printf '%P\n' |
+            /usr/bin/sort)
+        test "$output" = $'a/alpha.txt\nb/nested/gamma.txt'
+        printf 'find:recursive-filter-ok\n'
+        ;;
+    env)
+        output=$(/usr/bin/env -i ALPHA=6 BETA=7 /usr/bin/printenv ALPHA BETA)
+        test "$output" = $'6\n7'
+        printf 'env:clean-two-vars-ok\n'
+        ;;
+    factor)
+        output=$(/usr/bin/factor 360 97)
+        test "$output" = $'360: 2 2 2 3 3 5\n97: 97'
+        printf 'factor:composite-and-prime-ok\n'
+        ;;
+    xargs)
+        output=$(printf '6\n7\n' | /usr/bin/xargs -n1 /usr/bin/expr 6 '*')
+        test "$output" = $'36\n42'
+        printf 'xargs:two-products-ok\n'
+        ;;
+    time)
+        /usr/bin/time -f 'exit=%x maxrss=%M' -o "$WORK_DIR/timing.txt" \
+            /bin/sh -c "/bin/echo time-command-ok >$WORK_DIR/command.txt"
+        IFS= read -r command_output <"$WORK_DIR/command.txt"
+        IFS= read -r timing <"$WORK_DIR/timing.txt"
+        test "$command_output" = 'time-command-ok'
+        test "$timing" = 'exit=0 maxrss=0'
+        printf 'time:exit-and-rusage-ok\n'
+        ;;
+    shuf)
+        output=$(printf 'alpha\nbeta\ngamma\ndelta\n' |
+            /usr/bin/shuf | /usr/bin/sort)
+        test "$output" = $'alpha\nbeta\ndelta\ngamma'
+        printf 'shuf:permutation-ok\n'
         ;;
     *)
         echo "unknown real compatibility workload: $PROGRAM" >&2

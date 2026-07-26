@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x103);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +149,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
+        exit_on_unsupported_syscall: false,
+        shutdown_on_unsupported_syscall: false,
+        unsupported_syscall_report_fd: None,
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
@@ -221,8 +224,8 @@ mod tests {
     #[test]
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x110)));
     }
 
     #[test]
@@ -232,7 +235,7 @@ mod tests {
 
     #[test]
     fn record_version_rejects_pre_madvise_policy_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x101)));
     }
 }

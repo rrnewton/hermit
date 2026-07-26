@@ -127,27 +127,44 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm|e9patch` to select the process instrumentation
-backend. It is a global option and belongs before the subcommand. The default is
+Use `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` to select the process
+instrumentation backend.
+It is a global option and belongs before the subcommand, but backend scope is
+command-specific. LiteInst and e9patch support only `run`, while SaBRe supports
+`run` and `strace`; unsupported combinations fail closed. The default is
 `ptrace`, so existing commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-The e9patch preprocessor is currently supported only by `run`; other explicit
-e9patch subcommand combinations fail closed.
-
 For backwards compatibility, `run` also accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
-the current host. It does not silently fall back to a different backend. The
-current DynamoRIO prototype requires a discoverable SDK and has no Detcore
-process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
-commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
-those prototypes therefore fail before the guest starts and explain the missing
-capability.
+the current host. It does not silently fall back to a different backend.
+LiteInst requires `libdetcore_liteinst.so` beside the Hermit executable. That
+DSO installs `Detcore` over `LiteinstGuest`; a coordinator-side
+`LiteinstBackend` owns global state and transports tool RPC over a Unix socket.
+The first syscall at each site traps through seccomp `SIGSYS`; subsequent calls
+use the installed LiteInst trampoline.
+
+LiteInst uses the normal Hermit run and verification paths. A successful
+`--strict --verify` run compares captured status/output and Detcore scheduler
+logs and is therefore an L2 result. Verification currently supplies
+`/dev/null` as guest stdin. The supported execution scope is dynamically
+linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
+`fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
+unsupported. RCB timer delivery and CPUID/RDTSC interception are not yet
+implemented.
+
+The default namespace, mount, and network setup is shared with Hermit's other
+backends; `--no-namespace` remains available for trusted guests. The preload
+runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
+in-process path is not a security boundary for intentionally hostile code.
+The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
+runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
+plus a guest-kernel ABI.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode

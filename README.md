@@ -80,25 +80,47 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|kvm|e9patch` as a global option, before the
-subcommand. Omitting the option selects `ptrace`, preserving the existing behavior:
+Hermit accepts `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` as a global
+option before the subcommand. Backend scope is command-specific: LiteInst and
+e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
+combinations fail closed. Omitting the option selects `ptrace`, preserving the
+existing behavior:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-The e9patch preprocessor is currently supported only by `run`; other explicit
-e9patch subcommand combinations fail closed.
-
 For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
-SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
-requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
-and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
-an availability error rather than running the command without determinization.
+explicit backend request. LiteInst is an experimental in-process Detcore
+backend for dynamically linked Linux x86-64 guests:
+
+```bash
+cargo build -p hermit --bin hermit
+cargo build -p detcore-liteinst --lib
+hermit run --backend=liteinst --strict --verify -- /bin/echo hello
+```
+
+The Hermit-owned preload DSO installs `Detcore` as a generic Reverie `Tool`.
+The first invocation of a syscall site arrives through seccomp `SIGSYS`, where
+LiteInst installs an instruction-punning hook. Later invocations enter the
+LiteInst trampoline and `LiteinstGuest<Detcore>`; global Detcore state remains
+in the coordinator and is reached over the Reverie RPC transport.
+
+`--verify` runs the normal Detcore comparison over captured status, output,
+and deterministic scheduler logs, so a successful result is an L2 claim.
+Current support is limited to single-threaded, single-process guests. Thread
+clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
+unsupported because the inherited seccomp filter would outlive the preload
+runtime. RCB preemption and CPUID/RDTSC interception are not implemented.
+The default Hermit namespace path is supported; `--no-namespace` remains an
+explicit option for trusted guests. The in-process preload is experimental and
+must not be treated as a security boundary for hostile code.
+The DynamoRIO path requires a discoverable SDK, SaBRe requires its runner,
+rewriter, and plugin artifacts, and KVM requires read-write `/dev/kvm` access
+plus its guest-kernel Linux ABI.
 
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs

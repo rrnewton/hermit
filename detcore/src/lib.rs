@@ -108,8 +108,34 @@ pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
+pub use tool_global::format_unsupported_syscall_warning;
+use tool_global::report_unsupported_syscall;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
+/// Identifies an unsupported syscall that a backend must terminate without unwinding.
+#[derive(Debug)]
+pub struct UnsupportedSyscallError(pub Sysno);
+
+impl std::fmt::Display for UnsupportedSyscallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unsupported syscall: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedSyscallError {}
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+/// Returns whether the audited runtime policy classifies `sysno` as unsupported.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBI-child classification surface.
+pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
+    matches!(
+        syscall_classification::classify_syscall(sysno),
+        syscall_classification::SyscallClassification::Unsupported
+    )
+}
+
 use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
@@ -127,6 +153,10 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
+use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_unimplemented_enosys_syscall;
+use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -178,8 +208,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    /// Applies the legacy policy to an explicitly listed but unclassified syscall.
-    async fn handle_unclassified_syscall<G: Guest<Self>>(
+    // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
+    /// Applies the legacy policy to an explicitly listed but unsupported syscall.
+    async fn handle_unsupported_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
@@ -192,8 +223,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid,
                 call.display(&guest.memory()),
             );
+            if guest.config().shutdown_on_unsupported_syscall {
+                unrecoverable_shutdown(guest).await;
+            }
+            if guest.config().exit_on_unsupported_syscall {
+                return Err(Error::Tool(anyhow::Error::new(UnsupportedSyscallError(
+                    call.number(),
+                ))));
+            }
             panic!("unsupported syscall: {:?}", call);
         }
+        report_unsupported_syscall(guest, call.number()).await;
         self.passthrough(guest, call).await
     }
 
@@ -619,6 +659,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 Sysno::writev,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#683)
+                Sysno::pwrite64,
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
@@ -703,8 +746,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // TODO(T137258824): add proper Select / PSelect6
-                // Sysno::pselect6,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+                Sysno::pselect6,
+                // TODO(T137258824): add proper Select
                 // Sysno::select,
             ]);
 
@@ -1242,6 +1287,88 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.passthrough(guest, call).await
                 }
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#663)
+            // The pinned Reverie revision exposes process_madvise only as a raw call.
+            SyscallClassification::Determinized if call.number() == Sysno::process_madvise => {
+                match call {
+                    Syscall::Other(_, args) => Self::handle_process_madvise(args.arg0, args.arg4),
+                    _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
+                }
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
+            // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
+            // deterministic by construction and identical to the modern kernel's own
+            // return, so no guest-visible behavior changes versus the legacy
+            // pass-through. These are untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_unimplemented_enosys_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
+            // system-administration syscalls (module load/unload, kexec, reboot,
+            // swap, raw I/O ports, root-mount pivot, host/domain name, tty
+            // hangup, disk quotas). The deterministic guest does not hold the
+            // capabilities these require against the host kernel, so a fixed
+            // -EPERM matches the unprivileged errno, never perturbs global host
+            // state, and is identical across --verify and record/replay. These
+            // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on
+            // the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_privileged_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#720): set_mempolicy_home_node is untyped in the
+            // pinned Reverie revision. Hermit exposes a single virtual NUMA node,
+            // so setting a memory range's home node has no observable effect: a
+            // deterministic no-op.
+            SyscallClassification::Determinized
+                if call.number() == Sysno::set_mempolicy_home_node =>
+            {
+                Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
+            // and namespace administration syscalls (mount/umount2/mount_setattr/
+            // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
+            // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
+            // deterministic container pins the guest's namespaces, mount
+            // hierarchy, and virtual clock for the whole run, so these are
+            // refused with a fixed -EPERM: the unprivileged errno for the
+            // capability-gated operations and a deliberate deterministic refusal
+            // otherwise. Never forwarded to the host; identical across --verify
+            // and record/replay. Untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_mount_ns_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
+            // asynchronous and message-passing I/O and IPC interfaces Detcore
+            // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
+            // io_cancel/io_getevents/io_pgetevents), POSIX message queues
+            // (mq_*), and System V message queues (msg*). AIO completion is
+            // kernel-driven and lives outside logical time; the message-queue
+            // families operate on global, key/name-addressed kernel objects
+            // shared with the whole host. A fixed -ENOSYS is the errno a kernel
+            // built without AIO/CONFIG_POSIX_MQUEUE/CONFIG_SYSVIPC returns, is
+            // never forwarded to the host, and is identical across --verify and
+            // record/replay (mirrors the io_uring refusal). Untyped
+            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+            // before the typed match below.
+            SyscallClassification::Determinized
+                if is_unsupported_async_ipc_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1253,6 +1380,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#683)
+                Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
@@ -1284,7 +1414,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_gettimeofday(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1297,7 +1427,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_time(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1310,7 +1440,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_clock_gettime(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1323,7 +1453,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     if virtualize_time {
                         self.handle_clock_getres(guest, s).await
                     } else {
-                        self.handle_unclassified_syscall(
+                        self.handle_unsupported_syscall(
                             guest,
                             call,
                             dettid,
@@ -1332,7 +1462,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                     }
                 }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
                 Syscall::Uname(s) => self.handle_uname(guest, s).await,
                 Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
@@ -1358,6 +1503,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
                 Syscall::Connect(s) => self.handle_connect(guest, s).await,
                 Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Setsockopt(s) => self.handle_setsockopt(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Listen(s) => self.handle_listen(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
@@ -1388,6 +1548,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
                 Syscall::EpollCreate(s) => {
                     self.handle_epoll_create1(guest, EpollCreate1::from(s))
@@ -1409,6 +1572,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
                 Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
 
+                // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
+                // policy. Hermit exposes a single virtual NUMA node and replaces
+                // the Linux scheduler with Detcore, so these are inoperative and
+                // are virtualized to fixed, host-independent results (see the
+                // determinism argument in syscall_classification.rs). Setters and
+                // count-returning calls are no-ops; getters emulate a default
+                // single-node / SCHED_OTHER answer.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#720)
+                Syscall::Mbind(_) => Ok(0),
+                Syscall::SetMempolicy(_) => Ok(0),
+                Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
+                Syscall::MigratePages(_) => Ok(0),
+                Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
+                Syscall::SchedSetscheduler(_) => Ok(0),
+                Syscall::SchedSetparam(_) => Ok(0),
+                // Report the fixed default policy SCHED_OTHER (0).
+                Syscall::SchedGetscheduler(_) => Ok(0),
+                Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
+                Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
@@ -1419,6 +1603,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
 
                 Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
                 Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
@@ -1432,6 +1625,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
                 Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
 
                 // POSIX per-process timers. Arming is tracked against the virtual
                 // clock so these verify deterministically under --strict; timer
@@ -1456,7 +1655,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
 
                 unexpected => {
-                    self.handle_unclassified_syscall(
+                    self.handle_unsupported_syscall(
                         guest,
                         unexpected,
                         dettid,
@@ -1465,102 +1664,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
+            // reviewed classification table routes them, and every other reviewed
+            // PassThrough syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
-            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
-            // dispatch it by Sysno while retaining typed guards for every represented call.
-            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
-                self.passthrough(guest, call).await
+            // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+            SyscallClassification::Unsupported => {
+                self.handle_unsupported_syscall(
+                    guest,
+                    call,
+                    dettid,
+                    config.panic_on_unsupported_syscalls,
+                )
+                .await
             }
-            SyscallClassification::PassThrough => match call {
-                Syscall::Access(_)
-                | Syscall::Brk(_)
-                | Syscall::Capget(_)
-                | Syscall::Capset(_)
-                | Syscall::Chdir(_)
-                | Syscall::Chmod(_)
-                | Syscall::Fchdir(_)
-                | Syscall::Fchmodat(_)
-                | Syscall::Fdatasync(_)
-                | Syscall::Ftruncate(_)
-                // Fixed credentials and process-local unlocks are deterministic; fsync is
-                // conditional on guest-owned files and stable filesystem state.
-                // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fsync(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Getresgid(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Getresuid(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Munlock(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Munlockall(_)
-                // Stable guest files make these synchronous extent and pathname operations
-                // repeatable when the namespace is not externally mutated.
-                // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Fallocate(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Readlinkat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Rename(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Renameat(_)
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                | Syscall::Truncate(_)
-                | Syscall::Getcwd(_)
-                | Syscall::Getegid(_)
-                | Syscall::Geteuid(_)
-                | Syscall::Getgid(_)
-                | Syscall::Getgroups(_)
-                | Syscall::Getpid(_)
-                | Syscall::Gettid(_)
-                | Syscall::Getuid(_)
-                | Syscall::Getxattr(_)
-                | Syscall::Lgetxattr(_)
-                | Syscall::Linkat(_)
-                | Syscall::Lseek(_)
-                | Syscall::Mkdir(_)
-                | Syscall::Mkdirat(_)
-                | Syscall::Mprotect(_)
-                | Syscall::Readlink(_)
-                | Syscall::Removexattr(_)
-                | Syscall::Renameat2(_)
-                | Syscall::Rmdir(_)
-                | Syscall::RtSigreturn(_)
-                | Syscall::Setxattr(_)
-                | Syscall::SetRobustList(_)
-                | Syscall::SetTidAddress(_)
-                | Syscall::Sigaltstack(_)
-                | Syscall::Symlinkat(_)
-                | Syscall::Umask(_)
-                | Syscall::Unlink(_)
-                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
-                unexpected => {
-                    self.handle_unclassified_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        config.panic_on_unsupported_syscalls,
-                    )
-                    .await
-                }
-            },
-            SyscallClassification::Unclassified => match call {
-                Syscall::Prctl(s) if syscalls::is_supported_prctl_option(s.option()) => {
-                    self.handle_prctl(guest, s).await
-                }
-                unexpected => {
-                    self.handle_unclassified_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        config.panic_on_unsupported_syscalls,
-                    )
-                    .await
-                }
-            },
         };
 
         detlog!(
@@ -1698,6 +1816,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::writev)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::pwrite64)
         );
     }
 }

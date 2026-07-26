@@ -38,8 +38,10 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::IdentityGuard;
 use super::container::apply_affinity;
 use super::container::default_container;
+use super::container::identity_hardening_mounts;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
@@ -50,6 +52,10 @@ use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+struct PreparedMounts {
+    mounts: Vec<Mount>,
+    identity_sources: IdentityGuard,
+}
 
 #[derive(Debug, Clone)]
 struct E9patchOverlay {
@@ -91,8 +97,8 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Enable fail-closed strict deterministic mode. Deterministic scheduling and I/O are the
+    /// default; this explicit flag additionally rejects unsupported syscalls immediately.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
@@ -626,6 +632,7 @@ fn backend_values_parse_and_round_trip() {
     for (value, expected) in [
         ("ptrace", Backend::Ptrace),
         ("dbi", Backend::Dbi),
+        ("liteinst", Backend::Liteinst),
         ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
@@ -634,7 +641,12 @@ fn backend_values_parse_and_round_trip() {
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
+        let normalized = if expected == Backend::Liteinst {
+            format!(" --backend={value} --max-timeslice=disabled -- fakeprog")
+        } else {
+            format!(" --backend={value} -- fakeprog")
+        };
+        assert_eq!(format!("{}", ro), normalized);
     }
 }
 
@@ -653,6 +665,7 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let tmpfs = tempfile::tempdir().unwrap();
     let mounts = ro.mounts(tmpfs.path()).unwrap();
     let overlay = mounts
+        .mounts
         .iter()
         .find(|mount| mount.get_source() == Some(Path::new("/cache/patched-echo")))
         .unwrap();
@@ -880,14 +893,22 @@ fn display_runopts4() {
 }
 
 #[test]
-fn strict_flag_preserves_deterministic_defaults() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+    let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    normal.validate_args_with_perf_support(true).unwrap();
+    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
 
-    assert!(ro.det_opts.det_config.sequentialize_threads);
-    assert!(ro.det_opts.det_config.deterministic_io);
-    assert!(!ro.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    strict.validate_args_with_perf_support(true).unwrap();
+
+    assert!(strict.det_opts.det_config.sequentialize_threads);
+    assert!(strict.det_opts.det_config.deterministic_io);
+    assert!(!strict.det_opts.det_config.passthru_opt);
+    assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", strict),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
@@ -908,6 +929,26 @@ fn passthru_optimization_requires_explicit_opt_in() {
 
     assert!(ro.det_opts.det_config.passthru_opt);
     assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review rejecting optimization that bypasses fail-closed policy.
+#[test]
+fn passthru_optimization_rejects_fail_closed_modes() {
+    for fail_closed in ["--strict", "--panic-on-unsupported-syscalls"] {
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", "--passthru-opt", fail_closed, "fakeprog"]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--passthru-opt"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("fail-closed"),
+            "unexpected error: {message}"
+        );
+    }
 }
 
 #[test]
@@ -1081,8 +1122,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "fail-closed strict deterministic mode",
+        "rejects unsupported syscalls immediately",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -1137,7 +1178,9 @@ fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&bytes[start..end])))
 }
 
-fn is_elf_file(path: &Path) -> Result<bool, Error> {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review sharing ELF entrypoint detection with record.
+pub(super) fn is_elf_file(path: &Path) -> Result<bool, Error> {
     let mut file = File::open(path)
         .with_context(|| format!("failed to open executable {}", path.display()))?;
     let mut magic = [0_u8; 4];
@@ -1233,7 +1276,9 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(normalized)
 }
 
-fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Result<bool, Error> {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review sharing mount-boundary resolution with record.
+pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Result<bool, Error> {
     let mut candidate = std::path::absolute(path)?;
     for _ in 0..40 {
         let components = candidate
@@ -1381,31 +1426,27 @@ impl RunOpts {
         }
         // });
 
-        // Dispatch to an alternative Reverie backend if one was requested. The
-        // DBI prototype is handled entirely outside the ptrace container
-        // machinery below. KVM falls through to the normal run/verify path: it
-        // skips `ensure_available()` above and reaches `hermit::run_with_backend`
-        // (via `run_in_container`), whose own dispatch routes it to `run_kvm`
-        // and returns an accurate, program-specific error.
+        // DBI uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
+        // e9patch, and ptrace use the common container and run/verify machinery.
         match backend {
-            Backend::Ptrace | Backend::Kvm | Backend::E9patch => {}
+            Backend::Ptrace
+            | Backend::Liteinst
+            | Backend::Sabre
+            | Backend::Kvm
+            | Backend::E9patch => {}
             Backend::Dbi => {
                 return super::backends::run_dbi(
                     &self.program,
                     &self.args,
                     self.verify,
                     global.log,
+                    &self.effective_det_config(),
                 );
             }
-            // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
-            Backend::Sabre => {
-                return super::backends::run_sabre(
-                    &self.program,
-                    &self.args,
-                    self.verify,
-                    global.log,
-                );
-            }
+        }
+
+        if backend == Backend::Liteinst {
+            eprintln!("hermit: [liteinst backend] Detcore Tool active");
         }
 
         if self.no_namespace {
@@ -1433,11 +1474,13 @@ impl RunOpts {
         let perf_supported = match self.selected_backend() {
             Backend::Ptrace | Backend::E9patch => reverie_ptrace::is_perf_supported(),
             Backend::Dbi | Backend::Sabre | Backend::Kvm => true,
+            Backend::Liteinst => false,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+        let liteinst_backend = self.selected_backend() == Backend::Liteinst;
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = !self.no_namespace;
@@ -1453,6 +1496,18 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
+        if self.strict {
+            config.panic_on_unsupported_syscalls = true;
+        }
+        if config.passthru_opt && config.panic_on_unsupported_syscalls {
+            anyhow::bail!(
+                "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
+                 (--strict or --panic-on-unsupported-syscalls)"
+            );
+        }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -1491,7 +1546,12 @@ impl RunOpts {
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.max_timeslice.is_some() && !perf_supported {
+        if config.max_timeslice.is_some() && liteinst_backend {
+            eprintln!(
+                "WARNING: --backend=liteinst does not implement PMU/RCB timer delivery; continuing with --max-timeslice=disabled."
+            );
+            config.max_timeslice = None;
+        } else if config.max_timeslice.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(
                 "WARNING: --max-timeslice requires user-space perf counters, but \
@@ -1908,7 +1968,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let mut container = self.container(tmpfs.path())?;
+        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
 
         with_container(&mut container, || {
             self.run_in_container(global, capture_output)
@@ -1921,6 +1981,10 @@ impl RunOpts {
         let _guard = global.init_tracing();
 
         let tmpfs = self.tmpfs()?;
+        let PreparedMounts {
+            mounts,
+            identity_sources: _identity_sources,
+        } = self.mounts(tmpfs.path())?;
 
         let mut command = Command::new(&self.program);
         command
@@ -1930,7 +1994,7 @@ impl RunOpts {
             .hostname("hermetic-container.local")
             .domainname("local")
             .mount(Mount::proc())
-            .mounts(self.mounts(tmpfs.path())?);
+            .mounts(mounts);
 
         match &self.network {
             NetworkingMode::Local => {
@@ -1985,8 +2049,13 @@ impl RunOpts {
             },
         )?;
 
-        if self.selected_backend() == Backend::Kvm {
-            eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
+        let backend_banner = match self.selected_backend() {
+            Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
+            Backend::Liteinst => Some("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+            _ => None,
+        };
+        if let Some(backend_banner) = backend_banner {
+            eprintln!(":: Backend: {backend_banner}");
             std::io::stdout().write_all(&out1.stdout)?;
             std::io::stderr().write_all(&out1.stderr)?;
         }
@@ -1994,8 +2063,8 @@ impl RunOpts {
     }
 
     /// Returns the mounts to be used with the container.
-    fn mounts(&self, tmpfs: &Path) -> Result<Vec<Mount>, Error> {
-        let mut mounts = Vec::new();
+    fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
+        let (mut mounts, identity_sources) = identity_hardening_mounts()?;
 
         for mount in &self.mount {
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
@@ -2045,11 +2114,14 @@ impl RunOpts {
         // while hiding the real /tmp.
         mounts.push(Mount::bind(tmpfs, TMP_DIR).rshared());
 
-        Ok(mounts)
+        Ok(PreparedMounts {
+            mounts,
+            identity_sources,
+        })
     }
 
     /// Returns a configured container to run a function in.
-    fn container(&self, tmpfs: &Path) -> Result<Container, Error> {
+    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
         let mut container = default_container(self.pin_threads);
 
         match &self.network {
@@ -2064,9 +2136,13 @@ impl RunOpts {
             }
         }
 
-        container.mounts(self.mounts(tmpfs)?);
+        let PreparedMounts {
+            mounts,
+            identity_sources,
+        } = self.mounts(tmpfs)?;
+        container.mounts(mounts);
 
-        Ok(container)
+        Ok((container, identity_sources))
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
@@ -2083,7 +2159,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let mut container = self.container(tmpfs.path())?;
+        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
         with_container(&mut container, || {
@@ -2151,6 +2227,7 @@ impl RunOpts {
         if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
             config.panic_on_unsupported_syscalls = true;
         }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
         config
     }
 
