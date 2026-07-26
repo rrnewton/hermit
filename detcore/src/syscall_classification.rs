@@ -390,6 +390,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setgroups
         | Sysno::setfsuid
         | Sysno::setfsgid => SyscallClassification::Determinized,
+        // ===== BATCH 76: nested tracing, zero-copy I/O, and pidfd handles =====
+        // Three groups that previously fail-closed --strict, aborting real programs
+        // (strace/gdb via ptrace; python os.sendfile / os.splice; python os.pidfd_open).
+        // Each has a paired dispatch arm and (for the multi-syscall groups) a helper
+        // predicate below carrying the per-group errno and rationale: ptrace -> EPERM
+        // (nested tracing is unsupported and the guest is already traced), the
+        // zero-copy data-movement family -> ENOSYS (it bypasses Detcore's read/write
+        // interposition), and the pidfd family -> ENOSYS (it keys on host pids the
+        // guest does not see). All are untyped (Syscall::Other) in the pinned Reverie,
+        // so the dispatcher matches on the Sysno before the typed match below.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#795)
+        Sysno::ptrace
+        | Sysno::sendfile
+        | Sysno::splice
+        | Sysno::tee
+        | Sysno::vmsplice
+        | Sysno::pidfd_open
+        | Sysno::pidfd_getfd
+        | Sysno::pidfd_send_signal => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -588,15 +608,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::perf_event_open
-        | Sysno::pidfd_getfd
-        | Sysno::pidfd_open
-        | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
-        | Sysno::ptrace
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
@@ -609,18 +625,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semget
         | Sysno::semop
         | Sysno::semtimedop
-        | Sysno::sendfile
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
         | Sysno::syslog
-        | Sysno::tee
-        | Sysno::ustat
-        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        | Sysno::ustat => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
@@ -796,6 +808,49 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS refusal set.
+/// Zero-copy data-movement syscalls that shuffle bytes directly between file
+/// descriptors inside the kernel: `sendfile` (file -> any fd), `splice` and
+/// `tee` (to/from pipes), and `vmsplice` (user pages <-> pipe). Detcore records
+/// and sequentializes guest I/O by interposing on `read`/`write`; these
+/// primitives move the same bytes without ever surfacing them to that
+/// interposition, so a forwarded copy escapes record/replay data capture and,
+/// when either end is a pipe or socket, is not deterministically ordered. A
+/// fixed `ENOSYS` is the errno a kernel built without these features returns;
+/// callers that use them as an optimization (glibc, Python `shutil`, Go, web
+/// servers) fall back to a `read`/`write` loop that Detcore already
+/// determinizes. `copy_file_range` is deliberately excluded here: it is
+/// regular-file -> regular-file only and is owned by a separate change. These
+/// are untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher
+/// matches on the `Sysno` before the typed match.
+pub(crate) const fn is_zero_copy_io_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::sendfile | Sysno::splice | Sysno::tee | Sysno::vmsplice
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS refusal set.
+/// The pidfd process-handle family: `pidfd_open` (obtain an fd for a process),
+/// `pidfd_getfd` (steal an fd out of another process), and `pidfd_send_signal`
+/// (signal a process by pidfd). Each keys on a host-visible pid or reaches into
+/// another live process, but Detcore virtualizes guest pids, sequentializes
+/// processes, and owns process lifetime and signal delivery through its
+/// scheduler, so a real pidfd would leak host pids and race the deterministic
+/// process/signal model. A fixed `ENOSYS` is the errno a pre-5.3 kernel returns
+/// (`pidfd_open` landed in 5.3, `pidfd_send_signal` in 5.1); callers feature-
+/// probe and fall back to `kill`/`waitpid`, which Detcore already determinizes.
+/// These are untyped (`Syscall::Other`) in the pinned Reverie, so the
+/// dispatcher matches on the `Sysno` before the typed match.
+pub(crate) const fn is_pidfd_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::pidfd_open | Sysno::pidfd_getfd | Sysno::pidfd_send_signal
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,7 +867,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [220, 91, 62]);
+        assert_eq!(counts, [228, 91, 54]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1061,6 +1116,30 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
+        // Batch 76: nested tracing, zero-copy data movement, and the pidfd
+        // process-handle family previously fail-closed --strict; they are now
+        // determinized (ptrace -> EPERM in the dispatcher; the zero-copy and
+        // pidfd families -> ENOSYS; see is_zero_copy_io_syscall / is_pidfd_syscall).
+        assert_eq!(
+            classify_syscall(Sysno::ptrace),
+            SyscallClassification::Determinized
+        );
+        assert!(!is_zero_copy_io_syscall(Sysno::ptrace));
+        assert!(!is_pidfd_syscall(Sysno::ptrace));
+        for sysno in [Sysno::sendfile, Sysno::splice, Sysno::tee, Sysno::vmsplice] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_zero_copy_io_syscall(sysno));
+            assert!(!is_pidfd_syscall(sysno));
+        }
+        for sysno in [
+            Sysno::pidfd_open,
+            Sysno::pidfd_getfd,
+            Sysno::pidfd_send_signal,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_pidfd_syscall(sysno));
+            assert!(!is_zero_copy_io_syscall(sysno));
+        }
     }
 
     #[test]
@@ -1242,5 +1321,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn batch76_tracing_zerocopy_pidfd_syscalls_are_determinized() {
+        // All eight batch-76 syscalls are now Determinized (they previously
+        // fail-closed --strict). ptrace is dispatched to EPERM on its own; the
+        // zero-copy and pidfd families are dispatched to ENOSYS via their helpers.
+        for sysno in [
+            Sysno::ptrace,
+            Sysno::sendfile,
+            Sysno::splice,
+            Sysno::tee,
+            Sysno::vmsplice,
+            Sysno::pidfd_open,
+            Sysno::pidfd_getfd,
+            Sysno::pidfd_send_signal,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+
+        // The zero-copy helper covers exactly sendfile/splice/tee/vmsplice.
+        let zero_copy = [Sysno::sendfile, Sysno::splice, Sysno::tee, Sysno::vmsplice];
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_zero_copy_io_syscall(sysno),
+                zero_copy.contains(&sysno),
+                "{sysno:?} zero-copy helper membership disagrees with the reviewed set"
+            );
+        }
+
+        // The pidfd helper covers exactly pidfd_open/pidfd_getfd/pidfd_send_signal.
+        let pidfd = [
+            Sysno::pidfd_open,
+            Sysno::pidfd_getfd,
+            Sysno::pidfd_send_signal,
+        ];
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_pidfd_syscall(sysno),
+                pidfd.contains(&sysno),
+                "{sysno:?} pidfd helper membership disagrees with the reviewed set"
+            );
+        }
+
+        // ptrace belongs to neither family (it is dispatched to EPERM directly).
+        assert!(!is_zero_copy_io_syscall(Sysno::ptrace));
+        assert!(!is_pidfd_syscall(Sysno::ptrace));
+        // copy_file_range is deliberately excluded from the zero-copy family.
+        assert!(!is_zero_copy_io_syscall(Sysno::copy_file_range));
     }
 }
