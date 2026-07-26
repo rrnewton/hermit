@@ -355,7 +355,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sched_getattr => SyscallClassification::Determinized,
 
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#767): close_range(first, last, flags) closes every
+        // TODO-HUMAN-REVIEW(#780): close_range(first, last, flags) closes every
         // open descriptor in [first, last] (or CLOSE_RANGE_CLOEXEC-marks them).
         // Detcore determinizes it by injecting the real syscall (record/replay-
         // aware, so the host result is captured and reproduced) and then pruning

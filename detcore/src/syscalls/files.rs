@@ -217,7 +217,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#767)
+    // TODO-HUMAN-REVIEW(#780)
     /// SYS_close_range: close every open descriptor in the inclusive range
     /// `[first, last]`.
     ///
