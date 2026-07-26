@@ -69,9 +69,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if requested.current > requested.maximum {
             return Err(Errno::EINVAL.into());
         }
-        if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
-            return Err(Errno::EPERM.into());
-        }
+        // TODO-HUMAN-REVIEW(PR-PENDING): allow lowering any virtual limit.
+        // These limits are virtual compatibility state, not a host-enforced
+        // sandbox boundary. An unprivileged process may set the soft limit and
+        // may irreversibly lower the hard limit for ANY resource; only raising
+        // the hard limit above its current value is privileged. Restricting
+        // mutation to RLIMIT_STACK/RLIMIT_NOFILE spuriously returned EPERM for
+        // e.g. RLIMIT_CORE, which programs like gpg lower to disable core dumps.
         if requested.maximum > previous.maximum {
             return Err(Errno::EPERM.into());
         }
@@ -131,9 +135,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if requested.current > requested.maximum {
                     return Err(Errno::EINVAL.into());
                 }
-                if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
-                    return Err(Errno::EPERM.into());
-                }
+                // TODO-HUMAN-REVIEW(PR-PENDING): allow lowering any virtual limit.
+                // Virtual limits are guest-observable compatibility state, not a
+                // host-enforced boundary, so lowering the soft limit or hard
+                // limit of ANY resource is unprivileged; only raising the hard
+                // limit is privileged (guarded below). The prior
+                // STACK/NOFILE-only allow-list returned EPERM for RLIMIT_CORE,
+                // which gpg lowers to disable core dumps ("can't disable core
+                // dumps: Operation not permitted").
                 if requested.maximum > previous.maximum {
                     return Err(Errno::EPERM.into());
                 }
