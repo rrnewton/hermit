@@ -99,7 +99,10 @@ class Fixtures:
 
         local = SCRIPT_DIR / "fixtures"
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
-            "pthread_lifecycle": (local / "pthread_lifecycle.c", ("-pthread",)),
+            "pthread_lifecycle": (
+                local / "pthread_lifecycle.c",
+                ("-pthread", "-no-pie"),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
