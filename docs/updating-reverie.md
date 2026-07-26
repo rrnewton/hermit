@@ -12,8 +12,10 @@ The same `rev` appears in every crate that depends on a Reverie crate. Keep them
 identical — mixing revisions pulls two incompatible `reverie` cores into one
 build. As of this writing the deps are:
 
-- `hermit-cli/Cargo.toml` — `reverie`, `reverie-ptrace`
+- `hermit-cli/Cargo.toml` — `reverie`, `reverie-ptrace`, `reverie-dbi`,
+  `reverie-kvm`
 - `detcore/Cargo.toml` — `reverie`, `reverie-ptrace`
+- `detcore-dbi/Cargo.toml` — `reverie`, `reverie-dbi`
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
 - `detcore/tests/testutils/Cargo.toml` — `reverie`, `reverie-ptrace`
 
@@ -54,8 +56,9 @@ the LiteInst crate's dependencies change.
 
 ## Notes
 
-- `Cargo.lock` is not tracked in this repo, so the `rev` in the manifests is the
-  authoritative pin.
+- `Cargo.lock` is tracked in this repo. Commit its resolved source updates with
+  every pin bump; the matching `rev` values in the manifests remain the
+  authoritative requested revision.
 - To point at a fork instead of upstream (e.g. for the experimental
   `reverie-dbi` / `reverie-kvm` backends), change the `git =` URL as well as the
   `rev`, and keep all Reverie crates on the same source.
