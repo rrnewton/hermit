@@ -1396,15 +1396,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // asynchronous and message-passing I/O and IPC interfaces Detcore
             // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
             // io_cancel/io_getevents/io_pgetevents), POSIX message queues
-            // (mq_*), and System V message queues (msg*). AIO completion is
-            // kernel-driven and lives outside logical time; the message-queue
+            // (mq_*), System V message queues (msg*), and the sibling System V
+            // semaphore (sem*) and shared-memory (shm*) families. AIO completion
+            // is kernel-driven and lives outside logical time; the SysV IPC
             // families operate on global, key/name-addressed kernel objects
-            // shared with the whole host. A fixed -ENOSYS is the errno a kernel
-            // built without AIO/CONFIG_POSIX_MQUEUE/CONFIG_SYSVIPC returns, is
-            // never forwarded to the host, and is identical across --verify and
-            // record/replay (mirrors the io_uring refusal). Untyped
-            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
-            // before the typed match below.
+            // shared with the whole host whose ids differ run-to-run. A fixed
+            // -ENOSYS is the errno a kernel built without AIO/CONFIG_POSIX_MQUEUE/
+            // CONFIG_SYSVIPC returns, is never forwarded to the host, and is
+            // identical across --verify and record/replay (mirrors the io_uring
+            // refusal). Untyped (Syscall::Other) in the pinned Reverie, so
+            // dispatch on the Sysno before the typed match below.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
             {

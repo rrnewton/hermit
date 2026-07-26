@@ -319,9 +319,20 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // existing io_uring ENOSYS refusal. These are untyped (Syscall::Other)
         // in the pinned Reverie, so the dispatcher matches on the Sysno before
         // the typed match below. System V semaphores (sem*) and shared memory
-        // (shm*) are deliberately left unclassified: they are common
-        // intra-container synchronization/sharing primitives whose refusal would
-        // be a real capability regression and needs a dedicated decision.
+        // (shm*) are the sibling families of System V message queues: they are
+        // global, key/name-addressed kernel objects that persist across runs and
+        // are shared with the whole host, so forwarding them (the legacy
+        // pass-through) is nondeterministic and a container-isolation hole, and
+        // their host-assigned ids differ run-to-run so pass-through cannot be
+        // bitwise-identical under --verify. #275 originally classified them
+        // Unsupported when that meant warn-and-forward, but #644 turned
+        // Unsupported into a --strict fail-closed abort, which was strictly worse
+        // than the intended usable-with-warning behavior. This is the dedicated
+        // decision the earlier note reserved: they join the deterministic ENOSYS
+        // refusal (the errno a kernel without CONFIG_SYSVIPC returns), matching
+        // the msg* sibling exactly. Deterministic in-container synchronization
+        // and sharing remain available through the modeled primitives (futex,
+        // POSIX shared memory via mmap of shm_open/memfd files, pipes).
         | Sysno::io_setup
         | Sysno::io_destroy
         | Sysno::io_submit
@@ -338,6 +349,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgsnd
         | Sysno::msgrcv
         | Sysno::msgctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#731): System V semaphores (sem*) and shared memory
+        // (shm*) join the deterministic ENOSYS refusal for the reasons above.
+        | Sysno::semget
+        | Sysno::semop
+        | Sysno::semtimedop
+        | Sysno::semctl
+        | Sysno::shmget
+        | Sysno::shmat
+        | Sysno::shmdt
+        | Sysno::shmctl
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -569,10 +591,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::sched_setattr
         | Sysno::seccomp
-        | Sysno::semctl
-        | Sysno::semget
-        | Sysno::semop
-        | Sysno::semtimedop
         | Sysno::sendfile
         | Sysno::setfsgid
         | Sysno::setfsuid
@@ -583,10 +601,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setresuid
         | Sysno::setreuid
         | Sysno::setuid
-        | Sysno::shmat
-        | Sysno::shmctl
-        | Sysno::shmdt
-        | Sysno::shmget
         | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
@@ -715,10 +729,11 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 /// `CONFIG_POSIX_MQUEUE`, or `CONFIG_SYSVIPC` returns. The result is never
 /// forwarded to the host and is bitwise-identical across `--verify` and
 /// record/replay, mirroring the existing `io_uring` ENOSYS refusal. System V
-/// semaphores and shared memory are deliberately excluded (common
-/// intra-container primitives that need a dedicated decision). These are untyped
-/// (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches on the
-/// `Sysno` before the typed match.
+/// semaphores (`sem*`) and shared memory (`shm*`) are the sibling families of
+/// System V message queues and share their key/name-addressed, host-global,
+/// nondeterministic nature, so they join the same deterministic ENOSYS refusal.
+/// These are untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher
+/// matches on the `Sysno` before the typed match.
 pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
@@ -738,6 +753,16 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
             | Sysno::msgsnd
             | Sysno::msgrcv
             | Sysno::msgctl
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#731): System V semaphores and shared memory.
+            | Sysno::semget
+            | Sysno::semop
+            | Sysno::semtimedop
+            | Sysno::semctl
+            | Sysno::shmget
+            | Sysno::shmat
+            | Sysno::shmdt
+            | Sysno::shmctl
     )
 }
 
@@ -757,7 +782,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [217, 91, 65]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -971,7 +996,8 @@ mod tests {
         }
         // Batch 7: asynchronous and message-passing I/O and IPC interfaces
         // Detcore does not model are refused with a deterministic ENOSYS (Linux
-        // native AIO, POSIX message queues, System V message queues); see
+        // native AIO, POSIX message queues, System V message queues, and the
+        // sibling System V semaphore and shared-memory families); see
         // is_unsupported_async_ipc_syscall.
         for sysno in [
             Sysno::io_setup,
@@ -990,15 +1016,19 @@ mod tests {
             Sysno::msgsnd,
             Sysno::msgrcv,
             Sysno::msgctl,
+            // System V semaphores and shared memory: sibling families of the
+            // message queues above, refused with the same deterministic ENOSYS.
+            Sysno::semget,
+            Sysno::semop,
+            Sysno::semtimedop,
+            Sysno::semctl,
+            Sysno::shmget,
+            Sysno::shmat,
+            Sysno::shmdt,
+            Sysno::shmctl,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
             assert!(is_unsupported_async_ipc_syscall(sysno));
-        }
-        // System V semaphores and shared memory are deliberately still
-        // unsupported (intra-container primitives pending a dedicated decision).
-        for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
-            assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
     }
 
