@@ -1392,7 +1392,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#795): Deterministic EPERM for ptrace. Nested
+            // TODO-HUMAN-REVIEW(#800): Deterministic EPERM for ptrace. Nested
             // tracing is unsupported: the guest is already traced/instrumented
             // by Reverie, and forwarding ptrace to the host would both escape
             // the deterministic model (a guest tracer observing raw scheduling
@@ -1408,7 +1408,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS for the zero-copy
+            // TODO-HUMAN-REVIEW(#800): Deterministic ENOSYS for the zero-copy
             // data-movement family (sendfile/splice/tee/vmsplice). Detcore
             // records and sequentializes guest I/O by interposing on read/write;
             // these move bytes directly between descriptors inside the kernel,
@@ -1424,7 +1424,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS for the pidfd
+            // TODO-HUMAN-REVIEW(#800): Deterministic ENOSYS for the pidfd
             // process-handle family (pidfd_open/pidfd_getfd/pidfd_send_signal).
             // Each keys on a host-visible pid or reaches into another live
             // process, but Detcore virtualizes guest pids, sequentializes

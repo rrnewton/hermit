@@ -342,7 +342,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // guest does not see). All are untyped (Syscall::Other) in the pinned Reverie,
         // so the dispatcher matches on the Sysno before the typed match below.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#795)
+        // TODO-HUMAN-REVIEW(#800)
         | Sysno::ptrace
         | Sysno::sendfile
         | Sysno::splice
@@ -737,7 +737,7 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#800): Deterministic ENOSYS refusal set.
 /// Zero-copy data-movement syscalls that shuffle bytes directly between file
 /// descriptors inside the kernel: `sendfile` (file -> any fd), `splice` and
 /// `tee` (to/from pipes), and `vmsplice` (user pages <-> pipe). Detcore records
@@ -760,7 +760,7 @@ pub(crate) const fn is_zero_copy_io_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#795): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(#800): Deterministic ENOSYS refusal set.
 /// The pidfd process-handle family: `pidfd_open` (obtain an fd for a process),
 /// `pidfd_getfd` (steal an fd out of another process), and `pidfd_send_signal`
 /// (signal a process by pidfd). Each keys on a host-visible pid or reaches into
