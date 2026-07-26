@@ -581,7 +581,7 @@ fn run_dbi_strict_returns_with_blocked_stdin_source() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review the real LiteInst Detcore CLI assertion.
+// TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
 #[test]
 fn run_liteinst_verifies_detcore_backend() {
     let args = [

@@ -698,7 +698,7 @@ pub fn run_with_backend(
     )
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review reserved LiteInst runtime failure statuses.
+// TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     matches!(
         status,

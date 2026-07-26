@@ -11,7 +11,7 @@
 #![deny(missing_docs)]
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-pending): Review the LiteInst Detcore constructor boundary.
+// TODO-HUMAN-REVIEW(PR-736): Review the LiteInst Detcore constructor boundary.
 /// Installs `Detcore` before guest application code starts.
 #[used]
 #[unsafe(link_section = ".init_array")]
