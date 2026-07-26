@@ -10,8 +10,8 @@ license = "BSD-3-Clause"
 [dependencies]
 detcore = { version = "0.0.0", path = "../.." }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0e78926ff45ae8eecbdb90d92fb6eb57cba52173" }
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0e78926ff45ae8eecbdb90d92fb6eb57cba52173" }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ef99a79c149512e1b3f3230f38a820d1bd4d23ae" }
+reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ef99a79c149512e1b3f3230f38a820d1bd4d23ae" }
 test-allocator = { version = "0.0.0", path = "../../../common/test-allocator" }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
