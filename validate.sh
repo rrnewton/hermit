@@ -298,7 +298,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=184
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -319,9 +319,10 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 
 # Tracked compatibility gaps that are intentionally excluded from the
 # executable corpus. They remain in the canonical denominator and table.
+# timeout and free were previously excluded but now pass strict L2: timeout's
+# delayed-child signal delivery is handled, and free's /proc/meminfo reads are
+# now sanitized (see detcore/src/procfs.rs), so both moved into the corpus.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
-    [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
-    [free]="live /proc/meminfo values differ between otherwise identical runs"
     # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
@@ -2192,8 +2193,13 @@ function run_compatibility_corpus {
     strict_compatibility_probe pkill bash -c \
         'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf "pkill-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # timeout is intentionally absent: "timeout 1 true" hangs in Run1 while
-    # the parent waits in rt_sigsuspend for its delayed child.
+    # timeout now passes strict L2: the delayed child that formerly stalled the
+    # parent in rt_sigsuspend is delivered deterministically. Strict-only so the
+    # SaBRe/e9patch/record-replay ratchets keep their independent totals.
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe timeout /usr/bin/timeout 1 /bin/true \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#575)
     # Filesystem fixtures use a per-probe mktemp dir so concurrent validate.sh
@@ -2288,8 +2294,16 @@ function run_compatibility_corpus {
     strict_compatibility_probe cmp bash -c \
         'set -euo pipefail; d=$(mktemp -d); printf "same\n" >"$d/a"; printf "same\n" >"$d/b"; cmp -s "$d/a" "$d/b"; printf "cmp-ok\n"; rm -rf "$d"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # free is intentionally absent: its live /proc/meminfo values differ
-    # between otherwise identical strict runs.
+    # free and vmstat now pass strict L2: their live /proc/meminfo, /proc/stat,
+    # and /proc/vmstat reads are snapshotted and sanitized in
+    # detcore/src/procfs.rs, so identical strict runs produce identical output.
+    # Strict-only so the alternate-backend/record-replay ratchets are unchanged.
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe free /usr/bin/free \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe vmstat /usr/bin/vmstat \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         if ((RR_COMPAT_CANARY_FAILED == 1)); then
