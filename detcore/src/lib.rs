@@ -1412,7 +1412,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#784): BATCH 38. openat2 is untyped (Syscall::Other)
+            // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2 is untyped (Syscall::Other)
             // in the pinned Reverie revision. It is a superset of openat whose
             // callers must fall back to openat when it returns ENOSYS (kernels
             // before 5.6 lack openat2), so a fixed -ENOSYS routes them onto the
@@ -1422,7 +1422,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#784): BATCH 38. The credential-setting family
+            // TODO-HUMAN-REVIEW(#787): BATCH 38. The credential-setting family
             // (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
             // untyped (Syscall::Other) in the pinned Reverie. Detcore presents a
             // fixed virtual-root identity (getuid/geteuid/getgid/getegid are
