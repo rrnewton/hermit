@@ -194,6 +194,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review normalized procfs lseek offset synchronization.
+    /// Forwards lseek and synchronizes any normalized procfs snapshot offset.
+    pub async fn handle_lseek<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Lseek,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        let result = self.record_or_replay(guest, call).await?;
+        let offset = usize::try_from(result).map_err(|_| Errno::EOVERFLOW)?;
+        let _ = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.seek_procfs(offset));
+        Ok(result)
+    }
+
     /// flock under Hermit. `flock(2)` places an advisory whole-file lock. Detcore
     /// serializes guest threads onto a single virtual CPU, so a lock is never
     /// truly contended within the run: a blocking `LOCK_EX`/`LOCK_SH` would
@@ -265,6 +282,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.initialize_procfs(
                     contents.clone(),
                     virtual_uptime_seconds,
+                    guest.config().memory,
                     virtual_pid,
                     virtual_ppid,
                 );

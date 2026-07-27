@@ -1808,7 +1808,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // PassThrough syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
-            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+            SyscallClassification::PassThrough => match call {
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
+                other => self.passthrough(guest, other).await,
+            },
             SyscallClassification::Unsupported => {
                 self.handle_unsupported_syscall(
                     guest,

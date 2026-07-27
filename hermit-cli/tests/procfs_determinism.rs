@@ -94,6 +94,32 @@ fn proc_self_stat_is_deterministic() {
 }
 
 #[test]
+fn proc_numeric_stat_hides_process_memory_usage() {
+    assert_deterministic("/proc/1/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        let comm_end = text.rfind(") ").expect("stat has no comm terminator");
+        let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields[23 - 3], "0", "stat vsize is volatile");
+        assert_eq!(fields[24 - 3], "0", "stat rss is volatile");
+    });
+}
+
+#[test]
+fn proc_numeric_status_hides_host_task_state() {
+    assert_deterministic("/proc/1/status", |contents| {
+        let text = std::str::from_utf8(contents).expect("status should be UTF-8");
+        assert!(text.contains("State:\tS (sleeping)\n"));
+    });
+}
+
+#[test]
+fn proc_numeric_statm_hides_process_memory_usage() {
+    assert_deterministic("/proc/1/statm", |contents| {
+        assert_eq!(contents, b"0 0 0 0 0 0 0\n");
+    });
+}
+
+#[test]
 fn proc_self_status_is_deterministic() {
     assert_deterministic("/proc/self/status", |contents| {
         let text = std::str::from_utf8(contents).expect("status should be UTF-8");
@@ -143,6 +169,39 @@ fn proc_cpuinfo_is_deterministic() {
 fn proc_loadavg_uses_virtual_values() {
     assert_deterministic("/proc/loadavg", |contents| {
         assert_eq!(contents, b"0.00 0.00 0.00 1/1 1\n");
+    });
+}
+
+#[test]
+fn proc_meminfo_uses_virtual_memory() {
+    assert_deterministic("/proc/meminfo", |contents| {
+        let text = std::str::from_utf8(contents).expect("meminfo should be UTF-8");
+        assert!(text.contains("MemTotal: 976562 kB\n"));
+        assert!(text.contains("MemFree: 976562 kB\n"));
+        assert!(text.contains("MemAvailable: 976562 kB\n"));
+    });
+}
+
+#[test]
+fn proc_stat_uses_fixed_cpu_counters() {
+    assert_deterministic("/proc/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        let fields = text
+            .lines()
+            .next()
+            .expect("stat should have an aggregate CPU line")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 11);
+        assert_eq!(&fields[1..4], &["0", "0", "0"]);
+        assert!(
+            fields[4]
+                .parse::<u64>()
+                .expect("idle ticks should be numeric")
+                > 0
+        );
+        assert!(fields[5..].iter().all(|field| *field == "0"));
+        assert!(text.contains("\nprocs_running 1\n"));
     });
 }
 

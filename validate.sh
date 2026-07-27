@@ -298,7 +298,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=182
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -321,7 +321,6 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 # executable corpus. They remain in the canonical denominator and table.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
-    [free]="live /proc/meminfo values differ between otherwise identical runs"
     # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
@@ -338,7 +337,6 @@ declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [javac]="timed out on the GitHub-hosted no-PMU runner"
     [java]="timed out on the GitHub-hosted no-PMU runner"
     [node]="timed out on the GitHub-hosted no-PMU runner"
-    [top]="live process-table reads differ on the GitHub-hosted runner"
     [zstd]="timed out on the GitHub-hosted no-PMU runner"
     [zstd-roundtrip]="timed out on the GitHub-hosted no-PMU runner"
 )
@@ -2202,15 +2200,14 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Restrict process tools to stable identity/existence observations. Host
-    # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
-    # shellcheck disable=SC2016
-    strict_compatibility_probe ps bash -c \
-        'set -euo pipefail; pid=$(ps -o pid= -p $$); pid=${pid//[[:space:]]/}; test "$pid" = "$$"; printf "ps-ok\n"' \
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # Process and system accounting fields are normalized by the procfs
+    # snapshot layer, so exercise the real output rather than discarding it.
+    strict_compatibility_probe ps /usr/bin/ps aux \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # shellcheck disable=SC2016
-    strict_compatibility_probe top bash -c \
-        'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf "top-ok\n"' \
+    strict_compatibility_probe top /usr/bin/top -b -n 1 -w 160 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe free /usr/bin/free -m \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Signal zero checks deterministic guest-process existence without
     # perturbing signal delivery or depending on host process IDs.

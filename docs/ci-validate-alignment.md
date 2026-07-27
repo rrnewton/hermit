@@ -41,10 +41,10 @@ The selector covers exactly 457 of the 868 Cargo-discovered cases:
 | Portable Hermit integration cases | 114 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 181-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
-The corpus is blocking except for seven bounded diagnostics observed on a
-GitHub-hosted runner with PMU disabled: Rust, Java/Javac, Node.js, the two zstd
-rows, and `top` process-table variance.
+the 182-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
+The corpus is blocking except for six bounded diagnostics observed on a
+GitHub-hosted runner with PMU disabled: Rust, Java/Javac, Node.js, and the two
+zstd rows.
 
 The lane also requires all six DynamoRIO DBI parity scenarios currently
 marked `pass`. Cargo builds the pinned DynamoRIO runtime and native client;
