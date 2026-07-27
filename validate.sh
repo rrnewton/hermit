@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=180
-readonly SABRE_COMPAT_TOTAL=180
+readonly SABRE_COMPAT_EXPECTED=185
+readonly SABRE_COMPAT_TOTAL=185
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -2989,6 +2989,25 @@ function run_compatibility_corpus {
         # shellcheck disable=SC2016
         strict_compatibility_probe truncate bash -c \
             'set -euo pipefail; f=$(mktemp); printf "Hermit\n" >"$f"; /usr/bin/truncate -s 4096 "$f"; test "$(stat -c %s "$f")" = 4096; /usr/bin/truncate -s 7 "$f"; test "$(stat -c %s "$f")" = 7; test "$(cat "$f")" = Hermit; rm -f "$f"; printf "truncate:4096-to-7-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#845): Review the expanded functional utility rows.
+        # Expand temporary paths and command substitutions inside the guest.
+        # shellcheck disable=SC2016
+        strict_compatibility_probe fallocate bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; f="$d/file"; /usr/bin/fallocate -l 4096 "$f"; size=$(stat -c %s "$f"); test "$size" = 4096; printf "fallocate:size=%s\n" "$size"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe setfattr bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf payload >"$f"; /usr/bin/setfattr -n user.hermit.compat -v 42 "$f"; value=$(/usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat "$f"); test "$value" = 42; /usr/bin/setfattr -x user.hermit.compat "$f"; ! /usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat "$f" >/dev/null 2>&1; printf "setfattr:value=%s:removed\n" "$value"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe setfacl bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; chmod 600 "$f"; /usr/bin/setfacl -m u::rw,g::r,o::- "$f"; mode=$(stat -c %a "$f"); test "$mode" = 640; /usr/bin/getfacl --absolute-names -cp "$f" | /usr/bin/grep -Fxq "group::r--"; printf "setfacl:mode=%s\n" "$mode"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe mountpoint bash -c \
+            'set -euo pipefail; /usr/bin/mountpoint -q /; ! /usr/bin/mountpoint -q README.md; printf "mountpoint:root=yes:file=no\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe diff3 bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "alpha\nbeta\n" >"$d/base"; printf "alpha\nbeta\nours\n" >"$d/ours"; printf "theirs\nalpha\nbeta\n" >"$d/theirs"; /usr/bin/diff3 -m "$d/ours" "$d/base" "$d/theirs" | /usr/bin/diff -u <(printf "theirs\nalpha\nbeta\nours\n") -; printf "diff3:clean-merge-ok\n"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
