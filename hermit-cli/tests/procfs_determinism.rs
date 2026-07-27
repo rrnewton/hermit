@@ -221,6 +221,29 @@ fn proc_pressure_uses_virtual_zero_values() {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review interrupt, softirq, and module snapshot coverage.
+#[test]
+fn proc_interrupt_accounting_is_deterministic() {
+    for path in ["/proc/interrupts", "/proc/softirqs"] {
+        assert_deterministic(path, |contents| {
+            let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
+            assert!(text.contains("CPU0"));
+            for line in text.lines().filter(|line| line.contains(':')) {
+                let (_, values) = line
+                    .split_once(':')
+                    .expect("interrupt row should have a label");
+                for token in values.split_whitespace() {
+                    if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+                        break;
+                    }
+                    assert!(token.bytes().all(|byte| byte == b'0'));
+                }
+            }
+        });
+    }
+}
+
 #[test]
 fn proc_schedstat_uses_virtual_zero_values() {
     assert_deterministic("/proc/schedstat", |contents| {
@@ -347,4 +370,24 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         advanced.contains("rtc_date\t: 2001-01-01\n"),
         "RTC did not cross the configured epoch day:\n{advanced}"
     );
+}
+
+#[test]
+fn proc_modules_are_deterministic() {
+    assert_deterministic("/proc/modules", |contents| {
+        let text = std::str::from_utf8(contents).expect("modules should be UTF-8");
+        for line in text.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert!(fields.len() >= 4, "malformed module row: {line}");
+            let expected = if fields[3] == "-" {
+                0
+            } else {
+                fields[3]
+                    .split(',')
+                    .filter(|holder| !holder.is_empty())
+                    .count()
+            };
+            assert_eq!(fields[2].parse::<usize>().unwrap(), expected);
+        }
+    });
 }
