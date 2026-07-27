@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=185
-readonly SABRE_COMPAT_TOTAL=185
+readonly SABRE_COMPAT_EXPECTED=191
+readonly SABRE_COMPAT_TOTAL=191
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -3002,6 +3002,28 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe diff3 bash -c \
             'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "alpha\nbeta\n" >"$d/base"; printf "alpha\nbeta\nours\n" >"$d/ours"; printf "theirs\nalpha\nbeta\n" >"$d/theirs"; /usr/bin/diff3 -m "$d/ours" "$d/base" "$d/theirs" | /usr/bin/diff -u <(printf "theirs\nalpha\nbeta\nours\n") -; printf "diff3:clean-merge-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#845): Review the functional text utility rows.
+        # Expand command substitutions and temporary paths inside the guest.
+        # shellcheck disable=SC2016
+        strict_compatibility_probe basenc bash -c \
+            'set -euo pipefail; encoded=$(printf "Hermit\n" | /usr/bin/basenc --base64url); test "$encoded" = SGVybWl0Cg==; decoded=$(printf "%s\n" "$encoded" | /usr/bin/basenc --base64url -d); test "$decoded" = Hermit; printf "basenc:%s:roundtrip-ok\n" "$encoded"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe dos2unix bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf "alpha\r\nbeta\r\n" >"$f"; /usr/bin/dos2unix -q "$f"; /usr/bin/diff -u <(printf "alpha\nbeta\n") "$f"; printf "dos2unix:crlf-to-lf-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe envsubst bash -c \
+            'set -euo pipefail; output=$(HERMIT_NAME=Hermit HERMIT_VALUE=42 /usr/bin/envsubst "\$HERMIT_NAME=\$HERMIT_VALUE" <<<"\$HERMIT_NAME=\$HERMIT_VALUE"); test "$output" = Hermit=42; printf "envsubst:%s\n" "$output"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe col bash -c \
+            'set -euo pipefail; output=$(printf "A\bB\n" | /usr/bin/col -b); test "$output" = B; printf "col:overstrike=%s\n" "$output"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe colrm bash -c \
+            'set -euo pipefail; output=$(printf "abcdef\n" | /usr/bin/colrm 3 5); test "$output" = abf; printf "colrm:%s\n" "$output"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe crc32 bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf "Hermit\n" >"$f"; sum=$(/usr/bin/crc32 "$f"); test "$sum" = 146f43bb; printf "crc32:%s\n" "$sum"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
