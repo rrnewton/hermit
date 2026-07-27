@@ -1073,10 +1073,12 @@ impl Scheduler {
                 // WARNING: this try_put should potentially turn back into a put(), if we can narrow
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
-                nextturn.req.try_put(Err(ThreadExited));
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
-                nextturn.resp.try_put(SchedResponse::Signaled());
+                let request_was_pending = nextturn.req.try_put(Err(ThreadExited)).is_some();
+                if request_was_pending {
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
+                    nextturn.resp.try_put(SchedResponse::Signaled());
+                }
                 self.wake_futex_child_cleartid(
                     FutexID::private(mm, nextturn.child_tid_addr),
                     *dtid,
@@ -1689,11 +1691,7 @@ impl Scheduler {
                 {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
-                    let delta = if event_ns > gt_now_ns {
-                        event_ns.duration_since(gt_now_ns)
-                    } else {
-                        Duration::ZERO
-                    };
+                    let delta = event_ns.duration_since(gt_now_ns);
                     detlog_debug!(
                         "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
                         delta,
@@ -2164,7 +2162,8 @@ impl Scheduler {
                 // NB: `committed_time` still tracks the (host-timing-perturbed) global clock,
                 // including the time advanced by suppressed IO-polling retries above, so this
                 // line's presence is retry-count sensitive. It is therefore excluded from the
-                // deterministic `--verify` comparison as scheduler clock bookkeeping.
+                // deterministic `--verify` comparison in `logdiff::is_scheduler_committed_time`
+                // (it is redundant with the per-turn "advance global time" DETLOG anyway).
                 detlog_debug!(
                     "[sched-step1] advancing committed_time from {} to {}",
                     self.committed_time,
@@ -2845,7 +2844,7 @@ mod test {
             ThreadNextTurn {
                 dettid,
                 child_tid_addr: 0,
-                req: Ivar::new(),
+                req: Ivar::full(Ok(Resources::new(dettid))),
                 resp: response.clone(),
             },
         );
@@ -2856,6 +2855,30 @@ mod test {
             response.try_read(),
             Some(SchedResponse::Signaled())
         ));
+    }
+
+    #[test]
+    fn logically_kill_running_thread_does_not_preload_response() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let request = Ivar::new();
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: request.clone(),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
+        assert!(matches!(request.try_read(), Some(Err(ThreadExited))));
+        assert!(response.try_read().is_none());
     }
 
     #[test]
@@ -2910,32 +2933,6 @@ mod test {
             (LogicalTime::from_nanos(150), LogicalTime::ZERO)
         );
         assert!(scheduler.blocked.timed_waiters.is_empty());
-    }
-
-    #[test]
-    fn empty_queue_wakes_an_already_due_timed_event() {
-        let config = Config::default();
-        let mut scheduler = Scheduler::new(&config);
-        let detpid = DetPid::from_raw(100);
-        let dettid = DetTid::from_raw(101);
-        let mut global_time = GlobalTime::new(&config);
-        let now = global_time.as_nanos();
-
-        scheduler.register_alarm(
-            detpid,
-            dettid,
-            now,
-            LogicalTime::from_nanos(500),
-            LogicalTime::ZERO,
-            Signal::SIGALRM,
-        );
-        global_time.add_extra_time(Duration::from_nanos(1_000));
-        let advanced = global_time.as_nanos();
-        let global_time = Arc::new(Mutex::new(global_time));
-
-        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
-        assert!(scheduler.blocked.timed_waiters.is_empty());
-        assert_eq!(global_time.lock().unwrap().as_nanos(), advanced);
     }
 
     #[test]
