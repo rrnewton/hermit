@@ -39,6 +39,7 @@ enum ProcfsKind {
     InodeNr,
     InodeState,
     Protocols,
+    Rtc,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -96,6 +97,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
+            "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -156,6 +160,7 @@ impl ProcfsFile {
             ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
+            ProcfsKind::Rtc => sanitize_rtc(&contents),
         });
     }
 
@@ -897,6 +902,36 @@ fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
     output
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-917): Review the fixed virtual RTC epoch.
+//
+// `/proc/driver/rtc` exposes the live hardware clock; its `rtc_time` and
+// `rtc_date` fields advance run-to-run and break tools like awk, perl, and
+// bash+grep under `--verify`. Pin both to Hermit's fixed virtual epoch while
+// preserving capability and alarm metadata (`alrm_time`, `24hr`, etc.).
+fn sanitize_rtc(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with("rtc_time\t:") {
+            normalized.extend_from_slice(b"rtc_time\t: 23:59:59");
+        } else if body.starts_with("rtc_date\t:") {
+            normalized.extend_from_slice(b"rtc_date\t: 2021-12-31");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,6 +985,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::KeyUsers
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/driver/rtc"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Rtc
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/123/io"))
@@ -1324,6 +1365,22 @@ VmFlags: rd ex mr mw me ac\n"
 
         let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
         assert_eq!(sanitize_smaps(invalid_header), invalid_header);
+    }
+
+    #[test]
+    fn rtc_uses_the_fixed_virtual_epoch() {
+        let contents = b"rtc_time\t: 10:07:42\n\
+rtc_date\t: 2026-07-27\n\
+alrm_time\t: 00:50:12\n\
+24hr\t\t: yes\n";
+
+        assert_eq!(
+            sanitize_rtc(contents),
+            b"rtc_time\t: 23:59:59\n\
+rtc_date\t: 2021-12-31\n\
+alrm_time\t: 00:50:12\n\
+24hr\t\t: yes\n"
+        );
     }
 
     #[test]
