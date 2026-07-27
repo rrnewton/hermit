@@ -22,6 +22,9 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review host-global uevent sequence normalization.
+    UeventSeqnum,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +47,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
         });
         self.offset = 0;
     }
@@ -249,6 +254,19 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the synthetic /sys/kernel/uevent_seqnum value.
+fn sanitize_uevent_seqnum(contents: &[u8]) -> Vec<u8> {
+    let Some(value) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        contents.to_vec()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -340,6 +358,13 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/uevent_seqnum"))
+                .unwrap()
+                .kind,
+            ProcfsKind::UeventSeqnum
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/uevent_helper")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -369,6 +394,14 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn uevent_seqnum_is_fixed_after_strict_validation() {
+        assert_eq!(sanitize_uevent_seqnum(b"1282733\n"), b"0\n");
+        assert_eq!(sanitize_uevent_seqnum(b"1282733"), b"1282733");
+        assert_eq!(sanitize_uevent_seqnum(b"unknown\n"), b"unknown\n");
+        assert_eq!(sanitize_uevent_seqnum(b"\n"), b"\n");
     }
 
     #[test]
