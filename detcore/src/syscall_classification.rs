@@ -371,6 +371,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
+        // synchronization and the deterministic seccomp compatibility refusal.
+        // The close_range handler serializes the kernel operation and removes the
+        // same descriptor slots from Detcore's model. Seccomp support is hidden
+        // because installing a guest filter can block the injected syscalls used
+        // by the ptrace runtime, while its capability probes otherwise expose
+        // host-kernel configuration. A fixed ENOSYS presents a stable
+        // kernel-without-seccomp boundary.
+        | Sysno::close_range
+        | Sysno::seccomp
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
+        // The handler serializes destination writes and forwards the copy through
+        // record/replay; unsupported endpoint types receive ENOSYS so callers can
+        // fall back to determinized read/write loops.
+        | Sysno::sendfile
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -593,7 +610,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
@@ -626,12 +642,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::seccomp
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
         | Sysno::semtimedop
-        | Sysno::sendfile
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
@@ -857,7 +871,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [226, 91, 56]);
+        assert_eq!(counts, [229, 91, 53]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -921,6 +935,11 @@ mod tests {
             Sysno::sched_getattr,
             Sysno::sched_setattr,
         ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+        // Debug batch 184: these real-program blockers must remain on explicit
+        // deterministic paths rather than falling back to strict fail-closed.
+        for sysno in [Sysno::close_range, Sysno::seccomp, Sysno::sendfile] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         // recvmmsg is the multi-message sibling of recvmsg and must stay
