@@ -35,6 +35,11 @@ enum ProcfsKind {
     FileNr,
     FileMax,
     Zoneinfo,
+    Mountinfo,
+    RandomUuid,
+    DentryState,
+    InodeState,
+    PtyNr,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -82,6 +87,13 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
             "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
+            "/proc/self/mountinfo" => ProcfsKind::Mountinfo,
+            "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
+            "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
+            "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
+            "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -138,6 +150,13 @@ impl ProcfsFile {
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
             ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
+            ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
+            ProcfsKind::RandomUuid => {
+                fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
+            }
+            ProcfsKind::DentryState => fixed_snapshot(&contents, b"0\t0\t45\t0\t0\t0\n"),
+            ProcfsKind::InodeState => fixed_snapshot(&contents, b"0\t0\t0\t0\t0\t0\t0\n"),
+            ProcfsKind::PtyNr => fixed_snapshot(&contents, b"0\n"),
         });
     }
 
@@ -644,6 +663,48 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review private mount-root and kernel-counter normalization.
+fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
+    const TEMP_ROOT_PREFIX: &[u8] = b"/tmpvol/.tmp";
+
+    fn is_private_temp_root(root: &[u8]) -> bool {
+        let Some(suffix) = root.strip_prefix(TEMP_ROOT_PREFIX) else {
+            return false;
+        };
+        suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
+    }
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
+
+        if fields.len() >= 5 && is_private_temp_root(fields[3]) {
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    normalized.push(b' ');
+                }
+                if index == 3 {
+                    // Deriving the synthetic root from the guest mount point
+                    // preserves a distinct, stable source for each bind mount.
+                    normalized.extend_from_slice(b"/tmpvol/.hermit");
+                    normalized.extend_from_slice(fields[4]);
+                } else {
+                    normalized.extend_from_slice(field);
+                }
+            }
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn numbered_label(label: &str, prefix: &str) -> bool {
     label.strip_prefix(prefix).is_some_and(|suffix| {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -705,6 +766,13 @@ fn zero_decimal_runs(text: &str) -> String {
     normalized
 }
 
+fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        replacement.to_vec()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +910,47 @@ mod tests {
         // The static min/max limits are deterministic and must not be rewritten.
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_max_freq")).is_none());
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_max_freq")).is_none());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    #[test]
+    fn recognizes_mount_and_kernel_accounting_paths() {
+        for (path, kind) in [
+            ("/proc/self/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
+            ("/proc/sys/fs/dentry-state", ProcfsKind::DentryState),
+            ("/proc/sys/fs/file-nr", ProcfsKind::FileNr),
+            ("/proc/sys/fs/inode-state", ProcfsKind::InodeState),
+            ("/proc/sys/kernel/pty/nr", ProcfsKind::PtyNr),
+        ] {
+            assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
+        }
+        assert!(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-max")).is_none());
+    }
+
+    #[test]
+    fn private_mount_roots_are_guest_stable() {
+        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n";
+        assert_eq!(
+            sanitize_mountinfo(input),
+            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
+        );
+    }
+
+    #[test]
+    fn random_uuid_and_kernel_counters_are_synthetic() {
+        assert_eq!(
+            fixed_snapshot(
+                b"24e63f35-232a-43e2-8799-b151e9833f45\n",
+                b"00000000-0000-4000-8000-000000000000\n"
+            ),
+            b"00000000-0000-4000-8000-000000000000\n"
+        );
+        assert_eq!(
+            fixed_snapshot(b"246498\t0\t1024\n", b"0\t0\t1024\n"),
+            b"0\t0\t1024\n"
+        );
+        assert!(fixed_snapshot(b"", b"0\n").is_empty());
     }
 
     #[test]
