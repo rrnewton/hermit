@@ -567,9 +567,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::syslog
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-841): Return the fixed virtual default I/O priority.
-        | Sysno::ioprio_get
-        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-841): Linux scheduler attributes are inoperative under Detcore.
         | Sysno::sched_setattr
         // AUTONOMOUS-BOT-IMPLEMENTED
