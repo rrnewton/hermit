@@ -11,7 +11,7 @@ A `gap` must have a concrete implementation reason.
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
 | DBI | 9/10 | 90% |
-| KVM | 9/10 | 90% |
+| KVM | 10/10 | 100% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 9/10 number above is deliberately
@@ -22,11 +22,11 @@ during native startup and remains the sole gap; child-thread random sources
 remain covered by that lifecycle gap rather than this pair.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-nine pairs, including its bounded cooperative pthread lifecycle and
-deterministic clock, PID, and synthetic CPUID probes. The remaining gap is the
-threaded random-source fixture: child-thread syscalls bypass per-child Detcore
-callbacks, and the KVM personality's fixed random streams repeat across worker
-threads.
+all ten pairs, including its bounded cooperative pthread lifecycle and
+deterministic clock, PID, synthetic CPUID, and threaded random-source probes.
+Child-thread random syscalls still use the backend personality rather than
+per-child Detcore callbacks, but their deterministic streams are separated by
+stable virtual thread ID.
 
 ## Matrix
 
@@ -40,7 +40,7 @@ threads.
 | `pthread_lifecycle` | pass | gap | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
-| `random_sources` | pass | pass | gap |
+| `random_sources` | pass | pass | pass |
 | `virtual_pid` | pass | pass | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
