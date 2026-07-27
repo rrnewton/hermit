@@ -36,6 +36,7 @@ enum ProcfsKind {
     FileMax,
     Zoneinfo,
     InodeNr,
+    InodeState,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -61,6 +62,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
             "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
+            "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
@@ -143,6 +145,7 @@ impl ProcfsFile {
             ProcfsKind::FileMax => sanitize_file_max(&contents),
             ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
             ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
+            ProcfsKind::InodeState => sanitize_inode_state(&contents),
         });
     }
 
@@ -522,6 +525,14 @@ fn sanitize_inode_nr(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+fn sanitize_inode_state(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\t0\t0\t0\t0\t0\t0\n".to_vec()
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
@@ -840,6 +851,12 @@ mod tests {
                 .kind,
             ProcfsKind::InodeNr
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-state"))
+                .unwrap()
+                .kind,
+            ProcfsKind::InodeState
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -973,7 +990,12 @@ mod tests {
     #[test]
     fn inode_nr_hides_host_global_allocation_counters() {
         assert_eq!(sanitize_inode_nr(b"13929543\t1109179\n"), b"0\t0\n");
+        assert_eq!(
+            sanitize_inode_state(b"13929543\t1109179\t0\t0\t0\t0\t0\n"),
+            b"0\t0\t0\t0\t0\t0\t0\n"
+        );
         assert!(sanitize_inode_nr(b"").is_empty());
+        assert!(sanitize_inode_state(b"").is_empty());
     }
 
     #[test]

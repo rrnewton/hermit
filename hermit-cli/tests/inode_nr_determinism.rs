@@ -17,6 +17,24 @@ struct ProgramCase {
     args: &'static [&'static str],
 }
 
+const INODE_RELATION_CHECK: &str = r#"
+import os
+
+inode_nr = b"0\t0\n"
+inode_state = b"0\t0\t0\t0\t0\t0\t0\n"
+fd = os.open("/proc/sys/fs/inode-nr", os.O_RDONLY)
+assert os.pread(fd, 128, 0) == inode_nr
+assert os.read(fd, 1) == inode_nr[:1]
+assert os.lseek(fd, 0, os.SEEK_SET) == 0
+assert os.read(fd, 128) == inode_nr
+os.close(fd)
+
+with open("/proc/sys/fs/inode-state", "rb") as state:
+    observed = state.read()
+assert observed == inode_state
+assert observed.split()[:2] == inode_nr.split()
+"#;
+
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
     let output = command
@@ -48,6 +66,10 @@ fn inode_nr_consumers_verify() {
         Path::new("/proc/sys/fs/inode-nr").is_file(),
         "/proc/sys/fs/inode-nr is required"
     );
+    assert!(
+        Path::new("/proc/sys/fs/inode-state").is_file(),
+        "/proc/sys/fs/inode-state is required"
+    );
     let cases = [
         ProgramCase {
             name: "cat inode-nr",
@@ -63,6 +85,11 @@ fn inode_nr_consumers_verify() {
             name: "cut inode-nr allocation count",
             candidates: &["/usr/bin/cut", "/bin/cut"],
             args: &["-f1", "/proc/sys/fs/inode-nr"],
+        },
+        ProgramCase {
+            name: "inode positional reads and paired state",
+            candidates: &["/usr/bin/python3", "/bin/python3"],
+            args: &["-c", INODE_RELATION_CHECK],
         },
     ];
 
