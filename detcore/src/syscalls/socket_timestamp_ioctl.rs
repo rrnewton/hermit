@@ -69,7 +69,7 @@ fn logical_timespec(now: LogicalTime) -> libc::timespec {
 
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(PR-912)
     /// Preserve kernel validation while replacing host receive time with logical time.
     pub async fn handle_socket_timestamp_ioctl<G: Guest<Self>>(
         &self,
