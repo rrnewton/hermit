@@ -1457,7 +1457,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Optional modern memory APIs vary with
+            // TODO-HUMAN-REVIEW(PR-839): Optional modern memory APIs vary with
             // host kernel configuration, CET support, and pidfd lifecycle.
             // Present the portable feature-absence result instead.
             SyscallClassification::Determinized

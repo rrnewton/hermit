@@ -369,7 +369,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for optional memory
+        // TODO-HUMAN-REVIEW(PR-839): Deterministic ENOSYS for optional memory
         // features that Detcore does not model. These APIs depend on kernel
         // generation/configuration, CET support, or pidfd process lifecycle.
         // Returning the pre-feature errno keeps guest behavior host-independent
@@ -846,7 +846,7 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(PR-839): Deterministic ENOSYS refusal set.
 /// Optional modern memory features that are outside Detcore's model.
 /// `memfd_secret` depends on secret-memory kernel configuration,
 /// `map_shadow_stack` depends on CET support, and `process_mrelease` operates
