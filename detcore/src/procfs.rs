@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    SmapsRollup,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review smaps rollup accounting normalization.
+            "/proc/self/smaps_rollup" => ProcfsKind::SmapsRollup,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,38 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/self/smaps_rollup field policy.
+fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let accounting_label = body.split_once(':').and_then(|(label, value)| {
+            let mut fields = value.split_whitespace();
+            let amount = fields.next()?;
+            (amount.parse::<u64>().is_ok()
+                && fields.next() == Some("kB")
+                && fields.next().is_none())
+            .then_some(label)
+        });
+        if let Some(label) = accounting_label {
+            normalized.extend_from_slice(label.as_bytes());
+            normalized.extend_from_slice(b":\t0 kB");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +376,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SmapsRollup
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -430,6 +473,24 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn smaps_rollup_hides_physical_page_accounting() {
+        let contents = b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:                2216 kB\n\
+Pss:                 311 kB\n\
+Pss_File:            131 kB\n\
+THPeligible:    0\n";
+
+        assert_eq!(
+            sanitize_smaps_rollup(contents),
+            b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Pss_File:\t0 kB\n\
+THPeligible:    0\n"
         );
     }
 
