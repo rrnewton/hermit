@@ -470,12 +470,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     SchedValue::Value(num) => num,
                     SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
                 };
-                trace!(
-                    "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
-                    &dettid,
-                    guest.memory().read_value(ptr).unwrap(),
-                    call.val(),
-                );
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
+                match guest.memory().read_value(ptr) {
+                    Ok(observed) => trace!(
+                        "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
+                        &dettid,
+                        observed,
+                        call.val(),
+                    ),
+                    Err(error) => trace!(
+                        "[detcore, dtid {}] skipped post-wake futex memory diagnostic: {}",
+                        &dettid, error,
+                    ),
+                }
                 let _ = futex_action(
                     guest,
                     FutexAction::WakeFinished(0),
@@ -509,15 +517,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
                     let res = if ans != Some(SchedValue::TimeOut) {
                         let expected = call.val();
-                        let observed = guest.memory().read_value(ptr).unwrap();
-                        trace!(
-                            "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
-                            &dettid, observed, expected,
-                        );
-                        if expected == observed {
-                            debug!(
-                                "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
-                            );
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
+                        match guest.memory().read_value(ptr) {
+                            Ok(observed) => {
+                                trace!(
+                                    "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
+                                    &dettid, observed, expected,
+                                );
+                                if expected == observed {
+                                    debug!(
+                                        "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
+                                    );
+                                }
+                            }
+                            Err(error) => trace!(
+                                "[detcore, dtid {}] skipped post-wait futex memory diagnostic: {}",
+                                &dettid, error,
+                            ),
                         }
                         Ok(0)
                     } else {
