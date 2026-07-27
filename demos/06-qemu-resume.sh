@@ -92,7 +92,9 @@ qemu_snapshot_exists "$QEMU_SNAPSHOT_DISK" "$QEMU_SNAPSHOT_NAME" || {
 }
 
 snapshot_identity="$(cat "$QEMU_SNAPSHOT_ID_FILE")"
-command_key="$(printf '%s\0%s' "$snapshot_identity" "$guest_command" \
+info_comparison_version=2
+command_key="$(printf '%s\0%s\0%s' \
+  "$snapshot_identity" "$guest_command" "$info_comparison_version" \
   | sha256sum | cut -d' ' -f1)"
 comparison_dir="$QEMU_ASSETS/resume-info"
 previous_info="$comparison_dir/$command_key.info.log"
@@ -101,6 +103,7 @@ mkdir -p "$comparison_dir"
 export QEMU_LOG="${QEMU_LOG:-$DEMO_ARTIFACTS/qemu-resume.log}"
 serial_log="$DEMO_ARTIFACTS/qemu-resume.serial.log"
 info_tail="$DEMO_ARTIFACTS/qemu-resume.info.log"
+comparison_info="$DEMO_ARTIFACTS/qemu-resume.compare.info.log"
 serial_socket="$DEMO_ARTIFACTS/qemu-resume-serial.sock"
 input_fifo="$DEMO_ARTIFACTS/qemu-resume-input.$$"
 hermit_pid=""
@@ -244,18 +247,20 @@ awk -v begin="$begin_marker" -v end="$end_marker" '
 qemu_write_stable_info_tail "$QEMU_LOG" "$info_tail"
 demo_banner "Hermit INFO tail (wall-clock timestamps stripped)"
 cat "$info_tail"
+qemu_normalize_info_for_comparison "$info_tail" "$comparison_info"
 
 if [ -r "$previous_info" ]; then
-  if cmp -s "$previous_info" "$info_tail"; then
-    printf '\nINFO tail matches the previous run of %q.\n' "$guest_command"
+  if cmp -s "$previous_info" "$comparison_info"; then
+    printf '\nNormalized INFO structure matches the previous run of %q.\n' \
+      "$guest_command"
   else
-    echo "INFO tail differs from the previous run of: $guest_command" >&2
-    diff -u "$previous_info" "$info_tail" || true
+    echo "Normalized INFO structure differs from the previous run of: $guest_command" >&2
+    diff -u "$previous_info" "$comparison_info" || true
     exit 1
   fi
 else
-  cp "$info_tail" "$previous_info"
-  printf '\nSaved the first INFO tail for %q. Run this command again to compare.\n' \
+  cp "$comparison_info" "$previous_info"
+  printf '\nSaved the first normalized INFO structure for %q. Run this command again to compare.\n' \
     "$guest_command"
 fi
 printf 'Evidence: %s\n' "${DEMO_ARTIFACTS#"$ROOT/"}"
