@@ -411,13 +411,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for guest pidfd
-        // operations. Detcore virtualizes guest PIDs but does not map guest
-        // pidfds onto host process lifetimes, descriptor tables, permissions,
-        // or signal delivery. A fixed pre-pidfd-kernel response keeps those
-        // host details outside the deterministic guest and enables fallbacks.
+        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for guest process-
+        // handle operations. Detcore does not map guest process resource
+        // identity, descriptor tables, permissions, or pidfd signal delivery
+        // into deterministic state. A fixed feature-absence response keeps
+        // those host details outside the guest and enables fallbacks.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::pidfd_open
+        | Sysno::kcmp
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::pidfd_getfd
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -646,7 +646,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::get_robust_list
         | Sysno::getitimer
         | Sysno::ioprio_get
-        | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
@@ -656,6 +655,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::perf_event_open
+        | Sysno::pidfd_open
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
@@ -912,17 +912,17 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic guest pidfd refusal set.
-/// Guest pidfd operations. Detcore virtualizes guest PIDs but has no pidfd
-/// model that can translate process lifetimes, descriptor tables, permissions,
-/// or signal delivery into its deterministic state. A fixed `ENOSYS` presents
-/// the standard pre-pidfd kernel boundary and directs probing callers to their
+// TODO-HUMAN-REVIEW(PR-TBD): Deterministic guest process-handle refusal set.
+/// Guest process-handle inspection and mutation operations. Detcore has no
+/// model for comparing process resources, reaching into another descriptor
+/// table, or delivering signals through pidfds. A fixed `ENOSYS` presents the
+/// standard kernel feature-absence boundary and directs probing callers to
 /// traditional PID-based fallbacks without exposing host process state.
-pub(crate) const fn is_guest_pidfd_syscall(sysno: Sysno) -> bool {
+pub(crate) const fn is_guest_process_handle_refused_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
         // AUTONOMOUS-BOT-IMPLEMENTED
-        Sysno::pidfd_open
+        Sysno::kcmp
             // AUTONOMOUS-BOT-IMPLEMENTED
             | Sysno::pidfd_getfd
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1352,12 +1352,8 @@ mod tests {
     }
 
     #[test]
-    fn guest_pidfd_syscalls_are_determinized_and_consistent() {
-        let refused = [
-            Sysno::pidfd_open,
-            Sysno::pidfd_getfd,
-            Sysno::pidfd_send_signal,
-        ];
+    fn guest_process_handle_syscalls_are_determinized_and_consistent() {
+        let refused = [Sysno::kcmp, Sysno::pidfd_getfd, Sysno::pidfd_send_signal];
         for sysno in refused {
             assert_eq!(
                 classify_syscall(sysno),
@@ -1365,16 +1361,16 @@ mod tests {
                 "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
             );
             assert!(
-                is_guest_pidfd_syscall(sysno),
-                "{sysno:?} should be in the guest pidfd refusal set"
+                is_guest_process_handle_refused_syscall(sysno),
+                "{sysno:?} should be in the guest process-handle refusal set"
             );
         }
 
         for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
             assert_eq!(
-                is_guest_pidfd_syscall(sysno),
+                is_guest_process_handle_refused_syscall(sysno),
                 refused.contains(&sysno),
-                "{sysno:?} guest pidfd helper membership is inconsistent"
+                "{sysno:?} guest process-handle helper membership is inconsistent"
             );
         }
     }
