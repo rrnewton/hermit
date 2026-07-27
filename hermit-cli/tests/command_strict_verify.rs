@@ -50,7 +50,8 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
-    std::fs::create_dir_all(home.path().join(".config/procps"))
+    let config_home = home.path().join(".config");
+    std::fs::create_dir_all(config_home.join("procps"))
         .expect("failed to preseed the isolated procps HOME");
     let mut command = Command::new("timeout");
     command
@@ -62,10 +63,12 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "run", "--strict", "--verify"])
         .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!("--env=XDG_CONFIG_HOME={}", config_home.display()))
         .arg("--")
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &config_home)
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
