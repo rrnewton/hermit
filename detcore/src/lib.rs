@@ -1353,7 +1353,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Host filesystem and mount
+            // TODO-HUMAN-REVIEW(PR-836): Host filesystem and mount
             // introspection are outside the deterministic model. Return the
             // portable feature-absence errno so callers use /proc fallbacks.
             SyscallClassification::Determinized

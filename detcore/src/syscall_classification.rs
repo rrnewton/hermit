@@ -313,7 +313,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fanotify_mark
         | Sysno::settimeofday
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for host mount
+        // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS for host mount
         // introspection. sysfs exposes the host filesystem-type table, while
         // statmount/listmount expose host mount IDs and topology. Returning the
         // pre-feature ENOSYS result keeps guests on portable /proc fallbacks and
@@ -860,7 +860,7 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
 /// Host filesystem and mount-introspection syscalls. `sysfs` reads the
 /// host's filesystem-type table; `statmount` and `listmount` read mount IDs
 /// and topology from the active mount namespace. Neither source is part of a
