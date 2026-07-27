@@ -799,6 +799,16 @@ fn sanitize_status(
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
     const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
+    const MEMORY_ACCOUNTING_FIELDS: &[&[u8]] = &[
+        b"VmHWM",
+        b"VmRSS",
+        b"RssAnon",
+        b"RssFile",
+        b"RssShmem",
+        b"VmPTE",
+        b"VmSwap",
+        b"HugetlbPages",
+    ];
 
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
@@ -837,6 +847,14 @@ fn sanitize_status(
         } else if body.starts_with(NONVOLUNTARY) {
             normalized.extend_from_slice(NONVOLUNTARY);
             normalized.extend_from_slice(b"\t0");
+        } else if body
+            .split(|byte| *byte == b':')
+            .next()
+            .is_some_and(|label| MEMORY_ACCOUNTING_FIELDS.contains(&label))
+        {
+            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
+            normalized.extend_from_slice(label);
+            normalized.extend_from_slice(b":\t0 kB");
         } else {
             normalized.extend_from_slice(body);
         }
@@ -3607,10 +3625,10 @@ mod tests {
     // TODO-HUMAN-REVIEW(#553)
     #[test]
     fn status_normalizes_affinity_and_context_switches() {
-        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, 3, 3, 1),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
