@@ -53,7 +53,7 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review the TCP_INFO compatibility boundary.
+// TODO-HUMAN-REVIEW(PR-904): Review the TCP_INFO compatibility boundary.
 /// Retain the logical TCP state and negotiated option header while hiding all
 /// host timing, rate, packet, and byte counters.
 fn canonicalize_tcp_info(info: &mut [u8]) {
