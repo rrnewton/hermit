@@ -472,14 +472,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::vmsplice
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-860): Deterministic ENOSYS for host security
-        // and filesystem identity probes. Detcore does not model host LSM
-        // attributes or opaque filesystem handles/mount IDs; feature absence
-        // keeps those host-specific values outside the deterministic guest.
+        // probes. Detcore does not model host LSM attributes.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_get_self_attr
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_set_self_attr
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-899): Opaque filesystem handles and mount IDs
+        // remain outside Detcore's filesystem identity model.
         | Sysno::name_to_handle_at
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
