@@ -17,19 +17,22 @@ set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 4: Schedule Bisection"
-cat <<'DESC'
-=== Demo 4: Schedule Bisection ===
-
-hermit analyze first finds passing and failing schedules, then bisects their
-event streams to identify the ordering that changes the outcome. It builds a
-debug guest so the report can resolve source locations. This is intentionally
-the slow finale: it runs the guest many times. The portable default explores
-syscall-boundary schedules; set ANALYZE_PREEMPTION_TIMEOUT=400000 to add precise
-PMU preemption. A successful run ends with "Completed analysis successfully".
-
-By default only the per-pass search progress and the final result are shown;
-run with DEMO_VERBOSE=1 for the full analyze diagnostics.
-DESC
+echo ''
+echo '=========================================='
+echo '=== Demo 4: Schedule Bisection ==='
+echo '=========================================='
+echo ''
+echo 'hermit analyze first finds passing and failing schedules, then bisects their'
+echo 'event streams to identify the ordering that changes the outcome. It builds a'
+echo 'debug guest so the report can resolve source locations. This is intentionally'
+echo 'the slow finale: it runs the guest many times. The portable default explores'
+echo 'syscall-boundary schedules; set ANALYZE_PREEMPTION_TIMEOUT=400000 to add precise'
+echo 'PMU preemption. A successful run ends with "Completed analysis successfully".'
+echo ''
+echo 'By default only the per-pass search progress and the final result are shown;'
+echo 'run with DEMO_VERBOSE=1 for the full analyze diagnostics.'
+echo ''
+echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
