@@ -337,7 +337,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::listmount
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for obsolete ustat
+        // TODO-HUMAN-REVIEW(PR-859): Deterministic ENOSYS for obsolete ustat
         // host-filesystem capacity and free-space introspection.
         | Sysno::ustat
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -378,7 +378,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // feature-absence boundary for legacy nonlinear memory mappings.
         | Sysno::remap_file_pages
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Extend the System V ENOSYS boundary to
+        // TODO-HUMAN-REVIEW(PR-859): Extend the System V ENOSYS boundary to
         // semaphore and shared-memory objects whose host IDs and state are not
         // represented in Detcore.
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -918,7 +918,7 @@ pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
 /// untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches
 /// on the `Sysno` before the typed match.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the System V semaphore/shared-memory
+// TODO-HUMAN-REVIEW(PR-859): Review the System V semaphore/shared-memory
 // capability boundary added to the existing deterministic IPC refusal set.
 pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     matches!(
@@ -1053,7 +1053,7 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
             | Sysno::statmount
             | Sysno::listmount
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Obsolete host filesystem statistics.
+            // TODO-HUMAN-REVIEW(PR-859): Obsolete host filesystem statistics.
             | Sysno::ustat
     )
 }

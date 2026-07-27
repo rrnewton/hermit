@@ -1373,7 +1373,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // introspection are outside the deterministic model. Return the
             // portable feature-absence errno so callers use /proc fallbacks.
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Extend this boundary to obsolete ustat
+            // TODO-HUMAN-REVIEW(PR-859): Extend this boundary to obsolete ustat
             // host-filesystem capacity counters.
             SyscallClassification::Determinized
                 if is_mount_introspection_enosys_syscall(call.number()) =>
@@ -1472,7 +1472,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
             // before the typed match below.
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Include System V semaphore and shared-
+            // TODO-HUMAN-REVIEW(PR-859): Include System V semaphore and shared-
             // memory objects in the existing CONFIG_SYSVIPC refusal boundary.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
