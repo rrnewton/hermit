@@ -688,7 +688,7 @@ impl GlobalTime {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review thread-presence detection for backend reconnects.
+    // TODO-HUMAN-REVIEW(PR-845): Review thread-presence detection for backend reconnects.
     /// Returns whether this clock has observed work from a thread.
     pub fn contains_thread(&self, dtid: DetTid) -> bool {
         self.time_vector.contains_key(&dtid)

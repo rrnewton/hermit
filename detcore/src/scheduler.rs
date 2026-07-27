@@ -1071,7 +1071,7 @@ impl Scheduler {
                 // has NOT filled its request to the scheduler yet.
                 nextturn.req.try_put(Err(ThreadExited));
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review killed-thread RPC cancellation.
+                // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                 nextturn.resp.try_put(SchedResponse::Signaled());
                 self.wake_futex_child_cleartid(
                     FutexID::private(mm, nextturn.child_tid_addr),
