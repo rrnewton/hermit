@@ -100,9 +100,12 @@ fn swaps_consumers_are_deterministic_under_strict_verify() {
             args: &[PROC_SWAPS],
         },
         ProgramCase {
-            name: "awk",
+            name: "awk validates zero usage",
             candidates: &["/usr/bin/awk", "/bin/awk"],
-            args: &["{print $1, $2, $3, $4, $5}", PROC_SWAPS],
+            args: &[
+                "NR > 1 && $4 != 0 { exit 1 } END { if (NR < 1) exit 1 }",
+                PROC_SWAPS,
+            ],
         },
         ProgramCase {
             name: "sed",
