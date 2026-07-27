@@ -1697,7 +1697,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_addrlen(unix_autobind_addrlen());
             return Ok(self.record_or_replay(guest, deterministic_bind).await?);
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic Netlink autobind identities.
+        // TODO-HUMAN-REVIEW(PR-880): Review deterministic Netlink autobind identities.
         } else if sockaddr_family == libc::AF_NETLINK as u16
             && call.addrlen() >= std::mem::size_of::<libc::sockaddr_nl>() as i32
         {
