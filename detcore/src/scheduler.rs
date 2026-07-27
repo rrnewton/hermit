@@ -2832,6 +2832,11 @@ mod test {
             ),
             (LogicalTime::ZERO, LogicalTime::ZERO)
         );
+        assert_eq!(scheduler.alarm_remaining(detpid, now), duration);
+        assert_eq!(
+            scheduler.alarm_remaining(detpid, LogicalTime::from_nanos(1_100)),
+            LogicalTime::from_nanos(150)
+        );
         assert_eq!(
             scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
             vec![(

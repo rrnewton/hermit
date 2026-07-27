@@ -1695,6 +1695,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-TBD)
+                Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED

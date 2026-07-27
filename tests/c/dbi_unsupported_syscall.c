@@ -7,7 +7,8 @@
  */
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and exec.
+// TODO-HUMAN-REVIEW(PR-644): Review unsupported policy across root, fork, and
+// exec.
 
 #define _GNU_SOURCE
 #include <stddef.h>
