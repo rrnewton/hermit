@@ -1401,7 +1401,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Host LSM attributes, opaque file
+            // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes, opaque file
             // handles, and mount IDs are outside Detcore's model. Present a
             // stable feature-absence boundary instead of forwarding probes.
             SyscallClassification::Determinized
