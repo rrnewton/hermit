@@ -8,6 +8,8 @@ ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || printf '%s' /usr/sbin/busybox)}"
+INITRAMFS_VERSION=2
+INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -40,10 +42,12 @@ mkdir -p "$ARTIFACT_DIR" "$HERMIT_REPO/target"
 
 kernel_tmp=""
 initrd_tmp=""
+version_tmp=""
 workdir=""
 cleanup() {
   [ -z "$kernel_tmp" ] || rm -f "$kernel_tmp"
   [ -z "$initrd_tmp" ] || rm -f "$initrd_tmp"
+  [ -z "$version_tmp" ] || rm -f "$version_tmp"
   [ -z "$workdir" ] || rm -rf "$workdir"
 }
 trap cleanup EXIT
@@ -61,7 +65,9 @@ else
     "$ARTIFACT_DIR/bzImage" "$(stat -c%s "$ARTIFACT_DIR/bzImage")"
 fi
 
-if [ ! -r "$ARTIFACT_DIR/initramfs.cpio.gz" ]; then
+cached_initramfs_version="$(cat "$INITRAMFS_VERSION_FILE" 2>/dev/null || true)"
+if [ ! -r "$ARTIFACT_DIR/initramfs.cpio.gz" ] || \
+   [ "$cached_initramfs_version" != "$INITRAMFS_VERSION" ]; then
   workdir="$(mktemp -d "$HERMIT_REPO/target/qemu-demo-assets.XXXXXX")"
   root="$workdir/initramfs"
   mkdir -p "$root"/{bin,sbin,etc,proc,sys,dev,tmp,usr/bin,usr/sbin}
@@ -86,7 +92,7 @@ echo "HERMIT-QEMU-BASELINE-BOOT-OK"
 echo "kernel: $(uname -r)"
 echo "=========================================="
 echo "Interactive busybox shell. Type 'poweroff -f' to exit."
-exec /bin/sh
+exec setsid cttyhack sh
 INIT
   chmod +x "$root/init"
   printf 'root:x:0:0:root:/:/bin/sh\n' >"$root/etc/passwd"
@@ -99,6 +105,10 @@ INIT
   ) | gzip -9 >"$initrd_tmp"
   mv "$initrd_tmp" "$ARTIFACT_DIR/initramfs.cpio.gz"
   initrd_tmp=""
+  version_tmp="$ARTIFACT_DIR/.initramfs-version.$$"
+  printf '%s\n' "$INITRAMFS_VERSION" >"$version_tmp"
+  mv "$version_tmp" "$INITRAMFS_VERSION_FILE"
+  version_tmp=""
   printf 'initramfs: built %s (%s bytes)\n' \
     "$ARTIFACT_DIR/initramfs.cpio.gz" \
     "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")"

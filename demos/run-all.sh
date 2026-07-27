@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run the portable demos (1-3) in order under a single shared scratch directory.
-# Demo 4 is the slow schedule-analysis finale and demo 5 requires QEMU plus
-# git-ignored Linux boot images, so both are opt-in.
+# Demo 4 is the slow schedule-analysis finale. Demos 5 and 6 require QEMU plus
+# git-ignored Linux boot images, so the QEMU pair is opt-in.
 
 set -euo pipefail
 
@@ -42,6 +42,7 @@ fi
 
 if [ "$with_qemu" -eq 1 ]; then
   bash "$DEMO_DIR/05-qemu-boot.sh"
+  bash "$DEMO_DIR/06-qemu-resume.sh" 'uname -a'
 fi
 
 printf '\n=== Demo suite: SUCCESS — all requested demos passed ===\n'
