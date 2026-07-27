@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=179
-readonly SABRE_COMPAT_TOTAL=179
+readonly SABRE_COMPAT_EXPECTED=180
+readonly SABRE_COMPAT_TOTAL=180
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -2976,6 +2976,13 @@ function run_compatibility_corpus {
     # the atomic rt_sigsuspend mask transition.
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         strict_compatibility_probe timeout /usr/bin/timeout 1 /usr/bin/true \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#845): Review the functional truncate workload.
+        # Expand the temporary-file operations inside the guest shell.
+        # shellcheck disable=SC2016
+        strict_compatibility_probe truncate bash -c \
+            'set -euo pipefail; f=$(mktemp); printf "Hermit\n" >"$f"; /usr/bin/truncate -s 4096 "$f"; test "$(stat -c %s "$f")" = 4096; /usr/bin/truncate -s 7 "$f"; test "$(stat -c %s "$f")" = 7; test "$(cat "$f")" = Hermit; rm -f "$f"; printf "truncate:4096-to-7-ok\n"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
