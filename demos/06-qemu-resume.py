@@ -18,6 +18,7 @@ from demo_common import (  # noqa: E402
     acquire_demo_lock,
     banner,
     canonicalize_qcow2_snapshot_timestamp,
+    check_dependencies,
     compare_runs,
     copy_file,
     extract_info_tail,
@@ -91,13 +92,18 @@ def main() -> int:
     if "\n" in guest_command or "\r" in guest_command:
         raise ValueError("guest command must be a single line")
 
-    print_header(DEMO_LABEL)
-    print("QEMU restores the live shell, runs one command, saves a post-command")
-    print("snapshot by default, and compares repeats keyed by the command string.")
-
     os.environ["HERMIT_RELEASE"] = str(HERMIT)
     os.environ["QEMU_BIN"] = QEMU
-    run_checked(["make", "--no-print-directory", "-s", "build"], cwd=ROOT)
+    dependency = check_dependencies(ROOT)
+    print_header(
+        DEMO_LABEL,
+        (
+            "QEMU restores the live shell, runs one command, saves a post-command",
+            "snapshot by default, and compares repeats keyed by the command string.",
+        ),
+        dependency,
+    )
+    run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     if not QEMU:
         raise RuntimeError("qemu-system-x86_64 is required")
     if not BOOT_SNAPSHOT_DISK.is_file():
@@ -226,7 +232,12 @@ def main() -> int:
             )
         else:
             passed, report = compare_runs(anchor, current)
-            print_comparison(passed, report)
+            print_comparison(
+                passed,
+                report,
+                current.get("qcow2_sha256"),
+                "Resume",
+            )
 
         if saved_snapshot:
             print("Post-command snapshot: {}".format(archived_disk.relative_to(ROOT)))
