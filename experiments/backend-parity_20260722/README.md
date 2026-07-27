@@ -10,15 +10,15 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
-| DBI | 9/10 | 90% |
+| DBI | 8/10 | 80% |
 | KVM | 8/10 | 80% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 9/10 number above is deliberately
+measures the backend's own Reverie suite. The 8/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-The current DBI path satisfies the pthread lifecycle, virtual clock, and virtual
-PID contracts, but its threaded random-source fixture still does not complete.
-These contracts do not by themselves establish full Detcore parity.
+The current DBI path satisfies the virtual clock and virtual PID contracts. Its
+hosted pthread lifecycle case can still stall during native startup, and the
+threaded random-source fixture remains a gap.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 eight pairs, including deterministic clock, PID, and synthetic CPUID probes.
@@ -35,7 +35,7 @@ page-permission fault enforcement.
 | `exit_zero` | pass | pass | pass |
 | `exit_status` | pass | pass | pass |
 | `file_read` | pass | pass | pass |
-| `pthread_lifecycle` | pass | pass | gap |
+| `pthread_lifecycle` | pass | gap | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | gap | gap |
