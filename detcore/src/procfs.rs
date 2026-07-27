@@ -32,6 +32,7 @@ enum ProcfsKind {
     Buddyinfo,
     Schedstat,
     SoftnetStat,
+    FileNr,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -72,6 +73,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host file-table normalization.
+            "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -125,6 +129,7 @@ impl ProcfsFile {
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
+            ProcfsKind::FileNr => sanitize_file_nr(&contents),
         });
         self.offset = 0;
     }
@@ -460,6 +465,16 @@ fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/file-nr policy.
+fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\t0\t9223372036854775807\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -714,6 +729,12 @@ mod tests {
                 .kind,
             ProcfsKind::SoftnetStat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::FileNr
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -853,6 +874,15 @@ malformed buddy row\n";
 Node 1, zone Normal 0 0 0 0\n\
 malformed buddy row\n"
         );
+    }
+
+    #[test]
+    fn file_nr_hides_host_global_allocations() {
+        assert_eq!(
+            sanitize_file_nr(b"245853\t0\t9223372036854775807\n"),
+            b"0\t0\t9223372036854775807\n"
+        );
+        assert!(sanitize_file_nr(b"").is_empty());
     }
 
     #[test]
