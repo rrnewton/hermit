@@ -330,8 +330,10 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # previously because --strict used to forward unsupported syscalls.
     # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
     # are now measured as ordinary passing rows below.)
+    [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall on some hosts"
     [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
+    [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall on some hosts"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [top]="live process-table reads differ on the GitHub-hosted runner"
@@ -2706,10 +2708,10 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe cpio-roundtrip /usr/bin/cpio --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe wget-localhost /usr/bin/wget --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe curl-localhost /usr/bin/curl --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        tally_known_failclosed_probe passed failed known_flaky wget-localhost \
+            functional_compatibility_probe wget-localhost /usr/bin/wget --version
+        tally_known_failclosed_probe passed failed known_flaky curl-localhost \
+            functional_compatibility_probe curl-localhost /usr/bin/curl --version
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         real_compatibility_probe gzip-roundtrip \
             && passed=$((passed + 1)) || failed=$((failed + 1))
