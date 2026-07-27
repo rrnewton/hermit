@@ -40,6 +40,7 @@ enum ProcfsKind {
     InodeState,
     Protocols,
     BtrfsBytesReserved,
+    Rtc,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -66,8 +67,6 @@ fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
             }
         });
     canonical_uuid && matches!(class, "data" | "metadata" | "system")
-}
-
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
@@ -129,6 +128,9 @@ impl ProcfsFile {
                 ProcfsKind::BtrfsBytesReserved
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review host RTC normalization.
+            "/proc/driver/rtc" => ProcfsKind::Rtc,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
             // like `lscpu` under `--verify`. These are opened relative to a
@@ -189,6 +191,7 @@ impl ProcfsFile {
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
+            ProcfsKind::Rtc => sanitize_rtc(&contents),
         });
     }
 
@@ -950,6 +953,31 @@ fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
     output
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the fixed virtual RTC epoch.
+fn sanitize_rtc(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with("rtc_time\t:") {
+            normalized.extend_from_slice(b"rtc_time\t: 23:59:59");
+        } else if body.starts_with("rtc_date\t:") {
+            normalized.extend_from_slice(b"rtc_date\t: 2021-12-31");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1115,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Smaps
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/driver/rtc"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Rtc
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -1317,6 +1351,22 @@ full avg10=1.23 avg60=2.34 avg300=3.45 total=654321\n";
             sanitize_pressure(contents),
             b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
 full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        );
+    }
+
+    #[test]
+    fn rtc_uses_the_fixed_virtual_epoch() {
+        let contents = b"rtc_time\t: 10:07:42\n\
+rtc_date\t: 2026-07-27\n\
+alrm_time\t: 00:50:12\n\
+24hr\t\t: yes\n";
+
+        assert_eq!(
+            sanitize_rtc(contents),
+            b"rtc_time\t: 23:59:59\n\
+rtc_date\t: 2021-12-31\n\
+alrm_time\t: 00:50:12\n\
+24hr\t\t: yes\n"
         );
     }
 
