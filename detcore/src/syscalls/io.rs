@@ -1028,7 +1028,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
-    /// Handles recvfrom, sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
+    /// Handles sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
     pub async fn handle_sendrecv<
         G: Guest<Self>,
         C: SyscallInfo + NonblockableSyscall + Into<Syscall>,
@@ -1069,6 +1069,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = thread_observe_time(guest).await;
         canonicalize_socket_timestamps(&mut control, now);
         guest.memory().write_exact(control_address, &control)?;
+        Ok(result)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-912): Review receive-time capture across socket aliases.
+    /// Handle a socket receive and retain one timestamp for every alias of its open file.
+    pub async fn handle_socket_receive<
+        G: Guest<Self>,
+        C: SyscallInfo + NonblockableSyscall + Into<Syscall>,
+    >(
+        &self,
+        guest: &mut G,
+        call: C,
+        fd: i32,
+        zero_delivers_packet: bool,
+    ) -> Result<i64, Error> {
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        if self.cfg.virtualize_time && (result > 0 || (result == 0 && zero_delivers_packet)) {
+            let timestamp = thread_observe_time(guest).await;
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_socket_receive_timestamp(timestamp);
+            })?;
+        }
         Ok(result)
     }
 }
