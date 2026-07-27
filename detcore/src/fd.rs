@@ -284,20 +284,38 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_snapshot)
     }
 
+    /// Whether this procfs snapshot consumes deterministic random bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+    pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_random_uuid)
+    }
+
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic UUID snapshot input.
     pub(crate) fn initialize_procfs(
         &self,
         contents: Vec<u8>,
         virtual_uptime_seconds: u64,
         virtual_pid: i32,
         virtual_ppid: i32,
+        random_uuid: Option<[u8; 16]>,
     ) {
         self.description()
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, virtual_uptime_seconds, virtual_pid, virtual_ppid);
+            .initialize(
+                contents,
+                virtual_uptime_seconds,
+                virtual_pid,
+                virtual_ppid,
+                random_uuid,
+            );
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.

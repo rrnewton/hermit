@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    RandomUuid,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+            "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -70,14 +74,23 @@ impl ProcfsFile {
         self.contents.is_none()
     }
 
+    /// Returns true when this snapshot consumes deterministic random bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+    pub(crate) fn needs_random_uuid(&self) -> bool {
+        self.kind == ProcfsKind::RandomUuid
+    }
+
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic UUID snapshot input.
     pub(crate) fn initialize(
         &mut self,
         contents: Vec<u8>,
         virtual_uptime_seconds: u64,
         virtual_pid: i32,
         virtual_ppid: i32,
+        random_uuid: Option<[u8; 16]>,
     ) {
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
@@ -87,6 +100,10 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::RandomUuid => sanitize_random_uuid(
+                &contents,
+                random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
+            ),
         });
         self.offset = 0;
     }
@@ -232,6 +249,51 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
+    const HYPHENS: &[usize] = &[8, 13, 18, 23];
+
+    if contents.len() != 37 || contents[36] != b'\n' {
+        return contents.to_vec();
+    }
+    for (index, byte) in contents[..36].iter().copied().enumerate() {
+        if HYPHENS.contains(&index) {
+            if byte != b'-' {
+                return contents.to_vec();
+            }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte) {
+            return contents.to_vec();
+        }
+    }
+    if contents[14] != b'4' || !matches!(contents[19], b'8' | b'9' | b'a' | b'b') {
+        return contents.to_vec();
+    }
+
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\n",
+        random[0],
+        random[1],
+        random[2],
+        random[3],
+        random[4],
+        random[5],
+        random[6],
+        random[7],
+        random[8],
+        random[9],
+        random[10],
+        random[11],
+        random[12],
+        random[13],
+        random[14],
+        random[15]
+    )
+    .into_bytes()
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -340,6 +402,13 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/kernel/random/uuid"))
+                .unwrap()
+                .kind,
+            ProcfsKind::RandomUuid
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/sys/kernel/random/boot_id")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -369,6 +438,29 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn random_uuid_uses_deterministic_v4_bytes_or_fails_open() {
+        let kernel_uuid = b"4e9412e7-bed4-4ebb-98e1-24284f6a0f19\n";
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0; 16]),
+            b"00000000-0000-4000-8000-000000000000\n"
+        );
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0xff; 16]),
+            b"ffffffff-ffff-4fff-bfff-ffffffffffff\n"
+        );
+
+        for malformed in [
+            b"4e9412e7-bed4-1ebb-98e1-24284f6a0f19\n".as_slice(),
+            b"4e9412e7-bed4-4ebb-c8e1-24284f6a0f19\n",
+            b"4E9412E7-BED4-4EBB-98E1-24284F6A0F19\n",
+            b"4e9412e7-bed4-4ebb-98e1-24284f6a0f19",
+            b"not-a-uuid\n",
+        ] {
+            assert_eq!(sanitize_random_uuid(malformed, [0; 16]), malformed);
+        }
     }
 
     #[test]
@@ -436,7 +528,7 @@ RAW: inuse 5\n"
     #[test]
     fn snapshot_supports_partial_reads() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 3, 1);
+        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 3, 1, None);
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
