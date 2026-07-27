@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review strict verification coverage for AIO counts.
+// TODO-HUMAN-REVIEW(PR-933): Review strict verification coverage for AIO counts.
 #[test]
 fn aio_nr_consumers_verify() {
     assert!(

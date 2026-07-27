@@ -43,7 +43,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global AIO count normalization.
+            // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/aio-nr policy.
+// TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
 fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -439,7 +439,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review AIO count fixture coverage.
+    // TODO-HUMAN-REVIEW(PR-933): Review AIO count fixture coverage.
     #[test]
     fn aio_nr_hides_host_global_reservations() {
         assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
