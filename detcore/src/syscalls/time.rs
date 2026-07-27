@@ -105,6 +105,14 @@ where
     }
 }
 
+fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
+    if target > now {
+        target.duration_since(now)
+    } else {
+        Duration::ZERO
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
@@ -287,7 +295,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             ResumeStatus::Normal => Ok(0),
             ResumeStatus::Signaled => {
                 let now = thread_observe_time(guest).await;
-                let delta: Duration = target_time.duration_since(now);
+                let delta = remaining_sleep_duration(target_time, now);
                 let addr2 = call.rem();
                 if let Some(addr2) = addr2 {
                     info!(
@@ -606,5 +614,20 @@ mod tests {
         assert_eq!(tx.tick, 10_000);
         assert_eq!(tx.time.tv_sec, 123);
         assert_eq!(tx.time.tv_usec, 456_789);
+    }
+
+    #[test]
+    fn interrupted_sleep_remaining_time_floors_at_zero() {
+        let target = LogicalTime::from_nanos(1_000);
+
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(750)),
+            Duration::from_nanos(250)
+        );
+        assert_eq!(remaining_sleep_duration(target, target), Duration::ZERO);
+        assert_eq!(
+            remaining_sleep_duration(target, LogicalTime::from_nanos(1_250)),
+            Duration::ZERO
+        );
     }
 }
