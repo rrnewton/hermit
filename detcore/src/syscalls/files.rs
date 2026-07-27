@@ -53,6 +53,17 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
 }
 
+// TODO-HUMAN-REVIEW(PR-id): Review the TCP_INFO compatibility boundary.
+/// Retain the logical TCP state and negotiated option header while hiding all
+/// host timing, rate, packet, and byte counters.
+fn canonicalize_tcp_info(info: &mut [u8]) {
+    for (offset, byte) in info.iter_mut().enumerate() {
+        if !matches!(offset, 0 | 1 | 5 | 6) {
+            *byte = 0;
+        }
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     async fn inject_fstat<G: Guest<Self>>(
@@ -1441,7 +1452,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+
+        if result == 0
+            && call.level() == libc::IPPROTO_TCP
+            && call.optname() == libc::TCP_INFO
+            && let (Some(optval), Some(optlen)) = (call.optval(), call.optlen())
+        {
+            let returned_len: libc::socklen_t = guest.memory().read_value(optlen)?;
+            let mut info = vec![0; returned_len as usize];
+            let optval = optval.cast::<u8>();
+            guest.memory().read_exact(optval, info.as_mut_slice())?;
+            canonicalize_tcp_info(&mut info);
+            guest.memory().write_exact(optval, info.as_slice())?;
+        }
+
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1870,11 +1896,32 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod test {
     use nix::fcntl::OFlag;
 
+    use super::canonicalize_tcp_info;
+
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
     #[test]
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn tcp_info_retains_only_logical_connection_header() {
+        let mut info = [0xff; 16];
+        canonicalize_tcp_info(&mut info);
+
+        for (offset, byte) in info.into_iter().enumerate() {
+            let expected = if matches!(offset, 0 | 1 | 5 | 6) {
+                0xff
+            } else {
+                0
+            };
+            assert_eq!(byte, expected, "unexpected byte at offset {offset}");
+        }
+
+        for len in 0..8 {
+            canonicalize_tcp_info(&mut [0xff; 8][..len]);
+        }
     }
 }
