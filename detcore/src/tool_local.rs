@@ -409,7 +409,7 @@ impl FileMetadata {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe on-demand inherited descriptor discovery.
+    // TODO-HUMAN-REVIEW(PR-845): Review SaBRe on-demand inherited descriptor discovery.
     fn discover_fd_from_current_process(&mut self, owner: DetTid, fd: RawFd) -> Result<(), Errno> {
         if self.file_handles.contains_key(&fd) {
             return Ok(());
@@ -1090,7 +1090,7 @@ pub struct ThreadState<T> {
     pub file_metadata: Arc<Mutex<FileMetadata>>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review backend-gated live descriptor discovery state.
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-gated live descriptor discovery state.
     /// Whether missing guest descriptors may be inspected in the current process.
     #[serde(default)]
     pub(crate) discover_live_file_metadata: bool,

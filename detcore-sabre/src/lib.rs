@@ -55,7 +55,7 @@ fn remember_coordinator_socket(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe guest comm-name restoration.
+// TODO-HUMAN-REVIEW(PR-845): Review SaBRe guest comm-name restoration.
 fn guest_comm_from_args(args: impl IntoIterator<Item = OsString>) -> Option<CString> {
     let program = args.into_iter().next()?;
     let name = Path::new(&program).file_name()?.as_bytes();
