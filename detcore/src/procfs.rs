@@ -56,6 +56,11 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
+            // `cpuinfo_avg_freq` is another driver-provided live hardware
+            // reading, distinct from the static cpuinfo min/max limits.
+            other if other.ends_with("cpufreq/cpuinfo_avg_freq") => ProcfsKind::ScalingCurFreq,
             _ => return None,
         };
         Some(Self {
@@ -219,11 +224,12 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-764)
-/// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
-/// instantaneous core frequency is a live hardware reading that varies between
-/// otherwise identical runs, so replace it with a fixed value. This mirrors the
-/// `cpu MHz` zeroing already done for `/proc/cpuinfo` in [`sanitize_cpuinfo`],
-/// and keeps the static `cpuinfo_max_freq`/`scaling_max_freq` files untouched.
+// TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
+/// Normalizes a dynamic cpufreq current/average frequency snapshot. These live
+/// hardware readings vary between otherwise identical runs, so replace them
+/// with a fixed value. This mirrors the `cpu MHz` zeroing already done for
+/// `/proc/cpuinfo` in [`sanitize_cpuinfo`], and keeps static min/max files
+/// untouched.
 fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -344,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_cpufreq_current_frequency_by_suffix() {
+    fn recognizes_dynamic_cpufreq_by_suffix() {
         // Opened relative to a `/sys/devices/system/cpu` directory fd.
         assert_eq!(
             ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_cur_freq"))
@@ -360,13 +366,19 @@ mod tests {
             .kind,
             ProcfsKind::ScalingCurFreq
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_avg_freq"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ScalingCurFreq
+        );
         // The static min/max limits are deterministic and must not be rewritten.
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_max_freq")).is_none());
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_max_freq")).is_none());
     }
 
     #[test]
-    fn scaling_cur_freq_is_fixed() {
+    fn dynamic_cpufreq_values_are_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
     }
