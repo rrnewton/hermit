@@ -70,7 +70,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review softnet counter normalization.
+            // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -580,7 +580,7 @@ fn numbered_label(label: &str, prefix: &str) -> bool {
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review the preserved CPU-index column.
+// TODO-HUMAN-REVIEW(PR-909): Review the preserved CPU-index column.
 /// Preserves the softnet table shape and per-row CPU index while hiding live
 /// network backlog counters maintained by the host kernel.
 fn sanitize_softnet_stat(contents: &[u8]) -> Vec<u8> {
