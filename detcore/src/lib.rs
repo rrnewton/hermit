@@ -1384,7 +1384,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Strict runs cannot expose unmodeled
+            // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled
             // pipe-buffer ownership or vmsplice page pinning. Return ENOSYS so
             // callers use read/write fallbacks, but preserve the legacy normal-
             // mode pass-through used by the existing rr splice compatibility
