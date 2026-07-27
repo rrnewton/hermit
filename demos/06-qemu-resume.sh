@@ -6,13 +6,16 @@ set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 6: QEMU Snapshot Resume"
-cat <<'DESC'
-=== Demo 6: QEMU Snapshot Resume ===
-
-QEMU resumes the live Linux shell saved by Demo 5. The requested command is
-injected over the guest serial socket, then the normalized Hermit INFO tail is
-saved and compared with the previous run of that same command.
-DESC
+echo ''
+echo '=========================================='
+echo '=== Demo 6: QEMU Snapshot Resume ==='
+echo '=========================================='
+echo ''
+echo 'QEMU resumes the live Linux shell saved by Demo 5. The requested command is'
+echo 'injected over the guest serial socket, then the normalized Hermit INFO tail is'
+echo 'saved and compared with the previous run of that same command.'
+echo ''
+echo '=========================================='
 
 # shellcheck source=demos/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"

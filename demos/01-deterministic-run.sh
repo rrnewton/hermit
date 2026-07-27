@@ -10,16 +10,19 @@ set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 1: Deterministic Run"
-cat <<'DESC'
-=== Demo 1: Deterministic Run ===
-
-Hermit preserves the guest exit status and output while making random bytes,
-wall-clock time, Python hash seeding, and heap address layout stable across
-runs. run_hermit --verify re-runs the guest and compares status, output, and
-Hermit's deterministic execution log. The guest must be idempotent: a first run
-that changes a file, database, cache, or external service can legitimately
-change the second run.
-DESC
+echo ''
+echo '=========================================='
+echo '=== Demo 1: Deterministic Run ==='
+echo '=========================================='
+echo ''
+echo 'Hermit preserves the guest exit status and output while making random bytes,'
+echo 'wall-clock time, Python hash seeding, and heap address layout stable across'
+echo 'runs. run_hermit --verify re-runs the guest and compares status, output, and'
+echo "Hermit's deterministic execution log. The guest must be idempotent: a first run"
+echo 'that changes a file, database, cache, or external service can legitimately'
+echo 'change the second run.'
+echo ''
+echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
