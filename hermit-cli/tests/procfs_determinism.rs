@@ -165,7 +165,7 @@ fn proc_entropy_available_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review mountinfo, UUID, and resource-counter snapshots.
+// TODO-HUMAN-REVIEW(PR-873): Review mountinfo, UUID, and resource-counter snapshots.
 #[test]
 fn proc_self_mountinfo_hides_private_temp_roots() {
     fn private_mount_records() -> Vec<String> {

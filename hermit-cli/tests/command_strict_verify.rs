@@ -307,7 +307,7 @@ fn identity_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review kernel pseudo-file command coverage.
+// TODO-HUMAN-REVIEW(PR-873): Review kernel pseudo-file command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + util-linux/procps/sysstat"]
 fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {

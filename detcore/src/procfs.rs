@@ -48,7 +48,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review deterministic kernel pseudo-file snapshots.
+            // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             "/proc/self/mountinfo" => ProcfsKind::Mountinfo,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
@@ -271,7 +271,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review private mount-root and kernel-counter normalization.
+// TODO-HUMAN-REVIEW(PR-873): Review private mount-root and kernel-counter normalization.
 fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
     const TEMP_ROOT_PREFIX: &[u8] = b"/tmpvol/.tmp";
 
