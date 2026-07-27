@@ -398,6 +398,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // fall back to determinized read/write loops.
         | Sysno::sendfile
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): copy_file_range availability and behavior
+        // depend on the host kernel and filesystem pair. Return fixed ENOSYS so
+        // callers take their portable read/write fallback.
+        | Sysno::copy_file_range
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
         // process accounting and cross-process memory access. Detcore does not
         // model host process-accounting state or translate/synchronize target
@@ -626,7 +631,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -918,7 +922,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [232, 91, 50]);
+        assert_eq!(counts, [233, 91, 49]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -987,6 +991,12 @@ mod tests {
         for sysno in [Sysno::close_range, Sysno::seccomp, Sysno::sendfile] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD)
+        assert_eq!(
+            classify_syscall(Sysno::copy_file_range),
+            SyscallClassification::Determinized
+        );
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
         assert_eq!(
