@@ -411,7 +411,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for unmodeled kernel
+        // TODO-HUMAN-REVIEW(PR-856): Deterministic ENOSYS for unmodeled kernel
         // features with established compatibility fallbacks. Kernel-managed
         // copy progress, nonlinear page remapping, and another task's robust
         // list are outside Detcore's FD, VM, and virtual-PID models.
@@ -899,7 +899,7 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic kernel-feature fallback set.
+// TODO-HUMAN-REVIEW(PR-856): Deterministic kernel-feature fallback set.
 /// Kernel interfaces whose state transitions are outside Detcore's model but
 /// whose callers have explicit feature-absence paths. `copy_file_range` tracks
 /// kernel-side file offsets and partial copy progress, `remap_file_pages`

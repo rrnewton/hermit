@@ -1387,7 +1387,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Present stable feature absence for
+            // TODO-HUMAN-REVIEW(PR-856): Present stable feature absence for
             // unmodeled copy, nonlinear mapping, and robust-list interfaces.
             SyscallClassification::Determinized
                 if is_kernel_feature_fallback_syscall(call.number()) =>
