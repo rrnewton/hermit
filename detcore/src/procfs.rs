@@ -66,7 +66,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
             "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host scheduler accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
