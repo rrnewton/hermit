@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
 #
-# Demo 5: boot Linux in QEMU under Hermit's strict deterministic profile.
+# Demo 5: boot Linux under Hermit and save a reusable QEMU snapshot.
 
 set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
-DEMO_LABEL="Demo 5: QEMU Linux Boot"
+DEMO_LABEL="Demo 5: QEMU Linux Snapshot"
 cat <<'DESC'
-=== Demo 5: QEMU Linux Boot ===
+=== Demo 5: QEMU Linux Snapshot ===
 
-Hermit runs QEMU's TCG emulator, which boots a real Linux kernel and prints its
-guest-visible Real-Time Clock (RTC). The boot runs with --strict, so unsupported
-operations fail closed instead of escaping Hermit's deterministic boundary.
---verify can compare two complete boots, but this demo omits it to keep the
-runtime practical. Run this demo again -- you will see identical INFO logs.
+Hermit runs QEMU's TCG emulator in strict mode, boots a real Linux kernel to
+its serial shell, and saves that live machine as the internal snapshot
+"hermit-boot". Demo 6 can then resume the shell without booting Linux again.
 DESC
 
 # shellcheck source=demos/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+# shellcheck source=demos/lib/qemu-snapshot.sh
+source "$DEMO_DIR/lib/qemu-snapshot.sh"
 
 export QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
 export QEMU_TIMEOUT="${QEMU_TIMEOUT:-600}"
 export HERMIT_RELEASE="${HERMIT_RELEASE:-$HERMIT_REPO/target/release/hermit}"
 export QEMU_ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
-# Keep the evidence readable: global INFO emits millions of per-syscall lines
-# during a VM boot. These targets retain deterministic seed/lifecycle INFO.
 export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-detcore::scheduler::runqueue=info,detcore::tool_global=info}"
+export QEMU_SNAPSHOT_NAME="${QEMU_SNAPSHOT_NAME:-hermit-boot}"
+export QEMU_SNAPSHOT_DISK="${QEMU_SNAPSHOT_DISK:-$QEMU_ASSETS/hermit-snapshot.qcow2}"
+export QEMU_SNAPSHOT_ID_FILE="${QEMU_SNAPSHOT_ID_FILE:-$QEMU_SNAPSHOT_DISK.id}"
+export QEMU_SNAPSHOT_SIZE="${QEMU_SNAPSHOT_SIZE:-64M}"
 
-# Build the ignored artifacts on first use, then reuse the cache. This keeps a
-# clean checkout self-contained without committing a kernel or initramfs.
 if [ ! -r "$QEMU_ASSETS/bzImage" ] || \
-   [ ! -r "$QEMU_ASSETS/initramfs.cpio.gz" ]; then
+   [ ! -r "$QEMU_ASSETS/initramfs.cpio.gz" ] || \
+   [ "$(cat "$QEMU_ASSETS/.initramfs-version" 2>/dev/null || true)" != 2 ]; then
   demo_banner "Provision QEMU kernel and initramfs"
   "$DEMO_DIR/lib/qemu-assets.sh"
 fi
@@ -52,25 +53,42 @@ test -r "$QEMU_ASSETS/initramfs.cpio.gz" || {
   echo "missing QEMU initramfs: $QEMU_ASSETS/initramfs.cpio.gz" >&2
   exit 1
 }
+qemu_snapshot_require_tools
 
-export QEMU_LOG="${QEMU_LOG:-$DEMO_ARTIFACTS/qemu-linux-boot.log}"
-input_fifo="$DEMO_ARTIFACTS/qemu-linux-input.$$"
-rm -f "$input_fifo"
+mkdir -p "$QEMU_ASSETS"
+snapshot_tmp="$QEMU_SNAPSHOT_DISK.tmp.$$"
+snapshot_id_tmp="$QEMU_SNAPSHOT_ID_FILE.tmp.$$"
+rm -f "$QEMU_SNAPSHOT_ID_FILE"
+qemu-img create -q -f qcow2 "$snapshot_tmp" "$QEMU_SNAPSHOT_SIZE"
+mv -f "$snapshot_tmp" "$QEMU_SNAPSHOT_DISK"
+snapshot_tmp=""
+
+export QEMU_LOG="${QEMU_LOG:-$DEMO_ARTIFACTS/qemu-snapshot-boot.log}"
+serial_log="$DEMO_ARTIFACTS/qemu-snapshot-boot.serial.log"
+info_tail="$DEMO_ARTIFACTS/qemu-snapshot-boot.info.log"
+qmp_socket="$DEMO_ARTIFACTS/qemu-snapshot-qmp.sock"
+serial_socket="$DEMO_ARTIFACTS/qemu-snapshot-serial.sock"
+input_fifo="$DEMO_ARTIFACTS/qemu-snapshot-input.$$"
+hermit_pid=""
+serial_pid=""
+
+cleanup_qemu() {
+  exec 3>&- 2>/dev/null || true
+  qemu_stop_pid "$serial_pid"
+  qemu_stop_pid "$hermit_pid"
+  [ -z "$snapshot_tmp" ] || rm -f "$snapshot_tmp"
+  [ -z "$snapshot_id_tmp" ] || rm -f "$snapshot_id_tmp"
+  rm -f "$input_fifo" "$qmp_socket" "$serial_socket"
+}
+trap cleanup_qemu EXIT
+
+rm -f "$input_fifo" "$qmp_socket" "$serial_socket"
 mkfifo "$input_fifo"
 exec 3<>"$input_fifo"
-cleanup_qemu_input() {
-  exec 3>&-
-  rm -f "$input_fifo"
-}
-trap cleanup_qemu_input EXIT
-
-demo_banner "Boot Linux and power off from its serial shell"
 : >"$QEMU_LOG"
+: >"$serial_log"
 
-# -nographic assigns the QEMU monitor and serial port to stdio by default.
-# Disabling the monitor is required before the requested explicit
-# `-serial stdio`; without it QEMU 10.1 exits because two devices claim stdio.
-set +e
+demo_banner "Boot Linux to its serial shell"
 RUST_LOG="$QEMU_LOG_FILTER" \
 timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   "$HERMIT_RELEASE" run \
@@ -82,68 +100,81 @@ timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   -cpu max \
   -smp 1 \
   -m 512M \
-  -nographic \
+  -display none \
   -monitor none \
-  -serial stdio \
+  -serial "unix:$serial_socket,server=on,wait=off" \
+  -qmp "unix:$qmp_socket,server=on,wait=off" \
+  -drive "if=none,id=hermit-snapshot-store,file=$QEMU_SNAPSHOT_DISK,format=qcow2" \
   -icount shift=0,sleep=off \
   -rtc base=2022-01-01T00:00:00,clock=vm \
   -kernel "$QEMU_ASSETS/bzImage" \
   -initrd "$QEMU_ASSETS/initramfs.cpio.gz" \
   -append 'console=ttyS0 reboot=t' \
-  <"$input_fifo" >"$QEMU_LOG" 2>&1 &
-boot_pid=$!
-set -e
+  >"$QEMU_LOG" 2>&1 &
+hermit_pid=$!
 
-# This staged initramfs opens an interactive shell after its boot marker. Wait
-# until the marker is visible so firmware cannot consume the poweroff command.
+qemu_wait_for_socket "$qmp_socket" "$hermit_pid" 60
+qemu_wait_for_socket "$serial_socket" "$hermit_pid" 60
+nc -U "$serial_socket" <"$input_fifo" >"$serial_log" 2>&1 &
+serial_pid=$!
+
 marker='HERMIT-QEMU-BASELINE-BOOT-OK'
-for ((attempt = 0; attempt < QEMU_TIMEOUT * 5; attempt++)); do
-  if grep -q "$marker" "$QEMU_LOG"; then
-    sleep 1
-    printf 'poweroff -f\n' >&3
-    break
-  fi
-  if ! kill -0 "$boot_pid" 2>/dev/null; then
-    break
-  fi
-  sleep 0.2
-done
+qemu_wait_for_log_line "$serial_log" "$marker" "$hermit_pid" "$QEMU_TIMEOUT"
+qemu_wait_for_log_line "$serial_log" '~ #' "$hermit_pid" "$QEMU_TIMEOUT"
+sleep "${QEMU_SNAPSHOT_SETTLE_SECONDS:-0.2}"
+
+demo_banner "Save live snapshot $QEMU_SNAPSHOT_NAME"
+qemu_qmp_command "$qmp_socket" human-monitor-command command-line \
+  "savevm $QEMU_SNAPSHOT_NAME"
+qemu_qmp_command "$qmp_socket" quit
 
 set +e
-wait "$boot_pid"
+wait "$hermit_pid"
 boot_rc=$?
+hermit_pid=""
+qemu_stop_pid "$serial_pid"
+serial_pid=""
 set -e
 
 if [ "$boot_rc" -ne 0 ]; then
-  echo "QEMU boot exited with status $boot_rc; transcript: $QEMU_LOG" >&2
+  echo "QEMU snapshot boot exited with status $boot_rc; log: $QEMU_LOG" >&2
   exit "$boot_rc"
 fi
-grep -q "$marker" "$QEMU_LOG" || {
+grep -Fq "$marker" "$serial_log" || {
   echo "QEMU exited without the expected boot marker: $marker" >&2
   exit 1
 }
-grep -q 'reboot: Power down' "$QEMU_LOG" || {
-  echo "QEMU exited without a clean Linux power-down marker" >&2
+qemu_snapshot_exists "$QEMU_SNAPSHOT_DISK" "$QEMU_SNAPSHOT_NAME" || {
+  echo "snapshot $QEMU_SNAPSHOT_NAME is missing from $QEMU_SNAPSHOT_DISK" >&2
   exit 1
 }
+sha256sum "$QEMU_SNAPSHOT_DISK" | cut -d' ' -f1 >"$snapshot_id_tmp"
+mv "$snapshot_id_tmp" "$QEMU_SNAPSHOT_ID_FILE"
+snapshot_id_tmp=""
 
-rtc_line="$(grep 'rtc_cmos.*setting system clock to' "$QEMU_LOG" | tail -1 || true)"
+rtc_line="$(grep 'rtc_cmos.*setting system clock to' "$serial_log" | tail -1 || true)"
 case "$rtc_line" in
   *'2022-01-01T'*' UTC ('*) ;;
   *)
-    echo "missing Hermit virtual-epoch RTC timestamp in $QEMU_LOG" >&2
+    echo "missing Hermit virtual-epoch RTC timestamp in $serial_log" >&2
     exit 1
     ;;
 esac
 
-demo_banner "Guest-visible virtual timestamp"
+demo_banner "Snapshot ready"
 printf '%s\n' "$rtc_line"
+qemu-img snapshot -l "$QEMU_SNAPSHOT_DISK"
 
-demo_banner "Hermit INFO log snippet"
-grep -E ' INFO (detcore::scheduler::runqueue: DETLOG SCHEDRAND|detcore::tool_global: detcore shut down)' \
-  "$QEMU_LOG" | sed -E 's/^[^ ]+ +//'
+qemu_write_stable_info_tail "$QEMU_LOG" "$info_tail"
+demo_banner "Hermit INFO log tail"
+cat "$info_tail"
+
+demo_banner "Paste a snapshot-resume command"
+printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'ls /'
+printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'cat /proc/cpuinfo'
+printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'uname -a'
+printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'echo hello'
 echo
-echo "Run this demo again -- you will see identical INFO logs."
-echo "For a paired comparison, --verify is available but intentionally omitted here because a second VM boot is slow."
+echo "Run the same line twice. Demo 6 compares its normalized INFO tail with the previous run."
 
 demo_success
