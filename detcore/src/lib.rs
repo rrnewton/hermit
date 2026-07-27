@@ -2107,11 +2107,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         self.post_handler_hook(guest).await;
 
-        // Defense-in-depth: before returning to the guest, force the
-        // syscall-clobbered registers (%rcx/%r11 on x86-64) to deterministic
-        // values so that even a misbehaving guest cannot observe nondeterminism
-        // (or Reverie's private trampoline address) through them.
-        self.canonicalize_syscall_clobbers(guest).await;
+        // Defense-in-depth: unless the backend already owns this guarantee,
+        // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to
+        // deterministic values before returning to the guest.
+        if !self.cfg.syscall_clobbers_virtualized_by_backend {
+            self.canonicalize_syscall_clobbers(guest).await;
+        }
 
         res
     }

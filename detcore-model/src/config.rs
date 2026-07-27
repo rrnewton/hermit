@@ -64,6 +64,14 @@ pub struct Config {
     #[clap(skip)]
     pub use_thread_local_clock_reads: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
+    /// The execution backend already returns deterministic values for registers clobbered by a
+    /// syscall instruction, so Detcore must not write the complete register set back afterward.
+    #[serde(default)]
+    #[clap(skip)]
+    pub syscall_clobbers_virtualized_by_backend: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
