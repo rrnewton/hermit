@@ -1014,7 +1014,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-XXX): Review virtual sched_setattr no-op policy.
+    // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
     /// Linux scheduler attributes cannot affect Detcore's replacement
     /// scheduler. Accept the request as a deterministic no-op, matching the
     /// existing sched_setscheduler and sched_setparam policy.
@@ -1053,7 +1053,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-XXX): Review virtual ioprio_get default.
+    // TODO-HUMAN-REVIEW(PR-841): Review virtual ioprio_get default.
     /// Return the fixed default I/O class and priority paired with the existing
     /// no-op ioprio_set policy. Linux encodes IOPRIO_CLASS_NONE/priority 0 as 0.
     pub async fn handle_ioprio_get<G: Guest<Self>>(

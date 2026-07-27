@@ -592,7 +592,7 @@ impl GlobalTool for GlobalState {
                 R::RegisterAlarm(remaining)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-XXX): Review logical alarm query RPC.
+            // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
             GlobalRequest::AlarmRemaining(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 R::AlarmRemaining(self.sched.lock().unwrap().alarm_remaining(dpid, now))
@@ -1297,7 +1297,7 @@ pub enum GlobalRequest {
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-XXX): Review logical alarm query RPC.
+    // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     /// Return the logical time remaining on a process's one-shot alarm.
     AlarmRemaining(DetPid),
 
@@ -1344,7 +1344,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-XXX): Review logical alarm query RPC.
+    // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     AlarmRemaining(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -1887,7 +1887,7 @@ where
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-XXX): Review logical alarm query API.
+// TODO-HUMAN-REVIEW(PR-841): Review logical alarm query API.
 /// Return the logical duration remaining on the process's one-shot alarm.
 pub async fn alarm_remaining<G, T>(guest: &mut G) -> LogicalTime
 where

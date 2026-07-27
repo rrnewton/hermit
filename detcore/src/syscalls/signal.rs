@@ -147,7 +147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-XXX): Review logical one-shot getitimer emulation.
+    // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
     /// Report Detcore's logical one-shot ITIMER_REAL state without consulting
     /// host elapsed time. Repeating and CPU-time timers remain unsupported.
     pub async fn handle_getitimer<G: Guest<Self>>(
