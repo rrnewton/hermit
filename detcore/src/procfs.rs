@@ -55,6 +55,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
+    SelfSchedstat,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -198,6 +199,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
             // like `lscpu` under `--verify`. These are opened relative to a
@@ -274,6 +278,7 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
+            ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
         });
     }
 
@@ -1279,6 +1284,17 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     normalized
 }
 
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/schedstat field policy.
+fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else if contents.ends_with(b"\n") {
+        b"0 0 0\n".to_vec()
+    } else {
+        b"0 0 0".to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,6 +1474,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::DentryState
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/schedstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SelfSchedstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -2000,6 +2022,25 @@ THPeligible:    0\n"
 
         let invalid_counter = b"71000000 default active=recent N0=1\n";
         assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
+    }
+
+    #[test]
+    fn self_schedstat_hides_host_scheduler_accounting() {
+        assert_eq!(
+            sanitize_self_schedstat(b"3029609 1559338 150\n"),
+            b"0 0 0\n"
+        );
+        assert_eq!(sanitize_self_schedstat(b"3029609 1559338 150"), b"0 0 0");
+    }
+
+    #[test]
+    fn self_schedstat_fails_closed_on_unknown_formats() {
+        let extra_field = b"3029609 1559338 150 4\n";
+        assert_eq!(sanitize_self_schedstat(extra_field), b"0 0 0\n");
+
+        let invalid_counter = b"3029609 waiting 150\n";
+        assert_eq!(sanitize_self_schedstat(invalid_counter), b"0 0 0\n");
+        assert!(sanitize_self_schedstat(b"").is_empty());
     }
 
     #[test]
