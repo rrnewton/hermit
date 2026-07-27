@@ -1460,7 +1460,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Legacy nonlinear page
+            // TODO-HUMAN-REVIEW(PR-882): Legacy nonlinear page
             // remapping has host-dependent kernel support and VMA behavior that
             // Detcore does not model. Preserve the documented mmap fallback.
             SyscallClassification::Determinized
