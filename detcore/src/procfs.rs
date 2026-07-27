@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    BlockInflight,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review host block queue-depth normalization.
+            _ if is_block_inflight_path(path) => ProcfsKind::BlockInflight,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,40 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+fn is_block_inflight_path(path: &Path) -> bool {
+    path.file_name().and_then(|leaf| leaf.to_str()) == Some("inflight")
+        && path.parent().and_then(Path::parent) == Some(Path::new("/sys/block"))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /sys/block/<device>/inflight field policy.
+fn sanitize_block_inflight(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let has_newline = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.contains('\n') {
+        return contents.to_vec();
+    }
+
+    let mut fields = body.split_whitespace();
+    let valid = matches!(
+        (fields.next(), fields.next(), fields.next()),
+        (Some(reads), Some(writes), None)
+            if reads.parse::<u64>().is_ok() && writes.parse::<u64>().is_ok()
+    );
+    if !valid {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0 0\n".to_vec()
+    } else {
+        b"0 0".to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +379,16 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/block/md0/inflight"))
+                .unwrap()
+                .kind,
+            ProcfsKind::BlockInflight
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/block/md0/stat")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/block/md0/size")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/class/block/md0/inflight")).is_none());
     }
 
     #[test]
@@ -431,6 +479,24 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn block_inflight_hides_host_queue_depths() {
+        assert_eq!(sanitize_block_inflight(b"      24        3\n"), b"0 0\n");
+        assert_eq!(sanitize_block_inflight(b"0 7"), b"0 0");
+    }
+
+    #[test]
+    fn block_inflight_leaves_unknown_formats_untouched() {
+        let malformed = b"reads writes\n";
+        assert_eq!(sanitize_block_inflight(malformed), malformed);
+
+        let extra_field = b"1 2 3\n";
+        assert_eq!(sanitize_block_inflight(extra_field), extra_field);
+
+        let extra_row = b"1 2\n3 4\n";
+        assert_eq!(sanitize_block_inflight(extra_row), extra_row);
     }
 
     #[test]
