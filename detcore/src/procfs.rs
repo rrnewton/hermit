@@ -22,6 +22,51 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    ThpCounter,
+}
+
+const THP_COUNTERS: &[&str] = &[
+    "anon_fault_alloc",
+    "anon_fault_fallback",
+    "anon_fault_fallback_charge",
+    "nr_anon",
+    "nr_anon_partially_mapped",
+    "shmem_alloc",
+    "shmem_fallback",
+    "shmem_fallback_charge",
+    "split",
+    "split_deferred",
+    "split_failed",
+    "swpin",
+    "swpin_fallback",
+    "swpin_fallback_charge",
+    "swpout",
+    "swpout_fallback",
+    "zswpout",
+];
+
+fn is_thp_counter_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some(counter) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(stats) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(size_dir) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+
+    let Some(size_kb) = size_dir
+        .strip_prefix("hugepages-")
+        .and_then(|value| value.strip_suffix("kB"))
+    else {
+        return false;
+    };
+    stats == "stats"
+        && !size_kb.is_empty()
+        && size_kb.bytes().all(|byte| byte.is_ascii_digit())
+        && THP_COUNTERS.contains(&counter)
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -56,6 +101,9 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
+            other if is_thp_counter_path(Path::new(other)) => ProcfsKind::ThpCounter,
             _ => return None,
         };
         Some(Self {
@@ -87,6 +135,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +281,16 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
+fn sanitize_thp_counter(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -369,6 +428,33 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_per_size_thp_counters() {
+        for counter in THP_COUNTERS {
+            let path = format!("hugepages-2048kB/stats/{counter}");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::ThpCounter
+            );
+        }
+
+        for path in [
+            "hugepages-2048kB/enabled",
+            "hugepages-2048kB/shmem_enabled",
+            "hugepages-2048kB/stats/unknown",
+            "hugepages-kB/stats/nr_anon",
+            "hugepages-2MB/stats/nr_anon",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn thp_counter_is_fixed() {
+        assert_eq!(sanitize_thp_counter(b"37515411\n"), b"0\n");
+        assert!(sanitize_thp_counter(b"").is_empty());
     }
 
     #[test]
