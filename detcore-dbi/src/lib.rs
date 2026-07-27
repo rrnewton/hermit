@@ -932,7 +932,15 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     // to distinguish timestamp ioctls or timestamp-enabled receive buffers.
     // Strict mode therefore fails closed for the three syscall classes that can
     // expose native socket timestamps. Non-strict mode retains native behavior.
-    if matches!(sysno, Sysno::ioctl | Sysno::recvmsg | Sysno::recvmmsg) && strict {
+    // TODO-HUMAN-REVIEW(PR-972): readlink identity canonicalization also requires
+    // Detcore mediation. This ABI has neither syscall arguments nor a memory
+    // writer, so a copied child must fail closed rather than expose native
+    // pipe/socket inode identities.
+    if matches!(
+        sysno,
+        Sysno::ioctl | Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
+    ) && strict
+    {
         return 1;
     }
     if detcore::is_deterministically_refused_syscall(sysno)
@@ -1476,6 +1484,8 @@ mod tests {
             libc::SYS_ioctl,
             libc::SYS_recvmsg,
             libc::SYS_recvmmsg,
+            libc::SYS_readlink,
+            libc::SYS_readlinkat,
         ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
@@ -1502,6 +1512,8 @@ mod tests {
             libc::SYS_recvmsg,
             libc::SYS_recvmmsg,
             libc::SYS_read,
+            libc::SYS_readlink,
+            libc::SYS_readlinkat,
         ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
