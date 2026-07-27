@@ -1405,7 +1405,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Refuse nested tracing, host-object
+            // TODO-HUMAN-REVIEW(PR-853): Refuse nested tracing, host-object
             // comparison, and guest PMU access at the deterministic boundary.
             SyscallClassification::Determinized
                 if is_privileged_observation_refused_syscall(call.number()) =>

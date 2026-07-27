@@ -459,7 +459,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::cachestat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_list_modules
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic EPERM for privileged host
+        // TODO-HUMAN-REVIEW(PR-853): Deterministic EPERM for privileged host
         // observation/control interfaces. Nested ptrace and kcmp expose host
         // PIDs, permissions, and kernel-object identity; guest perf events
         // expose nondeterministic PMU state and compete with Detcore's PMU use.
@@ -950,7 +950,7 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic privileged-observation refusal set.
+// TODO-HUMAN-REVIEW(PR-853): Deterministic privileged-observation refusal set.
 /// Privileged host observation and control interfaces that Detcore deliberately
 /// refuses. Nested `ptrace` and `kcmp` depend on untranslated host PIDs,
 /// permissions, process lifetimes, and kernel-object identity. Guest
