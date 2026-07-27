@@ -7,5 +7,5 @@ file_read	pass	pass	pass	-	-
 pthread_lifecycle	pass	pass	gap	-	KVM single-vCPU personality does not implement clone and futex thread lifecycle
 cpuid_policy	pass	pass	gap	-	KVM exposes the host vendor and maximum leaves instead of Detcore's ptrace CPUID identity
 virtual_clock	pass	pass	pass	-	-
-random_sources	pass	gap	gap	DBI observes syscalls but does not route random sources through Detcore	KVM random fixture still requires thread lifecycle and page-permission fault enforcement
+random_sources	pass	pass	gap	-	KVM random fixture still requires thread lifecycle and page-permission fault enforcement
 virtual_pid	pass	pass	pass	-	-

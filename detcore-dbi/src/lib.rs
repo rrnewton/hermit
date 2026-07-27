@@ -36,9 +36,11 @@ use std::task::Poll;
 use std::task::Waker;
 
 use detcore::Config;
+use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::thread_rng_from_parent;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Pid;
@@ -58,6 +60,8 @@ use reverie_dbi::SyscallInvoker;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
+const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
+const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
@@ -65,6 +69,7 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
+type PendingThreadParent = (Tid, DetcoreThreadState, DetTid);
 type Emitter = reverie_dbi::RuntimeEmitter;
 type Idler = reverie_dbi::RuntimeIdler;
 
@@ -219,8 +224,11 @@ struct NativeThreadScratch {
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
-static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, (Tid, DetcoreThreadState)>>> =
+static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// Pcg64Mcg forces its internal state odd, so adjacent even/odd seed IDs can alias.
+// Keep DBI stream IDs even and advance by two.
+static NEXT_DBI_RANDOM_STREAM_ID: AtomicI32 = AtomicI32::new(2);
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -270,6 +278,39 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
+}
+
+fn getrandom_flags_are_valid(flags: u64) -> bool {
+    let flags = flags as u32;
+    let random = flags & libc::GRND_RANDOM != 0;
+    let insecure = flags & libc::GRND_INSECURE != 0;
+
+    flags & !GETRANDOM_ALLOWED_FLAGS == 0 && !(random && insecure)
+}
+
+fn getrandom_writable_prefix(
+    args: &[u64],
+    mut invoke: impl FnMut(&[u64; 6]) -> i64,
+) -> Option<Result<usize, i64>> {
+    if args[1] == 0 || !getrandom_flags_are_valid(args[2]) {
+        return None;
+    }
+
+    let length = (args[1] as usize).min(GETRANDOM_MAX_BYTES);
+    let probe_args = [
+        args[0],
+        length as u64,
+        u64::from(libc::GRND_NONBLOCK),
+        0,
+        0,
+        0,
+    ];
+    let result = invoke(&probe_args);
+    if result < 0 {
+        Some(Err(result))
+    } else {
+        Some(Ok((result as usize).min(length)))
+    }
 }
 
 fn report_fd_is_available() -> bool {
@@ -609,12 +650,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     };
     let parent_ref = parent
         .as_ref()
-        .map(|(parent_tid, state)| (*parent_tid, state));
+        .map(|(parent_tid, state, _)| (*parent_tid, state));
     let tid = Pid::from_raw(tid);
     let pid = Pid::from_raw(pid);
+    let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref);
+    if let Some((_, parent_state, stream_id)) = parent.as_ref() {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review stable DBI child random streams.
+        state.prng = thread_rng_from_parent("DBI USER RAND", &parent_state.prng, *stream_id);
+    }
     let mut thread = Box::new(ThreadRuntime {
         tid,
-        state: tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref),
+        state,
         initialized: false,
         post_exec_pending: tid == pid,
     });
@@ -675,11 +722,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     let parent = unsafe { &mut *scratch.runtime_state };
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review stable DBI child random streams.
+    let random_stream_id =
+        DetTid::from_raw(NEXT_DBI_RANDOM_STREAM_ID.fetch_add(2, Ordering::SeqCst));
     let parent_snapshot = parent.state.clone();
     if PENDING_THREAD_PARENTS
         .lock()
         .expect("pending DBI thread parent lock poisoned")
-        .insert(child_tid, (Tid::from_raw(parent_tid), parent_snapshot))
+        .insert(
+            child_tid,
+            (Tid::from_raw(parent_tid), parent_snapshot, random_stream_id),
+        )
         .is_some()
     {
         parent.state.clone_flags = None;
@@ -819,6 +873,25 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review DBI getrandom fault-prefix probing.
+    // The probe writes host-random bytes only to discover the kernel-approved prefix;
+    // Detcore overwrites that entire prefix before the application resumes.
+    if sysnum == libc::SYS_getrandom
+        && let Some(probe) = getrandom_writable_prefix(raw_args, |probe_args| unsafe {
+            invoke_syscall(context as usize, libc::SYS_getrandom, probe_args.as_ptr())
+        })
+    {
+        match probe {
+            Ok(accessible) => dispatch_args[1] = accessible as u64,
+            Err(error) => {
+                unsafe { result.write(error) };
+                TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                return 1;
+            }
+        }
+    }
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -852,12 +925,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
-            raw_args[0] as usize,
-            raw_args[1] as usize,
-            raw_args[2] as usize,
-            raw_args[3] as usize,
-            raw_args[4] as usize,
-            raw_args[5] as usize,
+            dispatch_args[0] as usize,
+            dispatch_args[1] as usize,
+            dispatch_args[2] as usize,
+            dispatch_args[3] as usize,
+            dispatch_args[4] as usize,
+            dispatch_args[5] as usize,
         ),
     );
 
@@ -1041,6 +1114,49 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    #[test]
+    fn getrandom_flag_validation_matches_detcore_policy() {
+        for flags in [
+            0,
+            u64::from(libc::GRND_NONBLOCK),
+            u64::from(libc::GRND_RANDOM),
+            u64::from(libc::GRND_NONBLOCK | libc::GRND_RANDOM),
+            1_u64 << 32,
+        ] {
+            assert!(getrandom_flags_are_valid(flags), "flags={flags:#x}");
+        }
+        assert!(!getrandom_flags_are_valid(u64::from(
+            libc::GRND_RANDOM | libc::GRND_INSECURE
+        )));
+        assert!(!getrandom_flags_are_valid(0x8000_0000));
+    }
+
+    #[test]
+    fn getrandom_probe_uses_nonblocking_kernel_write_and_preserves_result() {
+        let args = [0x1000, 16, 0, 0, 0, 0];
+        let partial = getrandom_writable_prefix(&args, |probe| {
+            assert_eq!(probe[0], 0x1000);
+            assert_eq!(probe[1], 16);
+            assert_eq!(probe[2], u64::from(libc::GRND_NONBLOCK));
+            8
+        });
+        assert_eq!(partial, Some(Ok(8)));
+
+        let fault = getrandom_writable_prefix(&args, |_| -(Errno::EFAULT.into_raw() as i64));
+        assert_eq!(fault, Some(Err(-(Errno::EFAULT.into_raw() as i64))));
+
+        let invalid_flags = [0x1000, 16, 0x8000_0000, 0, 0, 0];
+        let mut invoked = false;
+        assert_eq!(
+            getrandom_writable_prefix(&invalid_flags, |_| {
+                invoked = true;
+                16
+            }),
+            None
+        );
+        assert!(!invoked);
     }
 
     #[test]
