@@ -50,6 +50,8 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
+    std::fs::create_dir_all(home.path().join(".config/procps"))
+        .expect("failed to preseed the isolated procps HOME");
     let mut command = Command::new("timeout");
     command
         .args([
