@@ -10,6 +10,7 @@
 
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::path::Path;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
@@ -51,6 +52,36 @@ use crate::types::*;
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
+}
+
+fn is_canonical_self_proc_fd(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    ["/proc/self/fd/", "/proc/thread-self/fd/"]
+        .into_iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn parse_proc_fd_link_target(target: &[u8]) -> Option<(&'static str, RawInode)> {
+    for (prefix, kind) in [
+        (b"pipe:[".as_slice(), "pipe"),
+        (b"socket:[".as_slice(), "socket"),
+    ] {
+        let Some(inode) = target
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(b"]"))
+        else {
+            continue;
+        };
+        if inode.is_empty() || !inode.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let inode = std::str::from_utf8(inode).ok()?.parse().ok()?;
+        return Some((kind, inode));
+    }
+    None
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -174,6 +205,64 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(e.into())
             }
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink identity virtualization.
+    async fn normalize_proc_fd_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        output: Option<AddrMut<'_, libc::c_char>>,
+        capacity: usize,
+        result: i64,
+    ) -> Result<i64, Error> {
+        if result <= 0 || !is_canonical_self_proc_fd(path) {
+            return Ok(result);
+        }
+
+        let output = output.ok_or(Errno::EFAULT)?;
+        let mut target = vec![0; result as usize];
+        guest.memory().read_exact(output.cast(), &mut target)?;
+        let Some((kind, raw_inode)) = parse_proc_fd_link_target(&target) else {
+            return Ok(result);
+        };
+
+        let (det_inode, _) = determinize_inode(guest, raw_inode).await;
+        let target = format!("{kind}:[{det_inode}]").into_bytes();
+        let count = target.len().min(capacity);
+        guest
+            .memory()
+            .write_exact(output.cast(), &target[..count])?;
+        Ok(count as i64)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review readlink forwarding and output normalization.
+    /// Forward `readlink` and normalize kernel identities in canonical proc-fd targets.
+    pub async fn handle_readlink<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlink,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let result = self.record_or_replay(guest, call).await?;
+        self.normalize_proc_fd_link(guest, &path, call.buf(), call.bufsize(), result)
+            .await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review readlinkat forwarding and output normalization.
+    /// Forward `readlinkat` and normalize kernel identities in canonical proc-fd targets.
+    pub async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlinkat,
+    ) -> Result<i64, Error> {
+        let path = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let result = self.record_or_replay(guest, call).await?;
+        self.normalize_proc_fd_link(guest, &path, call.buf(), call.buf_len(), result)
+            .await
     }
 
     /// SYS_close system call.
@@ -1868,7 +1957,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod test {
+    use std::path::Path;
+
     use nix::fcntl::OFlag;
+
+    use super::is_canonical_self_proc_fd;
+    use super::parse_proc_fd_link_target;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -1876,5 +1970,45 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn canonical_proc_fd_paths_are_narrow() {
+        assert!(is_canonical_self_proc_fd(Path::new("/proc/self/fd/1")));
+        assert!(is_canonical_self_proc_fd(Path::new(
+            "/proc/thread-self/fd/20"
+        )));
+        for path in [
+            "/proc/self/fd/",
+            "/proc/self/fd/1/status",
+            "/proc/self/fd/stdout",
+            "/proc/3/fd/1",
+            "/dev/fd/1",
+            "pipe:[123]",
+        ] {
+            assert!(!is_canonical_self_proc_fd(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn proc_fd_link_targets_require_complete_kernel_shapes() {
+        assert_eq!(
+            parse_proc_fd_link_target(b"pipe:[123]"),
+            Some(("pipe", 123))
+        );
+        assert_eq!(
+            parse_proc_fd_link_target(b"socket:[18446744073709551615]"),
+            Some(("socket", u64::MAX))
+        );
+        for target in [
+            b"pipe:[123".as_slice(),
+            b"pipe:[]",
+            b"pipe:[12x]",
+            b"socket:[18446744073709551616]",
+            b"anon_inode:[eventfd]",
+            b"/tmp/pipe:[123]",
+        ] {
+            assert_eq!(parse_proc_fd_link_target(target), None);
+        }
     }
 }

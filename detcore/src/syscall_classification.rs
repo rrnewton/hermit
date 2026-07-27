@@ -410,6 +410,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_readv
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink identity virtualization.
+        | Sysno::readlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::readlinkat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -478,7 +483,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getuid
         | Sysno::lseek
         | Sysno::mprotect
-        | Sysno::readlink
         | Sysno::set_robust_list
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -537,7 +541,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fallocate
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::readlinkat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::rename
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -918,8 +921,15 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [232, 91, 50]);
+        assert_eq!(counts, [234, 89, 50]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
+    }
+
+    #[test]
+    fn proc_fd_link_syscalls_are_determinized() {
+        for sysno in [Sysno::readlink, Sysno::readlinkat] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
     }
 
     #[test]
@@ -1061,7 +1071,6 @@ mod tests {
             Sysno::getresuid,
             Sysno::munlock,
             Sysno::munlockall,
-            Sysno::readlinkat,
             Sysno::rename,
             Sysno::renameat,
             Sysno::getgroups,
@@ -1085,7 +1094,6 @@ mod tests {
             Sysno::removexattr,
             Sysno::readahead,
             Sysno::renameat2,
-            Sysno::readlinkat,
             Sysno::rmdir,
             Sysno::rt_sigreturn,
             Sysno::setxattr,
