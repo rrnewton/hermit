@@ -943,7 +943,7 @@ async fn run_kvm(
     config.backend_supports_madvise = false;
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
     // same synthetic identity that the namespace-backed ptrace path exposes.
-    // TODO-HUMAN-REVIEW(PR-TBD): Review KVM UTS namespace parity.
+    // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
     config.has_uts_namespace = false;
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
