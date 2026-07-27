@@ -126,7 +126,9 @@ pub fn run_dbi(
                 client.display()
             ))
         })?
-        .summary(true);
+        .summary(true)
+        // TODO-HUMAN-REVIEW(PR-592): Re-review DBI process-tree cleanup after DetConfig wiring.
+        .isolated_process_group(true);
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",

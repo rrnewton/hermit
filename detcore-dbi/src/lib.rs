@@ -13,6 +13,8 @@
 
 #![deny(missing_docs)]
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
@@ -23,6 +25,7 @@ use std::pin::pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -40,6 +43,8 @@ use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::CloneArgs;
+use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
@@ -137,6 +142,55 @@ fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Op
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingThreadClone {
+    sysno: Sysno,
+    flags: CloneFlags,
+    child_tid_address: usize,
+}
+
+fn thread_clone_metadata(
+    sysnum: i64,
+    args: &[u64],
+    read_memory: MemoryReader,
+) -> Option<PendingThreadClone> {
+    let (sysno, flags, child_tid_address) = match sysnum {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::SYS_clone => (
+            Sysno::clone,
+            CloneFlags::from_bits_retain(args[0]),
+            args[3] as usize,
+        ),
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        libc::SYS_clone3 if args[0] != 0 && args[1] >= std::mem::size_of::<u64>() as u64 => {
+            let mut clone_args: CloneArgs = unsafe { std::mem::zeroed() };
+            let read_length = usize::min(args[1] as usize, std::mem::size_of::<CloneArgs>());
+            let read = unsafe {
+                read_memory(
+                    args[0] as usize,
+                    (&mut clone_args as *mut CloneArgs).cast(),
+                    read_length,
+                )
+            };
+            if read == 0 {
+                return None;
+            }
+            (
+                Sysno::clone3,
+                clone_args.flags,
+                clone_args.child_tid as usize,
+            )
+        }
+        _ => return None,
+    };
+    (flags.contains(CloneFlags::CLONE_THREAD) && !flags.contains(CloneFlags::CLONE_VFORK))
+        .then_some(PendingThreadClone {
+            sysno,
+            flags,
+            child_tid_address,
+        })
+}
+
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let waker = Waker::noop();
@@ -174,6 +228,7 @@ struct ThreadRuntime {
     state: DetcoreThreadState,
     initialized: bool,
     post_exec_pending: bool,
+    pending_clone: Option<PendingThreadClone>,
 }
 
 #[repr(C)]
@@ -182,9 +237,20 @@ struct NativeThreadScratch {
     observed_syscalls: u64,
     rewritten_syscalls: u64,
     runtime_state: *mut ThreadRuntime,
+    // TODO-HUMAN-REVIEW(PR-592): Re-review native thread-admission scratch ABI.
+    runtime_started: u64,
+    runtime_start_pc: usize,
+}
+
+#[derive(Default)]
+struct ThreadHandoffs {
+    inherited: HashMap<i32, Box<ThreadRuntime>>,
+    exited: HashSet<i32>,
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
+static THREAD_HANDOFFS: LazyLock<Mutex<ThreadHandoffs>> =
+    LazyLock::new(|| Mutex::new(ThreadHandoffs::default()));
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -203,6 +269,18 @@ fn current_runtime() -> Arc<Runtime> {
             .as_ref()
             .expect("Detcore DBI runtime was not initialized"),
     )
+}
+
+fn run_guest_future<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::hint::spin_loop(),
+        }
+    }
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -451,6 +529,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(scratch: *mut c_void) {
                 observed_syscalls: 0,
                 rewritten_syscalls: 0,
                 runtime_state: std::ptr::null_mut(),
+                runtime_started: 0,
+                runtime_start_pc: 0,
             });
     }
 }
@@ -462,18 +542,38 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(scratch: *mut c_void) {
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbi_runtime_thread_init`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
+// TODO-HUMAN-REVIEW(PR-592): Re-review thread-state release races after DetConfig wiring.
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void, tid: i32) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
-    if scratch.runtime_state.is_null() {
+    let runtime_state = if scratch.runtime_state.is_null() {
+        let mut handoffs = THREAD_HANDOFFS
+            .lock()
+            .expect("Detcore DBI thread handoff lock poisoned");
+        match handoffs.inherited.remove(&tid) {
+            Some(state) => Some(state),
+            None => {
+                handoffs.exited.insert(tid);
+                None
+            }
+        }
+    } else {
+        let state = unsafe { Box::from_raw(scratch.runtime_state) };
+        scratch.runtime_state = std::ptr::null_mut();
+        Some(state)
+    };
+    let Some(thread) = runtime_state else {
         return;
-    }
+    };
+    release_thread_runtime(*thread);
+}
+
+fn release_thread_runtime(thread: ThreadRuntime) {
     let ThreadRuntime {
         tid,
         state,
         initialized,
         ..
-    } = *unsafe { Box::from_raw(scratch.runtime_state) };
-    scratch.runtime_state = std::ptr::null_mut();
+    } = thread;
     if initialized {
         let runtime = current_runtime();
         let tool = runtime
@@ -489,6 +589,87 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
             ExitStatus::SUCCESS,
         );
     }
+}
+
+/// Adopts inherited Detcore state before a new application thread executes.
+///
+/// # Safety
+///
+/// All pointers and callbacks must remain valid for this callback.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-592): Re-review first-block child admission after DetConfig wiring.
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_start(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    emit: Emitter,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if !scratch.runtime_state.is_null() {
+        return 0;
+    }
+    let runtime = current_runtime();
+    let tid = Pid::from_raw(tid);
+    let pid = Pid::from_raw(pid);
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(pid, &runtime.config));
+    let thread = if tid == pid {
+        Box::new(ThreadRuntime {
+            tid,
+            state: tool.init_thread_state(Tid::from_raw(tid.into()), None),
+            initialized: false,
+            post_exec_pending: true,
+            pending_clone: None,
+        })
+    } else {
+        if info_logging_enabled() {
+            emit_marker(emit, b"detcore-dbi: child first-block gate entered\n");
+        }
+        loop {
+            if let Some(thread) = THREAD_HANDOFFS
+                .lock()
+                .expect("Detcore DBI thread handoff lock poisoned")
+                .inherited
+                .remove(&tid.as_raw())
+            {
+                break thread;
+            }
+            std::thread::yield_now();
+        }
+    };
+    if info_logging_enabled() {
+        emit_marker(emit, b"detcore-dbi: child state adopted\n");
+    }
+    scratch.runtime_state = Box::into_raw(thread);
+    let thread = unsafe { &mut *scratch.runtime_state };
+    if reverie_dbi::run_tool_thread_start(
+        tool,
+        context as usize,
+        tid,
+        pid,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+    )
+    .is_err()
+    {
+        emit_marker(emit, b"detcore-dbi: thread-start hook failed\n");
+        return 1;
+    }
+    thread.initialized = true;
+    if info_logging_enabled() {
+        emit_marker(emit, b"detcore-dbi: child thread-start completed\n");
+    }
+    0
 }
 
 fn resume_paused_runtime() {
@@ -548,6 +729,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let pending_thread_clone = thread_clone_metadata(sysnum, raw_args, read_memory);
     let clone3_flags = if sysnum == libc::SYS_clone3
         && raw_args[0] != 0
         && raw_args[1] >= std::mem::size_of::<u64>() as u64
@@ -584,6 +766,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         }
         return 0;
     }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if matches!(sysnum, libc::SYS_clone | libc::SYS_clone3) && pending_thread_clone.is_none() {
+        return 0;
+    }
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = current_runtime();
@@ -609,10 +795,16 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    scratch.observed_syscalls = scratch.observed_syscalls.saturating_add(1);
     if scratch.runtime_state.is_null() {
         if first_event {
             let message = b"detcore-dbi: constructing Detcore thread state\n";
             unsafe { emit(message.as_ptr(), message.len()) };
+        }
+        if tid != pid {
+            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            return 1;
         }
         let state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
         if first_event {
@@ -624,6 +816,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             state,
             initialized: false,
             post_exec_pending: true,
+            pending_clone: None,
         }));
     }
     let thread = unsafe { &mut *scratch.runtime_state };
@@ -701,10 +894,146 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
         }
-        Ok(DbiSyscallOutcome::AllowOriginal) => 0,
+        Ok(DbiSyscallOutcome::AllowOriginal) => {
+            if let Some(pending_thread_clone) = pending_thread_clone {
+                thread.state.clone_flags = Some(pending_thread_clone.flags);
+                assert!(
+                    thread.pending_clone.replace(pending_thread_clone).is_none(),
+                    "DBI parent already had a pending thread clone"
+                );
+            }
+            0
+        }
         Err(error) => {
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            1
+        }
+    }
+}
+
+/// Completes a syscall deferred to DynamoRIO's native application path.
+///
+/// Thread clone is split across pre- and post-syscall callbacks so the child
+/// returns through DynamoRIO application code while Detcore inherits and
+/// registers its deterministic thread state.
+///
+/// # Safety
+///
+/// The callback pointers and scratch storage must remain valid for this call.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-592): Re-review split clone completion after DetConfig wiring.
+pub unsafe extern "C" fn reverie_dbi_runtime_post_syscall(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    _sysnum: i64,
+    _args: *const u64,
+    branches: u64,
+    original_result: i64,
+    result: *mut i64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    emit: Emitter,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if scratch.runtime_state.is_null() {
+        return 0;
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let Some(pending) = thread.pending_clone.take() else {
+        return 0;
+    };
+    if info_logging_enabled() {
+        emit_marker(emit, b"detcore-dbi: parent clone post-hook entered\n");
+    }
+    let runtime = current_runtime();
+    let tool = runtime
+        .tool
+        .get()
+        .expect("Detcore DBI tool was initialized");
+    let tid = Pid::from_raw(tid);
+    let pid = Pid::from_raw(pid);
+
+    let mut child = (original_result >= 0).then(|| {
+        let child_tid = Pid::from_raw(original_result as i32);
+        let state = tool.init_thread_state(
+            Tid::from_raw(child_tid.into()),
+            Some((Tid::from_raw(tid.into()), &thread.state)),
+        );
+        (
+            child_tid,
+            Box::new(ThreadRuntime {
+                tid: child_tid,
+                state,
+                initialized: false,
+                post_exec_pending: false,
+                pending_clone: None,
+            }),
+        )
+    });
+
+    let mut guest = reverie_dbi::DbiGuest::new(
+        context as usize,
+        tid,
+        pid,
+        None,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+    );
+    let mut child_exited_before_admission = false;
+    if let Some((child_tid, child_state)) = child.take() {
+        let mut child_state = Some(child_state);
+        child_exited_before_admission = {
+            let mut handoffs = THREAD_HANDOFFS
+                .lock()
+                .expect("Detcore DBI thread handoff lock poisoned");
+            if handoffs.exited.remove(&child_tid.as_raw()) {
+                true
+            } else {
+                assert!(
+                    handoffs
+                        .inherited
+                        .insert(child_tid.as_raw(), child_state.take().unwrap())
+                        .is_none(),
+                    "duplicate inherited DBI thread state for {child_tid}"
+                );
+                false
+            }
+        };
+        if child_exited_before_admission {
+            drop(child_state.unwrap());
+        } else if info_logging_enabled() {
+            emit_marker(emit, b"detcore-dbi: child state published\n");
+        }
+    }
+    if info_logging_enabled() {
+        emit_marker(emit, b"detcore-dbi: parent registering child\n");
+    }
+    if child_exited_before_admission {
+        let _discarded =
+            tool.discard_external_thread_clone(&mut guest, pending.flags, original_result);
+    } else {
+        let _registration = run_guest_future(tool.register_external_thread_clone(
+            &mut guest,
+            pending.flags,
+            pending.child_tid_address,
+            original_result,
+        ));
+    }
+    if info_logging_enabled() {
+        emit_marker(emit, b"detcore-dbi: parent child registration completed\n");
+    }
+    match run_guest_future(tool.finish_external_thread_clone(&mut guest, pending.sysno)) {
+        Ok(()) => 0,
+        Err(error) => {
+            unsafe { result.write(error_result(error)) };
             1
         }
     }
@@ -738,6 +1067,48 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn read_local(address: usize, output: *mut u8, length: usize) -> i32 {
+        unsafe { std::ptr::copy_nonoverlapping(address as *const u8, output, length) };
+        1
+    }
+
+    #[test]
+    fn thread_clone_metadata_captures_clone_and_clone3_tid_state() {
+        let mut args = [0_u64; 6];
+        let flags =
+            CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_CHILD_CLEARTID;
+        args[0] = flags.bits();
+        args[3] = 0x1234;
+        assert_eq!(
+            thread_clone_metadata(libc::SYS_clone, &args, read_local),
+            Some(PendingThreadClone {
+                sysno: Sysno::clone,
+                flags,
+                child_tid_address: 0x1234,
+            })
+        );
+
+        let mut clone_args: CloneArgs = unsafe { std::mem::zeroed() };
+        clone_args.flags = flags;
+        clone_args.child_tid = 0x5678;
+        args[0] = (&clone_args as *const CloneArgs) as u64;
+        args[1] = std::mem::size_of::<CloneArgs>() as u64;
+        assert_eq!(
+            thread_clone_metadata(libc::SYS_clone3, &args, read_local),
+            Some(PendingThreadClone {
+                sysno: Sysno::clone3,
+                flags,
+                child_tid_address: 0x5678,
+            })
+        );
+
+        args[0] = libc::SIGCHLD as u64;
+        assert_eq!(
+            thread_clone_metadata(libc::SYS_clone, &args, read_local),
+            None
+        );
+    }
 
     #[test]
     fn only_dynamorio_managed_process_lifecycle_stays_native() {
