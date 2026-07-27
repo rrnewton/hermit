@@ -1503,7 +1503,7 @@ pub async fn thread_start_request<G, T>(
     cfg: &Config,
     guest: &mut G,
     detpid: DetPid,
-) -> Option<ThreadHistory>
+) -> (Option<ThreadHistory>, bool)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1512,15 +1512,17 @@ where
     if cfg.sequentialize_threads {
         trace!("[detcore, dtid {}] new thread BLOCKING on rpc...", &dettid);
         let resp = send_and_update_time(guest, GlobalRequest::StartNewThread(dettid, detpid)).await;
-        match resp.1 {
+        let reconnected_after_exec = resp.0.is_some();
+        let history = match resp.1 {
             GlobalResponse::StartNewThread(preempts) => {
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
                 preempts
             }
             _ => unreachable!(),
-        }
+        };
+        (history, reconnected_after_exec)
     } else {
-        None
+        (None, false)
     }
 }
 

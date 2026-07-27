@@ -1128,6 +1128,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
 
+        let mut reconnected_after_exec = false;
         if guest.is_root_thread() {
             // There is no fork event to catch for the root thread.
             debug!(
@@ -1135,19 +1136,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            let reconnected_after_exec = create_child_thread(guest, new_dettid, 0, None).await;
-            if reconnected_after_exec {
-                let pid = guest.pid();
-                guest
-                    .thread_state_mut()
-                    .restore_file_metadata_after_exec(pid.into());
-            }
+            reconnected_after_exec = create_child_thread(guest, new_dettid, 0, None).await;
         } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        let (th, thread_reconnected_after_exec) =
+            tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        if reconnected_after_exec || thread_reconnected_after_exec {
+            let pid = guest.pid();
+            guest
+                .thread_state_mut()
+                .restore_file_metadata_after_exec(pid.into());
+        }
 
         // Finish the delayed initialization of the full threadstate:
         {
