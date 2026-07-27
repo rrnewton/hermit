@@ -179,6 +179,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let path = call.path().ok_or(Errno::EFAULT)?;
         let path: PathBuf = path.read(&guest.memory())?;
+        let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
+            path.clone()
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.dirfd(), |detfd| detfd.path())?
+                .map_or_else(|| path.clone(), |directory| directory.join(&path))
+        };
 
         let resource = ResourceID::Path(path.clone());
         // Ask for permission to resolve this path into a file:
@@ -197,11 +205,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
-                if let Some(procfs) = ProcfsFile::from_path(&path) {
-                    guest
-                        .thread_state()
-                        .with_detfd(fd, |detfd| detfd.set_procfs(procfs.clone()))?;
-                }
+                let procfs = ProcfsFile::from_path(&observed_path);
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.set_path(&observed_path);
+                    if let Some(procfs) = procfs.clone() {
+                        detfd.set_procfs(procfs);
+                    }
+                })?;
                 resource_release_all(guest).await;
                 Ok(fd as i64)
             }

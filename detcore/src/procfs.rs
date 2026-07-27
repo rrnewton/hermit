@@ -8,7 +8,10 @@
 
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
+use std::collections::BTreeMap;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -59,6 +62,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
+    Locks,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -133,6 +137,7 @@ pub(crate) struct ProcfsFile {
 impl ProcfsFile {
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let path = normalize_observed_path(path)?;
         let kind = match path.to_str()? {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
@@ -211,6 +216,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-926): Review kernel lock identity normalization.
+            "/proc/locks" => ProcfsKind::Locks,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-969): Review Btrfs reserved-byte normalization.
             other if is_btrfs_bytes_reserved_path(Path::new(other)) => {
@@ -300,6 +308,7 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
+            ProcfsKind::Locks => sanitize_locks(&contents),
         });
     }
 
@@ -327,6 +336,24 @@ impl ProcfsFile {
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
+}
+
+fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
 }
 
 fn is_process_io_path(path: &str) -> bool {
@@ -1454,6 +1481,166 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-926): Review the /proc/locks field policy.
+//
+// `/proc/locks` exposes global kernel sequence, owner, and backing-object IDs.
+// Replace each identity domain with compact virtual IDs while retaining its
+// equality relation. Holder/waiter rows remain grouped under the same virtual
+// sequence, distinct files stay distinct, and physical PIDs never escape.
+// Unknown formats fail closed rather than returning the volatile raw snapshot.
+fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Clone)]
+    struct Row {
+        sequence: String,
+        waiter: bool,
+        fields: Vec<String>,
+        owner_index: usize,
+        object_index: usize,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    for line in text.lines() {
+        let fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let waiter = fields.get(1).is_some_and(|field| field == "->");
+        let details = usize::from(waiter) + 1;
+        let owner_index = details + 3;
+        let object_index = details + 4;
+        let Some(sequence) = fields
+            .first()
+            .and_then(|field| field.strip_suffix(':'))
+            .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
+            return Vec::new();
+        };
+        if fields.len() != details + 7
+            || fields[owner_index].parse::<i64>().is_err()
+            || fields[object_index].split(':').count() != 3
+        {
+            return Vec::new();
+        }
+        rows.push(Row {
+            sequence: sequence.to_owned(),
+            waiter,
+            fields,
+            owner_index,
+            object_index,
+        });
+    }
+
+    // Assign object IDs from their stable lock semantics, not physical inode
+    // order. Objects with identical signatures are interchangeable, so the raw
+    // identity is used only as a final in-snapshot tie breaker.
+    let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        signature[row.object_index] = "object".to_owned();
+        object_signatures
+            .entry(row.fields[row.object_index].clone())
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut objects = object_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut objects {
+        signatures.sort_unstable();
+    }
+    objects.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let object_ids = objects
+        .into_iter()
+        .enumerate()
+        .map(|(index, (object, _))| (object, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let object_id = object_ids[&row.fields[row.object_index]];
+        row.fields[row.object_index] = format!("00:00:{object_id}");
+    }
+
+    let mut owner_signatures: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner == -1 {
+            continue;
+        }
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        owner_signatures
+            .entry(owner)
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut owners = owner_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut owners {
+        signatures.sort_unstable();
+    }
+    owners.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let owner_ids = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, (owner, _))| (owner, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner != -1 {
+            row.fields[row.owner_index] = owner_ids[&owner].to_string();
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.sequence.clone()).or_default().push(row);
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    for rows in &mut groups {
+        rows.sort_by(|left, right| {
+            left.waiter
+                .cmp(&right.waiter)
+                .then_with(|| left.fields.cmp(&right.fields))
+        });
+    }
+    groups.sort_by_key(|rows| {
+        rows.iter()
+            .map(|row| {
+                let mut fields = row.fields.clone();
+                fields[0] = "sequence:".to_owned();
+                fields.join(" ")
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let normalized_rows = groups
+        .into_iter()
+        .enumerate()
+        .flat_map(|(sequence, rows)| {
+            rows.into_iter().map(move |mut row| {
+                row.fields[0] = format!("{}:", sequence + 1);
+                row.fields.join(" ")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = normalized_rows.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,6 +1823,18 @@ mod tests {
                 .kind,
             ProcfsKind::Protocols
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/locks"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Locks
+        );
+        for alias in ["/proc/./locks", "/proc/self/../locks"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(alias)).unwrap().kind,
+                ProcfsKind::Locks
+            );
+        }
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
                 .unwrap()
@@ -2281,6 +2480,54 @@ se.vruntime : 2.0\n\
 se.sum_exec_runtime : 3.0\n\
 nr_switches : -1\n";
         assert_eq!(sanitize_self_sched(negative_counter), negative_counter);
+    }
+
+    #[test]
+    fn locks_virtualize_identities_and_preserve_relationships() {
+        let first = b"125: POSIX ADVISORY WRITE 30 00:27:47713925 0 EOF\n\
+125: -> POSIX ADVISORY WRITE 40 00:27:47713925 0 EOF\n\
+91: OFDLCK ADVISORY WRITE -1 00:27:47715277 4 19\n\
+77: POSIX ADVISORY READ 30 00:2a:99 0 EOF\n";
+        let renumbered_and_reordered = b"800: POSIX ADVISORY READ 300 00:fe:9001 0 EOF\n\
+700: OFDLCK ADVISORY WRITE -1 00:fe:9002 4 19\n\
+900: -> POSIX ADVISORY WRITE 400 00:fe:9003 0 EOF\n\
+900: POSIX ADVISORY WRITE 300 00:fe:9003 0 EOF\n";
+
+        let normalized = sanitize_locks(first);
+        assert_eq!(normalized, sanitize_locks(renumbered_and_reordered));
+        let normalized = std::str::from_utf8(&normalized).unwrap();
+        assert!(!normalized.contains("47713925"));
+        assert!(!normalized.contains(" 30 "));
+        assert!(!normalized.contains(" 40 "));
+
+        let holder = normalized
+            .lines()
+            .find(|line| line.contains(" POSIX ADVISORY WRITE ") && !line.contains(" -> "))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let waiter = normalized
+            .lines()
+            .find(|line| line.contains(" -> POSIX ADVISORY WRITE "))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(holder[0], waiter[0], "holder/waiter sequence split");
+        assert_eq!(holder[5], waiter[6], "holder/waiter object split");
+
+        let mut objects = normalized
+            .lines()
+            .map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields[usize::from(fields[1] == "->") + 5]
+            })
+            .collect::<Vec<_>>();
+        objects.sort_unstable();
+        objects.dedup();
+        assert_eq!(objects.len(), 3, "distinct backing objects collapsed");
+
+        assert!(sanitize_locks(b"malformed\n").is_empty());
+        assert!(sanitize_locks(b"").is_empty());
     }
 
     #[test]
