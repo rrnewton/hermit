@@ -1485,7 +1485,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic Netlink autobind identities.
+        // TODO-HUMAN-REVIEW(PR-880): Review deterministic Netlink autobind identities.
         if sockaddr_family == libc::AF_NETLINK as u16
             && call.addrlen() >= std::mem::size_of::<libc::sockaddr_nl>() as i32
         {
