@@ -299,7 +299,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=184
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -2296,6 +2296,12 @@ function run_compatibility_corpus {
     strict_compatibility_probe users /usr/bin/users \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe numastat /usr/bin/numastat \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe numactl-hardware /usr/bin/numactl --hardware \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sensors /usr/bin/sensors \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Restrict process tools to stable identity/existence observations. Host
     # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
