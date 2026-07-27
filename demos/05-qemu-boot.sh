@@ -32,12 +32,8 @@ export QEMU_SNAPSHOT_DISK="${QEMU_SNAPSHOT_DISK:-$QEMU_ASSETS/hermit-snapshot.qc
 export QEMU_SNAPSHOT_ID_FILE="${QEMU_SNAPSHOT_ID_FILE:-$QEMU_SNAPSHOT_DISK.id}"
 export QEMU_SNAPSHOT_SIZE="${QEMU_SNAPSHOT_SIZE:-64M}"
 
-if [ ! -r "$QEMU_ASSETS/bzImage" ] || \
-   [ ! -r "$QEMU_ASSETS/initramfs.cpio.gz" ] || \
-   [ "$(cat "$QEMU_ASSETS/.initramfs-version" 2>/dev/null || true)" != 2 ]; then
-  demo_banner "Provision QEMU kernel and initramfs"
-  "$DEMO_DIR/lib/qemu-assets.sh"
-fi
+demo_banner "Verify QEMU kernel and initramfs"
+"$DEMO_DIR/lib/qemu-assets.sh"
 
 test -x "$HERMIT_RELEASE" || {
   echo "missing release Hermit binary: $HERMIT_RELEASE" >&2

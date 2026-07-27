@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the ignored Linux kernel and BusyBox initramfs used by demo 5.
+# Provision the fixed Linux kernel and BusyBox initramfs used by demo 5.
 
 set -euo pipefail
 
@@ -8,6 +8,8 @@ ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || printf '%s' /usr/sbin/busybox)}"
+KERNEL_SHA256="${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}"
+KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-test/tree/dev-hermit/qemu-kernels/$KERNEL_SHA256/bzImage}"
 INITRAMFS_VERSION=2
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 
@@ -16,27 +18,17 @@ fail() {
   exit 1
 }
 
-if [ -z "${KERNEL_IMAGE:-}" ]; then
-  if [ -r /boot/vmlinuz ]; then
-    KERNEL_IMAGE="$(readlink -f /boot/vmlinuz)"
-  else
-    KERNEL_IMAGE="$(find /boot -maxdepth 1 -type f -name 'vmlinuz-*' \
-      -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"
-  fi
-fi
-
-if [ -z "${KERNEL_IMAGE:-}" ] || [ ! -r "$KERNEL_IMAGE" ]; then
-  fail "no readable host kernel; set KERNEL_IMAGE=/path/to/bzImage"
-fi
 if [ -z "$BUSYBOX" ] || [ ! -x "$BUSYBOX" ]; then
   fail "a statically linked BusyBox is required; set BUSYBOX=/path/to/busybox"
 fi
 
-for tool in file cpio gzip; do
+for tool in file cpio gzip sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
 done
 file "$BUSYBOX" | grep -q 'statically linked' || \
   fail "$BUSYBOX is not statically linked"
+[[ $KERNEL_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+  fail "QEMU_KERNEL_SHA256 must be a lowercase 64-character SHA-256"
 
 mkdir -p "$ARTIFACT_DIR" "$HERMIT_REPO/target"
 
@@ -52,17 +44,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -r "$ARTIFACT_DIR/bzImage" ]; then
+cached_kernel_sha=""
+if [ -r "$ARTIFACT_DIR/bzImage" ]; then
+  cached_kernel_sha="$(sha256sum "$ARTIFACT_DIR/bzImage" | cut -d' ' -f1)"
+fi
+
+if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
+  if [ -n "$cached_kernel_sha" ]; then
+    printf 'kernel: replacing cache with unexpected sha256 %s\n' \
+      "$cached_kernel_sha"
+  fi
   kernel_tmp="$ARTIFACT_DIR/.bzImage.$$"
-  cp "$KERNEL_IMAGE" "$kernel_tmp"
+  if [ -n "${KERNEL_IMAGE:-}" ]; then
+    [ -r "$KERNEL_IMAGE" ] || fail "unreadable KERNEL_IMAGE: $KERNEL_IMAGE"
+    cp "$KERNEL_IMAGE" "$kernel_tmp"
+    kernel_source="$KERNEL_IMAGE"
+  else
+    command -v manifold >/dev/null 2>&1 || \
+      fail "manifold is required to download manifold://$KERNEL_MANIFOLD_PATH"
+    manifold --quiet get --threads 20 "$KERNEL_MANIFOLD_PATH" "$kernel_tmp"
+    kernel_source="manifold://$KERNEL_MANIFOLD_PATH"
+  fi
+
+  downloaded_kernel_sha="$(sha256sum "$kernel_tmp" | cut -d' ' -f1)"
+  if [ "$downloaded_kernel_sha" != "$KERNEL_SHA256" ]; then
+    fail "kernel sha256 mismatch from $kernel_source: expected $KERNEL_SHA256, got $downloaded_kernel_sha"
+  fi
   mv "$kernel_tmp" "$ARTIFACT_DIR/bzImage"
   kernel_tmp=""
-  printf 'kernel: %s -> %s (%s bytes)\n' \
-    "$KERNEL_IMAGE" "$ARTIFACT_DIR/bzImage" \
-    "$(stat -c%s "$ARTIFACT_DIR/bzImage")"
+  printf 'kernel: %s -> %s (%s bytes, sha256 %s)\n' \
+    "$kernel_source" "$ARTIFACT_DIR/bzImage" \
+    "$(stat -c%s "$ARTIFACT_DIR/bzImage")" "$KERNEL_SHA256"
 else
-  printf 'kernel: using cached %s (%s bytes)\n' \
-    "$ARTIFACT_DIR/bzImage" "$(stat -c%s "$ARTIFACT_DIR/bzImage")"
+  printf 'kernel: using verified cache %s (%s bytes, sha256 %s)\n' \
+    "$ARTIFACT_DIR/bzImage" "$(stat -c%s "$ARTIFACT_DIR/bzImage")" \
+    "$KERNEL_SHA256"
 fi
 
 cached_initramfs_version="$(cat "$INITRAMFS_VERSION_FILE" 2>/dev/null || true)"
