@@ -305,6 +305,7 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
+    pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
 impl ProcfsFile {
@@ -489,8 +490,16 @@ impl ProcfsFile {
         self.bound_thread_identity = Some((tgid, tid, ppid));
     }
 
+    /// Returns true when this snapshot consumes deterministic random bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+    pub(crate) fn needs_random_uuid(&self) -> bool {
+        self.kind == ProcfsKind::RandomUuid
+    }
+
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
+    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic UUID snapshot input.
     pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
@@ -500,6 +509,7 @@ impl ProcfsFile {
             virtual_ppid,
             virtual_pty_count,
             fdinfo_identity,
+            random_uuid,
         } = context;
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
@@ -572,9 +582,10 @@ impl ProcfsFile {
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
             ProcfsKind::Modules => sanitize_modules(&contents),
             ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
-            ProcfsKind::RandomUuid => {
-                fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
-            }
+            ProcfsKind::RandomUuid => sanitize_random_uuid(
+                &contents,
+                random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
+            ),
         });
     }
 
@@ -2389,6 +2400,51 @@ fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
+    const HYPHENS: &[usize] = &[8, 13, 18, 23];
+
+    if contents.len() != 37 || contents[36] != b'\n' {
+        return contents.to_vec();
+    }
+    for (index, byte) in contents[..36].iter().copied().enumerate() {
+        if HYPHENS.contains(&index) {
+            if byte != b'-' {
+                return contents.to_vec();
+            }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte) {
+            return contents.to_vec();
+        }
+    }
+    if contents[14] != b'4' || !matches!(contents[19], b'8' | b'9' | b'a' | b'b') {
+        return contents.to_vec();
+    }
+
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\n",
+        random[0],
+        random[1],
+        random[2],
+        random[3],
+        random[4],
+        random[5],
+        random[6],
+        random[7],
+        random[8],
+        random[9],
+        random[10],
+        random[11],
+        random[12],
+        random[13],
+        random[14],
+        random[15]
+    )
+    .into_bytes()
+}
+
 fn numbered_label(label: &str, prefix: &str) -> bool {
     label.strip_prefix(prefix).is_some_and(|suffix| {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -3143,15 +3199,26 @@ mod tests {
     }
 
     #[test]
-    fn random_uuid_is_synthetic() {
+    fn random_uuid_uses_deterministic_v4_bytes_or_fails_open() {
+        let kernel_uuid = b"24e63f35-232a-43e2-8799-b151e9833f45\n";
         assert_eq!(
-            fixed_snapshot(
-                b"24e63f35-232a-43e2-8799-b151e9833f45\n",
-                b"00000000-0000-4000-8000-000000000000\n"
-            ),
+            sanitize_random_uuid(kernel_uuid, [0; 16]),
             b"00000000-0000-4000-8000-000000000000\n"
         );
-        assert!(fixed_snapshot(b"", b"0\n").is_empty());
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0xff; 16]),
+            b"ffffffff-ffff-4fff-bfff-ffffffffffff\n"
+        );
+
+        for malformed in [
+            b"24e63f35-232a-1e32-8799-b151e9833f45\n".as_slice(),
+            b"24e63f35-232a-4e32-c799-b151e9833f45\n",
+            b"24E63F35-232A-4E32-8799-B151E9833F45\n",
+            b"24e63f35-232a-4e32-8799-b151e9833f45",
+            b"not-a-uuid\n",
+        ] {
+            assert_eq!(sanitize_random_uuid(malformed, [0; 16]), malformed);
+        }
     }
 
     #[test]
