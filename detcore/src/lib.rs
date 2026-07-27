@@ -1616,7 +1616,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
                 Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD)
+                // TODO-HUMAN-REVIEW(PR-912)
                 Syscall::Ioctl(s)
                     if syscalls::socket_timestamp_ioctl::is_socket_timestamp_ioctl(s) =>
                 {
