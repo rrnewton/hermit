@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
             "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -304,7 +304,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/schedstat field policy.
+// TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
 fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
