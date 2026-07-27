@@ -49,11 +49,13 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie_dbi::DbiGuest;
 use reverie_dbi::DbiSyscallOutcome;
 use reverie_dbi::MemoryReader;
 use reverie_dbi::RegisterReader;
+use reverie_dbi::RegisterWriter;
 use reverie_dbi::SyscallInvoker;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -678,6 +680,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// The native client must pass a valid writable `scratch` pointer, a live
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
+// TODO-HUMAN-REVIEW(PR-pending): Review compatibility with Reverie's expanded DBI callback ABI.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -685,10 +688,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     context: *mut c_void,
     tid: i32,
     pid: i32,
+    _in_tree_ppid: i32,
     branch_count: u64,
     defer_runtime: i32,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> i32 {
     unsafe {
         scratch
@@ -751,6 +756,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
         &runtime.config,
         invoke_syscall,
         read_registers,
+        write_registers,
     )
     .is_err()
     {
@@ -770,6 +776,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// `scratch` must name the initialized parent state, `context` must be its
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
+// TODO-HUMAN-REVIEW(PR-pending): Review register-writer propagation to child registration.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -783,6 +790,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     flags: u64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 ) -> i32 {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
@@ -820,6 +828,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
             &runtime.config,
             invoke_syscall,
             read_registers,
+            write_registers,
         );
         run_ready(tool.register_external_child(
             &mut guest,
@@ -911,6 +920,21 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-pending): Review deferred DBI syscall encoding.
+unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut u64) {
+    let (sysno, syscall_args) = syscall.into_parts();
+    unsafe { number.write(sysno.id() as i64) };
+    let values = [
+        syscall_args.arg0 as u64,
+        syscall_args.arg1 as u64,
+        syscall_args.arg2 as u64,
+        syscall_args.arg3 as u64,
+        syscall_args.arg4 as u64,
+        syscall_args.arg5 as u64,
+    ];
+    unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -920,6 +944,7 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
+// TODO-HUMAN-REVIEW(PR-pending): Review deferred-syscall and register-writer ABI compatibility.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
@@ -930,8 +955,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     args: *const u64,
     branches: u64,
     result: *mut i64,
+    deferred_sysnum: *mut i64,
+    deferred_args: *mut u64,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
+    write_registers: RegisterWriter,
     read_memory: MemoryReader,
     emit: unsafe extern "C" fn(*const u8, usize),
 ) -> i32 {
@@ -1051,6 +1079,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             &runtime.config,
             invoke_syscall,
             read_registers,
+            write_registers,
         ) {
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -1074,6 +1103,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             &runtime.config,
             invoke_syscall,
             read_registers,
+            write_registers,
         ) {
             unsafe { result.write(-(errno.into_raw() as i64)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -1105,6 +1135,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         syscall,
         invoke_syscall,
         read_registers,
+        write_registers,
     );
     if let Some((probe, original_prng)) = getrandom_prng {
         // The shortened safe write must consume exactly the stream portion that the shared
@@ -1126,7 +1157,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
         }
-        Ok(DbiSyscallOutcome::AllowOriginal) => 0,
+        Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
+            unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
+            2
+        }
         Err(Error::Tool(error)) => {
             if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
                 let message = format!("detcore-dbi: {unsupported}\n");
@@ -1301,6 +1335,12 @@ mod tests {
         ) -> i32 {
             0
         }
+        unsafe extern "C" fn write_registers(
+            _context: usize,
+            _registers: *const libc::user_regs_struct,
+        ) -> i32 {
+            1
+        }
 
         let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
         let status = unsafe {
@@ -1309,10 +1349,12 @@ mod tests {
                 std::ptr::null_mut(),
                 7,
                 7,
+                -1,
                 99,
                 1,
                 invoke_syscall,
                 read_registers,
+                write_registers,
             )
         };
 

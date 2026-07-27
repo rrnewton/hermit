@@ -1482,14 +1482,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_close_range(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-838): Review the deterministic seccomp
-            // compatibility refusal. Guest filters can block ptrace-runtime
-            // syscall injection and capability probes expose host-kernel state,
-            // so Hermit presents a fixed kernel-without-seccomp boundary.
-            SyscallClassification::Determinized if call.number() == Sysno::seccomp => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
             // in the pinned Reverie revision. It is epoll_pwait with a
             // `struct timespec *` timeout; recent glibc routes epoll_wait/
@@ -1601,6 +1593,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
