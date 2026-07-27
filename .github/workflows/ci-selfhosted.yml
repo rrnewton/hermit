@@ -46,7 +46,7 @@ jobs:
           )
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
     timeout-minutes: 5
     env:
       DETCORE_TEST_RUST_LOG: "off"
