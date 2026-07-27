@@ -87,7 +87,7 @@ exec 3<>"$input_fifo"
 : >"$QEMU_LOG"
 : >"$serial_log"
 
-demo_banner "Boot Linux to its serial shell"
+demo_banner "Boot Linux to its serial shell (1st line takes a while to appear)"
 RUST_LOG="$QEMU_LOG_FILTER" \
 timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   "$HERMIT_RELEASE" run \
@@ -164,6 +164,8 @@ demo_banner "Snapshot ready"
 printf 'Snapshot disk: %s (internal tag: %s)\n' \
   "${QEMU_SNAPSHOT_DISK#"$ROOT/"}" "$QEMU_SNAPSHOT_NAME"
 qemu-img snapshot -l "$QEMU_SNAPSHOT_DISK"
+printf 'Snapshot hash: %s\n' \
+  "$(md5sum "$QEMU_SNAPSHOT_DISK" | cut -d' ' -f1)"
 
 qemu_write_stable_info_tail "$QEMU_LOG" "$info_tail"
 demo_banner "Hermit INFO tail (wall-clock timestamps stripped)"

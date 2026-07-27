@@ -5,7 +5,7 @@ set -euo pipefail
 
 qemu_snapshot_require_tools() {
   local tool
-  for tool in nc python3 qemu-img sha256sum; do
+  for tool in md5sum nc python3 qemu-img sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || {
       printf 'missing required tool: %s\n' "$tool" >&2
       return 1
