@@ -44,7 +44,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review deterministic NUMA and hwmon snapshots.
+            // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
             other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
             other if is_numa_node_file(other, "numastat") => ProcfsKind::NodeNumastat,
             other if is_hwmon_input_file(other) => ProcfsKind::HwmonInput,
@@ -243,7 +243,7 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review synthetic NUMA and hwmon accounting values.
+// TODO-HUMAN-REVIEW(PR-865): Review synthetic NUMA and hwmon accounting values.
 fn sanitize_node_numastat(contents: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {

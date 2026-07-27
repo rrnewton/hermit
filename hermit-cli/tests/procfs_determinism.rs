@@ -193,7 +193,7 @@ fn proc_entropy_available_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review NUMA and hwmon snapshot coverage.
+// TODO-HUMAN-REVIEW(PR-865): Review NUMA and hwmon snapshot coverage.
 #[test]
 fn sysfs_numa_accounting_is_deterministic() {
     assert_deterministic("/sys/devices/system/node/node0/numastat", |contents| {
