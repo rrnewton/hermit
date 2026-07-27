@@ -22,6 +22,33 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    BtrfsBytesReserved,
+}
+
+fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix("/sys/fs/btrfs") else {
+        return false;
+    };
+    let mut components = relative.iter();
+    let (Some(uuid), Some("allocation"), Some(class), Some("bytes_reserved"), None) = (
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next(),
+    ) else {
+        return false;
+    };
+
+    let canonical_uuid = uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        });
+    canonical_uuid && matches!(class, "data" | "metadata" | "system")
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +71,11 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-969): Review Btrfs reserved-byte normalization.
+            other if is_btrfs_bytes_reserved_path(Path::new(other)) => {
+                ProcfsKind::BtrfsBytesReserved
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +119,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +265,26 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-969): Review Btrfs bytes_reserved normalization.
+fn sanitize_btrfs_bytes_reserved(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let valid_value = std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some();
+    if !valid_value {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -366,9 +419,52 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_btrfs_reserved_byte_gauges() {
+        const UUID: &str = "004b7924-9df8-4ec2-aea0-d9775554e1ba";
+        for class in ["data", "metadata", "system"] {
+            let path = format!("/sys/fs/btrfs/{UUID}/allocation/{class}/bytes_reserved");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::BtrfsBytesReserved
+            );
+        }
+
+        for path in [
+            "/sys/fs/btrfs/004B7924-9df8-4ec2-aea0-d9775554e1ba/allocation/data/bytes_reserved",
+            "/sys/fs/btrfs/not-a-uuid/allocation/data/bytes_reserved",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/allocation/global/bytes_reserved",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/allocation/data/bytes_may_use",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/allocation/data/bytes_used",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/allocation/data/nested/bytes_reserved",
+            "/tmp/004b7924-9df8-4ec2-aea0-d9775554e1ba/allocation/data/bytes_reserved",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
+    }
+
+    #[test]
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn btrfs_reserved_bytes_are_fixed() {
+        assert_eq!(sanitize_btrfs_bytes_reserved(b"164425728\n"), b"0\n");
+        assert_eq!(sanitize_btrfs_bytes_reserved(b"164425728"), b"0");
+        assert_eq!(
+            sanitize_btrfs_bytes_reserved(b"18446744073709551615\n"),
+            b"0\n"
+        );
+        for malformed in [
+            b"".as_slice(),
+            b"18446744073709551616\n",
+            b"-1\n",
+            b"123 456\n",
+            b"unknown\n",
+        ] {
+            assert_eq!(sanitize_btrfs_bytes_reserved(malformed), malformed);
+        }
     }
 
     #[test]
