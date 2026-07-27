@@ -85,7 +85,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-XXX): Query the logical one-shot ITIMER_REAL state.
+        // TODO-HUMAN-REVIEW(PR-841): Query the logical one-shot ITIMER_REAL state.
         | Sysno::getitimer
         | Sysno::getrandom
         | Sysno::getrusage
@@ -440,10 +440,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_set
         | Sysno::sched_getattr
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-XXX): Return the fixed virtual default I/O priority.
+        // TODO-HUMAN-REVIEW(PR-841): Return the fixed virtual default I/O priority.
         | Sysno::ioprio_get
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-XXX): Linux scheduler attributes are inoperative under Detcore.
+        // TODO-HUMAN-REVIEW(PR-841): Linux scheduler attributes are inoperative under Detcore.
         | Sysno::sched_setattr
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2(2) is a modern superset of

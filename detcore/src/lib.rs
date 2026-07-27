@@ -1611,7 +1611,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-XXX): Review logical one-shot getitimer emulation.
+                // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
                 Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1758,13 +1758,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-XXX): Review virtual sched_setattr no-op policy.
+                // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
                 Syscall::SchedSetattr(s) => self.handle_sched_setattr(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-XXX): Review virtual ioprio_get default.
+                // TODO-HUMAN-REVIEW(PR-841): Review virtual ioprio_get default.
                 Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
