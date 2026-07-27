@@ -611,8 +611,13 @@ where
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // The CLI probes ptrace readiness before entering its container; repeating
     // the namespace probe here would test nested namespaces instead of the host.
-    if matches!(backend, Backend::Ptrace | Backend::E9patch) {
+    if backend == Backend::Ptrace {
         return Ok(());
+    }
+    if backend == Backend::E9patch {
+        return Err(anyhow!(
+            "backend `e9patch` requires the CLI's private mount namespace"
+        ));
     }
     // KVM and DBI have dedicated dispatches (`run_kvm` and `run_dbi`); neither
     // must reach this generic rejection path.
@@ -1095,25 +1100,6 @@ async fn run_with_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
-    // TODO-HUMAN-REVIEW(PR-711): Review direct Detcore dispatch through e9patch.
-    if backend == Backend::E9patch {
-        if config.gdbserver {
-            return Err(anyhow!(
-                "the e9patch backend does not yet support --gdbserver"
-            ));
-        }
-        let (exit_status, global_state) =
-            reverie_e9patch::E9patchBackend::run_preserving_executable::<Detcore>(
-                command,
-                config.clone(),
-            )
-            .await?;
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(exit_status);
-    }
-
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1223,25 +1209,6 @@ async fn run_with_output_backend_inner(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    // TODO-HUMAN-REVIEW(PR-711): Review captured Detcore dispatch through e9patch.
-    if backend == Backend::E9patch {
-        if config.gdbserver {
-            return Err(anyhow!(
-                "the e9patch backend does not yet support --gdbserver"
-            ));
-        }
-        let (output, global_state) =
-            reverie_e9patch::E9patchBackend::run_with_output_preserving_executable::<Detcore>(
-                command,
-                config.clone(),
-            )
-            .await?;
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(output);
-    }
-
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1740,8 +1707,32 @@ mod tests {
     }
 
     #[test]
-    fn public_backend_dispatch_accepts_e9patch() {
-        ensure_backend_dispatch(Backend::E9patch).unwrap();
+    fn public_backend_dispatch_rejects_e9patch_without_private_namespace() {
+        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
+        assert!(error.to_string().contains("private mount namespace"));
+    }
+
+    #[test]
+    fn public_e9patch_run_apis_reject_without_private_namespace() {
+        let error = super::run_with_backend(
+            super::Command::new("/bin/true"),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::E9patch,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("private mount namespace"));
+
+        let error = super::run_with_output_backend(
+            super::Command::new("/bin/true"),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::E9patch,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("private mount namespace"));
     }
 
     #[test]

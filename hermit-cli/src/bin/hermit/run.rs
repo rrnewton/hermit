@@ -36,6 +36,7 @@ use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::Namespace;
 use reverie::process::Output;
+use reverie::process::Stdio;
 
 use super::container::IdentityGuard;
 use super::container::apply_affinity;
@@ -51,6 +52,58 @@ use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_e9patch_in_private_namespace(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<ExitStatus, Error> {
+    if config.gdbserver {
+        anyhow::bail!("the e9patch backend does not yet support --gdbserver");
+    }
+    // SAFETY: This private helper is called only from RunOpts container callbacks,
+    // after e9patch has rejected --no-namespace and with_container has isolated mounts.
+    let (status, global_state) = unsafe {
+        reverie_e9patch::E9patchBackend::run_preserving_executable::<hermit::Detcore>(
+            command, config,
+        )
+    }
+    .await?;
+    global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+    Ok(status)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_e9patch_with_output_in_private_namespace(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<Output, Error> {
+    if config.gdbserver {
+        anyhow::bail!("the e9patch backend does not yet support --gdbserver");
+    }
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    // SAFETY: This private helper is called only from RunOpts container callbacks,
+    // after e9patch has rejected --no-namespace and with_container has isolated mounts.
+    let (output, global_state) = unsafe {
+        reverie_e9patch::E9patchBackend::run_with_output_preserving_executable::<hermit::Detcore>(
+            command, config,
+        )
+    }
+    .await?;
+    global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+    Ok(output)
+}
+
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
@@ -1987,6 +2040,25 @@ impl RunOpts {
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
+        if self.runtime_backend() == Backend::E9patch {
+            if capture_output {
+                let out = run_e9patch_with_output_in_private_namespace(
+                    command,
+                    config,
+                    self.summary,
+                    &self.summary_json,
+                )?;
+                return Ok((out.status, Some(out)));
+            }
+            let status = run_e9patch_in_private_namespace(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+            )?;
+            return Ok((status, None));
+        }
+
         if capture_output {
             let out = hermit::run_with_output_backend(
                 command,
@@ -2030,6 +2102,15 @@ impl RunOpts {
 
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
+
+        if self.runtime_backend() == Backend::E9patch {
+            return run_e9patch_with_output_in_private_namespace(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+            );
+        }
 
         hermit::run_with_output_backend(
             command,
