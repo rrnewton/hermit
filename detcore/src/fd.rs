@@ -308,6 +308,22 @@ impl DetFd {
             .and_then(|procfs| procfs.take(maximum))
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-973): Review positioned procfs snapshot reads.
+    /// Whether this open file description carries a deterministic procfs snapshot.
+    pub(crate) fn is_procfs(&self) -> bool {
+        self.description().procfs.is_some()
+    }
+
+    /// Read from the deterministic procfs snapshot at an absolute `offset`
+    /// without advancing the shared sequential cursor (for `pread64`).
+    pub(crate) fn read_at_procfs(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.read_at(offset, maximum))
+    }
+
     /// Cached stat data attached to the backing object.
     pub fn stat(&self) -> Option<DetStat> {
         self.description().stat

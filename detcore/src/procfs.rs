@@ -137,6 +137,24 @@ impl ProcfsFile {
         self.offset = end;
         Some(bytes)
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-973): Review positioned procfs snapshot reads.
+    /// Returns bytes from the normalized snapshot at an absolute `offset`
+    /// without advancing the sequential cursor.
+    ///
+    /// This is the positioned counterpart to [`take`](Self::take), used by
+    /// `pread64` so offset-based reads observe the sanitized snapshot instead
+    /// of live kernel bytes. An `offset` at or past the end yields an empty
+    /// slice, mirroring `pread(2)` at EOF.
+    pub(crate) fn read_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
+        let contents = self.contents.as_ref()?;
+        if offset >= contents.len() {
+            return Some(Vec::new());
+        }
+        let end = offset.saturating_add(maximum).min(contents.len());
+        Some(contents[offset..end].to_vec())
+    }
 }
 
 fn is_process_io_path(path: &str) -> bool {
@@ -906,5 +924,31 @@ domain0 SMT 00000003 0 0 0\n"
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-973): Review positioned procfs snapshot reads.
+    #[test]
+    fn positioned_reads_serve_snapshot_without_moving_cursor() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 3, 1);
+        // read_at is normalized ("12" -> "0") and repeatable at any offset.
+        let expected = b"voluntary_ctxt_switches:\t0\n";
+        assert_eq!(file.read_at(0, 5).unwrap(), b"volun");
+        assert_eq!(file.read_at(0, 4096).unwrap(), expected);
+        // Positioned reads do not advance the sequential cursor.
+        assert_eq!(file.read_at(10, 4).unwrap(), &expected[10..14]);
+        assert_eq!(file.take(expected.len()).unwrap(), expected);
+        // An offset at or past EOF yields an empty slice, like pread at EOF.
+        assert!(file.read_at(expected.len(), 8).unwrap().is_empty());
+        assert!(file.read_at(expected.len() + 100, 8).unwrap().is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-973): Review positioned procfs snapshot reads.
+    #[test]
+    fn positioned_reads_require_a_snapshot() {
+        let file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        assert!(file.read_at(0, 8).is_none());
     }
 }

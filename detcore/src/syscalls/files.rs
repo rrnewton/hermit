@@ -293,6 +293,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-973): Review shared procfs snapshot capture.
+    /// Capture and sanitize the deterministic procfs snapshot for `fd` when it
+    /// has not been taken yet.
+    ///
+    /// Every subsequent read of `fd` — sequential (`read`/`readv`) or positioned
+    /// (`pread64`) — is served from this normalized in-memory copy rather than
+    /// live kernel bytes, so the sanitization applied by [`ProcfsFile`] is not
+    /// bypassed by the offset-based read paths. `scratch_buf`/`scratch_len` name
+    /// a writable guest buffer used only to stage the drained bytes; its
+    /// contents are clobbered and the caller must write the real reply after.
+    async fn ensure_procfs_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        scratch_buf: AddrMut<'_, u8>,
+        scratch_len: usize,
+    ) -> Result<(), Error> {
+        let needs_snapshot = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_needs_snapshot())?;
+        if !needs_snapshot {
+            return Ok(());
+        }
+        // The kernel file is drained from its current offset; a freshly opened
+        // procfs fd is positioned at 0, so this captures the whole file before
+        // any read is served from the snapshot.
+        let drain = syscalls::Read::new()
+            .with_fd(fd)
+            .with_buf(Some(scratch_buf))
+            .with_len(scratch_len);
+        let contents = self.snapshot_procfs(guest, drain).await?;
+        let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
+        // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
+        let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
+        let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.initialize_procfs(
+                contents.clone(),
+                virtual_uptime_seconds,
+                virtual_pid,
+                virtual_ppid,
+            );
+        })?;
+        Ok(())
+    }
+
     /// SYS_read system call (MAYHANG).
     pub async fn handle_read<G: Guest<Self>>(
         &self,
@@ -309,19 +356,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
         if needs_procfs_snapshot {
-            let contents = self.snapshot_procfs(guest, call).await?;
-            let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
-            // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
-            let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
-            let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.initialize_procfs(
-                    contents.clone(),
-                    virtual_uptime_seconds,
-                    virtual_pid,
-                    virtual_ppid,
-                );
-            })?;
+            let scratch = call.buf().ok_or(Errno::EFAULT)?;
+            self.ensure_procfs_snapshot(guest, call.fd(), scratch, call.len())
+                .await?;
         }
 
         let procfs_bytes = guest
@@ -392,6 +429,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Zero-count reads only serve to detect errors.
             let res = guest.inject(Syscall::from(call)).await?;
             return Ok(res);
+        }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-973): Positioned reads must observe the sanitized
+        // procfs snapshot, not live kernel bytes. Capture the snapshot on first
+        // use and serve the requested window from the normalized copy so
+        // pread64 cannot bypass the determinism guarantee that `read` provides.
+        let is_procfs = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.is_procfs())?;
+        if is_procfs {
+            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+            self.ensure_procfs_snapshot(guest, call.fd(), remote_buf, call.len())
+                .await?;
+            let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+            let bytes = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.read_at_procfs(offset, call.len()))?
+                .expect("procfs snapshot must exist after ensure_procfs_snapshot");
+            guest.memory().write_exact(remote_buf, &bytes)?;
+            return Ok(bytes.len() as i64);
         }
 
         let (fd_type, resource) = guest
@@ -546,6 +604,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !matches!(in_type, FdType::Regular | FdType::Memfd)
             || !matches!(out_type, FdType::Regular | FdType::Memfd)
         {
+            return Err(Errno::ENOSYS.into());
+        }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-973): A procfs input is a `Regular` fd whose
+        // sanitized snapshot is only served by the read path. Refuse sendfile so
+        // libc/application fallbacks copy through read()/write() and observe the
+        // normalized bytes instead of the live kernel file.
+        let in_is_procfs = guest
+            .thread_state()
+            .with_detfd(call.in_fd(), |detfd| detfd.is_procfs())?;
+        if in_is_procfs {
             return Err(Errno::ENOSYS.into());
         }
 
