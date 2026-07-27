@@ -15,7 +15,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 /// Environment variable selecting a Hermit installation directory.
-// TODO-HUMAN-REVIEW(PR-TBD): Review the unified installation-directory contract.
+// TODO-HUMAN-REVIEW(PR-1002): Review the unified installation-directory contract.
 pub const INSTALL_DIR_ENV: &str = "HERMIT_INSTALL_DIR";
 
 fn invoked_executable(argv0: Option<&OsStr>, current_dir: &Path) -> Option<PathBuf> {
@@ -69,7 +69,7 @@ fn discover_install_dir_from(
 }
 
 /// Returns the selected installation directory, if a packaged installation is available.
-// TODO-HUMAN-REVIEW(PR-TBD): Review executable-relative resource discovery.
+// TODO-HUMAN-REVIEW(PR-1002): Review executable-relative resource discovery.
 pub fn install_dir() -> io::Result<Option<PathBuf>> {
     let executable = env::current_exe()?;
     let current_dir = env::current_dir()?;
@@ -82,7 +82,7 @@ pub fn install_dir() -> io::Result<Option<PathBuf>> {
 }
 
 /// Returns a path below the selected installation's `rsrcs` directory.
-// TODO-HUMAN-REVIEW(PR-TBD): Review the shared backend-resource layout.
+// TODO-HUMAN-REVIEW(PR-1002): Review the shared backend-resource layout.
 pub fn resource(relative: impl AsRef<Path>) -> io::Result<Option<PathBuf>> {
     Ok(install_dir()?.map(|directory| directory.join("rsrcs").join(relative)))
 }

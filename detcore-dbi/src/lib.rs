@@ -495,7 +495,7 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
 }
 
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
-// TODO-HUMAN-REVIEW(PR-TBD): Review packaged DBI runtime and client discovery.
+// TODO-HUMAN-REVIEW(PR-1002): Review packaged DBI runtime and client discovery.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     if let Some(install_dir) = hermit_resources::install_dir()? {
         let resources = install_dir.join("rsrcs");
