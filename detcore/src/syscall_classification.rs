@@ -398,7 +398,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // fall back to determinized read/write loops.
         | Sysno::sendfile
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for guest process-
+        // TODO-HUMAN-REVIEW(PR-851): Deterministic ENOSYS for guest process-
         // handle operations. Detcore does not map guest process resource
         // identity, descriptor tables, permissions, or pidfd signal delivery
         // into deterministic state. A fixed feature-absence response keeps
@@ -912,7 +912,7 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic guest process-handle refusal set.
+// TODO-HUMAN-REVIEW(PR-851): Deterministic guest process-handle refusal set.
 /// Guest process-handle inspection and mutation operations. Detcore has no
 /// model for comparing process resources, reaching into another descriptor
 /// table, or delivering signals through pidfds. A fixed `ENOSYS` presents the
