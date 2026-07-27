@@ -1248,6 +1248,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 mod tests {
     use super::*;
 
+    static COPIED_CHILD_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn native_client_links_only_the_dedicated_dbi_runtime() {
         let executable = std::path::Path::new("/workspace/target/debug/hermit");
@@ -1290,6 +1292,9 @@ mod tests {
     // rather than let it execute natively against the host keyring.
     #[test]
     fn copied_child_refuses_keyring_syscalls_under_strict() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
 
         // Strict (panic-on-unsupported): keyring syscalls are refused so the
@@ -1445,6 +1450,9 @@ mod tests {
 
     #[test]
     fn copied_child_gate_refuses_deterministic_refusal_families_in_strict() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The copied pre-exec child runs natively with no Detcore tool. Under
         // strict mode the gate must fail-close (return 1) not only for the
         // classic Unsupported set but for the full deterministic-refusal
