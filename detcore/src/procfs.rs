@@ -46,7 +46,7 @@ enum ProcfsKind {
     Rtc,
     DentryState,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review host swap-usage normalization.
+    // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
 }
 
@@ -612,7 +612,7 @@ fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the zeroed /proc/swaps Used column policy.
+// TODO-HUMAN-REVIEW(PR-945): Review the zeroed /proc/swaps Used column policy.
 fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
     const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
 
