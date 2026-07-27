@@ -2910,6 +2910,13 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sar-resource-tables /usr/bin/sar -v 1 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe lsirq /usr/bin/lsirq --noheadings \
+        --output IRQ,TOTAL,NAME \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe mpstat-softirqs /usr/bin/mpstat -I SCPU 1 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe lsmod /usr/sbin/lsmod \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Restrict process tools to stable identity/existence observations. Host
     # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
     # shellcheck disable=SC2016

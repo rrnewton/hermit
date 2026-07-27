@@ -110,6 +110,8 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     Vmstat,
+    InterruptCounters,
+    Modules,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -517,6 +519,8 @@ impl ProcfsFile {
             ProcfsKind::RandomUuid => {
                 fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
             }
+            ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
+            ProcfsKind::Modules => sanitize_modules(&contents),
         });
     }
 
@@ -2152,60 +2156,30 @@ fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
 fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let mut line = line.to_vec();
-        let body_end = line
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(line.len());
-
-        if let Some(colon) = line[..body_end].iter().position(|byte| *byte == b':') {
-            let mut cursor = colon + 1;
-            loop {
-                while cursor < body_end && line[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                let start = cursor;
-                while cursor < body_end && !line[cursor].is_ascii_whitespace() {
-                    cursor += 1;
-                }
-                if start == cursor || !line[start..cursor].iter().all(u8::is_ascii_digit) {
-                    break;
-                }
-                line[start..cursor].fill(b'0');
-            }
-        }
-        normalized.extend_from_slice(&line);
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
-fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let Some(colon) = body.iter().position(|byte| *byte == b':') else {
+            normalized.extend_from_slice(line);
+            continue;
+        };
+        let fields = body[colon + 1..]
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
             .collect::<Vec<_>>();
-        if fields.len() >= 4 {
-            let holders = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            fields[2] = holders.to_string();
+        let counter_count = fields
+            .iter()
+            .take_while(|field| field.iter().all(u8::is_ascii_digit))
+            .count();
+        if counter_count == 0 {
+            normalized.extend_from_slice(line);
+            continue;
         }
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
+
+        normalized.extend_from_slice(&body[..=colon]);
+        for (index, field) in fields.iter().enumerate() {
+            normalized.push(b' ');
+            normalized.extend_from_slice(if index < counter_count { b"0" } else { field });
+        }
         if has_newline {
             normalized.push(b'\n');
         }
@@ -2290,6 +2264,40 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
+fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() >= 4 {
+            let holders = if fields[3] == "-" {
+                0
+            } else {
+                fields[3]
+                    .split(',')
+                    .filter(|holder| !holder.is_empty())
+                    .count()
+            };
+            fields[2] = holders.to_string();
+        }
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -2347,7 +2355,6 @@ fn zero_decimal_runs(text: &str) -> String {
     }
     normalized
 }
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-916): Review the /proc/net/protocols field policy.
 fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
@@ -3585,7 +3592,12 @@ RAW: inuse 5\n"
         let interrupts = b"           CPU0       CPU1\n  9:        123          4 IR-PCI-MSI 0-edge acpi\nNMI:          8          9 Non-maskable interrupts\nERR:          5\n";
         assert_eq!(
             sanitize_interrupt_counters(interrupts),
-            b"           CPU0       CPU1\n  9:        000          0 IR-PCI-MSI 0-edge acpi\nNMI:          0          0 Non-maskable interrupts\nERR:          0\n"
+            b"           CPU0       CPU1\n  9: 0 0 IR-PCI-MSI 0-edge acpi\nNMI: 0 0 Non-maskable interrupts\nERR: 0\n"
+        );
+        assert_eq!(
+            sanitize_interrupt_counters(b"  9: 9 99 IR-PCI-MSI 0-edge acpi\nERR: 999999\n"),
+            sanitize_interrupt_counters(b"  9: 123456789 4 IR-PCI-MSI 0-edge acpi\nERR: 5\n"),
+            "native counter width and padding must not affect the snapshot"
         );
 
         let modules = b"kvm_amd 212992 95 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n";
