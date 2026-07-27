@@ -121,7 +121,7 @@ fn setpriority_result(which: i32) -> Result<i64, Errno> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic empty kernel-log action policy.
+// TODO-HUMAN-REVIEW(PR-857): Deterministic empty kernel-log action policy.
 fn deterministic_syslog_result(action: i32, len: usize) -> Result<i64, Errno> {
     const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
 
@@ -328,7 +328,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Deterministic syslog(2) virtualization.
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic syslog(2) virtualization.
     /// Present an empty kernel ring buffer. Reads and size queries return zero,
     /// controls are inert, and invalid actions preserve Linux's EINVAL boundary.
     pub async fn handle_syslog<G: Guest<Self>>(

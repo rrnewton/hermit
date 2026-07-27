@@ -493,7 +493,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::flock
         | Sysno::ioprio_set
         | Sysno::sched_getattr
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic NTP and kernel-log
+        // TODO-HUMAN-REVIEW(PR-857): Review deterministic NTP and kernel-log
         // virtualization. Query-only timex calls report Hermit's virtual clock
         // and an unsynchronized discipline, while mutation modes are refused.
         // syslog exposes an empty ring buffer and never reads host dmesg state.

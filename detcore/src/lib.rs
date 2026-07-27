@@ -1676,7 +1676,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     }
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Clock-id form of virtual NTP query.
+                // TODO-HUMAN-REVIEW(PR-857): Clock-id form of virtual NTP query.
                 Syscall::ClockAdjtime(s) => {
                     if virtualize_time {
                         self.handle_clock_adjtime(guest, s).await
