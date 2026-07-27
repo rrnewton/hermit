@@ -1444,7 +1444,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic network-namespace identity.
+        // TODO-HUMAN-REVIEW(PR-894): Review deterministic network-namespace identity.
         let requested_length =
             if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_NETNS_COOKIE {
                 let fd_type = guest
