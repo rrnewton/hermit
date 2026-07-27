@@ -410,6 +410,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_readv
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for unmodeled kernel
+        // features with established compatibility fallbacks. Kernel-managed
+        // copy progress, nonlinear page remapping, and another task's robust
+        // list are outside Detcore's FD, VM, and virtual-PID models.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::copy_file_range
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::remap_file_pages
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::get_robust_list
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -626,12 +637,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
         | Sysno::futex_wake
-        | Sysno::get_robust_list
         | Sysno::getitimer
         | Sysno::ioprio_get
         | Sysno::kcmp
@@ -654,7 +663,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
-        | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::sched_setattr
@@ -891,6 +899,26 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Deterministic kernel-feature fallback set.
+/// Kernel interfaces whose state transitions are outside Detcore's model but
+/// whose callers have explicit feature-absence paths. `copy_file_range` tracks
+/// kernel-side file offsets and partial copy progress, `remap_file_pages`
+/// creates deprecated nonlinear mappings, and `get_robust_list` exposes a
+/// host-task pointer through an untranslated PID. A fixed `ENOSYS` routes code
+/// to read/write, linear-mapping, or non-robust-futex compatibility paths.
+pub(crate) const fn is_kernel_feature_fallback_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::copy_file_range
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::remap_file_pages
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::get_robust_list
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
 /// Host filesystem and mount-introspection syscalls. `sysfs` reads the
 /// host's filesystem-type table; `statmount` and `listmount` read mount IDs
@@ -918,7 +946,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [232, 91, 50]);
+        assert_eq!(counts, [235, 91, 47]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1392,6 +1420,34 @@ mod tests {
                 is_process_isolation_refused_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} process-isolation helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_feature_fallback_syscalls_are_determinized_and_consistent() {
+        let unavailable = [
+            Sysno::copy_file_range,
+            Sysno::remap_file_pages,
+            Sysno::get_robust_list,
+        ];
+        for sysno in unavailable {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_kernel_feature_fallback_syscall(sysno),
+                "{sysno:?} should be in the kernel-feature fallback set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_kernel_feature_fallback_syscall(sysno),
+                unavailable.contains(&sysno),
+                "{sysno:?} kernel-feature helper membership is inconsistent"
             );
         }
     }
