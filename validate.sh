@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=197
-readonly SABRE_COMPAT_TOTAL=197
+readonly SABRE_COMPAT_EXPECTED=201
+readonly SABRE_COMPAT_TOTAL=201
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -3046,6 +3046,22 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe getconf bash -c \
             'set -euo pipefail; page=$(/usr/bin/getconf PAGESIZE); bits=$(/usr/bin/getconf LONG_BIT); test "$page:$bits" = 4096:64; printf "getconf:page=%s:long=%s\n" "$page" "$bits"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#845): Review the functional build/catalog rows.
+        # Expand command substitutions and temporary paths inside the guest.
+        # shellcheck disable=SC2016
+        strict_compatibility_probe cscope bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "int compat_add(int a, int b) { return a + b; }\nint main(void) { return compat_add(20, 22) != 42; }\n" >"$d/fixture.c"; printf "fixture.c\n" >"$d/cscope.files"; (cd "$d" && /usr/bin/cscope -bq -i cscope.files); output=$(cd "$d" && /usr/bin/cscope -dL -1 compat_add); [[ $output == *"fixture.c compat_add 1"* ]]; printf "cscope:compat_add-found\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe flex bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "%option prefix=\"compat\" noyywrap" "%%" "[0-9]+ return 1;" ".      ;" "%%" >"$d/scanner.l"; /usr/bin/flex -o "$d/scanner.c" "$d/scanner.l"; grep -q compatlex "$d/scanner.c"; printf "flex:compat-scanner-generated\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe msgfmt bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "msgid \"\"" "msgstr \"Content-Type: text/plain; charset=UTF-8\\n\"" "" "msgid \"hello\"" "msgstr \"Hermit\"" >"$d/messages.po"; /usr/bin/msgfmt -o "$d/messages.mo" "$d/messages.po"; test -s "$d/messages.mo"; printf "msgfmt:catalog-compiled\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe msgunfmt bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "msgid \"\"" "msgstr \"Content-Type: text/plain; charset=UTF-8\\n\"" "" "msgid \"hello\"" "msgstr \"Hermit\"" >"$d/messages.po"; /usr/bin/msgfmt -o "$d/messages.mo" "$d/messages.po"; /usr/bin/msgunfmt "$d/messages.mo" >"$d/roundtrip.po"; grep -Fq '\''msgstr "Hermit"'\'' "$d/roundtrip.po"; printf "msgunfmt:catalog-roundtrip-ok\n"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
