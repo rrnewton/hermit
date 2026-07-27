@@ -1411,7 +1411,7 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe dc /usr/bin/dc -e '2 2 + p' && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe cal /usr/bin/cal 1 2000 && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe sleep /usr/bin/sleep 0 && passed=$((passed + 1)) || failed=$((failed + 1))
-    liteinst_compatibility_probe logger /usr/bin/logger --stderr --no-act -t hermit-compat logger-ok && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-repart-version /usr/bin/systemd-repart --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe comm /usr/bin/comm /dev/null /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe join /usr/bin/join /dev/null /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe tee /usr/bin/tee && passed=$((passed + 1)) || failed=$((failed + 1))
