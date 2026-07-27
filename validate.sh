@@ -307,8 +307,8 @@ readonly RR_COMPAT_EXPECTED=143
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=159
-readonly SABRE_COMPAT_TOTAL=159
+readonly SABRE_COMPAT_EXPECTED=170
+readonly SABRE_COMPAT_TOTAL=170
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -2484,11 +2484,6 @@ function run_compatibility_corpus {
             bash /usr/bin/perl \
             'my $sum=0; OUTER: for my $n (2..100) { for my $d (2..int(sqrt($n))) { next OUTER if $n % $d == 0 } $sum += $n } print "$sum\n"' 1060 \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        strict_compatibility_probe tcl bash -c \
-            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "tcl-squares=%s\n" "$out"' \
-            bash /usr/bin/tclsh \
-            'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
         # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#698): Review the expanded bc and dc exact-output probes.
         # Keep the combined exact result below GNU bc output wrap width.
@@ -2498,17 +2493,26 @@ function run_compatibility_corpus {
             'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; scale=50; print f(20), " ", sqrt(2), "\n"' \
             '2432902008176640000 1.41421356237309504880168872420969807856967187537694' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        strict_compatibility_probe dc bash -c \
-            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-math=%s\n" "$out"' \
-            bash /usr/bin/dc '2 100 ^ 1 - n [ ]P 4 13 497 | p' \
-            '1267650600228229401496703205375 445' \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
     else
         strict_compatibility_probe lua lua -e 'print(42)' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#845): Review the measured SaBRe system-utility expansion.
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
+        strict_compatibility_probe tcl bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "tcl-squares=%s\n" "$out"' \
+            bash /usr/bin/tclsh \
+            'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe dc bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-math=%s\n" "$out"' \
+            bash /usr/bin/dc '2 100 ^ 1 - n [ ]P 4 13 497 | p' \
+            '1267650600228229401496703205375 445' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # shellcheck disable=SC2016
@@ -2521,7 +2525,7 @@ function run_compatibility_corpus {
     functional_compatibility_probe jq /usr/bin/jq -c -n \
         '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    if [[ $COMPATIBILITY_MODE == strict ]]; then
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe xmllint /usr/bin/xmllint --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
@@ -2552,7 +2556,7 @@ function run_compatibility_corpus {
         functional_compatibility_probe rustc rustc --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
-    if [[ $COMPATIBILITY_MODE == strict ]]; then
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe clang clang --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         if defer_hosted_strict_diagnostic_to_super javac; then
@@ -2586,11 +2590,13 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#699)
-    if [[ $COMPATIBILITY_MODE == strict ]]; then
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         strict_compatibility_probe wget /usr/bin/wget --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe netcat /usr/bin/nc -h \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
         if [[ -x /usr/bin/socat ]]; then
             strict_compatibility_probe socat /usr/bin/socat -h \
                 && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2756,7 +2762,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe hostname /usr/bin/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    if [[ $COMPATIBILITY_MODE == strict ]]; then
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe ip /usr/sbin/ip -V \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe ss /usr/sbin/ss -V \
@@ -2765,6 +2771,10 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        tally_known_failclosed_probe passed failed known_flaky lsof \
+            functional_compatibility_probe lsof /usr/bin/lsof -v
     fi
     strict_compatibility_probe whoami /usr/bin/whoami \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2824,7 +2834,7 @@ function run_compatibility_corpus {
     functional_compatibility_probe xargs bash -c \
         'printf "one\ntwo\n" | /usr/bin/xargs -n1 /bin/echo' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    if [[ $COMPATIBILITY_MODE == strict ]]; then
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe time /usr/bin/time --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
