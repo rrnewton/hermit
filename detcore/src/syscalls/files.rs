@@ -84,6 +84,25 @@ fn parse_proc_fd_link_target(target: &[u8]) -> Option<(&'static str, RawInode)> 
     None
 }
 
+const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+fn unix_autobind_addrlen() -> i32 {
+    (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
+}
+
+fn unix_autobind_address(port: u16) -> libc::sockaddr_un {
+    // Linux autobind names are a leading NUL followed by five lowercase hex digits.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (destination, source) in address.sun_path[1..UNIX_AUTOBIND_NAME_LEN]
+        .iter_mut()
+        .zip(format!("{port:05x}").bytes())
+    {
+        *destination = source as libc::c_char;
+    }
+    address
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     async fn inject_fstat<G: Guest<Self>>(
@@ -1530,7 +1549,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+
+        // TODO-HUMAN-REVIEW(PR-898): Hermit exposes one virtual CPU, so do not
+        // leak the host CPU that processed a socket's most recent packet.
+        if result == 0
+            && call.level() == libc::SOL_SOCKET
+            && call.optname() == libc::SO_INCOMING_CPU
+            && let (Some(optval), Some(optlen)) = (call.optval(), call.optlen())
+        {
+            let returned_len: libc::socklen_t = guest.memory().read_value(optlen)?;
+            let zero_cpu = 0_i32.to_ne_bytes();
+            let returned_len = (returned_len as usize).min(zero_cpu.len());
+            guest
+                .memory()
+                .write_exact(optval.cast::<u8>(), &zero_cpu[..returned_len])?;
+        }
+
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1570,7 +1606,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
-        if sockaddr_family == libc::AF_INET as u16 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-872): Review deterministic AF_UNIX autobind identity.
+        if sockaddr_family == libc::AF_UNIX as u16
+            && call.addrlen() == std::mem::offset_of!(libc::sockaddr_un, sun_path) as i32
+        {
+            let mytime = guest.thread_state().thread_logical_time.clone();
+            let resp = guest
+                .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
+                .await;
+            let port = match resp.1 {
+                GlobalResponse::RequestPort(port) => port,
+                GlobalResponse::PortFull => {
+                    return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                }
+                _ => unreachable!(),
+            };
+
+            let mut stack = guest.stack().await;
+            let autobind_addr: AddrMut<libc::sockaddr_un> = stack.reserve();
+            let _stack_guard = stack.commit()?;
+            guest
+                .memory()
+                .write_value(autobind_addr, &unix_autobind_address(port))?;
+            let deterministic_bind = call
+                .with_umyaddr(Some(autobind_addr.cast()))
+                .with_addrlen(unix_autobind_addrlen());
+            return Ok(self.record_or_replay(guest, deterministic_bind).await?);
+        } else if sockaddr_family == libc::AF_INET as u16 {
             // For IPv4
             let mut sockaddr_in: libc::sockaddr_in = guest
                 .memory()
@@ -1961,8 +2024,11 @@ mod test {
 
     use nix::fcntl::OFlag;
 
+    use super::UNIX_AUTOBIND_NAME_LEN;
     use super::is_canonical_self_proc_fd;
     use super::parse_proc_fd_link_target;
+    use super::unix_autobind_address;
+    use super::unix_autobind_addrlen;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2010,5 +2076,21 @@ mod test {
         ] {
             assert_eq!(parse_proc_fd_link_target(target), None);
         }
+    }
+
+    #[test]
+    fn unix_autobind_address_matches_linux_shape() {
+        let address = unix_autobind_address(0x2af);
+        assert_eq!(address.sun_family, libc::AF_UNIX as libc::sa_family_t);
+        assert_eq!(address.sun_path[0], 0);
+        let name = address.sun_path[1..UNIX_AUTOBIND_NAME_LEN]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(name, b"002af");
+        assert_eq!(
+            unix_autobind_addrlen() as usize,
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN
+        );
     }
 }
