@@ -9,13 +9,12 @@
 
 set -euo pipefail
 
+# shellcheck source=demos/lib/display.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/display.sh"
+
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 2: Record And Replay"
-echo ''
-echo '=========================================='
-echo '=== Demo 2: Record And Replay ==='
-echo '=========================================='
-echo ''
+demo_header "$DEMO_LABEL"
 echo 'Hermit records an execution into an isolated data directory, lists the recording'
 echo 'in text and JSON, and replays it to completion with --autopilot. It can also'
 echo 'record and immediately verify a replay. Without --autopilot, hermit replay'

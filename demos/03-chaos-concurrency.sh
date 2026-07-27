@@ -9,13 +9,12 @@
 
 set -euo pipefail
 
+# shellcheck source=demos/lib/display.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/display.sh"
+
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 3: Chaos Concurrency Testing"
-echo ''
-echo '=========================================='
-echo '=== Demo 3: Chaos Concurrency Testing ==='
-echo '=========================================='
-echo ''
+demo_header "$DEMO_LABEL"
 echo 'hello_race contains an intentional data race. Chaos mode makes scheduler'
 echo 'choices with a seeded PRNG, so different seeds explore different interleavings'
 echo 'and the same seed reproduces the same result. Seed 1 passes; seed 0 reaches the'
