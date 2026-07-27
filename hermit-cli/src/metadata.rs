@@ -165,6 +165,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,
         discover_live_file_metadata: false,
+        use_thread_local_clock_reads: false,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
