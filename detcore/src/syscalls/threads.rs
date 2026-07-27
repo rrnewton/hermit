@@ -15,6 +15,7 @@ use std::time::Duration;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -73,29 +74,65 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     }
 }
 
-async fn futex_timeout_deadline<G, T>(
-    guest: &mut G,
-    futex_op: i32,
-    timeout: Option<Addr<'_, Timespec>>,
-) -> Result<Option<LogicalTime>, Error>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let Some(timeout) = timeout else {
-        return Ok(None);
-    };
-    let timeout = parse_futex_timeout(futex_op, guest.memory().read_value(timeout)?)?;
-    match timeout {
-        FutexTimeout::Relative(nanos) => {
-            let now = thread_observe_time(guest).await;
-            Ok(Some(now + Duration::from_nanos(nanos)))
-        }
-        FutexTimeout::Absolute(deadline) => Ok(Some(deadline)),
-    }
+fn rebase_absolute_timeout(
+    deadline: LogicalTime,
+    clock_now: LogicalTime,
+    logical_now: LogicalTime,
+) -> LogicalTime {
+    logical_now + Duration::from_nanos(deadline.as_nanos().saturating_sub(clock_now.as_nanos()))
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn futex_timeout_deadline<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        futex_flags: i32,
+        timeout: Option<Addr<'_, Timespec>>,
+    ) -> Result<Option<LogicalTime>, Error> {
+        let Some(timeout) = timeout else {
+            return Ok(None);
+        };
+        let timeout = parse_futex_timeout(futex_flags, guest.memory().read_value(timeout)?)?;
+        match timeout {
+            FutexTimeout::Relative(nanos) => {
+                let now = thread_observe_time(guest).await;
+                Ok(Some(now + Duration::from_nanos(nanos)))
+            }
+            FutexTimeout::Absolute(deadline) if self.cfg.virtualize_time => Ok(Some(deadline)),
+            FutexTimeout::Absolute(deadline) => {
+                let clockid = if futex_flags & libc::FUTEX_CLOCK_REALTIME != 0 {
+                    syscalls::ClockId::CLOCK_REALTIME
+                } else {
+                    syscalls::ClockId::CLOCK_MONOTONIC
+                };
+
+                let mut stack = guest.stack().await;
+                let clock_output = syscalls::TimespecMutPtr(stack.reserve());
+                let _stack_guard = stack.commit()?;
+                self.record_or_replay(
+                    guest,
+                    syscalls::ClockGettime::new()
+                        .with_clockid(clockid)
+                        .with_tp(Some(clock_output)),
+                )
+                .await?;
+                let clock_now = match parse_futex_timeout(
+                    libc::FUTEX_WAIT_BITSET,
+                    guest.memory().read_value(clock_output.0)?,
+                )? {
+                    FutexTimeout::Absolute(time) => time,
+                    FutexTimeout::Relative(_) => unreachable!(),
+                };
+                let logical_now = thread_observe_time(guest).await;
+                Ok(Some(rebase_absolute_timeout(
+                    deadline,
+                    clock_now,
+                    logical_now,
+                )))
+            }
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -277,8 +314,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
-                    let maybe_timeout_lt =
-                        futex_timeout_deadline(guest, futex_op, call.timeout()).await?;
+                    let maybe_timeout_lt = self
+                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                        .await?;
                     let ans = futex_action(
                         guest,
                         FutexAction::WaitRequest(maybe_timeout_lt),
@@ -363,7 +401,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(res?)
                 } else {
                     let rsrc = make_futex_wait_request(dettid);
-                    let deadline = futex_timeout_deadline(guest, futex_op, call.timeout()).await?;
+                    let deadline = self
+                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                        .await?;
                     let res =
                         retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await?;
                     trace!(
@@ -547,6 +587,25 @@ mod tests {
             Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
                 2_000_000_003
             )))
+        );
+    }
+
+    #[test]
+    fn absolute_futex_timeout_is_rebased_to_logical_time() {
+        let logical_now = LogicalTime::from_secs(100);
+        let clock_now = LogicalTime::from_secs(5_000);
+        let deadline = clock_now + Duration::from_millis(100);
+        assert_eq!(
+            rebase_absolute_timeout(deadline, clock_now, logical_now),
+            logical_now + Duration::from_millis(100)
+        );
+        assert_eq!(
+            rebase_absolute_timeout(
+                clock_now - LogicalTime::from_nanos(1),
+                clock_now,
+                logical_now
+            ),
+            logical_now
         );
     }
 

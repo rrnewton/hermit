@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -93,6 +94,19 @@ impl Replayer {
             // stat calls always return 0 on success.
             Ok(0)
         })
+    }
+
+    pub(super) async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<AddrMut<'_, libc::statfs>>,
+    ) -> Result<i64, Errno> {
+        let bytes = next_event!(guest, Statfs)?;
+        assert_eq!(bytes.len(), std::mem::size_of::<libc::statfs>());
+        guest
+            .memory()
+            .write_exact(buf.ok_or(Errno::EFAULT)?.cast(), &bytes)?;
+        Ok(0)
     }
 
     pub(super) async fn handle_statx<G: Guest<Self>>(

@@ -250,6 +250,7 @@ fn record_replay_stable_arbitrary_binaries() {
         "dynamic_ls",
         "shell",
         "python",
+        "java",
         "curl",
         "wget",
         "git",
