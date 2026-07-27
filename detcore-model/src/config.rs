@@ -80,6 +80,14 @@ pub struct Config {
     #[clap(skip)]
     pub syscall_clobbers_virtualized_by_backend: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
+    /// Logically killed guest threads need an explicit scheduler response because the backend
+    /// does not rely on ptrace's kernel-driven exit-group teardown.
+    #[serde(default)]
+    #[clap(skip)]
+    pub cancel_killed_thread_rpcs: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and

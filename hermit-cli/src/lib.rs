@@ -1116,6 +1116,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
+    config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
     config
 }
 
@@ -1571,11 +1572,13 @@ mod tests {
         assert!(sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
+        assert!(sabre.cancel_killed_thread_rpcs);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
+        assert!(!ptrace.cancel_killed_thread_rpcs);
     }
 
     #[test]

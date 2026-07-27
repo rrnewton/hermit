@@ -277,6 +277,9 @@ pub struct Scheduler {
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
 
+    /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
+    cancel_killed_thread_rpcs: bool,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -899,6 +902,7 @@ impl Scheduler {
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
+            cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1074,7 +1078,7 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 let request_was_pending = nextturn.req.try_put(Err(ThreadExited)).is_some();
-                if request_was_pending {
+                if request_was_pending && self.cancel_killed_thread_rpcs {
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled());
@@ -2834,7 +2838,11 @@ mod test {
 
     #[test]
     fn logically_kill_thread_unblocks_pending_rpc() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
         let response = Ivar::new();
@@ -2859,7 +2867,11 @@ mod test {
 
     #[test]
     fn logically_kill_running_thread_does_not_preload_response() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
         let request = Ivar::new();
@@ -2878,6 +2890,28 @@ mod test {
         scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
 
         assert!(matches!(request.try_read(), Some(Err(ThreadExited))));
+        assert!(response.try_read().is_none());
+    }
+
+    #[test]
+    fn ptrace_kill_leaves_pending_rpc_to_kernel_teardown() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(Resources::new(dettid))),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
         assert!(response.try_read().is_none());
     }
 
