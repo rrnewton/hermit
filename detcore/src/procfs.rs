@@ -155,7 +155,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
             "/proc/self/sched" => ProcfsKind::SelfSched,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
@@ -841,7 +841,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/sched field policy.
+// TODO-HUMAN-REVIEW(PR-928): Review the /proc/self/sched field policy.
 fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
     const FLOAT_FIELDS: &[&str] = &["se.exec_start", "se.vruntime", "se.sum_exec_runtime"];
     const INTEGER_FIELDS: &[&str] = &[
