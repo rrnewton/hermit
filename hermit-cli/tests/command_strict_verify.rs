@@ -50,7 +50,8 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
-    std::fs::create_dir_all(home.path().join(".config/procps"))
+    let xdg_config_home = home.path().join(".config");
+    std::fs::create_dir_all(xdg_config_home.join("procps"))
         .expect("failed to preseed the isolated procps HOME");
     let mut command = Command::new("timeout");
     command
@@ -60,7 +61,12 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=off", "run", "--strict", "--verify"])
+        .arg("--env")
+        .arg(format!("HOME={}", home.path().display()))
+        .arg("--env")
+        .arg(format!("XDG_CONFIG_HOME={}", xdg_config_home.display()))
+        .arg("--")
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
@@ -515,17 +521,39 @@ fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
             args: &["--hardware"],
             stdin: None,
         },
-        StrictCommandCase {
-            name: "sensors",
-            candidates: &["/usr/bin/sensors"],
-            args: &[],
-            stdin: None,
-        },
     ];
 
     for case in &cases {
         assert_l2_under_strict_verify(case);
     }
+
+    let sensors = StrictCommandCase {
+        name: "sensors",
+        candidates: &["/usr/bin/sensors"],
+        args: &[],
+        stdin: None,
+    };
+    let Some(program) = sensors
+        .candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+    else {
+        eprintln!("skipping sensors L2 coverage: sensors is not installed");
+        return;
+    };
+    if !Command::new(program)
+        .args(sensors.args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to probe sensors support")
+        .success()
+    {
+        eprintln!("skipping sensors L2 coverage: host exposes no usable sensor devices");
+        return;
+    }
+    assert_l2_under_strict_verify(&sensors);
 }
 
 #[test]
