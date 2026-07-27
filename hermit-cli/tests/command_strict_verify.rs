@@ -307,7 +307,7 @@ fn identity_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review NUMA and sensor command coverage.
+// TODO-HUMAN-REVIEW(PR-865): Review NUMA and sensor command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + numactl/lm_sensors tools"]
 fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
