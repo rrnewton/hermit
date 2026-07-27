@@ -371,7 +371,7 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(PR-881)
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + util-linux ionice"]
 fn ionice_query_is_deterministic_under_strict_verify() {

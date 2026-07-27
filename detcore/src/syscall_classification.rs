@@ -551,7 +551,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Report fixed raw/effective I/O priority
+        // TODO-HUMAN-REVIEW(PR-881): Report fixed raw/effective I/O priority
         // defaults without observing host block-scheduler state.
         | Sysno::ioprio_get
         | Sysno::ioprio_set

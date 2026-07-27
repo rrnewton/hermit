@@ -68,7 +68,7 @@ const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
     (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(PR-881)
 fn virtual_ioprio(which: libc::c_int) -> Result<i64, Errno> {
     match which {
         IOPRIO_WHO_PROCESS => Ok(0),
@@ -1076,7 +1076,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// value while group/user queries observe the effective SCHED_OTHER default
     /// of IOPRIO_CLASS_BE/4, without consulting host block-scheduler state.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(PR-881)
     pub async fn handle_ioprio_get<G: Guest<Self>>(
         &self,
         _guest: &mut G,
