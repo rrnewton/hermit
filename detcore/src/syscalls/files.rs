@@ -176,6 +176,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// SYS_lseek system call.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-id): Review procfs snapshot lseek synchronization.
+    pub async fn handle_lseek<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Lseek,
+    ) -> Result<i64, Error> {
+        let result = self.record_or_replay(guest, call).await?;
+        let offset = usize::try_from(result).map_err(|_| Errno::EOVERFLOW)?;
+        guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(offset))?;
+        Ok(result)
+    }
+
     /// SYS_close system call.
     pub async fn handle_close<G: Guest<Self>>(
         &self,
@@ -292,6 +308,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if needs_procfs_snapshot {
             let contents = self.snapshot_procfs(guest, call).await?;
             let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review virtual procfs boot-time derivation.
+            let virtual_boot_time_seconds = guest.config().epoch.timestamp()
+                - i64::try_from(self.cfg.sysinfo_uptime_offset)
+                    .expect("sysinfo uptime offset exceeds i64");
             // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
             let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
             let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
@@ -299,6 +320,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.initialize_procfs(
                     contents.clone(),
                     virtual_uptime_seconds,
+                    virtual_boot_time_seconds,
                     virtual_pid,
                     virtual_ppid,
                 );

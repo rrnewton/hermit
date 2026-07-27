@@ -290,6 +290,7 @@ impl DetFd {
         &self,
         contents: Vec<u8>,
         virtual_uptime_seconds: u64,
+        virtual_boot_time_seconds: i64,
         virtual_pid: i32,
         virtual_ppid: i32,
     ) {
@@ -297,7 +298,22 @@ impl DetFd {
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, virtual_uptime_seconds, virtual_pid, virtual_ppid);
+            .initialize(
+                contents,
+                virtual_uptime_seconds,
+                virtual_boot_time_seconds,
+                virtual_pid,
+                virtual_ppid,
+            );
+    }
+
+    /// Synchronize a deterministic procfs snapshot after lseek.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-id): Review procfs descriptor seek synchronization.
+    pub(crate) fn set_procfs_offset(&self, offset: usize) {
+        if let Some(procfs) = self.description().procfs.as_mut() {
+            procfs.set_offset(offset);
+        }
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.

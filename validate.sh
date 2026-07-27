@@ -298,7 +298,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=183
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -321,7 +321,6 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 # executable corpus. They remain in the canonical denominator and table.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
-    [free]="live /proc/meminfo values differ between otherwise identical runs"
     # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
@@ -2253,11 +2252,11 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Restrict process tools to stable identity/existence observations. Host
-    # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
-    # shellcheck disable=SC2016
-    strict_compatibility_probe ps bash -c \
-        'set -euo pipefail; pid=$(ps -o pid= -p $$); pid=${pid//[[:space:]]/}; test "$pid" = "$$"; printf "ps-ok\n"' \
+    strict_compatibility_probe ps /usr/bin/ps aux \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe free /usr/bin/free -m \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe vmstat /usr/bin/vmstat -s \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe top bash -c \
@@ -2370,9 +2369,6 @@ function run_compatibility_corpus {
     strict_compatibility_probe cmp bash -c \
         'set -euo pipefail; d=$(mktemp -d); printf "same\n" >"$d/a"; printf "same\n" >"$d/b"; cmp -s "$d/a" "$d/b"; printf "cmp-ok\n"; rm -rf "$d"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # free is intentionally absent: its live /proc/meminfo values differ
-    # between otherwise identical strict runs.
-
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         if ((RR_COMPAT_CANARY_FAILED == 1)); then
             printf "❌ Record/replay compatibility canary %s failed; executed %s selected probe and skipped %s remaining selected probes (%s unselected)\n" \

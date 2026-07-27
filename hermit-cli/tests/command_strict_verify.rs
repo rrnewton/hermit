@@ -306,6 +306,44 @@ fn identity_commands_are_deterministic_under_strict_verify() {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review strict process-accounting command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + procps-ng tools"]
+fn process_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "ps aux",
+            candidates: &["/usr/bin/ps", "/bin/ps"],
+            args: &["aux"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "free -m",
+            candidates: &["/usr/bin/free", "/bin/free"],
+            args: &["-m"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vmstat -s",
+            candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
+            args: &["-s"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "top batch",
+            candidates: &["/usr/bin/top", "/bin/top"],
+            args: &["-b", "-n", "1", "-p", "1", "-w", "80"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {
