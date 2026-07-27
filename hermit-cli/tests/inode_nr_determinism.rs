@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review strict verification coverage for inode counters.
+// TODO-HUMAN-REVIEW(PR-914): Review strict verification coverage for inode counters.
 #[test]
 fn inode_nr_consumers_verify() {
     assert!(
