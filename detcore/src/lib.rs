@@ -1456,14 +1456,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review close_range descriptor-table
+            // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
             // synchronization. The pinned Reverie exposes close_range as a raw
             // call, so dispatch by Sysno before the typed match.
             SyscallClassification::Determinized if call.number() == Sysno::close_range => {
                 self.handle_close_range(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review the deterministic seccomp
+            // TODO-HUMAN-REVIEW(PR-838): Review the deterministic seccomp
             // compatibility refusal. Guest filters can block ptrace-runtime
             // syscall injection and capability probes expose host-kernel state,
             // so Hermit presents a fixed kernel-without-seccomp boundary.
@@ -1491,7 +1491,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review regular-file sendfile mediation.
+                // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
                 Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)

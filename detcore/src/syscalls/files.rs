@@ -195,7 +195,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review close_range descriptor-table synchronization.
+    // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table synchronization.
     /// Close a contiguous descriptor range and mirror successful closes in Detcore.
     ///
     /// The pinned Reverie revision exposes close_range as `Syscall::Other`. The
@@ -496,7 +496,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review regular-file sendfile mediation.
+    // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
     /// Copy data between tracked regular files or memfds.
     ///
     /// The kernel advances the input offset (or the explicit offset pointer) and

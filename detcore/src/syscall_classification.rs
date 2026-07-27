@@ -369,7 +369,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review close_range descriptor-table
+        // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
         // synchronization and the deterministic seccomp compatibility refusal.
         // The close_range handler serializes the kernel operation and removes the
         // same descriptor slots from Detcore's model. Seccomp support is hidden
@@ -380,7 +380,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::close_range
         | Sysno::seccomp
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review regular-file sendfile mediation.
+        // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
         // The handler serializes destination writes and forwards the copy through
         // record/replay; unsupported endpoint types receive ENOSYS so callers can
         // fall back to determinized read/write loops.
