@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    DentryState,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -41,6 +42,9 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global dentry counter normalization.
+            "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::DentryState => sanitize_dentry_state(&contents),
         });
         self.offset = 0;
     }
@@ -249,6 +254,16 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/dentry-state field policy.
+fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\t0\t45\t0\t0\t0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -340,6 +355,12 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/dentry-state"))
+                .unwrap()
+                .kind,
+            ProcfsKind::DentryState
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -415,6 +436,17 @@ mod tests {
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
         );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review dentry counter fixture coverage.
+    #[test]
+    fn dentry_state_hides_host_global_cache_counters() {
+        assert_eq!(
+            sanitize_dentry_state(b"1888773\t1374220\t45\t0\t212904\t0\n"),
+            b"0\t0\t45\t0\t0\t0\n"
+        );
+        assert!(sanitize_dentry_state(b"").is_empty());
     }
 
     #[test]
