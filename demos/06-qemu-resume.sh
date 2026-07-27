@@ -4,6 +4,28 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [COMMAND...]
+
+Resume the QEMU snapshot created by Demo 5, run one command in the guest
+serial shell, and compare its normalized Hermit INFO tail with the previous
+run of the same command. The default command is: uname -a
+
+Examples:
+  ./demos/06-qemu-resume.sh 'ls /'
+  ./demos/06-qemu-resume.sh 'cat /proc/cpuinfo'
+  ./demos/06-qemu-resume.sh 'echo hello'
+EOF
+}
+
+case ${1:-} in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 6: QEMU Snapshot Resume"
 echo ''
