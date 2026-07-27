@@ -148,7 +148,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review host NUMA observation normalization.
+            // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
             "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
@@ -805,7 +805,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/numa_maps field policy.
+// TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
 fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
