@@ -457,7 +457,7 @@ impl RunQueue {
         self.tentative_selection
     }
 
-    // TODO-HUMAN-REVIEW(PR-TBD): Review exact run-queue selection for vfork barriers.
+    // TODO-HUMAN-REVIEW(PR-868): Review exact run-queue selection for vfork barriers.
     /// Begin a pop transaction for one specific queued thread, bypassing the
     /// configured scheduling heuristic without changing the thread's priority.
     pub fn tentative_pop_tid(&mut self, tid: DetTid) -> Option<DetTid> {

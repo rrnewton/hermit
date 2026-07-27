@@ -1932,7 +1932,7 @@ impl Scheduler {
         }
     }
 
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the vfork registration scheduler barrier.
+    // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler barrier.
     pub(crate) fn complete_vfork_registration(&mut self, parent: DetTid, child: DetTid) {
         let registered_child = self
             .vfork_barriers

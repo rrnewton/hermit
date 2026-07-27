@@ -227,7 +227,7 @@ pub enum ResourceID {
     /// In general these should be recorded if strict reproducibility is to be achieved.
     BlockingExternalIO(ExternalOpId),
 
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the vfork registration scheduler token.
+    // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler token.
     /// A `CLONE_VFORK` parent entering the kernel. The scheduler must not admit
     /// another guest turn until the child has registered or the clone has failed.
     BlockingVfork(ExternalOpId),
