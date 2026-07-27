@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Schedstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review host scheduler accounting normalization.
+            "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Schedstat => sanitize_schedstat(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,46 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        let preserved_fields = match fields.first().map(String::as_str) {
+            Some("timestamp") => 1,
+            Some(label) if numbered_label(label, "cpu") => 1,
+            Some(label) if numbered_label(label, "domain") => 3,
+            _ => fields.len(),
+        };
+        for field in fields.iter_mut().skip(preserved_fields) {
+            if field.parse::<u128>().is_ok() {
+                *field = "0".to_owned();
+            }
+        }
+
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn numbered_label(label: &str, prefix: &str) -> bool {
+    label.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +384,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/schedstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Schedstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -430,6 +481,22 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn schedstat_hides_host_scheduler_accounting() {
+        let contents = b"version 17\n\
+timestamp 4671819092\n\
+cpu0 1 2 3 4 5 6 129488086714063 39956207684532 545893933\n\
+domain0 SMT 00000003 1 2 3\n";
+
+        assert_eq!(
+            sanitize_schedstat(contents),
+            b"version 17\n\
+timestamp 0\n\
+cpu0 0 0 0 0 0 0 0 0 0\n\
+domain0 SMT 00000003 0 0 0\n"
         );
     }
 
