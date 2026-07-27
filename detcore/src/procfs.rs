@@ -280,7 +280,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review Btrfs commit telemetry normalization.
+            // TODO-HUMAN-REVIEW(PR-966): Review Btrfs commit telemetry normalization.
             _ if is_btrfs_commit_stats_path(path) => ProcfsKind::BtrfsCommitStats,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -1711,7 +1711,7 @@ fn is_lowercase_uuid(value: &str) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the Btrfs commit_stats field policy.
+// TODO-HUMAN-REVIEW(PR-966): Review the Btrfs commit_stats field policy.
 fn sanitize_btrfs_commit_stats(contents: &[u8]) -> Vec<u8> {
     const LABELS: &[&str] = &[
         "commits",
