@@ -280,7 +280,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review Unix socket identity normalization.
+            // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
             "/proc/net/unix" => ProcfsKind::UnixSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -994,7 +994,7 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review Unix socket identity normalization.
+// TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
 fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
     const HEADER: [&str; 8] = [
         "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
