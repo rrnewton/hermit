@@ -47,7 +47,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review interrupt and module accounting snapshots.
+            // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
             "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
             "/proc/modules" => ProcfsKind::Modules,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -307,7 +307,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review synthetic interrupt and module accounting values.
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic interrupt and module accounting values.
 fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
@@ -339,7 +339,7 @@ fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review synthetic module reference counts.
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
 fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();

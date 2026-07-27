@@ -165,7 +165,7 @@ fn proc_entropy_available_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review interrupt, softirq, and module snapshot coverage.
+// TODO-HUMAN-REVIEW(PR-883): Review interrupt, softirq, and module snapshot coverage.
 #[test]
 fn proc_interrupt_accounting_is_deterministic() {
     for path in ["/proc/interrupts", "/proc/softirqs"] {

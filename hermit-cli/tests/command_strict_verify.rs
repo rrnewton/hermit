@@ -307,7 +307,7 @@ fn identity_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review interrupt and module command coverage.
+// TODO-HUMAN-REVIEW(PR-883): Review interrupt and module command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + util-linux/sysstat/kmod"]
 fn kernel_activity_commands_are_deterministic_under_strict_verify() {
