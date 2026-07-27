@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review strict verification coverage for PTY counts.
+// TODO-HUMAN-REVIEW(PR-927): Review strict verification coverage for PTY counts.
 #[test]
 fn pty_nr_consumers_verify() {
     assert!(

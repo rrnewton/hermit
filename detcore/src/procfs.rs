@@ -43,7 +43,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global PTY count normalization.
+            // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/kernel/pty/nr policy.
+// TODO-HUMAN-REVIEW(PR-927): Review the /proc/sys/kernel/pty/nr policy.
 fn sanitize_pty_nr(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -439,7 +439,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review PTY count fixture coverage.
+    // TODO-HUMAN-REVIEW(PR-927): Review PTY count fixture coverage.
     #[test]
     fn pty_nr_hides_host_global_allocations() {
         assert_eq!(sanitize_pty_nr(b"107\n"), b"0\n");
