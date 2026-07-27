@@ -20,8 +20,8 @@ The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and verifies
-that epoll remains available as a fallback, and refuses cross-process memory
-reads with deterministic `EPERM`. The wait contract covers deterministic
+that epoll remains available as a fallback, and refuses process-memory reads
+with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -45,9 +45,9 @@ mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
-The process-memory refusal row supplies local and remote iovecs to
-`process_vm_readv` and requires deterministic `EPERM` before any cross-process
-memory is exposed.
+The process-memory refusal row supplies valid local and remote iovecs for a
+self-targeted `process_vm_readv` and requires deterministic `EPERM` without
+copying the source byte. The same call succeeds outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 seventeen pairs, including its bounded cooperative pthread lifecycle, executable
