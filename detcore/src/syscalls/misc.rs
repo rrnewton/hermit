@@ -47,7 +47,7 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             | libc::PR_SET_THP_DISABLE
             | libc::PR_GET_THP_DISABLE
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD)
+            // TODO-HUMAN-REVIEW(#919)
             //
             // Dumpability is per-process state initialized deterministically by
             // ordinary exec and subsequently controlled only by the guest. Keep
