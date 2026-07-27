@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 #
-# Demo 5: boot Linux in QEMU under Hermit's relaxed VMM profile.
-#
-# QEMU needs concurrent host threads to make progress, so this is virtual-time
-# compatibility evidence rather than a strict/verify determinism claim.
+# Demo 5: boot Linux in QEMU under Hermit's strict deterministic profile.
 
 set -euo pipefail
 
@@ -13,25 +10,29 @@ cat <<'DESC'
 === Demo 5: QEMU Linux Boot ===
 
 Hermit runs QEMU's TCG emulator, which boots a real Linux kernel and prints its
-guest-visible RTC. QEMU's host threads run concurrently in this profile, so the
-result demonstrates Linux-boot compatibility and Hermit's fixed virtual-time
-epoch; it is not a strict/verify (L2) determinism claim.
+guest-visible Real-Time Clock (RTC). The boot runs with --strict, so unsupported
+operations fail closed instead of escaping Hermit's deterministic boundary.
+--verify can compare two complete boots, but this demo omits it to keep the
+runtime practical. Run this demo again -- you will see identical INFO logs.
 DESC
 
 # shellcheck source=demos/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
-export QEMU_TIMEOUT="${QEMU_TIMEOUT:-180}"
+export QEMU_TIMEOUT="${QEMU_TIMEOUT:-600}"
 export HERMIT_RELEASE="${HERMIT_RELEASE:-$HERMIT_REPO/target/release/hermit}"
 export QEMU_ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
+# Keep the evidence readable: global INFO emits millions of per-syscall lines
+# during a VM boot. These targets retain deterministic seed/lifecycle INFO.
+export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-detcore::scheduler::runqueue=info,detcore::tool_global=info}"
 
 # Build the ignored artifacts on first use, then reuse the cache. This keeps a
 # clean checkout self-contained without committing a kernel or initramfs.
 if [ ! -r "$QEMU_ASSETS/bzImage" ] || \
    [ ! -r "$QEMU_ASSETS/initramfs.cpio.gz" ]; then
   demo_banner "Provision QEMU kernel and initramfs"
-  "$DEMO_DIR/05-qemu-assets.sh"
+  "$DEMO_DIR/lib/qemu-assets.sh"
 fi
 
 test -x "$HERMIT_RELEASE" || {
@@ -70,10 +71,12 @@ demo_banner "Boot Linux and power off from its serial shell"
 # Disabling the monitor is required before the requested explicit
 # `-serial stdio`; without it QEMU 10.1 exits because two devices claim stdio.
 set +e
+RUST_LOG="$QEMU_LOG_FILTER" \
 timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   "$HERMIT_RELEASE" run \
-  --no-sequentialize-threads \
-  --preemption-timeout 10000000000 -- \
+  --strict \
+  --target-timeslice 100000 \
+  --max-timeslice 2000000000 -- \
   "$QEMU_BIN" \
   -machine q35 \
   -cpu max \
@@ -83,10 +86,11 @@ timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   -monitor none \
   -serial stdio \
   -icount shift=0,sleep=off \
+  -rtc base=2022-01-01T00:00:00,clock=vm \
   -kernel "$QEMU_ASSETS/bzImage" \
   -initrd "$QEMU_ASSETS/initramfs.cpio.gz" \
   -append 'console=ttyS0 reboot=t' \
-  <"$input_fifo" 2>&1 | tee "$QEMU_LOG" &
+  <"$input_fifo" >"$QEMU_LOG" 2>&1 &
 boot_pid=$!
 set -e
 
@@ -123,7 +127,7 @@ grep -q 'reboot: Power down' "$QEMU_LOG" || {
   exit 1
 }
 
-rtc_line="$(grep 'rtc_cmos.*setting system clock to' "$QEMU_LOG" | tail -1)"
+rtc_line="$(grep 'rtc_cmos.*setting system clock to' "$QEMU_LOG" | tail -1 || true)"
 case "$rtc_line" in
   *'2022-01-01T'*' UTC ('*) ;;
   *)
@@ -134,6 +138,12 @@ esac
 
 demo_banner "Guest-visible virtual timestamp"
 printf '%s\n' "$rtc_line"
-echo "Compatibility only: concurrent QEMU host-thread interleavings are not L2-controlled."
+
+demo_banner "Hermit INFO log snippet"
+grep -E ' INFO (detcore::scheduler::runqueue: DETLOG SCHEDRAND|detcore::tool_global: detcore shut down)' \
+  "$QEMU_LOG" | sed -E 's/^[^ ]+ +//'
+echo
+echo "Run this demo again -- you will see identical INFO logs."
+echo "For a paired comparison, --verify is available but intentionally omitted here because a second VM boot is slow."
 
 demo_success

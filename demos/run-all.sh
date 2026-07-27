@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run the portable demos (1-3) in order under a single shared scratch directory.
-# Demo 4 requires user-accessible CPU performance counters and demo 5 requires
-# QEMU plus git-ignored Linux boot images, so both are opt-in.
+# Demo 4 is the slow schedule-analysis finale and demo 5 requires QEMU plus
+# git-ignored Linux boot images, so both are opt-in.
 
 set -euo pipefail
 
