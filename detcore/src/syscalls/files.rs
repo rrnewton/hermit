@@ -73,7 +73,7 @@ fn unix_autobind_address(port: u16) -> libc::sockaddr_un {
     address
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review the TCP_INFO compatibility boundary.
+// TODO-HUMAN-REVIEW(PR-904): Review the TCP_INFO compatibility boundary.
 /// Retain the logical TCP state and negotiated option header while hiding all
 /// host timing, rate, packet, and byte counters.
 fn canonicalize_tcp_info(info: &mut [u8]) {
