@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Zoneinfo,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review host memory-zone accounting normalization.
+            "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,45 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = body.trim_start();
+        if trimmed.starts_with("Node ") || trimmed.starts_with("cpu: ") {
+            normalized.extend_from_slice(body.as_bytes());
+        } else {
+            normalized.extend_from_slice(zero_decimal_runs(body).as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn zero_decimal_runs(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut in_digits = false;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                normalized.push('0');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +383,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/zoneinfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Zoneinfo
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -430,6 +480,26 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn zoneinfo_hides_host_memory_accounting() {
+        let contents = b"Node 3, zone    DMA32\n\
+  pages free     2816\n\
+      nr_inactive_anon 39937459\n\
+        protection: (0, 2117, 772897)\n\
+    cpu: 7\n\
+              count:    12\n";
+
+        assert_eq!(
+            sanitize_zoneinfo(contents),
+            b"Node 3, zone    DMA32\n\
+  pages free     0\n\
+      nr_inactive_anon 0\n\
+        protection: (0, 0, 0)\n\
+    cpu: 7\n\
+              count:    0\n"
         );
     }
 
