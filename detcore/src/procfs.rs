@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    UnixSockets,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review Unix socket identity normalization.
+            "/proc/net/unix" => ProcfsKind::UnixSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
         });
         self.offset = 0;
     }
@@ -283,6 +288,104 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review Unix socket identity normalization.
+fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 8] = [
+        "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
+    ];
+    const ZERO_NUM: &str = "0000000000000000:";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let Some((mut fields, path)) = unix_socket_fields(line) else {
+            return contents.to_vec();
+        };
+        let Some(num) = fields[0].strip_suffix(':') else {
+            return contents.to_vec();
+        };
+        if !is_fixed_lower_hex(num, 16)
+            || !is_fixed_lower_hex(fields[1], 8)
+            || !is_fixed_lower_hex(fields[2], 8)
+            || !is_fixed_lower_hex(fields[3], 8)
+            || !is_fixed_lower_hex(fields[4], 4)
+            || !is_fixed_lower_hex(fields[5], 2)
+            || !is_decimal(fields[6])
+        {
+            return contents.to_vec();
+        }
+
+        fields[0] = ZERO_NUM;
+        fields[6] = "0";
+        let mut row = fields.join(" ");
+        if !path.is_empty() {
+            row.push(' ');
+            row.push_str(path);
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for row in rows {
+        normalized.push_str(&row);
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+fn unix_socket_fields(line: &str) -> Option<(Vec<&str>, &str)> {
+    const FIELD_COUNT: usize = 7;
+
+    let mut fields = Vec::with_capacity(FIELD_COUNT);
+    let mut remainder = line;
+    while fields.len() < FIELD_COUNT {
+        remainder = remainder.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        if remainder.is_empty() {
+            return None;
+        }
+        let end = remainder
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(remainder.len());
+        fields.push(&remainder[..end]);
+        remainder = &remainder[end..];
+    }
+
+    Some((
+        fields,
+        remainder.trim_start_matches(|character: char| character.is_ascii_whitespace()),
+    ))
+}
+
+fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_decimal(field: &str) -> bool {
+    !field.is_empty()
+        && field.bytes().all(|byte| byte.is_ascii_digit())
+        && field.parse::<u64>().is_ok()
+}
+
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == name)?;
     fields.get(index + 1).cloned()
@@ -340,6 +443,13 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/unix"))
+                .unwrap()
+                .kind,
+            ProcfsKind::UnixSockets
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/net/packet")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -431,6 +541,36 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn unix_sockets_hide_kernel_identities_and_sort_semantic_rows() {
+        let contents = b"Num RefCount Protocol Flags Type St Inode Path\n\
+00000000fedcba98: 00000003 00000000 00010000 0002 01 12346 /run/socket two\n\
+000000001234abcd: 00000002 00000000 00000000 0001 03 12345\n";
+
+        assert_eq!(
+            sanitize_unix_sockets(contents),
+            b"Num RefCount Protocol Flags Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
+0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n"
+        );
+    }
+
+    #[test]
+    fn unix_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            b"Num RefCount Protocol Flags Type St Inode Path",
+            b"Num RefCount Protocol Flags Type St Inode Path Extra\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n1234: 00000003 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 0000000G 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 inode\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 18446744073709551616\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001\n",
+        ] {
+            assert_eq!(sanitize_unix_sockets(malformed), malformed);
+        }
     }
 
     #[test]
