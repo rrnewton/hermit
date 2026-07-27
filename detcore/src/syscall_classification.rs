@@ -621,7 +621,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getuid
         | Sysno::mprotect
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review process-local robust-list
+        // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
         // queries under fixed guest address and PID namespaces.
         | Sysno::get_robust_list
         | Sysno::set_robust_list
