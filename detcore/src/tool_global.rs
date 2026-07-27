@@ -451,23 +451,28 @@ impl GlobalTool for GlobalState {
                 R::MarkPastFirstExecve(())
             }
             // Requested by the parent thread:
-            GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
-                R::CreateChildThread(
-                    self.recv_create_child_thread(
-                        from,
-                        ChildRegistration {
-                            parent_dettid: DetTid::from_raw(from.into()),
-                            parent_detpid,
-                            child_dettid: dettid,
-                            child_tid_addr: ctid,
-                            flags,
-                            maybe_priority: priority,
-                            parent_is_kernel_blocked: false,
-                        },
-                    )
-                    .await,
+            GlobalRequest::CreateChildThread(
+                dettid,
+                parent_detpid,
+                ctid,
+                flags,
+                priority,
+                parent_is_backend_blocked,
+            ) => R::CreateChildThread(
+                self.recv_create_child_thread(
+                    from,
+                    ChildRegistration {
+                        parent_dettid: DetTid::from_raw(from.into()),
+                        parent_detpid,
+                        child_dettid: dettid,
+                        child_tid_addr: ctid,
+                        flags,
+                        maybe_priority: priority,
+                        parent_is_kernel_blocked: parent_is_backend_blocked,
+                    },
                 )
-            }
+                .await,
+            ),
             // Requested by the vfork child on behalf of its kernel-blocked parent:
             GlobalRequest::CreateVforkChildThread(
                 parent_dettid,
@@ -1183,7 +1188,14 @@ pub enum GlobalRequest {
     /// The only scenario where the Priority will be missing is when we're replaying preemptions.
     /// In that case it is the global state that holds the information regarding the new thread's
     /// initial priority.
-    CreateChildThread(DetTid, DetPid, usize, Option<CloneFlags>, Option<Priority>),
+    CreateChildThread(
+        DetTid,
+        DetPid,
+        usize,
+        Option<CloneFlags>,
+        Option<Priority>,
+        bool,
+    ),
 
     /// A vfork child registering itself while its parent is blocked inside the
     /// kernel. Contains the (real) parent dettid and detpid, the child dettid,
@@ -1396,11 +1408,13 @@ where
 /// Nonblocking: future returning does not guarantee anything about the central scheduler,
 /// except that it will eventually give a slot to the child.  Then the protocol is that
 /// child will subsequently make a `thread_start_request` to gate the start of its execution.
+// TODO-HUMAN-REVIEW(#92): Review backend-blocked parent registration semantics.
 pub async fn create_child_thread<G, T>(
     guest: &mut G,
     child_dettid: DetTid,
     ctid: usize,
     flags: Option<CloneFlags>,
+    parent_is_backend_blocked: bool,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1443,7 +1457,14 @@ pub async fn create_child_thread<G, T>(
 
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::CreateChildThread(child_dettid, detpid, ctid, flags, starting_priority),
+        GlobalRequest::CreateChildThread(
+            child_dettid,
+            detpid,
+            ctid,
+            flags,
+            starting_priority,
+            parent_is_backend_blocked,
+        ),
     )
     .await;
     match resp.1 {

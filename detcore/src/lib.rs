@@ -1058,7 +1058,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            create_child_thread(guest, new_dettid, 0, None).await;
+            create_child_thread(guest, new_dettid, 0, None, false).await;
         } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         }

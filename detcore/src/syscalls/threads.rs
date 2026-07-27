@@ -219,6 +219,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let flags = clone_family.flags(&guest.memory());
         let ctid = clone_family.child_tid(&guest.memory());
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
+        let backend_blocks_parent = guest.fork_blocks_parent_until_child_exit();
+        let parent_is_blocked = is_vfork || backend_blocks_parent;
 
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
@@ -250,9 +252,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let vfork_op_id =
             ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
-        // The kernel blocks a CLONE_VFORK parent until its child execs or exits.
-        // Remove it from Detcore's run queue before entering that blocking call.
-        if is_vfork && self.cfg.sequentialize_threads {
+        // CLONE_VFORK and synchronous backends block the parent until the child exits.
+        // Remove the parent from Detcore's run queue before entering that call.
+        if parent_is_blocked && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
             resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
             resources.fyi("clone_vfork");
@@ -260,16 +262,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
-
-        if is_vfork && self.cfg.sequentialize_threads {
-            let mut resources = Resources::new(parent_dettid);
-            resources.insert(
-                ResourceID::BlockedExternalContinue(vfork_op_id),
-                Permission::RW,
-            );
-            resources.fyi("clone_vfork");
-            resource_request(guest, resources).await;
-        }
 
         let ts = guest.thread_state_mut();
         ts.clone_flags = None; // Unset, now that it has been read by the child.
@@ -297,7 +289,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
 
         if !is_vfork {
-            create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+            create_child_thread(
+                guest,
+                child_dettid,
+                ctid,
+                Some(flags),
+                backend_blocks_parent,
+            )
+            .await;
+        }
+        if backend_blocks_parent {
+            // TODO-HUMAN-REVIEW(#92): Review synchronous KVM child-completion
+            // ordering before the parent requests scheduler continuation.
+            guest.wait_for_fork_child_exit(child_tid).await?;
+        }
+        if parent_is_blocked && self.cfg.sequentialize_threads {
+            let mut resources = Resources::new(parent_dettid);
+            resources.insert(
+                ResourceID::BlockedExternalContinue(vfork_op_id),
+                Permission::RW,
+            );
+            resources.fyi("clone_blocked_parent");
+            resource_request(guest, resources).await;
         }
 
         {
