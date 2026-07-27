@@ -116,6 +116,37 @@ fn proc_self_status_is_deterministic() {
     });
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-843): Review procfs accounting integration coverage.
+#[test]
+fn proc_pid_statm_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/statm", |contents| {
+        assert_eq!(contents, b"0 0 0 0 0 0 0\n");
+    });
+}
+
+#[test]
+fn proc_system_cpu_accounting_is_deterministic() {
+    assert_deterministic("/proc/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        let cpu_lines = text
+            .lines()
+            .filter(|line| line.starts_with("cpu"))
+            .collect::<Vec<_>>();
+        assert!(cpu_lines.len() > 1, "stat should include per-CPU rows");
+        for line in cpu_lines {
+            let counters = line
+                .split_whitespace()
+                .skip(1)
+                .map(|field| field.parse::<u64>().expect("CPU counter should be numeric"))
+                .collect::<Vec<_>>();
+            assert!(counters[0] > 0);
+            assert!(counters[1..].iter().all(|counter| *counter == 0));
+        }
+        assert!(text.lines().any(|line| line.starts_with("btime ")));
+    });
+}
+
 #[test]
 fn proc_self_cmdline_is_deterministic() {
     assert_deterministic("/proc/self/cmdline", |contents| {
