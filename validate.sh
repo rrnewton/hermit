@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=170
-readonly SABRE_COMPAT_TOTAL=170
+readonly SABRE_COMPAT_EXPECTED=176
+readonly SABRE_COMPAT_TOTAL=176
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -2362,6 +2362,16 @@ function strict_compatibility_probe {
 # focused SaBRe and record/replay modes enforce their measured blocking floors.
 # Strict mode replaces banner probes with functional workloads so an
 # executable that merely starts cannot be counted as compatible at L2.
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#845): Review sharing exact functional fixtures with SaBRe.
+function real_compatibility_probe {
+    local label=$1
+
+    strict_compatibility_probe "$label" env \
+        REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
+        bash "$REAL_COMPAT_WORKLOAD" "$label"
+}
+
 function functional_compatibility_probe {
     local label=$1
     shift
@@ -2371,9 +2381,7 @@ function functional_compatibility_probe {
         return $?
     fi
 
-    strict_compatibility_probe "$label" env \
-        REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
-        bash "$REAL_COMPAT_WORKLOAD" "$label"
+    real_compatibility_probe "$label"
 }
 
 # These runtime/compiler workloads consume their full timeout on the no-PMU
@@ -2681,9 +2689,10 @@ function run_compatibility_corpus {
         'zstd -q -c README.md | sha256sum' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#686): Review strict-only archive/network envelope growth.
-    # These functional rows are measured only for ptrace strict L2. The alternate-backend
-    # and record/replay ratchets retain their independently measured 151/151 and 128 rows.
+    # TODO-HUMAN-REVIEW(#686): Review archive/network envelope growth.
+    # SaBRe measures the six deterministic archive round trips with the same
+    # real workloads as ptrace strict mode. Network rows retain their separate
+    # fail-closed policy, and the other backend ratchets remain independent.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         functional_compatibility_probe gzip-roundtrip /usr/bin/gzip --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2701,6 +2710,19 @@ function run_compatibility_corpus {
             functional_compatibility_probe wget-localhost /usr/bin/wget --version
         tally_known_failclosed_probe passed failed known_flaky curl-localhost \
             functional_compatibility_probe curl-localhost /usr/bin/curl --version
+    elif [[ $COMPATIBILITY_MODE == sabre ]]; then
+        real_compatibility_probe gzip-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe bzip2-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe xz-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe zstd-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe tar-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe cpio-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     strict_compatibility_probe zip-unzip bash -c \
         'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
