@@ -1443,7 +1443,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let result = self.record_or_replay(guest, call).await?;
 
-        // TODO-HUMAN-REVIEW(PR-id): Hermit exposes one virtual CPU, so do not
+        // TODO-HUMAN-REVIEW(PR-898): Hermit exposes one virtual CPU, so do not
         // leak the host CPU that processed a socket's most recent packet.
         if result == 0
             && call.level() == libc::SOL_SOCKET
