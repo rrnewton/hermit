@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review per-mapping memory accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             "/proc/self/smaps" => ProcfsKind::Smaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -304,7 +304,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/smaps accounting field policy.
+// TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
 fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
     const ACCOUNTING_FIELDS: &[&str] = &[
         "Rss",
