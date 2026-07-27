@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use chrono::DateTime;
+use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -166,6 +168,7 @@ impl ProcfsFile {
         &mut self,
         contents: Vec<u8>,
         virtual_uptime_seconds: u64,
+        virtual_realtime_seconds: i64,
         virtual_pid: i32,
         virtual_ppid: i32,
     ) {
@@ -193,7 +196,7 @@ impl ProcfsFile {
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
-            ProcfsKind::Rtc => sanitize_rtc(&contents),
+            ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
         });
     }
 
@@ -956,20 +959,40 @@ fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-917): Review the fixed virtual RTC epoch.
-fn sanitize_rtc(contents: &[u8]) -> Vec<u8> {
+// TODO-HUMAN-REVIEW(PR-917): Review virtual RTC clock and alarm policy.
+fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
+    let Some(now) = DateTime::<Utc>::from_timestamp(virtual_realtime_seconds, 0) else {
+        return contents.to_vec();
+    };
+    let rtc_time = now.format("%H:%M:%S").to_string();
+    let rtc_date = now.format("%Y-%m-%d").to_string();
 
     let mut normalized = Vec::with_capacity(contents.len());
     for line in text.split_inclusive('\n') {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
-        if body.starts_with("rtc_time\t:") {
-            normalized.extend_from_slice(b"rtc_time\t: 23:59:59");
-        } else if body.starts_with("rtc_date\t:") {
-            normalized.extend_from_slice(b"rtc_date\t: 2021-12-31");
+        let replacement = body.split_once(':').and_then(|(key, _)| {
+            let value = match key.trim() {
+                "rtc_time" => rtc_time.as_str(),
+                "rtc_date" => rtc_date.as_str(),
+                "alrm_time" => "00:00:00",
+                "alrm_date" => rtc_date.as_str(),
+                "alarm_IRQ"
+                | "alrm_pending"
+                | "update IRQ enabled"
+                | "periodic IRQ enabled"
+                | "periodic_IRQ"
+                | "update_IRQ" => "no",
+                "periodic IRQ frequency" | "max user IRQ frequency" | "periodic_freq" => "0",
+                _ => return None,
+            };
+            Some(format!("{key}: {value}"))
+        });
+        if let Some(replacement) = replacement {
+            normalized.extend_from_slice(replacement.as_bytes());
         } else {
             normalized.extend_from_slice(body.as_bytes());
         }
@@ -1357,17 +1380,25 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
     }
 
     #[test]
-    fn rtc_uses_the_fixed_virtual_epoch() {
+    fn rtc_uses_the_virtual_clock_and_hides_alarm_state() {
         let contents = b"rtc_time\t: 10:07:42\n\
 rtc_date\t: 2026-07-27\n\
 alrm_time\t: 00:50:12\n\
+alrm_date\t: 2026-07-28\n\
+alarm_IRQ\t: yes\n\
+periodic IRQ enabled\t: yes\n\
+periodic IRQ frequency\t: 1024\n\
 24hr\t\t: yes\n";
 
         assert_eq!(
-            sanitize_rtc(contents),
+            sanitize_rtc(contents, 978_307_199),
             b"rtc_time\t: 23:59:59\n\
-rtc_date\t: 2021-12-31\n\
-alrm_time\t: 00:50:12\n\
+rtc_date\t: 2000-12-31\n\
+alrm_time\t: 00:00:00\n\
+alrm_date\t: 2000-12-31\n\
+alarm_IRQ\t: no\n\
+periodic IRQ enabled\t: no\n\
+periodic IRQ frequency\t: 0\n\
 24hr\t\t: yes\n"
         );
     }
@@ -1477,7 +1508,7 @@ VmFlags: rd ex mr mw me ac\n"
     #[test]
     fn snapshot_supports_partial_reads() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 3, 1);
+        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 0, 3, 1);
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
@@ -1486,7 +1517,7 @@ VmFlags: rd ex mr mw me ac\n"
     #[test]
     fn snapshot_supports_positional_reads_and_rewinds() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
-        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 1, 0);
+        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 0, 1, 0);
 
         assert_eq!(file.take(2).unwrap(), b"0\t");
         assert_eq!(file.take_at(4, 1).unwrap(), b"9");
