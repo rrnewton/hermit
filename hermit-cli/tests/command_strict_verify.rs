@@ -516,9 +516,9 @@ fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "sensors",
+            name: "sensors version",
             candidates: &["/usr/bin/sensors"],
-            args: &[],
+            args: &["--version"],
             stdin: None,
         },
     ];
