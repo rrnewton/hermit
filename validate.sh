@@ -298,7 +298,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=181
+readonly STRICT_COMPAT_TOTAL=184
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -2068,6 +2068,14 @@ function run_compatibility_corpus {
         functional_compatibility_probe lsof /usr/bin/lsof -v \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(PR-TBD): Review normalized host telemetry probes.
+        strict_compatibility_probe iostat /usr/bin/iostat -d \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe numastat /usr/bin/numastat \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe sensors /usr/bin/sensors \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     strict_compatibility_probe whoami /usr/bin/whoami \

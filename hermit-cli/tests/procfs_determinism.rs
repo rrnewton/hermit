@@ -63,6 +63,23 @@ fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
     }
 }
 
+fn first_sysfs_file(root: &str, leaf_matches: impl Fn(&str) -> bool) -> Option<String> {
+    for directory in std::fs::read_dir(root).ok()?.flatten() {
+        let Ok(files) = std::fs::read_dir(directory.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let Some(name) = file.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if leaf_matches(&name) {
+                return Some(file.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn proc_self_maps_is_deterministic() {
     assert_deterministic("/proc/self/maps", |contents| {
@@ -151,6 +168,44 @@ fn proc_uptime_uses_virtual_time() {
     assert_deterministic("/proc/uptime", |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
+}
+
+#[test]
+fn sys_block_statistics_are_deterministic() {
+    let Some(path) = first_sysfs_file("/sys/block", |leaf| leaf == "stat") else {
+        return;
+    };
+    assert_deterministic(&path, |contents| {
+        let fields = std::str::from_utf8(contents)
+            .expect("block stat should be UTF-8")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert!(fields.len() >= 11, "block stat has too few fields");
+        assert!(fields.iter().all(|field| *field == "0"));
+    });
+}
+
+#[test]
+fn sys_numa_statistics_are_deterministic() {
+    let Some(path) = first_sysfs_file("/sys/devices/system/node", |leaf| leaf == "numastat") else {
+        return;
+    };
+    assert_deterministic(&path, |contents| {
+        let text = std::str::from_utf8(contents).expect("NUMA stat should be UTF-8");
+        assert!(text.lines().all(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|value| value == "0")
+        }));
+    });
+}
+
+#[test]
+fn sys_hwmon_inputs_are_deterministic() {
+    let Some(path) = first_sysfs_file("/sys/class/hwmon", |leaf| leaf.ends_with("_input")) else {
+        return;
+    };
+    assert_deterministic(&path, |contents| assert_eq!(contents, b"0\n"));
 }
 
 #[test]

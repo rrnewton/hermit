@@ -21,6 +21,9 @@ enum ProcfsKind {
     Loadavg,
     Uptime,
     ScalingCurFreq,
+    BlockStat,
+    NumaStat,
+    HwmonInput,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -52,6 +55,24 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review sysfs telemetry normalization.
+            _ if is_block_stat_path(path) => ProcfsKind::BlockStat,
+            _ if is_numbered_sysfs_file(
+                path,
+                Path::new("/sys/devices/system/node"),
+                "node",
+                |leaf| leaf == "numastat",
+            ) =>
+            {
+                ProcfsKind::NumaStat
+            }
+            _ if is_numbered_sysfs_file(path, Path::new("/sys/class/hwmon"), "hwmon", |leaf| {
+                leaf.ends_with("_input")
+            }) =>
+            {
+                ProcfsKind::HwmonInput
+            }
             _ => return None,
         };
         Some(Self {
@@ -82,6 +103,9 @@ impl ProcfsFile {
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
+            ProcfsKind::BlockStat => sanitize_numeric_fields(&contents),
+            ProcfsKind::NumaStat => sanitize_labeled_counters(&contents),
+            ProcfsKind::HwmonInput => sanitize_hwmon_input(&contents),
         });
         self.offset = 0;
     }
@@ -94,6 +118,39 @@ impl ProcfsFile {
         self.offset = end;
         Some(bytes)
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+fn is_block_stat_path(path: &Path) -> bool {
+    path.file_name().and_then(|leaf| leaf.to_str()) == Some("stat")
+        && path.parent().and_then(Path::parent) == Some(Path::new("/sys/block"))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+fn is_numbered_sysfs_file(
+    path: &Path,
+    root: &Path,
+    directory_prefix: &str,
+    leaf_matches: impl FnOnce(&str) -> bool,
+) -> bool {
+    let Some(leaf) = path.file_name().and_then(|leaf| leaf.to_str()) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(suffix) = parent
+        .file_name()
+        .and_then(|directory| directory.to_str())
+        .and_then(|directory| directory.strip_prefix(directory_prefix))
+    else {
+        return false;
+    };
+
+    parent.parent() == Some(root)
+        && !suffix.is_empty()
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        && leaf_matches(leaf)
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
@@ -227,6 +284,63 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review zeroed host telemetry snapshots.
+fn sanitize_numeric_fields(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.is_empty() || fields.iter().any(|field| field.parse::<u64>().is_err()) {
+        return contents.to_vec();
+    }
+
+    let mut normalized = vec!["0"; fields.len()].join(" ");
+    if text.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+fn sanitize_labeled_counters(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 2 && fields[1..].iter().all(|field| field.parse::<u64>().is_ok()) {
+            normalized.push_str(fields[0]);
+            for _ in &fields[1..] {
+                normalized.push_str(" 0");
+            }
+            if line.ends_with('\n') {
+                normalized.push('\n');
+            }
+        } else {
+            normalized.push_str(line);
+        }
+    }
+    normalized.into_bytes()
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+fn sanitize_hwmon_input(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    if text.trim().parse::<i64>().is_err() {
+        return contents.to_vec();
+    }
+    if text.ends_with('\n') {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -279,6 +393,30 @@ mod tests {
                 .kind,
             ProcfsKind::Uptime
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/block/nvme0n1/stat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::BlockStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/numastat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon3/power1_input"))
+                .unwrap()
+                .kind,
+            ProcfsKind::HwmonInput
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/block/nvme0n1/size")).is_none());
+        assert!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/not-a-node/numastat"))
+                .is_none()
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon3/power1_cap")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -308,6 +446,20 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn host_telemetry_counters_are_zeroed() {
+        assert_eq!(
+            sanitize_numeric_fields(b"123 45 6 7 8 9 10 11 12 13 14 15 16 17 18\n"),
+            b"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        assert_eq!(
+            sanitize_labeled_counters(b"numa_hit 123\nnuma_miss 0\nlocal_node 456\n"),
+            b"numa_hit 0\nnuma_miss 0\nlocal_node 0\n"
+        );
+        assert_eq!(sanitize_hwmon_input(b"228710000\n"), b"0\n");
+        assert_eq!(sanitize_hwmon_input(b"-1000\n"), b"0\n");
     }
 
     #[test]
