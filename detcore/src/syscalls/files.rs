@@ -1501,7 +1501,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic AF_UNIX autobind identity.
+        // TODO-HUMAN-REVIEW(PR-872): Review deterministic AF_UNIX autobind identity.
         if sockaddr_family == libc::AF_UNIX as u16
             && call.addrlen() == std::mem::offset_of!(libc::sockaddr_un, sun_path) as i32
         {
