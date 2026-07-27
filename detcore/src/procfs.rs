@@ -59,7 +59,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global inode counter normalization.
+            // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
             "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
@@ -513,7 +513,7 @@ fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/inode-nr field policy.
+// TODO-HUMAN-REVIEW(PR-914): Review the /proc/sys/fs/inode-nr field policy.
 fn sanitize_inode_nr(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -969,7 +969,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review inode counter fixture coverage.
+    // TODO-HUMAN-REVIEW(PR-914): Review inode counter fixture coverage.
     #[test]
     fn inode_nr_hides_host_global_allocation_counters() {
         assert_eq!(sanitize_inode_nr(b"13929543\t1109179\n"), b"0\t0\n");
