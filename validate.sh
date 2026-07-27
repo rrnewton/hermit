@@ -299,8 +299,9 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# Current main's 190-row strict corpus plus free(1).
-readonly STRICT_COMPAT_TOTAL=191
+# Current main's 190-row strict corpus plus free(1), plus three hardware
+# accounting probes (numastat, numactl --hardware, sensors) from PR #865.
+readonly STRICT_COMPAT_TOTAL=194
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -2902,6 +2903,12 @@ function run_compatibility_corpus {
     strict_compatibility_probe vmstat-disk /usr/bin/vmstat -d 1 2 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pidstat-disk /usr/bin/pidstat -d -p 1 1 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe numastat /usr/bin/numastat \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe numactl-hardware /usr/bin/numactl --hardware \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sensors /usr/bin/sensors \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe findmnt /usr/bin/findmnt --kernel --list \
         --output TARGET,SOURCE,FSTYPE,OPTIONS \
