@@ -27,6 +27,7 @@ enum ProcfsKind {
     FileNr,
     InodeState,
     PtyNr,
+    Sockstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -54,6 +55,9 @@ impl ProcfsFile {
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
+            "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -104,6 +108,7 @@ impl ProcfsFile {
             ProcfsKind::FileNr => fixed_snapshot(&contents, b"0\t0\t9223372036854775807\n"),
             ProcfsKind::InodeState => fixed_snapshot(&contents, b"0\t0\t0\t0\t0\t0\t0\n"),
             ProcfsKind::PtyNr => fixed_snapshot(&contents, b"0\n"),
+            ProcfsKind::Sockstat => sanitize_sockstat(&contents),
         });
         self.offset = 0;
     }
@@ -315,6 +320,56 @@ fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
+fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        match fields.first().map(String::as_str) {
+            Some("TCP:") => {
+                let inuse = sockstat_field(&fields, "inuse").unwrap_or_else(|| "0".to_owned());
+                replace_sockstat_field(&mut fields, "orphan", "0");
+                replace_sockstat_field(&mut fields, "alloc", &inuse);
+                replace_sockstat_field(&mut fields, "mem", "0");
+            }
+            Some("UDP:") => replace_sockstat_field(&mut fields, "mem", "0"),
+            _ => {}
+        }
+
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
+    let index = fields.iter().position(|field| field == name)?;
+    fields.get(index + 1).cloned()
+}
+
+fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
+    let Some(index) = fields.iter().position(|field| field == name) else {
+        return;
+    };
+    let Some(field_value) = fields.get_mut(index + 1) else {
+        return;
+    };
+    *field_value = value.to_owned();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +405,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Uptime
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/sockstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Sockstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -466,6 +527,22 @@ mod tests {
         assert_eq!(
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
+        );
+    }
+
+    #[test]
+    fn sockstat_hides_host_global_allocation_and_memory_counters() {
+        let contents = b"sockets: used 41\n\
+TCP: inuse 3 orphan 2 tw 7 alloc 100 mem 200\n\
+UDP: inuse 4 mem 99\n\
+RAW: inuse 5\n";
+
+        assert_eq!(
+            sanitize_sockstat(contents),
+            b"sockets: used 41\n\
+TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
+UDP: inuse 4 mem 0\n\
+RAW: inuse 5\n"
         );
     }
 
