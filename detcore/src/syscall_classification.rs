@@ -368,6 +368,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for optional memory
+        // features that Detcore does not model. These APIs depend on kernel
+        // generation/configuration, CET support, or pidfd process lifecycle.
+        // Returning the pre-feature errno keeps guest behavior host-independent
+        // and lets feature-probing callers use their portable fallbacks.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::memfd_secret
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::process_mrelease
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::map_shadow_stack
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -600,8 +612,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
-        | Sysno::map_shadow_stack
-        | Sysno::memfd_secret
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::perf_event_open
@@ -610,7 +620,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
-        | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
         | Sysno::ptrace
@@ -836,6 +845,21 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS refusal set.
+/// Optional modern memory features that are outside Detcore's model.
+/// `memfd_secret` depends on secret-memory kernel configuration,
+/// `map_shadow_stack` depends on CET support, and `process_mrelease` operates
+/// on a dying process through a pidfd. A fixed `ENOSYS` matches kernels from
+/// before each feature was introduced and lets feature probes use established
+/// fallback paths without exposing host configuration or process lifecycle.
+pub(crate) const fn is_optional_memory_feature_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::memfd_secret | Sysno::process_mrelease | Sysno::map_shadow_stack
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,7 +876,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [223, 91, 59]);
+        assert_eq!(counts, [226, 91, 56]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1225,6 +1249,34 @@ mod tests {
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn optional_memory_feature_syscalls_are_determinized_and_consistent() {
+        let refused = [
+            Sysno::memfd_secret,
+            Sysno::process_mrelease,
+            Sysno::map_shadow_stack,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_optional_memory_feature_syscall(sysno),
+                "{sysno:?} should be in the optional-memory refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_optional_memory_feature_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} optional-memory helper membership is inconsistent"
+            );
         }
     }
 
