@@ -23,7 +23,7 @@ enum ProcfsKind {
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review NUMA node VM accounting normalization.
+    // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
     NodeVmstat,
 }
 
@@ -267,7 +267,7 @@ fn is_node_vmstat_path(path: &str) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the zeroed node VM accounting policy.
+// TODO-HUMAN-REVIEW(PR-939): Review the zeroed node VM accounting policy.
 fn sanitize_node_vmstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
