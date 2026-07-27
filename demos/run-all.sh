@@ -41,8 +41,8 @@ if [ "$with_analyze" -eq 1 ]; then
 fi
 
 if [ "$with_qemu" -eq 1 ]; then
-  bash "$DEMO_DIR/05-qemu-boot.sh"
-  bash "$DEMO_DIR/06-qemu-resume.sh" 'uname -a'
+  python3 "$DEMO_DIR/05-qemu-boot.py"
+  python3 "$DEMO_DIR/06-qemu-resume.py" 'uname -a'
 fi
 
 printf '\n=== Demo suite: SUCCESS — all requested demos passed ===\n'
