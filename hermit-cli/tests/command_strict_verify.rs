@@ -66,6 +66,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
