@@ -469,7 +469,7 @@ impl GlobalTool for GlobalState {
         let time_from_guest = gr.0.as_nanos();
 
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe exec-reload clock recovery.
+        // TODO-HUMAN-REVIEW(PR-845): Review SaBRe exec-reload clock recovery.
         // SaBRe reloads its plugin after exec, so the root thread reconnects
         // with fresh local state while its scheduler entry remains live.
         let is_exec_reconnect = matches!(
@@ -1041,7 +1041,7 @@ impl GlobalState {
                 .map(|nextturn| nextturn.resp.clone())
             else {
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review late RPCs from exit-group siblings.
+                // TODO-HUMAN-REVIEW(PR-845): Review late RPCs from exit-group siblings.
                 trace!(
                     "[detcore, dtid {}] ignoring futex action after logical thread removal",
                     dettid
@@ -1487,7 +1487,7 @@ where
     let mytime = guest.thread_state().thread_logical_time.clone();
     let resp = guest.send_rpc((mytime, request)).await;
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review applying the coordinator clock after exec reload.
+    // TODO-HUMAN-REVIEW(PR-845): Review applying the coordinator clock after exec reload.
     if let Some(time) = resp.0 {
         guest
             .thread_state_mut()
