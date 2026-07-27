@@ -23,7 +23,7 @@ enum ProcfsKind {
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review host-global uevent sequence normalization.
+    // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
 }
 
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the synthetic /sys/kernel/uevent_seqnum value.
+// TODO-HUMAN-REVIEW(PR-958): Review the synthetic /sys/kernel/uevent_seqnum value.
 fn sanitize_uevent_seqnum(contents: &[u8]) -> Vec<u8> {
     let Some(value) = contents.strip_suffix(b"\n") else {
         return contents.to_vec();
