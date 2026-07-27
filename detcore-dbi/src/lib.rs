@@ -656,7 +656,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref);
     if let Some((_, parent_state, stream_id)) = parent.as_ref() {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review stable DBI child random streams.
+        // TODO-HUMAN-REVIEW(PR-849): Review stable DBI child random streams.
         state.prng = thread_rng_from_parent("DBI USER RAND", &parent_state.prng, *stream_id);
     }
     let mut thread = Box::new(ThreadRuntime {
@@ -723,7 +723,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review stable DBI child random streams.
+    // TODO-HUMAN-REVIEW(PR-849): Review stable DBI child random streams.
     let random_stream_id =
         DetTid::from_raw(NEXT_DBI_RANDOM_STREAM_ID.fetch_add(2, Ordering::SeqCst));
     let parent_snapshot = parent.state.clone();
@@ -875,7 +875,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review DBI getrandom fault-prefix probing.
+    // TODO-HUMAN-REVIEW(PR-849): Review DBI getrandom fault-prefix probing.
     // The probe writes host-random bytes only to discover the kernel-approved prefix;
     // Detcore overwrites that entire prefix before the application resumes.
     if sysnum == libc::SYS_getrandom
