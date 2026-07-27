@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Vmstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review host VM accounting normalization.
+            "/proc/vmstat" => ProcfsKind::Vmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Vmstat => sanitize_vmstat(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,38 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/vmstat field policy.
+fn sanitize_vmstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || fields[0].is_empty() || fields[1].parse::<u64>().is_err() {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(fields[0].as_bytes());
+        normalized.extend_from_slice(b" 0");
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +376,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Vmstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +474,28 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn vmstat_hides_host_vm_accounting() {
+        let contents = b"nr_free_pages 4587515\npgfault 175926829665\noom_kill 30\n";
+        assert_eq!(
+            sanitize_vmstat(contents),
+            b"nr_free_pages 0\npgfault 0\noom_kill 0\n"
+        );
+        assert_eq!(
+            sanitize_vmstat(b"nr_free_pages 4587515"),
+            b"nr_free_pages 0"
+        );
+    }
+
+    #[test]
+    fn vmstat_leaves_unknown_formats_untouched() {
+        let extra_field = b"nr_free_pages 4587515 pages\n";
+        assert_eq!(sanitize_vmstat(extra_field), extra_field);
+
+        let invalid_counter = b"nr_free_pages many\n";
+        assert_eq!(sanitize_vmstat(invalid_counter), invalid_counter);
     }
 
     #[test]
