@@ -1671,10 +1671,7 @@ mod tests {
 
     #[test]
     fn host_security_identity_probes_are_determinized_and_consistent() {
-        let refused = [
-            Sysno::lsm_get_self_attr,
-            Sysno::lsm_set_self_attr,
-        ];
+        let refused = [Sysno::lsm_get_self_attr, Sysno::lsm_set_self_attr];
         for sysno in refused {
             assert_eq!(
                 classify_syscall(sysno),
