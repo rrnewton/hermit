@@ -11,16 +11,19 @@ set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 2: Record And Replay"
-cat <<'DESC'
-=== Demo 2: Record And Replay ===
-
-Hermit records an execution into an isolated data directory, lists the recording
-in text and JSON, and replays it to completion with --autopilot. It can also
-record and immediately verify a replay. Without --autopilot, hermit replay
-starts a replay gdbserver and GDB client; the demo drives a noninteractive GDB
-session that continues the guest to completion. Keep the recording directory,
-executable, inputs, and Hermit revision unchanged between recording and replay.
-DESC
+echo ''
+echo '=========================================='
+echo '=== Demo 2: Record And Replay ==='
+echo '=========================================='
+echo ''
+echo 'Hermit records an execution into an isolated data directory, lists the recording'
+echo 'in text and JSON, and replays it to completion with --autopilot. It can also'
+echo 'record and immediately verify a replay. Without --autopilot, hermit replay'
+echo 'starts a replay gdbserver and GDB client; the demo drives a noninteractive GDB'
+echo 'session that continues the guest to completion. Keep the recording directory,'
+echo 'executable, inputs, and Hermit revision unchanged between recording and replay.'
+echo ''
+echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
