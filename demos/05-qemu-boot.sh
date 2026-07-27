@@ -4,13 +4,12 @@
 
 set -euo pipefail
 
+# shellcheck source=demos/lib/display.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/display.sh"
+
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 5: QEMU Linux Snapshot"
-echo ''
-echo '=========================================='
-echo '=== Demo 5: QEMU Linux Snapshot ==='
-echo '=========================================='
-echo ''
+demo_header "$DEMO_LABEL"
 echo "Hermit runs QEMU's TCG emulator in strict mode, boots a real Linux kernel to"
 echo 'its serial shell, and saves that live machine as the internal snapshot'
 echo '"hermit-boot". Demo 6 can then resume the shell without booting Linux again.'
@@ -18,6 +17,7 @@ echo ''
 echo '=========================================='
 
 # shellcheck source=demos/common.sh
+export DEMO_BUILD_MODE=release
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=demos/lib/qemu-snapshot.sh
 source "$DEMO_DIR/lib/qemu-snapshot.sh"
@@ -26,7 +26,7 @@ export QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
 export QEMU_TIMEOUT="${QEMU_TIMEOUT:-600}"
 export HERMIT_RELEASE="${HERMIT_RELEASE:-$HERMIT_REPO/target/release/hermit}"
 export QEMU_ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
-export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-detcore::scheduler::runqueue=info,detcore::tool_global=info}"
+export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-warn,detcore::scheduler=info,detcore::tool_global=info,reverie_ptrace::task=info}"
 export QEMU_SNAPSHOT_NAME="${QEMU_SNAPSHOT_NAME:-hermit-boot}"
 export QEMU_SNAPSHOT_DISK="${QEMU_SNAPSHOT_DISK:-$QEMU_ASSETS/hermit-snapshot.qcow2}"
 export QEMU_SNAPSHOT_ID_FILE="${QEMU_SNAPSHOT_ID_FILE:-$QEMU_SNAPSHOT_DISK.id}"
@@ -37,7 +37,7 @@ demo_banner "Verify QEMU kernel and initramfs"
 
 test -x "$HERMIT_RELEASE" || {
   echo "missing release Hermit binary: $HERMIT_RELEASE" >&2
-  echo "Run: (cd $HERMIT_REPO && cargo build --release -p hermit)" >&2
+  echo "Run: make" >&2
   exit 1
 }
 if [ -z "$QEMU_BIN" ] || [ ! -x "$QEMU_BIN" ]; then
@@ -114,7 +114,7 @@ hermit_pid=$!
 
 qemu_wait_for_socket "$qmp_socket" "$hermit_pid" 60
 qemu_wait_for_socket "$serial_socket" "$hermit_pid" 60
-nc -U "$serial_socket" <"$input_fifo" >"$serial_log" 2>&1 &
+nc -U "$serial_socket" <"$input_fifo" > >(tee "$serial_log") 2>&1 &
 serial_pid=$!
 
 marker='HERMIT-QEMU-BASELINE-BOOT-OK'
@@ -161,18 +161,19 @@ case "$rtc_line" in
 esac
 
 demo_banner "Snapshot ready"
-printf '%s\n' "$rtc_line"
+printf 'Snapshot disk: %s (internal tag: %s)\n' \
+  "${QEMU_SNAPSHOT_DISK#"$ROOT/"}" "$QEMU_SNAPSHOT_NAME"
 qemu-img snapshot -l "$QEMU_SNAPSHOT_DISK"
 
 qemu_write_stable_info_tail "$QEMU_LOG" "$info_tail"
-demo_banner "Hermit INFO log tail"
+demo_banner "Hermit INFO tail (wall-clock timestamps stripped)"
 cat "$info_tail"
 
 demo_banner "Paste a snapshot-resume command"
-printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'ls /'
-printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'cat /proc/cpuinfo'
-printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'uname -a'
-printf '  %q %q\n' "$DEMO_DIR/06-qemu-resume.sh" 'echo hello'
+printf '  %q %q\n' './demos/06-qemu-resume.sh' 'ls /'
+printf '  %q %q\n' './demos/06-qemu-resume.sh' 'cat /proc/cpuinfo'
+printf '  %q %q\n' './demos/06-qemu-resume.sh' 'uname -a'
+printf '  %q %q\n' './demos/06-qemu-resume.sh' 'echo hello'
 echo
 echo "Run the same line twice. Demo 6 compares its normalized INFO tail with the previous run."
 

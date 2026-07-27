@@ -107,11 +107,64 @@ qemu_snapshot_exists() {
 qemu_write_stable_info_tail() {
   local hermit_log=$1
   local output=$2
-  grep -E \
-    ' INFO (detcore::scheduler::runqueue: DETLOG SCHEDRAND|detcore::tool_global: (Scheduler authorized|detcore shut down))' \
-    "$hermit_log" \
-    | sed -E 's/^[^ ]+ +//' \
-    | tail -n 12 >"$output"
+  local artifact_prefix=${DEMO_ARTIFACTS:-}
+  local root_prefix=${ROOT:-}
+
+  grep -Fq ' COMMIT turn ' "$hermit_log" || {
+    printf 'Hermit INFO log contains no scheduler COMMIT event: %s\n' \
+      "$hermit_log" >&2
+    return 1
+  }
+  grep -Fq 'Final virtual global (cpu) time:' "$hermit_log" || {
+    printf 'Hermit INFO log contains no virtual-time report: %s\n' "$hermit_log" >&2
+    return 1
+  }
+
+  awk -v artifacts="$artifact_prefix" -v root="$root_prefix" '
+    function emit(line) {
+      if (line == "") return
+      if (artifacts != "") gsub(artifacts, "<demo-artifacts>", line)
+      if (root != "") gsub(root "/", "./", line)
+      print line
+    }
+    {
+      sub(/^[0-9T:.Z-]+ +/, "")
+      if ($0 ~ /^ COMMIT turn /) commit = $0
+      if ($0 ~ /INFO detcore::tool_global: Scheduler authorized/) authorized = $0
+      if ($0 ~ /INFO reverie_ptrace::task: .*tail_inject of syscall:/) tail_inject = $0
+      if ($0 ~ /INFO detcore::scheduler: logically_kill:/) {
+        previous_kill = last_kill
+        last_kill = $0
+      }
+      if ($0 ~ /INFO detcore::scheduler: scheduler \(step2_process_blocked\):/) blocked = $0
+      if ($0 ~ /INFO detcore::scheduler: \[scheduler\] run queue empty/) empty = $0
+      if ($0 ~ /INFO detcore::tool_global: detcore shut down/) shutdown = $0
+      if ($0 ~ /hermit run report/ ||
+          $0 ~ /^Final thread-tree/ ||
+          $0 ~ /^There were / ||
+          $0 ~ /^Internally,/ ||
+          $0 ~ /^Final virtual global \(cpu\) time:/ ||
+          $0 ~ /^Elapsed virtual global \(cpu\) time:/ ||
+          $0 ~ /^Timeslice stats:/) {
+        report[++report_lines] = $0
+      }
+    }
+    END {
+      emit(commit)
+      emit(authorized)
+      emit(tail_inject)
+      emit(previous_kill)
+      emit(last_kill)
+      emit(blocked)
+      emit(empty)
+      emit(shutdown)
+      for (i = 1; i <= report_lines; i++) emit(report[i])
+    }
+  ' "$hermit_log" >"$output"
+
+  grep -Fq ' COMMIT turn ' "$output" || return 1
+  grep -Fq 'tail_inject of syscall:' "$output" || return 1
+  grep -Fq 'hermit run report' "$output" || return 1
 }
 
 qemu_stop_pid() {
