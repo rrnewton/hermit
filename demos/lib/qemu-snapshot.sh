@@ -167,6 +167,20 @@ qemu_write_stable_info_tail() {
   grep -Fq 'hermit run report' "$output" || return 1
 }
 
+qemu_normalize_info_for_comparison() {
+  local input=$1
+  local output=$2
+
+  sed -E \
+    -e 's/(COMMIT turn )[0-9]+/\1<turn>/' \
+    -e 's/(previously committed )[0-9_.]+s/\1<virtual-time>/' \
+    -e 's/(scheduler ran )[0-9]+ turns/\1<turns> turns/' \
+    -e 's/^(Final virtual global \(cpu\) time:).*/\1 <virtual-time>/' \
+    -e 's/^(Elapsed virtual global \(cpu\) time:).*/\1 <virtual-time>/' \
+    -e 's/^Timeslice stats:.*/Timeslice stats: <normalized>/' \
+    "$input" >"$output"
+}
+
 qemu_stop_pid() {
   local pid=${1:-}
   [ -n "$pid" ] || return 0
