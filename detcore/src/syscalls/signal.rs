@@ -147,7 +147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(PR-892)
     /// Return interval-timer state from Detcore's logical scheduler.
     pub async fn handle_getitimer<G: Guest<Self>>(
         &self,
