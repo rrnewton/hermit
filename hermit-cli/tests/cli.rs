@@ -248,6 +248,16 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("hermit stderr should be UTF-8")
 }
 
+fn assert_kvm_verify_success(output: &Output) {
+    let stderr = stderr(output);
+    for marker in [
+        "KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic",
+        "Success: KVM guest output and exit status matched.",
+    ] {
+        assert!(stderr.contains(marker), "missing {marker:?} in:\n{stderr}");
+    }
+}
+
 fn assert_failure_contains(output: &Output, expected: &[&str]) {
     assert_eq!(
         output.status.code(),
@@ -959,7 +969,7 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "paste-ok\n");
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert_kvm_verify_success(&output);
 }
 
 #[test]
@@ -1014,7 +1024,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
         stdout(&output),
         "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
     );
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert_kvm_verify_success(&output);
 }
 
 #[test]
@@ -1194,7 +1204,7 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "fcntl-verify-ok\n");
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert_kvm_verify_success(&output);
 }
 
 #[test]
