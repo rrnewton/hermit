@@ -1221,6 +1221,19 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 impl<T> ThreadState<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review SaBRe orphan-thread memory identity recovery.
+    /// Repair a thread state that a remote backend had to initialize without
+    /// access to its parent's state.
+    pub(crate) fn recover_process_mm_id(&mut self, detpid: DetPid) -> bool {
+        if self.dettid == detpid || self.mm_id != MmId::initial(self.dettid) {
+            return false;
+        }
+
+        self.mm_id = MmId::initial(detpid);
+        true
+    }
+
     pub(crate) fn account_process_cpu_time(&mut self) {
         let user = self.thread_logical_time.user_cpu_time();
         let system = self.thread_logical_time.system_cpu_time();
@@ -1695,6 +1708,29 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+
+    #[test]
+    fn unparented_thread_recovers_process_memory_identity() {
+        let detpid = DetPid::from_raw(4);
+        let dettid = DetTid::from_raw(7);
+        let mut state = ThreadState::new(dettid, &Config::default(), ());
+
+        assert!(state.recover_process_mm_id(detpid));
+        assert_eq!(state.mm_id, MmId::initial(detpid));
+        assert!(!state.recover_process_mm_id(detpid));
+    }
+
+    #[test]
+    fn inherited_thread_keeps_existing_memory_identity() {
+        let detpid = DetPid::from_raw(4);
+        let dettid = DetTid::from_raw(7);
+        let inherited_mm = MmId::initial(detpid).for_exec(detpid);
+        let mut state = ThreadState::new(dettid, &Config::default(), ());
+        state.mm_id = inherited_mm;
+
+        assert!(!state.recover_process_mm_id(detpid));
+        assert_eq!(state.mm_id, inherited_mm);
+    }
 
     fn cpu_snapshot(
         user: u64,

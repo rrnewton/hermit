@@ -1175,6 +1175,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let detpid = DetPid::from_raw(guest.pid().into());
+        let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -1182,9 +1183,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         );
 
         // Delayed initialization of thread_state for this new thread:
-        guest.thread_state_mut().detpid = Some(detpid);
+        let thread_state = guest.thread_state_mut();
+        thread_state.detpid = Some(detpid);
+        if thread_state.recover_process_mm_id(detpid) {
+            debug!(
+                "[detcore, dtid {}] recovered process memory identity {} for unparented thread state",
+                new_dettid, detpid
+            );
+        }
 
-        let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
 
         if guest.is_root_thread() {
