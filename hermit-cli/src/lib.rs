@@ -1039,6 +1039,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
         );
         config.max_timeslice = None;
     }
+    config.discover_live_file_metadata = backend == Backend::Sabre;
     config
 }
 
@@ -1482,6 +1483,13 @@ mod tests {
                 .max_timeslice
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sabre_backend_config_enables_live_descriptor_discovery() {
+        let config = super::DetConfig::default();
+        assert!(prepare_backend_config(config.clone(), Backend::Sabre).discover_live_file_metadata);
+        assert!(!prepare_backend_config(config, Backend::Ptrace).discover_live_file_metadata);
     }
 
     #[test]
