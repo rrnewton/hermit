@@ -1634,10 +1634,13 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
-    const TEMP_ROOT_PREFIX: &[u8] = b"/tmpvol/.tmp";
+    const TEMP_ROOT_PREFIXES: &[&[u8]] = &[b"/tmpvol/.tmp", b"/tmp/.tmp"];
 
     fn is_private_temp_root(root: &[u8]) -> bool {
-        let Some(suffix) = root.strip_prefix(TEMP_ROOT_PREFIX) else {
+        let Some(suffix) = TEMP_ROOT_PREFIXES
+            .iter()
+            .find_map(|prefix| root.strip_prefix(*prefix))
+        else {
             return false;
         };
         suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
@@ -2362,7 +2365,7 @@ mod tests {
 
     #[test]
     fn private_mount_roots_are_guest_stable() {
-        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n";
+        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n";
         assert_eq!(
             sanitize_mountinfo(input),
             b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
