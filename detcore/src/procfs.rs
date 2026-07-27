@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Protocols,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review live protocol allocation counter normalization.
+            "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Protocols => sanitize_protocols(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,57 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/net/protocols field policy.
+fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
+    const HEADER: &[&str] = &[
+        "protocol", "size", "sockets", "memory", "press", "maxhdr", "slab", "module",
+    ];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    let header_fields = header.split_whitespace().collect::<Vec<_>>();
+    if !header_fields.starts_with(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut normalized = Vec::new();
+    normalized.push(header.to_owned());
+    for line in lines {
+        let mut fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() != header_fields.len()
+            || fields[1].parse::<u64>().is_err()
+            || fields[2].parse::<u64>().is_err()
+            || (fields[3] != "-1" && fields[3].parse::<u64>().is_err())
+        {
+            return contents.to_vec();
+        }
+
+        fields[2] = "0".to_owned();
+        if fields[3] != "-1" {
+            fields[3] = "0".to_owned();
+        }
+        normalized.push(fields.join(" "));
+    }
+    if normalized.len() == 1 {
+        return contents.to_vec();
+    }
+
+    let mut output = normalized.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        output.push(b'\n');
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +395,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/protocols"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Protocols
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +493,30 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn protocols_hides_live_socket_and_memory_counters() {
+        let contents = b"protocol size sockets memory press maxhdr slab module cl co\n\
+TCP 2304 17 12309 no 256 yes kernel y y\n\
+RAW 1008 4 -1 NI 0 yes kernel y y\n";
+
+        assert_eq!(
+            sanitize_protocols(contents),
+            b"protocol size sockets memory press maxhdr slab module cl co\n\
+TCP 2304 0 0 no 256 yes kernel y y\n\
+RAW 1008 0 -1 NI 0 yes kernel y y\n"
+        );
+    }
+
+    #[test]
+    fn protocols_leaves_unknown_formats_untouched() {
+        let missing_column = b"protocol size sockets press\nTCP 2304 17 no\n";
+        assert_eq!(sanitize_protocols(missing_column), missing_column);
+
+        let invalid_counter = b"protocol size sockets memory press maxhdr slab module\n\
+TCP 2304 many 12309 no 256 yes kernel\n";
+        assert_eq!(sanitize_protocols(invalid_counter), invalid_counter);
     }
 
     #[test]
