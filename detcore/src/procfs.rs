@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+            // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -76,14 +76,14 @@ impl ProcfsFile {
 
     /// Returns true when this snapshot consumes deterministic random bytes.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
     pub(crate) fn needs_random_uuid(&self) -> bool {
         self.kind == ProcfsKind::RandomUuid
     }
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic UUID snapshot input.
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
     pub(crate) fn initialize(
         &mut self,
         contents: Vec<u8>,
@@ -250,7 +250,7 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+// TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
 fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
     const HYPHENS: &[usize] = &[8, 13, 18, 23];
 

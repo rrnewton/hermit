@@ -286,7 +286,7 @@ impl DetFd {
 
     /// Whether this procfs snapshot consumes deterministic random bytes.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic kernel UUID generation.
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs
@@ -296,7 +296,7 @@ impl DetFd {
 
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
-    // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic UUID snapshot input.
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
     pub(crate) fn initialize_procfs(
         &self,
         contents: Vec<u8>,
