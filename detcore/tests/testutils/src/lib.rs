@@ -75,6 +75,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_madvise: true,
     discover_live_file_metadata: false,
     use_thread_local_clock_reads: false,
+    syscall_clobbers_virtualized_by_backend: false,
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
@@ -138,6 +139,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_madvise: true,
     discover_live_file_metadata: false,
     use_thread_local_clock_reads: false,
+    syscall_clobbers_virtualized_by_backend: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
@@ -201,6 +203,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_madvise: true,
     discover_live_file_metadata: false,
     use_thread_local_clock_reads: false,
+    syscall_clobbers_virtualized_by_backend: false,
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,
