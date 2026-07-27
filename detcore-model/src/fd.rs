@@ -89,7 +89,7 @@ impl OpenFileId {
         Self { creator, sequence }
     }
 
-    // TODO-HUMAN-REVIEW(PR-TBD): Review stable socket-cookie identity encoding.
+    // TODO-HUMAN-REVIEW(PR-886): Review stable socket-cookie identity encoding.
     /// Encode the ordinary per-task open sequence as a deterministic socket cookie.
     ///
     /// Linux promises that live socket cookies are unique and that descriptor aliases

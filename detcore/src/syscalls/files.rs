@@ -1754,7 +1754,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None
             };
 
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic SO_COOKIE identities.
+        // TODO-HUMAN-REVIEW(PR-886): Review deterministic SO_COOKIE identities.
         let deterministic_cookie =
             if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_COOKIE {
                 let requested_length = call
