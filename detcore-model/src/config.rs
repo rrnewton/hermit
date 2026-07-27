@@ -65,6 +65,14 @@ pub struct Config {
     pub use_thread_local_clock_reads: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review host-clock futex deadline detection.
+    /// Direct guest clock reads may bypass backend virtualization, so absolute futex deadlines
+    /// must be classified against both the host and logical clocks.
+    #[serde(default)]
+    #[clap(skip)]
+    pub detect_host_clock_futex_timeouts: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
     /// The execution backend already returns deterministic values for registers clobbered by a
     /// syscall instruction, so Detcore must not write the complete register set back afterward.
