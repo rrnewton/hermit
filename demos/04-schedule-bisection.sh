@@ -15,13 +15,12 @@
 
 set -euo pipefail
 
+# shellcheck source=demos/lib/display.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/display.sh"
+
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 4: Schedule Bisection"
-echo ''
-echo '=========================================='
-echo '=== Demo 4: Schedule Bisection ==='
-echo '=========================================='
-echo ''
+demo_header "$DEMO_LABEL"
 echo 'hermit analyze first finds passing and failing schedules, then bisects their'
 echo 'event streams to identify the ordering that changes the outcome. It builds a'
 echo 'debug guest so the report can resolve source locations. This is intentionally'

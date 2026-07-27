@@ -32,16 +32,25 @@ if ! command -v make >/dev/null 2>&1; then
   echo "ERROR: make is required to check the Hermit build dependencies." >&2
   exit 1
 fi
-if ! make --no-print-directory -s -C "$ROOT" check-deps; then
-  echo "Install the missing packages with: make -C '$ROOT' install-deps" >&2
-  exit 1
-fi
-
 # Build the debug binaries used for the validated record/replay path and
 # source-resolved analyzer output. The release build remains available for
 # normal use. Set DEMO_SKIP_BUILD=1 to reuse an existing build.
-if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
-  ( cd "$HERMIT_REPO" && cargo build --release && cargo build )
+if [ "${DEMO_SKIP_BUILD:-0}" = "1" ]; then
+  make --no-print-directory -s -C "$ROOT" check-deps
+else
+  case "${DEMO_BUILD_MODE:-all}" in
+    release)
+      make --no-print-directory -s -C "$ROOT" build
+      ;;
+    all)
+      make --no-print-directory -s -C "$ROOT" check-deps
+      ( cd "$HERMIT_REPO" && cargo build --release && cargo build )
+      ;;
+    *)
+      echo "ERROR: unsupported DEMO_BUILD_MODE: $DEMO_BUILD_MODE" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 export HERMIT="${HERMIT:-$HERMIT_REPO/target/debug/hermit}"
