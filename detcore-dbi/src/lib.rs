@@ -906,10 +906,31 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
-/// Applies unsupported-syscall policy in a copied pre-exec DBI child.
+// TODO-HUMAN-REVIEW(PR-978): Review extending the copied-child gate from the
+// Unsupported set to the full deterministic-refusal boundary.
+/// Applies the deterministic-refusal policy in a copied pre-exec DBI child.
+///
+/// A copied pre-exec child runs natively on the DynamoRIO client stack with no
+/// Detcore tool, so every syscall it makes bypasses `handle_syscall_event`.
+/// Returning 0 lets the syscall run natively; returning 1 fail-closes by
+/// aborting the runtime tree. There is no errno-injection channel in this ABI,
+/// so a fixed-ENOSYS/EPERM syscall cannot be emulated here — the only way to
+/// avoid leaking host state is to refuse the whole child.
+///
+/// The gate covers two overlapping sets:
+///   * `is_unsupported_syscall` — the classic Unsupported set, and
+///   * `is_deterministically_refused_syscall` — the broader boundary of
+///     syscalls the strict ptrace dispatcher refuses with a fixed ENOSYS/EPERM
+///     (e.g. `splice`/`tee`/`vmsplice`, `perf_event_open`, the keyring family).
+///     Before PR-978 these executed natively in a strict copied child even
+///     though the ptrace path refused them, so classifying a syscall
+///     Determinized-refuse did not actually enforce isolation on DBI.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
-    if !detcore::is_unsupported_syscall(Sysno::from(sysnum as i32)) {
+    let sysno = Sysno::from(sysnum as i32);
+    if !detcore::is_unsupported_syscall(sysno)
+        && !detcore::is_deterministically_refused_syscall(sysno)
+    {
         return 0;
     }
     if COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire) {
@@ -1373,5 +1394,72 @@ mod tests {
         assert_eq!(scratch.virtual_tid, 0);
         assert_eq!(scratch.pending_virtual_child, 0);
         assert_eq!(scratch.pending_clone_flags, 0);
+    }
+
+    #[test]
+    fn copied_child_gate_refuses_deterministic_refusal_families_in_strict() {
+        // The copied pre-exec child runs natively with no Detcore tool. Under
+        // strict mode the gate must fail-close (return 1) not only for the
+        // classic Unsupported set but for the full deterministic-refusal
+        // boundary (splice/tee/vmsplice, perf_event_open, the keyring family),
+        // otherwise strict guests execute those syscalls natively against the
+        // host. Report fd is left at its -1 default so `append_copied_syscall_record`
+        // is a no-op and the non-strict branch has no observable side effect.
+        let previous = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        // Every family member must be recognized by the shared predicate.
+        for sysno in [
+            Sysno::splice,
+            Sysno::tee,
+            Sysno::vmsplice,
+            Sysno::perf_event_open,
+            Sysno::keyctl,
+            Sysno::add_key,
+            Sysno::request_key,
+        ] {
+            assert!(
+                detcore::is_deterministically_refused_syscall(sysno),
+                "{sysno:?} should be in Detcore's deterministic-refusal boundary"
+            );
+        }
+
+        // Strict: refused families and Unsupported syscalls fail-close (1);
+        // ordinary passthrough syscalls continue natively (0).
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+        for sysnum in [
+            libc::SYS_splice,
+            libc::SYS_tee,
+            libc::SYS_vmsplice,
+            libc::SYS_perf_event_open,
+            libc::SYS_keyctl,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
+        ] {
+            assert_eq!(
+                reverie_dbi_runtime_copied_syscall(sysnum),
+                1,
+                "strict copied child must refuse syscall {sysnum}"
+            );
+        }
+        for sysnum in [libc::SYS_read, libc::SYS_write, libc::SYS_getpid] {
+            assert_eq!(
+                reverie_dbi_runtime_copied_syscall(sysnum),
+                0,
+                "strict copied child must allow ordinary syscall {sysnum}"
+            );
+        }
+
+        // Non-strict: refused families continue natively (0), matching the
+        // ptrace path's passthrough-when-not-strict behavior for these families.
+        COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
+        for sysnum in [libc::SYS_splice, libc::SYS_perf_event_open, libc::SYS_read] {
+            assert_eq!(
+                reverie_dbi_runtime_copied_syscall(sysnum),
+                0,
+                "non-strict copied child must not abort for syscall {sysnum}"
+            );
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
     }
 }
