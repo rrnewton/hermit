@@ -2359,14 +2359,6 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        replacement.to_vec()
-    }
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
 fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
