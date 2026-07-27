@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host file-table normalization.
+            // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/file-nr policy.
+// TODO-HUMAN-REVIEW(PR-910): Review the /proc/sys/fs/file-nr policy.
 fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
