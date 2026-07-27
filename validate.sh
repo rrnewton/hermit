@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=178
-readonly SABRE_COMPAT_TOTAL=178
+readonly SABRE_COMPAT_EXPECTED=179
+readonly SABRE_COMPAT_TOTAL=179
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -2971,8 +2971,13 @@ function run_compatibility_corpus {
     strict_compatibility_probe pkill bash -c \
         'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf "pkill-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # timeout is intentionally absent: "timeout 1 true" hangs in Run1 while
-    # the parent waits in rt_sigsuspend for its delayed child.
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#845): Review SaBRe queued-signal preservation through
+    # the atomic rt_sigsuspend mask transition.
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        strict_compatibility_probe timeout /usr/bin/timeout 1 /usr/bin/true \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#575)
     # Filesystem fixtures use a per-probe mktemp dir so concurrent validate.sh
