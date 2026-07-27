@@ -529,7 +529,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // registers the result as FdType::Pidfd before later fd operations.
         | Sysno::pidfd_open
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-877): Canonicalize fresh kernel namespace inode
+        // TODO-HUMAN-REVIEW(#877): Canonicalize fresh kernel namespace inode
         // identities while preserving ordinary symlink behavior and errors.
         | Sysno::readlink
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1258,7 +1258,7 @@ mod tests {
             SyscallClassification::Determinized
         );
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-877)
+        // TODO-HUMAN-REVIEW(#877)
         for sysno in [Sysno::readlink, Sysno::readlinkat] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }

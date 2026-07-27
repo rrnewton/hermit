@@ -236,7 +236,7 @@ fn common_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD)
+        // TODO-HUMAN-REVIEW(#877)
         StrictCommandCase {
             name: "readlink mount namespace",
             candidates: &["/usr/bin/readlink", "/bin/readlink"],

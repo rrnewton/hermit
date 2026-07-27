@@ -26,7 +26,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::tool_local::Detcore;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#877)
 fn is_proc_id(component: &OsStr) -> bool {
     component == "self"
         || component == "thread-self"
@@ -36,7 +36,7 @@ fn is_proc_id(component: &OsStr) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#877)
 fn canonical_namespace_name(name: &OsStr) -> Option<&'static [u8]> {
     match name.to_str()? {
         "cgroup" => Some(b"cgroup:[4026531835]"),
@@ -52,7 +52,7 @@ fn canonical_namespace_name(name: &OsStr) -> Option<&'static [u8]> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#877)
 fn canonical_namespace_target(path: &Path) -> Option<&'static [u8]> {
     if !path.is_absolute() {
         return None;
@@ -87,7 +87,7 @@ fn canonical_namespace_target(path: &Path) -> Option<&'static [u8]> {
 
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#877)
     async fn finish_namespace_readlink<G, S>(
         &self,
         guest: &mut G,
@@ -114,7 +114,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlink errors and canonicalize procfs namespace identities.
     pub async fn handle_readlink<G: Guest<Self>>(
         &self,
@@ -127,7 +127,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlinkat errors and canonicalize absolute procfs namespace identities.
     pub async fn handle_readlinkat<G: Guest<Self>>(
         &self,

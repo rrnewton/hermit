@@ -1618,7 +1618,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Statx(s) => self.handle_statx(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD)
+                // TODO-HUMAN-REVIEW(#877)
                 Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
