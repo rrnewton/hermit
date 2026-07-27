@@ -46,7 +46,7 @@ impl ProcfsFile {
             "/proc/self/status" => ProcfsKind::Status,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review deterministic kernel I/O accounting.
+            // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
             "/proc/diskstats" => ProcfsKind::Diskstats,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
@@ -248,7 +248,7 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review deterministic kernel I/O accounting values.
+// TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting values.
 fn sanitize_diskstats(contents: &[u8]) -> Vec<u8> {
     sanitize_numeric_lines(contents, 3)
 }
