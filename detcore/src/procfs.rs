@@ -25,7 +25,7 @@ enum ProcfsKind {
     BtrfsBytesPinned,
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review Btrfs pinned-space path recognition.
+// TODO-HUMAN-REVIEW(PR-971): Review Btrfs pinned-space path recognition.
 fn is_btrfs_bytes_pinned_path(path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix("/sys/fs/btrfs") else {
         return false;
@@ -88,7 +88,7 @@ impl ProcfsFile {
                 ProcfsKind::ScalingCurFreq
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review Btrfs pinned-space normalization.
+            // TODO-HUMAN-REVIEW(PR-971): Review Btrfs pinned-space normalization.
             other if is_btrfs_bytes_pinned_path(Path::new(other)) => ProcfsKind::BtrfsBytesPinned,
             _ => return None,
         };
@@ -268,7 +268,7 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review Btrfs bytes_pinned normalization.
+// TODO-HUMAN-REVIEW(PR-971): Review Btrfs bytes_pinned normalization.
 fn sanitize_btrfs_bytes_pinned(contents: &[u8]) -> Vec<u8> {
     let has_newline = contents.ends_with(b"\n");
     let value = contents.strip_suffix(b"\n").unwrap_or(contents);
