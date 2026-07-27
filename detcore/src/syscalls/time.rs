@@ -69,13 +69,13 @@ fn ns_to_timespec(ns: u64) -> libc::timespec {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Query-only timex mode boundary.
+// TODO-HUMAN-REVIEW(PR-857): Query-only timex mode boundary.
 fn timex_mode_is_query(modes: libc::c_uint) -> bool {
     modes == 0 || modes == libc::ADJ_OFFSET_SS_READ
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Host-independent NTP discipline snapshot.
+// TODO-HUMAN-REVIEW(PR-857): Host-independent NTP discipline snapshot.
 fn deterministic_timex(now: Timespec) -> libc::timex {
     // SAFETY: `libc::timex` contains only integer fields and padding; zero is a
     // valid baseline for the fields not modeled by Hermit.
@@ -217,7 +217,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Deterministic adjtimex query/refusal policy.
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic adjtimex query/refusal policy.
     /// Report Hermit's virtual clock with a fixed unsynchronized discipline.
     /// Adjustment modes are capability-gated host mutations and receive EPERM.
     pub async fn handle_adjtimex<G: Guest<Self>>(
@@ -229,7 +229,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Deterministic clock_adjtime query/refusal policy.
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic clock_adjtime query/refusal policy.
     /// Apply the adjtimex policy to CLOCK_REALTIME. Linux does not permit NTP
     /// adjustment of the other fixed clock IDs, so reject them with EOPNOTSUPP.
     pub async fn handle_clock_adjtime<G: Guest<Self>>(
