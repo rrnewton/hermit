@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    IrqPerCpuCount,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review per-CPU host interrupt normalization.
+            _ if is_irq_per_cpu_count_path(path) => ProcfsKind::IrqPerCpuCount,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,49 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+fn is_irq_per_cpu_count_path(path: &Path) -> bool {
+    if path.file_name().and_then(|leaf| leaf.to_str()) != Some("per_cpu_count") {
+        return false;
+    }
+    let Some(irq_directory) = path.parent() else {
+        return false;
+    };
+    let Some(irq) = irq_directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !irq.is_empty()
+        && irq.bytes().all(|byte| byte.is_ascii_digit())
+        && irq_directory.parent() == Some(Path::new("/sys/kernel/irq"))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /sys/kernel/irq/<IRQ>/per_cpu_count field policy.
+fn sanitize_irq_per_cpu_count(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let has_newline = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.contains('\n') {
+        return contents.to_vec();
+    }
+
+    let fields = body.split(',').collect::<Vec<_>>();
+    if fields.is_empty()
+        || fields
+            .iter()
+            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return contents.to_vec();
+    }
+
+    let mut normalized = vec!["0"; fields.len()].join(",").into_bytes();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +388,18 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/per_cpu_count"))
+                .unwrap()
+                .kind,
+            ProcfsKind::IrqPerCpuCount
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/irq/irq254/per_cpu_count")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/actions")).is_none());
+        assert!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/device/per_cpu_count")).is_none()
+        );
     }
 
     #[test]
@@ -431,6 +490,27 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn irq_per_cpu_count_hides_host_interrupt_totals() {
+        assert_eq!(
+            sanitize_irq_per_cpu_count(b"0,17,0,983421,0\n"),
+            b"0,0,0,0,0\n"
+        );
+        assert_eq!(sanitize_irq_per_cpu_count(b"42,0"), b"0,0");
+    }
+
+    #[test]
+    fn irq_per_cpu_count_leaves_unknown_formats_untouched() {
+        for contents in [
+            b"".as_slice(),
+            b"1,,2\n".as_slice(),
+            b"1,2,three\n".as_slice(),
+            b"1,2\n3,4\n".as_slice(),
+        ] {
+            assert_eq!(sanitize_irq_per_cpu_count(contents), contents);
+        }
     }
 
     #[test]
