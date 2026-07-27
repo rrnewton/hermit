@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    NumaMaps,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review host NUMA observation normalization.
+            "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,50 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/numa_maps field policy.
+fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 || u64::from_str_radix(fields[0], 16).is_err() {
+            return contents.to_vec();
+        }
+
+        let mut kept = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(value) = field
+                .strip_prefix("active=")
+                .or_else(|| field.strip_prefix("mapmax="))
+            {
+                if value.parse::<u64>().is_err() {
+                    return contents.to_vec();
+                }
+            } else {
+                kept.push(field);
+            }
+        }
+        normalized.extend_from_slice(kept.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +388,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaMaps
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +486,27 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn numa_maps_hides_host_page_aging_and_sharing_maxima() {
+        let contents = b"71000000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 kernelpagesize_kB=4\n";
+
+        assert_eq!(
+            sanitize_numa_maps(contents),
+            b"71000000 default anon=1 dirty=1 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 N0=41 kernelpagesize_kB=4\n"
+        );
+    }
+
+    #[test]
+    fn numa_maps_leaves_unknown_formats_untouched() {
+        let invalid_address = b"address default anon=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_address), invalid_address);
+
+        let invalid_counter = b"71000000 default active=recent N0=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
     }
 
     #[test]
