@@ -23,6 +23,9 @@ enum ProcfsKind {
     ProcessIo,
     Uptime,
     BlockStat,
+    NodeMeminfo,
+    NodeNumastat,
+    HwmonInput,
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -83,6 +86,11 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
             "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
+            other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
+            other if is_numa_node_file(other, "numastat") => ProcfsKind::NodeNumastat,
+            other if is_hwmon_input_file(other) => ProcfsKind::HwmonInput,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
             // like `lscpu` under `--verify`. These are opened relative to a
@@ -128,6 +136,9 @@ impl ProcfsFile {
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
+            ProcfsKind::NodeMeminfo => sanitize_node_meminfo(&contents),
+            ProcfsKind::NodeNumastat => sanitize_node_numastat(&contents),
+            ProcfsKind::HwmonInput => sanitize_numeric_scalar(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
@@ -179,6 +190,25 @@ fn is_block_stat_path(path: &str) -> bool {
     path.strip_prefix("/sys/block/")
         .and_then(|path| path.strip_suffix("/stat"))
         .is_some_and(|device| !device.is_empty() && !device.contains('/'))
+}
+
+fn is_numa_node_file(path: &str, filename: &str) -> bool {
+    path.strip_prefix("/sys/devices/system/node/node")
+        .and_then(|path| path.split_once('/'))
+        .is_some_and(|(node, leaf)| {
+            !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()) && leaf == filename
+        })
+}
+
+fn is_hwmon_input_file(path: &str) -> bool {
+    path.strip_prefix("/sys/class/hwmon/hwmon")
+        .and_then(|path| path.split_once('/'))
+        .is_some_and(|(instance, attribute)| {
+            !instance.is_empty()
+                && instance.bytes().all(|byte| byte.is_ascii_digit())
+                && !attribute.contains('/')
+                && attribute.ends_with("_input")
+        })
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
@@ -349,6 +379,30 @@ fn sanitize_numeric_lines(contents: &[u8], stable_fields: usize) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-865): Review synthetic NUMA and hwmon accounting values.
+fn sanitize_node_numastat(contents: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let fields = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        if fields.len() == 2 && fields[1].iter().all(u8::is_ascii_digit) {
+            normalized.extend_from_slice(fields[0]);
+            normalized.extend_from_slice(b" 0");
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
     const COUNTERS: &[&[u8]] = &[
         b"rchar",
@@ -377,6 +431,64 @@ fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+fn sanitize_node_meminfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let Some((label, value)) = body.split_once(':') else {
+            normalized.push_str(body);
+            if has_newline {
+                normalized.push('\n');
+            }
+            continue;
+        };
+        let field = label.split_whitespace().last().unwrap_or_default();
+        let mut value_fields = value.split_whitespace();
+        let numeric = value_fields.next();
+        let unit = value_fields.next();
+        if numeric.is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+            && value_fields.next().is_none()
+        {
+            // Keep the node online and internally consistent while hiding live usage.
+            let synthetic = match field {
+                "MemTotal" | "MemFree" => 1_048_576,
+                _ => 0,
+            };
+            normalized.push_str(label);
+            normalized.push_str(": ");
+            normalized.push_str(&synthetic.to_string());
+            if let Some(unit) = unit {
+                normalized.push(' ');
+                normalized.push_str(unit);
+            }
+        } else {
+            normalized.push_str(body);
+        }
+        if has_newline {
+            normalized.push('\n');
+        }
+    }
+    normalized.into_bytes()
+}
+
+fn sanitize_numeric_scalar(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    if text.trim().parse::<i64>().is_err() {
+        return contents.to_vec();
+    }
+    if text.ends_with('\n') {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -845,6 +957,32 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_numa_and_hwmon_accounting_paths() {
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/numastat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeNumastat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node12/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeMeminfo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_input"))
+                .unwrap()
+                .kind,
+            ProcfsKind::HwmonInput
+        );
+        assert!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/nodeX/numastat")).is_none()
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_cap")).is_none());
+    }
+
+    #[test]
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
@@ -880,6 +1018,26 @@ mod tests {
         assert_eq!(
             sanitize_softnet_stat(b"not a softnet row\n"),
             b"not a softnet row\n"
+        );
+    }
+
+    #[test]
+    fn numa_and_hwmon_values_are_synthetic() {
+        assert_eq!(
+            sanitize_node_numastat(b"numa_hit 123\nnuma_miss 7\n"),
+            b"numa_hit 0\nnuma_miss 0\n"
+        );
+        assert_eq!(
+            sanitize_node_meminfo(
+                b"Node 0 MemTotal: 791462432 kB\nNode 0 MemFree: 24654068 kB\nNode 0 Active: 100 kB\nNode 0 HugePages_Total: 2\n"
+            ),
+            b"Node 0 MemTotal: 1048576 kB\nNode 0 MemFree: 1048576 kB\nNode 0 Active: 0 kB\nNode 0 HugePages_Total: 0\n"
+        );
+        assert_eq!(sanitize_numeric_scalar(b"193723000\n"), b"0\n");
+        assert_eq!(sanitize_numeric_scalar(b"-12000"), b"0");
+        assert_eq!(
+            sanitize_numeric_scalar(b"not-a-number\n"),
+            b"not-a-number\n"
         );
     }
 
