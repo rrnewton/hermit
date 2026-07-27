@@ -410,6 +410,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_vm_readv
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for guest pidfd
+        // operations. Detcore virtualizes guest PIDs but does not map guest
+        // pidfds onto host process lifetimes, descriptor tables, permissions,
+        // or signal delivery. A fixed pre-pidfd-kernel response keeps those
+        // host details outside the deterministic guest and enables fallbacks.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::pidfd_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::pidfd_getfd
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::pidfd_send_signal
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -644,9 +656,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mincore
         | Sysno::name_to_handle_at
         | Sysno::perf_event_open
-        | Sysno::pidfd_getfd
-        | Sysno::pidfd_open
-        | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
@@ -900,6 +909,25 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 /// and directs feature-probing callers to their portable `/proc` fallbacks.
 pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool {
     matches!(sysno, Sysno::sysfs | Sysno::statmount | Sysno::listmount)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Deterministic guest pidfd refusal set.
+/// Guest pidfd operations. Detcore virtualizes guest PIDs but has no pidfd
+/// model that can translate process lifetimes, descriptor tables, permissions,
+/// or signal delivery into its deterministic state. A fixed `ENOSYS` presents
+/// the standard pre-pidfd kernel boundary and directs probing callers to their
+/// traditional PID-based fallbacks without exposing host process state.
+pub(crate) const fn is_guest_pidfd_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::pidfd_open
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::pidfd_getfd
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::pidfd_send_signal
+    )
 }
 
 #[cfg(test)]
@@ -1319,6 +1347,34 @@ mod tests {
                 is_mount_introspection_enosys_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} mount-introspection helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_pidfd_syscalls_are_determinized_and_consistent() {
+        let refused = [
+            Sysno::pidfd_open,
+            Sysno::pidfd_getfd,
+            Sysno::pidfd_send_signal,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_guest_pidfd_syscall(sysno),
+                "{sysno:?} should be in the guest pidfd refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_guest_pidfd_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} guest pidfd helper membership is inconsistent"
             );
         }
     }
