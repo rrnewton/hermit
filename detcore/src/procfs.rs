@@ -23,7 +23,7 @@ enum ProcfsKind {
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review key-user resource normalization.
+    // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
     KeyUsers,
 }
 
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/key-users quota accounting policy.
+// TODO-HUMAN-REVIEW(PR-951): Review the /proc/key-users quota accounting policy.
 fn sanitize_key_users(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
