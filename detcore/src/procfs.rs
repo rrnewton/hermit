@@ -62,7 +62,7 @@ impl ProcfsFile {
                 ProcfsKind::Pressure
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review buddy allocator normalization.
+            // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
             "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -417,7 +417,7 @@ fn parse_key_user_pair(field: &str) -> Option<(u64, u64)> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/buddyinfo field policy.
+// TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
 fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
