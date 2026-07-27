@@ -260,7 +260,8 @@ fn prctl_timer_slack_round_trips_deterministically() {
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
         assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
 
-        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, original), 0);
+        // A zero value restores the thread's inherited default timer slack.
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
         assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), original);
     });
 }
