@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review strict verification coverage for dentry counters.
+// TODO-HUMAN-REVIEW(PR-918): Review strict verification coverage for dentry counters.
 #[test]
 fn dentry_state_consumers_verify() {
     assert!(

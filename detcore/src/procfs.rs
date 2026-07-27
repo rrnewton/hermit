@@ -43,7 +43,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global dentry counter normalization.
+            // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/dentry-state field policy.
+// TODO-HUMAN-REVIEW(PR-918): Review the /proc/sys/fs/dentry-state field policy.
 fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -439,7 +439,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review dentry counter fixture coverage.
+    // TODO-HUMAN-REVIEW(PR-918): Review dentry counter fixture coverage.
     #[test]
     fn dentry_state_hides_host_global_cache_counters() {
         assert_eq!(
