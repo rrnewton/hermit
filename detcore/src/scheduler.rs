@@ -1070,6 +1070,9 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 nextturn.req.try_put(Err(ThreadExited));
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-TBD): Review killed-thread RPC cancellation.
+                nextturn.resp.try_put(SchedResponse::Signaled());
                 self.wake_futex_child_cleartid(
                     FutexID::private(mm, nextturn.child_tid_addr),
                     *dtid,
@@ -2811,6 +2814,31 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn logically_kill_thread_unblocks_pending_rpc() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
+        assert!(matches!(
+            response.try_read(),
+            Some(SchedResponse::Signaled())
+        ));
     }
 
     #[test]

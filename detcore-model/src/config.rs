@@ -50,6 +50,13 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_madvise: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review in-process backend descriptor discovery.
+    /// The execution backend runs Detcore inside the guest and can inspect its live descriptors.
+    #[serde(default)]
+    #[clap(skip)]
+    pub discover_live_file_metadata: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
