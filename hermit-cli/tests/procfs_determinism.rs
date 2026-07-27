@@ -186,6 +186,46 @@ fn proc_pid_io_uses_zero_counters() {
 }
 
 #[test]
+fn proc_system_cpu_accounting_is_deterministic() {
+    assert_deterministic("/proc/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        for line in text.lines().filter(|line| line.starts_with("cpu")) {
+            let counters = line.split_whitespace().skip(1).collect::<Vec<_>>();
+            assert!(counters.iter().skip(1).all(|counter| *counter == "0"));
+        }
+        assert!(text.lines().any(|line| line.starts_with("btime ")));
+    });
+}
+
+#[test]
+fn proc_pid_stat_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        let comm_end = text.rfind(") ").expect("stat has no comm terminator");
+        let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields[0], "S");
+        assert_eq!(fields[23 - 3], "0");
+        assert_eq!(fields[24 - 3], "0");
+    });
+}
+
+#[test]
+fn proc_pid_statm_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/statm", |contents| {
+        assert_eq!(contents, b"0 0 0 0 0 0 0\n");
+    });
+}
+
+#[test]
+fn proc_pid_status_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/status", |contents| {
+        let text = std::str::from_utf8(contents).expect("status should be UTF-8");
+        assert!(text.contains("VmSize:\t0 kB\n"));
+        assert!(text.contains("VmRSS:\t0 kB\n"));
+    });
+}
+
+#[test]
 fn proc_cpuinfo_is_deterministic() {
     assert_deterministic("/proc/cpuinfo", |contents| {
         let text = std::str::from_utf8(contents).expect("cpuinfo should be UTF-8");

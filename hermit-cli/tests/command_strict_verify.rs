@@ -49,6 +49,7 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
 
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
+    let home = tempfile::tempdir().expect("failed to create isolated command HOME");
     let mut command = Command::new("timeout");
     command
         .args([
@@ -60,6 +61,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .args(["--log=off", "run", "--strict", "--verify", "--"])
         .arg(&program)
         .args(case.args)
+        .env("HOME", home.path())
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -329,6 +331,44 @@ fn identity_commands_are_deterministic_under_strict_verify() {
             name: "groups",
             candidates: &["/usr/bin/groups", "/bin/groups"],
             args: &[],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-843): Review strict process-accounting command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + procps-ng tools"]
+fn process_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "ps aux",
+            candidates: &["/usr/bin/ps", "/bin/ps"],
+            args: &["aux"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "free -m",
+            candidates: &["/usr/bin/free", "/bin/free"],
+            args: &["-m"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vmstat -s",
+            candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
+            args: &["-s"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "top batch",
+            candidates: &["/usr/bin/top", "/bin/top"],
+            args: &["-b", "-n", "1", "-p", "1", "-w", "80"],
             stdin: None,
         },
     ];
