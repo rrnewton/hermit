@@ -195,7 +195,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getsockopt
         | Sysno::getpriority
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD)
+        // TODO-HUMAN-REVIEW(PR-892)
         | Sysno::getitimer
         | Sysno::getrlimit
         | Sysno::kill

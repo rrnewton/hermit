@@ -2620,7 +2620,7 @@ impl Scheduler {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-841): Review logical ITIMER_REAL state queries.
+    // TODO-HUMAN-REVIEW(PR-892): Review logical ITIMER_REAL state queries.
     pub fn alarm_remaining(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {
         self.blocked
             .timed_waiters
