@@ -3514,12 +3514,11 @@ mod tests {
         file.bind_thread_identity(3, 4, 1);
         file.initialize(
             b"Tgid:\t1234\nPid:\t1235\nPPid:\t1200\nNStgid:\t1234\nNSpid:\t1235\n".to_vec(),
-            0,
-            0,
-            99,
-            98,
-            0,
-            None,
+            ProcfsSnapshotContext {
+                virtual_pid: 99,
+                virtual_ppid: 98,
+                ..ProcfsSnapshotContext::default()
+            },
         );
         assert_eq!(
             file.take(usize::MAX).unwrap(),
