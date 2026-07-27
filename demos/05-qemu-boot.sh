@@ -6,13 +6,16 @@ set -euo pipefail
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 5: QEMU Linux Snapshot"
-cat <<'DESC'
-=== Demo 5: QEMU Linux Snapshot ===
-
-Hermit runs QEMU's TCG emulator in strict mode, boots a real Linux kernel to
-its serial shell, and saves that live machine as the internal snapshot
-"hermit-boot". Demo 6 can then resume the shell without booting Linux again.
-DESC
+echo ''
+echo '=========================================='
+echo '=== Demo 5: QEMU Linux Snapshot ==='
+echo '=========================================='
+echo ''
+echo "Hermit runs QEMU's TCG emulator in strict mode, boots a real Linux kernel to"
+echo 'its serial shell, and saves that live machine as the internal snapshot'
+echo '"hermit-boot". Demo 6 can then resume the shell without booting Linux again.'
+echo ''
+echo '=========================================='
 
 # shellcheck source=demos/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
