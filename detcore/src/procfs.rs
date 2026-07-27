@@ -110,8 +110,6 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     Vmstat,
-    InterruptCounters,
-    Modules,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -519,8 +517,6 @@ impl ProcfsFile {
             ProcfsKind::RandomUuid => {
                 fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
             }
-            ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
-            ProcfsKind::Modules => sanitize_modules(&contents),
         });
     }
 
@@ -2187,6 +2183,40 @@ fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
+fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() >= 4 {
+            let holders = if fields[3] == "-" {
+                0
+            } else {
+                fields[3]
+                    .split(',')
+                    .filter(|holder| !holder.is_empty())
+                    .count()
+            };
+            fields[2] = holders.to_string();
+        }
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -2264,40 +2294,6 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
-fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if fields.len() >= 4 {
-            let holders = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            fields[2] = holders.to_string();
-        }
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
 fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -2355,6 +2351,7 @@ fn zero_decimal_runs(text: &str) -> String {
     }
     normalized
 }
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-916): Review the /proc/net/protocols field policy.
 fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
