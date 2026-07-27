@@ -10,15 +10,15 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
-| DBI | 6/10 | 60% |
+| DBI | 9/10 | 90% |
 | KVM | 8/10 | 80% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 6/10 number above is deliberately
+measures the backend's own Reverie suite. The 9/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-Conflating the two would overstate Detcore parity because the current DBI client
-observes most syscalls but only rewrites `write` and CPUID; it does not yet use
-Detcore's scheduler, virtual clock, PID model, or random model.
+The current DBI path satisfies the process lifecycle, virtual clock, and virtual
+PID contracts, but its threaded random-source fixture still does not complete.
+These contracts do not by themselves establish full Detcore parity.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 eight pairs, including deterministic clock, PID, and synthetic CPUID probes.
@@ -35,11 +35,11 @@ page-permission fault enforcement.
 | `exit_zero` | pass | pass | pass |
 | `exit_status` | pass | pass | pass |
 | `file_read` | pass | pass | pass |
-| `pthread_lifecycle` | pass | gap | gap |
+| `pthread_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
-| `virtual_clock` | pass | gap | pass |
+| `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | gap | gap |
-| `virtual_pid` | pass | gap | pass |
+| `virtual_pid` | pass | pass | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
@@ -71,8 +71,9 @@ python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
 Run DBI with the pinned DynamoRIO runtime and client built by Cargo:
 
 ```bash
-cargo build -p hermit
-python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
+cargo build --release -p hermit
+python3 experiments/backend-parity_20260722/run_matrix.py \
+    --hermit target/release/hermit --backend dbi --require-backend
 ```
 
 Run KVM on a host with read-write `/dev/kvm` access:
