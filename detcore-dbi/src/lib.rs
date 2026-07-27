@@ -36,11 +36,9 @@ use std::task::Poll;
 use std::task::Waker;
 
 use detcore::Config;
-use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
-use detcore::thread_rng_from_parent;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -71,7 +69,6 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
-type PendingThreadParent = (Tid, DetcoreThreadState, DetTid);
 type Emitter = reverie_dbi::RuntimeEmitter;
 type Idler = reverie_dbi::RuntimeIdler;
 
@@ -226,11 +223,8 @@ struct NativeThreadScratch {
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
-static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
+static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, (Tid, DetcoreThreadState)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-// Pcg64Mcg forces its internal state odd, so adjacent even/odd seed IDs can alias.
-// Keep DBI stream IDs even and advance by two.
-static NEXT_DBI_RANDOM_STREAM_ID: AtomicI32 = AtomicI32::new(2);
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -737,18 +731,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     };
     let parent_ref = parent
         .as_ref()
-        .map(|(parent_tid, state, _)| (*parent_tid, state));
+        .map(|(parent_tid, state)| (*parent_tid, state));
     let tid = Pid::from_raw(tid);
     let pid = Pid::from_raw(pid);
-    let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref);
-    if let Some((_, parent_state, stream_id)) = parent.as_ref() {
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-849): Review stable DBI child random streams.
-        state.prng = thread_rng_from_parent("DBI USER RAND", &parent_state.prng, *stream_id);
-    }
     let mut thread = Box::new(ThreadRuntime {
         tid,
-        state,
+        state: tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref),
         initialized: false,
         post_exec_pending: tid == pid,
     });
@@ -809,18 +797,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     let parent = unsafe { &mut *scratch.runtime_state };
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-849): Review stable DBI child random streams.
-    let random_stream_id =
-        DetTid::from_raw(NEXT_DBI_RANDOM_STREAM_ID.fetch_add(2, Ordering::SeqCst));
     let parent_snapshot = parent.state.clone();
     if PENDING_THREAD_PARENTS
         .lock()
         .expect("pending DBI thread parent lock poisoned")
-        .insert(
-            child_tid,
-            (Tid::from_raw(parent_tid), parent_snapshot, random_stream_id),
-        )
+        .insert(child_tid, (Tid::from_raw(parent_tid), parent_snapshot))
         .is_some()
     {
         parent.state.clone_flags = None;

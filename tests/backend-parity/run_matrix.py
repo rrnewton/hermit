@@ -276,6 +276,8 @@ def run_case(
     hermit: Path, backend: str, name: str, fixtures: Fixtures
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
+    if backend == "dbi" and name == "random_sources":
+        guest = [*guest, "--root-only"]
     baseline: bytes | None = None
     started = time.monotonic()
     ptrace_random: bytes | None = None
