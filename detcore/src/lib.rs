@@ -155,9 +155,9 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
-use crate::syscall_classification::is_kernel_keyring_syscall;
-use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
+use crate::syscall_classification::is_host_kernel_probe_syscall;
+use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -1562,6 +1562,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
                 Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,

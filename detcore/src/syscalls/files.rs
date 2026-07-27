@@ -28,6 +28,7 @@ use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
+use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
 use tracing::info;
 use tracing::trace;
@@ -54,6 +55,7 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+const MAX_PROCFS_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
@@ -274,23 +276,72 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<Vec<u8>, Error> {
-        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
-
-        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+        let remote_buf = call.buf().ok_or(Errno::EFAULT)?.as_raw();
         let mut contents = Vec::new();
         loop {
             let bytes_read = self.record_or_replay(guest, call).await? as usize;
             if bytes_read == 0 {
                 return Ok(contents);
             }
-            if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
+            if contents.len() + bytes_read > MAX_PROCFS_SNAPSHOT_BYTES {
                 return Err(Errno::EFBIG.into());
             }
 
             let mut chunk = vec![0; bytes_read];
+            let remote_buf = AddrMut::<u8>::from_raw(remote_buf).ok_or(Errno::EFAULT)?;
             guest.memory().read_exact(remote_buf, &mut chunk)?;
             contents.extend_from_slice(&chunk);
         }
+    }
+
+    async fn snapshot_procfs_pread<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mut call: syscalls::Pread64,
+    ) -> Result<Vec<u8>, Error> {
+        call = call.with_offset(0);
+        let remote_buf = call.buf().ok_or(Errno::EFAULT)?.as_raw();
+        let mut contents = Vec::new();
+        loop {
+            let bytes_read = self.record_or_replay(guest, call).await? as usize;
+            if bytes_read == 0 {
+                return Ok(contents);
+            }
+            if contents.len() + bytes_read > MAX_PROCFS_SNAPSHOT_BYTES {
+                return Err(Errno::EFBIG.into());
+            }
+
+            let mut chunk = vec![0; bytes_read];
+            let remote_buf = AddrMut::<u8>::from_raw(remote_buf).ok_or(Errno::EFAULT)?;
+            guest.memory().read_exact(remote_buf, &mut chunk)?;
+            contents.extend_from_slice(&chunk);
+            let offset = call
+                .offset()
+                .checked_add(bytes_read as i64)
+                .ok_or(Errno::EOVERFLOW)?;
+            call = call.with_offset(offset);
+        }
+    }
+
+    async fn initialize_procfs_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        contents: Vec<u8>,
+    ) -> Result<(), Error> {
+        let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
+        // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
+        let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
+        let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.initialize_procfs(
+                contents.clone(),
+                virtual_uptime_seconds,
+                virtual_pid,
+                virtual_ppid,
+            );
+        })?;
+        Ok(())
     }
 
     /// SYS_read system call (MAYHANG).
@@ -309,19 +360,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
         if needs_procfs_snapshot {
+            let procfs_offset = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_position())?
+                .expect("procfs snapshot state disappeared")
+                .1;
+            if procfs_offset != 0 {
+                guest
+                    .inject(
+                        syscalls::Lseek::new()
+                            .with_fd(call.fd())
+                            .with_offset(0)
+                            .with_whence(Whence::SEEK_SET),
+                    )
+                    .await?;
+            }
             let contents = self.snapshot_procfs(guest, call).await?;
-            let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
-            // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
-            let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
-            let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.initialize_procfs(
-                    contents.clone(),
-                    virtual_uptime_seconds,
-                    virtual_pid,
-                    virtual_ppid,
-                );
-            })?;
+            self.initialize_procfs_snapshot(guest, call.fd(), contents)
+                .await?;
         }
 
         let procfs_bytes = guest
@@ -394,6 +450,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(res);
         }
 
+        let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+        let needs_procfs_snapshot = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
+        if needs_procfs_snapshot {
+            let contents = self.snapshot_procfs_pread(guest, call).await?;
+            self.initialize_procfs_snapshot(guest, call.fd(), contents)
+                .await?;
+        }
+
+        let procfs_bytes = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.take_procfs_at(call.len(), offset))?;
+        if let Some(bytes) = procfs_bytes {
+            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+            guest.memory().write_exact(remote_buf, &bytes)?;
+            return Ok(bytes.len() as i64);
+        }
+
         let (fd_type, resource) = guest
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
@@ -421,6 +496,43 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         resource_release_all(guest).await;
         res
+    }
+
+    /// Seek within a deterministic procfs snapshot or forward ordinary seeks.
+    pub async fn handle_lseek<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Lseek,
+    ) -> Result<i64, Error> {
+        let procfs_position = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
+
+        if let Some((false, current, Some(length))) = procfs_position {
+            let base = match call.whence() {
+                Whence::SEEK_SET => 0,
+                Whence::SEEK_CUR => current as i128,
+                Whence::SEEK_END => length as i128,
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            let position = base + call.offset() as i128;
+            if !(0..=i64::MAX as i128).contains(&position) {
+                return Err(Errno::EINVAL.into());
+            }
+            let position = position as usize;
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(position))?;
+            return Ok(position as i64);
+        }
+
+        let result = self.record_or_replay(guest, call).await?;
+        if procfs_position.is_some() {
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(result as usize))?;
+        }
+        Ok(result)
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its

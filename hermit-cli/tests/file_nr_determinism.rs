@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 #[test]
-fn file_nr_consumers_verify() {
+fn file_nr_consumers_verify_under_ptrace() {
     assert!(
         Path::new("/proc/sys/fs/file-nr").is_file(),
         "/proc/sys/fs/file-nr is required"
@@ -61,6 +61,23 @@ fn file_nr_consumers_verify() {
             name: "cut file-nr allocation",
             candidates: &["/usr/bin/cut", "/bin/cut"],
             args: &["-f1", "/proc/sys/fs/file-nr"],
+        },
+        ProgramCase {
+            name: "awk file-nr and file-max relation",
+            candidates: &["/usr/bin/awk", "/bin/awk"],
+            args: &[
+                "NR == 1 { maximum = $3; next } { exit ($1 == maximum ? 0 : 1) }",
+                "/proc/sys/fs/file-nr",
+                "/proc/sys/fs/file-max",
+            ],
+        },
+        ProgramCase {
+            name: "python positional and rewound file-nr reads",
+            candidates: &["/usr/bin/python3", "/bin/python3"],
+            args: &[
+                "-c",
+                "import os; expected=b'0\\t0\\t9223372036854775807\\n'; fd=os.open('/proc/sys/fs/file-nr', os.O_RDONLY); alias=os.dup(fd); assert os.pread(fd, len(expected), 0) == expected; assert os.read(fd, len(expected)) == expected; assert os.lseek(alias, 0, os.SEEK_SET) == 0; assert os.read(fd, len(expected)) == expected",
+            ],
         },
     ];
 

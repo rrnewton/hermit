@@ -33,6 +33,7 @@ enum ProcfsKind {
     Schedstat,
     SoftnetStat,
     FileNr,
+    FileMax,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -76,6 +77,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
+            "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -130,8 +132,8 @@ impl ProcfsFile {
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
+            ProcfsKind::FileMax => sanitize_file_max(&contents),
         });
-        self.offset = 0;
     }
 
     /// Returns the next bytes from the normalized snapshot.
@@ -141,6 +143,26 @@ impl ProcfsFile {
         let bytes = contents[self.offset..end].to_vec();
         self.offset = end;
         Some(bytes)
+    }
+
+    /// Returns bytes at a positional offset without changing the shared cursor.
+    pub(crate) fn take_at(&self, maximum: usize, offset: usize) -> Option<Vec<u8>> {
+        let contents = self.contents.as_ref()?;
+        let start = offset.min(contents.len());
+        let end = start.saturating_add(maximum).min(contents.len());
+        Some(contents[start..end].to_vec())
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+    }
+
+    pub(crate) fn snapshot_len(&self) -> Option<usize> {
+        self.contents.as_ref().map(Vec::len)
     }
 }
 
@@ -474,6 +496,14 @@ fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"9223372036854775807\n".to_vec()
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
@@ -735,6 +765,12 @@ mod tests {
                 .kind,
             ProcfsKind::FileNr
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/file-max"))
+                .unwrap()
+                .kind,
+            ProcfsKind::FileMax
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -883,6 +919,8 @@ malformed buddy row\n"
             b"0\t0\t9223372036854775807\n"
         );
         assert!(sanitize_file_nr(b"").is_empty());
+        assert_eq!(sanitize_file_max(b"1048576\n"), b"9223372036854775807\n");
+        assert!(sanitize_file_max(b"").is_empty());
     }
 
     #[test]
@@ -936,5 +974,9 @@ domain0 SMT 00000003 0 0 0\n"
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
+
+        file.set_offset(0);
+        assert_eq!(file.take_at(9, 9).unwrap(), b"_ctxt_swi");
+        assert_eq!(file.offset(), 0);
     }
 }

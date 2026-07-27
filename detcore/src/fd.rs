@@ -308,6 +308,35 @@ impl DetFd {
             .and_then(|procfs| procfs.take(maximum))
     }
 
+    /// Read a deterministic procfs snapshot without changing its shared offset.
+    pub(crate) fn take_procfs_at(&self, maximum: usize, offset: usize) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.take_at(maximum, offset))
+    }
+
+    /// Return snapshot initialization, cursor, and length state for procfs fds.
+    pub(crate) fn procfs_position(&self) -> Option<(bool, usize, Option<usize>)> {
+        self.description().procfs.as_ref().map(|procfs| {
+            (
+                procfs.needs_snapshot(),
+                procfs.offset(),
+                procfs.snapshot_len(),
+            )
+        })
+    }
+
+    /// Update the shared procfs cursor used by this fd and all of its aliases.
+    pub(crate) fn set_procfs_offset(&self, offset: usize) -> bool {
+        let mut description = self.description();
+        let Some(procfs) = description.procfs.as_mut() else {
+            return false;
+        };
+        procfs.set_offset(offset);
+        true
+    }
+
     /// Cached stat data attached to the backing object.
     pub fn stat(&self) -> Option<DetStat> {
         self.description().stat
