@@ -22,6 +22,28 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    CpuidleCounter,
+}
+
+fn is_cpuidle_counter_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some(counter) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(state) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpuidle) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+
+    let Some(state_index) = state.strip_prefix("state") else {
+        return false;
+    };
+    cpuidle == "cpuidle"
+        && !state_index.is_empty()
+        && state_index.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(counter, "time" | "usage" | "above" | "below" | "rejected")
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -56,6 +78,9 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-935): Review cpuidle counter normalization.
+            other if is_cpuidle_counter_path(Path::new(other)) => ProcfsKind::CpuidleCounter,
             _ => return None,
         };
         Some(Self {
@@ -87,6 +112,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +258,16 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-935): Review cpuidle counter normalization.
+fn sanitize_cpuidle_counter(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -369,6 +405,38 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_dynamic_cpuidle_counters() {
+        for path in [
+            "cpu0/cpuidle/state0/time",
+            "/sys/devices/system/cpu/cpu3/cpuidle/state12/usage",
+            "cpu0/cpuidle/state0/above",
+            "cpu0/cpuidle/state0/below",
+            "cpu0/cpuidle/state0/rejected",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuidleCounter
+            );
+        }
+
+        for path in [
+            "cpu0/cpuidle/state0/name",
+            "cpu0/cpuidle/state0/latency",
+            "cpu0/cpuidle/state0/residency",
+            "cpu0/cpuidle/state/usage",
+            "cpu0/cpuidle/statex/time",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn cpuidle_counter_is_fixed() {
+        assert_eq!(sanitize_cpuidle_counter(b"42496983978\n"), b"0\n");
+        assert!(sanitize_cpuidle_counter(b"").is_empty());
     }
 
     #[test]
