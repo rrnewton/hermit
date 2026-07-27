@@ -556,11 +556,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, resource, raw_ino) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
                     detfd.resource(),
                     detfd.stat().map(|x| x.inode),
                 )
@@ -585,7 +586,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review scalar blocking-pipe completion dispatch.
+            self.execute_blocking_pipe_write(guest, call).await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
