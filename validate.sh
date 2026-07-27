@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=176
-readonly SABRE_COMPAT_TOTAL=176
+readonly SABRE_COMPAT_EXPECTED=178
+readonly SABRE_COMPAT_TOTAL=178
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -329,9 +329,8 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # previously because --strict used to forward unsupported syscalls.
     # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
     # are now measured as ordinary passing rows below.)
+    [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
-    [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
-    [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [top]="live process-table reads differ on the GitHub-hosted runner"
@@ -2690,9 +2689,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#686): Review archive/network envelope growth.
-    # SaBRe measures the six deterministic archive round trips with the same
-    # real workloads as ptrace strict mode. Network rows retain their separate
-    # fail-closed policy, and the other backend ratchets remain independent.
+    # SaBRe measures the deterministic archive and localhost round trips with
+    # the same real workloads as ptrace strict mode. Other backend ratchets
+    # remain independent.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         functional_compatibility_probe gzip-roundtrip /usr/bin/gzip --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2706,10 +2705,10 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe cpio-roundtrip /usr/bin/cpio --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        tally_known_failclosed_probe passed failed known_flaky wget-localhost \
-            functional_compatibility_probe wget-localhost /usr/bin/wget --version
-        tally_known_failclosed_probe passed failed known_flaky curl-localhost \
-            functional_compatibility_probe curl-localhost /usr/bin/curl --version
+        functional_compatibility_probe wget-localhost /usr/bin/wget --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe curl-localhost /usr/bin/curl --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         real_compatibility_probe gzip-roundtrip \
             && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2722,6 +2721,10 @@ function run_compatibility_corpus {
         real_compatibility_probe tar-roundtrip \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         real_compatibility_probe cpio-roundtrip \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe wget-localhost \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        real_compatibility_probe curl-localhost \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     strict_compatibility_probe zip-unzip bash -c \
