@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review live protocol allocation counter normalization.
+            // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -304,7 +304,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/net/protocols field policy.
+// TODO-HUMAN-REVIEW(PR-916): Review the /proc/net/protocols field policy.
 fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
     const HEADER: &[&str] = &[
         "protocol", "size", "sockets", "memory", "press", "maxhdr", "slab", "module",
