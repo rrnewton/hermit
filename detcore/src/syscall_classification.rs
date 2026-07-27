@@ -93,9 +93,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getcpu
         | Sysno::getdents
         | Sysno::getdents64
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-841): Query the logical one-shot ITIMER_REAL state.
-        | Sysno::getitimer
         | Sysno::getrandom
         | Sysno::getrusage
         | Sysno::gettimeofday

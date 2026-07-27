@@ -1701,9 +1701,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
-                Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-857): Virtual NTP query and fixed mutation refusal.
                 Syscall::Adjtimex(s) => {
                     if virtualize_time {
