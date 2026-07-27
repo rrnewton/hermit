@@ -163,3 +163,13 @@ fn proc_entropy_available_is_deterministic() {
             .expect("entropy_avail should be numeric");
     });
 }
+
+#[test]
+fn proc_rtc_uses_the_fixed_virtual_epoch() {
+    assert_deterministic("/proc/driver/rtc", |contents| {
+        let text = std::str::from_utf8(contents).expect("rtc should be UTF-8");
+        assert!(text.contains("rtc_time\t: 23:59:59\n"));
+        assert!(text.contains("rtc_date\t: 2021-12-31\n"));
+        assert!(text.contains("24hr\t\t: "));
+    });
+}
