@@ -1364,7 +1364,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Detcore has no deterministic model for
+            // TODO-HUMAN-REVIEW(PR-851): Detcore has no deterministic model for
             // kcmp resource identity, descriptor access through pidfd_getfd, or
             // pidfd_send_signal delivery. Return the portable feature-absence
             // errno instead of exposing host process state.
