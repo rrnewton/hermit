@@ -27,15 +27,19 @@ mod record;
 mod recorder;
 mod replay;
 mod replayer;
+mod sabre_ptrace;
 mod script;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
@@ -65,6 +69,7 @@ use metadata::Metadata;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
+use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
 pub use reverie::process::Mount;
@@ -436,32 +441,31 @@ impl Backend {
 }
 
 fn sabre_runtime_unavailable_reason() -> Option<String> {
-    for (variable, description) in [
-        ("HERMIT_SABRE_RUNNER", "Reverie SaBRe runner"),
-        ("HERMIT_SABRE_BINARY", "SaBRe executable"),
-        ("HERMIT_SABRE_PLUGIN", "Reverie SaBRe plugin"),
-    ] {
-        let Some(value) = std::env::var_os(variable) else {
-            return Some(format!("set {variable} to the {description} path"));
-        };
-        let path = Path::new(&value);
-        match fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                return Some(format!(
-                    "{variable}={} is not a regular file",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                return Some(format!(
-                    "cannot access {variable}={}: {error}",
-                    path.display()
-                ));
-            }
+    let variable = "HERMIT_SABRE_BINARY";
+    let Some(value) = std::env::var_os(variable) else {
+        return Some("set HERMIT_SABRE_BINARY to the SaBRe executable path".to_owned());
+    };
+    let path = Path::new(&value);
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Some(format!(
+                "{variable}={} is not a regular file",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Some(format!(
+                "cannot access {variable}={}: {error}",
+                path.display()
+            ));
         }
     }
-    None
+    detcore_sabre::runtime_library_path().err().map(|error| {
+        format!(
+            "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
+        )
+    })
 }
 
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
@@ -484,6 +488,107 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     ))
 }
 
+/// Run one command with the Detcore tool executing inside a SaBRe plugin and
+/// the single GlobalState hosted by this Hermit coordinator process.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-pending): Review SaBRe coordinator lifetime and artifact loading.
+async fn run_sabre(
+    mut command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    let sabre = std::env::var_os("HERMIT_SABRE_BINARY")
+        .ok_or_else(|| anyhow!("HERMIT_SABRE_BINARY is not set"))?;
+    let plugin = detcore_sabre::runtime_library_path()
+        .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
+    let program = command.find_program().map_err(|error| {
+        anyhow!(
+            "failed to resolve SaBRe guest executable {:?}: {error}",
+            command.get_program()
+        )
+    })?;
+
+    let socket_dir = tempfile::Builder::new()
+        .prefix("hermit-sabre-rpc-")
+        .tempdir()?;
+    let socket_path = socket_dir.path().join("coordinator.sock");
+    let fallback_ready = Arc::new(AtomicBool::new(false));
+    let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
+    let server = reverie_rpc_transport::RpcServer::bind_with_readiness(
+        &socket_path,
+        global.clone(),
+        config.clone(),
+        fallback_ready.clone(),
+    )
+    .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
+    let server_task = tokio::spawn(async move { server.serve().await });
+
+    command.prepend_args([plugin.as_os_str(), OsStr::new("--"), program.as_os_str()]);
+    command.program(&sabre);
+    command.env(detcore_sabre::RPC_SOCKET_ENV, &socket_path);
+    command.env_remove("SABRE_BINARY");
+    command.env_remove("SABRE_PLUGIN");
+
+    tracing::info!(
+        target: "hermit::sabre",
+        guest = %program.display(),
+        plugin = %plugin.display(),
+        socket = %socket_path.display(),
+        "launching Detcore guest through SaBRe with coordinator RPC",
+    );
+
+    let supervised = match sabre_ptrace::run(
+        command.into_std_lossy(),
+        PathBuf::from(&sabre),
+        plugin.clone(),
+        fallback_ready,
+        capture_output,
+    )
+    .await
+    {
+        Ok(supervised) => supervised,
+        Err(error) => {
+            global.force_shutdown_with_error();
+            server_task.abort();
+            let _ = server_task.await;
+            return Err(error);
+        }
+    };
+    if !supervised.status.success() {
+        global.force_shutdown_with_error();
+    }
+    tracing::info!(
+        target: "hermit::sabre::fallback",
+        patched_sites = supervised.patched_sites,
+        "SaBRe ptrace fallback completed",
+    );
+    let output = Output {
+        status: supervised.status.into(),
+        stdout: supervised.stdout,
+        stderr: supervised.stderr,
+    };
+
+    server_task.abort();
+    let _ = server_task.await;
+    for _ in 0..100 {
+        if Arc::strong_count(&global) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let global = Arc::try_unwrap(global).map_err(|global| {
+        anyhow!(
+            "SaBRe coordinator stopped with {} live RPC reference(s)",
+            Arc::strong_count(&global) - 1
+        )
+    })?;
+    global
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
+    Ok(output)
+}
 /// Guest-physical memory available to the single-process KVM personality.
 const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
@@ -651,6 +756,17 @@ async fn run_with_backend_inner(
         .await?
         .status);
     }
+    if backend == Backend::Sabre {
+        return Ok(run_sabre(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            false,
+        )
+        .await?
+        .status);
+    }
     ensure_backend_dispatch(backend)?;
 
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
@@ -711,6 +827,19 @@ async fn run_with_output_backend_inner(
     if backend == Backend::Kvm {
         return run_kvm(
             &command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            true,
+        )
+        .await;
+    }
+    if backend == Backend::Sabre {
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        return run_sabre(
+            command,
             config,
             print_summary,
             print_summary_to_json_file,
