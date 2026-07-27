@@ -680,7 +680,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// The native client must pass a valid writable `scratch` pointer, a live
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
-// TODO-HUMAN-REVIEW(PR-pending): Review compatibility with Reverie's expanded DBI callback ABI.
+// TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -776,7 +776,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// `scratch` must name the initialized parent state, `context` must be its
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
-// TODO-HUMAN-REVIEW(PR-pending): Review register-writer propagation to child registration.
+// TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -920,7 +920,7 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review deferred DBI syscall encoding.
+// TODO-HUMAN-REVIEW(PR-874): Review deferred DBI syscall encoding.
 unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut u64) {
     let (sysno, syscall_args) = syscall.into_parts();
     unsafe { number.write(sysno.id() as i64) };
@@ -944,7 +944,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
-// TODO-HUMAN-REVIEW(PR-pending): Review deferred-syscall and register-writer ABI compatibility.
+// TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,

@@ -225,7 +225,7 @@ fn write_random_chunk(
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Validates seccomp capability probes without installing guest filters.
-    // TODO-HUMAN-REVIEW(PR-pending): Review deterministic seccomp probe validation.
+    // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe validation.
     pub async fn handle_seccomp<G: Guest<Self>>(
         &self,
         _guest: &mut G,
