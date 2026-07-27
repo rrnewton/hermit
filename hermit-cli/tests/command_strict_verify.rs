@@ -307,7 +307,7 @@ fn identity_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review strict I/O-accounting command coverage.
+// TODO-HUMAN-REVIEW(PR-861): Review strict I/O-accounting command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
 fn io_accounting_commands_are_deterministic_under_strict_verify() {

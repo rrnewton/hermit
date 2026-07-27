@@ -124,7 +124,7 @@ fn proc_self_cmdline_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review deterministic kernel I/O accounting coverage.
+// TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting coverage.
 #[test]
 fn proc_diskstats_uses_synthetic_counters() {
     assert_deterministic("/proc/diskstats", |contents| {
