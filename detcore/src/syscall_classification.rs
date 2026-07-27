@@ -426,7 +426,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // fall back to determinized read/write loops.
         | Sysno::sendfile
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): copy_file_range availability and behavior
+        // TODO-HUMAN-REVIEW(PR-887): copy_file_range availability and behavior
         // depend on the host kernel and filesystem pair. Return fixed ENOSYS so
         // callers take their portable read/write fallback.
         | Sysno::copy_file_range
@@ -1146,7 +1146,7 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD)
+        // TODO-HUMAN-REVIEW(PR-887)
         assert_eq!(
             classify_syscall(Sysno::copy_file_range),
             SyscallClassification::Determinized
