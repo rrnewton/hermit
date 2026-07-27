@@ -25,39 +25,17 @@ if [ ! -f "$HERMIT_REPO/Cargo.toml" ]; then
   exit 1
 fi
 
-# Verify the native build prerequisites BEFORE attempting a cargo build. The
-# Hermit dependency `unwind-sys` runs `pkg-config --libs --cflags
-# libunwind-ptrace` in its build script and panics if the package is missing,
-# which otherwise surfaces as a confusing mid-build failure on a fresh machine.
-require_prereqs() {
-  local missing=()
-  if ! command -v pkg-config >/dev/null 2>&1; then
-    missing+=("pkg-config")
-  else
-    # unwind-sys's build script runs `pkg-config ... libunwind-ptrace` and panics
-    # if that module is absent, so this is the hard, reproducible requirement.
-    pkg-config --exists libunwind-ptrace 2>/dev/null \
-      || missing+=("libunwind-dev (provides the libunwind-ptrace pkg-config module)")
-  fi
-  # liblzma is a documented build dependency but is linked directly (-llzma)
-  # rather than through pkg-config, so accept any of a pkg-config module, a
-  # shared library, or the dev header to avoid false positives.
-  if ! { pkg-config --exists liblzma 2>/dev/null \
-         || ldconfig -p 2>/dev/null | grep -q 'liblzma\.so' \
-         || [ -e /usr/include/lzma.h ]; }; then
-    missing+=("liblzma-dev")
-  fi
-  if [ "${#missing[@]}" -ne 0 ]; then
-    {
-      echo "ERROR: missing build prerequisites: ${missing[*]}"
-      echo "Install them and re-run this demo:"
-      echo "  Debian/Ubuntu: sudo apt install libunwind-dev liblzma-dev pkg-config"
-      echo "  Fedora/CentOS: sudo dnf install libunwind-devel xz-devel pkgconf-pkg-config"
-    } >&2
-    exit 1
-  fi
-}
-require_prereqs
+# Check the native dependencies before Cargo reaches unwind-sys's build script.
+# Keeping this in the Makefile gives fresh machines and every demo the same
+# package names and remediation path.
+if ! command -v make >/dev/null 2>&1; then
+  echo "ERROR: make is required to check the Hermit build dependencies." >&2
+  exit 1
+fi
+if ! make --no-print-directory -s -C "$ROOT" check-deps; then
+  echo "Install the missing packages with: make -C '$ROOT' install-deps" >&2
+  exit 1
+fi
 
 # Build the debug binaries used for the validated record/replay path and
 # source-resolved analyzer output. The release build remains available for
