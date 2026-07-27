@@ -80,7 +80,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::futex
-        // TODO-HUMAN-REVIEW(PR-TBD): Review the futex2 feature-absence boundary.
+        // TODO-HUMAN-REVIEW(PR-852): Review the futex2 feature-absence boundary.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::futex_requeue
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -745,7 +745,7 @@ pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic futex2 ENOSYS refusal set.
+// TODO-HUMAN-REVIEW(PR-852): Deterministic futex2 ENOSYS refusal set.
 /// Detcore models the established `futex(2)` ABI but not futex2's vector waits,
 /// sized values, or requeue rules. Refusing the complete family with `ENOSYS`
 /// matches kernels without the relevant interfaces and directs feature-probing
