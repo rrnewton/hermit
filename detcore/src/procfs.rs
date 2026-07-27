@@ -56,7 +56,7 @@ impl ProcfsFile {
                 ProcfsKind::ScalingCurFreq
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review sysfs telemetry normalization.
+            // TODO-HUMAN-REVIEW(PR-846): Review sysfs telemetry normalization.
             _ if is_block_stat_path(path) => ProcfsKind::BlockStat,
             _ if is_numbered_sysfs_file(
                 path,
@@ -285,7 +285,7 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review zeroed host telemetry snapshots.
+// TODO-HUMAN-REVIEW(PR-846): Review zeroed host telemetry snapshots.
 fn sanitize_numeric_fields(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();

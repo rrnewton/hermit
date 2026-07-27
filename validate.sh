@@ -2097,7 +2097,7 @@ function run_compatibility_corpus {
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         # AUTONOMOUS-BOT-IMPLEMENTED
-        # TODO-HUMAN-REVIEW(PR-TBD): Review normalized host telemetry probes.
+        # TODO-HUMAN-REVIEW(PR-846): Review normalized host telemetry probes.
         strict_compatibility_probe iostat /usr/bin/iostat -d \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe numastat /usr/bin/numastat \
