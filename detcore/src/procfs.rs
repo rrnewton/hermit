@@ -67,6 +67,8 @@ fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
             }
         });
     canonical_uuid && matches!(class, "data" | "metadata" | "system")
+}
+
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
@@ -128,7 +130,7 @@ impl ProcfsFile {
                 ProcfsKind::BtrfsBytesReserved
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host RTC normalization.
+            // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -954,7 +956,7 @@ fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the fixed virtual RTC epoch.
+// TODO-HUMAN-REVIEW(PR-917): Review the fixed virtual RTC epoch.
 fn sanitize_rtc(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
