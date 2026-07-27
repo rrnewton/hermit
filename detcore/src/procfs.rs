@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Smaps,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review per-mapping memory accounting normalization.
+            "/proc/self/smaps" => ProcfsKind::Smaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Smaps => sanitize_smaps(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,140 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/smaps accounting field policy.
+fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
+    const ACCOUNTING_FIELDS: &[&str] = &[
+        "Rss",
+        "Pss",
+        "Pss_Dirty",
+        "Pss_Anon",
+        "Pss_File",
+        "Pss_Shmem",
+        "Shared_Clean",
+        "Shared_Dirty",
+        "Private_Clean",
+        "Private_Dirty",
+        "Referenced",
+        "Anonymous",
+        "KSM",
+        "LazyFree",
+        "AnonHugePages",
+        "ShmemPmdMapped",
+        "FilePmdMapped",
+        "Shared_Hugetlb",
+        "Private_Hugetlb",
+        "Swap",
+        "SwapPss",
+        "Locked",
+    ];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut mapping_count = 0;
+    let mut accounting_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+
+        if is_smaps_mapping_header(body) {
+            mapping_count += 1;
+            normalized.extend_from_slice(body.as_bytes());
+        } else {
+            if mapping_count == 0 {
+                return contents.to_vec();
+            }
+            let Some((label, value)) = body.split_once(':') else {
+                return contents.to_vec();
+            };
+
+            if ACCOUNTING_FIELDS.contains(&label) {
+                if !is_smaps_kilobyte_value(value) {
+                    return contents.to_vec();
+                }
+                normalized.extend_from_slice(label.as_bytes());
+                normalized.extend_from_slice(b":\t0 kB");
+                accounting_count += 1;
+            } else {
+                let valid_static_field = match label {
+                    "Size" | "KernelPageSize" | "MMUPageSize" => is_smaps_kilobyte_value(value),
+                    "THPeligible" | "ProtectionKey" => is_smaps_integer_value(value),
+                    "VmFlags" => value
+                        .split_whitespace()
+                        .all(|flag| flag.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+                    _ => false,
+                };
+                if !valid_static_field {
+                    return contents.to_vec();
+                }
+                normalized.extend_from_slice(body.as_bytes());
+            }
+        }
+
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+
+    if mapping_count == 0 || accounting_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
+fn is_smaps_mapping_header(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some((start, end)) = fields.next().and_then(|range| range.split_once('-')) else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+    else {
+        return false;
+    };
+    let Some(permissions) = fields.next() else {
+        return false;
+    };
+    let permissions = permissions.as_bytes();
+    let valid_permissions = permissions.len() == 4
+        && matches!(permissions[0], b'r' | b'-')
+        && matches!(permissions[1], b'w' | b'-')
+        && matches!(permissions[2], b'x' | b'-')
+        && matches!(permissions[3], b'p' | b's');
+    let valid_offset = fields
+        .next()
+        .is_some_and(|offset| u64::from_str_radix(offset, 16).is_ok());
+    let valid_device = fields.next().is_some_and(|device| {
+        device.split_once(':').is_some_and(|(major, minor)| {
+            u64::from_str_radix(major, 16).is_ok() && u64::from_str_radix(minor, 16).is_ok()
+        })
+    });
+    let valid_inode = fields
+        .next()
+        .is_some_and(|inode| inode.parse::<u64>().is_ok());
+
+    start < end && valid_permissions && valid_offset && valid_device && valid_inode
+}
+
+fn is_smaps_kilobyte_value(value: &str) -> bool {
+    let mut fields = value.split_whitespace();
+    matches!(
+        (fields.next(), fields.next(), fields.next()),
+        (Some(number), Some("kB"), None) if number.parse::<u64>().is_ok()
+    )
+}
+
+fn is_smaps_integer_value(value: &str) -> bool {
+    let mut fields = value.split_whitespace();
+    matches!(
+        (fields.next(), fields.next()),
+        (Some(number), None) if number.parse::<u64>().is_ok()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +478,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Smaps
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +576,48 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn smaps_hides_host_memory_accounting_but_preserves_mapping_metadata() {
+        let contents = b"71000000-71001000 r-xp 00000000 00:00 0\n\
+Size:                  4 kB\n\
+KernelPageSize:        4 kB\n\
+MMUPageSize:           4 kB\n\
+Rss:                   4 kB\n\
+Pss:                   3 kB\n\
+Shared_Clean:          4 kB\n\
+Private_Dirty:         0 kB\n\
+THPeligible:           0\n\
+ProtectionKey:         0\n\
+VmFlags: rd ex mr mw me ac\n";
+
+        assert_eq!(
+            sanitize_smaps(contents),
+            b"71000000-71001000 r-xp 00000000 00:00 0\n\
+Size:                  4 kB\n\
+KernelPageSize:        4 kB\n\
+MMUPageSize:           4 kB\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Shared_Clean:\t0 kB\n\
+Private_Dirty:\t0 kB\n\
+THPeligible:           0\n\
+ProtectionKey:         0\n\
+VmFlags: rd ex mr mw me ac\n"
+        );
+    }
+
+    #[test]
+    fn smaps_leaves_unknown_or_malformed_formats_untouched() {
+        let invalid_counter = b"71000000-71001000 r-xp 00000000 00:00 0\nPss: many kB\n";
+        assert_eq!(sanitize_smaps(invalid_counter), invalid_counter);
+
+        let unknown_field = b"71000000-71001000 r-xp 00000000 00:00 0\nMystery: 1 kB\n";
+        assert_eq!(sanitize_smaps(unknown_field), unknown_field);
+
+        let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
+        assert_eq!(sanitize_smaps(invalid_header), invalid_header);
     }
 
     #[test]
