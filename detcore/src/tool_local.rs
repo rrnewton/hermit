@@ -432,11 +432,9 @@ impl FileMetadata {
         };
         let mut flags = OFlag::from_bits_truncate(status_flags);
         let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
-        if ty == FdType::Pipe {
-            // Detcore creates pipes physically nonblocking for scheduler progress,
-            // while the guest-visible status remains blocking unless requested.
-            flags.remove(OFlag::O_NONBLOCK);
-        }
+        // Discovered descriptors have unknown provenance, so an observed
+        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
+        // pipes are registered when created and do not reach this fallback.
         if fd_flags & libc::FD_CLOEXEC != 0 {
             flags.insert(OFlag::O_CLOEXEC);
         }
@@ -683,7 +681,7 @@ mod file_metadata_tests {
     }
 
     #[test]
-    fn discovered_pipe_keeps_internal_nonblocking_hidden() {
+    fn discovered_pipe_preserves_inherited_nonblocking() {
         let owner = DetTid::from_raw(9);
         let mut fds = [-1; 2];
         assert_eq!(
@@ -701,7 +699,7 @@ mod file_metadata_tests {
             })
             .expect("discovered pipe should be tracked");
 
-        assert_eq!(flags, (false, true));
+        assert_eq!(flags, (true, true));
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
