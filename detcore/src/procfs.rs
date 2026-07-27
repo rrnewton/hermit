@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review fdinfo backing-identity normalization.
+            // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
             other
                 if other.strip_prefix("/proc/self/fdinfo/").is_some_and(|fd| {
                     !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit())
@@ -310,7 +310,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/self/fdinfo field policy.
+// TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
 fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
