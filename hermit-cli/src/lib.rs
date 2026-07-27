@@ -725,7 +725,7 @@ async fn run_sabre(
 // The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
 // for its own ELF mappings, nested RAM, and savevm worker stacks.
 // AUTONOMOUS-BOT-IMPLEMENTED: Match Reverie's three-directory identity map.
-// TODO-HUMAN-REVIEW(impl-kvm-ratchet-17): Review the three-GiB KVM arena size.
+// TODO-HUMAN-REVIEW(PR-896): Review the three-GiB KVM arena size.
 const KVM_GUEST_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
