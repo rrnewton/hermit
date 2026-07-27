@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host scheduler accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
