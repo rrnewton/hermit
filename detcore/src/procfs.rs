@@ -51,6 +51,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
+    NetlinkSockets,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -164,6 +165,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review proc netlink identity normalization.
+            "/proc/net/netlink" => ProcfsKind::NetlinkSockets,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
             // like `lscpu` under `--verify`. These are opened relative to a
@@ -233,6 +237,7 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
+            ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
         });
     }
 
@@ -741,6 +746,90 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review proc netlink identity normalization.
+fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 10] = [
+        "sk", "Eth", "Pid", "Groups", "Rmem", "Wmem", "Dump", "Locks", "Drops", "Inode",
+    ];
+    const ZERO_POINTER: &str = "0000000000000000";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != HEADER.len()
+            || !is_lower_hex(fields[0], 16)
+            || !is_lower_hex(fields[3], 8)
+        {
+            return contents.to_vec();
+        }
+
+        let Some(key) = [
+            parse_decimal(fields[1]),
+            parse_decimal(fields[2]),
+            parse_lower_hex(fields[3]),
+            parse_decimal(fields[4]),
+            parse_decimal(fields[5]),
+            parse_decimal(fields[6]),
+            parse_decimal(fields[7]),
+            parse_decimal(fields[8]),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>() else {
+            return contents.to_vec();
+        };
+        if parse_decimal(fields[9]).is_none() {
+            return contents.to_vec();
+        }
+
+        fields[0] = ZERO_POINTER;
+        fields[9] = "0";
+        rows.push((key, fields.join(" ")));
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for (_, row) in rows {
+        normalized.push_str(&row);
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+fn is_lower_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_lower_hex(field: &str) -> Option<u64> {
+    u64::from_str_radix(field, 16).ok()
+}
+
+fn parse_decimal(field: &str) -> Option<u64> {
+    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
 }
 
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
@@ -1296,6 +1385,13 @@ mod tests {
                 .kind,
             ProcfsKind::DentryState
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/netlink"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NetlinkSockets
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/net/packet")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -1645,6 +1741,20 @@ RAW 1008 0 -1 NI 0 yes kernel y y\n"
     }
 
     #[test]
+    fn netlink_sockets_hide_kernel_identities_and_sort_semantic_rows() {
+        let contents = b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+00000000fedcba98 10 20 00000002 3 4 5 6 7 12346\n\
+000000001234abcd 4 10 00000001 0 0 0 2 0 12345\n";
+
+        assert_eq!(
+            sanitize_netlink_sockets(contents),
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
+0000000000000000 10 20 00000002 3 4 5 6 7 0\n"
+        );
+    }
+
+    #[test]
     fn schedstat_hides_host_scheduler_accounting() {
         let contents = b"version 17\n\
 timestamp 4671819092\n\
@@ -1748,6 +1858,20 @@ x86_Thread_features_locked:\t\n"
             sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
             b"AVX512_elapsed_ms:\tunknown\n"
         );
+    }
+
+    #[test]
+    fn netlink_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode Extra\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n1234 4 10 00000001 0 0 0 2 0 12345\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 zero 12345\n",
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 0 12345 extra\n",
+        ] {
+            assert_eq!(sanitize_netlink_sockets(malformed), malformed);
+        }
     }
 
     #[test]
