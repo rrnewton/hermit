@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review buddy allocator normalization.
+            // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
             "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/buddyinfo field policy.
+// TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
 fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
