@@ -1441,7 +1441,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic SO_COOKIE identities.
+        let deterministic_cookie =
+            if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_COOKIE {
+                let requested_length = call
+                    .optlen()
+                    .map(|length| guest.memory().read_value(length))
+                    .transpose()?;
+                let open_file_id = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.open_file_id())?;
+                Some((open_file_id.deterministic_socket_cookie(), requested_length))
+            } else {
+                None
+            };
+
+        let result = self.record_or_replay(guest, call).await?;
+        if let Some((cookie, Some(requested_length))) = deterministic_cookie
+            && let Some(value) = call.optval()
+        {
+            let bytes = cookie.to_ne_bytes();
+            let write_length = (requested_length as usize).min(bytes.len());
+            guest
+                .memory()
+                .write_exact(value.cast(), &bytes[..write_length])?;
+        }
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
