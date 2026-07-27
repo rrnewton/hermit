@@ -299,7 +299,8 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=187
+# Current main's 187-row strict corpus plus lsirq, mpstat-softirqs, and lsmod.
+readonly STRICT_COMPAT_TOTAL=190
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
