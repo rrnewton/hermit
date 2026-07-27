@@ -1296,11 +1296,18 @@ mod tests {
             );
         }
 
+        let reserved_path = format!("/sys/fs/btrfs/{UUID}/allocation/data/bytes_reserved");
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(&reserved_path))
+                .unwrap()
+                .kind,
+            ProcfsKind::BtrfsBytesReserved
+        );
+
         for path in [
             "/sys/fs/btrfs/63152D54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
             "/sys/fs/btrfs/not-a-uuid/allocation/data/bytes_pinned",
             "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/global/bytes_pinned",
-            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_reserved",
             "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned/extra",
             "/tmp/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
         ] {
