@@ -1306,23 +1306,6 @@ mod tests {
     }
 
     #[test]
-    fn copied_child_refuses_socket_timestamp_exposure_under_strict() {
-        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
-
-        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl), 1);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmsg), 1);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmmsg), 1);
-
-        COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl), 0);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmsg), 0);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmmsg), 0);
-
-        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
-    }
-
-    #[test]
     fn getrandom_flag_validation_matches_detcore_policy() {
         for flags in [
             0,
@@ -1490,6 +1473,9 @@ mod tests {
             libc::SYS_keyctl,
             libc::SYS_add_key,
             libc::SYS_request_key,
+            libc::SYS_ioctl,
+            libc::SYS_recvmsg,
+            libc::SYS_recvmmsg,
         ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
@@ -1509,7 +1495,14 @@ mod tests {
         // while unconditional fixed-error families still fail closed because
         // the copied-child ABI cannot inject their deterministic errno.
         COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
-        for sysnum in [libc::SYS_splice, libc::SYS_keyctl, libc::SYS_read] {
+        for sysnum in [
+            libc::SYS_splice,
+            libc::SYS_keyctl,
+            libc::SYS_ioctl,
+            libc::SYS_recvmsg,
+            libc::SYS_recvmmsg,
+            libc::SYS_read,
+        ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
                 0,
