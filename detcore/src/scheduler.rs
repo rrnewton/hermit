@@ -274,6 +274,9 @@ pub struct Scheduler {
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
 
+    /// Child-TID futexes whose kernel clear may still be racing a guest join.
+    cleared_child_tids: HashMap<FutexID, DetTid>,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -895,6 +898,7 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            cleared_child_tids: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1249,6 +1253,7 @@ impl Scheduler {
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
     pub fn wake_futex_child_cleartid(&mut self, futid: FutexID, dettid: DetTid) {
+        self.cleared_child_tids.insert(futid, dettid);
         debug!(
             "simulate CLONE_CHILD_CLEARTID on futex {:?}, wake one",
             futid
@@ -1256,6 +1261,15 @@ impl Scheduler {
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
         self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review late CLONE_CHILD_CLEARTID wait recovery.
+    /// Whether a futex word still names the child that was logically cleared.
+    pub(crate) fn child_tid_was_cleared(&self, futid: FutexID, observed: i32) -> bool {
+        self.cleared_child_tids
+            .get(&futid)
+            .is_some_and(|dettid| dettid.as_raw() == observed)
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
