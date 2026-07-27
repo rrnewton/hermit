@@ -122,7 +122,7 @@ pub struct RunOpts {
 
     /// Override the processor-specific PMU skid margin, in retired conditional branches. Larger
     /// values schedule the overflow interrupt earlier and can increase single-stepping overhead.
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the ptrace PMU skid-margin CLI override.
+    // TODO-HUMAN-REVIEW(PR-991): Review the ptrace PMU skid-margin CLI override.
     #[clap(long, value_name = "RCBS")]
     skid_margin: Option<u64>,
 
