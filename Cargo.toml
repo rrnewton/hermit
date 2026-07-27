@@ -18,3 +18,14 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie" }
+reverie-dbi = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-dbi" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-liteinst" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-process" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-ptrace" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/reverie-syscalls" }
+safeptrace = { path = "/home/newton/work/dev-hermit/worktrees/slot270/reverie/safeptrace" }
