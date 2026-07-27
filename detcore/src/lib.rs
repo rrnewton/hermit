@@ -1358,7 +1358,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review the futex2 fallback contract.
+            // TODO-HUMAN-REVIEW(PR-852): Review the futex2 fallback contract.
             // Detcore models legacy futex but not the newer vector/sized futex2
             // ABI. Match a kernel without futex2 so runtimes take their
             // established legacy-futex fallback without consulting the host.
