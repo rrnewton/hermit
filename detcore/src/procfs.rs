@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Fdinfo,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,15 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review fdinfo backing-identity normalization.
+            other
+                if other.strip_prefix("/proc/self/fdinfo/").is_some_and(|fd| {
+                    !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit())
+                }) =>
+            {
+                ProcfsKind::Fdinfo
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +97,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +309,31 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/self/fdinfo field policy.
+fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with("mnt_id:") {
+            normalized.extend_from_slice(b"mnt_id:\t0");
+        } else if body.starts_with("ino:") {
+            normalized.extend_from_slice(b"ino:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +376,14 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/fdinfo/17"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Fdinfo
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/stdin")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -430,6 +474,24 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn fdinfo_hides_backing_identity_only() {
+        let contents = b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t16368\n\
+ino:\t47761541\n\
+eventfd-count: 0000000000000007\n";
+
+        assert_eq!(
+            sanitize_fdinfo(contents),
+            b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t0\n\
+ino:\t0\n\
+eventfd-count: 0000000000000007\n"
         );
     }
 
