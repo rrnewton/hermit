@@ -17,6 +17,25 @@ struct ProgramCase {
     args: &'static [&'static str],
 }
 
+const POSITIONAL_READ_CHECK: &str = r#"
+import os
+
+expected = b"0\t0\t9223372036854775807\n"
+fd = os.open("/proc/sys/fs/file-nr", os.O_RDONLY)
+assert os.read(fd, 4) == expected[:4]
+assert os.lseek(fd, 0, os.SEEK_SET) == 0
+assert os.read(fd, 128) == expected
+assert os.pread(fd, 128, 0) == expected
+os.close(fd)
+
+fd = os.open("/proc/sys/fs/file-nr", os.O_RDONLY)
+assert os.pread(fd, 128, 0) == expected
+os.close(fd)
+
+with open("/proc/sys/fs/file-max", "rb") as file_max:
+    assert file_max.read() == expected.split(b"\t")[2]
+"#;
+
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
     let output = command
@@ -46,6 +65,10 @@ fn file_nr_consumers_verify() {
         Path::new("/proc/sys/fs/file-nr").is_file(),
         "/proc/sys/fs/file-nr is required"
     );
+    assert!(
+        Path::new("/proc/sys/fs/file-max").is_file(),
+        "/proc/sys/fs/file-max is required"
+    );
     let cases = [
         ProgramCase {
             name: "cat file-nr",
@@ -61,6 +84,11 @@ fn file_nr_consumers_verify() {
             name: "cut file-nr allocation",
             candidates: &["/usr/bin/cut", "/bin/cut"],
             args: &["-f1", "/proc/sys/fs/file-nr"],
+        },
+        ProgramCase {
+            name: "file-nr positional reads and paired maximum",
+            candidates: &["/usr/bin/python3", "/bin/python3"],
+            args: &["-c", POSITIONAL_READ_CHECK],
         },
     ];
 
