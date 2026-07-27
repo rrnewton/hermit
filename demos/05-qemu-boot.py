@@ -16,6 +16,7 @@ from demo_common import (  # noqa: E402
     acquire_demo_lock,
     banner,
     canonicalize_qcow2_snapshot_timestamp,
+    check_dependencies,
     compare_runs,
     copy_file,
     extract_info_tail,
@@ -62,13 +63,18 @@ def snapshot_exists(path: Path, name: str) -> bool:
 
 
 def main() -> int:
-    print_header(DEMO_LABEL)
-    print("Hermit boots QEMU/Linux, streams the serial console, saves a live snapshot,")
-    print("and compares every repeat run with the first metadata anchor.")
-
     os.environ["HERMIT_RELEASE"] = str(HERMIT)
     os.environ["QEMU_BIN"] = QEMU
-    run_checked(["make", "--no-print-directory", "-s", "build"], cwd=ROOT)
+    dependency = check_dependencies(ROOT)
+    print_header(
+        DEMO_LABEL,
+        (
+            "Hermit boots QEMU/Linux, streams the serial console, saves a live snapshot,",
+            "and compares every repeat run with the first metadata anchor.",
+        ),
+        dependency,
+    )
+    run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     banner("Verify QEMU kernel and initramfs")
     run_checked([str(DEMO_DIR / "lib/qemu-assets.sh")], cwd=ROOT)
     if not HERMIT.is_file() or not os.access(str(HERMIT), os.X_OK):
@@ -211,7 +217,7 @@ def main() -> int:
             )
         else:
             passed, report = compare_runs(anchor, current)
-            print_comparison(passed, report)
+            print_comparison(passed, report, current["qcow2_sha256"], "Boot")
         print(
             "Run metadata: {}".format((run_dir / "run-metadata.json").relative_to(ROOT))
         )
