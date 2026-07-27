@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    ArchStatus,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review AVX-512 elapsed-time normalization.
+            "/proc/self/arch_status" => ProcfsKind::ArchStatus,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,33 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/self/arch_status field policy.
+fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let elapsed = body
+            .strip_prefix("AVX512_elapsed_ms:")
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok());
+        if elapsed.is_some() {
+            normalized.extend_from_slice(b"AVX512_elapsed_ms:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +371,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/arch_status"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ArchStatus
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -430,6 +468,24 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn arch_status_uses_logical_avx512_elapsed_time() {
+        let contents = b"AVX512_elapsed_ms:\t48\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n";
+
+        assert_eq!(
+            sanitize_arch_status(contents),
+            b"AVX512_elapsed_ms:\t0\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n"
+        );
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
+            b"AVX512_elapsed_ms:\tunknown\n"
         );
     }
 
