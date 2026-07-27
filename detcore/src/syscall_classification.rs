@@ -411,7 +411,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::process_vm_writev
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink identity virtualization.
+        // TODO-HUMAN-REVIEW(PR-972): Review proc-fd readlink identity virtualization.
         | Sysno::readlink
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readlinkat

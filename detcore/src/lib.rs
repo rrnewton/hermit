@@ -693,7 +693,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::open,
                 Sysno::creat,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink subscriptions.
+                // TODO-HUMAN-REVIEW(PR-972): Review proc-fd readlink subscriptions.
                 Sysno::readlink,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Sysno::readlinkat,
@@ -1522,7 +1522,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink dispatch.
+                // TODO-HUMAN-REVIEW(PR-972): Review proc-fd readlink dispatch.
                 Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,

@@ -227,7 +227,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review proc-fd readlink identity virtualization.
+    // TODO-HUMAN-REVIEW(PR-972): Review proc-fd readlink identity virtualization.
     async fn normalize_proc_fd_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -257,7 +257,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review readlink forwarding and output normalization.
+    // TODO-HUMAN-REVIEW(PR-972): Review readlink forwarding and output normalization.
     /// Forward `readlink` and normalize kernel identities in canonical proc-fd targets.
     pub async fn handle_readlink<G: Guest<Self>>(
         &self,
@@ -271,7 +271,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review readlinkat forwarding and output normalization.
+    // TODO-HUMAN-REVIEW(PR-972): Review readlinkat forwarding and output normalization.
     /// Forward `readlinkat` and normalize kernel identities in canonical proc-fd targets.
     pub async fn handle_readlinkat<G: Guest<Self>>(
         &self,
