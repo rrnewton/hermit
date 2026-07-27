@@ -80,7 +80,7 @@ impl ProcfsFile {
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host memory-zone accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
             "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
