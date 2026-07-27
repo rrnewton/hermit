@@ -60,7 +60,9 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=off", "run", "--strict", "--verify"])
+        .arg(format!("--env=HOME={}", home.path().display()))
+        .arg("--")
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
