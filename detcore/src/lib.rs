@@ -1909,13 +1909,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
-                // recvmsg and shares its NonblockableSyscall impl. Route it
-                // through handle_sendrecv like the other datagram syscalls: the
-                // fd is made temporarily nonblocking, the kernel fills the
-                // mmsghdr array atomically, and the Detcore scheduler owns any
-                // blocking, so the timeout argument (deliberately ignored, see
-                // helpers.rs) does not introduce nondeterminism.
-                Syscall::Recvmmsg(s) => self.handle_sendrecv(guest, s).await,
+                // recvmsg and shares its NonblockableSyscall impl. The fd is made
+                // temporarily nonblocking, the kernel fills the mmsghdr array
+                // atomically, and the Detcore scheduler owns any blocking, so the
+                // timeout argument (deliberately ignored, see helpers.rs) does not
+                // introduce nondeterminism.
+                // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
+                Syscall::Recvmmsg(s) => self.handle_recvmmsg(guest, s).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
