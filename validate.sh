@@ -299,8 +299,8 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# Current main's 191-row strict corpus plus numastat, numactl, sensors, and
-# vmstat process accounting.
+# Current main's 191-row strict corpus plus numastat, numactl,
+# sensors-version, and vmstat process accounting.
 readonly STRICT_COMPAT_TOTAL=195
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
@@ -2955,7 +2955,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numactl-hardware /usr/bin/numactl --hardware \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sensors /usr/bin/sensors \
+    # Bare `sensors` exits 1 when the runner has no physical sensor devices.
+    strict_compatibility_probe sensors-version /usr/bin/sensors --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ps /usr/bin/ps aux \
         && passed=$((passed + 1)) || failed=$((failed + 1))
