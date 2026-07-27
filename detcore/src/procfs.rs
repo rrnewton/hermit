@@ -90,7 +90,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
             "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review live protocol allocation counter normalization.
+            // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -737,7 +737,7 @@ fn zero_decimal_runs(text: &str) -> String {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/net/protocols field policy.
+// TODO-HUMAN-REVIEW(PR-916): Review the /proc/net/protocols field policy.
 fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
     const HEADER: &[&str] = &[
         "protocol", "size", "sockets", "memory", "press", "maxhdr", "slab", "module",
