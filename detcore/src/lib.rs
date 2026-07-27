@@ -1467,7 +1467,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Refuse unmodeled host-kernel probes
+            // TODO-HUMAN-REVIEW(PR-847): Refuse unmodeled host-kernel probes
             // with a fixed ENOSYS so guest behavior does not depend on BPF/LSM
             // configuration or mutable page-cache state.
             SyscallClassification::Determinized if is_host_kernel_probe_syscall(call.number()) => {

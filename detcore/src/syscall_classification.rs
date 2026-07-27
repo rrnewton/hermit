@@ -398,7 +398,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // fall back to determinized read/write loops.
         | Sysno::sendfile
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for host-kernel
+        // TODO-HUMAN-REVIEW(PR-847): Deterministic ENOSYS for host-kernel
         // feature and state probes that Detcore does not model. BPF operations
         // depend on kernel configuration, capabilities, and security policy;
         // cachestat exposes mutable host page-cache residency; and
@@ -871,7 +871,7 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic host-kernel probe refusal set.
+// TODO-HUMAN-REVIEW(PR-847): Deterministic host-kernel probe refusal set.
 /// Host feature and mutable-state probes that Detcore deliberately presents as
 /// unavailable. Forwarding these would expose kernel BPF support and security
 /// policy, live page-cache residency, or the host LSM stack. A fixed `ENOSYS`
