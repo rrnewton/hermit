@@ -56,7 +56,7 @@ impl ProcfsFile {
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host pressure accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
             "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
                 ProcfsKind::Pressure
             }
