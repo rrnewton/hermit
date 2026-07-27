@@ -361,6 +361,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic
+        // feature-absence boundary for legacy nonlinear memory mappings.
+        | Sysno::remap_file_pages
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
         // unprivileged-sandbox syscalls (landlock_create_ruleset,
         // landlock_add_rule, landlock_restrict_self). Landlock is an LSM whose
@@ -654,7 +658,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
-        | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::sched_setattr
@@ -847,6 +850,22 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic feature-absence
+// boundary for legacy nonlinear memory mappings.
+/// The obsolete `remap_file_pages` interface creates nonlinear VMA layouts
+/// whose availability and implementation vary by host kernel. Detcore does not
+/// model page-offset remapping, so it exposes the fixed `ENOSYS` result used by
+/// kernels without the legacy interface. Callers can use the documented `mmap`
+/// fallback without importing host VMA behavior into a deterministic run.
+pub(crate) const fn is_remap_file_pages_enosys_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::remap_file_pages
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS refusal set.
 /// The Landlock unprivileged-sandbox syscalls (`landlock_create_ruleset`,
 /// `landlock_add_rule`, `landlock_restrict_self`). Landlock is an LSM whose
@@ -918,7 +937,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [232, 91, 50]);
+        assert_eq!(counts, [233, 91, 49]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1392,6 +1411,23 @@ mod tests {
                 is_process_isolation_refused_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} process-isolation helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn remap_file_pages_is_deterministically_unavailable() {
+        assert_eq!(
+            classify_syscall(Sysno::remap_file_pages),
+            SyscallClassification::Determinized
+        );
+        assert!(is_remap_file_pages_enosys_syscall(Sysno::remap_file_pages));
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_remap_file_pages_enosys_syscall(sysno),
+                sysno == Sysno::remap_file_pages,
+                "{sysno:?} remap-file-pages helper membership is inconsistent"
             );
         }
     }
