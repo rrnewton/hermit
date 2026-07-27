@@ -202,7 +202,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // handle_listen/handle_setsockopt (KVM ratchet round 12).
         | Sysno::shutdown
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-pending): Review deterministic seccomp probe
+        // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe
         // validation. Hermit returns Linux argument-validation errors for
         // capability probes but refuses real filters because they can block
         // ptrace-runtime syscall injection.
