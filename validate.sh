@@ -308,8 +308,8 @@ readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=191
-readonly SABRE_COMPAT_TOTAL=191
+readonly SABRE_COMPAT_EXPECTED=197
+readonly SABRE_COMPAT_TOTAL=197
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -3024,6 +3024,28 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe crc32 bash -c \
             'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf "Hermit\n" >"$f"; sum=$(/usr/bin/crc32 "$f"); test "$sum" = 146f43bb; printf "crc32:%s\n" "$sum"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#845): Review the functional system utility rows.
+        # Expand command substitutions and temporary paths inside the guest.
+        # shellcheck disable=SC2016
+        strict_compatibility_probe uuidgen bash -c \
+            'set -euo pipefail; value=$(/usr/bin/uuidgen --random); [[ $value =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; printf "uuidgen:%s\n" "$value"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe shred bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf seed >"$f"; /usr/bin/shred -n 1 -z -s 4096 "$f"; test "$(stat -c %s "$f")" = 4096; /usr/bin/cmp -n 4096 "$f" /dev/zero; printf "shred:4096-zeroed\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe sync bash -c \
+            'set -euo pipefail; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; printf "sync-payload\n" >"$f"; /usr/bin/sync -f "$f"; test "$(cat "$f")" = sync-payload; printf "sync:file-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe pathchk bash -c \
+            'set -euo pipefail; /usr/bin/pathchk -p alpha/beta_42; component=$(printf "%015d" 0 | /usr/bin/tr 0 x); ! /usr/bin/pathchk -p "$component" >/dev/null 2>&1; printf "pathchk:portable-limit-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe namei bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; mkdir "$d/real"; touch "$d/real/file"; ln -s real "$d/link"; /usr/bin/namei -m "$d/link/file" >"$d/output"; /usr/bin/grep -Fxq " lrwxrwxrwx link -> real" "$d/output"; /usr/bin/grep -Fxq " -rw-r--r-- file" "$d/output"; printf "namei:symlink-path-ok\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe getconf bash -c \
+            'set -euo pipefail; page=$(/usr/bin/getconf PAGESIZE); bits=$(/usr/bin/getconf LONG_BIT); test "$page:$bits" = 4096:64; printf "getconf:page=%s:long=%s\n" "$page" "$bits"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
