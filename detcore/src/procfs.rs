@@ -22,6 +22,37 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    BtrfsBytesPinned,
+}
+
+// TODO-HUMAN-REVIEW(PR-id): Review Btrfs pinned-space path recognition.
+fn is_btrfs_bytes_pinned_path(path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix("/sys/fs/btrfs") else {
+        return false;
+    };
+    let mut components = relative.iter();
+    let (Some(uuid), Some("allocation"), Some(class), Some("bytes_pinned"), None) = (
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next(),
+    ) else {
+        return false;
+    };
+
+    is_btrfs_uuid(uuid) && matches!(class, "data" | "metadata" | "system")
+}
+
+fn is_btrfs_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -56,6 +87,9 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review Btrfs pinned-space normalization.
+            other if is_btrfs_bytes_pinned_path(Path::new(other)) => ProcfsKind::BtrfsBytesPinned,
             _ => return None,
         };
         Some(Self {
@@ -87,6 +121,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +267,22 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review Btrfs bytes_pinned normalization.
+fn sanitize_btrfs_bytes_pinned(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -369,6 +420,44 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_btrfs_pinned_space_gauges() {
+        const UUID: &str = "63152d54-3f28-408a-80a2-46e53b5c0bda";
+        for class in ["data", "metadata", "system"] {
+            let path = format!("/sys/fs/btrfs/{UUID}/allocation/{class}/bytes_pinned");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::BtrfsBytesPinned
+            );
+        }
+
+        for path in [
+            "/sys/fs/btrfs/63152D54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
+            "/sys/fs/btrfs/not-a-uuid/allocation/data/bytes_pinned",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/global/bytes_pinned",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_reserved",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned/extra",
+            "/tmp/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn btrfs_pinned_space_gauge_is_fixed() {
+        assert_eq!(sanitize_btrfs_bytes_pinned(b"66535424\n"), b"0\n");
+        assert_eq!(sanitize_btrfs_bytes_pinned(b"66535424"), b"0");
+        for malformed in [
+            b"".as_slice(),
+            b"-1\n",
+            b"123 456\n",
+            b"123\n\n",
+            b"unknown\n",
+        ] {
+            assert_eq!(sanitize_btrfs_bytes_pinned(malformed), malformed);
+        }
     }
 
     #[test]
