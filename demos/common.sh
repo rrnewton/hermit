@@ -8,8 +8,9 @@
 # The demos deliberately disable CPUID virtualization and PMU timer preemption
 # so the short examples also run on hosts without those features. CPUID is
 # therefore a host input in these commands, and CPU-bound guests receive fewer
-# preemption opportunities. The schedule-bisection demo is the exception and
-# does require user-accessible CPU performance counters.
+# preemption opportunities. The schedule-bisection demo uses the same portable
+# syscall-boundary mode by default and offers precise PMU preemption as an
+# explicit opt-in.
 
 set -euo pipefail
 
