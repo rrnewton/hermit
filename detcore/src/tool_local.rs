@@ -86,7 +86,7 @@ pub struct FileMetadata {
 /// Detcore records arming against virtual time and schedules supported
 /// `SIGEV_SIGNAL` notifications through the deterministic scheduler.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#869)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PosixTimer {
     /// Reload interval for periodic timers, in nanoseconds (0 => one-shot).
@@ -115,7 +115,7 @@ pub struct PosixTimers {
 
 impl PosixTimers {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Allocate a new (disarmed) timer, returning its deterministic id.
     pub(crate) fn create(&mut self, signal: Option<i32>) -> i32 {
         let id = self.next_id;
@@ -169,7 +169,7 @@ impl PosixTimers {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub(crate) fn signal(&self, id: i32) -> Option<Option<i32>> {
         self.timers.get(&id).map(|timer| timer.signal)
     }
@@ -513,7 +513,7 @@ mod posix_timers_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     #[test]
     fn periodic_remaining_advances_past_each_deadline() {
         let mut timers = PosixTimers::default();

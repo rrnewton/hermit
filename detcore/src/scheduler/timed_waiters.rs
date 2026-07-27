@@ -30,7 +30,7 @@ pub struct TimedEvents {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#869)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SignalTimerId {
     Alarm(DetPid),
@@ -84,7 +84,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     fn insert_signal_timer(
         &mut self,
         id: SignalTimerId,
@@ -114,7 +114,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     // Return the last alarm state for this pid, if any.
     pub fn insert_alarm(
         &mut self,
@@ -129,7 +129,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     fn clear_old_signal_timer(&mut self, id: SignalTimerId, old: Option<SignalTimerState>) {
         if let Some(state) = old {
             // The `map` entry may already be gone if the alarm fired (was
@@ -166,7 +166,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub fn insert_posix_timer(
         &mut self,
         ns: LogicalTime,
@@ -180,13 +180,13 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub fn remove_posix_timer(&mut self, dp: DetPid, timer_id: i32) {
         self.remove_signal_timer(SignalTimerId::Posix(dp, timer_id));
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     fn remove_signal_timer(&mut self, id: SignalTimerId) -> Option<SignalTimerState> {
         let old = self.signal_timers.remove(&id);
         self.clear_old_signal_timer(id, old);
@@ -202,7 +202,7 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub fn remove_process_timers(&mut self, dp: DetPid) {
         let ids: Vec<_> = self
             .signal_timers
@@ -224,7 +224,7 @@ impl TimedEvents {
     /// Return the next event if its target time of occurrence is before the supplied time.
     /// Being a "pop", this destructively removes the entry.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub fn pop_if_before(
         &mut self,
         current_time: LogicalTime,
@@ -439,7 +439,7 @@ mod test {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     #[test]
     fn periodic_alarm_rearms_at_its_interval() {
         let mut ev = TimedEvents::default();
@@ -455,7 +455,7 @@ mod test {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     #[test]
     fn posix_timer_does_not_replace_process_alarm() {
         let mut ev = TimedEvents::default();

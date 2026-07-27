@@ -2568,7 +2568,7 @@ impl Scheduler {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     // Returns the logical duration until any previously scheduled alarm, if any (zero otherwise).
     pub fn register_alarm(
         &mut self,
@@ -2598,7 +2598,7 @@ impl Scheduler {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     pub fn register_posix_timer(
         &mut self,
         detpid: DetPid,

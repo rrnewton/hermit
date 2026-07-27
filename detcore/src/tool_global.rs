@@ -584,7 +584,7 @@ impl GlobalTool for GlobalState {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
-            // TODO-HUMAN-REVIEW(PR-TBD)
+            // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let remaining = self
@@ -599,7 +599,7 @@ impl GlobalTool for GlobalState {
                 R::AlarmRemaining(self.sched.lock().unwrap().alarm_remaining(dpid, now))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD)
+            // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
                 self.recv_register_posix_timer(dpid, dtid, timer_id, deadline, interval, sig)
                     .await;
@@ -1224,7 +1224,7 @@ impl GlobalState {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Register an alarm (delayed signal delivery) with the global scheduler.
     pub async fn recv_register_alarm(
         &self,
@@ -1242,7 +1242,7 @@ impl GlobalState {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Register, re-arm, or disarm a POSIX timer in the global scheduler.
     pub async fn recv_register_posix_timer(
         &self,
@@ -1325,12 +1325,12 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Basically performs an alarm syscall, takes a logical duration.
     RegisterAlarm(DetPid, DetTid, LogicalTime, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Register, re-arm, or disarm one POSIX timer.
     RegisterPosixTimer(
         DetPid,
@@ -1387,10 +1387,10 @@ pub enum GlobalResponse {
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     RegisterAlarm((LogicalTime, LogicalTime)),
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     RegisterPosixTimer(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
@@ -1915,7 +1915,7 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#869)
 /// Register an alarm (delayed signal delivery) with the global scheduler.
 /// Returns the logical duration remaining until any previously scheduled alarm.
 pub async fn register_alarm<G, T>(
@@ -1958,7 +1958,7 @@ where
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(#869)
 /// Register, re-arm, or disarm a POSIX timer with the global scheduler.
 pub async fn register_posix_timer<G, T>(
     guest: &mut G,

@@ -112,7 +112,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// Schedule a one-shot or periodic real-time interval timer on Detcore logical time.
     pub async fn handle_setitimer<G: Guest<Self>>(
         &self,

@@ -382,7 +382,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_create: allocate a per-process POSIX timer and hand back a
     /// deterministic id, retaining any scheduler-deliverable signal.
     pub async fn handle_timer_create<G: Guest<Self>>(
@@ -428,7 +428,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_settime: arm or disarm a timer against the deterministic virtual
     /// clock. The old arming is reported through `old_value` when requested.
     pub async fn handle_timer_settime<G: Guest<Self>>(
@@ -535,7 +535,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_delete: destroy a timer created by `timer_create`.
     pub async fn handle_timer_delete<G: Guest<Self>>(
         &self,
