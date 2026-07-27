@@ -307,8 +307,8 @@ readonly RR_COMPAT_EXPECTED=143
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=151
-readonly SABRE_COMPAT_TOTAL=151
+readonly SABRE_COMPAT_EXPECTED=159
+readonly SABRE_COMPAT_TOTAL=159
 readonly E9PATCH_COMPAT_TOTAL=156
 readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
@@ -3996,7 +3996,7 @@ if ((SABRE_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit -p detcore-sabre
     fi
     if ((failures == 0)); then
-        run_check "SaBRe compatibility ratchet (151 programs)" \
+        run_check "SaBRe compatibility ratchet (${SABRE_COMPAT_TOTAL} programs)" \
             run_sabre_compatibility_envelope
     fi
     print_summary
