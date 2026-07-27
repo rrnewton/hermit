@@ -313,6 +313,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fanotify_mark
         | Sysno::settimeofday
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS for host mount
+        // introspection. sysfs exposes the host filesystem-type table, while
+        // statmount/listmount expose host mount IDs and topology. Returning the
+        // pre-feature ENOSYS result keeps guests on portable /proc fallbacks and
+        // avoids leaking changing host namespace state.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::sysfs
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::statmount
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::listmount
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
         // asynchronous and message-passing I/O and IPC interfaces Detcore does
         // not model. Linux native AIO (io_setup/io_destroy/io_submit/io_cancel/
@@ -368,6 +380,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
+        // synchronization and the deterministic seccomp compatibility refusal.
+        // The close_range handler serializes the kernel operation and removes the
+        // same descriptor slots from Detcore's model. Seccomp support is hidden
+        // because installing a guest filter can block the injected syscalls used
+        // by the ptrace runtime, while its capability probes otherwise expose
+        // host-kernel configuration. A fixed ENOSYS presents a stable
+        // kernel-without-seccomp boundary.
+        | Sysno::close_range
+        | Sysno::seccomp
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
+        // The handler serializes destination writes and forwards the copy through
+        // record/replay; unsupported endpoint types receive ENOSYS so callers can
+        // fall back to determinized read/write loops.
+        | Sysno::sendfile
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -585,7 +614,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::bpf
         | Sysno::cachestat
         | Sysno::clock_adjtime
-        | Sysno::close_range
         | Sysno::copy_file_range
         | Sysno::futex_requeue
         | Sysno::futex_wait
@@ -596,7 +624,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_get
         | Sysno::kcmp
         | Sysno::keyctl
-        | Sysno::listmount
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
@@ -621,19 +648,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::sched_setattr
-        | Sysno::seccomp
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
         | Sysno::semtimedop
-        | Sysno::sendfile
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
         | Sysno::splice
-        | Sysno::statmount
-        | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::ustat
@@ -836,6 +859,18 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
+/// Host filesystem and mount-introspection syscalls. `sysfs` reads the
+/// host's filesystem-type table; `statmount` and `listmount` read mount IDs
+/// and topology from the active mount namespace. Neither source is part of a
+/// deterministic guest's modeled state, so forwarding them would expose
+/// changing host data. A fixed `ENOSYS` matches kernels that lack these APIs
+/// and directs feature-probing callers to their portable `/proc` fallbacks.
+pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool {
+    matches!(sysno, Sysno::sysfs | Sysno::statmount | Sysno::listmount)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,7 +887,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [223, 91, 59]);
+        assert_eq!(counts, [229, 91, 53]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -915,6 +950,11 @@ mod tests {
         // Their read/write siblings deliberately remain Unsupported for now.
         for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
+        // Debug batch 184: these real-program blockers must remain on explicit
+        // deterministic paths rather than falling back to strict fail-closed.
+        for sysno in [Sysno::close_range, Sysno::seccomp, Sysno::sendfile] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
@@ -1225,6 +1265,30 @@ mod tests {
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mount_introspection_syscalls_are_determinized_and_consistent() {
+        let refused = [Sysno::sysfs, Sysno::statmount, Sysno::listmount];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_mount_introspection_enosys_syscall(sysno),
+                "{sysno:?} should be in the mount-introspection refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_mount_introspection_enosys_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} mount-introspection helper membership is inconsistent"
+            );
         }
     }
 
