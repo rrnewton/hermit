@@ -136,6 +136,38 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// Returns whether `sysno` is a kernel-keyring syscall (`add_key`,
+/// `request_key`, `keyctl`) that Detcore hides behind a deterministic
+/// `CONFIG_KEYS`-absent boundary under strict mode.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBI-child policy can preserve
+// the same keyring isolation boundary that the reclassification (PR-848) moved
+// out of the Unsupported set.
+pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_kernel_keyring_syscall(sysno)
+}
+
+/// Returns whether Detcore deterministically refuses `sysno` with a fixed
+/// errno in strict mode without consulting the host.
+///
+/// This is the boundary backends that execute guest syscalls outside Detcore's
+/// `handle_syscall_event` dispatcher (the DBI copied-child fast path and the
+/// KVM executor) consult to enforce the same fixed refusal the ptrace path
+/// enforces. It deliberately excludes emulated / no-op / host-forwarding
+/// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
+/// `copy_file_range`), because fail-closing a copied child for those would
+/// diverge from the ptrace path rather than match it.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBI-child deterministic-refusal surface.
+pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_deterministically_refused_syscall(sysno)
+}
+
+/// Returns whether `sysno` is refused only when strict execution is enabled.
+pub fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_strict_only_deterministic_refusal_syscall(sysno)
+}
+
 use tool_local::PosixTimers;
 use tool_local::ProcessCpuTime;
 pub use tool_local::ThreadState;
@@ -158,7 +190,6 @@ use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_host_security_identity_probe_syscall;
-use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -843,6 +874,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 subscription.cpuid();
             }
 
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
+            // with the deterministic-refusal boundary. Even under the performance
+            // opt-in, Detcore MUST still see every syscall it deterministically
+            // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
+            // strict guests execute those syscalls natively against the host,
+            // exactly the leak the DBI copied-child path also had to close.
+            subscription.syscalls(Sysno::iter().filter(|sysno| {
+                syscall_classification::is_deterministically_refused_syscall(*sysno)
+            }));
+
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
             subscription | T::subscriptions(config)
@@ -1388,8 +1430,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
+            // TODO-HUMAN-REVIEW(PR-916): Only fail closed under the strict
+            // (panic-on-unsupported) policy. A non-strict run keeps the pre-848
+            // host pass-through so the guest observes a real working keyring;
+            // this restores the enabled rr `keyctl` compatibility test, whose
+            // guest asserts add_key + keyctl(SETPERM) succeed. Under strict mode
+            // the deterministic ENOSYS boundary is preserved.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
+                if config.panic_on_unsupported_syscalls {
+                    Err(Error::Errno(Errno::ENOSYS))
+                } else {
+                    self.passthrough(guest, call).await
+                }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled
@@ -1604,6 +1656,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
                 // boundary so callers use determinized read/write copying.
                 Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
+                // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
+                // read/pread64/pwrite64/writev.
+                Syscall::Readv(s) => self.handle_readv(guest, s).await,
+                Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
+                Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
+                Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
+                Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
@@ -1611,6 +1670,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
                 Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#775)
+                Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
                 Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
@@ -1624,6 +1686,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
                 Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-912)
+                Syscall::Ioctl(s)
+                    if syscalls::socket_timestamp_ioctl::is_socket_timestamp_ioctl(s) =>
+                {
+                    self.handle_socket_timestamp_ioctl(guest, s).await
+                }
                 Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
                 Syscall::Futex(s) => self.handle_futex(guest, s).await,
 

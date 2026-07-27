@@ -8,7 +8,10 @@
 
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
+use std::collections::BTreeMap;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -27,6 +30,16 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    PtyNr,
+    SelfSched,
+    Fdinfo,
+    AioNr,
+    NumaMaps,
+    SmapsRollup,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
+    ArchStatus,
+    CpuidleCounter,
     Smaps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
@@ -34,6 +47,7 @@ enum ProcfsKind {
     Pressure,
     Buddyinfo,
     Schedstat,
+    SelfSchedstat,
     SoftnetStat,
     FileNr,
     FileMax,
@@ -45,6 +59,88 @@ enum ProcfsKind {
     BtrfsBytesPinned,
     Rtc,
     DentryState,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
+    Swaps,
+    Locks,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
+    ThpCounter,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+    NodeVmstat,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
+    CppcFeedback,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
+    UnixSockets,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback path recognition.
+fn is_cppc_feedback_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some("feedback_ctrs") = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some("acpi_cppc") = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpu) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpu_number) = cpu.strip_prefix("cpu") else {
+        return false;
+    };
+
+    !cpu_number.is_empty() && cpu_number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+const THP_COUNTERS: &[&str] = &[
+    "anon_fault_alloc",
+    "anon_fault_fallback",
+    "anon_fault_fallback_charge",
+    "nr_anon",
+    "nr_anon_partially_mapped",
+    "shmem_alloc",
+    "shmem_fallback",
+    "shmem_fallback_charge",
+    "split",
+    "split_deferred",
+    "split_failed",
+    "swpin",
+    "swpin_fallback",
+    "swpin_fallback_charge",
+    "swpout",
+    "swpout_fallback",
+    "zswpout",
+];
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter path recognition.
+fn is_thp_counter_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some(counter) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(stats) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(size_dir) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+
+    let Some(size_kb) = size_dir
+        .strip_prefix("hugepages-")
+        .and_then(|value| value.strip_suffix("kB"))
+    else {
+        return false;
+    };
+    stats == "stats"
+        && !size_kb.is_empty()
+        && size_kb.bytes().all(|byte| byte.is_ascii_digit())
+        && THP_COUNTERS.contains(&counter)
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -87,6 +183,27 @@ fn is_btrfs_uuid(value: &str) -> bool {
         })
 }
 
+fn is_cpuidle_counter_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some(counter) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(state) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpuidle) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+
+    let Some(state_index) = state.strip_prefix("state") else {
+        return false;
+    };
+    cpuidle == "cpuidle"
+        && !state_index.is_empty()
+        && state_index.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(counter, "time" | "usage" | "above" | "below" | "rejected")
+}
+
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
@@ -98,6 +215,7 @@ pub(crate) struct ProcfsFile {
 impl ProcfsFile {
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let path = normalize_observed_path(path)?;
         let kind = match path.to_str()? {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
@@ -115,8 +233,39 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
+            "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
+            "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+            other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
+            "/proc/self/sched" => ProcfsKind::SelfSched,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
+            other
+                if other.strip_prefix("/proc/self/fdinfo/").is_some_and(|fd| {
+                    !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit())
+                }) =>
+            {
+                ProcfsKind::Fdinfo
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
+            "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
+            "/proc/self/smaps_rollup" => ProcfsKind::SmapsRollup,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
+            "/proc/self/arch_status" => ProcfsKind::ArchStatus,
+            "/proc/swaps" => ProcfsKind::Swaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             "/proc/self/smaps" => ProcfsKind::Smaps,
@@ -133,6 +282,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
+            other if is_process_schedstat_path(other) => ProcfsKind::SelfSchedstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -146,6 +298,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-926): Review kernel lock identity normalization.
+            "/proc/locks" => ProcfsKind::Locks,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-969): Review Btrfs reserved-byte normalization.
             other if is_btrfs_bytes_reserved_path(Path::new(other)) => {
                 ProcfsKind::BtrfsBytesReserved
@@ -153,6 +308,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
+            "/proc/net/unix" => ProcfsKind::UnixSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -165,11 +323,25 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
+            other if is_cppc_feedback_path(Path::new(other)) => ProcfsKind::CppcFeedback,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
+            // `cpuinfo_avg_freq` is another driver-provided live hardware
+            // reading, distinct from the static cpuinfo min/max limits.
+            other if other.ends_with("cpufreq/cpuinfo_avg_freq") => ProcfsKind::ScalingCurFreq,
             other if is_process_io_path(other) => ProcfsKind::ProcessIo,
             other if is_block_stat_path(other) => ProcfsKind::BlockStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-971): Review Btrfs pinned-space normalization.
             other if is_btrfs_bytes_pinned_path(Path::new(other)) => ProcfsKind::BtrfsBytesPinned,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-935): Review cpuidle counter normalization.
+            other if is_cpuidle_counter_path(Path::new(other)) => ProcfsKind::CpuidleCounter,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
+            other if is_thp_counter_path(Path::new(other)) => ProcfsKind::ThpCounter,
             _ => return None,
         };
         Some(Self {
@@ -205,11 +377,21 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::PtyNr => sanitize_pty_nr(&contents),
+            ProcfsKind::SelfSched => sanitize_self_sched(&contents),
+            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
+            ProcfsKind::AioNr => sanitize_aio_nr(&contents),
+            ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
+            ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
+            ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
+            ProcfsKind::Swaps => sanitize_swaps(&contents),
+            ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
+            ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
@@ -221,6 +403,11 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
+            ProcfsKind::Locks => sanitize_locks(&contents),
+            ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
+            ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
+            ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
+            ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
         });
     }
 
@@ -250,12 +437,56 @@ impl ProcfsFile {
     }
 }
 
+fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
 fn is_process_io_path(path: &str) -> bool {
     path == "/proc/self/io"
         || path
             .strip_prefix("/proc/")
             .and_then(|path| path.strip_suffix("/io"))
             .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_process_schedstat_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    let components = relative.split('/').collect::<Vec<_>>();
+    match components.as_slice() {
+        [task, "schedstat"] => is_proc_task_name(task),
+        [process, "task", thread, "schedstat"] => {
+            is_proc_process_name(process) && is_numeric_id(thread)
+        }
+        _ => false,
+    }
+}
+
+fn is_proc_task_name(name: &str) -> bool {
+    matches!(name, "self" | "thread-self") || is_numeric_id(name)
+}
+
+fn is_proc_process_name(name: &str) -> bool {
+    name == "self" || is_numeric_id(name)
+}
+
+fn is_numeric_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_block_stat_path(path: &str) -> bool {
@@ -464,6 +695,7 @@ fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-764)
+// TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
 /// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
 /// instantaneous core frequency is a live hardware reading that varies between
 /// otherwise identical runs, so replace it with a fixed value. This mirrors the
@@ -511,6 +743,56 @@ fn sanitize_btrfs_bytes_pinned(contents: &[u8]) -> Vec<u8> {
     } else {
         b"0".to_vec()
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-935): Review cpuidle counter normalization.
+fn sanitize_cpuidle_counter(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
+fn sanitize_thp_counter(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback counter values.
+fn sanitize_cppc_feedback(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let Ok(text) = std::str::from_utf8(body) else {
+        return contents.to_vec();
+    };
+    let mut fields = text.split_whitespace();
+    let (Some(reference), Some(delivered), None) = (fields.next(), fields.next(), fields.next())
+    else {
+        return contents.to_vec();
+    };
+    let valid_reference = reference
+        .strip_prefix("ref:")
+        .is_some_and(|value| value.parse::<u64>().is_ok());
+    let valid_delivered = delivered
+        .strip_prefix("del:")
+        .is_some_and(|value| value.parse::<u64>().is_ok());
+    if !valid_reference || !valid_delivered {
+        return contents.to_vec();
+    }
+
+    let mut normalized = b"ref:0 del:0".to_vec();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
 }
 
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
@@ -655,6 +937,109 @@ fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-945): Review the zeroed /proc/swaps Used column policy.
+fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut lines = text.split_inclusive('\n');
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    normalized.extend_from_slice(header.as_bytes());
+    for line in lines {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        let [filename, swap_type, size, used, priority] = fields.as_slice() else {
+            return contents.to_vec();
+        };
+        if size.parse::<u64>().is_err()
+            || used.parse::<u64>().is_err()
+            || priority.parse::<i32>().is_err()
+        {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(
+            format!("{filename}\t{swap_type}\t{size}\t0\t{priority}").as_bytes(),
+        );
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
+fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-927): Review the /proc/sys/kernel/pty/nr policy.
+fn sanitize_pty_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+fn is_node_vmstat_path(path: &str) -> bool {
+    let relative = path
+        .strip_prefix("/sys/devices/system/node/")
+        .unwrap_or(path);
+    let Some(node) = relative.strip_suffix("/vmstat") else {
+        return false;
+    };
+    let Some(index) = node.strip_prefix("node") else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-939): Review the zeroed node VM accounting policy.
+fn sanitize_node_vmstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body.split_whitespace();
+        let (Some(name), Some(value), None) = (fields.next(), fields.next(), fields.next()) else {
+            return contents.to_vec();
+        };
+        if value.parse::<u64>().is_err() {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(name.as_bytes());
+        normalized.extend_from_slice(b" 0");
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -689,6 +1074,104 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
+fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 8] = [
+        "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
+    ];
+    const ZERO_NUM: &str = "0000000000000000:";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let Some((mut fields, path)) = unix_socket_fields(line) else {
+            return contents.to_vec();
+        };
+        let Some(num) = fields[0].strip_suffix(':') else {
+            return contents.to_vec();
+        };
+        if !is_fixed_lower_hex(num, 16)
+            || !is_fixed_lower_hex(fields[1], 8)
+            || !is_fixed_lower_hex(fields[2], 8)
+            || !is_fixed_lower_hex(fields[3], 8)
+            || !is_fixed_lower_hex(fields[4], 4)
+            || !is_fixed_lower_hex(fields[5], 2)
+            || !is_decimal(fields[6])
+        {
+            return contents.to_vec();
+        }
+
+        fields[0] = ZERO_NUM;
+        fields[6] = "0";
+        let mut row = fields.join(" ");
+        if !path.is_empty() {
+            row.push(' ');
+            row.push_str(path);
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for row in rows {
+        normalized.push_str(&row);
+        normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+fn unix_socket_fields(line: &str) -> Option<(Vec<&str>, &str)> {
+    const FIELD_COUNT: usize = 7;
+
+    let mut fields = Vec::with_capacity(FIELD_COUNT);
+    let mut remainder = line;
+    while fields.len() < FIELD_COUNT {
+        remainder = remainder.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        if remainder.is_empty() {
+            return None;
+        }
+        let end = remainder
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(remainder.len());
+        fields.push(&remainder[..end]);
+        remainder = &remainder[end..];
+    }
+
+    Some((
+        fields,
+        remainder.trim_start_matches(|character: char| character.is_ascii_whitespace()),
+    ))
+}
+
+fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_decimal(field: &str) -> bool {
+    !field.is_empty()
+        && field.bytes().all(|byte| byte.is_ascii_digit())
+        && field.parse::<u64>().is_ok()
+}
+
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == name)?;
     fields.get(index + 1).cloned()
@@ -702,6 +1185,212 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
         return;
     };
     *field_value = value.to_owned();
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-928): Review the /proc/self/sched field policy.
+fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
+    const FLOAT_FIELDS: &[&str] = &["se.exec_start", "se.vruntime", "se.sum_exec_runtime"];
+    const INTEGER_FIELDS: &[&str] = &[
+        "se.nr_migrations",
+        "nr_switches",
+        "nr_voluntary_switches",
+        "nr_involuntary_switches",
+        "se.avg.load_sum",
+        "se.avg.runnable_sum",
+        "se.avg.util_sum",
+        "se.avg.load_avg",
+        "se.avg.runnable_avg",
+        "se.avg.util_avg",
+        "se.avg.last_update_time",
+        "se.avg.util_est",
+        "clock-delta",
+        "mm->numa_scan_seq",
+        "numa_pages_migrated",
+        "total_numa_faults",
+    ];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut core_fields_seen = [false; 3];
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let Some((left, right)) = body.split_once(':') else {
+            normalized.extend_from_slice(body.as_bytes());
+            if has_newline {
+                normalized.push(b'\n');
+            }
+            continue;
+        };
+        let label = left.trim();
+        let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
+        {
+            let Ok(value) = right.trim().parse::<f64>() else {
+                return contents.to_vec();
+            };
+            if !value.is_finite() || value.is_sign_negative() {
+                return contents.to_vec();
+            }
+            core_fields_seen[index] = true;
+            Some("0.000000")
+        } else if INTEGER_FIELDS.contains(&label) {
+            if right.trim().parse::<u128>().is_err() {
+                return contents.to_vec();
+            }
+            Some("0")
+        } else {
+            None
+        };
+
+        if let Some(value) = replacement {
+            normalized.extend_from_slice(left.as_bytes());
+            normalized.extend_from_slice(b": ");
+            normalized.extend_from_slice(value.as_bytes());
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+
+    if core_fields_seen.iter().all(|seen| *seen) {
+        normalized
+    } else {
+        contents.to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
+fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with("mnt_id:") {
+            normalized.extend_from_slice(b"mnt_id:\t0");
+        } else if body.starts_with("ino:") {
+            normalized.extend_from_slice(b"ino:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
+fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 || u64::from_str_radix(fields[0], 16).is_err() {
+            return contents.to_vec();
+        }
+
+        let mut kept = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(value) = field
+                .strip_prefix("active=")
+                .or_else(|| field.strip_prefix("mapmax="))
+            {
+                if value.parse::<u64>().is_err() {
+                    return contents.to_vec();
+                }
+            } else {
+                kept.push(field);
+            }
+        }
+        normalized.extend_from_slice(kept.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-937): Review the /proc/self/smaps_rollup field policy.
+fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let accounting_label = body.split_once(':').and_then(|(label, value)| {
+            let mut fields = value.split_whitespace();
+            let amount = fields.next()?;
+            (amount.parse::<u64>().is_ok()
+                && fields.next() == Some("kB")
+                && fields.next().is_none())
+            .then_some(label)
+        });
+        if let Some(label) = accounting_label {
+            normalized.extend_from_slice(label.as_bytes());
+            normalized.extend_from_slice(b":\t0 kB");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
+fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let elapsed = body
+            .strip_prefix("AVX512_elapsed_ms:")
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok());
+        if elapsed.is_some() {
+            normalized.extend_from_slice(b"AVX512_elapsed_ms:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -931,6 +1620,24 @@ fn numbered_label(label: &str, prefix: &str) -> bool {
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
+fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields.iter().any(|field| field.parse::<u64>().is_err()) {
+        return contents.to_vec();
+    }
+
+    if text.ends_with('\n') {
+        b"0 0 0\n".to_vec()
+    } else {
+        b"0 0 0".to_vec()
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-909): Review the single-CPU softnet policy.
 /// Exposes Hermit's single virtual CPU and hides host CPU count, hotplug state,
 /// CPU identifiers, and live network backlog counters.
@@ -1053,6 +1760,171 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-926): Review the /proc/locks identity-virtualization policy.
+//
+// `/proc/locks` rows have the shape
+//     `SEQ: [->] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
+// where the leading `SEQ:` is a kernel-global lock counter, `PID` is the owner
+// task, and `MAJOR:MINOR:INODE` identifies the backing object. All three are
+// host-specific and vary run-to-run, and the kernel emits rows in an internal
+// order. A granted lock and the blocked waiters queued behind it share one
+// `SEQ`, and a waiter row is marked with `->`.
+//
+// Rather than collapse every identity to a single constant, derive dense IDs
+// from stable lock semantics. Equal raw values remain equal, distinct objects
+// stay distinct, holder/waiter groups stay adjacent, and raw ID renumbering or
+// row reordering does not change the resulting snapshot. An unknown format
+// fails the complete snapshot closed instead of leaking any raw identities.
+fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Clone)]
+    struct LockRow {
+        sequence: String,
+        waiter: bool,
+        fields: Vec<String>,
+        owner_index: usize,
+        object_index: usize,
+    }
+
+    let mut rows: Vec<LockRow> = Vec::new();
+    for line in text.lines() {
+        let fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let waiter = fields.get(1).is_some_and(|field| field == "->");
+        let details = usize::from(waiter) + 1;
+        let owner_index = details + 3;
+        let object_index = details + 4;
+        let Some(sequence) = fields
+            .first()
+            .and_then(|field| field.strip_suffix(':'))
+            .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
+            return Vec::new();
+        };
+        if fields.len() != details + 7
+            || fields[owner_index].parse::<i64>().is_err()
+            || fields[object_index].split(':').count() != 3
+        {
+            return Vec::new();
+        }
+        rows.push(LockRow {
+            sequence: sequence.to_owned(),
+            waiter,
+            fields,
+            owner_index,
+            object_index,
+        });
+    }
+
+    let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        signature[row.object_index] = "object".to_owned();
+        object_signatures
+            .entry(row.fields[row.object_index].clone())
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut objects = object_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut objects {
+        signatures.sort_unstable();
+    }
+    objects.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let object_ids = objects
+        .into_iter()
+        .enumerate()
+        .map(|(index, (object, _))| (object, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let object_id = object_ids[&row.fields[row.object_index]];
+        row.fields[row.object_index] = format!("00:00:{object_id}");
+    }
+
+    let mut owner_signatures: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner == -1 {
+            continue;
+        }
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        owner_signatures
+            .entry(owner)
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut owners = owner_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut owners {
+        signatures.sort_unstable();
+    }
+    owners.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let owner_ids = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, (owner, _))| (owner, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner != -1 {
+            row.fields[row.owner_index] = owner_ids[&owner].to_string();
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<LockRow>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.sequence.clone()).or_default().push(row);
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    for rows in &mut groups {
+        rows.sort_by(|left, right| {
+            left.waiter
+                .cmp(&right.waiter)
+                .then_with(|| left.fields.cmp(&right.fields))
+        });
+    }
+    groups.sort_by_key(|rows| {
+        rows.iter()
+            .map(|row| {
+                let mut fields = row.fields.clone();
+                fields[0] = "sequence:".to_owned();
+                fields.join(" ")
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let normalized_rows = groups
+        .into_iter()
+        .enumerate()
+        .flat_map(|(sequence, rows)| {
+            rows.into_iter().map(move |mut row| {
+                row.fields[0] = format!("{}:", sequence + 1);
+                row.fields.join(" ")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = normalized_rows.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,6 +1972,56 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/kernel/pty/nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::PtyNr
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/sched"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SelfSched
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/fdinfo/17"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Fdinfo
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/stdin")).is_none());
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::AioNr
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaMaps
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SmapsRollup
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/arch_status"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ArchStatus
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/swaps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Swaps
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/key-users"))
@@ -1186,6 +2108,18 @@ mod tests {
             ProcfsKind::Protocols
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/locks"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Locks
+        );
+        for alias in ["/proc/./locks", "/proc/self/../locks"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(alias)).unwrap().kind,
+                ProcfsKind::Locks
+            );
+        }
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
                 .unwrap()
                 .kind,
@@ -1203,6 +2137,26 @@ mod tests {
                 .kind,
             ProcfsKind::DentryState
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/unix"))
+                .unwrap()
+                .kind,
+            ProcfsKind::UnixSockets
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/net/packet")).is_none());
+        for path in [
+            "/proc/self/schedstat",
+            "/proc/thread-self/schedstat",
+            "/proc/123/schedstat",
+            "/proc/self/task/456/schedstat",
+            "/proc/123/task/456/schedstat",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::SelfSchedstat
+            );
+        }
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -1221,6 +2175,12 @@ mod tests {
             ))
             .unwrap()
             .kind,
+            ProcfsKind::ScalingCurFreq
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_avg_freq"))
+                .unwrap()
+                .kind,
             ProcfsKind::ScalingCurFreq
         );
         // The static min/max limits are deterministic and must not be rewritten.
@@ -1253,9 +2213,68 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_numa_node_vmstat_paths() {
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("node12/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/vmstat")).is_none());
+    }
+
+    #[test]
+    fn node_vmstat_preserves_fields_and_zeros_accounting() {
+        let contents = b"nr_free_pages 3859604\nnuma_hit 197122344154\nnr_writeback 38\n";
+        assert_eq!(
+            sanitize_node_vmstat(contents),
+            b"nr_free_pages 0\nnuma_hit 0\nnr_writeback 0\n"
+        );
+        assert!(sanitize_node_vmstat(b"").is_empty());
+        assert_eq!(
+            sanitize_node_vmstat(b"nr_free_pages unknown\n"),
+            b"nr_free_pages unknown\n"
+        );
+        assert_eq!(
+            sanitize_node_vmstat(b"nr_free_pages 1 extra\n"),
+            b"nr_free_pages 1 extra\n"
+        );
+    }
+
+    #[test]
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn swaps_preserves_configuration_and_zeros_usage() {
+        let contents = b"Filename\tType\tSize\tUsed\tPriority\n\
+/dev/nvme1n1p3 partition 2000892 0 5\n\
+/data/swapvol/swapfile file 134217724 69308912 -2\n";
+        assert_eq!(
+            sanitize_swaps(contents),
+            b"Filename\tType\tSize\tUsed\tPriority\n\
+/dev/nvme1n1p3\tpartition\t2000892\t0\t5\n\
+/data/swapvol/swapfile\tfile\t134217724\t0\t-2\n"
+        );
+        assert!(sanitize_swaps(b"").is_empty());
+        assert_eq!(
+            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"),
+            b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"
+        );
+        assert_eq!(
+            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 unknown\n"),
+            b"Filename Type Size Used Priority\n/swap file 12 unknown\n"
+        );
     }
 
     #[test]
@@ -1348,6 +2367,104 @@ mod tests {
             b"unknown\n",
         ] {
             assert_eq!(sanitize_btrfs_bytes_pinned(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn recognizes_only_dynamic_cpuidle_counters() {
+        for path in [
+            "cpu0/cpuidle/state0/time",
+            "/sys/devices/system/cpu/cpu3/cpuidle/state12/usage",
+            "cpu0/cpuidle/state0/above",
+            "cpu0/cpuidle/state0/below",
+            "cpu0/cpuidle/state0/rejected",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuidleCounter
+            );
+        }
+
+        for path in [
+            "cpu0/cpuidle/state0/name",
+            "cpu0/cpuidle/state0/latency",
+            "cpu0/cpuidle/state0/residency",
+            "cpu0/cpuidle/state/usage",
+            "cpu0/cpuidle/statex/time",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn cpuidle_counter_is_fixed() {
+        assert_eq!(sanitize_cpuidle_counter(b"42496983978\n"), b"0\n");
+        assert!(sanitize_cpuidle_counter(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_per_size_thp_counters() {
+        for counter in THP_COUNTERS {
+            let path = format!("hugepages-2048kB/stats/{counter}");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::ThpCounter
+            );
+        }
+
+        for path in [
+            "hugepages-2048kB/enabled",
+            "hugepages-2048kB/shmem_enabled",
+            "hugepages-2048kB/stats/unknown",
+            "hugepages-kB/stats/nr_anon",
+            "hugepages-2MB/stats/nr_anon",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn thp_counter_is_fixed() {
+        assert_eq!(sanitize_thp_counter(b"37515411\n"), b"0\n");
+        assert!(sanitize_thp_counter(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_numbered_cpu_cppc_feedback() {
+        for path in [
+            "cpu0/acpi_cppc/feedback_ctrs",
+            "/sys/devices/system/cpu/cpu315/acpi_cppc/feedback_ctrs",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CppcFeedback
+            );
+        }
+
+        for path in [
+            "cpu/acpi_cppc/feedback_ctrs",
+            "gpu0/acpi_cppc/feedback_ctrs",
+            "cpu0/acpi_cppc/highest_perf",
+            "cpu0/feedback_ctrs",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn cppc_feedback_counters_are_fixed() {
+        assert_eq!(
+            sanitize_cppc_feedback(b"ref:222494767542210 del:411574706774324\n"),
+            b"ref:0 del:0\n"
+        );
+        assert_eq!(sanitize_cppc_feedback(b"ref:123 del:456"), b"ref:0 del:0");
+        for malformed in [
+            b"ref:abc del:456\n".as_slice(),
+            b"ref:123 delivered:456\n",
+            b"ref:123\n",
+            b"ref:123 del:456 extra\n",
+        ] {
+            assert_eq!(sanitize_cppc_feedback(malformed), malformed);
         }
     }
 
@@ -1463,6 +2580,22 @@ malformed buddy row\n"
         assert!(sanitize_dentry_state(b"").is_empty());
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-933): Review AIO count fixture coverage.
+    #[test]
+    fn aio_nr_hides_host_global_reservations() {
+        assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
+        assert!(sanitize_aio_nr(b"").is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-927): Review PTY count fixture coverage.
+    #[test]
+    fn pty_nr_hides_host_global_allocations() {
+        assert_eq!(sanitize_pty_nr(b"107\n"), b"0\n");
+        assert!(sanitize_pty_nr(b"").is_empty());
+    }
+
     #[test]
     fn sockstat_hides_host_global_allocation_and_memory_counters() {
         let contents = b"sockets: used 41\n\
@@ -1546,6 +2679,24 @@ domain0 SMT 00000003 0 0 0\n"
     }
 
     #[test]
+    fn self_schedstat_hides_host_scheduler_accounting() {
+        assert_eq!(
+            sanitize_self_schedstat(b"3029609 1559338 150\n"),
+            b"0 0 0\n"
+        );
+        assert_eq!(sanitize_self_schedstat(b"3029609 1559338 150"), b"0 0 0");
+    }
+
+    #[test]
+    fn self_schedstat_leaves_unknown_formats_untouched() {
+        let extra_field = b"3029609 1559338 150 4\n";
+        assert_eq!(sanitize_self_schedstat(extra_field), extra_field);
+
+        let invalid_counter = b"3029609 waiting 150\n";
+        assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
+    }
+
+    #[test]
     fn zoneinfo_hides_host_memory_accounting() {
         let contents = b"Node 3, zone    DMA32\n\
   pages free     2816\n\
@@ -1615,6 +2766,223 @@ VmFlags: rd ex mr mw me ac\n"
 
         let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
         assert_eq!(sanitize_smaps(invalid_header), invalid_header);
+    }
+
+    #[test]
+    fn arch_status_uses_logical_avx512_elapsed_time() {
+        let contents = b"AVX512_elapsed_ms:\t48\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n";
+
+        assert_eq!(
+            sanitize_arch_status(contents),
+            b"AVX512_elapsed_ms:\t0\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n"
+        );
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
+            b"AVX512_elapsed_ms:\tunknown\n"
+        );
+    }
+
+    #[test]
+    fn smaps_rollup_hides_physical_page_accounting() {
+        let contents = b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:                2216 kB\n\
+Pss:                 311 kB\n\
+Pss_File:            131 kB\n\
+THPeligible:    0\n";
+
+        assert_eq!(
+            sanitize_smaps_rollup(contents),
+            b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Pss_File:\t0 kB\n\
+THPeligible:    0\n"
+        );
+    }
+
+    #[test]
+    fn numa_maps_hides_host_page_aging_and_sharing_maxima() {
+        let contents = b"71000000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 kernelpagesize_kB=4\n";
+
+        assert_eq!(
+            sanitize_numa_maps(contents),
+            b"71000000 default anon=1 dirty=1 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 N0=41 kernelpagesize_kB=4\n"
+        );
+    }
+
+    #[test]
+    fn numa_maps_leaves_unknown_formats_untouched() {
+        let invalid_address = b"address default anon=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_address), invalid_address);
+
+        let invalid_counter = b"71000000 default active=recent N0=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
+    }
+
+    #[test]
+    fn fdinfo_hides_backing_identity_only() {
+        let contents = b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t16368\n\
+ino:\t47761541\n\
+eventfd-count: 0000000000000007\n";
+
+        assert_eq!(
+            sanitize_fdinfo(contents),
+            b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t0\n\
+ino:\t0\n\
+eventfd-count: 0000000000000007\n"
+        );
+    }
+
+    #[test]
+    fn self_sched_hides_host_scheduler_accounting() {
+        let contents = b"cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n\
+nr_switches : 149\n\
+se.avg.load_avg : 749\n\
+policy : 0\n";
+
+        assert_eq!(
+            sanitize_self_sched(contents),
+            b"cat (3, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n\
+nr_switches : 0\n\
+se.avg.load_avg : 0\n\
+policy : 0\n"
+        );
+    }
+
+    #[test]
+    fn self_sched_leaves_unknown_formats_untouched() {
+        let missing_core_field = b"se.exec_start : 1.0\nse.vruntime : 2.0\n";
+        assert_eq!(sanitize_self_sched(missing_core_field), missing_core_field);
+
+        let invalid_counter = b"se.exec_start : NaN\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n";
+        assert_eq!(sanitize_self_sched(invalid_counter), invalid_counter);
+
+        let negative_counter = b"se.exec_start : 1.0\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n\
+nr_switches : -1\n";
+        assert_eq!(sanitize_self_sched(negative_counter), negative_counter);
+    }
+
+    #[test]
+    fn locks_virtualize_identities_but_preserve_equivalences() {
+        // A holder (seq 74) with a waiter blocked behind it on the same object,
+        // a second lock by the same owner (PID 480) on a *different* object,
+        // and a third lock by a different owner on the *first* object.
+        let contents = b"74: POSIX  ADVISORY  WRITE 480 08:02:1111 0 EOF\n\
+74: -> POSIX  ADVISORY  WRITE 481 08:02:1111 0 EOF\n\
+9: OFDLCK ADVISORY  WRITE 480 08:02:2222 0 EOF\n\
+21: FLOCK ADVISORY  WRITE 999 08:02:1111 0 EOF\n";
+
+        let out = String::from_utf8(sanitize_locks(contents)).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        // No host-specific sequence, PID, or device:inode magnitude survives.
+        assert!(!out.contains("74"), "raw sequence leaked: {out}");
+        assert!(!out.contains("480") && !out.contains("481") && !out.contains("999"));
+        assert!(!out.contains("1111") && !out.contains("2222"));
+
+        // The holder and its `->` waiter keep a shared virtual sequence and stay
+        // adjacent (grouping preserved rather than scattered by a global sort).
+        let holder = lines
+            .iter()
+            .position(|l| l.contains("POSIX") && !l.contains("->"));
+        let waiter = lines.iter().position(|l| l.contains("->"));
+        let (holder, waiter) = (holder.unwrap(), waiter.unwrap());
+        assert_eq!(waiter, holder + 1, "waiter must immediately follow holder");
+        let seq_of = |l: &str| l.split(':').next().unwrap().to_owned();
+        assert_eq!(seq_of(lines[holder]), seq_of(lines[waiter]));
+
+        // The two locks on object 08:02:1111 (holder + FLOCK) share one virtual
+        // object id; the lock on 08:02:2222 keeps a *distinct* one.
+        let obj_of = |l: &str| l.split_whitespace().nth_back(2).unwrap().to_owned();
+        let flock = lines.iter().find(|l| l.contains("FLOCK")).unwrap();
+        let ofd = lines.iter().find(|l| l.contains("OFDLCK")).unwrap();
+        assert_eq!(
+            obj_of(lines[holder]),
+            obj_of(flock),
+            "same object must match"
+        );
+        assert_ne!(
+            obj_of(lines[holder]),
+            obj_of(ofd),
+            "distinct objects must differ"
+        );
+
+        // Same raw owner (PID 480) on two different objects keeps one virtual
+        // owner; the other owners stay distinct.
+        let pid_of = |l: &str| l.split_whitespace().nth_back(3).unwrap().to_owned();
+        assert_eq!(pid_of(lines[holder]), pid_of(ofd), "same owner must match");
+        assert_ne!(pid_of(lines[holder]), pid_of(lines[waiter]));
+        assert_ne!(pid_of(lines[holder]), pid_of(flock));
+
+        let renumbered_and_reordered = b"800: FLOCK ADVISORY WRITE 9000 00:fe:9001 0 EOF\n\
+700: OFDLCK ADVISORY WRITE 8000 00:fe:9002 0 EOF\n\
+900: -> POSIX ADVISORY WRITE 7000 00:fe:9001 0 EOF\n\
+900: POSIX ADVISORY WRITE 8000 00:fe:9001 0 EOF\n";
+        assert_eq!(
+            sanitize_locks(contents),
+            sanitize_locks(renumbered_and_reordered),
+            "raw ID renumbering and row order changed the virtual graph"
+        );
+
+        // Fail closed, not open: one unclassifiable row suppresses the entire
+        // snapshot instead of mixing a sentinel with partially trusted data.
+        assert!(sanitize_locks(b"malformed row\n").is_empty());
+        assert!(
+            sanitize_locks(b"74: POSIX ADVISORY WRITE 480 08:02:1111 0 EOF\nmalformed\n")
+                .is_empty()
+        );
+        assert!(sanitize_locks(&[0xff, 0xfe]).is_empty());
+        assert!(sanitize_locks(b"").is_empty());
+    }
+
+    #[test]
+    fn unix_sockets_hide_kernel_identities_and_sort_semantic_rows() {
+        let contents = b"Num RefCount Protocol Flags Type St Inode Path\n\
+00000000fedcba98: 00000003 00000000 00010000 0002 01 12346 /run/socket two\n\
+000000001234abcd: 00000002 00000000 00000000 0001 03 12345\n";
+
+        assert_eq!(
+            sanitize_unix_sockets(contents),
+            b"Num RefCount Protocol Flags Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
+0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n"
+        );
+    }
+
+    #[test]
+    fn unix_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            b"Num RefCount Protocol Flags Type St Inode Path",
+            b"Num RefCount Protocol Flags Type St Inode Path Extra\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n1234: 00000003 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 0000000G 00000000 00000000 0001 03 12345\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 inode\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 18446744073709551616\n",
+            b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001\n",
+        ] {
+            assert_eq!(sanitize_unix_sockets(malformed), malformed);
+        }
     }
 
     #[test]
