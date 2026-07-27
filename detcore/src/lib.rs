@@ -156,8 +156,10 @@ use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
+use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_process_isolation_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscalls::helpers::with_guest_rip;
@@ -1352,6 +1354,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-836): Host filesystem and mount
+            // introspection are outside the deterministic model. Return the
+            // portable feature-absence errno so callers use /proc fallbacks.
+            SyscallClassification::Determinized
+                if is_mount_introspection_enosys_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
             // system-administration syscalls (module load/unload, kexec, reboot,
             // swap, raw I/O ports, root-mount pivot, host/domain name, tty
@@ -1363,6 +1374,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // the Sysno before the typed match below.
             SyscallClassification::Determinized
                 if is_privileged_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-844): Enforce a deterministic boundary
+            // around host-global process accounting and cross-process memory.
+            SyscallClassification::Determinized
+                if is_process_isolation_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::EPERM))
             }
@@ -1456,6 +1475,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
+            // synchronization. The pinned Reverie exposes close_range as a raw
+            // call, so dispatch by Sysno before the typed match.
+            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                self.handle_close_range(guest, call).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-838): Review the deterministic seccomp
+            // compatibility refusal. Guest filters can block ptrace-runtime
+            // syscall injection and capability probes expose host-kernel state,
+            // so Hermit presents a fixed kernel-without-seccomp boundary.
+            SyscallClassification::Determinized if call.number() == Sysno::seccomp => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
             // in the pinned Reverie revision. It is epoll_pwait with a
             // `struct timespec *` timeout; recent glibc routes epoll_wait/
@@ -1475,6 +1509,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
+                Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
