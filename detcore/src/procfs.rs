@@ -23,7 +23,7 @@ enum ProcfsKind {
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review host swap-usage normalization.
+    // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
 }
 
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the zeroed /proc/swaps Used column policy.
+// TODO-HUMAN-REVIEW(PR-945): Review the zeroed /proc/swaps Used column policy.
 fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
     const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
 
