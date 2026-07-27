@@ -195,7 +195,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review normalized procfs lseek offset synchronization.
+    // TODO-HUMAN-REVIEW(PR-840): Review normalized procfs lseek offset synchronization.
     /// Forwards lseek and synchronizes any normalized procfs snapshot offset.
     pub async fn handle_lseek<G: Guest<Self>>(
         &self,
