@@ -57,6 +57,13 @@ pub struct Config {
     #[clap(skip)]
     pub discover_live_file_metadata: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    /// Guest clock reads use per-thread logical time instead of the global RPC arrival order.
+    #[serde(default)]
+    #[clap(skip)]
+    pub use_thread_local_clock_reads: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and

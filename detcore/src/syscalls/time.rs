@@ -91,6 +91,20 @@ fn deterministic_timex(now: Timespec) -> libc::timex {
     tx
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-845): Review SaBRe thread-local guest clock reads.
+async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if guest.config().use_thread_local_clock_reads {
+        guest.thread_state().thread_logical_time.as_nanos()
+    } else {
+        thread_observe_time(guest).await
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
@@ -147,7 +161,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Gettimeofday,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
 
         let ret = self.record_or_replay(guest, call).await?;
 
@@ -168,7 +182,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Time,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
         let secs = time_ns.as_secs() as i64;
 
         if let Some(tloc) = call.tloc() {
@@ -185,7 +199,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGettime,
     ) -> Result<i64, Error> {
-        let time_ns = thread_observe_time(guest).await;
+        let time_ns = guest_clock_time(guest).await;
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
         let tp = call.tp().ok_or(Errno::EFAULT)?;
