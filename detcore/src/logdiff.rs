@@ -108,7 +108,7 @@ impl LogDiffOpts {
     fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         v.iter()
             .filter_map(|(i, s)| {
-                if (is_detlog(s) && !self.skip_detlog(s) && !is_scheduler_committed_time(s))
+                if (is_detlog(s) && !self.skip_detlog(s) && !is_scheduler_time_bookkeeping(s))
                     || (is_commit(s) && !self.skip_commit && !is_internal_io_poll_commit(s))
                 {
                     Some((*i, *s))
@@ -262,16 +262,13 @@ fn is_internal_io_poll_commit(line: &str) -> bool {
     is_commit(line) && line.contains("{InternalIOPolling: ")
 }
 
-/// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
-/// the global logical clock, which still moves forward when an `InternalIOPolling` retry
-/// (see `is_internal_io_poll_commit`) advances time -- and the number of those retries is
-/// host-timing nondeterministic. That makes the *presence* of this line on a given turn
-/// retry-count sensitive, so we exclude it from the deterministic comparison. No
-/// guest-observable signal is lost: the value is redundant with the (retained,
-/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
-/// the per-turn committed time echoed on each COMMIT line.
-fn is_scheduler_committed_time(line: &str) -> bool {
+/// Per-turn scheduler clock bookkeeping. Host timing can change whether an administrative
+/// turn advances the clock before an already-due event is observed, without changing a
+/// guest-visible syscall or COMMIT turn. Exclude both clock-only lines while retaining those
+/// guest-observable records.
+fn is_scheduler_time_bookkeeping(line: &str) -> bool {
     line.contains("advancing committed_time from ")
+        || line.contains("[sched] advance global time for scheduler turn")
 }
 
 fn is_detcore(line: &str) -> bool {
@@ -923,8 +920,8 @@ mod test {
     /// Regression: the deterministic comparison must ignore the scheduler bookkeeping emitted
     /// by nonblocking-IO poll retries, whose count is host-timing nondeterministic (e.g. how
     /// many times a thread re-polls a pipe before a child process makes it ready). Only the
-    /// `{InternalIOPolling: ...}` COMMIT turn and the `advancing committed_time` clock line
-    /// should be dropped; ordinary COMMIT turns and DETLOG entries must be retained.
+    /// `{InternalIOPolling: ...}` COMMIT turn and scheduler clock-only lines should be
+    /// dropped; ordinary COMMIT turns and guest-observable DETLOG entries must be retained.
     #[test]
     fn test_filter_deterministic_drops_io_polling_bookkeeping() {
         let opts = super::LogDiffOpts::default();
@@ -945,9 +942,13 @@ mod test {
                 3,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s",
             ),
+            (
+                4,
+                "DEBUG detcore::scheduler: DETLOG [sched] advance global time for scheduler turn, new time LogicalTime(3)",
+            ),
         ]);
-        // The InternalIOPolling COMMIT (0) and the committed_time line (1) are dropped; the
-        // guest-observable syscall (2) and the ordinary COMMIT turn (3) survive.
+        // The InternalIOPolling COMMIT (0) and clock-only lines (1, 4) are dropped; the
+        // guest-observable syscall (2) and ordinary COMMIT turn (3) survive.
         assert_eq!(
             v,
             vec![

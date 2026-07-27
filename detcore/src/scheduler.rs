@@ -1689,7 +1689,11 @@ impl Scheduler {
                 {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
-                    let delta = event_ns.duration_since(gt_now_ns);
+                    let delta = if event_ns > gt_now_ns {
+                        event_ns.duration_since(gt_now_ns)
+                    } else {
+                        Duration::ZERO
+                    };
                     detlog_debug!(
                         "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
                         delta,
@@ -2160,8 +2164,7 @@ impl Scheduler {
                 // NB: `committed_time` still tracks the (host-timing-perturbed) global clock,
                 // including the time advanced by suppressed IO-polling retries above, so this
                 // line's presence is retry-count sensitive. It is therefore excluded from the
-                // deterministic `--verify` comparison in `logdiff::is_scheduler_committed_time`
-                // (it is redundant with the per-turn "advance global time" DETLOG anyway).
+                // deterministic `--verify` comparison as scheduler clock bookkeeping.
                 detlog_debug!(
                     "[sched-step1] advancing committed_time from {} to {}",
                     self.committed_time,
@@ -2907,6 +2910,32 @@ mod test {
             (LogicalTime::from_nanos(150), LogicalTime::ZERO)
         );
         assert!(scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn empty_queue_wakes_an_already_due_timed_event() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let detpid = DetPid::from_raw(100);
+        let dettid = DetTid::from_raw(101);
+        let mut global_time = GlobalTime::new(&config);
+        let now = global_time.as_nanos();
+
+        scheduler.register_alarm(
+            detpid,
+            dettid,
+            now,
+            LogicalTime::from_nanos(500),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+        global_time.add_extra_time(Duration::from_nanos(1_000));
+        let advanced = global_time.as_nanos();
+        let global_time = Arc::new(Mutex::new(global_time));
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), advanced);
     }
 
     #[test]
