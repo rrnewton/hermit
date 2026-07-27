@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review host block queue-depth normalization.
+            // TODO-HUMAN-REVIEW(PR-956): Review host block queue-depth normalization.
             _ if is_block_inflight_path(path) => ProcfsKind::BlockInflight,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -309,7 +309,7 @@ fn is_block_inflight_path(path: &Path) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /sys/block/<device>/inflight field policy.
+// TODO-HUMAN-REVIEW(PR-956): Review the /sys/block/<device>/inflight field policy.
 fn sanitize_block_inflight(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
