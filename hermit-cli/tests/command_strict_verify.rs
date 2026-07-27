@@ -62,11 +62,14 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "run", "--strict", "--verify"])
         .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!(
+            "--env=XDG_CONFIG_HOME={}",
+            home.path().join(".config").display()
+        ))
         .arg("--")
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .stdin(if case.stdin.is_some() {
             Stdio::piped()
         } else {
