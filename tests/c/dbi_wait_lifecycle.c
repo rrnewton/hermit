@@ -68,7 +68,7 @@ int main(void) {
   if (info.si_utime != 0 || info.si_stime != 0)
     return 5;
   // AUTONOMOUS-BOT-IMPLEMENTED
-  // TODO-HUMAN-REVIEW(PR-TBD): Confirm the portable coalesced-SIGCHLD contract.
+  // TODO-HUMAN-REVIEW(#878): Confirm the portable coalesced-SIGCHLD contract.
   if (sigchld_count < 1 || sigchld_count > 2)
     return 6;
   if (waitpid(first, NULL, WNOHANG) != -1 || errno != ECHILD)
