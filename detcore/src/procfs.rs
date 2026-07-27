@@ -1762,6 +1762,10 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "se.slice",
         "ext.enabled",
         "numa_preferred_nid",
+        "uclamp.min",
+        "uclamp.max",
+        "effective uclamp.min",
+        "effective uclamp.max",
     ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -1864,6 +1868,11 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 return Vec::new();
             }
             None
+        } else if right.trim().parse::<u128>().is_ok() {
+            // New kernels may append observational scheduler counters. Keep
+            // forward-compatible numeric telemetry deterministic without
+            // accepting malformed or negative unknown fields.
+            Some("0")
         } else {
             return Vec::new();
         };
@@ -4031,6 +4040,8 @@ se.sum_exec_runtime : 3.637972\n\
 nr_switches : 149\n\
 se.avg.load_avg : 749\n\
 policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 55\n\
 current_node=7, numa_group_id=91\n\
 numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
 
@@ -4043,6 +4054,8 @@ se.sum_exec_runtime : 0.000000\n\
 nr_switches : 0\n\
 se.avg.load_avg : 0\n\
 policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 0\n\
 current_node=0, numa_group_id=0\n\
 numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
         );
