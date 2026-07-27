@@ -53,7 +53,10 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 10
+    # Hermit guests share host PMU and namespace resources. Keep a generous
+    # outer deadline so the serial integration suite can clean up normally;
+    # individual potentially unbounded probes enforce their own timeouts.
+    timeout-minutes: 30
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -101,7 +104,10 @@ jobs:
         fi
     - name: Hermit tests including record/replay matrix
       if: steps.namespaces.outputs.available == 'true'
-      run: cargo test -p hermit
+      # The integration binaries use process-local locks around Hermit. A
+      # single libtest thread prevents guest runs in the same binary from
+      # contending for PMU and namespace resources.
+      run: cargo test -p hermit -- --test-threads=1
     - name: PMU Detcore lit tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1
