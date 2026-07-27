@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# shellcheck source=demos/lib/display.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/display.sh"
+
 usage() {
   cat <<EOF
 Usage: ${0##*/} [COMMAND...]
@@ -28,11 +31,7 @@ esac
 
 # shellcheck disable=SC2034  # consumed by common.sh demo_success/demo_failure
 DEMO_LABEL="Demo 6: QEMU Snapshot Resume"
-echo ''
-echo '=========================================='
-echo '=== Demo 6: QEMU Snapshot Resume ==='
-echo '=========================================='
-echo ''
+demo_header "$DEMO_LABEL"
 echo 'QEMU resumes the live Linux shell saved by Demo 5. The requested command is'
 echo 'injected over the guest serial socket, then the normalized Hermit INFO tail is'
 echo 'saved and compared with the previous run of that same command.'
@@ -40,15 +39,16 @@ echo ''
 echo '=========================================='
 
 # shellcheck source=demos/common.sh
+export DEMO_BUILD_MODE=release
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=demos/lib/qemu-snapshot.sh
 source "$DEMO_DIR/lib/qemu-snapshot.sh"
 
 export QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
-export QEMU_TIMEOUT="${QEMU_TIMEOUT:-600}"
+export QEMU_TIMEOUT="${QEMU_TIMEOUT:-120}"
 export HERMIT_RELEASE="${HERMIT_RELEASE:-$HERMIT_REPO/target/release/hermit}"
 export QEMU_ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
-export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-detcore::scheduler::runqueue=info,detcore::tool_global=info}"
+export QEMU_LOG_FILTER="${QEMU_LOG_FILTER:-warn,detcore::scheduler=info,detcore::tool_global=info,reverie_ptrace::task=info}"
 export QEMU_SNAPSHOT_NAME="${QEMU_SNAPSHOT_NAME:-hermit-boot}"
 export QEMU_SNAPSHOT_DISK="${QEMU_SNAPSHOT_DISK:-$QEMU_ASSETS/hermit-snapshot.qcow2}"
 export QEMU_SNAPSHOT_ID_FILE="${QEMU_SNAPSHOT_ID_FILE:-$QEMU_SNAPSHOT_DISK.id}"
@@ -70,19 +70,19 @@ if [ -z "$QEMU_BIN" ] || [ ! -x "$QEMU_BIN" ]; then
   exit 1
 fi
 test -r "$QEMU_ASSETS/bzImage" || {
-  echo "missing QEMU kernel; run $DEMO_DIR/05-qemu-boot.sh first" >&2
+  echo "missing QEMU kernel; run ./demos/05-qemu-boot.sh first" >&2
   exit 1
 }
 test -r "$QEMU_ASSETS/initramfs.cpio.gz" || {
-  echo "missing QEMU initramfs; run $DEMO_DIR/05-qemu-boot.sh first" >&2
+  echo "missing QEMU initramfs; run ./demos/05-qemu-boot.sh first" >&2
   exit 1
 }
 test -r "$QEMU_SNAPSHOT_DISK" || {
-  echo "missing snapshot disk; run $DEMO_DIR/05-qemu-boot.sh first" >&2
+  echo "missing snapshot disk; run ./demos/05-qemu-boot.sh first" >&2
   exit 1
 }
 test -r "$QEMU_SNAPSHOT_ID_FILE" || {
-  echo "missing snapshot identity; run $DEMO_DIR/05-qemu-boot.sh first" >&2
+  echo "missing snapshot identity; run ./demos/05-qemu-boot.sh first" >&2
   exit 1
 }
 qemu_snapshot_require_tools
@@ -105,8 +105,39 @@ serial_socket="$DEMO_ARTIFACTS/qemu-resume-serial.sock"
 input_fifo="$DEMO_ARTIFACTS/qemu-resume-input.$$"
 hermit_pid=""
 serial_pid=""
+progress_pid=""
+
+start_resume_progress() {
+  local owner_pid=$1
+  local label=${2:-Restoring snapshot}
+
+  if [ -t 2 ]; then
+    (
+      local frames='|/-'
+      local elapsed=0
+      while kill -0 "$owner_pid" 2>/dev/null; do
+        printf '\r%s... %s %ds' "$label" \
+          "${frames:elapsed%${#frames}:1}" "$elapsed"
+        sleep 1
+        elapsed=$((elapsed + 1))
+      done
+    ) >&2 &
+    progress_pid=$!
+  else
+    printf '%s (timeout: %ss)...\n' "$label" "$QEMU_TIMEOUT"
+  fi
+}
+
+stop_resume_progress() {
+  [ -n "$progress_pid" ] || return 0
+  kill "$progress_pid" 2>/dev/null || true
+  wait "$progress_pid" 2>/dev/null || true
+  progress_pid=""
+  printf '\r%*s\r' 48 '' >&2
+}
 
 cleanup_qemu() {
+  stop_resume_progress
   exec 3>&- 2>/dev/null || true
   qemu_stop_pid "$serial_pid"
   qemu_stop_pid "$hermit_pid"
@@ -144,8 +175,11 @@ timeout --kill-after=10 --signal=TERM "$QEMU_TIMEOUT" \
   -append 'console=ttyS0 reboot=t' \
   >"$QEMU_LOG" 2>&1 &
 hermit_pid=$!
+resume_started=$SECONDS
+start_resume_progress "$hermit_pid" 'Restoring snapshot'
 
-qemu_wait_for_socket "$serial_socket" "$hermit_pid" 60
+qemu_wait_for_socket "$serial_socket" "$hermit_pid" "$QEMU_TIMEOUT"
+echo 'Serial socket connected; waiting for the restored shell prompt...'
 nc -U "$serial_socket" <"$input_fifo" >"$serial_log" 2>&1 &
 serial_pid=$!
 
@@ -153,7 +187,10 @@ serial_pid=$!
 # it print a fresh prompt and proves the restored serial path is ready.
 sleep "${QEMU_RESUME_CONNECT_DELAY:-0.5}"
 printf '\n' >&3
-qemu_wait_for_log_line "$serial_log" '~ #' "$hermit_pid" 60
+qemu_wait_for_log_line "$serial_log" '~ #' "$hermit_pid" "$QEMU_TIMEOUT"
+stop_resume_progress
+printf 'Restored shell ready after %ds; sending command.\n' \
+  "$((SECONDS - resume_started))"
 
 begin_marker='__HERMIT_COMMAND_BEGIN__'
 end_marker='__HERMIT_COMMAND_END__'
@@ -164,17 +201,24 @@ sleep 0.2
 printf 'echo %s\n' "$end_marker" >&3
 sleep 0.2
 printf 'poweroff -f\n' >&3
+echo 'Command sent; waiting for clean guest shutdown...'
+start_resume_progress "$hermit_pid" 'Finishing Hermit run'
 
 set +e
 wait "$hermit_pid"
 resume_rc=$?
+stop_resume_progress
 hermit_pid=""
 qemu_stop_pid "$serial_pid"
 serial_pid=""
 set -e
 
-if [ "$resume_rc" -ne 0 ]; then
-  echo "QEMU resume exited with status $resume_rc; log: $QEMU_LOG" >&2
+if [ "$resume_rc" -eq 124 ] || [ "$resume_rc" -eq 137 ]; then
+  echo "QEMU resume timed out after ${QEMU_TIMEOUT}s." >&2
+  echo "Hermit log: ${QEMU_LOG#"$ROOT/"}" >&2
+  exit "$resume_rc"
+elif [ "$resume_rc" -ne 0 ]; then
+  echo "QEMU resume exited with status $resume_rc; log: ${QEMU_LOG#"$ROOT/"}" >&2
   exit "$resume_rc"
 fi
 grep -Fq "$begin_marker" "$serial_log" || {
@@ -191,10 +235,14 @@ grep -Fq 'reboot: Power down' "$serial_log" || {
 }
 
 demo_banner "Guest serial output"
-sed -n "/$begin_marker/,/$end_marker/p" "$serial_log"
+awk -v begin="$begin_marker" -v end="$end_marker" '
+  index($0, begin) { printing = 1; next }
+  index($0, end) { exit }
+  printing { print }
+' "$serial_log"
 
 qemu_write_stable_info_tail "$QEMU_LOG" "$info_tail"
-demo_banner "Hermit INFO log tail"
+demo_banner "Hermit INFO tail (wall-clock timestamps stripped)"
 cat "$info_tail"
 
 if [ -r "$previous_info" ]; then
@@ -210,6 +258,6 @@ else
   printf '\nSaved the first INFO tail for %q. Run this command again to compare.\n' \
     "$guest_command"
 fi
-printf 'Evidence: %s\n' "$DEMO_ARTIFACTS"
+printf 'Evidence: %s\n' "${DEMO_ARTIFACTS#"$ROOT/"}"
 
 demo_success

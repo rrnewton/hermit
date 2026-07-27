@@ -18,6 +18,10 @@ fail() {
   exit 1
 }
 
+size_mb() {
+  awk -v bytes="$1" 'BEGIN { printf "%.1f", bytes / 1000000 }'
+}
+
 if [ -z "$BUSYBOX" ] || [ ! -x "$BUSYBOX" ]; then
   fail "a statically linked BusyBox is required; set BUSYBOX=/path/to/busybox"
 fi
@@ -62,7 +66,10 @@ if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
   else
     command -v manifold >/dev/null 2>&1 || \
       fail "manifold is required to download manifold://$KERNEL_MANIFOLD_PATH"
-    manifold --quiet get --threads 20 "$KERNEL_MANIFOLD_PATH" "$kernel_tmp"
+    echo 'Downloading kernel from Manifold...'
+    manifold --quiet get --threads 20 \
+      "$KERNEL_MANIFOLD_PATH" "$kernel_tmp" >/dev/null 2>&1 || \
+      fail "kernel download failed: manifold://$KERNEL_MANIFOLD_PATH"
     kernel_source="manifold://$KERNEL_MANIFOLD_PATH"
   fi
 
@@ -72,13 +79,11 @@ if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
   fi
   mv "$kernel_tmp" "$ARTIFACT_DIR/bzImage"
   kernel_tmp=""
-  printf 'kernel: %s -> %s (%s bytes, sha256 %s)\n' \
-    "$kernel_source" "$ARTIFACT_DIR/bzImage" \
-    "$(stat -c%s "$ARTIFACT_DIR/bzImage")" "$KERNEL_SHA256"
+  kernel_bytes="$(stat -c%s "$ARTIFACT_DIR/bzImage")"
+  printf '✓ Kernel ready (%sMB)\n' "$(size_mb "$kernel_bytes")"
 else
-  printf 'kernel: using verified cache %s (%s bytes, sha256 %s)\n' \
-    "$ARTIFACT_DIR/bzImage" "$(stat -c%s "$ARTIFACT_DIR/bzImage")" \
-    "$KERNEL_SHA256"
+  kernel_bytes="$(stat -c%s "$ARTIFACT_DIR/bzImage")"
+  printf '✓ Kernel ready (%sMB, cached)\n' "$(size_mb "$kernel_bytes")"
 fi
 
 cached_initramfs_version="$(cat "$INITRAMFS_VERSION_FILE" 2>/dev/null || true)"
@@ -125,13 +130,11 @@ INIT
   printf '%s\n' "$INITRAMFS_VERSION" >"$version_tmp"
   mv "$version_tmp" "$INITRAMFS_VERSION_FILE"
   version_tmp=""
-  printf 'initramfs: built %s (%s bytes)\n' \
-    "$ARTIFACT_DIR/initramfs.cpio.gz" \
-    "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")"
+  printf '✓ Initramfs ready (%sMB)\n' \
+    "$(size_mb "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")")"
 else
-  printf 'initramfs: using cached %s (%s bytes)\n' \
-    "$ARTIFACT_DIR/initramfs.cpio.gz" \
-    "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")"
+  printf '✓ Initramfs ready (%sMB, cached)\n' \
+    "$(size_mb "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")")"
 fi
 
-printf 'QEMU assets ready in %s\n' "$ARTIFACT_DIR"
+echo 'QEMU assets ready.'
