@@ -384,7 +384,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic ENOSYS for the unmodeled
+        // TODO-HUMAN-REVIEW(PR-848): Deterministic ENOSYS for the unmodeled
         // kernel-keyring family. Key serials, quotas, permissions, contents,
         // and request-key upcalls are shared kernel state outside Detcore's
         // model. Presenting a kernel-without-CONFIG_KEYS boundary keeps feature
@@ -936,7 +936,7 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic kernel-keyring refusal set.
+// TODO-HUMAN-REVIEW(PR-848): Deterministic kernel-keyring refusal set.
 /// Kernel key-management syscalls that Detcore does not model. Keyring serials,
 /// quotas, permissions, contents, and `request_key` user-space upcalls expose
 /// shared host-kernel state. A fixed `ENOSYS` matches a kernel built without

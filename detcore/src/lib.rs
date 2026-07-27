@@ -1366,7 +1366,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Hide unmodeled shared keyrings and
+            // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
