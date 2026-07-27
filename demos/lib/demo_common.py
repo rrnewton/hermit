@@ -251,22 +251,58 @@ def compare_runs(
     return passed, report
 
 
-def print_comparison(passed: bool, report: Sequence[str]) -> None:
+def print_comparison(
+    passed: bool,
+    report: Sequence[str],
+    snapshot_sha256: Optional[str] = None,
+    subject: str = "Run",
+) -> None:
     for line in report:
         print(line)
     print("PASS: run matches anchor" if passed else "WARN: RUN DIVERGED FROM ANCHOR")
+    if passed and snapshot_sha256 is not None:
+        print()
+        print("🎉 DETERMINISTIC! Snapshot SHA-256 matches previous run:")
+        print("   {}".format(snapshot_sha256))
+        print("   {} is bitwise-reproducible under Hermit.".format(subject))
 
 
-def print_header(title: str) -> None:
-    width = 42
-    title_width = width - 8
+def check_dependencies(root: Path) -> str:
+    """Run the shared dependency check and return its one-line result."""
+    result = subprocess.run(
+        ["make", "--no-print-directory", "-s", "check-deps"],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        sys.stderr.write(result.stdout)
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+    lines = [line for line in result.stdout.splitlines() if line]
+    if len(lines) != 1 or not lines[0].startswith("Dependency check passed:"):
+        raise RuntimeError(
+            "unexpected dependency-check output: {!r}".format(result.stdout)
+        )
+    return lines[0]
+
+
+def print_header(title: str, description: Sequence[str], dependency: str) -> None:
+    width = 80
+    title_width = width - 10
     if len(title) > title_width:
         raise ValueError("demo title is too wide: {}".format(title))
+    print("=" * width)
+    print("=====" + title.center(title_width) + "=====")
+    print()
+    for line in description:
+        if len(line) > width:
+            raise ValueError("demo description is too wide: {}".format(line))
+        print(line)
+    print(dependency)
     print()
     print("=" * width)
-    print("=== {} ===".format(title.center(title_width)))
-    print("=" * width)
-    print()
 
 
 def banner(title: str) -> None:
