@@ -16,7 +16,7 @@ A `gap` must have a concrete implementation reason.
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 9/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-The current DBI path satisfies the process lifecycle, virtual clock, and virtual
+The current DBI path satisfies the pthread lifecycle, virtual clock, and virtual
 PID contracts, but its threaded random-source fixture still does not complete.
 These contracts do not by themselves establish full Detcore parity.
 
