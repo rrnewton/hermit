@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=203
+readonly LITEINST_COMPAT_EXPECTED=230
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -328,7 +328,6 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # previously because --strict used to forward unsupported syscalls.
     # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
     # are now measured as ordinary passing rows below.)
-    [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
     [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
     [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
@@ -806,7 +805,7 @@ function run_full_backend_gates {
     if ! backend_selector_supported; then
         note_backend_skip "KVM/DBI" "backend selector is unavailable"
         run_check "Real backend compatibility matrix" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
+            python3 tests/backend-parity/run_matrix.py \
             "${backends[@]}" --probe-gaps --output "$BACKEND_COMPAT_RESULTS"
         return
     fi
@@ -824,11 +823,11 @@ function run_full_backend_gates {
     fi
 
     run_check "Real backend compatibility matrix" \
-        python3 experiments/backend-parity_20260722/run_matrix.py \
+        python3 tests/backend-parity/run_matrix.py \
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1516,6 +1515,33 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe systemd-escape /usr/bin/systemd-escape --path /tmp/hermit-compat && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe sysctl-ostype /usr/sbin/sysctl -n kernel.ostype && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe php-version /usr/bin/php -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe basenc /usr/bin/basenc --base64 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chcon-version /usr/bin/chcon --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe runcon-version /usr/bin/runcon --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsblk-version /usr/bin/lsblk --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lslocks-version /usr/bin/lslocks --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsns-version /usr/bin/lsns --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe prlimit-live /usr/bin/prlimit --nofile && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe setpriv-dump /usr/bin/setpriv --dump && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nsenter-version /usr/bin/nsenter --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unshare-version /usr/bin/unshare --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe choom-pid1 /usr/bin/choom -p 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rename-version /usr/bin/rename --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe script-version /usr/bin/script --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe scriptreplay-version /usr/bin/scriptreplay --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe utmpdump-version /usr/bin/utmpdump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uuidgen-name /usr/bin/uuidgen --sha1 --namespace @dns --name hermit && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemctl-version /usr/bin/systemctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe journalctl-version /usr/bin/journalctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe busctl-version /usr/bin/busctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmake-echo /usr/bin/cmake -E echo cmake-ok && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pkgconf-zlib /usr/bin/pkgconf --modversion zlib && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe git-inside /usr/bin/git rev-parse --is-inside-work-tree && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe findmnt-fstype /usr/bin/findmnt -n -o FSTYPE / && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-unescape /usr/bin/systemd-escape --unescape 'tmp-hermit\x2dcompat' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-detect-virt /usr/bin/systemd-detect-virt && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-path /usr/bin/systemd-path temporary && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-id128 /usr/bin/systemd-id128 machine-id && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -2066,8 +2092,8 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe ss /usr/sbin/ss -V \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        tally_known_failclosed_probe passed failed known_flaky lsof \
-            functional_compatibility_probe lsof /usr/bin/lsof -v
+        functional_compatibility_probe lsof /usr/bin/lsof -v \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
@@ -2866,14 +2892,10 @@ function apply_locally_validated_label {
 }
 
 # fbsource import lints require the Meta copyright header on every imported Rust
-# source file. experiments/ is durable local research and is not imported to
-# fbsource, so it is exempt. `head -n 8` permits a rust-script shebang first.
+# source file. `head -n 8` permits a rust-script shebang first.
 function check_copyright_headers {
     local missing=0 f
     while IFS= read -r f; do
-        case "$f" in
-            experiments/*) continue ;;
-        esac
         if ! head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms'; then
             printf '  missing Meta copyright header: %s\n' "$f"
             missing=$((missing + 1))
@@ -2982,7 +3004,7 @@ function run_hosted_only_suite {
     run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
     run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
     run_check "Build release Hermit for DBI parity" cargo build --release -p hermit
-    run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend
+    run_check "DynamoRIO DBI backend parity" python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend
     run_check "Portable working-envelope levels" run_hosted_envelope_levels
 
     run_check_with_timeout 1200 "Strict compatibility envelope" run_strict_compatibility_envelope
@@ -3074,7 +3096,7 @@ function run_hardware_validation {
     run_check "Record/replay working-envelope level" run_hardware_envelope_record_replay
     run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
     run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
-    run_check "Ptrace backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
+    run_check "Ptrace backend parity" python3 tests/backend-parity/run_matrix.py --backend ptrace
 
     print_summary
     ((failures == 0))
@@ -3274,7 +3296,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
@@ -3319,7 +3341,7 @@ if ((QEMU_L2_ONLY == 1)); then
         cargo build --release -p hermit
     if ((failures == 0)); then
         run_check "QEMU strict L2 boot (heavyweight)" \
-            ./experiments/qemu-boot-debug/strict_l2_test.sh
+            ./tests/qemu-boot/strict_l2_test.sh
     fi
     print_summary
     ((failures == 0))

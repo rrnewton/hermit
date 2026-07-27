@@ -1,0 +1,11 @@
+test_name	ptrace	dbi	kvm	dbi_reason	kvm_reason
+hello_stdout	pass	pass	pass	-	-
+argument_forwarding	pass	pass	pass	-	-
+exit_zero	pass	pass	pass	-	-
+exit_status	pass	pass	pass	-	-
+file_read	pass	pass	pass	-	-
+pthread_lifecycle	pass	gap	pass	Hosted release DynamoRIO can stall during native pthread startup before Detcore readiness	-
+cpuid_policy	pass	pass	pass	-	-
+virtual_clock	pass	pass	pass	-	-
+random_sources	pass	gap	gap	DBI observes syscalls but does not route random sources through Detcore	KVM child-thread syscalls bypass Detcore callbacks and the personality repeats fixed random samples across workers
+virtual_pid	pass	pass	pass	-	-
