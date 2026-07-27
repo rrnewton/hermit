@@ -163,3 +163,59 @@ fn proc_entropy_available_is_deterministic() {
             .expect("entropy_avail should be numeric");
     });
 }
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review mountinfo, UUID, and resource-counter snapshots.
+#[test]
+fn proc_self_mountinfo_hides_private_temp_roots() {
+    fn private_mount_records() -> Vec<String> {
+        let contents = read_procfs("/proc/self/mountinfo");
+        let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
+        assert!(!text.contains("/tmpvol/.tmp"));
+        text.lines()
+            .filter(|line| line.contains("/tmpvol/.hermit/"))
+            // Mount ID, parent ID, and device minor are namespace-assigned.
+            .filter_map(|line| line.split_once(" /tmpvol/.hermit/"))
+            .map(|(_, stable)| format!("/tmpvol/.hermit/{stable}"))
+            .collect()
+    }
+
+    let _guard = hermit_run_lock();
+    let first = private_mount_records();
+    assert_eq!(first.len(), 3, "expected group, nscd, and /tmp mounts");
+    for run in 2..=RUNS {
+        assert_eq!(
+            first,
+            private_mount_records(),
+            "private mount records differed between run 1 and run {run}"
+        );
+    }
+}
+
+#[test]
+fn proc_random_uuid_is_deterministic() {
+    assert_deterministic("/proc/sys/kernel/random/uuid", |contents| {
+        assert_eq!(contents, b"00000000-0000-4000-8000-000000000000\n");
+    });
+}
+
+#[test]
+fn proc_kernel_resource_counters_are_deterministic() {
+    for (path, expected) in [
+        (
+            "/proc/sys/fs/dentry-state",
+            b"0\t0\t45\t0\t0\t0\n".as_slice(),
+        ),
+        (
+            "/proc/sys/fs/file-nr",
+            b"0\t0\t9223372036854775807\n".as_slice(),
+        ),
+        (
+            "/proc/sys/fs/inode-state",
+            b"0\t0\t0\t0\t0\t0\t0\n".as_slice(),
+        ),
+        ("/proc/sys/kernel/pty/nr", b"0\n".as_slice()),
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, expected));
+    }
+}
