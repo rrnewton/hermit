@@ -178,7 +178,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// SYS_lseek system call.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-id): Review procfs snapshot lseek synchronization.
+    // TODO-HUMAN-REVIEW(PR-843): Review procfs snapshot lseek synchronization.
     pub async fn handle_lseek<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -309,7 +309,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let contents = self.snapshot_procfs(guest, call).await?;
             let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review virtual procfs boot-time derivation.
+            // TODO-HUMAN-REVIEW(PR-843): Review virtual procfs boot-time derivation.
             let virtual_boot_time_seconds = guest.config().epoch.timestamp()
                 - i64::try_from(self.cfg.sysinfo_uptime_offset)
                     .expect("sysinfo uptime offset exceeds i64");

@@ -1847,7 +1847,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
             SyscallClassification::PassThrough => match call {
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-id): Review procfs-aware pass-through lseek dispatch.
+                // TODO-HUMAN-REVIEW(PR-843): Review procfs-aware pass-through lseek dispatch.
                 Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
                 other => self.passthrough(guest, other).await,
             },

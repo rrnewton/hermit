@@ -48,7 +48,7 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review deterministic process and system accounting.
+            // TODO-HUMAN-REVIEW(PR-843): Review deterministic process and system accounting.
             "/proc/meminfo" => ProcfsKind::Meminfo,
             "/proc/stat" => ProcfsKind::SystemStat,
             "/proc/uptime" => ProcfsKind::Uptime,
@@ -113,7 +113,7 @@ impl ProcfsFile {
 
     /// Synchronizes the snapshot offset after a successful kernel seek.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-id): Review procfs snapshot seek synchronization.
+    // TODO-HUMAN-REVIEW(PR-843): Review procfs snapshot seek synchronization.
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
@@ -138,7 +138,7 @@ fn is_process_file_path(path: &str, file: &str) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review deterministic process accounting fields.
+// TODO-HUMAN-REVIEW(PR-843): Review deterministic process accounting fields.
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
 fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u8> {
     const VOLATILE_FIELDS: &[usize] = &[
@@ -309,7 +309,7 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review deterministic procfs system accounting values.
+// TODO-HUMAN-REVIEW(PR-843): Review deterministic procfs system accounting values.
 fn sanitize_meminfo(contents: &[u8]) -> Vec<u8> {
     const VOLATILE_FIELDS: &[&[u8]] = &[
         b"MemFree",

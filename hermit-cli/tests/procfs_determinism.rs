@@ -124,7 +124,7 @@ fn proc_self_cmdline_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review deterministic process and system accounting coverage.
+// TODO-HUMAN-REVIEW(PR-843): Review deterministic process and system accounting coverage.
 #[test]
 fn proc_system_memory_accounting_is_deterministic() {
     assert_deterministic("/proc/meminfo", |contents| {

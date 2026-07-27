@@ -309,7 +309,7 @@ impl DetFd {
 
     /// Synchronize a deterministic procfs snapshot after lseek.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-id): Review procfs descriptor seek synchronization.
+    // TODO-HUMAN-REVIEW(PR-843): Review procfs descriptor seek synchronization.
     pub(crate) fn set_procfs_offset(&self, offset: usize) {
         if let Some(procfs) = self.description().procfs.as_mut() {
             procfs.set_offset(offset);
