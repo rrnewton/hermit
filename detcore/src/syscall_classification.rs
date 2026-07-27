@@ -524,7 +524,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::perf_event_open
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Review pidfd creation and descriptor-model
+        // TODO-HUMAN-REVIEW(PR-862): Review pidfd creation and descriptor-model
         // synchronization. The handler records/replays the kernel operation and
         // registers the result as FdType::Pidfd before later fd operations.
         | Sysno::pidfd_open

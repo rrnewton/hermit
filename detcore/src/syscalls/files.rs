@@ -1889,7 +1889,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): pidfd creation and Detcore FD registration.
+    // TODO-HUMAN-REVIEW(PR-862): pidfd creation and Detcore FD registration.
     /// Create a pidfd through record/replay and synchronize the descriptor with
     /// Detcore's metadata before fcntl, poll, close, or waitid can observe it.
     pub async fn handle_pidfd_open<G: Guest<Self>>(
