@@ -1893,8 +1893,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
-                Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
-                Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
+                Syscall::Recvmsg(s) => self.handle_socket_receive(guest, s, s.sockfd(), true).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendmmsg(s) => self.handle_sendrecv(guest, s).await,
@@ -1907,7 +1907,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // mmsghdr array atomically, and the Detcore scheduler owns any
                 // blocking, so the timeout argument (deliberately ignored, see
                 // helpers.rs) does not introduce nondeterminism.
-                Syscall::Recvmmsg(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Recvmmsg(s) => self.handle_socket_receive(guest, s, s.fd(), false).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
