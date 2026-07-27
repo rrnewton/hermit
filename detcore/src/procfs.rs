@@ -373,7 +373,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
             other if is_thp_counter_path(Path::new(other)) => ProcfsKind::ThpCounter,
             // TODO-HUMAN-REVIEW(PR-963): Review sysfs RTC clock normalization.
-            _ => sysfs_rtc_kind(path)?,
+            _ => sysfs_rtc_kind(&path)?,
         };
         Some(Self {
             kind,
