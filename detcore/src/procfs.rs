@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    Locks,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review kernel lock identity normalization.
+            "/proc/locks" => ProcfsKind::Locks,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Locks => sanitize_locks(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,43 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/locks field policy.
+fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let details = usize::from(fields.get(1).is_some_and(|field| field == "->")) + 1;
+        if fields.len() < details + 7
+            || !fields.first().is_some_and(|field| field.ends_with(':'))
+            || fields[details + 4].split(':').count() != 3
+        {
+            return contents.to_vec();
+        }
+
+        fields[0] = "0:".to_owned();
+        fields[details + 4] = "00:00:0".to_owned();
+        rows.push(fields.join(" "));
+    }
+    rows.sort_unstable();
+
+    let mut normalized = rows.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +381,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/locks"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Locks
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +479,22 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn locks_hide_kernel_sequence_and_backing_identity() {
+        let contents = b"125: POSIX  ADVISORY  WRITE 3 00:27:47713925 0 EOF\n\
+91: OFDLCK ADVISORY  WRITE -1 00:27:47715277 4 19\n\
+18: -> POSIX ADVISORY READ 7 00:2a:99 0 EOF\n";
+
+        assert_eq!(
+            sanitize_locks(contents),
+            b"0: -> POSIX ADVISORY READ 7 00:00:0 0 EOF\n\
+0: OFDLCK ADVISORY WRITE -1 00:00:0 4 19\n\
+0: POSIX ADVISORY WRITE 3 00:00:0 0 EOF\n"
+        );
+        assert_eq!(sanitize_locks(b"malformed\n"), b"malformed\n");
+        assert!(sanitize_locks(b"").is_empty());
     }
 
     #[test]
