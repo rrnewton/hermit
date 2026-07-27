@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review AVX-512 elapsed-time normalization.
+            // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             "/proc/self/arch_status" => ProcfsKind::ArchStatus,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -304,7 +304,7 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the /proc/self/arch_status field policy.
+// TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
 fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
