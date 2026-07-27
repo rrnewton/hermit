@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review host pressure accounting normalization.
+            // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
             "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
                 ProcfsKind::Pressure
             }
