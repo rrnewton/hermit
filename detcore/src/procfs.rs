@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review per-CPU host interrupt normalization.
+            // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
             _ if is_irq_per_cpu_count_path(path) => ProcfsKind::IrqPerCpuCount,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -319,7 +319,7 @@ fn is_irq_per_cpu_count_path(path: &Path) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review the /sys/kernel/irq/<IRQ>/per_cpu_count field policy.
+// TODO-HUMAN-REVIEW(PR-960): Review the /sys/kernel/irq/<IRQ>/per_cpu_count field policy.
 fn sanitize_irq_per_cpu_count(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
