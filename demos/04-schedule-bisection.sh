@@ -4,9 +4,9 @@
 #
 # hermit analyze first finds passing and failing schedules, then bisects their
 # event streams to identify the ordering that changes the outcome. This step
-# runs the guest many times and REQUIRES user-accessible CPU performance
-# counters (PMU). It can emit scheduler-desynchronization diagnostics while
-# converging; a successful run ends with "Completed analysis successfully".
+# runs the guest many times. The default uses syscall-boundary chaos so it is
+# portable across hosts; set ANALYZE_PREEMPTION_TIMEOUT=400000 to add precise
+# PMU preemption. A successful run ends with "Completed analysis successfully".
 #
 # Verbosity: by default this demo shows only the evolving per-pass search
 # progress lines and the final race localization, filtering out hermit
@@ -23,9 +23,9 @@ cat <<'DESC'
 hermit analyze first finds passing and failing schedules, then bisects their
 event streams to identify the ordering that changes the outcome. It builds a
 debug guest so the report can resolve source locations. This is intentionally
-the slow finale: it runs the guest many times, requires PMU access, and can emit
-scheduler-desynchronization diagnostics while converging. A successful run ends
-with "Completed analysis successfully".
+the slow finale: it runs the guest many times. The portable default explores
+syscall-boundary schedules; set ANALYZE_PREEMPTION_TIMEOUT=400000 to add precise
+PMU preemption. A successful run ends with "Completed analysis successfully".
 
 By default only the per-pass search progress and the final result are shown;
 run with DEMO_VERBOSE=1 for the full analyze diagnostics.
@@ -39,8 +39,9 @@ demo_banner "Build a debug guest so the report can resolve source locations"
 ( cd "$HERMIT_REPO" && cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race )
 export HELLO_RACE_DEBUG="$HERMIT_REPO/target/debug/hello_race"
 export ANALYSIS_REPORT="$DEMO_ARTIFACTS/hello-race-analysis.json"
+export ANALYZE_PREEMPTION_TIMEOUT="${ANALYZE_PREEMPTION_TIMEOUT:-disabled}"
 
-demo_banner "Search and bisect schedules (needs PMU; up to 10 minutes)"
+demo_banner "Search and bisect schedules (up to 10 minutes)"
 # hermit analyze writes its search progress AND its convergence diagnostics
 # (endpoint verification, Needleman-Wunsch fallbacks, jitter checks, sub-event
 # refinement skips, ...) straight to stderr with eprintln!, not through the log
@@ -75,7 +76,7 @@ run_analyze() {
     --report-file="$ANALYSIS_REPORT" \
     --analyze-seed=0 \
     --search -- \
-    --chaos --summary --preemption-timeout=400000 -- \
+    --chaos --summary --preemption-timeout="$ANALYZE_PREEMPTION_TIMEOUT" -- \
     "$HELLO_RACE_DEBUG"
 }
 
@@ -92,6 +93,7 @@ demo_banner "Report the two critical adjacent events"
 "$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["header"]); print("critical events:", d["critical_event1"]["event_index"], d["critical_event2"]["event_index"])' "$ANALYSIS_REPORT"
 
 echo
-echo "Event numbers can vary with the binary and Hermit revision; the source-level"
-echo "diagnosis (the racy access in flaky-tests/hello_race.rs) is the durable result."
+echo "Event numbers can vary with the binary and Hermit revision. Portable mode"
+echo "localizes the cross-thread syscall ordering; enable precise PMU preemption"
+echo "for finer-grained source-level localization on a validated host."
 demo_success
