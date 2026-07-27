@@ -1029,7 +1029,7 @@ impl GlobalState {
         dettid: DetTid,
         action: FutexAction,
         futexid: FutexID,
-        _init_read: i32,
+        init_read: i32,
         mask: u32,
     ) -> Option<SchedValue> {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
@@ -1050,6 +1050,13 @@ impl GlobalState {
             };
             match action {
                 FutexAction::WaitRequest(maybe_timeout) => {
+                    if sched.child_tid_was_cleared(futexid, init_read) {
+                        trace!(
+                            "[detcore, dtid {}] late wait on cleared child-TID futex {:?}",
+                            dettid, futexid
+                        );
+                        return Some(SchedValue::Value(0));
+                    }
                     sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }
@@ -2103,6 +2110,60 @@ mod tests {
             response,
             Some(SchedValue::Value(value)) if value == nix::errno::Errno::EINTR as u64
         ));
+    }
+
+    #[tokio::test]
+    async fn late_child_tid_wait_after_exit_returns_spurious_wake() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let detpid = DetPid::from_raw(17);
+        let child = DetTid::from_raw(18);
+        let futex = FutexID::private(MmId::initial(detpid), 0x1000);
+        state.sched.lock().unwrap().next_turns.insert(
+            detpid,
+            ThreadNextTurn {
+                dettid: detpid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .wake_futex_child_cleartid(futex, child);
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .child_tid_was_cleared(futex, child.as_raw())
+        );
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .child_tid_was_cleared(futex, child.as_raw() + 1)
+        );
+
+        let response = state
+            .recv_futex_action(
+                reverie::Tid::from_raw(detpid.as_raw()),
+                detpid,
+                FutexAction::WaitRequest(None),
+                futex,
+                child.as_raw(),
+                u32::MAX,
+            )
+            .await;
+
+        assert!(matches!(response, Some(SchedValue::Value(0))));
+        assert!(state.sched.lock().unwrap().blocked.futex_waiters.is_empty());
     }
 
     #[test]
