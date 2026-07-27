@@ -46,7 +46,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Review proc netlink identity normalization.
+            // TODO-HUMAN-REVIEW(PR-961): Review proc netlink identity normalization.
             "/proc/net/netlink" => ProcfsKind::NetlinkSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -289,7 +289,7 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review proc netlink identity normalization.
+// TODO-HUMAN-REVIEW(PR-961): Review proc netlink identity normalization.
 fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
     const HEADER: [&str; 10] = [
         "sk", "Eth", "Pid", "Groups", "Rmem", "Wmem", "Dump", "Locks", "Drops", "Inode",
