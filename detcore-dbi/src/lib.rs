@@ -927,6 +927,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     let sysno = Sysno::from(sysnum as i32);
     let strict = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+    // TODO-HUMAN-REVIEW(PR-981): Copied DBI children cannot enter the Rust
+    // Detcore Tool, and this callback receives no syscall arguments with which
+    // to distinguish timestamp ioctls or timestamp-enabled receive buffers.
+    // Strict mode therefore fails closed for the three syscall classes that can
+    // expose native socket timestamps. Non-strict mode retains native behavior.
+    if matches!(sysno, Sysno::ioctl | Sysno::recvmsg | Sysno::recvmmsg) && strict {
+        return 1;
+    }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
@@ -1293,6 +1301,23 @@ mod tests {
         assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_keyctl), 0);
         assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_add_key), 0);
         assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_request_key), 0);
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_socket_timestamp_exposure_under_strict() {
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl), 1);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmsg), 1);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmmsg), 1);
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl), 0);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmsg), 0);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_recvmmsg), 0);
 
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
