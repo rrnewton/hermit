@@ -35,6 +35,7 @@ enum ProcfsKind {
     FileNr,
     FileMax,
     Zoneinfo,
+    InodeNr,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -57,6 +58,9 @@ impl ProcfsFile {
             "/proc/diskstats" => ProcfsKind::Diskstats,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global inode counter normalization.
+            "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
@@ -138,6 +142,7 @@ impl ProcfsFile {
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
             ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
+            ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
         });
     }
 
@@ -508,6 +513,16 @@ fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/inode-nr field policy.
+fn sanitize_inode_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\t0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -819,6 +834,12 @@ mod tests {
                 .kind,
             ProcfsKind::Zoneinfo
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::InodeNr
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -945,6 +966,14 @@ mod tests {
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
         );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review inode counter fixture coverage.
+    #[test]
+    fn inode_nr_hides_host_global_allocation_counters() {
+        assert_eq!(sanitize_inode_nr(b"13929543\t1109179\n"), b"0\t0\n");
+        assert!(sanitize_inode_nr(b"").is_empty());
     }
 
     #[test]
