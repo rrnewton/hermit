@@ -1875,10 +1875,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // effect under Hermit. Detcore replaces the Linux scheduler, exposes a
                 // single virtual CPU, and serializes guest threads, so a thread's
                 // Linux scheduling attributes (sched_getattr) and I/O priority
-                // (ioprio_set) are inert, and an advisory whole-file lock (flock) is
-                // never contended inside the serialized container. Emulated to fixed,
-                // host-independent results (see syscall_classification.rs); re-enables
-                // chrt, ionice, and flock under --strict.
+                // (ioprio_get/ioprio_set) are inert, and an advisory whole-file lock
+                // (flock) is never contended inside the serialized container.
+                // Emulated to fixed, host-independent results (see
+                // syscall_classification.rs); re-enables chrt, ionice, and flock
+                // under --strict.
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,

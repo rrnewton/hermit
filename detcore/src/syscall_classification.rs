@@ -539,17 +539,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readlinkat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
-        // These three previously fail-closed --strict (aborting real programs such
+        // These calls previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
         // computation under Hermit. Detcore replaces the Linux scheduler, presents a
         // single virtual CPU, and serializes guest threads, so a thread's I/O
-        // priority (ioprio_set) and its Linux scheduling attributes (sched_getattr)
-        // are inert, and an advisory whole-file lock (flock) is never contended
-        // within the serialized container. They are determinized to fixed,
-        // host-independent results; see the handlers in lib.rs.
+        // priority (ioprio_get/ioprio_set) and its Linux scheduling attributes
+        // (sched_getattr/sched_setattr) are inert, and an advisory whole-file lock (flock) is
+        // never contended within the serialized container. They are determinized
+        // to fixed, host-independent results; see the handlers in lib.rs.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Report fixed raw/effective I/O priority
+        // defaults without observing host block-scheduler state.
+        | Sysno::ioprio_get
         | Sysno::ioprio_set
         | Sysno::sched_getattr
         // TODO-HUMAN-REVIEW(PR-857): Review deterministic NTP and kernel-log
