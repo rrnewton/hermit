@@ -19,9 +19,9 @@ walkthrough covers six working workflows:
 
 > [!WARNING]
 >
-> Hermit is in maintenance mode. It is not a security boundary, and it does not
-> make changing files or external network responses deterministic. Record/replay
-> support is experimental and narrower than `hermit run` compatibility.
+> Hermit is not a security boundary, and it does not make changing files or
+> external network responses deterministic. Record/replay support is
+> experimental and narrower than `hermit run` compatibility.
 
 ## Requirements
 
@@ -34,11 +34,10 @@ Demo 4 defaults to syscall-boundary schedule exploration; set
 `ANALYZE_PREEMPTION_TIMEOUT=400000` to add precise PMU preemption.
 
 Install the native build dependencies on Debian/Ubuntu or
-CentOS/RHEL/Fedora, then verify that pkg-config can find both required modules:
+CentOS/RHEL/Fedora:
 
 ```bash
 make install-deps
-make check-deps
 ```
 
 `install-deps` warns before invoking `sudo` and installs `libunwind-dev`,
@@ -46,7 +45,8 @@ make check-deps
 `libunwind-devel`, `xz-devel`, and `pkgconf` on Red Hat-family
 hosts. In particular, Hermit's `unwind-sys` build requires the
 `libunwind-ptrace.pc` file; the Makefile reports that missing dependency before
-Cargo starts. Build the release Hermit binary with `make build`.
+Cargo starts and points back to `make install-deps`. Running `make` initializes
+the `hermit/` submodule when needed and builds the release Hermit binary.
 
 The demos use private temporary and ignored build-artifact directories. Demos 5
 and 6 additionally need `qemu-system-x86_64`, `qemu-img`, the Meta `manifold`
@@ -72,7 +72,6 @@ demos/
     qemu_controller.py      # deterministic in-Hermit QEMU serial/QMP controller
     qemu-assets.sh          # internal first-run kernel/initramfs helper
     qemu-snapshot.sh        # QMP, snapshot, and stable-log helpers
-  run-all.sh                # demos 1-3; demo 4 and QEMU pair are opt-in
 ```
 
 Demos 1-4 source `demos/common.sh`, which locates the `hermit/` submodule,
@@ -91,39 +90,29 @@ demo 4 only requires it when `ANALYZE_PREEMPTION_TIMEOUT` enables preemption.
 
 ## Quick Start
 
-From the workspace root, make sure the submodule is populated, then run the
-portable demos:
+Clone the demo branch, install dependencies once per host, and build Hermit:
 
 ```bash
-git submodule update --init hermit
+git clone https://github.com/rrnewton/dev-hermit.git
+cd dev-hermit
+git checkout demo
 make install-deps
-make build
-./demos/run-all.sh
+make
 ```
 
-`make install-deps` is only needed once per host. Every demo runs
-`make check-deps` before attempting a Cargo build and prints the corresponding
-package names when a required `.pc` file is unavailable.
-
-Include the slow schedule analysis at the end with:
-
-```bash
-./demos/run-all.sh --with-analyze
-```
-
-Include the QEMU boot-and-resume pair with `--with-qemu`, or use `--all` for
-all optional demos:
-
-```bash
-./demos/run-all.sh --with-qemu
-./demos/run-all.sh --all
-```
-
-Run an individual step directly, for example:
+Run each demo individually so its output and result remain easy to inspect:
 
 ```bash
 ./demos/01-deterministic-run.sh
+./demos/02-record-replay.sh
+./demos/03-chaos-concurrency.sh
+./demos/04-schedule-bisection.sh
+./demos/05-qemu-boot.py
+./demos/06-qemu-resume.py 'ls /'
 ```
+
+Demo 4 is intentionally slow. Demo 5 must complete before Demo 6 because it
+creates the baseline QEMU snapshot.
 
 Set `DEMO_SKIP_BUILD=1` to reuse an existing `hermit/target` build, or export
 `HERMIT`, `HELLO_RACE`, and `HEAP_PTRS` to point at prebuilt binaries.
