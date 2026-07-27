@@ -18,3 +18,16 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# TEMP (impl-kvm-debug-remaining-42, slot250): build KVM against local reverie main 2ce0115 + fixes.
+# Do NOT commit this patch block.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie" }
+reverie-dbi = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-dbi" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-liteinst" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-process" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-ptrace" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/reverie-syscalls" }
+safeptrace = { path = "/home/newton/work/dev-hermit/worktrees_reverie/slot250/safeptrace" }
