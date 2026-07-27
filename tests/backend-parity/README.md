@@ -45,6 +45,9 @@ threads.
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
 status, stdout, and (for determinism cases) byte-identical repeated output.
+The DBI random-source contract also compares the root thread's post-fault
+random stream byte-for-byte with a ptrace reference run; child streams remain
+backend-local because their stable thread-identity schemes differ.
 These repeat-run results are compatibility evidence, not an L1/L2 assurance
 level: the runner disables timeslicing and does not pass `--strict --verify`.
 
