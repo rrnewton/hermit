@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    SelfSched,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            "/proc/self/sched" => ProcfsKind::SelfSched,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::SelfSched => sanitize_self_sched(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,84 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/sched field policy.
+fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
+    const FLOAT_FIELDS: &[&str] = &["se.exec_start", "se.vruntime", "se.sum_exec_runtime"];
+    const INTEGER_FIELDS: &[&str] = &[
+        "se.nr_migrations",
+        "nr_switches",
+        "nr_voluntary_switches",
+        "nr_involuntary_switches",
+        "se.avg.load_sum",
+        "se.avg.runnable_sum",
+        "se.avg.util_sum",
+        "se.avg.load_avg",
+        "se.avg.runnable_avg",
+        "se.avg.util_avg",
+        "se.avg.last_update_time",
+        "se.avg.util_est",
+        "clock-delta",
+        "mm->numa_scan_seq",
+        "numa_pages_migrated",
+        "total_numa_faults",
+    ];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut core_fields_seen = [false; 3];
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let Some((left, right)) = body.split_once(':') else {
+            normalized.extend_from_slice(body.as_bytes());
+            if has_newline {
+                normalized.push(b'\n');
+            }
+            continue;
+        };
+        let label = left.trim();
+        let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
+        {
+            let Ok(value) = right.trim().parse::<f64>() else {
+                return contents.to_vec();
+            };
+            if !value.is_finite() || value.is_sign_negative() {
+                return contents.to_vec();
+            }
+            core_fields_seen[index] = true;
+            Some("0.000000")
+        } else if INTEGER_FIELDS.contains(&label) {
+            if right.trim().parse::<u128>().is_err() {
+                return contents.to_vec();
+            }
+            Some("0")
+        } else {
+            None
+        };
+
+        if let Some(value) = replacement {
+            normalized.extend_from_slice(left.as_bytes());
+            normalized.extend_from_slice(b": ");
+            normalized.extend_from_slice(value.as_bytes());
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+
+    if core_fields_seen.iter().all(|seen| *seen) {
+        normalized
+    } else {
+        contents.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +422,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/sched"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SelfSched
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +520,45 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn self_sched_hides_host_scheduler_accounting() {
+        let contents = b"cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n\
+nr_switches : 149\n\
+se.avg.load_avg : 749\n\
+policy : 0\n";
+
+        assert_eq!(
+            sanitize_self_sched(contents),
+            b"cat (3, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n\
+nr_switches : 0\n\
+se.avg.load_avg : 0\n\
+policy : 0\n"
+        );
+    }
+
+    #[test]
+    fn self_sched_leaves_unknown_formats_untouched() {
+        let missing_core_field = b"se.exec_start : 1.0\nse.vruntime : 2.0\n";
+        assert_eq!(sanitize_self_sched(missing_core_field), missing_core_field);
+
+        let invalid_counter = b"se.exec_start : NaN\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n";
+        assert_eq!(sanitize_self_sched(invalid_counter), invalid_counter);
+
+        let negative_counter = b"se.exec_start : 1.0\n\
+se.vruntime : 2.0\n\
+se.sum_exec_runtime : 3.0\n\
+nr_switches : -1\n";
+        assert_eq!(sanitize_self_sched(negative_counter), negative_counter);
     }
 
     #[test]
