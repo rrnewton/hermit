@@ -2929,8 +2929,12 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe vmstat /usr/bin/vmstat -s \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    local top_home="$VALIDATION_TMP_DIR/top-home"
+    local top_config_home="$top_home/.config"
+    mkdir -p "$top_config_home/procps"
     # shellcheck disable=SC2016
-    strict_compatibility_probe top bash -c \
+    strict_compatibility_probe top /usr/bin/env \
+        "HOME=$top_home" "XDG_CONFIG_HOME=$top_config_home" /bin/bash -c \
         'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf "top-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Signal zero checks deterministic guest-process existence without
