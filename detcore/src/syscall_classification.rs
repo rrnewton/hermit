@@ -385,6 +385,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // record/replay; unsupported endpoint types receive ENOSYS so callers can
         // fall back to determinized read/write loops.
         | Sysno::sendfile
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic EPERM for host-global
+        // process accounting and cross-process memory access. Detcore does not
+        // model host process-accounting state or translate/synchronize target
+        // address spaces for process_vm_readv/writev. Forwarding these calls
+        // would expose host capabilities, PIDs, lifetimes, and memory, so the
+        // deterministic container refuses them at its process boundary.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::acct
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::process_vm_readv
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::process_vm_writev
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -596,8 +609,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::acct
-        | Sysno::add_key
+        Sysno::add_key
         | Sysno::adjtimex
         | Sysno::bpf
         | Sysno::cachestat
@@ -627,8 +639,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
-        | Sysno::process_vm_readv
-        | Sysno::process_vm_writev
         | Sysno::ptrace
         | Sysno::pwritev
         | Sysno::pwritev2
@@ -850,6 +860,27 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Deterministic process-isolation refusal set.
+/// Host-global process accounting and cross-process memory operations that
+/// Detcore deliberately refuses. `acct` mutates system-wide accounting and
+/// writes to a host-selected file. `process_vm_readv` and `process_vm_writev`
+/// address another process through host PIDs and lifetime/permission state that
+/// Detcore does not model. A fixed `EPERM` enforces the guest process boundary,
+/// does not depend on host capabilities or Yama/LSM policy, and never exposes or
+/// mutates host process state.
+pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::acct
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::process_vm_readv
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::process_vm_writev
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,7 +897,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [226, 91, 56]);
+        assert_eq!(counts, [229, 91, 53]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1289,6 +1320,34 @@ mod tests {
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn process_isolation_syscalls_are_determinized_and_consistent() {
+        let refused = [
+            Sysno::acct,
+            Sysno::process_vm_readv,
+            Sysno::process_vm_writev,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic EPERM refusal)"
+            );
+            assert!(
+                is_process_isolation_refused_syscall(sysno),
+                "{sysno:?} should be in the process-isolation refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_process_isolation_refused_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} process-isolation helper membership is inconsistent"
+            );
         }
     }
 

@@ -158,6 +158,7 @@ use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_process_isolation_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscalls::helpers::with_guest_rip;
@@ -1363,6 +1364,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // the Sysno before the typed match below.
             SyscallClassification::Determinized
                 if is_privileged_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Enforce a deterministic boundary
+            // around host-global process accounting and cross-process memory.
+            SyscallClassification::Determinized
+                if is_process_isolation_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::EPERM))
             }
