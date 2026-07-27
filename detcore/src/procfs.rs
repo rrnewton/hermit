@@ -22,6 +22,25 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    CppcFeedback,
+}
+
+fn is_cppc_feedback_path(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    let Some("feedback_ctrs") = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some("acpi_cppc") = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpu) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    let Some(cpu_number) = cpu.strip_prefix("cpu") else {
+        return false;
+    };
+
+    !cpu_number.is_empty() && cpu_number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -56,6 +75,9 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
+            other if is_cppc_feedback_path(Path::new(other)) => ProcfsKind::CppcFeedback,
             _ => return None,
         };
         Some(Self {
@@ -87,6 +109,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +255,36 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback counter values.
+fn sanitize_cppc_feedback(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let body = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let Ok(text) = std::str::from_utf8(body) else {
+        return contents.to_vec();
+    };
+    let mut fields = text.split_whitespace();
+    let (Some(reference), Some(delivered), None) = (fields.next(), fields.next(), fields.next())
+    else {
+        return contents.to_vec();
+    };
+    let valid_reference = reference
+        .strip_prefix("ref:")
+        .is_some_and(|value| value.parse::<u64>().is_ok());
+    let valid_delivered = delivered
+        .strip_prefix("del:")
+        .is_some_and(|value| value.parse::<u64>().is_ok());
+    if !valid_reference || !valid_delivered {
+        return contents.to_vec();
+    }
+
+    let mut normalized = b"ref:0 del:0".to_vec();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -369,6 +422,45 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_numbered_cpu_cppc_feedback() {
+        for path in [
+            "cpu0/acpi_cppc/feedback_ctrs",
+            "/sys/devices/system/cpu/cpu315/acpi_cppc/feedback_ctrs",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CppcFeedback
+            );
+        }
+
+        for path in [
+            "cpu/acpi_cppc/feedback_ctrs",
+            "gpu0/acpi_cppc/feedback_ctrs",
+            "cpu0/acpi_cppc/highest_perf",
+            "cpu0/feedback_ctrs",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn cppc_feedback_counters_are_fixed() {
+        assert_eq!(
+            sanitize_cppc_feedback(b"ref:222494767542210 del:411574706774324\n"),
+            b"ref:0 del:0\n"
+        );
+        assert_eq!(sanitize_cppc_feedback(b"ref:123 del:456"), b"ref:0 del:0");
+        for malformed in [
+            b"ref:abc del:456\n".as_slice(),
+            b"ref:123 delivered:456\n",
+            b"ref:123\n",
+            b"ref:123 del:456 extra\n",
+        ] {
+            assert_eq!(sanitize_cppc_feedback(malformed), malformed);
+        }
     }
 
     #[test]
