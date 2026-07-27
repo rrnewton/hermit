@@ -1901,7 +1901,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-TBD)
+                // TODO-HUMAN-REVIEW(PR-901)
                 Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,

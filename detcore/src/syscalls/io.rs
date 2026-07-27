@@ -267,7 +267,7 @@ fn socket_timestamp_messages(control: &[u8]) -> Vec<(usize, SocketTimestampKind)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD)
+// TODO-HUMAN-REVIEW(PR-901)
 fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize {
     let messages = socket_timestamp_messages(control);
     let timespec = libc::timespec {
@@ -1041,7 +1041,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD)
+    // TODO-HUMAN-REVIEW(PR-901)
     /// Receive one message and replace host socket timestamps with logical time.
     pub async fn handle_recvmsg<G: Guest<Self>>(
         &self,
