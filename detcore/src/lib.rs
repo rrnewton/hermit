@@ -1437,7 +1437,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Guest performance events
+            // TODO-HUMAN-REVIEW(PR-876): Guest performance events
             // expose host PMU availability, policy, and asynchronous counter
             // state that Detcore does not model. A fixed ENOSYS preserves the
             // portable feature-probe fallback without creating an untracked fd.

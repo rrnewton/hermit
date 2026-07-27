@@ -383,7 +383,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic
+        // TODO-HUMAN-REVIEW(PR-876): Review the deterministic
         // feature-absence boundary for guest performance monitoring.
         | Sysno::perf_event_open
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1056,7 +1056,7 @@ pub(crate) const fn is_privileged_observation_refused_syscall(sysno: Sysno) -> b
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic feature-absence
+// TODO-HUMAN-REVIEW(PR-876): Review the deterministic feature-absence
 // boundary for guest performance monitoring.
 /// Performance monitoring depends on host PMU hardware, kernel configuration,
 /// `perf_event_paranoid`, and process capabilities. Detcore does not model
