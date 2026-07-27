@@ -66,6 +66,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
     NodeVmstat,
+    BtrfsCommitStats,
 }
 
 const THP_COUNTERS: &[&str] = &[
@@ -279,6 +280,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review Btrfs commit telemetry normalization.
+            _ if is_btrfs_commit_stats_path(path) => ProcfsKind::BtrfsCommitStats,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
             // like `lscpu` under `--verify`. These are opened relative to a
@@ -370,6 +374,7 @@ impl ProcfsFile {
             ProcfsKind::Locks => sanitize_locks(&contents),
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
+            ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
         });
     }
 
@@ -1678,6 +1683,76 @@ fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn is_btrfs_commit_stats_path(path: &Path) -> bool {
+    if path.file_name().and_then(|leaf| leaf.to_str()) != Some("commit_stats") {
+        return false;
+    }
+    let Some(filesystem_directory) = path.parent() else {
+        return false;
+    };
+    let Some(uuid) = filesystem_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    is_lowercase_uuid(uuid) && filesystem_directory.parent() == Some(Path::new("/sys/fs/btrfs"))
+}
+
+fn is_lowercase_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the Btrfs commit_stats field policy.
+fn sanitize_btrfs_commit_stats(contents: &[u8]) -> Vec<u8> {
+    const LABELS: &[&str] = &[
+        "commits",
+        "cur_commit_ms",
+        "last_commit_ms",
+        "max_commit_ms",
+        "total_commit_ms",
+    ];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let has_newline = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let lines = body.split('\n').collect::<Vec<_>>();
+    if lines.len() != LABELS.len() {
+        return contents.to_vec();
+    }
+
+    for (line, expected_label) in lines.iter().zip(LABELS) {
+        let mut fields = line.split_whitespace();
+        let (Some(label), Some(value), None) = (fields.next(), fields.next(), fields.next()) else {
+            return contents.to_vec();
+        };
+        if label != *expected_label || value.parse::<u64>().is_err() {
+            return contents.to_vec();
+        }
+    }
+
+    let mut normalized = LABELS
+        .iter()
+        .map(|label| format!("{label} 0"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1897,7 +1972,33 @@ mod tests {
             );
         }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/commit_stats"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::BtrfsCommitStats
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        assert!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/fs/btrfs/004B7924-9DF8-4EC2-AEA0-D9775554E1BA/commit_stats"
+            ))
+            .is_none()
+        );
+        assert!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/generation"
+            ))
+            .is_none()
+        );
+        assert!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/nested/commit_stats"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -2364,6 +2465,23 @@ RAW 1008 0 -1 NI 0 yes kernel y y\n"
     }
 
     #[test]
+    fn btrfs_commit_stats_hides_host_commit_telemetry() {
+        let contents = b"commits 14545\n\
+cur_commit_ms 3\n\
+last_commit_ms 211\n\
+max_commit_ms 1977796\n\
+total_commit_ms 11281713\n";
+        assert_eq!(
+            sanitize_btrfs_commit_stats(contents),
+            b"commits 0\n\
+cur_commit_ms 0\n\
+last_commit_ms 0\n\
+max_commit_ms 0\n\
+total_commit_ms 0\n"
+        );
+    }
+
+    #[test]
     fn schedstat_hides_host_scheduler_accounting() {
         let contents = b"version 17\n\
 timestamp 4671819092\n\
@@ -2643,6 +2761,18 @@ nr_switches : -1\n";
             b"0: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\nREDACTED\n"
         );
         assert!(sanitize_locks(b"").is_empty());
+    }
+
+    #[test]
+    fn btrfs_commit_stats_leaves_unknown_formats_untouched() {
+        let wrong_order = b"cur_commit_ms 3\ncommits 14545\n";
+        assert_eq!(sanitize_btrfs_commit_stats(wrong_order), wrong_order);
+
+        let invalid_value = b"commits many\ncur_commit_ms 3\nlast_commit_ms 211\nmax_commit_ms 7\ntotal_commit_ms 9\n";
+        assert_eq!(sanitize_btrfs_commit_stats(invalid_value), invalid_value);
+
+        let extra_field = b"commits 1 transactions\ncur_commit_ms 3\nlast_commit_ms 2\nmax_commit_ms 7\ntotal_commit_ms 9\n";
+        assert_eq!(sanitize_btrfs_commit_stats(extra_field), extra_field);
     }
 
     #[test]
