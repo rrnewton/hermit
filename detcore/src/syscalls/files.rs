@@ -1441,7 +1441,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic SO_COOKIE identities.
+        // TODO-HUMAN-REVIEW(PR-886): Review deterministic SO_COOKIE identities.
         let deterministic_cookie =
             if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_COOKIE {
                 let requested_length = call
