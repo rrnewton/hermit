@@ -22,6 +22,7 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    SelfSchedstat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +45,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
         });
         self.offset = 0;
     }
@@ -298,6 +303,24 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/schedstat field policy.
+fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields.iter().any(|field| field.parse::<u64>().is_err()) {
+        return contents.to_vec();
+    }
+
+    if text.ends_with('\n') {
+        b"0 0 0\n".to_vec()
+    } else {
+        b"0 0 0".to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +362,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/schedstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SelfSchedstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -431,6 +460,24 @@ TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
         );
+    }
+
+    #[test]
+    fn self_schedstat_hides_host_scheduler_accounting() {
+        assert_eq!(
+            sanitize_self_schedstat(b"3029609 1559338 150\n"),
+            b"0 0 0\n"
+        );
+        assert_eq!(sanitize_self_schedstat(b"3029609 1559338 150"), b"0 0 0");
+    }
+
+    #[test]
+    fn self_schedstat_leaves_unknown_formats_untouched() {
+        let extra_field = b"3029609 1559338 150 4\n";
+        assert_eq!(sanitize_self_schedstat(extra_field), extra_field);
+
+        let invalid_counter = b"3029609 waiting 150\n";
+        assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
     }
 
     #[test]
