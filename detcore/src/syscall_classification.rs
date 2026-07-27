@@ -84,6 +84,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getcpu
         | Sysno::getdents
         | Sysno::getdents64
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-XXX): Query the logical one-shot ITIMER_REAL state.
+        | Sysno::getitimer
         | Sysno::getrandom
         | Sysno::getrusage
         | Sysno::gettimeofday
@@ -376,13 +379,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // priority (ioprio_set) and its Linux scheduling attributes (sched_getattr)
         // are inert, and an advisory whole-file lock (flock) is never contended
         // within the serialized container. They are determinized to fixed,
-        // host-independent results; see the handlers in lib.rs. sched_setattr and
-        // ioprio_get remain Unsupported until a task owns their write/read pair.
+        // host-independent results; see the handlers in lib.rs.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
         | Sysno::sched_getattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-XXX): Return the fixed virtual default I/O priority.
+        | Sysno::ioprio_get
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-XXX): Linux scheduler attributes are inoperative under Detcore.
+        | Sysno::sched_setattr
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2(2) is a modern superset of
         // openat(2); callers are required to fall back to openat on ENOSYS
@@ -592,8 +600,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
-        | Sysno::getitimer
-        | Sysno::ioprio_get
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::listmount
@@ -620,7 +626,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::semctl
         | Sysno::semget
@@ -852,7 +857,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [223, 91, 59]);
+        assert_eq!(counts, [226, 91, 56]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -909,12 +914,14 @@ mod tests {
             SyscallClassification::Determinized
         );
         // BATCH 51: these previously fail-closed --strict; now determinized.
-        for sysno in [Sysno::flock, Sysno::ioprio_set, Sysno::sched_getattr] {
+        for sysno in [
+            Sysno::flock,
+            Sysno::ioprio_get,
+            Sysno::ioprio_set,
+            Sysno::sched_getattr,
+            Sysno::sched_setattr,
+        ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
-        }
-        // Their read/write siblings deliberately remain Unsupported for now.
-        for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
@@ -938,6 +945,7 @@ mod tests {
             Sysno::getpeername,
             Sysno::getsockname,
             Sysno::getsockopt,
+            Sysno::getitimer,
             Sysno::getpriority,
             Sysno::getrlimit,
             Sysno::kill,
