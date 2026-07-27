@@ -431,7 +431,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // callers take their portable read/write fallback.
         | Sysno::copy_file_range
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Strict-mode ENOSYS for zero-copy pipe
+        // TODO-HUMAN-REVIEW(PR-855): Strict-mode ENOSYS for zero-copy pipe
         // transfers. Detcore does not model kernel pipe-buffer ownership or
         // vmsplice page pinning. Fail-closed runs expose the portable fallback
         // boundary; legacy non-strict runs retain record/replay pass-through.
@@ -1015,7 +1015,7 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Strict zero-copy pipe fallback set.
+// TODO-HUMAN-REVIEW(PR-855): Strict zero-copy pipe fallback set.
 /// Linux zero-copy pipe transfers. Their observable blocking and buffer
 /// ownership depend on kernel pipe state, while `vmsplice` can additionally
 /// pin guest pages beyond the syscall boundary. Strict/fail-closed runs return
