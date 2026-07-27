@@ -41,7 +41,7 @@ fn find_program(case: &ProgramCase) -> PathBuf {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review strict verification coverage for inode-state.
+// TODO-HUMAN-REVIEW(PR-923): Review strict verification coverage for inode-state.
 #[test]
 fn inode_state_consumers_verify() {
     assert!(

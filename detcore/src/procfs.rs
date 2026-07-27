@@ -43,7 +43,7 @@ impl ProcfsFile {
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review host-global inode-state normalization.
+            // TODO-HUMAN-REVIEW(PR-923): Review host-global inode-state normalization.
             "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
@@ -254,7 +254,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the /proc/sys/fs/inode-state field policy.
+// TODO-HUMAN-REVIEW(PR-923): Review the /proc/sys/fs/inode-state field policy.
 fn sanitize_inode_state(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -439,7 +439,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review inode-state fixture coverage.
+    // TODO-HUMAN-REVIEW(PR-923): Review inode-state fixture coverage.
     #[test]
     fn inode_state_hides_host_global_cache_counters() {
         assert_eq!(
