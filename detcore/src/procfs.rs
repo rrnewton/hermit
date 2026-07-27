@@ -22,6 +22,36 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    BtrfsBytesMayUse,
+}
+
+fn is_btrfs_bytes_may_use_path(path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix("/sys/fs/btrfs") else {
+        return false;
+    };
+    let mut components = relative.iter();
+    let (Some(uuid), Some("allocation"), Some(class), Some("bytes_may_use"), None) = (
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next().and_then(|part| part.to_str()),
+        components.next(),
+    ) else {
+        return false;
+    };
+
+    is_btrfs_uuid(uuid) && matches!(class, "data" | "metadata" | "system")
+}
+
+fn is_btrfs_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -56,6 +86,9 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
+            other if is_btrfs_bytes_may_use_path(Path::new(other)) => ProcfsKind::BtrfsBytesMayUse,
             _ => return None,
         };
         Some(Self {
@@ -87,6 +120,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
         });
         self.offset = 0;
     }
@@ -232,6 +266,22 @@ fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-957): Review Btrfs bytes_may_use normalization.
+fn sanitize_btrfs_bytes_may_use(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -369,6 +419,37 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_btrfs_reservation_gauges() {
+        const UUID: &str = "63152d54-3f28-408a-80a2-46e53b5c0bda";
+        for class in ["data", "metadata", "system"] {
+            let path = format!("/sys/fs/btrfs/{UUID}/allocation/{class}/bytes_may_use");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::BtrfsBytesMayUse
+            );
+        }
+
+        for path in [
+            "/sys/fs/btrfs/63152D54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_may_use",
+            "/sys/fs/btrfs/not-a-uuid/allocation/data/bytes_may_use",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/global/bytes_may_use",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_used",
+            "/tmp/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_may_use",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn btrfs_reservation_gauge_is_fixed() {
+        assert_eq!(sanitize_btrfs_bytes_may_use(b"58974208\n"), b"0\n");
+        assert_eq!(sanitize_btrfs_bytes_may_use(b"58974208"), b"0");
+        for malformed in [b"".as_slice(), b"-1\n", b"123 456\n", b"unknown\n"] {
+            assert_eq!(sanitize_btrfs_bytes_may_use(malformed), malformed);
+        }
     }
 
     #[test]
