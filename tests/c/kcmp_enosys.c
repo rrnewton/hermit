@@ -14,19 +14,23 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#ifndef SYS_pidfd_open
-#define SYS_pidfd_open 434
+#ifndef SYS_kcmp
+#define SYS_kcmp 312
+#endif
+
+#ifndef KCMP_FILES
+#define KCMP_FILES 2
 #endif
 
 int main(void) {
+  pid_t self = getpid();
   errno = 0;
-  long result = syscall(SYS_pidfd_open, 1, 0U);
+  long result = syscall(SYS_kcmp, self, self, KCMP_FILES, 0UL, 0UL);
   if (result != -1 || errno != ENOSYS) {
-    fprintf(stderr,
-            "pidfd_open returned %ld with errno %d (%s), expected ENOSYS\n",
+    fprintf(stderr, "kcmp returned %ld with errno %d (%s), expected ENOSYS\n",
             result, errno, strerror(errno));
     return 1;
   }
-  puts("pidfd_open deterministically unavailable");
+  puts("kcmp deterministically unavailable");
   return 0;
 }

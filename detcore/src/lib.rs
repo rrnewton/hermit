@@ -155,7 +155,7 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
-use crate::syscall_classification::is_guest_pidfd_syscall;
+use crate::syscall_classification::is_guest_process_handle_refused_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -1364,11 +1364,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Detcore has no guest-pidfd model, so
-            // refuse pidfd_open, pidfd_getfd, and pidfd_send_signal with the
-            // portable feature-absence errno instead of exposing host process
-            // lifetimes, descriptor tables, permissions, or signal delivery.
-            SyscallClassification::Determinized if is_guest_pidfd_syscall(call.number()) => {
+            // TODO-HUMAN-REVIEW(PR-TBD): Detcore has no deterministic model for
+            // kcmp resource identity, descriptor access through pidfd_getfd, or
+            // pidfd_send_signal delivery. Return the portable feature-absence
+            // errno instead of exposing host process state.
+            SyscallClassification::Determinized
+                if is_guest_process_handle_refused_syscall(call.number()) =>
+            {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED

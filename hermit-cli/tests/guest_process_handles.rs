@@ -27,15 +27,15 @@ fn command_output(mut command: Command, label: &str) -> Output {
 }
 
 #[test]
-fn guest_pidfd_syscalls_fall_back_deterministically() {
+fn guest_process_handle_syscalls_fall_back_deterministically() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("guest-pidfds");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("guest-process-handles");
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [
-        ("pidfd_open", repository.join("tests/c/pidfd_open_enosys.c")),
+        ("kcmp", repository.join("tests/c/kcmp_enosys.c")),
         (
             "pidfd_getfd",
             repository.join("tests/c/pidfd_getfd_enosys.c"),
