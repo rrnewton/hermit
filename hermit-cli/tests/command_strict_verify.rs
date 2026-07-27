@@ -320,9 +320,9 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "sar disk",
-            candidates: &["/usr/bin/sar"],
-            args: &["-d", "1", "1"],
+            name: "vmstat disk",
+            candidates: &["/usr/bin/vmstat"],
+            args: &["-d", "1", "2"],
             stdin: None,
         },
         StrictCommandCase {

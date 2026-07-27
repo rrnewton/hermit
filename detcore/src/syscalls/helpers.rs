@@ -167,60 +167,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-id): Review deterministic scalar blocking-pipe completion.
-    /// Complete a logically blocking pipe write after Hermit has made the pipe
-    /// physically nonblocking. Fixed PIPE_BUF-sized attempts prevent host pipe
-    /// occupancy from leaking through guest-visible positive short writes. A
-    /// one-turn yield after each physical write gives the paired reader a stable
-    /// opportunity to drain the chunk before the next attempt.
-    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Write,
-    ) -> Result<i64, Error> {
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
-        const PIPE_BUF: usize = 4096;
-
-        let target = call.len().min(MAX_RW_COUNT);
-        if target == 0 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        }
-        let Some(base) = call.buf() else {
-            return Err(Errno::EFAULT.into());
-        };
-        let mut written_total = 0usize;
-
-        while written_total < target {
-            let chunk_len = (target - written_total).min(PIPE_BUF);
-            let chunk_addr = base
-                .as_raw()
-                .checked_add(written_total)
-                .and_then(Addr::<u8>::from_raw)
-                .ok_or(Errno::EFAULT)?;
-            let chunk = call.with_buf(Some(chunk_addr)).with_len(chunk_len);
-            match self.execute_nonblockable_fd_syscall(guest, chunk).await {
-                Ok(written) if written > 0 => {
-                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
-                    if written > chunk_len {
-                        return Err(Errno::EIO.into());
-                    }
-                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
-                    if self.cfg.sequentialize_threads {
-                        let request = Self::sched_yield_request(guest);
-                        resource_request(guest, request).await;
-                    }
-                }
-                Ok(0) => return Ok(written_total as i64),
-                Err(_) if written_total > 0 => return Ok(written_total as i64),
-                Err(error) => return Err(error),
-                Ok(_) => return Err(Errno::EIO.into()),
-            }
-        }
-
-        Ok(written_total as i64)
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
     /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
     /// nonblocking. A positive short write is an implementation artifact here: without

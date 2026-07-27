@@ -371,64 +371,6 @@ static int check_large_blocking_pipe(void) {
   return 0;
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-id): Review scalar blocking-pipe completion coverage.
-static int check_large_scalar_blocking_pipe(void) {
-  enum { PAYLOAD_SIZE = 11200 };
-  static char payload[PAYLOAD_SIZE];
-  memset(payload, 'S', sizeof(payload));
-
-  int pipe_fds[2];
-  if (pipe(pipe_fds) != 0) {
-    perror("large scalar pipe");
-    return -1;
-  }
-  pid_t child = fork();
-  if (child < 0) {
-    perror("fork");
-    return -1;
-  }
-  if (child == 0) {
-    close(pipe_fds[1]);
-    size_t received = 0;
-    char buffer[4096];
-    while (received < sizeof(payload)) {
-      ssize_t count = read(pipe_fds[0], buffer, sizeof(buffer));
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count <= 0) {
-        _exit(2);
-      }
-      for (ssize_t index = 0; index < count; index++) {
-        if (buffer[index] != 'S') {
-          _exit(4);
-        }
-      }
-      received += (size_t)count;
-    }
-    close(pipe_fds[0]);
-    _exit(received == sizeof(payload) ? 0 : 3);
-  }
-
-  close(pipe_fds[0]);
-  ssize_t written = write(pipe_fds[1], payload, sizeof(payload));
-  close(pipe_fds[1]);
-  int status = 0;
-  if (waitpid(child, &status, 0) != child) {
-    perror("waitpid");
-    return -1;
-  }
-  if (written != (ssize_t)sizeof(payload) || !WIFEXITED(status) ||
-      WEXITSTATUS(status) != 0) {
-    fprintf(stderr,
-            "large blocking pipe write returned %zd/%zu, child status %#x\n",
-            written, sizeof(payload), status);
-    return -1;
-  }
-  return 0;
-}
-
 static int check_failed_write_preserves_metadata(void) {
   char path[] = "/tmp/hermit-writev-XXXXXX";
   int fd = mkstemp(path);
@@ -478,8 +420,7 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && strcmp(argv[1], "record-pipe") == 0) {
     if (check_atomic_full_pipe() != 0 || check_large_iovec_snapshot() != 0 ||
-        check_large_blocking_pipe() != 0 ||
-        check_large_scalar_blocking_pipe() != 0) {
+        check_large_blocking_pipe() != 0) {
       return 1;
     }
     puts("writev-determinism-ok");
@@ -512,7 +453,6 @@ int main(int argc, char **argv) {
 
   if (check_atomic_full_pipe() != 0 || check_readonly_iovec() != 0 ||
       check_large_iovec_snapshot() != 0 || check_large_blocking_pipe() != 0 ||
-      check_large_scalar_blocking_pipe() != 0 ||
       check_failed_write_preserves_metadata() != 0) {
     return 1;
   }

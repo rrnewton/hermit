@@ -2853,7 +2853,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe iostat /usr/bin/iostat -d -x 1 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sar-disk /usr/bin/sar -d 1 1 \
+    strict_compatibility_probe vmstat-disk /usr/bin/vmstat -d 1 2 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pidstat-disk /usr/bin/pidstat -d -p 1 1 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
