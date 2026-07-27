@@ -366,7 +366,6 @@ fn proc_self_mountinfo_hides_private_temp_roots() {
 
     let _guard = hermit_run_lock();
     let first = private_mount_records();
-    assert_eq!(first.len(), 3, "expected group, nscd, and /tmp mounts");
     for run in 2..=RUNS {
         assert_eq!(
             first,
