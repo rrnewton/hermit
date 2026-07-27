@@ -53,6 +53,9 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
 }
 
+// Hermit exposes exactly one isolated guest network namespace.
+const DETERMINISTIC_NETNS_COOKIE: u64 = 1;
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     async fn inject_fstat<G: Guest<Self>>(
@@ -1441,7 +1444,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        // TODO-HUMAN-REVIEW(PR-TBD): Review deterministic network-namespace identity.
+        let requested_length =
+            if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_NETNS_COOKIE {
+                let fd_type = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.ty())?;
+                if fd_type == FdType::Socket {
+                    call.optlen()
+                        .map(|length| guest.memory().read_value(length))
+                        .transpose()?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let result = self.record_or_replay(guest, call).await?;
+        if let Some(requested_length) = requested_length
+            && let Some(value) = call.optval()
+        {
+            let bytes = DETERMINISTIC_NETNS_COOKIE.to_ne_bytes();
+            let write_length = (requested_length as usize).min(bytes.len());
+            guest
+                .memory()
+                .write_exact(value.cast(), &bytes[..write_length])?;
+        }
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
