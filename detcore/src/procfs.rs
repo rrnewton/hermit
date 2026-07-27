@@ -199,7 +199,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-917): Review host RTC normalization.
             "/proc/driver/rtc" => ProcfsKind::Rtc,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-id): Review per-process host scheduler normalization.
+            // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
             "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
@@ -1284,7 +1284,7 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     normalized
 }
 
-// TODO-HUMAN-REVIEW(PR-id): Review the /proc/self/schedstat field policy.
+// TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
 fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
