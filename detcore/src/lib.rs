@@ -1378,7 +1378,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-TBD): Enforce a deterministic boundary
+            // TODO-HUMAN-REVIEW(PR-844): Enforce a deterministic boundary
             // around host-global process accounting and cross-process memory.
             SyscallClassification::Determinized
                 if is_process_isolation_refused_syscall(call.number()) =>

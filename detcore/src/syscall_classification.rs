@@ -398,7 +398,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // fall back to determinized read/write loops.
         | Sysno::sendfile
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TBD): Deterministic EPERM for host-global
+        // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
         // process accounting and cross-process memory access. Detcore does not
         // model host process-accounting state or translate/synchronize target
         // address spaces for process_vm_readv/writev. Forwarding these calls
@@ -870,7 +870,7 @@ pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Deterministic process-isolation refusal set.
+// TODO-HUMAN-REVIEW(PR-844): Deterministic process-isolation refusal set.
 /// Host-global process accounting and cross-process memory operations that
 /// Detcore deliberately refuses. `acct` mutates system-wide accounting and
 /// writes to a host-selected file. `process_vm_readv` and `process_vm_writev`
