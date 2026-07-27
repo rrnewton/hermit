@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$DEMO_DIR/.." && pwd)"
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || printf '%s' /usr/sbin/busybox)}"
