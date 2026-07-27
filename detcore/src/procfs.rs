@@ -27,6 +27,9 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review host swap-usage normalization.
+    Swaps,
     Smaps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
@@ -117,6 +120,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            "/proc/swaps" => ProcfsKind::Swaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             "/proc/self/smaps" => ProcfsKind::Smaps,
@@ -205,6 +209,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
@@ -527,6 +532,48 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     } else {
         format!("{virtual_uptime_seconds}.00 0.00\n").into_bytes()
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the zeroed /proc/swaps Used column policy.
+fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
+    const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut lines = text.split_inclusive('\n');
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    if !header.split_whitespace().eq(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    normalized.extend_from_slice(header.as_bytes());
+    for line in lines {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        let [filename, swap_type, size, used, priority] = fields.as_slice() else {
+            return contents.to_vec();
+        };
+        if size.parse::<u64>().is_err()
+            || used.parse::<u64>().is_err()
+            || priority.parse::<i32>().is_err()
+        {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(
+            format!("{filename}\t{swap_type}\t{size}\t0\t{priority}").as_bytes(),
+        );
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1203,6 +1250,12 @@ mod tests {
                 .kind,
             ProcfsKind::DentryState
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/swaps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Swaps
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -1275,6 +1328,28 @@ mod tests {
         assert_eq!(
             sanitize_key_users(b"0: 15 15/15 15/1000000 2499/25000000 extra\n"),
             b"0: 15 15/15 15/1000000 2499/25000000 extra\n"
+        );
+    }
+
+    #[test]
+    fn swaps_preserves_configuration_and_zeros_usage() {
+        let contents = b"Filename\tType\tSize\tUsed\tPriority\n\
+/dev/nvme1n1p3 partition 2000892 0 5\n\
+/data/swapvol/swapfile file 134217724 69308912 -2\n";
+        assert_eq!(
+            sanitize_swaps(contents),
+            b"Filename\tType\tSize\tUsed\tPriority\n\
+/dev/nvme1n1p3\tpartition\t2000892\t0\t5\n\
+/data/swapvol/swapfile\tfile\t134217724\t0\t-2\n"
+        );
+        assert!(sanitize_swaps(b"").is_empty());
+        assert_eq!(
+            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"),
+            b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"
+        );
+        assert_eq!(
+            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 unknown\n"),
+            b"Filename Type Size Used Priority\n/swap file 12 unknown\n"
         );
     }
 
