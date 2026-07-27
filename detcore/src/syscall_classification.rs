@@ -361,7 +361,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic
+        // TODO-HUMAN-REVIEW(PR-882): Review the deterministic
         // feature-absence boundary for legacy nonlinear memory mappings.
         | Sysno::remap_file_pages
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -850,7 +850,7 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TO-BE-ASSIGNED): Review the deterministic feature-absence
+// TODO-HUMAN-REVIEW(PR-882): Review the deterministic feature-absence
 // boundary for legacy nonlinear memory mappings.
 /// The obsolete `remap_file_pages` interface creates nonlinear VMA layouts
 /// whose availability and implementation vary by host kernel. Detcore does not
