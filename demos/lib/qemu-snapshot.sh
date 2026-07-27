@@ -175,6 +175,7 @@ qemu_normalize_info_for_comparison() {
     -e 's/(COMMIT turn )[0-9]+/\1<turn>/' \
     -e 's/(previously committed )[0-9_.]+s/\1<virtual-time>/' \
     -e 's/(scheduler ran )[0-9]+ turns/\1<turns> turns/' \
+    -e 's/(logically_kill: Scheduler removing all knowledge of \[det\]tid )[0-9]+/\1<tid>/' \
     -e 's/^(Final virtual global \(cpu\) time:).*/\1 <virtual-time>/' \
     -e 's/^(Elapsed virtual global \(cpu\) time:).*/\1 <virtual-time>/' \
     -e 's/^Timeslice stats:.*/Timeslice stats: <normalized>/' \

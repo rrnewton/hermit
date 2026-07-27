@@ -92,7 +92,7 @@ qemu_snapshot_exists "$QEMU_SNAPSHOT_DISK" "$QEMU_SNAPSHOT_NAME" || {
 }
 
 snapshot_identity="$(cat "$QEMU_SNAPSHOT_ID_FILE")"
-info_comparison_version=2
+info_comparison_version=3
 command_key="$(printf '%s\0%s\0%s' \
   "$snapshot_identity" "$guest_command" "$info_comparison_version" \
   | sha256sum | cut -d' ' -f1)"
