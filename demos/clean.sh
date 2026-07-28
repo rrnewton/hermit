@@ -2,9 +2,10 @@
 # Wipe stale computed results from the QEMU/Linux demo suite (demos 5 and 6).
 #
 # The Python demos (05-qemu-boot.py, 06-qemu-resume.py) persist a first-run
-# "anchor" (run-metadata.json) and compare every later run against it. When the
-# Hermit binary, kernel, or demo changes, that stale anchor makes fresh runs
-# report a false PARTIAL. This script gives a one-command fresh start.
+# "anchor" (demo 5: the boot-anchor/ directory; demo 6: resume-metadata/) and
+# compare every later run against it. When the Hermit binary, kernel, or demo
+# changes, that stale anchor makes fresh runs report a false PARTIAL. This
+# script gives a one-command fresh start.
 #
 #   ./clean.sh              wipe COMPUTED RESULTS only (anchors, run history,
 #                           snapshots, runtime cruft). Keeps the kernel/rootfs
@@ -51,7 +52,10 @@ fi
 # Computed results: recreated by the next demo run. Safe to wipe for a fresh
 # start; this is what clears the stale-anchor false-PARTIAL effect.
 computed=(
-  "run-metadata.json"          # top-level boot anchor (the stale anchor)
+  "boot-anchor"                # 05-qemu-boot.py atomic first-run anchor (dir)
+  "boot-anchor.claim.lock"     # fallback anchor-claim lock (non-renameat2 FS)
+  ".work"                      # private per-run working dirs (concurrent runs)
+  "run-metadata.json"          # legacy top-level boot anchor (pre-concurrent)
   "run-history"                # 05-qemu-boot.py per-run archives
   "resume-metadata"            # 06-qemu-resume.py per-command anchors + history
   "hermit-snapshot.qcow2"      # live snapshot store written by the boot demo
@@ -60,7 +64,7 @@ computed=(
   "serial.log"                 # runtime serial capture
   "serial.sock"                # runtime QEMU serial socket
   "qmp.sock"                   # runtime QEMU QMP socket
-  ".qemu-demo.lock"            # single-writer demo lock
+  ".qemu-demo.lock"            # single-writer demo lock (demo 6)
 )
 
 # Provisioned inputs: expensive to recreate (kernel download + initramfs build).
@@ -74,6 +78,7 @@ provisioned=(
 # Transient temp files the demos/assets script may leave behind on interruption.
 transient_globs=(
   "run-metadata.json.tmp."*
+  "hermit-boot.qcow2.tmp."*
   ".bzImage."*
   ".initramfs.cpio.gz."*
   ".initramfs-version."*
