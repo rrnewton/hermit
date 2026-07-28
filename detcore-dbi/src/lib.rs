@@ -953,7 +953,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
 // TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
-// TODO-HUMAN-REVIEW(PR-1141): Review copied-process Detcore state rebasing.
+// TODO-HUMAN-REVIEW(PR-1147): Review copied-process Detcore state rebasing.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -1171,7 +1171,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 ///
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbi_runtime_thread_init`].
-// TODO-HUMAN-REVIEW(PR-1141): Review guest-safe DBI thread-exit lifecycle delivery.
+// TODO-HUMAN-REVIEW(PR-1147): Review guest-safe DBI thread-exit lifecycle delivery.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(
     scratch: *mut c_void,
