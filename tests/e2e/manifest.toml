@@ -1,0 +1,386 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# ============================================================================
+# Hermit E2E centralized test manifest  (ci-overhaul2 prototype, schema = 2)
+# ============================================================================
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Today every E2E test embeds a `HERMIT_E2E_META` JSON block inside its own
+# `.sh` wrapper (see `ci/test_harness.sh`, which greps and `jq`-validates those
+# blocks). That works but it forces one hand-written shell wrapper per test,
+# even for the 183 standalone `tests/**/*.c` guests that need nothing more than
+# "compile me, run me". It also splits the mode/backend policy across two
+# sources of truth: the per-file JSON here and the backend-parity reasons in
+# `tests/backend-parity/matrix.tsv`.
+#
+# This manifest centralizes ALL of that in one TOML file so the CI overhaul can
+# fan out mode x backend cells at maximum speed from a single parse, point
+# directly at `.c`/`.rs`/`.sh` programs without a wrapper, and record WHY each
+# backend is off for each mode in one place.
+#
+# This is schema version 2. It is a strict superset of the embedded schema 1:
+# every existing `HERMIT_E2E_META` block has a lossless representation here
+# (see the five worked examples at the bottom, which reproduce real entries).
+# Schema 2 adds two things schema 1 could not express:
+#   1. the `custom` mode (hermit with test-chosen args), and
+#   2. per-(mode, backend) disable reasons, not just a whole-mode reason.
+#
+#
+# TOP-LEVEL KEYS
+# --------------
+#   schema        (int, required)     Manifest format version. This file is 2.
+#   backends      (array[str])        Closed set of known backends, for
+#                                     validation. Must stay in sync with the
+#                                     `BACKENDS` array in ci/test_harness.sh:
+#                                     ptrace, dbi, kvm, sabre, liteinst.
+#                                     `ptrace` is the default/best-tested path.
+#   modes         (array[str])        Closed set of known modes, for validation:
+#                                     naked, verify, replay, chaos, custom.
+#
+#
+# PER-TEST ENTRY  ([[test]])
+# --------------------------
+# One `[[test]]` table per program. Fields:
+#
+#   id                (str, required, unique)  Stable "category/name" id, e.g.
+#                                              "determinism-stress/order-violation".
+#   program           (str, required)          Repo-relative path to the entry
+#                                              point. Its extension is informational;
+#                                              `type` is authoritative.
+#   type              (str, required)          One of:
+#                                                "sh" - a shell wrapper exposing
+#                                                       `--prepare` / `--run`
+#                                                       (schema-1 style; full control).
+#                                                "c"  - a standalone C guest. The
+#                                                       harness compiles it
+#                                                       (`cc -std=c11 -O2 -pthread`
+#                                                       by default; override with
+#                                                       `compile`) and runs the
+#                                                       resulting binary. No wrapper.
+#                                                "rs" - a standalone Rust guest,
+#                                                       built with `rustc` (or the
+#                                                       `compile` override) and run.
+#   category          (str, required)          Grouping / directory bucket, e.g.
+#                                              "system-utils". Must be the id prefix.
+#   description       (str, required)          One-line human summary.
+#   lane              (str, required)          "portable" (GitHub-hosted) or
+#                                              "privileged" (self-hosted; kvm, etc.).
+#   requires          (array[str], required)   Host capabilities the harness must
+#                                              see before selecting this test, e.g.
+#                                              ["linux","x86_64","userns","ptrace","cc"].
+#   timeout_seconds   (int, required)          Per-cell wall-clock budget.
+#   occasional        (bool, default false)    Excluded from the default required
+#                                              set; only run with --include-occasional.
+#   slow_reason       (str, optional)          If set, documents why this test is
+#                                              slow (carried over from schema 1).
+#   compile           (array[str], optional)   For type "c"/"rs": the exact compile
+#                                              argv, with `{src}` and `{out}`
+#                                              placeholders. Omitted = harness default.
+#   run_args          (array[str], optional)   Extra argv passed to the guest itself
+#                                              (after the program), all modes.
+#
+#   [test.observation]  (required)             What is hashed into the guest
+#                                              observation for pass/fail:
+#     status    (bool)   include exit status.
+#     stdout    (bool)   include stdout bytes.
+#     stderr    (bool)   include stderr bytes.
+#     artifacts (array[str])  extra files to hash; each MUST stay under the
+#                             per-cell tmpdir (harness enforces this).
+#
+#
+# MODE TABLES  ([test.modes.<mode>])   <-- "mode outer, backend inner"
+# --------------------------------------------------------------------
+# Each of the five modes is an OPTIONAL sub-table under the test. Whether a mode
+# runs, and on which backends, is expressed uniformly:
+#
+#   backends          (array[str])  ENABLED backends for this mode ("backends-
+#                                   enabled list"). Order is informational.
+#                                   Omit / empty for `naked` (native, no hermit)
+#                                   and for a fully-disabled mode.
+#   enabled           (bool, default true)  Set false to declare the whole mode
+#                                   intentionally off (replaces schema-1
+#                                   `disabled_modes`); pair with `reason`.
+#   reason            (str)         WHY the whole mode is off. Required when
+#                                   `enabled = false`.
+#
+#   [test.modes.<mode>.disabled]    ("backends-disabled list + WHY reason")
+#                                   Optional map of backend -> reason for
+#                                   backends deliberately NOT in `backends`.
+#                                   This is where per-backend rationale lives
+#                                   (the same rationale as matrix.tsv's
+#                                   dbi_reason / kvm_reason columns). A backend
+#                                   that is neither enabled nor listed here is
+#                                   simply "not yet evaluated", not "disabled".
+#
+# Mode-specific extra keys:
+#   naked   : native sanity, NO hermit, NO backends. Runs the program directly
+#             `runs` times (2..=20, default 3) and asserts the outputs differ
+#             (`min_distinct`, >= 2). This proves the workload is genuinely
+#             nondeterministic natively, so a later Hermit `verify` pass is
+#             meaningful. This is the meta-CI sanity mode.
+#               runs         (int, 2..=20, default 3)
+#               min_distinct (int, >= 2, default 2)
+#   verify  : `hermit run --backend B --strict --verify` -> bitwise-identical
+#             repeat (L2). Backends: any of the five.
+#   replay  : `hermit --backend B record start --strict --verify ...` then
+#             replay+diff. Backends: PTRACE ONLY (harness rejects others).
+#   chaos   : `hermit run --backend B --strict --chaos --sched-heuristic=random`
+#             across `seeds`, asserting the seeds expose distinct schedules.
+#               seeds        (array[int], required)
+#               min_distinct (int, >= 2)   distinct observations across seeds
+#               min_passes   (int)         seeds that must pass
+#               min_failures (int)         seeds that must fail (racy oracle)
+#   custom  : NEW in schema 2. `hermit <args...>` with test-chosen arguments,
+#             for cases the four fixed modes cannot express (e.g. record without
+#             verify, relaxed scheduling, heap/stack detlog, alternate strict
+#             flags). Backends: any of the five.
+#               args         (array[str], required)  Full hermit argv AFTER the
+#                            binary and BEFORE `-- <program>`, e.g.
+#                            ["run","--strict","--verify","--detlog-heap"].
+#               label        (str, optional)  Short name for this custom cell,
+#                            so a test may (in future) define more than one.
+#             Any `--no-strict` / `--no-sequentialize-threads` style flag here is
+#             a determinism RELAXATION and must be justified in `description`.
+#
+# VALIDATION INVARIANTS (enforced by the future TOML-aware harness)
+# -----------------------------------------------------------------
+#   * every `id` unique; `category` is the id prefix.
+#   * `program` exists; `type` matches how it is invoked.
+#   * every mode key is in the top-level `modes` set; every enabled/disabled
+#     backend is in the top-level `backends` set.
+#   * every one of the five modes is accounted for per test: it is either
+#     present as a runnable table, or present with `enabled = false` + `reason`,
+#     or explicitly absent to mean "not applicable / not yet evaluated". (The
+#     schema-1 harness required all four modes to be named; schema 2 keeps that
+#     as a lint for the original four so nothing is silently dropped.)
+#   * `replay.backends` == ["ptrace"] when present.
+#   * `naked` has no `backends`; `2 <= runs <= 20`; `min_distinct >= 2`.
+#   * `custom` has a non-empty `args`.
+#   * every `observation.artifacts` path stays under the per-cell tmpdir.
+
+schema = 2
+backends = ["ptrace", "dbi", "kvm", "sabre", "liteinst"]
+modes = ["naked", "verify", "replay", "chaos", "custom"]
+
+
+# ---------------------------------------------------------------------------
+# Example 1 - shell wrapper, CHAOS oracle (reproduces the real schema-1 entry
+# tests/e2e/determinism-stress/order-violation.sh losslessly, and adds the
+# schema-2 per-backend disable reasons that schema 1 could not express).
+# ---------------------------------------------------------------------------
+[[test]]
+id = "determinism-stress/order-violation"
+program = "tests/e2e/determinism-stress/order-violation.sh"
+type = "sh"
+category = "determinism-stress"
+description = "Different chaos seeds expose distinct reproducible thread schedules"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+
+[test.observation]
+status = true
+stdout = true
+stderr = false
+artifacts = []
+
+[test.modes.verify]
+backends = ["ptrace"]
+[test.modes.verify.disabled]
+dbi = "DBI backend-parity for this racy pthread guest is not yet green"
+kvm = "KVM does not run the portable lane"
+sabre = "Not yet evaluated under SaBRe"
+liteinst = "LiteInst interception is incomplete for multi-threaded guests"
+
+[test.modes.chaos]
+backends = ["ptrace"]
+seeds = [0, 1]
+min_distinct = 2
+min_passes = 1
+min_failures = 1
+[test.modes.chaos.disabled]
+kvm = "KVM does not provide Detcore schedule exploration"
+
+[test.modes.naked]
+enabled = false
+reason = "Native scheduling does not guarantee both outcomes within a fixed budget"
+
+[test.modes.replay]
+enabled = false
+reason = "Chaos witness reproduction is the required relation for this deliberately racy guest"
+
+
+# ---------------------------------------------------------------------------
+# Example 2 - shell wrapper, NAKED meta-CI sanity + verify (reproduces
+# tests/e2e/system-utils/date-nanoseconds.sh). Shows the native-nondeterminism
+# gate: prove it varies natively, then prove Hermit pins it.
+# ---------------------------------------------------------------------------
+[[test]]
+id = "system-utils/date-nanoseconds"
+program = "tests/e2e/system-utils/date-nanoseconds.sh"
+type = "sh"
+category = "system-utils"
+description = "Wall-clock nanoseconds vary natively and repeat under Hermit"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 60
+occasional = false
+
+[test.observation]
+status = true
+stdout = true
+stderr = false
+artifacts = []
+
+[test.modes.naked]
+runs = 3
+min_distinct = 2
+
+[test.modes.verify]
+backends = ["ptrace"]
+
+[test.modes.replay]
+enabled = false
+reason = "The date utility currently diverges while replaying timezone-file reads"
+
+[test.modes.chaos]
+enabled = false
+reason = "Single-threaded wall-clock probe has no scheduling oracle"
+
+
+# ---------------------------------------------------------------------------
+# Example 3 - shell wrapper, REPLAY mode (reproduces
+# tests/e2e/system-utils/record-getpid.sh). Shows record/replay (ptrace only).
+# ---------------------------------------------------------------------------
+[[test]]
+id = "system-utils/record-getpid"
+program = "tests/e2e/system-utils/record-getpid.sh"
+type = "sh"
+category = "system-utils"
+description = "Process identity is deterministic in run and record/replay modes"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 60
+occasional = false
+
+[test.observation]
+status = true
+stdout = true
+stderr = false
+artifacts = []
+
+[test.modes.verify]
+backends = ["ptrace"]
+
+[test.modes.replay]
+backends = ["ptrace"]  # replay is ptrace-only by harness invariant
+
+[test.modes.naked]
+enabled = false
+reason = "Native process IDs vary but this test asserts Hermit's virtualized identity"
+
+[test.modes.chaos]
+enabled = false
+reason = "The guest is single-threaded"
+
+
+# ---------------------------------------------------------------------------
+# Example 4 - STANDALONE C guest, NO shell wrapper (type = "c"). This is the
+# headline schema-2 win: point straight at one of the 183 tests/**/*.c guests,
+# let the harness compile+run it, and fan out across multiple backends with
+# per-backend disable reasons. Also shows a `custom` cell (heap/stack detlog).
+# ---------------------------------------------------------------------------
+[[test]]
+id = "determinism-core/clock-determinism"
+program = "tests/c/clock_determinism.c"
+type = "c"
+category = "determinism-core"
+description = "clock_gettime is virtualized to a deterministic counter across backends"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 60
+occasional = false
+# Default compile is `cc -std=c11 -O2 -pthread {src} -o {out}`; shown explicitly:
+compile = ["cc", "-std=c11", "-O2", "-pthread", "{src}", "-o", "{out}"]
+
+[test.observation]
+status = true
+stdout = true
+stderr = false
+artifacts = []
+
+[test.modes.verify]
+backends = ["ptrace", "dbi", "kvm"]
+[test.modes.verify.disabled]
+sabre = "SaBRe does not intercept RDTSCP; raw host TSC would leak"
+liteinst = "LiteInst clock virtualization not yet wired"
+
+[test.modes.custom]
+backends = ["ptrace"]
+label = "memory-determinism"
+args = ["run", "--strict", "--verify", "--detlog-heap", "--detlog-stack"]
+
+[test.modes.naked]
+enabled = false
+reason = "This guest asserts Hermit's virtualized clock, not native wall time"
+
+[test.modes.replay]
+enabled = false
+reason = "Verify across backends is the required relation; replay adds no coverage here"
+
+[test.modes.chaos]
+enabled = false
+reason = "Single deterministic clock probe has no scheduling oracle"
+
+
+# ---------------------------------------------------------------------------
+# Example 5 - PRIVILEGED lane, KVM backend, + a CUSTOM mode with specific
+# hermit args (reproduces tests/e2e/applications/kvm-shell-environment.sh and
+# extends it with a record-only custom cell). Shows lane=privileged, a non-
+# ptrace verify backend, and the `custom` mode carrying explicit hermit argv.
+# ---------------------------------------------------------------------------
+[[test]]
+id = "applications/kvm-shell-environment"
+program = "tests/e2e/applications/kvm-shell-environment.sh"
+type = "sh"
+category = "applications"
+description = "KVM executes a shell workload with a deterministic environment"
+lane = "privileged"
+requires = ["linux", "x86_64", "kvm"]
+timeout_seconds = 60
+occasional = false
+
+[test.observation]
+status = true
+stdout = true
+stderr = false
+artifacts = []
+
+[test.modes.verify]
+backends = ["kvm"]
+[test.modes.verify.disabled]
+ptrace = "This cell exists to exercise the privileged KVM path specifically"
+
+[test.modes.custom]
+backends = ["kvm"]
+label = "record-only"
+# record without --verify: capture a KVM recording as an artifact, no replay.
+args = ["record", "start", "--strict", "--no-verify"]
+
+[test.modes.naked]
+enabled = false
+reason = "This is a privileged backend integration test"
+
+[test.modes.replay]
+enabled = false
+reason = "KVM has no record/replay runtime"
+
+[test.modes.chaos]
+enabled = false
+reason = "KVM does not provide Detcore schedule exploration"
