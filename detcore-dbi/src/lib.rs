@@ -1147,7 +1147,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 /// `args` must be null or point to the DBI client's live six-element syscall
 /// argument array for the duration of this call.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review copied-child ioctl errno emulation.
+// TODO-HUMAN-REVIEW(PR-1061): Review copied-child ioctl errno emulation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *const u64) -> i32 {
     let sysno = Sysno::from(sysnum as i32);
