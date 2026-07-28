@@ -201,6 +201,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // state, so handle_shutdown forwards it via record_or_replay exactly like
         // handle_listen/handle_setsockopt (KVM ratchet round 12).
         | Sysno::shutdown
+        // QEMU probes SECCOMP_FILTER_FLAG_TSYNC with a NULL filter. Return the
+        // Linux validation errno without installing an unenforceable filter.
+        | Sysno::seccomp
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
@@ -621,7 +624,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::sched_setattr
-        | Sysno::seccomp
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
@@ -852,7 +854,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [223, 91, 59]);
+        assert_eq!(counts, [224, 91, 58]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -930,6 +932,10 @@ mod tests {
         // Determinized (routed through handle_shutdown); regression for #818.
         assert_eq!(
             classify_syscall(Sysno::shutdown),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::seccomp),
             SyscallClassification::Determinized
         );
         for sysno in [

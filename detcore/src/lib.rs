@@ -1565,6 +1565,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
