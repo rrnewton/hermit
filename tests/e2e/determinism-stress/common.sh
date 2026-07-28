@@ -5,11 +5,13 @@ set -euo pipefail
 stress_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$stress_dir/../../.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+determinism_stress_backend=ptrace
 cc_bin=${CC:-cc}
 verify_repetitions=${DETERMINISM_STRESS_REPETITIONS:-1}
 native_repetitions=${NATIVE_STRESS_REPETITIONS:-3}
 verify_timeout=${DETERMINISM_STRESS_TIMEOUT:-180}
 verify_index=0
+readonly determinism_stress_backend
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -88,7 +90,8 @@ verify_guest() {
     printf '[hermit L2] %s (attempt %s/%s)\n' \
       "$label" "$attempt" "$verify_repetitions"
     if ! timeout --kill-after=10 "${verify_timeout}s" \
-      "$hermit_bin" --log info run --strict --verify -- "$@" \
+      "$hermit_bin" --log info run --backend "$determinism_stress_backend" \
+      --strict --verify -- "$@" \
       >"$stdout" 2>"$stderr"; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2

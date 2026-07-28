@@ -3907,9 +3907,8 @@ function run_hosted_only_suite {
         ./scripts/check-detcore-backend-abstraction.sh
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
-    run_check "User examples at ptrace L2" ./ci/e2e_commands_bucketed.sh
-    run_check "Application end-to-end strict verification" \
-        ./tests/e2e/applications/run_all.sh
+    run_check "E2E test contracts" ./tests/e2e/check-contract.sh
+    run_check "Portable E2E categories" ./tests/e2e/run.sh portable
 
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
@@ -4014,6 +4013,7 @@ function run_hardware_validation {
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
     run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
+    run_check "Privileged E2E categories" env HERMIT_BIN=target/debug/hermit ./tests/e2e/run.sh privileged
     run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness thread_sync_determinism writev_determinism
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
@@ -4060,6 +4060,8 @@ function run_full_suite {
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_quick_suite
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
+    run_check "E2E test contracts" ./tests/e2e/check-contract.sh
+    run_check "Portable E2E categories" env HERMIT_BIN=target/release/hermit ./tests/e2e/run.sh portable
 
     # Cargo supports concurrent commands in one target directory. Run checks that
     # do not execute Hermit guests alongside the ordered runtime and PMU gates.
@@ -4206,6 +4208,7 @@ function run_super_suite {
 
     run_check "Build workspace" cargo build --workspace
     run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Occasional E2E categories" env HERMIT_BIN=target/release/hermit ./tests/e2e/run.sh occasional
     run_super_diagnostic_suite
     run_check "Super repeated determinism probes" run_super_stress_suite
     if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then

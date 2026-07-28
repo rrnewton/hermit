@@ -8,7 +8,7 @@
     {
       "group": "build", "job": "hardware_tests",
       "desc": "Compile only the Detcore and Hermit test binaries used by this hardware smoke lane",
-      "cmd": "cargo test -p detcore --test tests_misc --no-run && cargo test -p hermit --test cli --no-run",
+      "cmd": "cargo build -p hermit && cargo test -p detcore --test tests_misc --no-run && cargo test -p hermit --test cli --no-run",
       "timeout": 210,
       "hint": {"est_duration_s": 150, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
@@ -40,6 +40,16 @@
       "deps": ["build.hardware_tests"],
       "timeout": 40,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 10,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "kvm", "job": "system_utils_e2e",
+      "desc": "KVM-allowlisted system utilities preserve strict output and exit status",
+      "cmd": "./tests/e2e/system-utils/run.sh target/debug/hermit kvm",
+      "deps": ["build.hardware_tests"],
+      "timeout": 120,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 45,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     }

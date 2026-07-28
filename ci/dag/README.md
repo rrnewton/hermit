@@ -16,6 +16,23 @@ can also box each node for memory limits and full process-subtree teardown.
   [`.github/workflows/ci-selfhosted.yml`](../../.github/workflows/ci-selfhosted.yml).
   Requires PMU + `/dev/kvm`.
 
+The substantive shell E2E suite is split by capability rather than duration:
+
+- `tests/e2e/run.sh portable` covers applications, data handling, determinism
+  stress, language runtimes, and system utilities on ptrace. Hosted DAG nodes
+  run those categories separately for precise failure attribution.
+- `tests/e2e/run.sh privileged` runs only the system-utility cases whose
+  checked-in backend allowlists include KVM. It shares the hardware DAG's KVM
+  resource token with the core KVM smoke.
+- `tests/e2e/run.sh occasional` runs the crates.io reproducible-build probe and
+  signal/syscall stress matrices from scheduled `validate.sh super`. Current
+  product gaps remain visible as named XFAILs rather than being counted as
+  passes; unexpected failures remain fatal.
+
+`tests/e2e/check-contract.sh` rejects missing categories, non-executable or
+invalid shell tests, low-log verification, trivial help/version/no-op probes,
+and missing backend contracts.
+
 Run a lane with the wrapper:
 
 ```sh

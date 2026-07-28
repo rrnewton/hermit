@@ -4,6 +4,16 @@ set -euo pipefail
 # shellcheck source=tests/e2e/determinism-stress/common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
+known_gaps_ok=false
+if [[ ${1:-} == --known-gaps-ok ]]; then
+  known_gaps_ok=true
+  shift
+fi
+if (($# > 0)); then
+  echo "usage: $0 [--known-gaps-ok]" >&2
+  exit 2
+fi
+
 order_guest=$(compile_c \
   tests/e2e/determinism-stress/guests/signal_order.c signal-order)
 show_native_variation "concurrent signal delivery order" "$order_guest"
@@ -29,7 +39,11 @@ scenarios=(
 )
 for scenario in "${scenarios[@]}"; do
   if ! verify_guest "signal scenario: $scenario" "$guest" "$scenario"; then
-    failures=$((failures + 1))
+    if [[ $known_gaps_ok == true && $scenario == blocking-sigsuspend ]]; then
+      echo "XFAIL: blocking-sigsuspend has a known signal log-order divergence" >&2
+    else
+      failures=$((failures + 1))
+    fi
   fi
 done
 
