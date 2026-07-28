@@ -90,9 +90,6 @@ def main() -> int:
     serial_log = ASSETS / "serial.log"
     archived_serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
-    temporary_disk = SNAPSHOT_DISK.with_name(
-        "{}.tmp.{}".format(SNAPSHOT_DISK.name, os.getpid())
-    )
     process = None
 
     try:
@@ -105,11 +102,10 @@ def main() -> int:
                 "-q",
                 "-f",
                 "qcow2",
-                str(temporary_disk),
+                str(SNAPSHOT_DISK),
                 SNAPSHOT_SIZE,
             ]
         )
-        os.replace(str(temporary_disk), str(SNAPSHOT_DISK))
 
         qemu_argv = build_qemu_command(
             QEMU,
@@ -123,10 +119,11 @@ def main() -> int:
             str(HERMIT),
             "run",
             "--strict",
+            "--no-rcb-time",
             "--target-timeslice",
             "100000",
             "--max-timeslice",
-            "2000000000",
+            "disabled",
             "--",
             sys.executable,
             str(DEMO_DIR / "lib/qemu_controller.py"),
@@ -228,7 +225,6 @@ def main() -> int:
         return 1 if result == "PARTIAL" else 0
     finally:
         stop_process(process)
-        temporary_disk.unlink(missing_ok=True)
         for socket_path in (qmp_socket, serial_socket):
             socket_path.unlink(missing_ok=True)
         release_demo_lock(lock)
