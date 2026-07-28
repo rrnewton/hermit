@@ -8,15 +8,14 @@ LICENSE file in the root directory of this source tree.
 
 # Centralized e2e test manifests (schema v2)
 
-Status: **prototype / design proposal** (CI Overhaul v2). This directory defines
+Status: **incremental migration** (CI Overhaul v2). This directory defines
 a centralized manifest format that supersedes the per-script
 `# HERMIT_E2E_META_BEGIN … HERMIT_E2E_META_END` JSON comment blocks parsed today
 by [`ci/test_harness.sh`](../../../ci/test_harness.sh). The v1 harness discovers
 **only** `*.sh` under five hard-coded `tests/e2e/<category>/` directories and
-finds exactly **12** annotated tests, while `tests/` contains **182 `.c`
-programs** and **31 guest `.rs`** files that are exercised piecemeal by
-hand-written `hermit-cli/tests/*.rs` integration tests. v2 makes every
-executable test discoverable from one small set of declarative manifests.
+finds exactly **12** annotated tests. The v2 inventory accounts for all **81
+`.sh` paths** and **43 `.rs` files** under `tests/`: executable guests are test
+entries, while helpers and host-side tooling carry explicit dispositions.
 
 ## Why centralize
 
@@ -142,7 +141,31 @@ The harness dispatches on the `program` extension:
   not need a file at all.
 
 A `build` table may override defaults when a program needs extra sources or
-flags (see `system-utils.toml`'s use of `build.extra_sources`).
+flags (see `system-utils.toml`'s use of `build.extra_sources`). Rust programs
+that depend on crates declare `build.cargo_target`; the harness builds that bin
+from `tests/Cargo.toml` instead of invoking bare `rustc`. `program_args` lists
+arguments appended after the guest program for parameterized workloads.
+
+### Source dispositions
+
+Not every source-like path is a guest program. Helpers sourced by wrappers,
+host-side test drivers, fixture libraries, symlink aliases, and legacy scripts
+that do not implement the e2e protocol are recorded as explicit dispositions:
+
+```toml
+[[source_disposition]]
+path = "tests/e2e/lib/applications/common.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+```
+
+Each disposition has a repository-relative `path`, a short classification in
+`kind`, and a concrete `reason`. `manifest-plan.rs` recursively inventories
+`tests/**/*.sh` and `tests/**/*.rs` and rejects missing paths, duplicate
+programs or dispositions, nonexistent disposition paths, and paths classified
+as both a program and a disposition. The shell inventory is 12 program entries
+plus 69 dispositions; the Rust inventory is 37 program entries plus 6
+dispositions.
 
 ## Validation rules (harness contract)
 
@@ -152,6 +175,8 @@ A manifest loader must reject a manifest unless, for every `[[test]]`:
 - `id` is unique across all manifests and begins with `<bucket>/`.
 - exactly one of `program` / `direct` is set; a `program` path exists and its
   extension is one of `.sh` / `.c` / `.rs`.
+- `program_args`, when present, is a string array and is not combined with
+  `direct`; `build.cargo_target` is a valid target name used only with `.rs`.
 - `lane` ∈ {portable, privileged}; `1 ≤ timeout_seconds ≤ 1800`.
 - each of `verify`/`chaos`/`replay`/`naked` is present in `modes` **or**
   `disabled_modes` (never both, never neither).
@@ -159,6 +184,8 @@ A manifest loader must reject a manifest unless, for every `[[test]]`:
   from the five known backends, and its `backends_disabled` keys are disjoint
   from `backends_enabled`.
 - `replay.backends_enabled ⊆ {ptrace}` (replay is ptrace-only today).
+- every `.sh` and `.rs` path below `tests/` is represented by one test program
+  or one non-empty `source_disposition`, never both.
 
 ## Migration path
 
@@ -185,6 +212,12 @@ A manifest loader must reject a manifest unless, for every `[[test]]`:
   `date-nanoseconds` (naked + verify, no build), and `clock-determinism`, a
   **new** entry that points directly at `tests/c/clock_determinism.c` (implicit
   build, no wrapper) and demonstrates the `custom` mode.
+- [`shell-programs.toml`](shell-programs.toml) — the remaining protocol-capable
+  shell wrappers plus explicit dispositions for shell helpers, drivers,
+  aliases, and non-protocol legacy scripts.
+- [`rust-programs.toml`](rust-programs.toml) — executable Rust guests with their
+  Cargo target where applicable, plus dispositions for host tools, libraries,
+  and shared modules.
 - [`manifest-plan.rs`](manifest-plan.rs) — a `rust-script` loader that parses the
   manifests, enforces the validation rules above, and prints the expanded
   execution plan. Run it with `./manifest-plan.rs` (or

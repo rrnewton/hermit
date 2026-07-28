@@ -16,7 +16,8 @@
 //!
 //!   1. **Implicit build dispatch.** A `[[test]]`'s `program` extension selects
 //!      the runner and the build: `*.sh` runs directly (its `--prepare`/`--run`
-//!      protocol), `*.c` is compiled with `cc`, `*.rs` is compiled with `rustc`.
+//!      protocol), `*.c` is compiled with `cc`, and `*.rs` is compiled with
+//!      `rustc` or its declared Cargo target.
 //!      This is what unlocks the ~170 wrapper-free `tests/c/*.c` guests that the
 //!      v1 `ci/test_harness.sh` (which discovers only annotated `*.sh`) cannot
 //!      reach. Per-test `[test.build]` `cflags` / `extra_sources` are honored.
@@ -96,8 +97,10 @@ struct TestEntry {
     timeout: i64,
     program: Option<String>,
     direct: Option<String>,
+    program_args: Vec<String>,
     cflags: Vec<String>,
     extra_sources: Vec<String>,
+    cargo_target: Option<String>,
     modes: Vec<ModeSpec>,
 }
 
@@ -173,10 +176,15 @@ fn parse_entry(t: &Value, bucket: &str) -> TestEntry {
     let timeout = t.get("timeout_seconds").and_then(Value::as_integer).unwrap_or(60);
     let program = t.get("program").and_then(Value::as_str).map(String::from);
     let direct = t.get("direct").and_then(Value::as_str).map(String::from);
+    let program_args = as_str_vec(t.get("program_args"));
 
     let build = t.get("build").and_then(Value::as_table);
     let cflags = build.map(|b| as_str_vec(b.get("cflags"))).unwrap_or_default();
     let extra_sources = build.map(|b| as_str_vec(b.get("extra_sources"))).unwrap_or_default();
+    let cargo_target = build
+        .and_then(|b| b.get("cargo_target"))
+        .and_then(Value::as_str)
+        .map(String::from);
 
     let mut modes = Vec::new();
     if let Some(mt) = t.get("modes").and_then(Value::as_table) {
@@ -213,8 +221,10 @@ fn parse_entry(t: &Value, bucket: &str) -> TestEntry {
         timeout,
         program,
         direct,
+        program_args,
         cflags,
         extra_sources,
+        cargo_target,
         modes,
     }
 }
@@ -326,6 +336,39 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool, no_build: boo
         "rs" => {
             std::fs::create_dir_all(out_dir).ok();
             let out = out_dir.join(sanitized(&entry.id));
+            if let Some(target) = &entry.cargo_target {
+                let target_dir = out_dir.join("cargo-target");
+                let manifest = root.join("tests/Cargo.toml");
+                let args = [
+                    "build".to_string(),
+                    "--release".to_string(),
+                    "--manifest-path".to_string(),
+                    manifest.to_string_lossy().to_string(),
+                    "--bin".to_string(),
+                    target.clone(),
+                    "--target-dir".to_string(),
+                    target_dir.to_string_lossy().to_string(),
+                ];
+                if dry_run {
+                    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+                    println!("{cargo} {}", args.join(" "));
+                } else {
+                    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+                    let mut c = Command::new(&cargo);
+                    c.args(&args);
+                    run_tool(&format!("cargo build {}", entry.id), c);
+                    let built = target_dir.join("release").join(target);
+                    std::fs::copy(&built, &out).unwrap_or_else(|e| {
+                        die(format!(
+                            "{}: cannot copy Cargo artifact {} to {}: {e}",
+                            entry.id,
+                            built.display(),
+                            out.display()
+                        ))
+                    });
+                }
+                return Program::Binary(out);
+            }
             let mut args: Vec<String> = vec!["-O".into()];
             args.extend(entry.cflags.iter().cloned()); // extra rustc flags reuse cflags
             args.push(abs.to_string_lossy().to_string());
@@ -346,10 +389,10 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool, no_build: boo
 
 /// Compile every `*.c`/`*.rs` guest into `out_dir` (optionally lane-filtered).
 ///
-/// This is the `build-all-c` DAG node: it depends only on `cc`/`rustc`, NOT on
-/// the hermit binary, so the scheduler can run it fully in parallel with the
-/// `cargo build --workspace` node. `.sh`/`direct` entries need no build step and
-/// are skipped. Returns the number of guests compiled.
+/// This is the `build-all-c` DAG node: it depends only on the guest compilers,
+/// not the Hermit binary, so the scheduler can run it fully in parallel with
+/// the workspace build. `.sh`/`direct` entries need no build step and are
+/// skipped. Returns the number of guests compiled.
 fn build_all(entries: &[TestEntry], out_dir: &Path, lane: &str, dry_run: bool) -> usize {
     let mut built = 0usize;
     for e in entries {
@@ -381,12 +424,14 @@ fn hermit_bin() -> String {
 }
 
 /// The argv fragment that names the guest to execute for each run mode.
-fn guest_argv(prog: &Program) -> Vec<String> {
-    match prog {
+fn guest_argv(prog: &Program, program_args: &[String]) -> Vec<String> {
+    let mut argv = match prog {
         Program::Direct(cmd) => vec!["sh".into(), "-c".into(), cmd.clone()],
         Program::Script(p) => vec![p.to_string_lossy().to_string(), "--run".into()],
         Program::Binary(p) => vec![p.to_string_lossy().to_string()],
-    }
+    };
+    argv.extend(program_args.iter().cloned());
+    argv
 }
 
 struct Attempt {
@@ -511,7 +556,7 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         }
     }
     let env = cell_env(&cell);
-    let guest = guest_argv(&prog);
+    let guest = guest_argv(&prog, &entry.program_args);
     let mut all_pass = true;
 
     for m in &entry.modes {
@@ -582,7 +627,11 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                         distinct.insert((a1.status, a1.stdout));
                     }
                     let d = if dry_run { m.min_distinct } else { distinct.len() as i64 };
-                    let pass = mism == 0 && d >= m.min_distinct && passes >= m.min_passes && failures >= m.min_failures;
+                    let pass = dry_run
+                        || (mism == 0
+                            && d >= m.min_distinct
+                            && passes >= m.min_passes
+                            && failures >= m.min_failures);
                     all_pass &= pass;
                     report(pass, entry, "chaos", b, &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}"));
                 }

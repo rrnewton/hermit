@@ -14,10 +14,11 @@
 //! ```
 //!
 //! Each `ignored/e2e-commands/<bucket>.txt` file contains one self-contained
-//! shell command per enabled `(test, mode, backend)` cell. Chaos seeds expand
-//! to separate lines. Commands compile implicit C/Rust guests and prepare shell
-//! wrappers before invoking Hermit, so any individual line can be rerun from
-//! the repository root.
+//! shell command per enabled `(test, mode, backend)` cell. Commands compile
+//! implicit C/Rust guests and prepare shell wrappers before invoking Hermit, so
+//! any individual line can be rerun from the repository root. Chaos cells
+//! delegate to the assertion-aware manifest harness so all seeds remain one
+//! aggregate oracle.
 //!
 //! ```cargo
 //! [dependencies]
@@ -83,22 +84,6 @@ fn string_array(value: Option<&Value>, context: &str) -> Vec<String> {
         .collect()
 }
 
-fn integer_array(value: Option<&Value>, context: &str) -> Vec<i64> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    let array = value
-        .as_array()
-        .unwrap_or_else(|| fail(format!("{context} must be an array")));
-    array
-        .iter()
-        .map(|item| {
-            item.as_integer()
-                .unwrap_or_else(|| fail(format!("{context} entries must be integers")))
-        })
-        .collect()
-}
-
 fn test_id(test: &Value, bucket: &str) -> String {
     test.get("id")
         .and_then(Value::as_str)
@@ -117,6 +102,7 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
             .to_owned(),
     ];
 
+    let program_args = string_array(test.get("program_args"), &format!("{id}.program_args"));
     let program = test.get("program").and_then(Value::as_str);
     let direct = test.get("direct").and_then(Value::as_str);
     let guest = match (program, direct) {
@@ -162,24 +148,49 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
             }
             Some("rs") => {
                 let build = test.get("build").and_then(Value::as_table);
-                let mut args = vec!["-O".to_owned()];
-                if let Some(build) = build {
-                    args.extend(string_array(
-                        build.get("cflags"),
-                        &format!("{id}.build.cflags"),
+                if let Some(target) = build.and_then(|table| table.get("cargo_target")) {
+                    let target = target.as_str().unwrap_or_else(|| {
+                        fail(format!("{id}.build.cargo_target must be a string"))
+                    });
+                    commands.push(format!(
+                        "${{CARGO:-cargo}} build --release --manifest-path tests/Cargo.toml --bin {} --target-dir \"$cell/cargo-target\"",
+                        shell_quote(target)
                     ));
+                    commands.push(format!(
+                        "cp -- \"$cell/cargo-target/release/{}\" \"$cell/guest\"",
+                        target
+                    ));
+                } else {
+                    let mut args = vec!["-O".to_owned()];
+                    if let Some(build) = build {
+                        args.extend(string_array(
+                            build.get("cflags"),
+                            &format!("{id}.build.cflags"),
+                        ));
+                    }
+                    args.push(program.to_owned());
+                    let args = args
+                        .iter()
+                        .map(|x| shell_quote(x))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    commands.push(format!("${{RUSTC:-rustc}} {args} -o \"$cell/guest\""));
                 }
-                args.push(program.to_owned());
-                let args = args
-                    .iter()
-                    .map(|x| shell_quote(x))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                commands.push(format!("${{RUSTC:-rustc}} {args} -o \"$cell/guest\""));
                 "\"$cell/guest\"".to_owned()
             }
             other => fail(format!("{id}: unsupported program extension {other:?}")),
         },
+    };
+
+    let guest_args = program_args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let guest = if guest_args.is_empty() {
+        guest
+    } else {
+        format!("{guest} {guest_args}")
     };
 
     (commands.join(" && "), guest)
@@ -280,34 +291,29 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
         if backends.is_empty() {
             fail(format!("{id}: mode `{mode}` has no enabled backend"));
         }
+        if mode == "chaos" {
+            for backend in backends {
+                lines.push(format!(
+                    "timeout --kill-after=10s {timeout}s ./tests/e2e/manifests/manifest-harness.rs run {} --mode chaos --backend {} # {id} mode=chaos backend={backend}",
+                    shell_quote(&id),
+                    shell_quote(&backend),
+                ));
+            }
+            continue;
+        }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
         let assert = spec.get("assert").and_then(Value::as_table);
         let custom_runs = assert
             .and_then(|a| a.get("runs"))
             .and_then(Value::as_integer)
             .unwrap_or(1);
-        let seeds = if mode == "chaos" {
-            let seeds = integer_array(spec.get("seeds"), &format!("{id}.modes.chaos.seeds"));
-            if seeds.is_empty() { vec![0, 1] } else { seeds }
-        } else {
-            vec![0]
-        };
-
         for backend in backends {
-            for seed in &seeds {
-                let seed = (mode == "chaos").then_some(*seed);
-                let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
-                let runs = match mode {
-                    "chaos" => 2,
-                    "custom" => custom_runs,
-                    _ => 1,
-                };
-                let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
-                lines.push(format!(
-                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
-                    repeat(&command, runs)
-                ));
-            }
+            let command = hermit_command(mode, &backend, lane, timeout, None, &extra, &guest);
+            let runs = if mode == "custom" { custom_runs } else { 1 };
+            lines.push(format!(
+                "{setup} && {} # {id} mode={mode} backend={backend}",
+                repeat(&command, runs)
+            ));
         }
     }
     lines

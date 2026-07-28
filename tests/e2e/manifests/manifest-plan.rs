@@ -55,7 +55,10 @@ fn main() {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     // repo root = tests/e2e/manifests/../../.. ; used to check program paths exist.
-    let repo_root = script_dir.join("../../..");
+    let repo_root = script_dir
+        .join("../../..")
+        .canonicalize()
+        .unwrap_or_else(|_| script_dir.join("../../.."));
 
     let mut manifests: Vec<PathBuf> = std::fs::read_dir(&script_dir)
         .unwrap_or_else(|e| die(format!("cannot read {}: {e}", script_dir.display())))
@@ -69,6 +72,8 @@ fn main() {
 
     let mut rows: Vec<PlanRow> = Vec::new();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+    let mut seen_program_paths: BTreeSet<String> = BTreeSet::new();
+    let mut seen_dispositions: BTreeSet<String> = BTreeSet::new();
 
     for path in &manifests {
         let text = std::fs::read_to_string(path)
@@ -98,9 +103,29 @@ fn main() {
             .unwrap_or_else(|| die(format!("{where_}: missing [[test]] array")));
 
         for test in tests {
-            validate_and_expand(test, &bucket, &where_, &repo_root, &mut seen_ids, &mut rows);
+            validate_and_expand(
+                test,
+                &bucket,
+                &where_,
+                &repo_root,
+                &mut seen_ids,
+                &mut seen_program_paths,
+                &mut rows,
+            );
+        }
+        if let Some(dispositions) = doc.get("source_disposition").and_then(Value::as_array) {
+            for disposition in dispositions {
+                validate_disposition(
+                    disposition,
+                    &where_,
+                    &repo_root,
+                    &mut seen_dispositions,
+                );
+            }
         }
     }
+
+    validate_source_inventory(&repo_root, &seen_program_paths, &seen_dispositions);
 
     rows.sort_by(|a, b| {
         (&a.bucket, &a.id, &a.mode, &a.backend).cmp(&(&b.bucket, &b.id, &b.mode, &b.backend))
@@ -141,6 +166,7 @@ fn validate_and_expand(
     where_: &str,
     repo_root: &Path,
     seen_ids: &mut BTreeSet<String>,
+    seen_program_paths: &mut BTreeSet<String>,
     rows: &mut Vec<PlanRow>,
 ) {
     let id = test
@@ -178,8 +204,41 @@ fn validate_and_expand(
             if !repo_root.join(p).exists() {
                 die(format!("{id}: program path does not exist: {p}"));
             }
+            if ["sh", "rs"].contains(&ext) && !seen_program_paths.insert(p.to_string()) {
+                die(format!("duplicate shell/Rust program path across manifests: {p}"));
+            }
         }
         (None, Some(_)) => {}
+    }
+    if let Some(args) = test.get("program_args") {
+        let Some(args) = args.as_array() else {
+            die(format!("{id}: program_args must be an array of strings"));
+        };
+        if direct.is_some() && !args.is_empty() {
+            die(format!("{id}: program_args cannot be used with direct"));
+        }
+        if args.iter().any(|arg| arg.as_str().is_none()) {
+            die(format!("{id}: program_args entries must be strings"));
+        }
+    }
+    if let Some(target) = test
+        .get("build")
+        .and_then(Value::as_table)
+        .and_then(|build| build.get("cargo_target"))
+    {
+        let Some(target) = target.as_str() else {
+            die(format!("{id}: build.cargo_target must be a string"));
+        };
+        if target.is_empty()
+            || target
+                .bytes()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
+        {
+            die(format!("{id}: build.cargo_target is not a valid target name: `{target}`"));
+        }
+        if program.is_none_or(|p| !p.ends_with(".rs")) {
+            die(format!("{id}: build.cargo_target requires an .rs program"));
+        }
     }
 
     let modes = test.get("modes").and_then(Value::as_table);
@@ -261,5 +320,106 @@ fn validate_and_expand(
                 backend: b,
             });
         }
+    }
+}
+
+fn validate_disposition(
+    disposition: &Value,
+    where_: &str,
+    repo_root: &Path,
+    seen_dispositions: &mut BTreeSet<String>,
+) {
+    let path = disposition
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| die(format!("{where_}: source_disposition.path must be a string")));
+    let source = Path::new(path);
+    if source.is_absolute()
+        || source
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !path.starts_with("tests/")
+    {
+        die(format!(
+            "{where_}: source disposition must be a repository-relative tests/ path: {path}"
+        ));
+    }
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if !["sh", "rs"].contains(&extension) {
+        die(format!(
+            "{where_}: source disposition path must end in .sh or .rs: {path}"
+        ));
+    }
+    if !repo_root.join(source).exists() {
+        die(format!("{where_}: source disposition path does not exist: {path}"));
+    }
+    for field in ["kind", "reason"] {
+        let value = disposition.get(field).and_then(Value::as_str).unwrap_or("");
+        if value.trim().is_empty() {
+            die(format!(
+                "{where_}: source disposition `{path}` needs a non-empty {field}"
+            ));
+        }
+    }
+    if !seen_dispositions.insert(path.to_string()) {
+        die(format!("duplicate source disposition across manifests: {path}"));
+    }
+}
+
+fn collect_source_inventory(dir: &Path, repo_root: &Path, paths: &mut BTreeSet<String>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| die(format!("cannot inventory {}: {e}", dir.display())));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| die(format!("cannot read inventory entry: {e}")));
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|e| die(format!("cannot inspect {}: {e}", path.display())));
+        if file_type.is_dir() {
+            collect_source_inventory(&path, repo_root, paths);
+            continue;
+        }
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        if ["sh", "rs"].contains(&extension) {
+            let relative = path
+                .strip_prefix(repo_root)
+                .unwrap_or_else(|_| die(format!("inventory path escaped repository: {}", path.display())))
+                .to_string_lossy()
+                .to_string();
+            paths.insert(relative);
+        }
+    }
+}
+
+fn validate_source_inventory(
+    repo_root: &Path,
+    program_paths: &BTreeSet<String>,
+    dispositions: &BTreeSet<String>,
+) {
+    let mut inventory = BTreeSet::new();
+    collect_source_inventory(&repo_root.join("tests"), repo_root, &mut inventory);
+
+    if let Some(path) = program_paths.intersection(dispositions).next() {
+        die(format!(
+            "shell/Rust source is both a test program and a disposition: {path}"
+        ));
+    }
+    if let Some(path) = dispositions.difference(&inventory).next() {
+        die(format!("source disposition is outside the shell/Rust inventory: {path}"));
+    }
+    let accounted: BTreeSet<&String> = program_paths.union(dispositions).collect();
+    let missing: Vec<&String> = inventory
+        .iter()
+        .filter(|path| !accounted.contains(path))
+        .collect();
+    if !missing.is_empty() {
+        die(format!(
+            "unaccounted shell/Rust source path(s): {}",
+            missing
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 }

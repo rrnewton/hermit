@@ -1,0 +1,524 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Rust source coverage for CI Overhaul v2. Executable guest programs are
+# manifest tests; host-side tooling, shared modules, and fixture libraries have
+# explicit source dispositions.
+
+schema = 2
+bucket = "rust-programs"
+
+[[test]]
+id = "rust-programs/chaos-cas-sequence"
+description = "Seeded schedules explore and reproduce multiple CAS handoff outcomes"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/cas_sequence.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "chaos_cas_sequence_bin" }
+modes.chaos = { backends_enabled = ["ptrace"], seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], assert = { min_distinct = 2, min_passes = 1, min_failures = 0 }, backends_disabled = { dbi = "The DBI backend is not qualified for seeded schedule exploration", kvm = "KVM does not provide Detcore schedule exploration", sabre = "SaBRe is not qualified for seeded schedule exploration", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "Native scheduling does not guarantee both encoded outcomes within a fixed budget", replay = "Seed reproduction is the required relation for this race", verify = "A single strict schedule cannot exercise the guest's alternate-outcome oracle" }
+
+[[test]]
+id = "rust-programs/chaos-hello-chaos"
+description = "Seeded schedules reproduce both encoded parent/child orderings"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/hello_chaos.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "chaos_hello_chaos" }
+modes.chaos = { backends_enabled = ["ptrace"], seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }, backends_disabled = { dbi = "The DBI backend is not qualified for seeded schedule exploration", kvm = "KVM does not provide Detcore schedule exploration", sabre = "SaBRe is not qualified for seeded schedule exploration", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "Native scheduling does not guarantee both encoded outcomes within a fixed budget", replay = "Seed reproduction is the required relation for this race", verify = "A single strict schedule cannot exercise the guest's alternate-outcome oracle" }
+
+[[test]]
+id = "rust-programs/chaos-keyvalue"
+description = "Seeded schedules expose and reproduce the key-value publication race"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/keyvalue.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "chaos_keyvalue_bin" }
+modes.chaos = { backends_enabled = ["ptrace"], seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }, backends_disabled = { dbi = "The DBI backend is not qualified for seeded schedule exploration", kvm = "KVM does not provide Detcore schedule exploration", sabre = "SaBRe is not qualified for seeded schedule exploration", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "Native scheduling does not guarantee both encoded outcomes within a fixed budget", replay = "Seed reproduction is the required relation for this race", verify = "A single strict schedule cannot exercise the guest's alternate-outcome oracle" }
+
+[[test]]
+id = "rust-programs/chaos-nanosleep-threads-nocrash-rust"
+description = "Strict verification inventory for tests/chaos/nanosleep-threads-nocrash-rust.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/nanosleep-threads-nocrash-rust.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "nanosleep_threads_nocrash_rust" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-bind-connect-race"
+description = "Strict verification inventory for tests/rust/bind_connect_race.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/bind_connect_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_bind_connect_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-clock-gettime"
+description = "Strict verification inventory for tests/rust/clock_gettime.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/clock_gettime.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_clock_gettime" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-clock-total-order"
+description = "Strict verification inventory for tests/rust/clock_total_order.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/clock_total_order.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_clock_total_order" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-exit-group"
+description = "Strict verification inventory for tests/rust/exit_group.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/exit_group.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_exit_group" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-futex-and-print"
+description = "Strict verification inventory for tests/rust/futex_and_print.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/futex_and_print.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_futex_and_print" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-futex-timeout"
+description = "Strict verification inventory for tests/rust/futex_timeout.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/futex_timeout.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_futex_timeout" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-futex-wait-child"
+description = "Strict verification inventory for tests/rust/futex_wait_child.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/futex_wait_child.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_futex_wait_child" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-futex-wake-some"
+description = "Strict verification inventory for tests/rust/futex_wake_some.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/futex_wake_some.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_futex_wake_some" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-heap-ptrs"
+description = "Strict verification inventory for tests/rust/heap_ptrs.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/heap_ptrs.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_heap_ptrs" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-interrogate-tty"
+description = "Strict verification inventory for tests/rust/interrogate_tty.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/interrogate_tty.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_interrogate_tty" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-landlock"
+description = "Strict verification inventory for tests/rust/landlock.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/landlock.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_landlock" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-mem-race"
+description = "RCB timer preemptions produce deterministic switch points in the memory race"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "pmu", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/mem_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_mem_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-nanosleep"
+description = "Strict verification inventory for tests/rust/nanosleep.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/nanosleep.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_nanosleep" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-network-hello-world"
+description = "Strict verification inventory for tests/rust/network_hello_world.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/network_hello_world.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_network_hello_world" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-pipe-basics"
+description = "Strict verification inventory for tests/rust/pipe_basics.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/pipe_basics.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_pipe_basics" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-poll"
+description = "Strict verification inventory for tests/rust/poll.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/poll.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_poll" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-poll-spin"
+description = "Strict verification inventory for tests/rust/poll_spin.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/poll_spin.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_poll_spin" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-print-clock-nanosleep-monotonic-abs-race"
+description = "Strict verification inventory for tests/rust/print_clock_nanosleep_monotonic_abs_race.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_print_clock_nanosleep_monotonic_abs_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-print-clock-nanosleep-monotonic-race"
+description = "Strict verification inventory for tests/rust/print_clock_nanosleep_monotonic_race.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/print_clock_nanosleep_monotonic_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_print_clock_nanosleep_monotonic_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-print-clock-nanosleep-realtime-abs-race"
+description = "Strict verification inventory for tests/rust/print_clock_nanosleep_realtime_abs_race.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/print_clock_nanosleep_realtime_abs_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_print_clock_nanosleep_realtime_abs_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-print-nanosleep-race"
+description = "Strict verification inventory for tests/rust/print_nanosleep_race.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/print_nanosleep_race.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_print_nanosleep_race" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-rdtsc"
+description = "Strict verification inventory for tests/rust/rdtsc.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "pmu", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/rdtsc.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_rdtsc" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-recvmmsg"
+description = "Strict verification inventory for tests/rust/recvmmsg.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/recvmmsg.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_recvmmsg" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-sched-yield"
+description = "Strict verification inventory for tests/rust/sched_yield.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/sched_yield.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_sched_yield" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-select"
+description = "Strict verification inventory for tests/rust/select.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/select.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_select" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-shutdown"
+description = "Strict verification inventory for tests/rust/shutdown.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/shutdown.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_shutdown" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-socketpair"
+description = "Strict verification inventory for tests/rust/socketpair.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/socketpair.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_socketpair" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-stack-ptr"
+description = "Strict verification inventory for tests/rust/stack_ptr.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/stack_ptr.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_stack_ptr" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-thread-random"
+description = "Strict verification inventory for tests/rust/thread_random.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/thread_random.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_thread_random" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/rust-tkill"
+description = "Strict verification inventory for tests/rust/tkill.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/rust/tkill.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "rustbin_tkill" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/standalone-network-bind"
+description = "Strict verification inventory for tests/standalone/network_bind.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/standalone/network_bind.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "network_bind_rs" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/standalone-network-bind-full"
+description = "Strict verification inventory for tests/standalone/network_bind_full.rs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cargo"]
+timeout_seconds = 90
+occasional = false
+program = "tests/standalone/network_bind_full.rs"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cargo_target = "network_bind_full_rs" }
+modes.verify = { backends_enabled = ["ptrace"], backends_disabled = { dbi = "Initial Rust-corpus migration preserves the ptrace baseline; qualify DBI separately", kvm = "Initial Rust-corpus migration preserves the ptrace baseline; qualify KVM separately", sabre = "Initial Rust-corpus migration preserves the ptrace baseline; qualify SaBRe separately", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "This migration inventories strict verification and does not add a native oracle", replay = "Record/replay qualification is separate from the initial Rust-source migration", chaos = "Chaos scheduling requires a test-specific schedule-diversity oracle" }
+
+[[test]]
+id = "rust-programs/stress-concurrency"
+description = "Seeded schedules expose the atomic lost-update stress case"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "rustc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/stress/concurrency.rs"
+program_args = ["atomic-lost-update", "4"]
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["--edition=2024"] }
+modes.chaos = { backends_enabled = ["ptrace"], seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], assert = { min_distinct = 1, min_passes = 0, min_failures = 1 }, backends_disabled = { dbi = "The DBI backend is not qualified for seeded schedule exploration", kvm = "KVM does not provide Detcore schedule exploration", sabre = "SaBRe is not qualified for seeded schedule exploration", liteinst = "LiteInst interception remains incomplete for broad Rust guests (#1047)" } }
+disabled_modes = { naked = "Native scheduling does not guarantee bounded exposure of the lost update", replay = "Seed reproduction is the required relation for this stress case", verify = "The guest's exit status is an exposure oracle, not a single-schedule pass condition" }
+
+[[source_disposition]]
+path = "tests/e2e/manifests/manifest-harness.rs"
+kind = "manifest-tooling"
+reason = "Host-side CI manifest loader or runner; it is not a Hermit guest"
+
+[[source_disposition]]
+path = "tests/e2e/manifests/manifest-plan.rs"
+kind = "manifest-tooling"
+reason = "Host-side CI manifest loader or runner; it is not a Hermit guest"
+
+[[source_disposition]]
+path = "tests/reproducible-builds/build-time-0.1.3/src/lib.rs"
+kind = "fixture-library"
+reason = "Vendored build-script fixture library compiled by the reproducible-build test"
+
+[[source_disposition]]
+path = "tests/rust/test_utils/mod.rs"
+kind = "shared-module"
+reason = "Shared Rust guest module included by sibling programs; it has no standalone main"
+
+[[source_disposition]]
+path = "tests/standalone/stacktrace_events.rs"
+kind = "host-analyzer"
+reason = "Host-side schedule and stacktrace analyzer binary, not a guest executed under Hermit"
+
+[[source_disposition]]
+path = "tests/stress/scheduling_fairness.rs"
+kind = "integration-owned-guest"
+reason = "Parameterized guest whose metric oracles are enforced by hermit-cli/tests/thread_scheduling_fairness.rs; status and output equality alone would not preserve them"

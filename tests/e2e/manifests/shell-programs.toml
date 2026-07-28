@@ -1,0 +1,547 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Shell source coverage for CI Overhaul v2. Executable protocol wrappers are
+# manifest tests; helpers, drivers, aliases, and legacy non-protocol guests have
+# explicit dispositions so coverage audits never silently drop a source path.
+
+schema = 2
+bucket = "shell-programs"
+
+[[test]]
+id = "shell-programs/e2e-applications-kvm-python-examples"
+description = "The user-facing Python examples run identically with the system interpreter under KVM"
+lane = "privileged"
+requires = ["linux", "x86_64", "kvm", "python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/kvm-python-examples.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["kvm"]
+[test.modes.verify.backends_disabled]
+ptrace = "This wrapper is the focused KVM integration case; portable ptrace coverage lives in sibling entries"
+dbi = "This wrapper is the focused KVM integration case; qualify DBI separately"
+sabre = "This wrapper is the focused KVM integration case; qualify SaBRe separately"
+liteinst = "This wrapper is the focused KVM integration case; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "The portable Python random case already provides the native nondeterminism control"
+replay = "Record/replay is a ptrace-only mode"
+chaos = "Both examples are single-threaded"
+
+[[test]]
+id = "shell-programs/e2e-applications-kvm-shell-environment"
+description = "KVM executes a shell workload with a deterministic environment"
+lane = "privileged"
+requires = ["linux", "x86_64", "kvm"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/applications/kvm-shell-environment.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["kvm"]
+[test.modes.verify.backends_disabled]
+ptrace = "This wrapper is the focused KVM integration case; portable ptrace coverage lives in sibling entries"
+dbi = "This wrapper is the focused KVM integration case; qualify DBI separately"
+sabre = "This wrapper is the focused KVM integration case; qualify SaBRe separately"
+liteinst = "This wrapper is the focused KVM integration case; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This is a privileged backend integration test"
+replay = "KVM has no record/replay runtime"
+chaos = "KVM does not provide Detcore schedule exploration"
+
+[[test]]
+id = "shell-programs/e2e-applications-timed-progress-bar"
+description = "A time-driven Python application completes identically under verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/timed-progress-bar.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+naked = "Elapsed time drives progress but the final application output is intentionally stable"
+replay = "The shorter time and entropy cases provide the blocking replay sentinels"
+chaos = "The application is single-threaded"
+
+[[test]]
+id = "shell-programs/e2e-data-handling-archive-roundtrip"
+description = "Create, extract, and verify a normalized tar archive"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/data-handling/archive-roundtrip.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+naked = "The archive uses normalized metadata and is deterministic by construction"
+replay = "The focused C sentinel provides the blocking replay contract"
+chaos = "The workload is single-threaded"
+
+[[test]]
+id = "shell-programs/e2e-determinism-stress-process-chains"
+description = "A 13-process fork tree and five-stage C pipe chain repeat under strict verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/determinism-stress/process-chains.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+naked = "Both programs self-check deterministic invariants rather than requiring native output variation"
+replay = "The focused C replay sentinel owns the blocking record/replay contract"
+chaos = "The order-violation test provides the seeded schedule-diversity oracle"
+
+[[test]]
+id = "shell-programs/e2e-determinism-stress-thread-output"
+description = "Concurrent shell writers produce repeatable output under strict verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/thread-output.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+naked = "Native ordering can vary but is not guaranteed to diverge in a bounded run"
+replay = "Strict verification already covers this example in the required lane"
+chaos = "The focused order-violation test provides a stronger seeded oracle"
+
+[[test]]
+id = "shell-programs/e2e-language-runtimes-python-random"
+description = "Python random output varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "python3"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/python-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+runs = 3
+assert = { min_distinct = 2 }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+replay = "The focused C sentinel provides the blocking replay contract"
+chaos = "The Python example is single-threaded"
+
+[[test]]
+id = "shell-programs/e2e-system-utils-random-device"
+description = "Kernel random bytes vary natively and repeat under Hermit"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/system-utils/random-device.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+runs = 3
+assert = { min_distinct = 2 }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial shell migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial shell migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial shell migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "LiteInst interception remains incomplete for broad shell workloads (#1047)"
+
+[test.disabled_modes]
+replay = "The hexdump process tree currently diverges during replay"
+chaos = "Random-byte generation has no scheduling oracle"
+
+[[source_disposition]]
+path = "tests/compat/complex_shell_workload.sh"
+kind = "compat-guest"
+reason = "Invoked directly under Hermit by validate.sh; it lacks the e2e prepare/run protocol and remains owned by the compatibility suite"
+
+[[source_disposition]]
+path = "tests/compat/prepare_real_compat_fixtures.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/compat/real_compat_workload.sh"
+kind = "compat-guest"
+reason = "Invoked directly under Hermit by validate.sh; it lacks the e2e prepare/run protocol and remains owned by the compatibility suite"
+
+[[source_disposition]]
+path = "tests/debugger/run_debugger_tests.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/e2e/lib/applications/build_tools.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/applications/common.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/applications/http_server.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/applications/run_all.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/applications/sqlite_on_disk.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/archive.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/compression.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/numerical.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/reproducible-build.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/run.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/data-handling/text-processing.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/common.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/examples.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/pid-tid.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/pipe-chain.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/random.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/run.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/signals.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/syscalls.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/thread-racing.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/determinism-stress/time-clock.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/language-runtimes/run.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/_common.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/df.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/du.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/groups.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/hostname.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/id.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/lscpu.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/lshw.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/numactl.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/proc.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/run.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/uname.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/e2e/lib/system-utils/whoami.sh"
+kind = "host-harness"
+reason = "Host-side suite driver or sourced library; it orchestrates guests instead of running as one"
+
+[[source_disposition]]
+path = "tests/qemu-boot/smoke_test.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/qemu-boot/strict_l2_network_test.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/qemu-boot/strict_l2_test.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/qemu-boot/strict_l2_userspace_test.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/reproducible-builds/run.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/shell/date.sh"
+kind = "symlink-alias"
+reason = "Compatibility alias to the canonical examples/ guest; retained for legacy callers and not a distinct test"
+
+[[source_disposition]]
+path = "tests/shell/devrand.sh"
+kind = "symlink-alias"
+reason = "Compatibility alias to the canonical examples/ guest; retained for legacy callers and not a distinct test"
+
+[[source_disposition]]
+path = "tests/shell/non_strict/curl.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/shell/par_work.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/shell/py_hello.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/shell/race.sh"
+kind = "symlink-alias"
+reason = "Compatibility alias to the canonical examples/ guest; retained for legacy callers and not a distinct test"
+
+[[source_disposition]]
+path = "tests/shell/taskset.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/cat_proc_uptime.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/curl_client_only.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/env_var_passthru.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/minimal_hello_backtraces.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/replay_and_print_stacktraces.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/replay_chaos_trace.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/replay_trace.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/stacktrace_signal.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/strict_setitimer.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/strict_timer_create.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/test_no_networking_network_bind.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/standalone/validate_race_example_properties.sh"
+kind = "legacy-non-protocol"
+reason = "Legacy guest or workflow lacks the v2 --prepare/--run contract; no manifest execution is claimed until a dedicated migration preserves its oracle"
+
+[[source_disposition]]
+path = "tests/util/chaos_stress_wrapper.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/util/curl_to_server_with_ssl.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/util/hermit_analyze_e2e.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/util/hermit_analyze_test.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/util/hermit_verify_trace_replay.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
+
+[[source_disposition]]
+path = "tests/util/perf_supported.sh"
+kind = "host-driver"
+reason = "Host-side validation driver or fixture helper; it invokes tests rather than running as a Hermit guest"
