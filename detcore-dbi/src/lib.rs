@@ -277,7 +277,7 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review DBI self-target queued-signal identity translation.
+// TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
 fn translate_self_queued_signal_targets(
     sysnum: i64,
     args: &mut [u64; 6],

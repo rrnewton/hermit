@@ -210,7 +210,7 @@ fn dbi_unsupported_syscall_guest() -> &'static Path {
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review the DBI self-signal fixture build.
+// TODO-HUMAN-REVIEW(PR-1038): Review the DBI self-signal fixture build.
 fn dbi_self_sigqueue_guest() -> &'static Path {
     DBI_SELF_SIGQUEUE_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -680,7 +680,7 @@ fn run_dbi_forwards_detcore_info_logs() {
     );
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review DBI queued self-signal verification.
+// TODO-HUMAN-REVIEW(PR-1038): Review DBI queued self-signal verification.
 #[test]
 fn run_dbi_verifies_queued_self_signals() {
     let program = dbi_self_sigqueue_guest()
