@@ -125,6 +125,33 @@ fn clock_apis_are_deterministic_across_five_runs() {
     }
 }
 
+#[test]
+fn date_example_prints_a_calendar_month() {
+    let _guard = hermit_clock_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--env=TZ=UTC",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+    ]);
+    command.arg(repository.join("examples/date.sh"));
+
+    let output = command_output(command, "date example");
+    let stdout = String::from_utf8(output.stdout).expect("date output should be UTF-8");
+    assert!(
+        stdout.starts_with("2026-01-01_00:00:"),
+        "date example did not print the January calendar month: {stdout:?}",
+    );
+}
+
 // NONDET_SOURCE: timestamp
 #[test]
 fn strict_mode_eliminates_native_clock_nondeterminism() {
