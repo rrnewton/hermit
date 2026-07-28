@@ -17,6 +17,14 @@ BEGIN_MARKER = "__HERMIT_COMMAND_BEGIN__"
 END_MARKER = "__HERMIT_COMMAND_END__"
 
 
+# QEMU's initial process state influences the VM snapshot. Do not leak harness
+# settings such as QEMU_TIMEOUT or proxy variables into its initial stack.
+QEMU_ENV = {
+    "LC_ALL": "C",
+    "TZ": "UTC",
+}
+
+
 class BlockingSerial:
     """Single-threaded serial transport used inside Hermit's scheduler."""
 
@@ -131,7 +139,7 @@ def run_controller(arguments: argparse.Namespace) -> int:
     process = None
     serial = None
     try:
-        process = subprocess.Popen(command)
+        process = subprocess.Popen(command, env=QEMU_ENV)
         wait_for_socket(arguments.qmp_socket, process, arguments.timeout)
         wait_for_socket(arguments.serial_socket, process, arguments.timeout)
         serial = BlockingSerial(arguments.serial_socket, arguments.serial_log)

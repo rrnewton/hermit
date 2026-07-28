@@ -174,10 +174,12 @@ At the shell, Demo 5 asks QEMU's QMP control socket to run `savevm hermit-boot`.
 The resulting internal snapshot is stored in the ignored
 `hermit-snapshot.qcow2` disk. The disk is deliberately not attached to the
 guest; it exists only as QEMU's VM-state store. Demo 5 then exits QEMU over QMP
-and records the image hash, raw INFO log, tool versions, and timestamp. The
-first run becomes `ignored/qemu-linux/run-metadata.json`; later runs compare
-their exact qcow2 SHA-256 and normalized INFO log with that anchor and print a
-clear `PASS` or `WARN` report.
+and records the image hash, raw INFO log, Hermit and QEMU versions, QEMU binary
+SHA-256, and timestamp. The first run becomes
+`ignored/qemu-linux/run-metadata.json`; later runs compare their exact qcow2,
+serial-output, and QEMU binary hashes. INFO logs are compared byte-for-byte
+after removing only each line's leading ISO-8601 wallclock timestamp. No
+address, path, virtual time, scheduler count, or other number is normalized.
 
 Both Python QEMU demos keep the QEMU-visible paths fixed at
 `ignored/qemu-linux/qmp.sock`, `serial.sock`, and `hermit-snapshot.qcow2`.
@@ -220,15 +222,15 @@ updates; `BUSYBOX` and `QEMU_ASSETS` retain their existing overrides.
 The boot and every resume use `--strict`, `--target-timeslice 100000`, and
 `--max-timeslice 2000000000`. Strict mode fails closed on unsupported
 operations; the timeslice settings retain deterministic scheduling while
-keeping the VM practical. To avoid writing millions of per-syscall lines, the
-scripts enable stable scheduler/run lifecycle INFO targets and print a concise,
-timestamp-free tail.
+keeping the VM practical. The scripts enable Detcore INFO logging so the raw
+log includes syscall entries and results as well as scheduler records. Console
+output remains concise because it prints only a timestamp-free tail.
 
 ### 6. QEMU Snapshot Resume
 
 Demo 6 starts the same QEMU machine with `-loadvm hermit-boot`, connects to its
 Unix serial socket, and injects one shell command. It prints the guest output
-and normalized Hermit INFO tail, then saves a post-command snapshot unless
+and timestamp-free Hermit INFO tail, then saves a post-command snapshot unless
 `--no-save-snapshot` is passed. For example:
 
 ```bash
@@ -239,9 +241,9 @@ and normalized Hermit INFO tail, then saves a post-command snapshot unless
 ```
 
 The command's SHA-256 selects its metadata directory. The first run anchors the
-guest-output hash, post-command qcow2 hash, and raw INFO log. Repeating that
-command compares all three and reports the first normalized log divergence
-without hiding virtual-time or scheduler differences.
+guest-output hash, post-command qcow2 hash, QEMU identity, and raw INFO log.
+Repeating that command compares every field and reports the first log
+divergence after stripping only the wallclock prefix.
 
 ## Scope And Next Steps
 
