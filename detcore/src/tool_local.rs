@@ -1940,11 +1940,7 @@ pub fn thread_rng_from_parent(msg: &str, parent: &Pcg64Mcg, child: DetTid) -> Pc
     thread_rng_from_parent_entropy_labeled(msg, parent, child.as_raw() as u32 as u128, "tid")
 }
 
-pub(crate) fn thread_rng_from_parent_entropy(
-    msg: &str,
-    parent: &Pcg64Mcg,
-    entropy: u128,
-) -> Pcg64Mcg {
+fn thread_rng_from_parent_entropy(msg: &str, parent: &Pcg64Mcg, entropy: u128) -> Pcg64Mcg {
     thread_rng_from_parent_entropy_labeled(msg, parent, entropy, "entropy")
 }
 
