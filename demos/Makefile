@@ -6,14 +6,19 @@
 
 DEMO_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 CLEAN := $(DEMO_DIR)clean.sh
+PYTHON ?= python3
 
-.PHONY: clean distclean help
+.PHONY: clean distclean help test
 
 help:
 	@echo "make clean      Wipe computed demo results (anchors, run history,"
 	@echo "                snapshots) so the next run starts fresh. Keeps the"
 	@echo "                downloaded kernel and built initramfs."
 	@echo "make distclean  Also remove the kernel download and initramfs blobs."
+	@echo "make test       Run the fast, hermetic demo unit tests (no QEMU)."
+
+test:
+	@$(PYTHON) -m unittest discover -s "$(DEMO_DIR)tests" -p 'test_*.py' -v
 
 clean:
 	@"$(CLEAN)"
