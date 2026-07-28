@@ -278,7 +278,7 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(compat-dbi-round10): Review DBI self-target prlimit64 translation.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-target prlimit64 translation.
 fn translate_self_identity_targets(
     sysnum: i64,
     args: &mut [u64; 6],
@@ -459,7 +459,7 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(compat-dbi-round10): Review fault-safe DBI prlimit64 input validation.
+// TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
 fn prlimit_new_limit_is_readable(
     sysnum: i64,
     args: &[u64],
@@ -1259,7 +1259,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         tid,
     );
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(compat-dbi-round10): Review fault-safe DBI prlimit64 input validation.
+    // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
     if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
         read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
     }) {

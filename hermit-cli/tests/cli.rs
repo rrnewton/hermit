@@ -184,7 +184,7 @@ fn dbi_pid_guest() -> &'static Path {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(compat-dbi-round10): Review DBI self-prlimit fixture coverage.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-prlimit fixture coverage.
 fn dbi_prlimit_self_guest() -> &'static Path {
     DBI_PRLIMIT_SELF_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -857,7 +857,7 @@ fn run_dbi_virtualizes_process_identities() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(compat-dbi-round10): Review DBI self-prlimit L2 coverage.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-prlimit L2 coverage.
 #[test]
 fn run_dbi_verifies_self_prlimit() {
     let program = dbi_prlimit_self_guest()
