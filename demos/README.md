@@ -58,11 +58,11 @@ summary is saved as `hermit-stderr.log` instead of replaying the serial console.
 - `cpio`, `file`, `find`, `gzip`, `install`, `sha256sum`, `sort`, `stat`,
   `tee`, `timeout`, `touch`, and `wc`
 
-The runner pins QEMU to one TCG vCPU and an instruction-derived clock, disables
-default devices and networking, and uses a VM-clock RTC. The initramfs builder
-fixes archive order, ownership, mtimes, cpio inode metadata, and the gzip
-header. A changing kernel, QEMU binary, BusyBox binary, host filesystem, or
-command line is a different experiment.
+The runner pins QEMU to the `q35` machine, `max` CPU, one TCG vCPU, and an
+instruction-derived clock. It disables default devices and networking and uses
+a VM-clock RTC. The initramfs builder fixes archive order, ownership, mtimes,
+cpio inode metadata, and the gzip header. A changing kernel, QEMU binary,
+BusyBox binary, host filesystem, or command line is a different experiment.
 
 ### Current boundary
 
@@ -89,11 +89,12 @@ and initramfs SHA-256
 `5515b4bced678c4d22ff54dafd1676f06b8e254f1656d2994018df24aa1e9698`.
 The guest reached `HERMIT-QEMU-BUSYBOX-PASS`, printed pi as `3.1415926532`,
 and powered down. With `boot_qemu.sh` as the guest entry point, Hermit scheduled
-six shell/QEMU threads for 32,161 turns over 146.181220200 virtual seconds. The
+six shell/QEMU threads for 38,088 turns over 181.740147850 virtual seconds. The
 documented `cargo run` form and the higher-level runner both produced console
-SHA-256 `0afde4df0d92cee9b5c331498fc4571fd8b53ef91f6fa34142fd8c7db5e1971a`.
+SHA-256 `f9a42014fac177223f08d5e722a8c6d88ae3b79eb0f1fab95bbdcb15487fbab3`.
+Pinning `q35` and `max` produced no QEMU stderr warnings.
 
 An L2 `VERIFY=1` run then completed both boots with the same inputs. Each
-normalized log contained 533,731 messages, including 375,853 DETLOG and
+normalized log contained 759,956 messages, including 548,255 DETLOG and
 scheduler COMMIT messages. Hermit reported no substantive differences and
 printed `Success: deterministic. Determinism verified.`
