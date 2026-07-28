@@ -63,8 +63,15 @@ use std::process::Command;
 
 use toml::Value;
 
+/// Every backend a `--backend` filter may name. Used to reject typo'd filter
+/// values (see the `run` subcommand) so an invalid `--backend` fails loudly
+/// instead of silently selecting zero cells.
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
-const ACCOUNTED_MODES: [&str; 4] = ["verify", "chaos", "replay", "naked"];
+/// Every mode a `--mode` filter may name — the exact set `run_entry` dispatches
+/// on. Kept in sync with `run_entry`'s `match m.name`; `custom` is a real mode
+/// (see `tests/e2e/manifests/system-utils.toml`). Used to reject typo'd
+/// `--mode` filter values.
+const ACCOUNTED_MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 
 fn die(msg: String) -> ! {
     eprintln!("manifest-harness: {msg}");
@@ -489,7 +496,23 @@ fn prepare_cell(cell: &Path) {
     }
 }
 
-fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool, no_build: bool) -> bool {
+/// The result of running one `[[test]]` entry through the active filters.
+///
+/// `cells` and `backend_cells` let the caller distinguish "every cell passed"
+/// from "no cell ran at all". A `--mode`/`--backend` filter that matches nothing
+/// leaves `all_pass` at its initial `true`, which historically caused the runner
+/// to report success while executing zero work (fail-open). Reporting the counts
+/// lets the caller turn an empty selection into a hard failure.
+struct RunOutcome {
+    /// True if every cell that actually ran passed (vacuously true if none ran).
+    all_pass: bool,
+    /// Total cells executed for this entry, including the backend-less `naked` mode.
+    cells: u64,
+    /// Cells executed that were subject to the `--backend` filter (excludes `naked`).
+    backend_cells: u64,
+}
+
+fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool, no_build: bool) -> RunOutcome {
     let out_dir = repo_root().join("target/e2e-harness/build");
     let prog = build_program(entry, &out_dir, dry_run, no_build);
     let cell = repo_root().join(format!("target/e2e-harness/runs/{}", sanitized(&entry.id)));
@@ -506,19 +529,22 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             let st = c.status().unwrap_or_else(|e| die(format!("prepare {}: {e}", entry.id)));
             if !st.success() {
                 println!("ERROR {} - fixture preparation failed", entry.id);
-                return false;
+                return RunOutcome { all_pass: false, cells: 0, backend_cells: 0 };
             }
         }
     }
     let env = cell_env(&cell);
     let guest = guest_argv(&prog);
     let mut all_pass = true;
+    let mut cells: u64 = 0;
+    let mut backend_cells: u64 = 0;
 
     for m in &entry.modes {
         if !mode_filter.is_empty() && m.name != mode_filter {
             continue;
         }
         if m.name == "naked" {
+            cells += 1;
             let mut seen: BTreeSet<(i32, Vec<u8>)> = BTreeSet::new();
             for _ in 0..m.runs.max(2) {
                 let at = run_argv(&guest, &env, dry_run);
@@ -535,6 +561,8 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             if !backend_filter.is_empty() && b != backend_filter {
                 continue;
             }
+            cells += 1;
+            backend_cells += 1;
             match m.name.as_str() {
                 "verify" | "custom" => {
                     let repeats = if m.name == "custom" { m.runs.max(1) } else { 1 };
@@ -590,7 +618,11 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             }
         }
     }
-    all_pass
+    RunOutcome {
+        all_pass,
+        cells,
+        backend_cells,
+    }
 }
 
 fn report(pass: bool, entry: &TestEntry, mode: &str, backend: &str, note: &str) {
@@ -803,6 +835,21 @@ fn main() {
                     s => die(format!("run: unknown option {s}")),
                 }
             }
+            // Reject typo'd filter values before doing any work. Without this an
+            // invalid `--mode`/`--backend` matched zero cells and the runner
+            // exited 0 having executed nothing (fail-open filter handling).
+            if !mode.is_empty() && !ACCOUNTED_MODES.contains(&mode.as_str()) {
+                die(format!(
+                    "run: unknown --mode `{mode}` (expected one of {})",
+                    ACCOUNTED_MODES.join("|")
+                ));
+            }
+            if !backend.is_empty() && !KNOWN_BACKENDS.contains(&backend.as_str()) {
+                die(format!(
+                    "run: unknown --backend `{backend}` (expected one of {})",
+                    KNOWN_BACKENDS.join("|")
+                ));
+            }
             let entries = load_entries();
             let selected: Vec<TestEntry> = if !id.is_empty() {
                 vec![find_entry(&entries, &id)]
@@ -817,11 +864,35 @@ fn main() {
             if selected.is_empty() {
                 die("run: selection matched no tests".into());
             }
-            let mut failures = 0;
+            let mut failures = 0u64;
+            let mut cells = 0u64;
+            let mut backend_cells = 0u64;
             for e in &selected {
-                if !run_entry(e, &mode, &backend, dry, no_build) {
+                let o = run_entry(e, &mode, &backend, dry, no_build);
+                if !o.all_pass {
                     failures += 1;
                 }
+                cells += o.cells;
+                backend_cells += o.backend_cells;
+            }
+            // A valid-but-unmatched filter can still select zero cells (e.g. a
+            // mode absent from every selected test, or a backend no selected
+            // test enables). Fail loudly instead of silently exiting 0. Only
+            // when there are no real failures, so a genuine failure keeps its
+            // normal reporting and exit(1).
+            if failures == 0 && cells == 0 {
+                die(format!(
+                    "run: filters selected 0 test cells across {} test(s) \
+                     (mode={mode:?} backend={backend:?}); nothing ran",
+                    selected.len()
+                ));
+            }
+            if failures == 0 && !backend.is_empty() && backend_cells == 0 {
+                die(format!(
+                    "run: --backend `{backend}` matched 0 backend cells across \
+                     {} test(s); nothing ran",
+                    selected.len()
+                ));
             }
             exit(if failures == 0 { 0 } else { 1 });
         }
@@ -850,7 +921,4 @@ fn main() {
         }
         other => die(format!("unknown subcommand `{other}` (try validate|plan|build|run|dag)")),
     }
-
-    // Silence unused-const warnings when a build only touches some paths.
-    let _ = (KNOWN_BACKENDS, ACCOUNTED_MODES);
 }
