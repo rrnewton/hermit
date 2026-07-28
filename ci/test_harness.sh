@@ -47,8 +47,8 @@ Filters:
   --include-occasional    include tests marked occasional
 
 The run command defaults to all required, non-occasional cells in both lanes.
-Every selected required cell emits one JSONL record. Hermit runs use
---log=off so test observations contain guest behavior rather than diagnostics.
+Every selected required cell emits one JSONL record. Verification runs use the
+required INFO level, but diagnostics stay outside the guest-observation hash.
 USAGE
 }
 
@@ -400,11 +400,11 @@ function execute_attempt {
             command=("$test" --run)
             ;;
         verify)
-            command=("$HERMIT_BIN" --log=off run --backend "$backend" --strict --verify
+            command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
                 "${profile[@]}" -- "$test" --run)
             ;;
         replay)
-            command=("$HERMIT_BIN" --log=off --backend "$backend" record start --strict --verify
+            command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "$test" --run)
             ;;
         chaos)
@@ -428,7 +428,7 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
-    local test_file test_sha256 binary_sha256 effective_args relaxations
+    local test_file test_sha256 binary_sha256 effective_args relaxations log_level
     test_file=${TEST_BY_ID[$test_id]}
     test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
     if [[ -x $HERMIT_BIN ]]; then
@@ -440,18 +440,22 @@ function append_result {
     case "$mode" in
         naked)
             effective_args='[]'
+            log_level=
             ;;
         verify)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["run",("--backend=" + $backend),"--strict","--verify"]')
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]')
+            log_level=info
             ;;
         replay)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '[("--backend=" + $backend),"record","start","--strict","--verify"]')
+                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify"]')
+            log_level=info
             ;;
         chaos)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["run",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
+                '["--log=off","run",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
+            log_level=off
             ;;
     esac
     if [[ $lane == portable && $mode != naked ]]; then
@@ -470,6 +474,7 @@ function append_result {
         --arg backend "$backend" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
+        --arg log_level "$log_level" \
         --argjson duration_ms "$duration_ms" \
         --argjson effective_args "$effective_args" \
         --argjson relaxations "$relaxations" \
@@ -477,7 +482,8 @@ function append_result {
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:"required",
-          outcome:$outcome,duration_ms:$duration_ms,log_level:(if $mode == "naked" then null else "off" end),
+          outcome:$outcome,duration_ms:$duration_ms,
+          log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,relaxations:$relaxations,preprocessor:null,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
