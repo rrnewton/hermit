@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Shared utilities for the Python QEMU snapshot demos."""
 
+import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -14,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -22,6 +25,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 WALLCLOCK_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]+"
 )
+
+# detcore logs the host-filesystem inode of a touched file as its resource id,
+# e.g. `FileContents(263701387)`. That number is a host-physical identifier the
+# kernel hands out afresh whenever a file is (re)created, so it varies run to run
+# even when guest execution is bit-identical (recreated fixed-path files churn it
+# just as per-run private directories do). It is nondeterministic in exactly the
+# same sense as the wallclock prefix, so the exact-log comparison folds it to a
+# stable token. Guest-observable determinism is still asserted independently via
+# the qcow2 / serial / guest-output SHAs.
+FILE_INODE_RE = re.compile(r"FileContents\(\d+\)")
 
 
 def hash_file(path: Path) -> str:
@@ -157,13 +170,186 @@ def save_anchor(run_dir: Path, metadata: Dict[str, Any]) -> Path:
     return anchor_path
 
 
+# ---------------------------------------------------------------------------
+# Concurrent-safe anchor claim.
+#
+# Multiple demo runs may execute simultaneously. Each builds its whole result in
+# a private working directory (make_temp_result_dir) and then races to publish it
+# as THE anchor with a single atomic, no-clobber rename. Exactly one run wins and
+# becomes the first-run anchor; every other run loses cleanly (EEXIST), archives
+# its own result, and compares against the fully-committed anchor. Because the
+# entire result directory is moved in one step, a loser never observes a
+# half-written anchor.
+# ---------------------------------------------------------------------------
+
+# renameat2(2) with RENAME_NOREPLACE is the atomic, no-clobber primitive.
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+# x86-64 renameat2 syscall number; used only if the glibc wrapper is missing.
+_SYS_RENAMEAT2 = 316
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """Atomically rename ``src`` to ``dst``, refusing to clobber an existing dst.
+
+    Wraps Linux ``renameat2(RENAME_NOREPLACE)``: the move either creates ``dst``
+    atomically or raises ``OSError(EEXIST)`` because ``dst`` already exists. It
+    never overwrites ``dst``, and there is no check-then-move window (no TOCTOU).
+    Raises ``OSError(ENOSYS)``/``OSError(EINVAL)`` when the kernel or filesystem
+    lacks RENAME_NOREPLACE, so callers can fall back to a lock-guarded rename.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    src_b = os.fsencode(str(src))
+    dst_b = os.fsencode(str(dst))
+    wrapper = getattr(libc, "renameat2", None)
+    if wrapper is not None:
+        wrapper.restype = ctypes.c_int
+        wrapper.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        result = wrapper(
+            _AT_FDCWD, src_b, _AT_FDCWD, dst_b, ctypes.c_uint(_RENAME_NOREPLACE)
+        )
+    else:
+        result = libc.syscall(
+            ctypes.c_long(_SYS_RENAMEAT2),
+            ctypes.c_int(_AT_FDCWD),
+            ctypes.c_char_p(src_b),
+            ctypes.c_int(_AT_FDCWD),
+            ctypes.c_char_p(dst_b),
+            ctypes.c_uint(_RENAME_NOREPLACE),
+        )
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(dst))
+
+
+def _publish_anchor_locked(work_dir: Path, anchor_dir: Path) -> bool:
+    """Portable fallback claim: serialize with an exclusive lock, then rename.
+
+    Used only when the filesystem lacks ``renameat2(RENAME_NOREPLACE)``. The lock
+    removes the check-then-rename race: a loser cannot rename while the winner
+    holds the lock, so the plain ``os.rename`` here is safe and never clobbers a
+    published anchor.
+    """
+    lock_path = anchor_dir.with_name(anchor_dir.name + ".claim.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if anchor_dir.exists():
+            return False
+        os.rename(str(work_dir), str(anchor_dir))
+        return True
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def make_temp_result_dir(assets: Path, prefix: str) -> Path:
+    """Create a private, unique per-run working directory under ``<assets>/.work``.
+
+    Everything for one concurrent run (sockets, snapshot, logs, metadata) is
+    built here in isolation so simultaneous runs never share a path. The
+    directory is later published atomically as the anchor (winner) or archived
+    into run-history (loser).
+    """
+    work_root = Path(assets) / ".work"
+    work_root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(work_root)))
+
+
+def publish_anchor(work_dir: Path, anchor_dir: Path) -> bool:
+    """Atomically publish ``work_dir`` as THE anchor directory.
+
+    Returns ``True`` if this run won the anchor (``work_dir`` became
+    ``anchor_dir``), or ``False`` if an anchor already existed, in which case the
+    caller is a loser and must compare against the committed anchor. The whole
+    result directory is moved in one atomic, no-clobber step, so no reader ever
+    observes a half-written anchor.
+    """
+    work_dir = Path(work_dir)
+    anchor_dir = Path(anchor_dir)
+    anchor_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _rename_noreplace(work_dir, anchor_dir)
+        return True
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            return False
+        if error.errno in (errno.ENOSYS, errno.EINVAL):
+            return _publish_anchor_locked(work_dir, anchor_dir)
+        raise
+
+
+def load_committed_anchor(anchor_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load the committed anchor metadata, resolving its bundled INFO log path.
+
+    Returns ``None`` when no anchor exists yet. The anchor's Hermit INFO log is
+    bundled inside the anchor directory; the ``info_log`` field recorded before
+    publication points at the pre-publish working path, so rewrite it to the
+    bundled copy for log comparison.
+    """
+    anchor_dir = Path(anchor_dir)
+    anchor_meta = anchor_dir / "run-metadata.json"
+    if not anchor_meta.is_file():
+        return None
+    metadata = json.loads(anchor_meta.read_text())
+    bundled_log = anchor_dir / "hermit-info.log"
+    if bundled_log.is_file():
+        metadata["info_log"] = str(bundled_log.resolve())
+    return metadata
+
+
+def archive_result_dir(work_dir: Path, assets: Path, prefix: str) -> Path:
+    """Move a completed non-anchor run into run-history under a unique name."""
+    work_dir = Path(work_dir)
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    history = Path(assets) / "run-history"
+    history.mkdir(parents=True, exist_ok=True)
+    # work_dir.name carries the mkdtemp random suffix, guaranteeing uniqueness.
+    destination = history / "{}-{}-{}".format(prefix, timestamp, work_dir.name)
+    os.rename(str(work_dir), str(destination))
+    return destination
+
+
+def publish_file_atomic(src: Path, dst: Path) -> None:
+    """Copy ``src`` onto ``dst`` atomically (temp copy + ``os.replace``).
+
+    Concurrent-safe replacement for a plain copy of a shared handoff artifact:
+    readers always see either the old or the new complete file, never a partial.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dst.with_name("{}.tmp.{}".format(dst.name, os.getpid()))
+    shutil.copy2(str(src), str(temporary))
+    os.replace(str(temporary), str(dst))
+
+
 def _strip_wallclock_prefix(line: str) -> str:
     """Strip only the nondeterministic tracing wallclock prefix."""
     return WALLCLOCK_RE.sub("", line, count=1)
 
 
+def _normalize_log_line(line: str) -> str:
+    """Fold out host-physical nondeterminism (wallclock prefix, inode numbers).
+
+    See WALLCLOCK_RE and FILE_INODE_RE for why each token is nondeterministic
+    even when the guest execution is bit-identical. Anything else surviving here
+    is a real divergence.
+    """
+    line = _strip_wallclock_prefix(line)
+    line = FILE_INODE_RE.sub("FileContents(<inode>)", line)
+    return line
+
+
 def hermit_log_diff(log1: Path, log2: Path) -> str:
-    """Return the first exact log divergence after stripping wallclock prefixes."""
+    """Return the first exact log divergence after normalizing host-physical noise."""
     before: List[Tuple[int, str, str]] = []
     with Path(log1).open(errors="replace") as left, Path(log2).open(
         errors="replace"
@@ -175,20 +361,20 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
             if not left_line and not right_line:
                 return ""
             line_number += 1
-            stripped_left = _strip_wallclock_prefix(left_line)
-            stripped_right = _strip_wallclock_prefix(right_line)
-            if stripped_left != stripped_right:
+            normalized_left = _normalize_log_line(left_line)
+            normalized_right = _normalize_log_line(right_line)
+            if normalized_left != normalized_right:
                 context = ["  {!r}".format(item[1]) for item in before]
                 context.extend(
                     (
-                        "- {!r}".format(stripped_left),
-                        "+ {!r}".format(stripped_right),
+                        "- {!r}".format(normalized_left),
+                        "+ {!r}".format(normalized_right),
                     )
                 )
-                return "first timestamp-stripped divergence at line {}:\n{}".format(
+                return "first divergence at line {} (wallclock + inode normalized):\n{}".format(
                     line_number, "\n".join(context)
                 )
-            before.append((line_number, stripped_left, stripped_right))
+            before.append((line_number, normalized_left, normalized_right))
             before = before[-3:]
 
 
@@ -231,13 +417,13 @@ def compare_runs(
         if difference:
             passed = False
             report.append(
-                "WARN: exact Hermit log differs from first run after stripping only wallclock timestamps\n{}".format(
+                "WARN: exact Hermit log differs from first run after normalizing only wallclock timestamps and host inode numbers\n{}".format(
                     difference
                 )
             )
         else:
             report.append(
-                "PASS: exact Hermit log matches first run after stripping wallclock timestamps"
+                "PASS: exact Hermit log matches first run after normalizing wallclock timestamps and host inode numbers"
             )
     else:
         passed = False
