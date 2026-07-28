@@ -204,6 +204,12 @@ impl reverie_sabre::Tool for Plugin {
     fn on_thread_exit(&self, thread_id: u32) {
         self.adapter.handle_thread_exit(thread_id);
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1023): Review SaBRe post-exec delivery into Detcore.
+    fn on_post_load(&self) {
+        self.adapter.handle_post_exec();
+    }
 }
 
 #[cfg(test)]
