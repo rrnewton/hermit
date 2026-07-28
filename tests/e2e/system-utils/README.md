@@ -37,7 +37,7 @@ claim that different backends expose byte-identical hardware descriptions.
 | `uname.sh` | pass | pass | |
 | `id.sh` | pass | pass | |
 | `groups.sh` | pass | pass | |
-| `proc.sh` | pass | gap | shell procfs probe stalls |
+| `proc.sh` | pass | pass | |
 | `du.sh` | pass | pass | |
 | `df.sh` | pass | pass | |
 
