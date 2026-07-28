@@ -41,11 +41,17 @@ fi
 lane=$1
 shift
 
-dag="$ROOT_DIR/ci/dag/${lane}.json"
-if [[ ! -f $dag ]]; then
-    echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
+dag_template="$ROOT_DIR/ci/dag/${lane}.json"
+if [[ ! -f $dag_template ]]; then
+    echo "run-dag.sh: unknown lane '$lane' (no such file: $dag_template)" >&2
     echo "            known lanes: portable, privileged" >&2
     exit 2
+fi
+
+dag="$ROOT_DIR/target/ci-dag/rendered-${lane}.json"
+if ! "$ROOT_DIR/ci/render-manifest-dag.sh" "$lane" "$dag"; then
+    echo "run-dag.sh: failed to render manifest nodes for lane '$lane'" >&2
+    exit 1
 fi
 
 # Locate the runner. Prefer an explicit override, then the compiled Rust binary
@@ -86,5 +92,5 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-echo "run-dag.sh: lane=$lane runner=$runner verb=$verb" >&2
+echo "run-dag.sh: lane=$lane dag=$dag runner=$runner verb=$verb" >&2
 exec "$runner" "$verb" --dag "$dag" "$@"

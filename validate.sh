@@ -2856,6 +2856,8 @@ function run_portable_only_suite {
         ./scripts/check-detcore-backend-abstraction.sh
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
+    run_check "Manifest/CI discovery alignment" \
+        ./ci/check-manifest-ci-alignment.sh
     run_check "Centralized E2E manifest metadata" \
         ./tests/e2e/manifests/manifest-harness.rs validate
     run_check "Build portable manifest guests" \
@@ -2990,6 +2992,8 @@ function run_privileged_validation {
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
 
     run_check "Build workspace" cargo build --workspace
+    run_check "Manifest/CI discovery alignment" \
+        ./ci/check-manifest-ci-alignment.sh
     run_check "Centralized E2E manifest metadata" \
         ./tests/e2e/manifests/manifest-harness.rs validate
     run_check "Build privileged manifest guests" \
@@ -3063,6 +3067,8 @@ function run_privileged_validation {
 
 function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
+    run_check "Manifest/CI discovery alignment" \
+        ./ci/check-manifest-ci-alignment.sh
     run_check "Centralized E2E manifest metadata" \
         ./tests/e2e/manifests/manifest-harness.rs validate
     run_check "Build portable manifest guests" \
