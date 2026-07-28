@@ -111,6 +111,10 @@ fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str)
 fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     let source = ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
     let build = build_root.join("sabre");
+    if build.exists() {
+        fs::remove_dir_all(&build)
+            .unwrap_or_else(|error| panic!("failed to reset {}: {error}", build.display()));
+    }
     run(
         Command::new("cmake")
             .arg("-S")
