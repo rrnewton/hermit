@@ -56,7 +56,7 @@ BOOT_SNAPSHOT_DISK = Path(
 )
 LOG_FILTER = os.environ.get(
     "QEMU_LOG_FILTER",
-    "warn,detcore::scheduler=info,detcore::tool_global=info,reverie_ptrace::task=info",
+    "warn,detcore=info,reverie_ptrace::task=info",
 )
 
 
@@ -223,10 +223,11 @@ def main() -> int:
         )
         anchor = load_anchor(command_root)
         banner("Automatic repeat verification")
+        result = "FIRST RUN SAVED"
         if anchor is None:
             anchor_path = save_anchor(command_root, current)
             print(
-                "PASS: saved first command anchor at {}".format(
+                "PASS: saved first run for this command at {}".format(
                     anchor_path.relative_to(ROOT)
                 )
             )
@@ -238,6 +239,7 @@ def main() -> int:
                 current.get("qcow2_sha256"),
                 "Resume",
             )
+            result = "SUCCESS" if passed else "PARTIAL"
 
         if saved_snapshot:
             print("Post-command snapshot: {}".format(archived_disk.relative_to(ROOT)))
@@ -245,8 +247,8 @@ def main() -> int:
         print(
             "Run metadata: {}".format((run_dir / "run-metadata.json").relative_to(ROOT))
         )
-        print("\n=== {}: SUCCESS ===".format(DEMO_LABEL))
-        return 0
+        print("\n=== {}: {} ===".format(DEMO_LABEL, result))
+        return 1 if result == "PARTIAL" else 0
     finally:
         stop_process(process)
         for socket_path in (qmp_socket, serial_socket):

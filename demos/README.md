@@ -68,7 +68,7 @@ demos/
   05-qemu-boot.py           # boot, snapshot, metadata, repeat verification
   06-qemu-resume.py         # resume, command snapshot, repeat verification
   lib/
-    demo_common.py          # hashes, metadata, QMP, serial, normalized log diff
+    demo_common.py          # hashes, metadata, QMP, serial, strict log diff
     qemu_controller.py      # deterministic in-Hermit QEMU serial/QMP controller
     qemu-assets.sh          # internal first-run kernel/initramfs helper
     qemu-snapshot.sh        # QMP, snapshot, and stable-log helpers
