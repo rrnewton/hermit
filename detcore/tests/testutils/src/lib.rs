@@ -78,6 +78,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    private_unix_socket_path: None,
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
@@ -144,6 +145,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    private_unix_socket_path: None,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
@@ -210,6 +212,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    private_unix_socket_path: None,
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,

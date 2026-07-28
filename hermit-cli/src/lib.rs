@@ -727,7 +727,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
 async fn run_sabre(
     mut command: Command,
-    config: DetConfig,
+    mut config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
@@ -750,6 +750,7 @@ async fn run_sabre(
         .prefix("hermit-sabre-rpc-")
         .tempdir()?;
     let socket_path = socket_dir.path().join("coordinator.sock");
+    config.private_unix_socket_path = Some(socket_path.clone());
     let fallback_ready = Arc::new(AtomicBool::new(false));
     let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
     let server = reverie_rpc_transport::RpcServer::bind_with_readiness(

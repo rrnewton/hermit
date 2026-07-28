@@ -88,6 +88,13 @@ pub struct Config {
     #[clap(skip)]
     pub cancel_killed_thread_rpcs: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1023): Review private backend control-socket canonicalization.
+    /// Internal Unix socket path that must not leak through socket-diagnostic queries.
+    #[serde(default)]
+    #[clap(skip)]
+    pub private_unix_socket_path: Option<PathBuf>,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and

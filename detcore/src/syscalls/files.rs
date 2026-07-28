@@ -1707,6 +1707,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 FdType::Socket,
             )
             .await?;
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_socket_protocol(call.family(), call.protocol())
+            })?;
             Ok(fd as i64)
         } else {
             // Under run mode, force all sockets to be registered to be nonblocking in the OS:
@@ -1725,6 +1728,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 FdType::Socket,
             )
             .await?;
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_socket_protocol(call.family(), call.protocol())
+            })?;
             self.maybe_set_nonblocking_fd(guest, fd);
 
             Ok(fd as i64)

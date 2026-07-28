@@ -120,6 +120,10 @@ struct OpenFileDescription {
     procfs: Option<ProcfsFile>,
     /// Logical timestamp of the last packet delivered through this socket.
     socket_receive_timestamp: Option<LogicalTime>,
+    /// Socket address family, when this descriptor was created by an intercepted socket(2).
+    socket_family: Option<i32>,
+    /// Socket protocol, when this descriptor was created by an intercepted socket(2).
+    socket_protocol: Option<i32>,
 }
 
 impl PartialEq for DetFd {
@@ -161,6 +165,8 @@ impl DetFd {
                 resource: None,
                 procfs: None,
                 socket_receive_timestamp: None,
+                socket_family: None,
+                socket_protocol: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -392,6 +398,21 @@ impl DetFd {
     pub(crate) fn socket_receive_timestamp(&self) -> Option<LogicalTime> {
         self.description().socket_receive_timestamp
     }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review tracked socket protocol metadata.
+    /// Retain the protocol identity needed to determinize protocol-specific socket replies.
+    pub(crate) fn set_socket_protocol(&self, family: i32, protocol: i32) {
+        let mut description = self.description();
+        description.socket_family = Some(family);
+        description.socket_protocol = Some(protocol);
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review tracked socket protocol metadata.
+    /// Return the socket family and protocol when they were observed at creation time.
+    pub(crate) fn socket_protocol(&self) -> Option<(i32, i32)> {
+        let description = self.description();
+        Some((description.socket_family?, description.socket_protocol?))
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -438,6 +459,9 @@ mod tests {
         let timestamp = LogicalTime::from_nanos(2_345_678_901);
         original.set_socket_receive_timestamp(timestamp);
         assert_eq!(duplicate.socket_receive_timestamp(), Some(timestamp));
+
+        original.set_socket_protocol(libc::AF_NETLINK, 4);
+        assert_eq!(duplicate.socket_protocol(), Some((libc::AF_NETLINK, 4)));
     }
 
     #[test]

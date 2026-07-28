@@ -169,6 +169,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detect_host_clock_futex_timeouts: false,
         syscall_clobbers_virtualized_by_backend: false,
         cancel_killed_thread_rpcs: false,
+        private_unix_socket_path: None,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),

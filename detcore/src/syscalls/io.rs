@@ -19,6 +19,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
@@ -177,6 +178,7 @@ const SCM_TIMESTAMP_NEW: libc::c_int = 63;
 const SCM_TIMESTAMPNS_NEW: libc::c_int = 64;
 const SCM_TIMESTAMPING_NEW: libc::c_int = 65;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
+const MAX_SOCK_DIAG_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum SocketTimestampKind {
@@ -1105,7 +1107,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmsg,
     ) -> Result<i64, Error> {
-        if !self.cfg.virtualize_time {
+        // TODO-HUMAN-REVIEW(PR-1023): Review SOCK_DIAG recvmsg scatter/gather canonicalization.
+        let canonicalize_sock_diag = self.cfg.virtualize_metadata
+            && guest
+                .thread_state()
+                .with_detfd(call.sockfd(), |detfd| detfd.socket_protocol())
+                .ok()
+                .flatten()
+                == Some((
+                    libc::AF_NETLINK,
+                    crate::sock_diag::NETLINK_SOCK_DIAG_PROTOCOL,
+                ));
+        if !self.cfg.virtualize_time && !canonicalize_sock_diag {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
 
@@ -1118,28 +1131,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         // control buffer to overlap this header, so rereading it afterward can
         // turn a successful consuming receive into an artificial EFAULT.
         let message: libc::msghdr = guest.memory().read_value(message_address)?;
-        if message.msg_control.is_null() || message.msg_controllen == 0 {
-            return self
-                .handle_socket_receive(guest, call, call.sockfd(), true)
-                .await;
-        }
-        let control_len = message.msg_controllen.min(MAX_CONTROL_BYTES);
-        let control_address: AddrMut<'_, u8> =
-            AddrMut::from_raw(message.msg_control as usize).ok_or(Errno::EFAULT)?;
-        let mut control = vec![0; control_len];
-        // Validate the output region before consuming a datagram.
-        guest.memory().read_exact(control_address, &mut control)?;
+        let control = if self.cfg.virtualize_time
+            && !message.msg_control.is_null()
+            && message.msg_controllen != 0
+        {
+            let length = message.msg_controllen.min(MAX_CONTROL_BYTES);
+            let address = message.msg_control as usize;
+            let control_address: AddrMut<'_, u8> =
+                AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
+            let mut bytes = vec![0; length];
+            // Validate the output region before consuming a datagram.
+            guest.memory().read_exact(control_address, &mut bytes)?;
+            Some((address, length))
+        } else {
+            None
+        };
+        let sock_diag_iovecs = if canonicalize_sock_diag
+            && message.msg_iovlen != 0
+            && message.msg_iovlen <= libc::UIO_MAXIOV as usize
+        {
+            let address = Addr::from_raw(message.msg_iov as usize).ok_or(Errno::EFAULT)?;
+            let mut iovecs = vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                message.msg_iovlen
+            ];
+            guest.memory().read_values(address, &mut iovecs)?;
+            Some(
+                iovecs
+                    .into_iter()
+                    .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
-        let now = self.observe_socket_receive(guest, call.sockfd()).await?;
-        let mut control = vec![0; control_len];
-        guest.memory().read_exact(control_address, &mut control)?;
-        if socket_timestamp_messages(&control).is_empty() {
-            return Ok(result);
+        if self.cfg.virtualize_time {
+            let now = self.observe_socket_receive(guest, call.sockfd()).await?;
+            if let Some((address, length)) = control {
+                let control_address: AddrMut<'_, u8> =
+                    AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
+                let mut bytes = vec![0; length];
+                guest.memory().read_exact(control_address, &mut bytes)?;
+                if !socket_timestamp_messages(&bytes).is_empty() {
+                    canonicalize_socket_timestamps(&mut bytes, now);
+                    guest.memory().write_exact(control_address, &bytes)?;
+                }
+            }
         }
 
-        canonicalize_socket_timestamps(&mut control, now);
-        guest.memory().write_exact(control_address, &control)?;
+        if let Some(iovecs) = sock_diag_iovecs {
+            let capacity = iovecs.iter().try_fold(0usize, |total, (_, length)| {
+                total.checked_add(*length).ok_or(Errno::EINVAL)
+            })?;
+            let delivered = usize::try_from(result).unwrap_or(0).min(capacity);
+            if delivered != 0 && delivered <= MAX_SOCK_DIAG_BYTES {
+                let mut bytes = Vec::with_capacity(delivered);
+                for (address, length) in &iovecs {
+                    let length = (*length).min(delivered - bytes.len());
+                    if length == 0 {
+                        continue;
+                    }
+                    let address: AddrMut<'_, u8> =
+                        AddrMut::from_raw(*address).ok_or(Errno::EFAULT)?;
+                    let start = bytes.len();
+                    bytes.resize(start + length, 0);
+                    guest.memory().read_exact(address, &mut bytes[start..])?;
+                }
+
+                if crate::sock_diag::canonicalize_messages(
+                    &mut bytes,
+                    self.cfg.private_unix_socket_path.as_deref(),
+                ) != 0
+                {
+                    let mut written = 0;
+                    for (address, length) in iovecs {
+                        let length = length.min(bytes.len() - written);
+                        if length == 0 {
+                            continue;
+                        }
+                        let address: AddrMut<'_, u8> =
+                            AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
+                        guest
+                            .memory()
+                            .write_exact(address, &bytes[written..written + length])?;
+                        written += length;
+                    }
+                }
+            }
+        }
         Ok(result)
     }
 
