@@ -1898,6 +1898,17 @@ mod timeslice_tests {
         state.end_of_timeslice = Some(now);
         assert!(state.timeslice_expired());
     }
+
+    #[test]
+    fn child_rng_distinguishes_adjacent_thread_ids() {
+        let parent = Pcg64Mcg::seed_from_u64(0);
+        let mut even = thread_rng_from_parent("test", &parent, DetTid::from_raw(8));
+        let mut odd = thread_rng_from_parent("test", &parent, DetTid::from_raw(9));
+
+        let even_values: [u64; 4] = std::array::from_fn(|_| even.next_u64());
+        let odd_values: [u64; 4] = std::array::from_fn(|_| odd.next_u64());
+        assert_ne!(even_values, odd_values);
+    }
 }
 
 /// Generate a new thread-local PRNG from the parent's PRNG state, mixing in the
@@ -1909,12 +1920,12 @@ pub fn thread_rng_from_parent(msg: &str, parent: &Pcg64Mcg, child: DetTid) -> Pc
     // Generate a seed from the parent:
     parent.clone().fill_bytes(seed.as_mut());
     detlog!("RNG {} Generated new seed {:?}", msg, seed);
-    // Perturb the seed by the tid
-    let entropy = child.as_raw();
-    seed[0] ^= entropy as u8;
-    seed[1] ^= (entropy >> 8) as u8;
-    seed[2] ^= (entropy >> 16) as u8;
-    seed[3] ^= (entropy >> 24) as u8;
+    // Pcg64Mcg forces its internal state odd, so seed bit zero carries no
+    // entropy. Mix the full thread ID into later bytes to preserve every bit.
+    let entropy = child.as_raw().to_le_bytes();
+    for (seed_byte, entropy_byte) in seed[4..8].iter_mut().zip(entropy) {
+        *seed_byte ^= entropy_byte;
+    }
     detlog!(
         "RNG {} seeding child tid {}: {:?} from parent {:?}",
         msg,
