@@ -1,0 +1,77 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+schema = 2
+bucket = "applications"
+
+[[test]]
+id = "applications/kvm-python-examples"
+description = "The user-facing Python examples run identically with the system interpreter under KVM"
+lane = "privileged"
+requires = ["linux", "x86_64", "kvm", "python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/kvm-python-examples.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["kvm"]
+  [test.modes.verify.backends_disabled]
+  ptrace = "This entry specifically validates the KVM backend; portable Python coverage is provided by language-runtimes/python-random"
+  dbi = "The embedded test metadata established this workload only for KVM"
+  sabre = "The embedded test metadata established this workload only for KVM"
+  liteinst = "The embedded test metadata established this workload only for KVM"
+
+  [test.disabled_modes]
+  naked = "The portable Python random case already provides the native nondeterminism control"
+  replay = "Record/replay is a ptrace-only mode"
+  chaos = "Both examples are single-threaded"
+
+[[test]]
+id = "applications/kvm-shell-environment"
+description = "KVM executes a shell workload with a deterministic environment"
+lane = "privileged"
+requires = ["linux", "x86_64", "kvm"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/applications/kvm-shell-environment.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["kvm"]
+  [test.modes.verify.backends_disabled]
+  ptrace = "This entry specifically validates the KVM backend"
+  dbi = "The embedded test metadata established this workload only for KVM"
+  sabre = "The embedded test metadata established this workload only for KVM"
+  liteinst = "The embedded test metadata established this workload only for KVM"
+
+  [test.disabled_modes]
+  naked = "This is a privileged backend integration test"
+  replay = "KVM has no record/replay runtime"
+  chaos = "KVM does not provide Detcore schedule exploration"
+
+[[test]]
+id = "applications/timed-progress-bar"
+description = "A time-driven Python application completes identically under verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/timed-progress-bar.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["ptrace"]
+  [test.modes.verify.backends_disabled]
+  dbi = "The embedded test metadata established this workload only for ptrace"
+  kvm = "KVM coverage is provided by applications/kvm-python-examples"
+  sabre = "The embedded test metadata established this workload only for ptrace"
+  liteinst = "The embedded test metadata established this workload only for ptrace"
+
+  [test.disabled_modes]
+  naked = "Elapsed time drives progress but the final application output is intentionally stable"
+  replay = "The shorter time and entropy cases provide the blocking replay sentinels"
+  chaos = "The application is single-threaded"

@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Centralized e2e manifest (schema v2). See README.md for the format spec.
-# Bucket: system-utils. Two entries ported from embedded HERMIT_E2E_META blocks
-# plus one NEW wrapper-free entry (clock-determinism) that points directly at a
+# Bucket: system-utils. Three entries ported from former HERMIT_E2E_META blocks
+# plus one wrapper-free entry (clock-determinism) that points directly at a
 # tests/c/*.c program to demonstrate implicit building and the `custom` mode.
 
 schema = 2
@@ -125,3 +125,29 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   replay = "Clock replay divergence is tracked separately; not part of this determinism entry"
   chaos  = "The clock matrix guest is single-threaded"
   naked  = "Covered by the strict_mode_eliminates_native_clock_nondeterminism case in clock_determinism.rs"
+
+[[test]]
+id = "system-utils/random-device"
+description = "Kernel random bytes vary natively and repeat under Hermit"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/system-utils/random-device.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.naked]
+  runs = 3
+  assert = { min_distinct = 2 }
+
+  [test.modes.verify]
+  backends_enabled = ["ptrace"]
+  [test.modes.verify.backends_disabled]
+  dbi = "The embedded test metadata established this workload only for ptrace"
+  kvm = "The embedded test metadata established this workload only for ptrace"
+  sabre = "The embedded test metadata established this workload only for ptrace"
+  liteinst = "The embedded test metadata established this workload only for ptrace"
+
+  [test.disabled_modes]
+  replay = "The hexdump process tree currently diverges during replay"
+  chaos = "Random-byte generation has no scheduling oracle"

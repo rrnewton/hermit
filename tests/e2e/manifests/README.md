@@ -8,19 +8,18 @@ LICENSE file in the root directory of this source tree.
 
 # Centralized e2e test manifests (schema v2)
 
-Status: **prototype / design proposal** (CI Overhaul v2). This directory defines
-a centralized manifest format that supersedes the per-script
-`# HERMIT_E2E_META_BEGIN … HERMIT_E2E_META_END` JSON comment blocks parsed today
-by [`ci/test_harness.sh`](../../../ci/test_harness.sh). The v1 harness discovers
-**only** `*.sh` under five hard-coded `tests/e2e/<category>/` directories and
-finds exactly **12** annotated tests, while `tests/` contains **182 `.c`
-programs** and **31 guest `.rs`** files that are exercised piecemeal by
-hand-written `hermit-cli/tests/*.rs` integration tests. v2 makes every
-executable test discoverable from one small set of declarative manifests.
+Status: **active migration** (CI Overhaul v2). This directory is the single
+source of metadata for the 12 shell e2e tests that previously carried
+`# HERMIT_E2E_META_BEGIN … # HERMIT_E2E_META_END` JSON comment blocks. The v1
+harness discovered only `*.sh` under five hard-coded
+`tests/e2e/<category>/` directories, while `tests/` contains 182 `.c` programs
+and 31 guest `.rs` files exercised piecemeal by hand-written
+`hermit-cli/tests/*.rs` integration tests. v2 makes every executable test
+discoverable from one small set of declarative manifests.
 
 ## Why centralize
 
-The embedded-comment approach has three structural problems:
+The embedded-comment approach had three structural problems:
 
 1. **Discovery is coupled to a `.sh` wrapper.** Every test needs a bespoke
    `--prepare`/`--run` shell script even when the payload is a single `.c`
@@ -49,8 +48,8 @@ The embedded-comment approach has three structural problems:
 - **K bucket manifests, not one monolith.** One `*.toml` per bucket
   (`determinism-stress.toml`, `system-utils.toml`, …). Buckets can map to CI
   lanes and be sharded across runners.
-- **Faithful superset of v1.** Everything the 12 current tests express is
-  representable, plus the two new modes (`naked` explicit, `custom`) and the
+- **Faithful superset of v1.** Everything the 12 migrated tests expressed is
+  preserved, plus the two new modes (`naked` explicit, `custom`) and the
   per-backend `WHY`.
 
 ## File format
@@ -160,31 +159,31 @@ A manifest loader must reject a manifest unless, for every `[[test]]`:
   from `backends_enabled`.
 - `replay.backends_enabled ⊆ {ptrace}` (replay is ptrace-only today).
 
-## Migration path
+## Migration status
 
-1. Land this format + the prototype manifests + `manifest-plan.rs` loader (this
-   task).
-2. Teach `ci/test_harness.sh` (or a Rust successor) to load `tests/e2e/manifests/
-   *.toml` in addition to the embedded blocks, expanding each test into
-   `(test × mode × enabled-backend)` cells exactly as `emit_required_plan` does
-   today.
-3. Port the 12 embedded-block tests into manifests and delete their comment
-   blocks.
-4. Fan the remaining `.c`/`.rs` guests into buckets, converting the bespoke
+1. The schema and `manifest-plan.rs` loader are implemented.
+2. `manifest-harness.rs` expands each test into
+   `(test × mode × enabled-backend)` cells and executes them.
+3. The 12 embedded-block tests are ported and their comment blocks removed.
+4. Remaining work is to fan the `.c`/`.rs` guests into buckets, converting the bespoke
    `hermit-cli/tests/*.rs` build-and-run integration tests into manifest
    entries so their coverage is discoverable and de-duplicated.
-5. A follow-up **audit task** confirms every executable test is reachable from a
+5. A follow-up audit confirms every executable test is reachable from a
    manifest (the coverage gate v1 lacked).
 
-## Prototype contents
+## Current contents
 
 - [`determinism-stress.toml`](determinism-stress.toml) — `order-violation`
-  (verify + seeded chaos) and `thread-contention` (explicit `naked` + verify,
-  multi-`.c` build).
+  (verify + seeded chaos), `thread-contention` (explicit `naked` + verify,
+  multi-`.c` build), `process-chains`, and `thread-output`.
 - [`system-utils.toml`](system-utils.toml) — `record-getpid` (verify + replay),
-  `date-nanoseconds` (naked + verify, no build), and `clock-determinism`, a
-  **new** entry that points directly at `tests/c/clock_determinism.c` (implicit
-  build, no wrapper) and demonstrates the `custom` mode.
+  `date-nanoseconds` and `random-device` (naked + verify), and
+  `clock-determinism`, which points directly at `tests/c/clock_determinism.c`.
+- [`applications.toml`](applications.toml) — the two privileged KVM tests and
+  the portable timed progress-bar test.
+- [`data-handling.toml`](data-handling.toml) — normalized archive round-trip.
+- [`language-runtimes.toml`](language-runtimes.toml) — Python randomness in
+  native and ptrace verification modes.
 - [`manifest-plan.rs`](manifest-plan.rs) — a `rust-script` loader that parses the
   manifests, enforces the validation rules above, and prints the expanded
   execution plan. Run it with `./manifest-plan.rs` (or

@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Centralized e2e manifest (schema v2). See README.md for the format spec.
-# Bucket: determinism-stress. Two prototype entries ported faithfully from the
-# embedded HERMIT_E2E_META blocks in tests/e2e/determinism-stress/*.sh.
+# Bucket: determinism-stress. Four entries ported faithfully from the former
+# HERMIT_E2E_META blocks in tests/e2e/determinism-stress/*.sh.
 
 schema = 2
 bucket = "determinism-stress"
@@ -90,3 +90,49 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   [test.disabled_modes]
   replay = "The focused C replay sentinel owns the blocking record/replay contract"
   chaos  = "The order-violation test provides the seeded schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress/process-chains"
+description = "A 13-process fork tree and five-stage C pipe chain repeat under strict verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/determinism-stress/process-chains.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["ptrace"]
+  [test.modes.verify.backends_disabled]
+  dbi = "The embedded test metadata established this multi-process workload only for ptrace"
+  kvm = "The embedded test metadata established this multi-process workload only for ptrace"
+  sabre = "The embedded test metadata established this multi-process workload only for ptrace"
+  liteinst = "The embedded test metadata established this multi-process workload only for ptrace"
+
+  [test.disabled_modes]
+  naked = "Both programs self-check deterministic invariants rather than requiring native output variation"
+  replay = "The focused C replay sentinel owns the blocking record/replay contract"
+  chaos = "The order-violation test provides the seeded schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress/thread-output"
+description = "Concurrent shell writers produce repeatable output under strict verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/thread-output.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["ptrace"]
+  [test.modes.verify.backends_disabled]
+  dbi = "The embedded test metadata established this threaded workload only for ptrace"
+  kvm = "The embedded test metadata established this threaded workload only for ptrace"
+  sabre = "The embedded test metadata established this threaded workload only for ptrace"
+  liteinst = "The embedded test metadata established this threaded workload only for ptrace"
+
+  [test.disabled_modes]
+  naked = "Native ordering can vary but is not guaranteed to diverge in a bounded run"
+  replay = "Strict verification already covers this example in the required lane"
+  chaos = "The focused order-violation test provides a stronger seeded oracle"

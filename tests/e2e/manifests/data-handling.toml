@@ -1,0 +1,31 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+schema = 2
+bucket = "data-handling"
+
+[[test]]
+id = "data-handling/archive-roundtrip"
+description = "Create, extract, and verify a normalized tar archive"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/data-handling/archive-roundtrip.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.modes.verify]
+  backends_enabled = ["ptrace"]
+  [test.modes.verify.backends_disabled]
+  dbi = "The embedded test metadata established this workload only for ptrace"
+  kvm = "The embedded test metadata established this workload only for ptrace"
+  sabre = "The embedded test metadata established this workload only for ptrace"
+  liteinst = "The embedded test metadata established this workload only for ptrace"
+
+  [test.disabled_modes]
+  naked = "The archive uses normalized metadata and is deterministic by construction"
+  replay = "The focused C sentinel provides the blocking replay contract"
+  chaos = "The workload is single-threaded"
