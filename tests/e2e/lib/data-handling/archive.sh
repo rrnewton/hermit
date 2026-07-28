@@ -22,8 +22,8 @@ if [[ ${1:-} == --guest ]]; then
     exit 0
 fi
 
-# shellcheck source=tests/e2e/data-handling/lib/common.bash
-source "$(dirname -- "$0")/lib/common.bash"
+# shellcheck source=tests/e2e/lib/data-handling/common.bash
+source "$(dirname -- "$0")/common.bash"
 require_tools tar touch sha256sum awk cmp
 export NATIVE_ATTEMPTS=3
 export NATIVE_RETRY_DELAY=1.1

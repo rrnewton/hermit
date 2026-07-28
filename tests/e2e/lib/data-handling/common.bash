@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-DATA_HANDLING_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ROOT_DIR="$(cd -- "$DATA_HANDLING_DIR/../../.." && pwd)"
+DATA_HANDLING_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$DATA_HANDLING_DIR/../../../.." && pwd)"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 DATA_HANDLING_TIMEOUT=${DATA_HANDLING_TIMEOUT:-120s}
 NATIVE_ATTEMPTS=${NATIVE_ATTEMPTS:-12}

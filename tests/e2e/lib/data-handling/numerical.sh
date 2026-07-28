@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-# shellcheck source=tests/e2e/data-handling/lib/common.bash
-source "$(dirname -- "$0")/lib/common.bash"
+# shellcheck source=tests/e2e/lib/data-handling/common.bash
+source "$(dirname -- "$0")/common.bash"
 require_tools cc
 
 target_dir=${CARGO_TARGET_DIR:-$ROOT_DIR/target}

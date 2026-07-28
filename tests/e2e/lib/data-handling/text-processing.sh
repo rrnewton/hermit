@@ -23,8 +23,8 @@ if [[ ${1:-} == --guest ]]; then
     exit 0
 fi
 
-# shellcheck source=tests/e2e/data-handling/lib/common.bash
-source "$(dirname -- "$0")/lib/common.bash"
+# shellcheck source=tests/e2e/lib/data-handling/common.bash
+source "$(dirname -- "$0")/common.bash"
 require_tools od sort uniq awk locale grep
 if ! locale -a | grep -Fqx en_US.utf8; then
     echo 'required locale is unavailable: en_US.utf8' >&2
