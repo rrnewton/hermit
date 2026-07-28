@@ -23,8 +23,8 @@ enum {
   WORKER_COUNT = 4,
   LOCK_ROUNDS = 1000,
   LOCK_TRACE_CAPACITY = 64,
-  CASCADE_PAIRS = 8,
-  CASCADE_EVENTS = CASCADE_PAIRS * 2,
+  CASCADE_ROUNDS = 8,
+  CASCADE_EVENTS = CASCADE_ROUNDS * 3,
 };
 
 struct stress_state {
@@ -43,6 +43,7 @@ struct worker_args {
 static int cascade_pipe[2] = {-1, -1};
 static volatile sig_atomic_t usr1_deliveries;
 static volatile sig_atomic_t usr2_deliveries;
+static volatile sig_atomic_t alarm_deliveries;
 static volatile sig_atomic_t cascade_error;
 
 static void fail(const char *operation) {
@@ -65,23 +66,28 @@ static void wait_at_barrier(pthread_barrier_t *barrier) {
 }
 
 static void cascade_handler(int signal_number) {
-  const unsigned char event = signal_number == SIGUSR1 ? '1' : '2';
-  const ssize_t written = write(cascade_pipe[1], &event, sizeof(event));
-  if (written != (ssize_t)sizeof(event)) {
+  unsigned char event;
+  int next_signal;
+
+  if (signal_number == SIGUSR1) {
+    event = '1';
+    usr1_deliveries += 1;
+    next_signal = SIGUSR2;
+  } else if (signal_number == SIGUSR2) {
+    event = '2';
+    usr2_deliveries += 1;
+    next_signal = SIGALRM;
+  } else if (signal_number == SIGALRM) {
+    event = 'A';
+    alarm_deliveries += 1;
+    next_signal = alarm_deliveries < CASCADE_ROUNDS ? SIGUSR1 : 0;
+  } else {
     cascade_error = 1;
     return;
   }
 
-  int next_signal = 0;
-  if (signal_number == SIGUSR1) {
-    usr1_deliveries += 1;
-    next_signal = SIGUSR2;
-  } else if (signal_number == SIGUSR2) {
-    usr2_deliveries += 1;
-    if (usr2_deliveries < CASCADE_PAIRS) {
-      next_signal = SIGUSR1;
-    }
-  } else {
+  const ssize_t written = write(cascade_pipe[1], &event, sizeof(event));
+  if (written != (ssize_t)sizeof(event)) {
     cascade_error = 1;
     return;
   }
@@ -119,9 +125,11 @@ static void install_cascade_handlers(void) {
   if (sigemptyset(&action.sa_mask) != 0 ||
       sigaddset(&action.sa_mask, SIGUSR1) != 0 ||
       sigaddset(&action.sa_mask, SIGUSR2) != 0 ||
+      sigaddset(&action.sa_mask, SIGALRM) != 0 ||
       sigaction(SIGUSR1, &action, NULL) != 0 ||
-      sigaction(SIGUSR2, &action, NULL) != 0) {
-    fail("sigaction(SIGUSR cascade)");
+      sigaction(SIGUSR2, &action, NULL) != 0 ||
+      sigaction(SIGALRM, &action, NULL) != 0) {
+    fail("sigaction(signal cascade)");
   }
 }
 
@@ -134,19 +142,21 @@ static void read_cascade(unsigned char events[CASCADE_EVENTS]) {
       continue;
     }
     if (bytes <= 0) {
-      fail("read(SIGUSR cascade)");
+      fail("read(signal cascade)");
     }
     received += (size_t)bytes;
   }
 }
 
 int main(void) {
-  sigset_t usr_signals;
-  if (sigemptyset(&usr_signals) != 0 || sigaddset(&usr_signals, SIGUSR1) != 0 ||
-      sigaddset(&usr_signals, SIGUSR2) != 0) {
-    fail("sigemptyset(SIGUSR cascade)");
+  sigset_t cascade_signals;
+  if (sigemptyset(&cascade_signals) != 0 ||
+      sigaddset(&cascade_signals, SIGUSR1) != 0 ||
+      sigaddset(&cascade_signals, SIGUSR2) != 0 ||
+      sigaddset(&cascade_signals, SIGALRM) != 0) {
+    fail("sigemptyset(signal cascade)");
   }
-  check_pthread(pthread_sigmask(SIG_BLOCK, &usr_signals, NULL),
+  check_pthread(pthread_sigmask(SIG_BLOCK, &cascade_signals, NULL),
                 "pthread_sigmask(SIG_BLOCK)");
 
   if (pipe2(cascade_pipe, O_CLOEXEC) != 0) {
@@ -169,7 +179,7 @@ int main(void) {
   }
 
   wait_at_barrier(&state.start);
-  check_pthread(pthread_sigmask(SIG_UNBLOCK, &usr_signals, NULL),
+  check_pthread(pthread_sigmask(SIG_UNBLOCK, &cascade_signals, NULL),
                 "pthread_sigmask(SIG_UNBLOCK)");
   if (raise(SIGUSR1) != 0) {
     fail("raise(SIGUSR1)");
@@ -177,7 +187,7 @@ int main(void) {
 
   unsigned char signal_events[CASCADE_EVENTS];
   read_cascade(signal_events);
-  check_pthread(pthread_sigmask(SIG_BLOCK, &usr_signals, NULL),
+  check_pthread(pthread_sigmask(SIG_BLOCK, &cascade_signals, NULL),
                 "pthread_sigmask(SIG_BLOCK final)");
 
   for (unsigned id = 0; id < WORKER_COUNT; ++id) {
@@ -187,20 +197,23 @@ int main(void) {
   const unsigned expected_counter = WORKER_COUNT * LOCK_ROUNDS;
   if (state.counter != expected_counter ||
       state.trace_length != LOCK_TRACE_CAPACITY || cascade_error != 0 ||
-      usr1_deliveries != CASCADE_PAIRS || usr2_deliveries != CASCADE_PAIRS) {
+      usr1_deliveries != CASCADE_ROUNDS ||
+      usr2_deliveries != CASCADE_ROUNDS ||
+      alarm_deliveries != CASCADE_ROUNDS) {
     fprintf(stderr,
             "stress invariant failed: counter=%u/%u trace=%zu/%u usr1=%d "
-            "usr2=%d error=%d\n",
+            "usr2=%d alarm=%d error=%d\n",
             state.counter, expected_counter, state.trace_length,
             LOCK_TRACE_CAPACITY, usr1_deliveries, usr2_deliveries,
-            cascade_error);
+            alarm_deliveries, cascade_error);
     return EXIT_FAILURE;
   }
+  const unsigned char expected_events[] = {'1', '2', 'A'};
   for (unsigned index = 0; index < CASCADE_EVENTS; ++index) {
-    const unsigned char expected = index % 2 == 0 ? '1' : '2';
+    const unsigned char expected = expected_events[index % 3];
     if (signal_events[index] != expected) {
       fprintf(stderr,
-              "SIGUSR cascade order mismatch at %u: got %c expected %c\n",
+              "signal cascade order mismatch at %u: got %c expected %c\n",
               index, signal_events[index], expected);
       return EXIT_FAILURE;
     }
@@ -210,11 +223,12 @@ int main(void) {
   for (size_t index = 0; index < state.trace_length; ++index) {
     printf("%s%u", index == 0 ? "" : ",", state.trace[index]);
   }
-  printf(" sigusr-cascade=");
+  printf(" signal-cascade=");
   for (unsigned index = 0; index < CASCADE_EVENTS; ++index) {
     putchar(signal_events[index]);
   }
-  printf(" usr1=%d usr2=%d\n", usr1_deliveries, usr2_deliveries);
+  printf(" usr1=%d usr2=%d alarm=%d\n", usr1_deliveries, usr2_deliveries,
+         alarm_deliveries);
 
   close(cascade_pipe[0]);
   close(cascade_pipe[1]);

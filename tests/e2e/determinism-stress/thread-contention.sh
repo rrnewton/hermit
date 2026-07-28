@@ -9,7 +9,7 @@
 #   "schema": 1,
 #   "id": "determinism-stress/thread-contention",
 #   "category": "determinism-stress",
-#   "description": "Mutex contention, multi-fd poll/epoll, and a SIGUSR handler cascade repeat under strict verification",
+#   "description": "Mutex contention, multi-fd poll/epoll, a three-signal cascade, and shared mmap across fork repeat under strict verification",
 #   "lane": "portable",
 #   "requires": ["linux", "x86_64", "userns", "ptrace", "cc"],
 #   "timeout_seconds": 120,
@@ -36,11 +36,15 @@ case ${1:-} in
         cc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
             "$ROOT_DIR/tests/e2e/determinism-stress/thread_stress.c" \
             -o "$E2E_FIXTURE_DIR/thread-stress"
+        cc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread \
+            "$ROOT_DIR/tests/e2e/determinism-stress/mmap_fork_shared.c" \
+            -o "$E2E_FIXTURE_DIR/mmap-fork-shared"
         ;;
     --run)
         "$E2E_FIXTURE_DIR/thread-contention" contention
         "$E2E_FIXTURE_DIR/thread-contention" epoll
-        exec "$E2E_FIXTURE_DIR/thread-stress"
+        "$E2E_FIXTURE_DIR/thread-stress"
+        exec "$E2E_FIXTURE_DIR/mmap-fork-shared"
         ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac
