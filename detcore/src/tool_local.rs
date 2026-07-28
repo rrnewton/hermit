@@ -1221,7 +1221,7 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 
 impl<T> ThreadState<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review backend-stable child RNG reseeding.
+    // TODO-HUMAN-REVIEW(PR-1060): Review backend-stable child RNG reseeding.
     /// Replaces the host-TID-derived child streams with a backend-provided,
     /// deterministic identity before the thread enters its start hook.
     pub fn reseed_child_rngs(&mut self, parent: &Self, entropy: u128) {

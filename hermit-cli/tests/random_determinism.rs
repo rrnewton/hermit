@@ -110,7 +110,7 @@ fn random_sources_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review DBI child identity and RNG lifecycle coverage.
+// TODO-HUMAN-REVIEW(PR-1060): Review DBI child identity and RNG lifecycle coverage.
 #[test]
 fn dbi_random_sources_are_deterministic_under_strict_verify() {
     let guest =

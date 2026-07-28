@@ -406,7 +406,7 @@ fn current_runtime() -> Arc<Runtime> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the stable DBI child RNG identity encoding.
+// TODO-HUMAN-REVIEW(PR-1060): Review the stable DBI child RNG identity encoding.
 fn dbi_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
     if virtual_pid <= 0 || child_ordinal == 0 {
         return None;
@@ -415,7 +415,7 @@ fn dbi_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review preservation of physical DBI child TIDs.
+// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBI child TIDs.
 fn dbi_scheduler_tid(host_tid: i32) -> Option<Tid> {
     (host_tid > 0).then(|| Tid::from_raw(host_tid))
 }
@@ -877,7 +877,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
-// TODO-HUMAN-REVIEW(PR-TBD): Review separation of host thread identity from stable RNG entropy.
+// TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -982,7 +982,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
 // TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
-// TODO-HUMAN-REVIEW(PR-TBD): Review deterministic child RNG identity allocation.
+// TODO-HUMAN-REVIEW(PR-1060): Review deterministic child RNG identity allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -1207,7 +1207,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
-// TODO-HUMAN-REVIEW(PR-TBD): Review host child DetTid syscall dispatch.
+// TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
