@@ -321,20 +321,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Vec<u8>, Error> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
-        let initial_offset = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position())?
-            .map_or(0, |(offset, _)| offset);
-        if initial_offset != 0 {
-            guest
-                .inject_with_retry(Syscall::Lseek(
-                    syscalls::Lseek::new()
-                        .with_fd(call.fd())
-                        .with_offset(0)
-                        .with_whence(Whence::SEEK_SET),
-                ))
-                .await?;
-        }
+        // A backend-owned read may have advanced the kernel cursor without
+        // passing through Detcore's logical procfs cursor (KVM does this for
+        // worker-shared descriptors). Always rewind before taking the initial
+        // snapshot so a later intercepted pread cannot snapshot from EOF.
+        guest
+            .inject_with_retry(Syscall::Lseek(
+                syscalls::Lseek::new()
+                    .with_fd(call.fd())
+                    .with_offset(0)
+                    .with_whence(Whence::SEEK_SET),
+            ))
+            .await?;
 
         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
         let mut contents = Vec::new();
@@ -570,7 +568,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
         let Some((current, snapshot_len)) = procfs_position else {
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
+            // flow through record_or_replay, exactly as handle_read does for
+            // FdType::Regular. Injecting the seek live here is correct for run
+            // and --verify (the inner NoopTool just re-injects), but under
+            // record/replay the replay descriptor is a virtual placeholder
+            // whose kernel position never advances (reads are served from the
+            // log, not the file). A live SEEK_CUR then returned Ok(0) on replay
+            // versus the recorded offset (e.g. glibc's __tzfile_read rewinds
+            // /etc/localtime with lseek(fd, -N, SEEK_CUR)), diverging the
+            // guest's control flow and desynchronizing the event stream. Routing
+            // through record_or_replay records the offset once and substitutes
+            // the recorded value on replay, keeping the two runs identical.
+            return Ok(self.record_or_replay(guest, call).await?);
         };
 
         let Some(snapshot_len) = snapshot_len else {
@@ -1401,24 +1412,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => (None, None),
         };
 
-        // When the guest clears O_NONBLOCK via FIONBIO on an fd that Detcore keeps
-        // physically nonblocking for the scheduler, we must NOT let the clear
-        // reach the kernel: doing so would make the fd physically blocking and
-        // violate the scheduler's invariant (nonblockize-and-retry could then
-        // block, risking deadlock). Instead we update only the guest-visible
-        // logical flag and leave the physical fd -- and Detcore's physical
-        // tracking -- nonblocking. This mirrors the F_SETFL handler's treatment
-        // of the same force condition.
-        if nonblocking == Some(false) {
-            let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1013): Review logical FIONBIO handling for forced fds.
+        // Detcore already keeps scheduler-managed fds physically nonblocking. Satisfy
+        // FIONBIO logically instead of forwarding it: some backends cannot apply the
+        // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
+        // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
+        if let Some(enabled) = nonblocking {
+            let (fd_type, physically_nonblocking) = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
             let force_nonblocking = self.cfg.use_nonblocking_sockets()
                 && !self.cfg.recordreplay_modes
                 && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
-            if force_nonblocking {
+            if force_nonblocking && physically_nonblocking {
                 guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.set_logical_nonblocking(false);
+                    detfd.set_logical_nonblocking(enabled);
                 })?;
-                // FIONBIO returns 0 on success; the fd stays physically nonblocking.
                 return Ok(0);
             }
         }
