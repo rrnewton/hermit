@@ -1993,7 +1993,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Review the DBI process-memory capability regression.
+// TODO-HUMAN-REVIEW(PR-1043): Review the DBI process-memory capability regression.
 #[test]
 fn run_reports_denied_dbi_process_vm_writev_capability() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));

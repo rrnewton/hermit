@@ -431,7 +431,7 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
              cdylib in the same target directory"
         ));
     }
-    // TODO-HUMAN-REVIEW(PR-pending): Review the DBI guest-memory capability requirement.
+    // TODO-HUMAN-REVIEW(PR-1043): Review the DBI guest-memory capability requirement.
     match run_capability_probe(CapabilityProbe::ProcessVmWritev) {
         Ok(true) => None,
         Ok(false) => Some(
