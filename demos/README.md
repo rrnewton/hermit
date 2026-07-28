@@ -22,6 +22,21 @@ artifacts are written under `target/qemu-busybox/`. The Linux serial console is
 streamed live and saved as `console.log`; Hermit's full INFO trace is saved as
 `hermit-info.log` without flooding the serial output.
 
+To exercise the QEMU launcher directly under `cargo run`, build the initramfs
+once on the host and supply both fixed images:
+
+```bash
+BUSYBOX=/path/to/static/busybox \
+  ./demos/qemu-busybox/build-initramfs.sh
+KERNEL_IMAGE=/path/to/bzImage \
+  INITRAMFS_IMAGE=target/qemu-busybox/initramfs-busybox.cpio.gz \
+  cargo run --release -p hermit -- run --strict -- demos/boot_qemu.sh
+```
+
+`boot_qemu.sh` only validates its inputs and then replaces itself with QEMU.
+The higher-level `05-qemu-busybox.sh` uses the same launcher while adding asset
+construction, timeouts, live serial output, log capture, and result checks.
+
 Run Hermit's two-execution comparison for L2 evidence:
 
 ```bash
@@ -73,10 +88,12 @@ BusyBox SHA-256
 and initramfs SHA-256
 `5515b4bced678c4d22ff54dafd1676f06b8e254f1656d2994018df24aa1e9698`.
 The guest reached `HERMIT-QEMU-BUSYBOX-PASS`, printed pi as `3.1415926532`,
-and powered down. Hermit scheduled three QEMU threads for 31,908 turns over
-139.118927965 virtual seconds.
+and powered down. With `boot_qemu.sh` as the guest entry point, Hermit scheduled
+six shell/QEMU threads for 32,161 turns over 146.181220200 virtual seconds. The
+documented `cargo run` form and the higher-level runner both produced console
+SHA-256 `0afde4df0d92cee9b5c331498fc4571fd8b53ef91f6fa34142fd8c7db5e1971a`.
 
 An L2 `VERIFY=1` run then completed both boots with the same inputs. Each
-normalized log contained 527,328 messages, including 371,433 DETLOG and
+normalized log contained 533,731 messages, including 375,853 DETLOG and
 scheduler COMMIT messages. Hermit reported no substantive differences and
 printed `Success: deterministic. Determinism verified.`
