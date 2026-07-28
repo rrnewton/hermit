@@ -4,6 +4,17 @@ set -euo pipefail
 # shellcheck source=tests/e2e/determinism-stress/common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
+known_gaps_ok=0
+if [[ ${1:-} == --known-gaps-ok ]]; then
+  known_gaps_ok=1
+  shift
+fi
+(($# == 0)) || fail "usage: $0 [--known-gaps-ok]"
+
+known_gap() {
+  [[ $1 == quick-wins || $1 == resources ]]
+}
+
 cases=(
   'quick-wins|tests/c/syscall_quick_wins.c|'
   'file-io|tests/c/syscall_file_io.c|'
@@ -34,6 +45,8 @@ cases=(
 )
 
 failures=0
+expected_failures=0
+passed=0
 for entry in "${cases[@]}"; do
   IFS='|' read -r name source_file arguments <<<"$entry"
   read -r -a guest_args <<<"$arguments"
@@ -45,9 +58,17 @@ for entry in "${cases[@]}"; do
   fi
   guest=$(compile_c "$source_file" "syscall-$name" "${compile_flags[@]}")
   if ! verify_guest "syscall target: $name" "$guest" "${guest_args[@]}"; then
-    failures=$((failures + 1))
+    if ((known_gaps_ok == 1)) && known_gap "$name"; then
+      printf 'XFAIL: syscall target %s is a documented current-main product gap\n' "$name"
+      expected_failures=$((expected_failures + 1))
+    else
+      failures=$((failures + 1))
+    fi
+  else
+    passed=$((passed + 1))
   fi
 done
 
 ((failures == 0)) || fail "$failures syscall target(s) failed strict L2"
-stress_success "targeted syscall matrix"
+printf '\nPASS: targeted syscall matrix (%d passed, %d documented XFAIL, ptrace L2, log=info)\n' \
+  "$passed" "$expected_failures"

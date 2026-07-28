@@ -13,6 +13,7 @@ REPO_ROOT=$(cd -- "$APPLICATION_DIR/../../.." && pwd)
 readonly REPO_ROOT
 readonly HERMIT_BIN=${HERMIT_BIN:-"$REPO_ROOT/target/debug/hermit"}
 readonly HERMIT_APPLICATION_TIMEOUT=${HERMIT_APPLICATION_TIMEOUT:-120}
+readonly APPLICATION_BACKEND=ptrace
 
 function require_commands {
     local command
@@ -51,7 +52,8 @@ function run_hermit_verify {
 
     # Keep this invocation explicit: every application must exercise strict L2.
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
-        "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
+        "$HERMIT_BIN" --log=info run --backend "$APPLICATION_BACKEND" \
+        --no-virtualize-cpuid \
         --max-timeslice=disabled --base-env=minimal --strict --verify -- \
         "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
 

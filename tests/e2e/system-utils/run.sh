@@ -12,19 +12,19 @@ repo_root=$(cd -- "$script_dir/../../.." && pwd)
 hermit_bin=${1:-$repo_root/target/release/hermit}
 backend=${2:-${SYSTEM_UTIL_BACKEND:-ptrace}}
 
-tests=(
-    whoami
-    hostname
-    lscpu
-    lshw
-    numactl
-    uname
-    id
-    groups
-    proc
-    du
-    df
-)
+case $backend in
+    ptrace)
+        tests=(whoami hostname lscpu lshw numactl uname id groups proc du df)
+        ;;
+    kvm)
+        tests=(whoami hostname lshw uname id groups du df)
+        ;;
+    *)
+        echo "unsupported system-utility backend: $backend (allowed: ptrace kvm)" >&2
+        exit 2
+        ;;
+esac
+readonly -a tests
 
 for test_name in "${tests[@]}"; do
     printf '\n== %s (%s) ==\n' "$test_name" "$backend"

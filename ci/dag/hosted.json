@@ -39,14 +39,12 @@
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
-      "group": "test", "job": "examples_ptrace",
-      "desc": "Run every executable user example at ptrace L2",
-      "cmd": "./ci/e2e_commands_bucketed.sh",
-      "deps": ["build.workspace"],
-      "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 60,
-               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
+      "group": "check", "job": "e2e_contract",
+      "desc": "Validate E2E category, lane, backend, and substantive-test contracts",
+      "cmd": "./tests/e2e/check-contract.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 10, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
       "group": "test", "job": "applications_e2e",
@@ -55,6 +53,46 @@
       "deps": ["build.workspace"],
       "timeout": 300,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "data_handling_e2e",
+      "desc": "Run portable data-handling native-variation and strict-verification tests",
+      "cmd": "./tests/e2e/data-handling/run.sh portable",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "determinism_stress_e2e",
+      "desc": "Run portable determinism stress categories at ptrace L2",
+      "cmd": "env HERMIT_BIN=target/debug/hermit ./tests/e2e/determinism-stress/run.sh portable",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "language_runtimes_e2e",
+      "desc": "Run Python, Ruby, JavaScript, and Java strict-verification tests",
+      "cmd": "env HERMIT_BIN=target/debug/hermit HERMIT_LANGUAGE_RUNTIME_BACKEND=ptrace ./tests/e2e/language-runtimes/run.sh",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "system_utils_e2e",
+      "desc": "Run substantive system-utility tests on the ptrace backend",
+      "cmd": "./tests/e2e/system-utils/run.sh target/debug/hermit ptrace",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
