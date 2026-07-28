@@ -384,6 +384,7 @@ pub(super) fn run_dbi(
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
 
+    // TODO-HUMAN-REVIEW(PR-1141): Review the production DBI coordinator runtime.
     // The Detcore RPC handler can await the scheduler. Keep the scheduler and
     // coordinator service on independent executor threads so a synchronous
     // guest request cannot block the task that must answer it.
@@ -571,6 +572,7 @@ fn clean_up_dbi_global(
     status: &std::process::ExitStatus,
     global: detcore::GlobalState,
 ) {
+    // TODO-HUMAN-REVIEW(PR-1141): Review DBI coordinator shutdown ordering.
     if !status.success() {
         global.force_shutdown_with_error();
     }

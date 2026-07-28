@@ -1177,7 +1177,7 @@ async fn run_dbi(
     );
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review Detcore's production DBI coordinator lifecycle.
+    // TODO-HUMAN-REVIEW(PR-1141): Review Detcore's production DBI coordinator lifecycle.
     // Host the single GlobalState outside the DynamoRIO process tree. The DBI
     // client reconnects after fork, so copied children join the same Detcore
     // scheduler instead of falling back to native host scheduling.
