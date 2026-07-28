@@ -35,7 +35,7 @@ echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-export PYTHON="${PYTHON:-/usr/bin/python3}"
+export PYTHON="${PYTHON:-python3}"
 
 demo_banner "Build a debug guest so the report can resolve source locations"
 ( cd "$HERMIT_REPO" && cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race )
