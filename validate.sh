@@ -2856,8 +2856,12 @@ function run_portable_only_suite {
         ./scripts/check-detcore-backend-abstraction.sh
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
-    run_check "Multi-mode portable E2E categories" \
-        ./ci/test_harness.sh run --lane portable
+    run_check "Centralized E2E manifest metadata" \
+        ./tests/e2e/manifests/manifest-harness.rs validate
+    run_check "Build portable manifest guests" \
+        ./tests/e2e/manifests/manifest-harness.rs build --all --lane portable
+    run_check "Multi-mode portable E2E manifest buckets" \
+        ./tests/e2e/manifests/manifest-harness.rs run --all --lane portable --prebuilt
     run_check "Application end-to-end strict verification" \
         ./tests/e2e/lib/applications/run_all.sh
 
@@ -2986,6 +2990,12 @@ function run_privileged_validation {
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
 
     run_check "Build workspace" cargo build --workspace
+    run_check "Centralized E2E manifest metadata" \
+        ./tests/e2e/manifests/manifest-harness.rs validate
+    run_check "Build privileged manifest guests" \
+        ./tests/e2e/manifests/manifest-harness.rs build --all --lane privileged
+    run_check "Multi-mode privileged E2E manifest buckets" \
+        ./tests/e2e/manifests/manifest-harness.rs run --all --lane privileged --prebuilt
     run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
     run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
     run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
@@ -3053,9 +3063,13 @@ function run_privileged_validation {
 
 function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
-    run_check "Portable E2E metadata" ./ci/test_harness.sh validate
+    run_check "Centralized E2E manifest metadata" \
+        ./tests/e2e/manifests/manifest-harness.rs validate
+    run_check "Build portable manifest guests" \
+        ./tests/e2e/manifests/manifest-harness.rs build --all --lane portable
     run_check "Portable ptrace E2E verification" \
-        ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace
+        ./tests/e2e/manifests/manifest-harness.rs run --all --lane portable \
+            --mode verify --backend ptrace --prebuilt
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
     run_check "Hermit output determinism" hermit_determinism_check

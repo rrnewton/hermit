@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1},
+  "resource_caps": {"hermit_guest": 5},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -40,17 +40,26 @@
     },
     {
       "group": "e2e", "job": "metadata",
-      "desc": "Validate multi-mode E2E metadata and required-cell plan",
-      "cmd": "./ci/test_harness.sh validate",
+      "desc": "Validate centralized schema-v2 E2E manifests and required-cell plan",
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs validate",
       "timeout": 60,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
+      "group": "build", "job": "manifest_guests",
+      "desc": "Build all direct portable manifest guests before bucket fan-out",
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs build --all --lane portable",
+      "deps": ["e2e.metadata"],
+      "timeout": 1800,
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 1073741824,
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
+    },
+    {
       "group": "e2e", "job": "system_utils",
       "desc": "Portable system-utility controls, verification, and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --results target/e2e/portable/system-utils/results.jsonl --junit target/e2e/portable/system-utils/junit.xml",
-      "deps": ["build.workspace", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket system-utils --lane portable --prebuilt --results target/e2e/portable/system-utils/results.jsonl --junit target/e2e/portable/system-utils/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -59,8 +68,8 @@
     {
       "group": "e2e", "job": "data_handling",
       "desc": "Portable data-handling verification and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --results target/e2e/portable/data-handling/results.jsonl --junit target/e2e/portable/data-handling/junit.xml",
-      "deps": ["build.workspace", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket data-handling --lane portable --prebuilt --results target/e2e/portable/data-handling/results.jsonl --junit target/e2e/portable/data-handling/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -69,8 +78,8 @@
     {
       "group": "e2e", "job": "determinism_stress",
       "desc": "Portable deterministic and seeded-chaos stress tests",
-      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress --results target/e2e/portable/determinism-stress/results.jsonl --junit target/e2e/portable/determinism-stress/junit.xml",
-      "deps": ["build.workspace", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket determinism-stress --lane portable --prebuilt --results target/e2e/portable/determinism-stress/results.jsonl --junit target/e2e/portable/determinism-stress/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -79,8 +88,8 @@
     {
       "group": "e2e", "job": "language_runtimes",
       "desc": "Portable language-runtime controls, verification, and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category language-runtimes --results target/e2e/portable/language-runtimes/results.jsonl --junit target/e2e/portable/language-runtimes/junit.xml",
-      "deps": ["build.workspace", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket language-runtimes --lane portable --prebuilt --results target/e2e/portable/language-runtimes/results.jsonl --junit target/e2e/portable/language-runtimes/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -89,8 +98,8 @@
     {
       "group": "e2e", "job": "applications",
       "desc": "Portable application verification",
-      "cmd": "./ci/test_harness.sh run --lane portable --category applications --results target/e2e/portable/applications/results.jsonl --junit target/e2e/portable/applications/junit.xml",
-      "deps": ["build.workspace", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket applications --lane portable --prebuilt --results target/e2e/portable/applications/results.jsonl --junit target/e2e/portable/applications/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -102,7 +111,7 @@
       "cmd": "./tests/e2e/lib/applications/run_all.sh",
       "deps": ["build.workspace"],
       "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -165,7 +174,7 @@
       "cmd": "cargo test -p hermit --lib --bins -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 120,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
                "classification": "cpu-bound"}
     },
@@ -185,7 +194,7 @@
       "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -195,7 +204,7 @@
       "cmd": "cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4",
       "deps": ["build.workspace"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
@@ -205,7 +214,7 @@
       "cmd": "cargo test -p hermit --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test cpufreq_avg_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 1200,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 300,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -215,7 +224,7 @@
       "cmd": "cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -225,7 +234,7 @@
       "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -235,7 +244,7 @@
       "cmd": "cargo test -p hermit --test liteinst_advanced -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
@@ -245,7 +254,7 @@
       "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 150,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -255,7 +264,7 @@
       "cmd": "cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -265,7 +274,7 @@
       "cmd": "cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -275,7 +284,7 @@
       "cmd": "cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -294,7 +303,7 @@
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend",
       "deps": ["build.dbi_release"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -304,7 +313,7 @@
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 120,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },
@@ -316,7 +325,7 @@
                "test.regular_crates", "build.flaky_harnesses",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
       "timeout": 1800,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
+      "hint": {"resources": {"hermit_guest": 5}, "est_duration_s": 600,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
                "classification": "latency-bound"}
     }

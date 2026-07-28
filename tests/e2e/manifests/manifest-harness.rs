@@ -37,8 +37,11 @@
 //!   ./manifest-harness.rs validate
 //!   ./manifest-harness.rs plan [--format text|json] [--lane L]
 //!   ./manifest-harness.rs build <test-id> [--out DIR]
+//!   ./manifest-harness.rs build --all [--lane L] [--out DIR]
 //!   ./manifest-harness.rs run   <test-id> [--mode M] [--backend B] [--dry-run]
-//!   ./manifest-harness.rs run   --bucket B --lane L [--dry-run]
+//!   ./manifest-harness.rs run   --bucket B --lane L [--prebuilt] [--dry-run]
+//!       [--results PATH] [--junit PATH]
+//!   ./manifest-harness.rs run   --all --lane L [--prebuilt] [--dry-run]
 //!   ./manifest-harness.rs dag   [--lane portable|privileged] [--format json]
 //!
 //! Environment:
@@ -50,10 +53,13 @@
 //! ```
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
 use std::process::Command;
+use std::time::Instant;
 
 use toml::Value;
 
@@ -251,7 +257,7 @@ fn run_tool(desc: &str, mut cmd: Command) {
 }
 
 /// Build (or resolve) the entry's program, returning how to run it.
-fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
+fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool, prebuilt: bool) -> Program {
     if let Some(cmd) = &entry.direct {
         return Program::Direct(cmd.clone());
     }
@@ -273,6 +279,16 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
         "c" => {
             std::fs::create_dir_all(out_dir).ok();
             let out = out_dir.join(sanitized(&entry.id));
+            if prebuilt {
+                if !dry_run && !out.is_file() {
+                    die(format!(
+                        "{}: prebuilt guest is missing: {}",
+                        entry.id,
+                        out.display()
+                    ));
+                }
+                return Program::Binary(out);
+            }
             // README default: cc -std=c11 -O2 -g -Wall -Wextra -Werror [+ per-test cflags]
             let mut args: Vec<String> = vec![
                 "-std=c11".into(),
@@ -302,6 +318,16 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
         "rs" => {
             std::fs::create_dir_all(out_dir).ok();
             let out = out_dir.join(sanitized(&entry.id));
+            if prebuilt {
+                if !dry_run && !out.is_file() {
+                    die(format!(
+                        "{}: prebuilt guest is missing: {}",
+                        entry.id,
+                        out.display()
+                    ));
+                }
+                return Program::Binary(out);
+            }
             let mut args: Vec<String> = vec!["-O".into()];
             args.extend(entry.cflags.iter().cloned()); // extra rustc flags reuse cflags
             args.push(abs.to_string_lossy().to_string());
@@ -341,6 +367,17 @@ fn guest_argv(prog: &Program) -> Vec<String> {
 struct Attempt {
     status: i32,
     stdout: Vec<u8>,
+}
+
+struct CellResult {
+    test: String,
+    bucket: String,
+    lane: String,
+    mode: String,
+    backend: String,
+    outcome: String,
+    duration_ms: u128,
+    reason: String,
 }
 
 fn cell_env(cell: &Path, isolated_guest_tmp: bool) -> Vec<(String, String)> {
@@ -443,9 +480,16 @@ fn prepare_cell(cell: &Path) {
     }
 }
 
-fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool) -> bool {
+fn run_entry(
+    entry: &TestEntry,
+    mode_filter: &str,
+    backend_filter: &str,
+    dry_run: bool,
+    prebuilt: bool,
+    results: &mut Vec<CellResult>,
+) -> bool {
     let out_dir = repo_root().join("target/e2e-harness/build");
-    let prog = build_program(entry, &out_dir, dry_run);
+    let prog = build_program(entry, &out_dir, dry_run, prebuilt);
     let cell = repo_root().join(format!("target/e2e-harness/runs/{}", sanitized(&entry.id)));
     if !dry_run {
         prepare_cell(&cell);
@@ -460,6 +504,16 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             let st = c.status().unwrap_or_else(|e| die(format!("prepare {}: {e}", entry.id)));
             if !st.success() {
                 println!("ERROR {} - fixture preparation failed", entry.id);
+                results.push(CellResult {
+                    test: entry.id.clone(),
+                    bucket: entry.bucket.clone(),
+                    lane: entry.lane.clone(),
+                    mode: "prepare".into(),
+                    backend: String::new(),
+                    outcome: "ERROR".into(),
+                    duration_ms: 0,
+                    reason: "fixture preparation failed".into(),
+                });
                 return false;
             }
         }
@@ -476,6 +530,7 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         // host-backed directory observed by run two.
         let env = cell_env(&cell, m.name != "naked");
         if m.name == "naked" {
+            let started = Instant::now();
             let mut seen: BTreeSet<(i32, Vec<u8>)> = BTreeSet::new();
             for _ in 0..m.runs.max(2) {
                 let at = run_argv(&guest, &env, dry_run);
@@ -484,7 +539,15 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             let distinct = if dry_run { m.min_distinct } else { seen.len() as i64 };
             let pass = distinct >= m.min_distinct;
             all_pass &= pass;
-            report(pass, entry, "naked", "native", &format!("distinct={distinct} need>={}", m.min_distinct));
+            report(
+                pass,
+                entry,
+                "naked",
+                "native",
+                &format!("distinct={distinct} need>={}", m.min_distinct),
+                started.elapsed().as_millis(),
+                results,
+            );
             continue;
         }
         let backends = &m.backends;
@@ -492,6 +555,7 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             if !backend_filter.is_empty() && b != backend_filter {
                 continue;
             }
+            let started = Instant::now();
             match m.name.as_str() {
                 "verify" | "custom" => {
                     let repeats = if m.name == "custom" { m.runs.max(1) } else { 1 };
@@ -515,14 +579,30 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                         }
                     }
                     all_pass &= pass;
-                    report(pass, entry, &m.name, b, "");
+                    report(
+                        pass,
+                        entry,
+                        &m.name,
+                        b,
+                        "",
+                        started.elapsed().as_millis(),
+                        results,
+                    );
                 }
                 "replay" => {
                     let argv = hermit_argv("replay", b, &entry.lane, None, &[], &guest);
                     let at = run_argv(&argv, &env, dry_run);
                     let pass = at.status == 0;
                     all_pass &= pass;
-                    report(pass, entry, "replay", b, "");
+                    report(
+                        pass,
+                        entry,
+                        "replay",
+                        b,
+                        "",
+                        started.elapsed().as_millis(),
+                        results,
+                    );
                 }
                 "chaos" => {
                     let seeds = if m.seeds.is_empty() { vec![0, 1] } else { m.seeds.clone() };
@@ -541,7 +621,15 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                     let d = if dry_run { m.min_distinct } else { distinct.len() as i64 };
                     let pass = mism == 0 && d >= m.min_distinct && passes >= m.min_passes && failures >= m.min_failures;
                     all_pass &= pass;
-                    report(pass, entry, "chaos", b, &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}"));
+                    report(
+                        pass,
+                        entry,
+                        "chaos",
+                        b,
+                        &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}"),
+                        started.elapsed().as_millis(),
+                        results,
+                    );
                 }
                 other => die(format!("{}: unsupported mode `{other}`", entry.id)),
             }
@@ -550,10 +638,116 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
     all_pass
 }
 
-fn report(pass: bool, entry: &TestEntry, mode: &str, backend: &str, note: &str) {
+fn report(
+    pass: bool,
+    entry: &TestEntry,
+    mode: &str,
+    backend: &str,
+    note: &str,
+    duration_ms: u128,
+    results: &mut Vec<CellResult>,
+) {
     let tag = if pass { "PASS" } else { "FAIL" };
     let suffix = if note.is_empty() { String::new() } else { format!(" - {note}") };
     println!("{tag:<5} {:<10} {mode:<7} {backend:<8} {}{suffix}", entry.lane, entry.id);
+    results.push(CellResult {
+        test: entry.id.clone(),
+        bucket: entry.bucket.clone(),
+        lane: entry.lane.clone(),
+        mode: mode.into(),
+        backend: backend.into(),
+        outcome: tag.into(),
+        duration_ms,
+        reason: note.into(),
+    });
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_results(results: &[CellResult], results_path: Option<&Path>, junit_path: Option<&Path>) {
+    if let Some(path) = results_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| die(format!("cannot create {}: {e}", parent.display())));
+        }
+        let mut file = File::create(path)
+            .unwrap_or_else(|e| die(format!("cannot create {}: {e}", path.display())));
+        for result in results {
+            writeln!(
+                file,
+                "{{\"schema\":1,\"test\":{},\"category\":{},\"lane\":{},\"mode\":{},\"backend\":{},\"outcome\":{},\"duration_ms\":{},\"reason\":{}}}",
+                json_str(&result.test),
+                json_str(&result.bucket),
+                json_str(&result.lane),
+                json_str(&result.mode),
+                json_str(&result.backend),
+                json_str(&result.outcome),
+                result.duration_ms,
+                json_str(&result.reason),
+            )
+            .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+        }
+        let passed = results.iter().filter(|r| r.outcome == "PASS").count();
+        let failed = results.iter().filter(|r| r.outcome == "FAIL").count();
+        let errors = results.iter().filter(|r| r.outcome == "ERROR").count();
+        let summary = path.parent().unwrap_or(Path::new(".")).join("summary.json");
+        std::fs::write(
+            &summary,
+            format!(
+                "{{\"schema\":1,\"tests\":{},\"cells\":{},\"passed\":{passed},\"failed\":{failed},\"errors\":{errors}}}\n",
+                results.iter().map(|r| &r.test).collect::<BTreeSet<_>>().len(),
+                results.len(),
+            ),
+        )
+        .unwrap_or_else(|e| die(format!("cannot write {}: {e}", summary.display())));
+    }
+
+    if let Some(path) = junit_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| die(format!("cannot create {}: {e}", parent.display())));
+        }
+        let failures = results.iter().filter(|r| r.outcome == "FAIL").count();
+        let errors = results.iter().filter(|r| r.outcome == "ERROR").count();
+        let mut file = File::create(path)
+            .unwrap_or_else(|e| die(format!("cannot create {}: {e}", path.display())));
+        writeln!(
+            file,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"hermit-e2e\" tests=\"{}\" failures=\"{failures}\" errors=\"{errors}\">",
+            results.len()
+        )
+        .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+        for result in results {
+            let backend = if result.backend.is_empty() { "none" } else { &result.backend };
+            write!(
+                file,
+                "  <testcase classname=\"{}\" name=\"{}/{}/{}\" time=\"{:.3}\">",
+                xml_escape(&result.bucket),
+                xml_escape(&result.test),
+                xml_escape(&result.mode),
+                xml_escape(backend),
+                result.duration_ms as f64 / 1000.0,
+            )
+            .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+            if result.outcome == "FAIL" {
+                write!(file, "<failure>{}</failure>", xml_escape(&result.reason))
+                    .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+            } else if result.outcome == "ERROR" {
+                write!(file, "<error>{}</error>", xml_escape(&result.reason))
+                    .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+            }
+            writeln!(file, "</testcase>")
+                .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+        }
+        writeln!(file, "</testsuite>")
+            .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,15 +788,18 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
     steps.push(String::from(
         r#"    {"group":"e2e","job":"manifest_validate","desc":"Validate centralized e2e manifests (schema v2)","cmd":"./tests/e2e/manifests/manifest-plan.rs","timeout":60,"hint":{"est_duration_s":5,"rss_baseline_bytes":268435456,"hard_mem_max_bytes":1073741824,"classification":"light"}}"#,
     ));
-    // One boxed run node per bucket, serialized on the hermit_guest resource.
-    // The node timeout is the sum of the bucket's per-test timeouts (the node
-    // runs every test in the bucket serially), floored at the DAG default.
+    steps.push(format!(
+        "    {{\"group\":\"build\",\"job\":\"manifest_guests\",\"desc\":\"Build all direct manifest guests ({lane} lane)\",\"cmd\":\"./tests/e2e/manifests/manifest-harness.rs build --all --lane {lane}\",\"deps\":[\"e2e.manifest_validate\"],\"timeout\":1800,\"hint\":{{\"est_duration_s\":180,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"cpu-bound\"}}}}"
+    ));
+    // One independently schedulable run node per bucket. The node timeout is
+    // the sum of the bucket's per-test timeouts (tests remain serial within a
+    // bucket), floored at the DAG default.
     for b in &buckets {
         let job = format!("manifest_{}", b.replace('-', "_"));
         let cmd = format!(
-            "./tests/e2e/manifests/manifest-harness.rs run --bucket {b} --lane {lane}"
+            "./tests/e2e/manifests/manifest-harness.rs run --bucket {b} --lane {lane} --prebuilt --results target/e2e/{lane}/{b}/results.jsonl --junit target/e2e/{lane}/{b}/junit.xml"
         );
-        let desc = format!("Manifest bucket `{b}` ({lane} lane): build guests and run all enabled cells");
+        let desc = format!("Manifest bucket `{b}` ({lane} lane): run all enabled cells with prebuilt guests");
         let bucket_timeout: i64 = entries
             .iter()
             .filter(|e| e.bucket == *b && e.lane == lane)
@@ -610,7 +807,7 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
             .sum::<i64>()
             .max(600);
         steps.push(format!(
-            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"build.workspace\",\"e2e.manifest_validate\"],\"timeout\":{bucket_timeout},\"hint\":{{\"resources\":{{\"hermit_guest\":1}},\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
+            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"build.workspace\",\"build.manifest_guests\",\"e2e.manifest_validate\"],\"timeout\":{bucket_timeout},\"hint\":{{\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
             job = json_str(&job),
             desc = json_str(&desc),
             cmd = json_str(&cmd),
@@ -618,7 +815,9 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
     }
 
     println!("{{");
-    println!("  \"resource_caps\": {{\"hermit_guest\": 1}},");
+    // Bucket cells use disjoint run directories and only read prebuilt guests.
+    // Let the runner's -j / memory limits schedule independent buckets in parallel.
+    println!("  \"resource_caps\": {{}},");
     println!("  \"mem_cap_factor\": 1.25,");
     println!("  \"mem_cap_floor_bytes\": 8589934592,");
     println!("  \"outer_mem_safety_factor\": 1.0,");
@@ -661,13 +860,28 @@ fn main() {
         }
         "build" => {
             let mut id = String::new();
+            let mut bucket = String::new();
+            let mut lane = String::new();
             let mut out = repo_root().join("target/e2e-harness/build");
+            let mut all = false;
             let mut dry = false;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--out" => {
                         out = PathBuf::from(rest.get(i + 1).cloned().unwrap_or_else(|| die("--out needs a value".into())));
+                        i += 2;
+                    }
+                    "--all" => {
+                        all = true;
+                        i += 1;
+                    }
+                    "--bucket" => {
+                        bucket = rest.get(i + 1).cloned().unwrap_or_else(|| die("--bucket needs a value".into()));
+                        i += 2;
+                    }
+                    "--lane" => {
+                        lane = rest.get(i + 1).cloned().unwrap_or_else(|| die("--lane needs a value".into()));
                         i += 2;
                     }
                     "--dry-run" => {
@@ -681,16 +895,38 @@ fn main() {
                     s => die(format!("build: unknown option {s}")),
                 }
             }
-            if id.is_empty() {
-                die("build: needs a <test-id>".into());
-            }
             let entries = load_entries();
-            let entry = find_entry(&entries, &id);
-            match build_program(&entry, &out, dry) {
-                Program::Direct(cmd) => println!("direct: {cmd}"),
-                Program::Script(p) => println!("script (runs directly): {}", p.display()),
-                Program::Binary(p) => println!("binary: {}", p.display()),
+            let selected: Vec<TestEntry> = if !id.is_empty() {
+                if all || !bucket.is_empty() || !lane.is_empty() {
+                    die("build: <test-id> cannot be combined with --all, --bucket, or --lane".into());
+                }
+                vec![find_entry(&entries, &id)]
+            } else if all || !bucket.is_empty() {
+                entries
+                    .into_iter()
+                    .filter(|e| bucket.is_empty() || e.bucket == bucket)
+                    .filter(|e| lane.is_empty() || e.lane == lane)
+                    .collect()
+            } else {
+                die("build: needs a <test-id>, --all, or --bucket".into());
+            };
+            if selected.is_empty() {
+                die("build: selection matched no tests".into());
             }
+            let mut compiled = 0;
+            for entry in &selected {
+                match build_program(entry, &out, dry, false) {
+                    Program::Direct(_) | Program::Script(_) => {}
+                    Program::Binary(p) => {
+                        compiled += 1;
+                        println!("binary: {}", p.display());
+                    }
+                }
+            }
+            println!(
+                "PASS: {} manifest entries selected; {compiled} compiled guest(s)",
+                selected.len()
+            );
         }
         "run" => {
             let mut id = String::new();
@@ -699,6 +935,10 @@ fn main() {
             let mut mode = String::new();
             let mut backend = String::new();
             let mut dry = false;
+            let mut prebuilt = false;
+            let mut all = false;
+            let mut results_path: Option<PathBuf> = None;
+            let mut junit_path: Option<PathBuf> = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -707,30 +947,61 @@ fn main() {
                     "--mode" => { mode = rest[i + 1].clone(); i += 2; }
                     "--backend" => { backend = rest[i + 1].clone(); i += 2; }
                     "--dry-run" => { dry = true; i += 1; }
+                    "--prebuilt" => { prebuilt = true; i += 1; }
+                    "--all" => { all = true; i += 1; }
+                    "--results" => {
+                        results_path = Some(PathBuf::from(
+                            rest.get(i + 1).cloned().unwrap_or_else(|| die("--results needs a value".into())),
+                        ));
+                        i += 2;
+                    }
+                    "--junit" => {
+                        junit_path = Some(PathBuf::from(
+                            rest.get(i + 1).cloned().unwrap_or_else(|| die("--junit needs a value".into())),
+                        ));
+                        i += 2;
+                    }
                     s if !s.starts_with("--") => { id = s.to_string(); i += 1; }
                     s => die(format!("run: unknown option {s}")),
                 }
             }
             let entries = load_entries();
             let selected: Vec<TestEntry> = if !id.is_empty() {
+                if all || !bucket.is_empty() {
+                    die("run: <test-id> cannot be combined with --all or --bucket".into());
+                }
                 vec![find_entry(&entries, &id)]
             } else if !bucket.is_empty() {
+                if all {
+                    die("run: --all cannot be combined with --bucket".into());
+                }
                 entries
                     .into_iter()
                     .filter(|e| e.bucket == bucket && (lane.is_empty() || e.lane == lane))
                     .collect()
+            } else if all {
+                entries
+                    .into_iter()
+                    .filter(|e| lane.is_empty() || e.lane == lane)
+                    .collect()
             } else {
-                die("run: needs a <test-id> or --bucket".into());
+                die("run: needs a <test-id>, --bucket, or --all".into());
             };
             if selected.is_empty() {
                 die("run: selection matched no tests".into());
             }
             let mut failures = 0;
+            let mut cell_results = Vec::new();
             for e in &selected {
-                if !run_entry(e, &mode, &backend, dry) {
+                if !run_entry(e, &mode, &backend, dry, prebuilt, &mut cell_results) {
                     failures += 1;
                 }
             }
+            write_results(
+                &cell_results,
+                results_path.as_deref(),
+                junit_path.as_deref(),
+            );
             exit(if failures == 0 { 0 } else { 1 });
         }
         "dag" => {
