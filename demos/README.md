@@ -189,7 +189,9 @@ boots. A shared lock prevents concurrent demos from colliding on these paths.
 The serial transcript is written to the fixed `serial.log` and copied into each
 run's history directory after QEMU exits. Demo 5 also preserves the clean boot
 image as `hermit-boot.qcow2` so Demo 6 can restore it into the fixed working
-image before every command.
+image before every command. Demo 5 recreates the fixed qcow2 path in place so
+its host inode, which Detcore uses as a file-content scheduling identity, also
+remains stable between runs.
 
 The serial marker observer and QMP client run in `qemu_controller.py` as a
 Hermit-managed parent of QEMU. Keeping that control process inside Hermit's
@@ -219,12 +221,14 @@ kernel for offline testing. `QEMU_KERNEL_MANIFOLD_PATH` and
 `QEMU_KERNEL_SHA256` provide an explicit paired override for intentional kernel
 updates; `BUSYBOX` and `QEMU_ASSETS` retain their existing overrides.
 
-The boot and every resume use `--strict`, `--target-timeslice 100000`, and
-`--max-timeslice 2000000000`. Strict mode fails closed on unsupported
-operations; the timeslice settings retain deterministic scheduling while
-keeping the VM practical. The scripts enable Detcore INFO logging so the raw
-log includes syscall entries and results as well as scheduler records. Console
-output remains concise because it prints only a timestamp-free tail.
+The boot and every resume use `--strict`, `--no-rcb-time`,
+`--target-timeslice 100000`, and `--max-timeslice disabled`. Strict mode fails
+closed on unsupported operations. This syscall-rich workload advances logical
+time by deterministic scheduler check-ins and does not need PMU preemption,
+whose hardware skid would otherwise perturb internal timing logs. The scripts
+enable Detcore INFO logging so the raw log includes syscall entries and results
+as well as scheduler records. Console output remains concise because it prints
+only a timestamp-free tail.
 
 ### 6. QEMU Snapshot Resume
 
