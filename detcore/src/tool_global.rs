@@ -780,9 +780,20 @@ impl GlobalState {
 
         let resp2 = {
             let mut sched = self.sched.lock().unwrap();
-            let nextturn = sched.next_turns.get(&dettid).unwrap_or_else(|| {
-                panic!("Detcore internal error: no entry for dettid {} in next_turns during resource request.", dettid)
-            }).clone();
+            let Some(nextturn) = sched.next_turns.get(&dettid).cloned() else {
+                if sched.should_cancel_late_killed_thread_request(dettid) {
+                    // TODO-HUMAN-REVIEW(PR-1023): Review late SaBRe resource-request cancellation.
+                    trace!(
+                        "[detcore, dtid {}] cancelling resource request after logical thread removal",
+                        dettid
+                    );
+                    return (ResumeStatus::Signaled, None);
+                }
+                panic!(
+                    "Detcore internal error: no entry for dettid {} in next_turns during resource request.",
+                    dettid
+                );
+            };
             trace!(
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
@@ -907,6 +918,8 @@ impl GlobalState {
 
         {
             let mut sched = self.sched.lock().unwrap();
+
+            sched.note_thread_registered(child_dettid);
 
             if parent_is_kernel_blocked && self.cfg.sequentialize_threads {
                 sched.complete_vfork_registration(parent_dettid, child_dettid);
@@ -2185,9 +2198,11 @@ mod tests {
 
     use super::FutexAction;
     use super::GlobalState;
+    use super::ResumeStatus;
     use super::format_unsupported_syscall_warning;
     use crate::config::Config;
     use crate::ivar::Ivar;
+    use crate::resources::Resources;
     use crate::scheduler::DEFAULT_PRIORITY;
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
@@ -2337,6 +2352,33 @@ mod tests {
 
         assert!(matches!(response, Some(SchedValue::Value(0))));
         assert!(state.sched.lock().unwrap().blocked.futex_waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_resource_request_after_logical_kill_is_cancelled() {
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        let detpid = DetPid::from_raw(17);
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.thread_tree.add_child(dettid, dettid, true);
+            scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+        }
+
+        let response = state
+            .recv_request_resources(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                detpid,
+                Resources::new(dettid),
+            )
+            .await;
+
+        assert_eq!(response, (ResumeStatus::Signaled, None));
     }
 
     #[test]

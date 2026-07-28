@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -279,6 +280,10 @@ pub struct Scheduler {
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
+
+    /// Threads removed by logical teardown. Backends which cannot stop all siblings before
+    /// teardown need this to distinguish a late request from an unregistered thread.
+    logically_killed_threads: BTreeSet<DetTid>,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -903,6 +908,7 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            logically_killed_threads: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1086,6 +1092,7 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        self.logically_killed_threads.insert(*dtid);
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1133,6 +1140,16 @@ impl Scheduler {
         if !live_process_thread {
             self.blocked.timed_waiters.remove_process_timers(*detpid);
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review late SaBRe resource-request cancellation.
+    pub(crate) fn should_cancel_late_killed_thread_request(&self, dettid: DetTid) -> bool {
+        self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review deterministic-TID reuse handling.
+    pub(crate) fn note_thread_registered(&mut self, dettid: DetTid) {
+        self.logically_killed_threads.remove(&dettid);
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.
