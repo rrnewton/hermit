@@ -82,14 +82,14 @@
     {
       "path": "tests/c/adjtimex_deterministic.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/adjtimex_deterministic.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/adjtimex_deterministic.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/arch_prctl_determinism.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/arch_prctl_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/arch_prctl_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/bpf_enosys.c",
@@ -106,8 +106,8 @@
     {
       "path": "tests/c/clock_adjtime_deterministic.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/clock_adjtime_deterministic.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/clock_adjtime_deterministic.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/clock_determinism.c",
@@ -220,8 +220,8 @@
     {
       "path": "tests/c/get_robust_list_child.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/get_robust_list_child.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/get_robust_list_child.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/get_robust_list_self.c",
@@ -232,14 +232,14 @@
     {
       "path": "tests/c/get_robust_list_thread.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/get_robust_list_thread.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/get_robust_list_thread.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/getitimer_determinism_probe.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/getitimer_determinism_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/getitimer_determinism_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/getpid.c",
@@ -514,8 +514,8 @@
     {
       "path": "tests/c/pidfd_open_self.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/pidfd_poll_self.c",
@@ -544,8 +544,8 @@
     {
       "path": "tests/c/prctl_dumpable.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/prctl_dumpable.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/prctl_dumpable.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/print_memaddrs.c",
@@ -1066,8 +1066,8 @@
     {
       "path": "tests/c/writev_determinism.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/writev_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/writev_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under ptrace strict verification and runs in blocking GitHub CI"
     },
     {
       "path": "tests/chaos/cas_sequence.rs",
