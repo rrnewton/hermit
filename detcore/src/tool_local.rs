@@ -1052,7 +1052,7 @@ pub struct ThreadState<T> {
     pub detpid: Option<DetTid>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(compat-dbi-round8): Review backend-supplied open-file creator identity.
+    // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
     #[serde(default)]
     pub(crate) open_file_creator: Option<DetTid>,
@@ -1469,7 +1469,7 @@ impl<T> ThreadState<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(compat-dbi-round8): Review backend-supplied open-file creator identity.
+    // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Overrides the task identity embedded in subsequently allocated open-file descriptions.
     pub fn set_open_file_creator(&mut self, creator: DetTid) {
         self.open_file_creator = Some(creator);
