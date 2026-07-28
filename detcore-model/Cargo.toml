@@ -15,7 +15,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-reverie-syscalls = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "46d14b6a6484f6adb873783a02191b3db0b222d1" }
+reverie-syscalls = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "ce49a08ca03b54c28b6cae13b7b2eb3524a7651b" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 shell-words = "1.1.1"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
