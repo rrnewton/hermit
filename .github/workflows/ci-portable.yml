@@ -1,4 +1,4 @@
-name: CI (GitHub-hosted)
+name: CI (GitHub-managed portable)
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 # branch. GitHub replaces an older pending run in the group without cancelling
 # the active run when cancel-in-progress is false.
 concurrency:
-  group: hosted-${{ github.event.pull_request.number || github.ref }}
+  group: portable-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   regular:
-    name: Regular tests (GitHub-hosted)
+    name: Regular tests (GitHub-managed portable)
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -38,7 +38,7 @@ jobs:
         cache: false
     - uses: Swatinem/rust-cache@v2
       with:
-        shared-key: hosted-validation
+        shared-key: portable-validation
         cache-on-failure: true
     - name: Dependencies
       run: |
@@ -57,7 +57,7 @@ jobs:
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Portable test DAG (no PMU or CPUID interception)
-      run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh hosted --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v
+      run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh portable --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v
     - name: Upload DAG performance report
       if: always()
       uses: actions/upload-artifact@v4
@@ -73,4 +73,12 @@ jobs:
         name: nextest-junit-${{ github.job }}
         path: target/nextest/ci/junit.xml
         if-no-files-found: warn
+        retention-days: 14
+    - name: Upload E2E structured results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-results-${{ github.job }}
+        path: target/e2e/portable
+        if-no-files-found: error
         retention-days: 14
