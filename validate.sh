@@ -1703,7 +1703,7 @@ function run_compatibility_corpus {
     fi
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#845): Review the measured SaBRe system-utility expansion.
-    # TODO-HUMAN-REVIEW(PR-rr-compat-lseek): rr mode must reach tcl/dc too. Both
+    # TODO-HUMAN-REVIEW(#1044): rr mode must reach tcl/dc too. Both
     # are listed in RR_COMPAT_PASSING_LABELS (part of the 144-row expected set),
     # but this guard previously admitted only strict/sabre, so under
     # COMPATIBILITY_MODE=rr the two probes were never invoked. RR_COMPAT_TOTAL
@@ -2520,7 +2520,7 @@ function require_sabre_artifacts {
 function run_rr_compatibility_envelope {
     local status=0
 
-    # TODO-HUMAN-REVIEW(PR-rr-compat-lseek): rr mode consumes the same
+    # TODO-HUMAN-REVIEW(#1044): rr mode consumes the same
     # binutils/gprof/gcov fixtures as strict mode -- ranlib, size, strip,
     # addr2line, gprof, and gcov all read $REAL_COMPAT_FIXTURES -- but only
     # run_strict_compatibility_envelope prepared them. In a full validate.sh run

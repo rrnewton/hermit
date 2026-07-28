@@ -571,7 +571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
         let Some((current, snapshot_len)) = procfs_position else {
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-rr-compat-lseek): Regular-file lseek must
+            // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
             // flow through record_or_replay, exactly as handle_read does for
             // FdType::Regular. Injecting the seek live here is correct for run
             // and --verify (the inner NoopTool just re-injects), but under
