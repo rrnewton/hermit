@@ -38,8 +38,17 @@
 //!   ./manifest-harness.rs plan [--format text|json] [--lane L]
 //!   ./manifest-harness.rs build <test-id> [--out DIR]
 //!   ./manifest-harness.rs run   <test-id> [--mode M] [--backend B] [--dry-run]
-//!   ./manifest-harness.rs run   --bucket B --lane L [--dry-run]
+//!   ./manifest-harness.rs run   --bucket B --lane L [-j N] [--dry-run]
 //!   ./manifest-harness.rs dag   [--lane portable|privileged] [--format json]
+//!
+//! Parallelism: `run` executes the selected test entries across a rayon thread
+//! pool (`-j N`/`--jobs N`, default = num_cpus). Each entry shells out to
+//! independent `std::process::Command` invocations; per-entry PASS/FAIL output is
+//! buffered and flushed atomically as each entry completes, so parallel tests
+//! never interleave their lines. The DAG's outer fan-out (build -> per-bucket run
+//! nodes) supplies coarse parallelism; this inner `-j` supplies the fine-grained
+//! parallelism within each bucket. `-j 1` and `--dry-run` run sequentially with
+//! deterministic, source-ordered output.
 //!
 //! Environment:
 //!   HERMIT_BIN   Hermit binary for run cells (default: target/debug/hermit).
@@ -47,14 +56,21 @@
 //! ```cargo
 //! [dependencies]
 //! toml = "0.8"
+//! rayon = "1"
+//! num_cpus = "1"
 //! ```
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
 use std::process::Command;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
+use rayon::prelude::*;
 use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
@@ -241,35 +257,41 @@ fn sanitized(id: &str) -> String {
         .collect()
 }
 
-fn run_tool(desc: &str, mut cmd: Command) {
+fn run_tool(desc: &str, mut cmd: Command) -> Result<(), String> {
     let status = cmd
         .status()
-        .unwrap_or_else(|e| die(format!("{desc}: failed to spawn: {e}")));
+        .map_err(|e| format!("{desc}: failed to spawn: {e}"))?;
     if !status.success() {
-        die(format!("{desc}: exited with {status}"));
+        return Err(format!("{desc}: exited with {status}"));
     }
+    Ok(())
 }
 
 /// Build (or resolve) the entry's program, returning how to run it.
-fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
+///
+/// Returns `Err(msg)` for any recoverable per-entry problem (missing source,
+/// unsupported extension, compile failure) so the runner can record a single
+/// FAIL rather than aborting the whole (possibly parallel) run. Fatal callers
+/// such as the `build` subcommand `die()` on `Err` themselves.
+fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Result<Program, String> {
     if let Some(cmd) = &entry.direct {
-        return Program::Direct(cmd.clone());
+        return Ok(Program::Direct(cmd.clone()));
     }
     let root = repo_root();
     let program = entry
         .program
         .as_ref()
-        .unwrap_or_else(|| die(format!("{}: has neither `program` nor `direct`", entry.id)));
+        .ok_or_else(|| format!("{}: has neither `program` nor `direct`", entry.id))?;
     let abs = root.join(program);
     if !abs.exists() {
-        die(format!("{}: program path does not exist: {program}", entry.id));
+        return Err(format!("{}: program path does not exist: {program}", entry.id));
     }
     let ext = Path::new(program)
         .extension()
         .and_then(|x| x.to_str())
         .unwrap_or("");
     match ext {
-        "sh" => Program::Script(abs),
+        "sh" => Ok(Program::Script(abs)),
         "c" => {
             std::fs::create_dir_all(out_dir).ok();
             let out = out_dir.join(sanitized(&entry.id));
@@ -295,9 +317,9 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
             } else {
                 let mut c = Command::new(&cc);
                 c.args(&args);
-                run_tool(&format!("cc {}", entry.id), c);
+                run_tool(&format!("cc {}", entry.id), c)?;
             }
-            Program::Binary(out)
+            Ok(Program::Binary(out))
         }
         "rs" => {
             std::fs::create_dir_all(out_dir).ok();
@@ -312,11 +334,11 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
             } else {
                 let mut c = Command::new("rustc");
                 c.args(&args);
-                run_tool(&format!("rustc {}", entry.id), c);
+                run_tool(&format!("rustc {}", entry.id), c)?;
             }
-            Program::Binary(out)
+            Ok(Program::Binary(out))
         }
-        other => die(format!("{}: unsupported program extension `.{other}`", entry.id)),
+        other => Err(format!("{}: unsupported program extension `.{other}`", entry.id)),
     }
 }
 
@@ -370,12 +392,17 @@ fn run_argv(argv: &[String], env: &[(String, String)], dry_run: bool) -> Attempt
     for (k, v) in env {
         c.env(k, v);
     }
-    let out = c
-        .output()
-        .unwrap_or_else(|e| die(format!("failed to run {}: {e}", argv[0])));
-    Attempt {
-        status: out.status.code().unwrap_or(-1),
-        stdout: out.stdout,
+    // A spawn failure fails only this cell (status 127, error captured as
+    // stdout so it shows in the report) rather than aborting the whole run.
+    match c.output() {
+        Ok(out) => Attempt {
+            status: out.status.code().unwrap_or(-1),
+            stdout: out.stdout,
+        },
+        Err(e) => Attempt {
+            status: 127,
+            stdout: format!("failed to run {}: {e}", argv[0]).into_bytes(),
+        },
     }
 }
 
@@ -438,9 +465,23 @@ fn prepare_cell(cell: &Path) {
     }
 }
 
-fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool) -> bool {
+/// Run every enabled cell of a single manifest entry.
+///
+/// Returns `(all_pass, buffered_output)`. Output is accumulated into a `String`
+/// rather than printed directly so that callers running entries in parallel can
+/// flush each entry's block atomically (no interleaving). The buffer already
+/// carries trailing newlines per line.
+fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool) -> (bool, String) {
+    let mut out = String::new();
     let out_dir = repo_root().join("target/e2e-harness/build");
-    let prog = build_program(entry, &out_dir, dry_run);
+    let prog = match build_program(entry, &out_dir, dry_run) {
+        Ok(p) => p,
+        Err(e) => {
+            // A build/resolution error fails just this entry; the run continues.
+            out.push_str(&format!("FAIL  {:<10} build   -        {} - {e}\n", entry.lane, entry.id));
+            return (false, out);
+        }
+    };
     let cell = repo_root().join(format!("target/e2e-harness/runs/{}", sanitized(&entry.id)));
     if !dry_run {
         prepare_cell(&cell);
@@ -452,10 +493,16 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             for (k, v) in &env {
                 c.env(k, v);
             }
-            let st = c.status().unwrap_or_else(|e| die(format!("prepare {}: {e}", entry.id)));
-            if !st.success() {
-                println!("ERROR {} - fixture preparation failed", entry.id);
-                return false;
+            match c.status() {
+                Ok(st) if st.success() => {}
+                Ok(_) => {
+                    out.push_str(&format!("FAIL  {:<10} prepare -        {} - fixture preparation failed\n", entry.lane, entry.id));
+                    return (false, out);
+                }
+                Err(e) => {
+                    out.push_str(&format!("FAIL  {:<10} prepare -        {} - could not spawn --prepare: {e}\n", entry.lane, entry.id));
+                    return (false, out);
+                }
             }
         }
     }
@@ -476,7 +523,7 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             let distinct = if dry_run { m.min_distinct } else { seen.len() as i64 };
             let pass = distinct >= m.min_distinct;
             all_pass &= pass;
-            report(pass, entry, "naked", "native", &format!("distinct={distinct} need>={}", m.min_distinct));
+            out.push_str(&report_line(pass, entry, "naked", "native", &format!("distinct={distinct} need>={}", m.min_distinct)));
             continue;
         }
         let backends = &m.backends;
@@ -507,14 +554,14 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                         }
                     }
                     all_pass &= pass;
-                    report(pass, entry, &m.name, b, "");
+                    out.push_str(&report_line(pass, entry, &m.name, b, ""));
                 }
                 "replay" => {
                     let argv = hermit_argv("replay", b, &entry.lane, None, &[], &guest);
                     let at = run_argv(&argv, &env, dry_run);
                     let pass = at.status == 0;
                     all_pass &= pass;
-                    report(pass, entry, "replay", b, "");
+                    out.push_str(&report_line(pass, entry, "replay", b, ""));
                 }
                 "chaos" => {
                     let seeds = if m.seeds.is_empty() { vec![0, 1] } else { m.seeds.clone() };
@@ -533,19 +580,84 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                     let d = if dry_run { m.min_distinct } else { distinct.len() as i64 };
                     let pass = mism == 0 && d >= m.min_distinct && passes >= m.min_passes && failures >= m.min_failures;
                     all_pass &= pass;
-                    report(pass, entry, "chaos", b, &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}"));
+                    out.push_str(&report_line(pass, entry, "chaos", b, &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}")));
                 }
                 other => die(format!("{}: unsupported mode `{other}`", entry.id)),
             }
         }
     }
-    all_pass
+    (all_pass, out)
 }
 
-fn report(pass: bool, entry: &TestEntry, mode: &str, backend: &str, note: &str) {
+/// Format one PASS/FAIL result line (trailing newline included) for buffering.
+fn report_line(pass: bool, entry: &TestEntry, mode: &str, backend: &str, note: &str) -> String {
     let tag = if pass { "PASS" } else { "FAIL" };
     let suffix = if note.is_empty() { String::new() } else { format!(" - {note}") };
-    println!("{tag:<5} {:<10} {mode:<7} {backend:<8} {}{suffix}", entry.lane, entry.id);
+    format!("{tag:<5} {:<10} {mode:<7} {backend:<8} {}{suffix}\n", entry.lane, entry.id)
+}
+
+/// Run each entry that panics under `catch_unwind`, converting a panic into a
+/// FAIL result line instead of aborting the whole run — one test's crash must
+/// never kill the others (task requirement).
+fn run_entry_guarded(entry: &TestEntry, mode: &str, backend: &str, dry: bool) -> (bool, String) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_entry(entry, mode, backend, dry)
+    })) {
+        Ok(result) => result,
+        Err(_) => (
+            false,
+            format!("FAIL  {:<10} panic   -        {} - harness panicked\n", entry.lane, entry.id),
+        ),
+    }
+}
+
+/// Execute all selected entries and return the failure count.
+///
+/// `--dry-run` and `jobs <= 1` run sequentially with deterministic,
+/// source-ordered output. Otherwise entries run across a rayon pool of `jobs`
+/// worker threads; each entry's buffered output is flushed atomically the moment
+/// it finishes (guarded by a stdout mutex) so parallel tests never interleave.
+fn run_selected(
+    selected: &[TestEntry],
+    mode: &str,
+    backend: &str,
+    dry: bool,
+    jobs: usize,
+) -> usize {
+    // Sequential path: dry-run must print commands in order to stay readable,
+    // and there is no point spinning up a pool for one job / one entry.
+    if dry || jobs <= 1 || selected.len() <= 1 {
+        let mut failures = 0usize;
+        for e in selected {
+            let (pass, buf) = run_entry_guarded(e, mode, backend, dry);
+            print!("{buf}");
+            if !pass {
+                failures += 1;
+            }
+        }
+        let _ = std::io::stdout().flush();
+        return failures;
+    }
+
+    let failures = AtomicUsize::new(0);
+    let stdout_lock = Mutex::new(());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .unwrap_or_else(|e| die(format!("failed to build thread pool: {e}")));
+    pool.install(|| {
+        selected.par_iter().for_each(|e| {
+            let (pass, buf) = run_entry_guarded(e, mode, backend, dry);
+            if !pass {
+                failures.fetch_add(1, Ordering::Relaxed);
+            }
+            // Flush this entry's whole block atomically: no interleaving.
+            let _guard = stdout_lock.lock().unwrap_or_else(|p| p.into_inner());
+            print!("{buf}");
+            let _ = std::io::stdout().flush();
+        });
+    });
+    failures.into_inner()
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +790,7 @@ fn main() {
             }
             let entries = load_entries();
             let entry = find_entry(&entries, &id);
-            match build_program(&entry, &out, dry) {
+            match build_program(&entry, &out, dry).unwrap_or_else(|e| die(e)) {
                 Program::Direct(cmd) => println!("direct: {cmd}"),
                 Program::Script(p) => println!("script (runs directly): {}", p.display()),
                 Program::Binary(p) => println!("binary: {}", p.display()),
@@ -691,6 +803,7 @@ fn main() {
             let mut mode = String::new();
             let mut backend = String::new();
             let mut dry = false;
+            let mut jobs: usize = 0; // 0 => default to num_cpus
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -698,6 +811,15 @@ fn main() {
                     "--lane" => { lane = rest[i + 1].clone(); i += 2; }
                     "--mode" => { mode = rest[i + 1].clone(); i += 2; }
                     "--backend" => { backend = rest[i + 1].clone(); i += 2; }
+                    "-j" | "--jobs" => {
+                        jobs = rest.get(i + 1)
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or_else(|| die("run: -j/--jobs needs a positive integer".into()));
+                        if jobs == 0 {
+                            die("run: -j/--jobs must be >= 1".into());
+                        }
+                        i += 2;
+                    }
                     "--dry-run" => { dry = true; i += 1; }
                     s if !s.starts_with("--") => { id = s.to_string(); i += 1; }
                     s => die(format!("run: unknown option {s}")),
@@ -717,12 +839,8 @@ fn main() {
             if selected.is_empty() {
                 die("run: selection matched no tests".into());
             }
-            let mut failures = 0;
-            for e in &selected {
-                if !run_entry(e, &mode, &backend, dry) {
-                    failures += 1;
-                }
-            }
+            let effective_jobs = if jobs == 0 { num_cpus::get().max(1) } else { jobs };
+            let failures = run_selected(&selected, &mode, &backend, dry, effective_jobs);
             exit(if failures == 0 { 0 } else { 1 });
         }
         "dag" => {
