@@ -1262,7 +1262,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
 // TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
-// TODO-HUMAN-REVIEW(PR-PENDING): Review fault-safe DBI getrandom memory writes.
+// TODO-HUMAN-REVIEW(PR-1118): Review fault-safe DBI getrandom memory writes.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
