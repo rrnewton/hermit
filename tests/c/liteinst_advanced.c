@@ -247,6 +247,18 @@ static void run_fork_stress(void) {
   }
 }
 
+static void run_address_layout(void) {
+  static int global_address;
+  int stack_address = 0;
+  void *heap_address = malloc(1);
+  if (heap_address == NULL) {
+    fail("malloc");
+  }
+  printf("global=%p stack=%p heap=%p\n", (void *)&global_address,
+         (void *)&stack_address, heap_address);
+  free(heap_address);
+}
+
 static void run_chaos(uint64_t seed) {
   atomic_store_explicit(&signal_count, 0, memory_order_relaxed);
   pthread_t sender = start_signal_sender();
@@ -289,6 +301,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "fork") == 0) {
     run_fork_stress();
     puts("fork-ok");
+    return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "addresses") == 0) {
+    run_address_layout();
     return 0;
   }
   if (argc == 3 && strcmp(argv[1], "chaos-verify") == 0) {

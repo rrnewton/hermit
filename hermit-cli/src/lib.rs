@@ -1163,6 +1163,39 @@ fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     )
 }
 
+// TODO-HUMAN-REVIEW(PR-1017): Review scoped LiteInst host personality inheritance.
+struct LiteinstPersonalityGuard {
+    original: libc::c_ulong,
+}
+
+impl LiteinstPersonalityGuard {
+    fn disable_aslr() -> io::Result<Self> {
+        // Linux uses all bits set to query the current personality without
+        // changing it.
+        let original = unsafe { libc::personality(libc::c_ulong::MAX) };
+        if original == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let original = original as libc::c_ulong;
+        let deterministic = original | libc::ADDR_NO_RANDOMIZE as libc::c_ulong;
+        if unsafe { libc::personality(deterministic) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { original })
+    }
+}
+
+impl Drop for LiteinstPersonalityGuard {
+    fn drop(&mut self) {
+        if unsafe { libc::personality(self.original) } == -1 {
+            eprintln!(
+                "WARNING: could not restore the host personality after LiteInst: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
     command: Command,
@@ -1197,6 +1230,7 @@ async fn run_with_backend_inner(
         .status);
     }
     if backend == Backend::Liteinst {
+        let _personality = LiteinstPersonalityGuard::disable_aslr()?;
         let preload = liteinst_runtime_library_path()?;
         let (exit_status, mut global_state) =
             reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
@@ -1297,6 +1331,7 @@ async fn run_with_output_backend_inner(
         .await;
     }
     if backend == Backend::Liteinst {
+        let _personality = LiteinstPersonalityGuard::disable_aslr()?;
         command.stdin(Stdio::null());
         let preload = liteinst_runtime_library_path()?;
         let (output, mut global_state) =
