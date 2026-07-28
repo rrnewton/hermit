@@ -343,7 +343,12 @@ struct Attempt {
     stdout: Vec<u8>,
 }
 
-fn cell_env(cell: &Path) -> Vec<(String, String)> {
+fn cell_env(cell: &Path, isolated_guest_tmp: bool) -> Vec<(String, String)> {
+    let tmpdir = if isolated_guest_tmp {
+        PathBuf::from("/tmp/hermit-e2e")
+    } else {
+        cell.join("tmp")
+    };
     vec![
         ("LC_ALL".into(), "C".into()),
         ("TZ".into(), "UTC".into()),
@@ -352,7 +357,7 @@ fn cell_env(cell: &Path) -> Vec<(String, String)> {
             "XDG_CONFIG_HOME".into(),
             cell.join("xdg-config").to_string_lossy().to_string(),
         ),
-        ("E2E_TMPDIR".into(), cell.join("tmp").to_string_lossy().to_string()),
+        ("E2E_TMPDIR".into(), tmpdir.to_string_lossy().to_string()),
         (
             "E2E_FIXTURE_DIR".into(),
             cell.join("fixtures").to_string_lossy().to_string(),
@@ -446,7 +451,7 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         prepare_cell(&cell);
         // .sh wrappers build their sibling .c via --prepare.
         if let Program::Script(p) = &prog {
-            let env = cell_env(&cell);
+            let env = cell_env(&cell, false);
             let mut c = Command::new(p);
             c.arg("--prepare");
             for (k, v) in &env {
@@ -459,7 +464,6 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
             }
         }
     }
-    let env = cell_env(&cell);
     let guest = guest_argv(&prog);
     let mut all_pass = true;
 
@@ -467,6 +471,10 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         if !mode_filter.is_empty() && m.name != mode_filter {
             continue;
         }
+        // Hermit's built-in verification executes the guest twice. Keep its
+        // scratch path inside the fresh guest /tmp so run one cannot mutate a
+        // host-backed directory observed by run two.
+        let env = cell_env(&cell, m.name != "naked");
         if m.name == "naked" {
             let mut seen: BTreeSet<(i32, Vec<u8>)> = BTreeSet::new();
             for _ in 0..m.runs.max(2) {
