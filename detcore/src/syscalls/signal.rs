@@ -299,7 +299,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    // TODO-HUMAN-REVIEW(compat-ptrace-round4): Review process-pending signal preservation.
+    // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
     /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
     /// unambiguous positive-PID process signal through the backend. Backends that can execute
     /// with guest PIDs preserve process-directed delivery; DBI translates it to the sole live
@@ -380,7 +380,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#812)
-    // TODO-HUMAN-REVIEW(compat-ptrace-round4): Review queued process-signal preservation.
+    // TODO-HUMAN-REVIEW(PR-1058): Review queued process-signal preservation.
     /// Queue a process-directed signal with an accompanying `siginfo_t`. Mirrors `handle_kill`:
     /// preserve process-directed delivery when the backend accepts guest PIDs, otherwise route an
     /// unambiguous positive-PID target to its sole live thread via `rt_tgsigqueueinfo`. Ambiguous

@@ -101,7 +101,7 @@ pub struct Config {
     pub backend_dispatches_thread_tools: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(compat-ptrace-round4): Review process-signal identity translation.
+    // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
     /// therefore requires Detcore to translate an unambiguous process target to a specific thread.
     #[serde(default)]
