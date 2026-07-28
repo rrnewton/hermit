@@ -262,6 +262,7 @@ enum CapabilityProbe {
     Namespaces,
     Ptrace,
     Seccomp,
+    ProcessVmWritev,
 }
 
 fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
@@ -308,6 +309,43 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
                         ) == 0
                 }
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            CapabilityProbe::ProcessVmWritev => unsafe {
+                let page = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if page == libc::MAP_FAILED {
+                    false
+                } else {
+                    let source = page.cast::<u8>();
+                    let destination = source.add(1);
+                    source.write(0x5a);
+                    destination.write(0);
+                    let local = libc::iovec {
+                        iov_base: source.cast(),
+                        iov_len: 1,
+                    };
+                    let remote = libc::iovec {
+                        iov_base: destination.cast(),
+                        iov_len: 1,
+                    };
+                    let written = libc::syscall(
+                        libc::SYS_process_vm_writev,
+                        libc::getpid(),
+                        &raw const local,
+                        1,
+                        &raw const remote,
+                        1,
+                        0,
+                    );
+                    written == 1 && destination.read_volatile() == 0x5a
+                }
+            },
         };
         // SAFETY: Avoid running Rust destructors after fork.
         unsafe { libc::_exit(i32::from(!supported)) }
@@ -387,12 +425,24 @@ fn dynamorio_sdk_available() -> bool {
 }
 
 fn dbi_runtime_unavailable_reason() -> Option<String> {
-    detcore_dbi::runtime_library_path().err().map(|error| {
-        format!(
+    if let Err(error) = detcore_dbi::runtime_library_path() {
+        return Some(format!(
             "the Detcore DBI runtime is unavailable: {error}; build the hermit binary and \
              cdylib in the same target directory"
-        )
-    })
+        ));
+    }
+    // TODO-HUMAN-REVIEW(PR-pending): Review the DBI guest-memory capability requirement.
+    match run_capability_probe(CapabilityProbe::ProcessVmWritev) {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "process_vm_writev to the current process was denied; allow it in the host/container \
+             seccomp and LSM policy because DBI needs it for fault-safe guest-memory writes"
+                .to_owned(),
+        ),
+        Err(error) => Some(format!(
+            "could not probe process_vm_writev for fault-safe guest-memory writes: {error}"
+        )),
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

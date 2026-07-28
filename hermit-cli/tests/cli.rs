@@ -1992,3 +1992,20 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         assert_failure_contains(&output, &expected);
     }
 }
+
+// TODO-HUMAN-REVIEW(PR-pending): Review the DBI process-memory capability regression.
+#[test]
+fn run_reports_denied_dbi_process_vm_writev_capability() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args(["run", "--backend", "dbi", "--strict", "--", "/bin/true"]);
+    deny_syscall(&mut command, libc::SYS_process_vm_writev);
+    let output = command.output().expect("failed to run restricted hermit");
+    assert_failure_contains(
+        &output,
+        &[
+            "backend `dbi` is unavailable",
+            "process_vm_writev",
+            "fault-safe guest-memory writes",
+        ],
+    );
+}
