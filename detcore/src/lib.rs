@@ -1280,7 +1280,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        // TODO-HUMAN-REVIEW(PR-1141): Review child-state identity at DBI thread start.
+        // TODO-HUMAN-REVIEW(PR-1147): Review child-state identity at DBI thread start.
         let detpid = guest.thread_state().detpid.expect("detpid unset");
         let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
