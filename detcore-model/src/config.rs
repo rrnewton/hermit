@@ -88,6 +88,16 @@ pub struct Config {
     #[clap(skip)]
     pub cancel_killed_thread_rpcs: bool,
 
+    /// The execution backend completes forked process children before returning to the parent.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_serializes_fork_children: bool,
+
+    /// The execution backend dispatches cloned thread syscalls through this tool.
+    #[serde(default = "default_true")]
+    #[clap(skip)]
+    pub backend_dispatches_thread_tools: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
