@@ -321,20 +321,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Vec<u8>, Error> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
-        let initial_offset = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position())?
-            .map_or(0, |(offset, _)| offset);
-        if initial_offset != 0 {
-            guest
-                .inject_with_retry(Syscall::Lseek(
-                    syscalls::Lseek::new()
-                        .with_fd(call.fd())
-                        .with_offset(0)
-                        .with_whence(Whence::SEEK_SET),
-                ))
-                .await?;
-        }
+        // A backend-owned read may have advanced the kernel cursor without
+        // passing through Detcore's logical procfs cursor (KVM does this for
+        // worker-shared descriptors). Always rewind before taking the initial
+        // snapshot so a later intercepted pread cannot snapshot from EOF.
+        guest
+            .inject_with_retry(Syscall::Lseek(
+                syscalls::Lseek::new()
+                    .with_fd(call.fd())
+                    .with_offset(0)
+                    .with_whence(Whence::SEEK_SET),
+            ))
+            .await?;
 
         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
         let mut contents = Vec::new();
@@ -1323,25 +1321,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => OFlag::empty(),
         };
         match call.cmd() {
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1013): Review serialized advisory-lock semantics.
-            F_SETLK(lock) | F_SETLKW(lock) | F_OFD_SETLK(lock) | F_OFD_SETLKW(lock) => {
-                // Keep advisory locking consistent with handle_flock. Detcore
-                // serializes guest execution, while forwarding pointer-based locks
-                // is not supported by every backend (notably KVM).
-                guest.thread_state().with_detfd(fd, |_| ())?;
-                let _: libc::flock = guest.memory().read_value(lock.ok_or(Errno::EFAULT)?)?;
-                info!("fcntl advisory lock on fd={fd} treated as deterministic no-op success");
-                Ok(0)
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1013): Review serialized advisory-lock semantics.
-            F_SETLK64(lock) | F_SETLKW64(lock) => {
-                guest.thread_state().with_detfd(fd, |_| ())?;
-                let _: libc::flock64 = guest.memory().read_value(lock.ok_or(Errno::EFAULT)?)?;
-                info!("fcntl64 advisory lock on fd={fd} treated as deterministic no-op success");
-                Ok(0)
-            }
             F_GETFL => {
                 let physical_flags = self.record_or_replay(guest, call).await?;
                 let logical_nonblocking = guest
