@@ -31,7 +31,7 @@ claim that different backends expose byte-identical hardware descriptions.
 | --- | --- | --- | --- |
 | `whoami.sh` | pass | pass | |
 | `hostname.sh` | pass | pass | |
-| `lscpu.sh` | pass | gap | `/proc/cpuinfo` read is denied |
+| `lscpu.sh` | pass | pass | |
 | `lshw.sh` | pass | pass | |
 | `numactl.sh` | pass | gap | host free-memory counter varies |
 | `uname.sh` | pass | pass | |

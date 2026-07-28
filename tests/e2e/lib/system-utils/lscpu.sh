@@ -10,9 +10,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091 # Resolved relative to this script at runtime.
 source "$script_dir/_common.sh"
 
-# KVM currently denies lscpu's /proc/cpuinfo read.
 # shellcheck disable=SC2034 # Consumed by the sourced common harness.
-readonly -a BACKEND_ALLOWLIST=(ptrace)
+readonly -a BACKEND_ALLOWLIST=(ptrace kvm)
 init_system_utility_test lscpu "$@"
 require_command lscpu
 utility=$(command -v lscpu)
