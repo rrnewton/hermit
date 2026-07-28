@@ -141,6 +141,12 @@ The harness dispatches on the `program` extension:
 - **`direct`** — an inline shell command for trivial cases, so a one-liner does
   not need a file at all.
 
+Every fixture-preparation command and mode attempt is bounded by the entry's
+`timeout_seconds`. The harness runs the command in a dedicated process group,
+sends `TERM` to the group at the deadline, and escalates to `KILL` after two
+seconds. A timeout always fails the cell; naked or chaos assertions cannot
+count timed-out output as valid nondeterministic variation.
+
 A `build` table may override defaults when a program needs extra sources or
 flags (see `system-utils.toml`'s use of `build.extra_sources`).
 

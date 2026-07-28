@@ -58,8 +58,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::exit;
 use std::process::Command;
+use std::process::exit;
+use std::time::Duration;
+use std::time::Instant;
 
 use toml::Value;
 
@@ -392,6 +394,7 @@ fn guest_argv(prog: &Program) -> Vec<String> {
 struct Attempt {
     status: i32,
     stdout: Vec<u8>,
+    timed_out: bool,
 }
 
 fn cell_env(cell: &Path) -> Vec<(String, String)> {
@@ -411,22 +414,72 @@ fn cell_env(cell: &Path) -> Vec<(String, String)> {
     ]
 }
 
-fn run_argv(argv: &[String], env: &[(String, String)], dry_run: bool) -> Attempt {
-    if dry_run {
-        println!("{}", argv.join(" "));
-        return Attempt { status: 0, stdout: Vec::new() };
+fn timeout_command(argv: &[String], env: &[(String, String)], timeout_seconds: i64) -> Command {
+    if timeout_seconds <= 0 {
+        die(format!("timeout must be positive, got {timeout_seconds}"));
     }
-    let mut c = Command::new(&argv[0]);
-    c.args(&argv[1..]);
+
+    // Without --foreground, GNU timeout creates a separate process group and
+    // signals the whole group. This ensures a stuck guest cannot leave Hermit
+    // or its descendants running after the manifest deadline.
+    let mut c = Command::new("timeout");
+    c.arg("--signal=TERM")
+        .arg("--kill-after=2s")
+        .arg(format!("{timeout_seconds}s"))
+        .arg(&argv[0])
+        .args(&argv[1..]);
     for (k, v) in env {
         c.env(k, v);
     }
+    c
+}
+
+fn did_time_out(status: i32, elapsed: Duration, timeout_seconds: i64) -> bool {
+    matches!(status, 124 | 137) && elapsed >= Duration::from_secs(timeout_seconds as u64)
+}
+
+fn run_argv(
+    argv: &[String],
+    env: &[(String, String)],
+    dry_run: bool,
+    timeout_seconds: i64,
+) -> Attempt {
+    if dry_run {
+        println!(
+            "timeout --signal=TERM --kill-after=2s {timeout_seconds}s {}",
+            argv.join(" ")
+        );
+        return Attempt {
+            status: 0,
+            stdout: Vec::new(),
+            timed_out: false,
+        };
+    }
+
+    let started = Instant::now();
+    let mut c = timeout_command(argv, env, timeout_seconds);
     let out = c
         .output()
         .unwrap_or_else(|e| die(format!("failed to run {}: {e}", argv[0])));
+    let status = out.status.code().unwrap_or(-1);
     Attempt {
-        status: out.status.code().unwrap_or(-1),
+        status,
         stdout: out.stdout,
+        timed_out: did_time_out(status, started.elapsed(), timeout_seconds),
+    }
+}
+
+fn run_status_argv(argv: &[String], env: &[(String, String)], timeout_seconds: i64) -> Attempt {
+    let started = Instant::now();
+    let status = timeout_command(argv, env, timeout_seconds)
+        .status()
+        .unwrap_or_else(|e| die(format!("failed to run {}: {e}", argv[0])))
+        .code()
+        .unwrap_or(-1);
+    Attempt {
+        status,
+        stdout: Vec::new(),
+        timed_out: did_time_out(status, started.elapsed(), timeout_seconds),
     }
 }
 
@@ -489,7 +542,13 @@ fn prepare_cell(cell: &Path) {
     }
 }
 
-fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool, no_build: bool) -> bool {
+fn run_entry(
+    entry: &TestEntry,
+    mode_filter: &str,
+    backend_filter: &str,
+    dry_run: bool,
+    no_build: bool,
+) -> bool {
     let out_dir = repo_root().join("target/e2e-harness/build");
     let prog = build_program(entry, &out_dir, dry_run, no_build);
     let cell = repo_root().join(format!("target/e2e-harness/runs/{}", sanitized(&entry.id)));
@@ -498,14 +557,15 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         // .sh wrappers build their sibling .c via --prepare.
         if let Program::Script(p) = &prog {
             let env = cell_env(&cell);
-            let mut c = Command::new(p);
-            c.arg("--prepare");
-            for (k, v) in &env {
-                c.env(k, v);
-            }
-            let st = c.status().unwrap_or_else(|e| die(format!("prepare {}: {e}", entry.id)));
-            if !st.success() {
-                println!("ERROR {} - fixture preparation failed", entry.id);
+            let prepare = vec![p.to_string_lossy().to_string(), "--prepare".into()];
+            let attempt = run_status_argv(&prepare, &env, entry.timeout);
+            if attempt.status != 0 {
+                let reason = if attempt.timed_out {
+                    format!("fixture preparation timed out after {}s", entry.timeout)
+                } else {
+                    format!("fixture preparation exited with status {}", attempt.status)
+                };
+                println!("ERROR {} - {reason}", entry.id);
                 return false;
             }
         }
@@ -520,14 +580,31 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
         }
         if m.name == "naked" {
             let mut seen: BTreeSet<(i32, Vec<u8>)> = BTreeSet::new();
+            let mut timed_out = 0i64;
             for _ in 0..m.runs.max(2) {
-                let at = run_argv(&guest, &env, dry_run);
+                let at = run_argv(&guest, &env, dry_run, entry.timeout);
+                if at.timed_out {
+                    timed_out += 1;
+                }
                 seen.insert((at.status, at.stdout));
             }
-            let distinct = if dry_run { m.min_distinct } else { seen.len() as i64 };
-            let pass = distinct >= m.min_distinct;
+            let distinct = if dry_run {
+                m.min_distinct
+            } else {
+                seen.len() as i64
+            };
+            let pass = timed_out == 0 && distinct >= m.min_distinct;
             all_pass &= pass;
-            report(pass, entry, "naked", "native", &format!("distinct={distinct} need>={}", m.min_distinct));
+            report(
+                pass,
+                entry,
+                "naked",
+                "native",
+                &format!(
+                    "distinct={distinct} need>={} timed_out={timed_out}",
+                    m.min_distinct
+                ),
+            );
             continue;
         }
         let backends = &m.backends;
@@ -540,9 +617,13 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                     let repeats = if m.name == "custom" { m.runs.max(1) } else { 1 };
                     let mut first: Option<(i32, Vec<u8>)> = None;
                     let mut pass = true;
+                    let mut timed_out = 0i64;
                     for _ in 0..repeats {
                         let argv = hermit_argv(&m.name, b, &entry.lane, None, &m.args, &guest);
-                        let at = run_argv(&argv, &env, dry_run);
+                        let at = run_argv(&argv, &env, dry_run, entry.timeout);
+                        if at.timed_out {
+                            timed_out += 1;
+                        }
                         if at.status != 0 {
                             pass = false;
                         }
@@ -558,33 +639,74 @@ fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run
                         }
                     }
                     all_pass &= pass;
-                    report(pass, entry, &m.name, b, "");
+                    let note = if timed_out == 0 {
+                        String::new()
+                    } else {
+                        format!("timed out {timed_out} time(s) after {}s", entry.timeout)
+                    };
+                    report(pass, entry, &m.name, b, &note);
                 }
                 "replay" => {
                     let argv = hermit_argv("replay", b, &entry.lane, None, &[], &guest);
-                    let at = run_argv(&argv, &env, dry_run);
-                    let pass = at.status == 0;
+                    let at = run_argv(&argv, &env, dry_run, entry.timeout);
+                    let pass = at.status == 0 && !at.timed_out;
                     all_pass &= pass;
-                    report(pass, entry, "replay", b, "");
+                    let note = if at.timed_out {
+                        format!("timed out after {}s", entry.timeout)
+                    } else {
+                        String::new()
+                    };
+                    report(pass, entry, "replay", b, &note);
                 }
                 "chaos" => {
-                    let seeds = if m.seeds.is_empty() { vec![0, 1] } else { m.seeds.clone() };
+                    let seeds = if m.seeds.is_empty() {
+                        vec![0, 1]
+                    } else {
+                        m.seeds.clone()
+                    };
                     let mut distinct: BTreeSet<(i32, Vec<u8>)> = BTreeSet::new();
-                    let (mut passes, mut failures, mut mism) = (0i64, 0i64, 0i64);
+                    let (mut passes, mut failures, mut mism, mut timed_out) =
+                        (0i64, 0i64, 0i64, 0i64);
                     for s in &seeds {
                         let argv = hermit_argv("chaos", b, &entry.lane, Some(*s), &[], &guest);
-                        let a1 = run_argv(&argv, &env, dry_run);
-                        let a2 = run_argv(&argv, &env, dry_run);
-                        if a1.status == 0 { passes += 1 } else { failures += 1 }
+                        let a1 = run_argv(&argv, &env, dry_run, entry.timeout);
+                        let a2 = run_argv(&argv, &env, dry_run, entry.timeout);
+                        if a1.timed_out {
+                            timed_out += 1;
+                        }
+                        if a2.timed_out {
+                            timed_out += 1;
+                        }
+                        if a1.status == 0 {
+                            passes += 1
+                        } else {
+                            failures += 1
+                        }
                         if (a1.status, &a1.stdout) != (a2.status, &a2.stdout) {
                             mism += 1;
                         }
                         distinct.insert((a1.status, a1.stdout));
                     }
-                    let d = if dry_run { m.min_distinct } else { distinct.len() as i64 };
-                    let pass = mism == 0 && d >= m.min_distinct && passes >= m.min_passes && failures >= m.min_failures;
+                    let d = if dry_run {
+                        m.min_distinct
+                    } else {
+                        distinct.len() as i64
+                    };
+                    let pass = timed_out == 0
+                        && mism == 0
+                        && d >= m.min_distinct
+                        && passes >= m.min_passes
+                        && failures >= m.min_failures;
                     all_pass &= pass;
-                    report(pass, entry, "chaos", b, &format!("distinct={d} passes={passes} failures={failures} repeat_mismatch={mism}"));
+                    report(
+                        pass,
+                        entry,
+                        "chaos",
+                        b,
+                        &format!(
+                            "distinct={d} passes={passes} failures={failures} repeat_mismatch={mism} timed_out={timed_out}"
+                        ),
+                    );
                 }
                 other => die(format!("{}: unsupported mode `{other}`", entry.id)),
             }
@@ -853,4 +975,62 @@ fn main() {
 
     // Silence unused-const warnings when a build only touches some paths.
     let _ = (KNOWN_BACKENDS, ACCOUNTED_MODES);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_guest_exit_124_from_deadline_expiry() {
+        assert!(!did_time_out(124, Duration::from_millis(10), 5));
+        assert!(did_time_out(124, Duration::from_secs(5), 5));
+        assert!(did_time_out(137, Duration::from_secs(7), 5));
+    }
+
+    #[test]
+    fn declared_timeout_kills_command_and_descendant() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "hermit-manifest-timeout-child-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 60 & child=$!; printf '%s\\n' \"$child\" >\"$1\"; wait \"$child\"".to_string(),
+            "timeout-regression".to_string(),
+            pid_file.to_string_lossy().to_string(),
+        ];
+
+        let started = Instant::now();
+        let attempt = run_argv(&argv, &[], false, 5);
+        let elapsed = started.elapsed();
+        assert!(
+            attempt.timed_out,
+            "expected timeout, got status {}",
+            attempt.status
+        );
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(9),
+            "five-second timeout returned after {elapsed:?}"
+        );
+
+        let child_pid = std::fs::read_to_string(&pid_file)
+            .expect("timed command must record its child pid")
+            .trim()
+            .to_string();
+        let proc_path = PathBuf::from(format!("/proc/{child_pid}"));
+        for _ in 0..40 {
+            if !proc_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if proc_path.exists() {
+            let _ = Command::new("kill").args(["-KILL", &child_pid]).status();
+            panic!("timed command left descendant pid {child_pid} running");
+        }
+        std::fs::remove_file(pid_file).expect("remove timeout child pid file");
+    }
 }
