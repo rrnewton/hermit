@@ -1390,7 +1390,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         .filter(|probe| probe.writable < probe.requested)
         .map(|probe| (probe, thread.state.prng.clone()));
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(compat-dbi-round7): Review production fault-safe DBI backtraces.
+    // TODO-HUMAN-REVIEW(PR-1057): Review production fault-safe DBI backtraces.
     // Preserve DynamoRIO's fault containment when Detcore asks DbiGuest for a
     // backtrace. Dropping this callback makes the adapter fall back to direct
     // self-process reads, which cannot distinguish a guest fault from a client
