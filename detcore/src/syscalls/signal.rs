@@ -241,7 +241,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review retrying interrupted signal-mask injections.
+    // TODO-HUMAN-REVIEW(#1046): Review retrying interrupted signal-mask injections.
     /// rt_sigprocmask
     pub async fn handle_rt_sigprocmask<G: Guest<Self>>(
         &self,
