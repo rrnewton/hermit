@@ -794,6 +794,11 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
     // One independently schedulable run node per bucket. The node timeout is
     // the sum of the bucket's per-test timeouts (tests remain serial within a
     // bucket), floored at the DAG default.
+    let bucket_resource = if lane == "portable" {
+        r#""resources":{"hermit_guest":1},"#
+    } else {
+        r#""resources":{"kvm":1},"#
+    };
     for b in &buckets {
         let job = format!("manifest_{}", b.replace('-', "_"));
         let cmd = format!(
@@ -807,7 +812,7 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
             .sum::<i64>()
             .max(600);
         steps.push(format!(
-            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"build.workspace\",\"build.manifest_guests\",\"e2e.manifest_validate\"],\"timeout\":{bucket_timeout},\"hint\":{{\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
+            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"build.workspace\",\"build.manifest_guests\",\"e2e.manifest_validate\"],\"timeout\":{bucket_timeout},\"hint\":{{{bucket_resource}\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
             job = json_str(&job),
             desc = json_str(&desc),
             cmd = json_str(&cmd),
@@ -815,9 +820,12 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
     }
 
     println!("{{");
-    // Bucket cells use disjoint run directories and only read prebuilt guests.
-    // Let the runner's -j / memory limits schedule independent buckets in parallel.
-    println!("  \"resource_caps\": {{}},");
+    // Portable buckets share five weighted slots; privileged KVM remains exclusive.
+    if lane == "portable" {
+        println!("  \"resource_caps\": {{\"hermit_guest\": 5}},");
+    } else {
+        println!("  \"resource_caps\": {{\"kvm\": 1}},");
+    }
     println!("  \"mem_cap_factor\": 1.25,");
     println!("  \"mem_cap_floor_bytes\": 8589934592,");
     println!("  \"outer_mem_safety_factor\": 1.0,");

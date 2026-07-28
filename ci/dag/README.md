@@ -51,6 +51,11 @@ dependency-free Python runner so per-node performance CSVs are available
 without an install step. `ci/run-dag.sh` also accepts
 `SAFE_CI_DAG_RUNNER` for local or preinstalled binaries.
 
+Manifest loading uses `rust-script` 0.36.0. Every GitHub job that invokes a
+DAG or `validate.sh` first runs `ci/install-rust-script.sh`; the installer uses
+`with-proxy` on self-hosted Meta runners and ordinary Cargo on GitHub-hosted
+runners, then verifies the exact version before continuing.
+
 ## Speed-to-signal audit
 
 A successful PR run on 2026-07-26 provided the baseline:
@@ -102,12 +107,27 @@ Each bucket still writes JSONL, summary JSON, and JUnit below
 `tests/e2e/manifests/manifest-harness.rs dag --lane portable` emits the same
 build-then-fan-out shape for auditing and for newly added manifest buckets.
 
+The checked-in `portable.json` and `privileged.json` files are templates for
+the non-manifest gates. `ci/run-dag.sh` calls `ci/render-manifest-dag.sh` before
+every run, replacing the template's manifest nodes with the nodes generated
+from the TOMLs at the checked-out commit. The rendered plan lives under
+`target/ci-dag/`; adding or removing a manifest bucket therefore cannot leave
+GitHub CI with a stale hardcoded bucket list. `ci/check-manifest-ci-alignment.sh`
+fails closed if the rendered buckets, `validate.sh` discovery commands, or
+workflow installer/audit steps drift, and prints the exact test/cell counts for
+both lanes.
+
 ### Command fidelity
 
-Node `cmd`s are the **verbatim** commands `validate.sh` runs, with three
-deliberate exceptions, chosen to avoid duplicating script logic that has many
+Node `cmd`s are the **verbatim** commands `validate.sh` runs, with these
+deliberate exceptions chosen to avoid duplicating script logic that has many
 moving parts:
 
+- **Manifest execution shares discovery but differs in granularity.**
+  `validate.sh` uses `run --all --lane ...` for a single local gate, while the
+  rendered CI DAG uses one `run --bucket ...` node per TOML. Both consume the
+  same validated plan; `check-manifest-ci-alignment.sh` proves the lane bucket
+  sets and reports their exact test/cell counts.
 - **Composite envelope gates reuse `validate.sh`'s own standalone entrypoints**
   so there is one source of truth: `test.strict_compat` runs
   `./validate.sh --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
