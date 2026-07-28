@@ -410,7 +410,7 @@ fn current_runtime() -> Arc<Runtime> {
 const DBI_THREAD_TID_BASE: i32 = 1 << 28;
 const DBI_THREAD_CHILD_STRIDE: i32 = 1 << 11;
 
-// TODO-HUMAN-REVIEW(PR-pending): Review the DBI DetTid namespace for native child threads.
+// TODO-HUMAN-REVIEW(PR-1052): Review the DBI DetTid namespace for native child threads.
 fn dbi_child_det_tid(virtual_pid: i32, child_ordinal: i32) -> Option<Tid> {
     if virtual_pid <= 0 || child_ordinal <= 0 || child_ordinal >= DBI_THREAD_CHILD_STRIDE {
         return None;
@@ -878,7 +878,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
-// TODO-HUMAN-REVIEW(PR-pending): Review preservation of stable DBI thread identity.
+// TODO-HUMAN-REVIEW(PR-1052): Review preservation of stable DBI thread identity.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -980,7 +980,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
 // TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
-// TODO-HUMAN-REVIEW(PR-pending): Review deterministic child DetTid allocation.
+// TODO-HUMAN-REVIEW(PR-1052): Review deterministic child DetTid allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -1201,7 +1201,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
-// TODO-HUMAN-REVIEW(PR-pending): Review mapped child DetTid syscall dispatch.
+// TODO-HUMAN-REVIEW(PR-1052): Review mapped child DetTid syscall dispatch.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,

@@ -1915,7 +1915,7 @@ mod timeslice_tests {
 /// Generate a new thread-local PRNG from the parent's PRNG state, mixing in the
 /// new DetTid for some deterministic entropy. This ensures sequentially-spawned
 /// threads get distinct PRNG states.
-// TODO-HUMAN-REVIEW(PR-pending): Review collision-free child-thread PRNG seeding.
+// TODO-HUMAN-REVIEW(PR-1052): Review collision-free child-thread PRNG seeding.
 pub fn thread_rng_from_parent(msg: &str, parent: &Pcg64Mcg, child: DetTid) -> Pcg64Mcg {
     // Perform the default SeedableRng::from_seed procedure
     let mut seed = <Pcg64Mcg as SeedableRng>::Seed::default();
