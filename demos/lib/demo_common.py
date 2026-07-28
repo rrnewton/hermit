@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 WALLCLOCK_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+"
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]+"
 )
 
 
@@ -157,9 +157,9 @@ def save_anchor(run_dir: Path, metadata: Dict[str, Any]) -> Path:
     return anchor_path
 
 
-def _normalize_log_line(line: str) -> str:
+def _strip_wallclock_prefix(line: str) -> str:
     """Strip only the nondeterministic tracing wallclock prefix."""
-    return WALLCLOCK_RE.sub("", line.rstrip("\n"))
+    return WALLCLOCK_RE.sub("", line, count=1)
 
 
 def hermit_log_diff(log1: Path, log2: Path) -> str:
@@ -175,20 +175,20 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
             if not left_line and not right_line:
                 return ""
             line_number += 1
-            normalized_left = _normalize_log_line(left_line)
-            normalized_right = _normalize_log_line(right_line)
-            if normalized_left != normalized_right:
-                context = ["  {}".format(item[1]) for item in before]
+            stripped_left = _strip_wallclock_prefix(left_line)
+            stripped_right = _strip_wallclock_prefix(right_line)
+            if stripped_left != stripped_right:
+                context = ["  {!r}".format(item[1]) for item in before]
                 context.extend(
                     (
-                        "- {}".format(normalized_left),
-                        "+ {}".format(normalized_right),
+                        "- {!r}".format(stripped_left),
+                        "+ {!r}".format(stripped_right),
                     )
                 )
                 return "first timestamp-stripped divergence at line {}:\n{}".format(
                     line_number, "\n".join(context)
                 )
-            before.append((line_number, normalized_left, normalized_right))
+            before.append((line_number, stripped_left, stripped_right))
             before = before[-3:]
 
 
