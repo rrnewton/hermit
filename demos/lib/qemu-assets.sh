@@ -10,7 +10,7 @@ ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || printf '%s' /usr/sbin/busybox)}"
 KERNEL_SHA256="${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}"
 KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-test/tree/dev-hermit/qemu-kernels/$KERNEL_SHA256/bzImage}"
-INITRAMFS_VERSION=2
+INITRAMFS_VERSION=3
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 
 fail() {
@@ -111,6 +111,7 @@ mount -t devtmpfs none /dev  2>/dev/null || mount -t tmpfs none /dev 2>/dev/null
 echo "=========================================="
 echo "HERMIT-QEMU-BASELINE-BOOT-OK"
 echo "kernel: $(uname -r)"
+echo "rtc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=========================================="
 echo "Interactive busybox shell. Type 'poweroff -f' to exit."
 exec setsid cttyhack sh
