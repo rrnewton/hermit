@@ -66,6 +66,22 @@ fn copy_file(source: &Path, destination: &Path) {
     });
 }
 
+fn reset_cmake_cache_for_source(build: &Path, source: &Path) {
+    let cache = build.join("CMakeCache.txt");
+    let Ok(contents) = fs::read_to_string(&cache) else {
+        return;
+    };
+    let expected = format!("CMAKE_HOME_DIRECTORY:INTERNAL={}", source.display());
+    if !contents.lines().any(|line| line == expected) {
+        fs::remove_dir_all(build).unwrap_or_else(|error| {
+            panic!(
+                "failed to reset stale CMake build directory {}: {error}",
+                build.display()
+            )
+        });
+    }
+}
+
 fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str) -> PathBuf {
     let source = repository.join(relative);
     if !source.join(marker).is_file() {
@@ -111,6 +127,7 @@ fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str)
 fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     let source = ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
     let build = build_root.join("sabre");
+    reset_cmake_cache_for_source(&build, &source);
     run(
         Command::new("cmake")
             .arg("-S")
