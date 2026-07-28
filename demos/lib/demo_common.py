@@ -2,7 +2,6 @@
 """Shared utilities for the Python QEMU snapshot demos."""
 
 import datetime as dt
-import difflib
 import fcntl
 import hashlib
 import json
@@ -20,15 +19,9 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-WALLCLOCK_RE = re.compile(r"^[0-9T:.Z-]+ +")
-RUN_PATH_RE = re.compile(r"(?:boot|resume)-[0-9TZ._-]+(?:-[0-9]+)?")
-HERMIT_TMP_RE = re.compile(r"hermit-demo\.[A-Za-z0-9]+")
-HEX_ADDRESS_RE = re.compile(r"\b0[xX][0-9A-Fa-f]+\b")
-COMMIT_TURN_RE = re.compile(r"(COMMIT turn )\d+")
-COMMITTED_TIME_RE = re.compile(r"(previously committed )[0-9_.]+s")
-LOGICAL_TIME_RE = re.compile(r"LogicalTime\(\d+\)")
-SCHEDULER_TURNS_RE = re.compile(r"(scheduler ran )\d+( turns)")
-NUMBER_RE = re.compile(r"\b\d[\d_]*(?:\.\d[\d_]*)?(?:ns|us|µs|ms)?\b")
+WALLCLOCK_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+"
+)
 
 
 def hash_file(path: Path) -> str:
@@ -94,6 +87,16 @@ def _tool_version(command: Sequence[str]) -> str:
     return first_line[0] if first_line else "unknown"
 
 
+def _tool_sha256(executable: str) -> str:
+    path = Path(shutil.which(executable) or executable)
+    if not path.is_file():
+        return "unavailable: {} is not a file".format(path)
+    try:
+        return hash_file(path)
+    except OSError as error:
+        return "unavailable: {}".format(error)
+
+
 def _write_json(path: Path, value: Dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +115,7 @@ def save_metadata(
     run_dir = Path(run_dir)
     info_log = Path(info_log)
     run_dir.mkdir(parents=True, exist_ok=True)
+    qemu = os.environ.get("QEMU_BIN", "qemu-system-x86_64")
     metadata: Dict[str, Any] = {
         "schema_version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -120,9 +124,8 @@ def save_metadata(
         "hermit_version": _tool_version(
             [os.environ.get("HERMIT_RELEASE", "hermit"), "--version"]
         ),
-        "qemu_version": _tool_version(
-            [os.environ.get("QEMU_BIN", "qemu-system-x86_64"), "--version"]
-        ),
+        "qemu_version": _tool_version([qemu, "--version"]),
+        "qemu_binary_sha256": _tool_sha256(qemu),
     }
     if qcow2_path is not None:
         qcow2_path = Path(qcow2_path)
@@ -155,26 +158,12 @@ def save_anchor(run_dir: Path, metadata: Dict[str, Any]) -> Path:
 
 
 def _normalize_log_line(line: str) -> str:
-    line = WALLCLOCK_RE.sub("", line.rstrip("\n"))
-    line = RUN_PATH_RE.sub("<run>", line)
-    line = HERMIT_TMP_RE.sub("hermit-demo.<run>", line)
-    line = HEX_ADDRESS_RE.sub("<address>", line)
-    line = COMMIT_TURN_RE.sub(r"\1<turn>", line)
-    line = COMMITTED_TIME_RE.sub(r"\1<virtual-time>", line)
-    line = LOGICAL_TIME_RE.sub("LogicalTime(<virtual-time>)", line)
-    line = SCHEDULER_TURNS_RE.sub(r"\1<turns>\2", line)
-    if line.startswith("Final virtual global (cpu) time:"):
-        line = "Final virtual global (cpu) time: <virtual-time>"
-    elif line.startswith("Elapsed virtual global (cpu) time:"):
-        line = "Elapsed virtual global (cpu) time: <virtual-time>"
-    elif line.startswith("Timeslice stats:"):
-        line = "Timeslice stats: <normalized>"
-    line = NUMBER_RE.sub("<number>", line)
-    return line
+    """Strip only the nondeterministic tracing wallclock prefix."""
+    return WALLCLOCK_RE.sub("", line.rstrip("\n"))
 
 
 def hermit_log_diff(log1: Path, log2: Path) -> str:
-    """Return a compact normalized diff at the first Hermit log divergence."""
+    """Return the first exact log divergence after stripping wallclock prefixes."""
     before: List[Tuple[int, str, str]] = []
     with Path(log1).open(errors="replace") as left, Path(log2).open(
         errors="replace"
@@ -189,19 +178,15 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
             normalized_left = _normalize_log_line(left_line)
             normalized_right = _normalize_log_line(right_line)
             if normalized_left != normalized_right:
-                left_context = [item[1] for item in before]
-                right_context = [item[2] for item in before]
-                left_context.append(normalized_left)
-                right_context.append(normalized_right)
-                diff = difflib.unified_diff(
-                    left_context,
-                    right_context,
-                    fromfile=str(log1),
-                    tofile=str(log2),
-                    lineterm="",
+                context = ["  {}".format(item[1]) for item in before]
+                context.extend(
+                    (
+                        "- {}".format(normalized_left),
+                        "+ {}".format(normalized_right),
+                    )
                 )
-                return "first normalized divergence at line {}:\n{}".format(
-                    line_number, "\n".join(diff)
+                return "first timestamp-stripped divergence at line {}:\n{}".format(
+                    line_number, "\n".join(context)
                 )
             before.append((line_number, normalized_left, normalized_right))
             before = before[-3:]
@@ -210,16 +195,21 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
 def compare_runs(
     anchor: Dict[str, Any], current: Dict[str, Any]
 ) -> Tuple[bool, List[str]]:
-    """Compare exact artifacts and normalized logs, returning a clear report."""
+    """Compare exact artifacts and timestamp-stripped logs."""
     passed = True
     report: List[str] = []
     if anchor.get("qemu_argv") == current.get("qemu_argv"):
-        report.append("PASS: QEMU argv matches anchor")
+        report.append("PASS: QEMU argv matches first run")
     else:
         passed = False
-        report.append("WARN: QEMU argv differs from anchor")
+        report.append(
+            "WARN: QEMU argv differs from first run; executable path or arguments changed"
+        )
     for field, label in (
+        ("qemu_version", "QEMU version"),
+        ("qemu_binary_sha256", "QEMU binary SHA-256"),
         ("qcow2_sha256", "qcow2 SHA-256"),
+        ("serial_sha256", "serial output SHA-256"),
         ("guest_output_sha256", "guest output SHA-256"),
     ):
         if field not in anchor and field not in current:
@@ -229,7 +219,7 @@ def compare_runs(
         else:
             passed = False
             report.append(
-                "WARN: {} differs: anchor={} current={}".format(
+                "WARN: {} differs from first run: first={} current={}".format(
                     label, anchor.get(field), current.get(field)
                 )
             )
@@ -241,13 +231,19 @@ def compare_runs(
         if difference:
             passed = False
             report.append(
-                "WARN: normalized Hermit INFO log differs\n{}".format(difference)
+                "WARN: exact Hermit log differs from first run after stripping only wallclock timestamps\n{}".format(
+                    difference
+                )
             )
         else:
-            report.append("PASS: normalized Hermit INFO log matches")
+            report.append(
+                "PASS: exact Hermit log matches first run after stripping wallclock timestamps"
+            )
     else:
         passed = False
-        report.append("WARN: anchor INFO log is unavailable")
+        report.append(
+            "WARN: cannot compare Hermit INFO logs because the first-run log is unavailable"
+        )
     return passed, report
 
 
@@ -259,7 +255,13 @@ def print_comparison(
 ) -> None:
     for line in report:
         print(line)
-    print("PASS: run matches anchor" if passed else "WARN: RUN DIVERGED FROM ANCHOR")
+    if passed:
+        print("PASS: all repeat checks match the first run")
+    else:
+        print(
+            "PARTIAL: workload completed, but repeat verification differs from the first run."
+        )
+        print("Review the WARN lines above before sharing this artifact.")
     if passed and snapshot_sha256 is not None:
         print()
         print("🎉 DETERMINISTIC! Snapshot SHA-256 matches previous run:")

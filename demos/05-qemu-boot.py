@@ -48,7 +48,7 @@ SNAPSHOT_DISK = Path(
 SNAPSHOT_SIZE = os.environ.get("QEMU_SNAPSHOT_SIZE", "64M")
 LOG_FILTER = os.environ.get(
     "QEMU_LOG_FILTER",
-    "warn,detcore::scheduler=info,detcore::tool_global=info,reverie_ptrace::task=info",
+    "warn,detcore=info,reverie_ptrace::task=info",
 )
 
 
@@ -70,7 +70,7 @@ def main() -> int:
         DEMO_LABEL,
         (
             "Hermit boots QEMU/Linux, streams the serial console, saves a live snapshot,",
-            "and compares every repeat run with the first metadata anchor.",
+            "and compares every repeat run with the first run.",
         ),
         dependency,
     )
@@ -208,22 +208,24 @@ def main() -> int:
             },
         )
         banner("Automatic repeat verification")
+        result = "FIRST RUN SAVED"
         if anchor is None:
             anchor_path = save_anchor(ASSETS, current)
             print(
-                "PASS: saved first-run anchor at {}".format(
+                "PASS: saved first run metadata at {}".format(
                     anchor_path.relative_to(ROOT)
                 )
             )
         else:
             passed, report = compare_runs(anchor, current)
             print_comparison(passed, report, current["qcow2_sha256"], "Boot")
+            result = "SUCCESS" if passed else "PARTIAL"
         print(
             "Run metadata: {}".format((run_dir / "run-metadata.json").relative_to(ROOT))
         )
         print("Archived snapshot: {}".format(archived_disk.relative_to(ROOT)))
-        print("\n=== {}: SUCCESS ===".format(DEMO_LABEL))
-        return 0
+        print("\n=== {}: {} ===".format(DEMO_LABEL, result))
+        return 1 if result == "PARTIAL" else 0
     finally:
         stop_process(process)
         temporary_disk.unlink(missing_ok=True)
