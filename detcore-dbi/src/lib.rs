@@ -903,6 +903,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
 // TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
+// TODO-HUMAN-REVIEW(PR-1141): Review copied-process Detcore state rebasing.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -947,6 +948,19 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+    let mut inherited_parent = if host_tid == host_pid && !scratch.runtime_state.is_null() {
+        // SAFETY: a copied DynamoRIO process inherits the parent's COW runtime
+        // allocation. This process owns its copy and replaces it below.
+        let parent = Some(unsafe { Box::from_raw(scratch.runtime_state) });
+        scratch.runtime_state = std::ptr::null_mut();
+        parent
+    } else {
+        None
+    };
+    if let Some(parent) = inherited_parent.as_mut() {
+        parent.state.clone_flags =
+            Some(CloneFlags::from_bits_truncate(scratch.pending_clone_flags));
+    }
     let parent = if host_tid == host_pid {
         None
     } else {
@@ -962,20 +976,31 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let Some(det_tid) = dbi_scheduler_tid(host_tid) else {
         return -1;
     };
-    let parent_ref = parent
+    let parent_ref = inherited_parent
         .as_ref()
-        .map(|parent| (parent.parent_tid, &parent.state));
+        .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
+        .or_else(|| {
+            parent
+                .as_ref()
+                .map(|parent| (parent.parent_tid, &parent.state))
+        });
     let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
     let mut state = tool.init_thread_state(det_tid, parent_ref);
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
+    } else if let Some(parent) = &inherited_parent {
+        let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
+        let Some(rng_entropy) = dbi_child_rng_entropy(scratch.virtual_pid, child_ordinal) else {
+            return -1;
+        };
+        state.reseed_child_rngs(&parent.state, rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
         tid: det_pid,
         state,
         initialized: false,
-        post_exec_pending: host_tid == pid,
+        post_exec_pending: host_tid == pid && inherited_parent.is_none(),
     });
     if reverie_dbi::run_tool_thread_start(
         tool,
@@ -996,6 +1021,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     }
     thread.initialized = true;
     scratch.runtime_state = Box::into_raw(thread);
+    scratch.pending_clone_flags = 0;
     0
 }
 
@@ -1095,8 +1121,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 ///
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbi_runtime_thread_init`].
+// TODO-HUMAN-REVIEW(PR-1141): Review guest-safe DBI thread-exit lifecycle delivery.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    _tid: i32,
+    invoke_syscall: SyscallInvoker,
+) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         return;
@@ -1114,8 +1146,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
             .tool
             .get()
             .expect("Detcore DBI tool was initialized");
-        let _ = reverie_dbi::run_tool_thread_exit(
+        let _ = reverie_dbi::run_tool_thread_exit_from_guest(
             tool,
+            context as usize,
+            invoke_syscall,
             tid,
             state,
             &runtime.global,
