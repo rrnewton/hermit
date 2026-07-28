@@ -70,7 +70,7 @@ computed=(
 # Provisioned inputs: expensive to recreate (kernel download + initramfs build).
 # Only removed by --distclean.
 provisioned=(
-  "bzImage"                    # kernel download (manifold or KERNEL_IMAGE)
+  "bzImage"                    # kernel from KERNEL_IMAGE, URL, or configured storage
   "initramfs.cpio.gz"          # BusyBox rootfs built by lib/qemu-assets.sh
   ".initramfs-version"         # initramfs cache-version marker
 )

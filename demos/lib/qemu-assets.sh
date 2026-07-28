@@ -7,9 +7,10 @@ LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
-BUSYBOX="${BUSYBOX:-$(command -v busybox || printf '%s' /usr/sbin/busybox)}"
+BUSYBOX="${BUSYBOX:-$(command -v busybox || true)}"
 KERNEL_SHA256="${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}"
-KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-test/tree/dev-hermit/qemu-kernels/$KERNEL_SHA256/bzImage}"
+KERNEL_URL="${QEMU_KERNEL_URL:-}"
+KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-}"
 INITRAMFS_VERSION=3
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 
@@ -63,14 +64,24 @@ if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
     [ -r "$KERNEL_IMAGE" ] || fail "unreadable KERNEL_IMAGE: $KERNEL_IMAGE"
     cp "$KERNEL_IMAGE" "$kernel_tmp"
     kernel_source="$KERNEL_IMAGE"
-  else
+  elif [ -n "$KERNEL_URL" ]; then
+    command -v curl >/dev/null 2>&1 || \
+      fail "curl is required to download QEMU_KERNEL_URL"
+    echo 'Downloading kernel...'
+    curl --fail --location --silent --show-error \
+      "$KERNEL_URL" --output "$kernel_tmp" || \
+      fail "kernel download failed: $KERNEL_URL"
+    kernel_source="$KERNEL_URL"
+  elif [ -n "$KERNEL_MANIFOLD_PATH" ]; then
     command -v manifold >/dev/null 2>&1 || \
-      fail "manifold is required to download manifold://$KERNEL_MANIFOLD_PATH"
-    echo 'Downloading kernel from Manifold...'
+      fail "manifold is required for QEMU_KERNEL_MANIFOLD_PATH"
+    echo 'Downloading kernel from configured artifact storage...'
     manifold --quiet get --threads 20 \
       "$KERNEL_MANIFOLD_PATH" "$kernel_tmp" >/dev/null 2>&1 || \
-      fail "kernel download failed: manifold://$KERNEL_MANIFOLD_PATH"
-    kernel_source="manifold://$KERNEL_MANIFOLD_PATH"
+      fail "kernel download failed from configured artifact storage"
+    kernel_source="configured artifact storage"
+  else
+    fail "set KERNEL_IMAGE, QEMU_KERNEL_URL, or QEMU_KERNEL_MANIFOLD_PATH"
   fi
 
   downloaded_kernel_sha="$(sha256sum "$kernel_tmp" | cut -d' ' -f1)"

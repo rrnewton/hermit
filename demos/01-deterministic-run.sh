@@ -39,7 +39,7 @@ for attempt in 1 2; do
 done
 
 demo_banner "Python entropy and hash ordering match under Hermit"
-export PYTHON="${PYTHON:-/usr/bin/python3}"
+export PYTHON="${PYTHON:-python3}"
 export PYTHON_DEMO='import os; print("random="+os.urandom(16).hex()); print("hash="+str(hash("hermit-demo"))); print("set="+",".join(set(["alpha","beta","gamma","delta","epsilon"])))'
 echo "-- native (normally differs) --"
 for attempt in 1 2; do
