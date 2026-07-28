@@ -17,6 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
+  RUST_SCRIPT_VERSION: "0.36.0"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -54,6 +55,10 @@ jobs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+    - name: Install rust-script
+      run: ci/install-rust-script.sh
+    - name: Verify manifest/CI alignment
+      run: ci/check-manifest-ci-alignment.sh
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Portable test DAG (no PMU or CPUID interception)
