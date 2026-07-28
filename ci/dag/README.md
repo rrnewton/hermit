@@ -82,6 +82,26 @@ every required run so estimates can be replaced with measurements.
 
 Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
+### Manifest bucket fan-out
+
+Schema-v2 test manifests use an explicit build barrier before execution:
+
+1. `e2e.metadata` validates every TOML manifest.
+2. `build.manifest_guests` compiles all direct C/Rust entries once.
+3. One `e2e.<bucket>` node per manifest runs with `--prebuilt` and depends on
+   both build nodes plus metadata validation.
+
+`--prebuilt` fails closed if a compiled guest is missing, so a run node cannot
+silently move compilation back onto the critical path. Bucket nodes use
+disjoint cell directories and each reserve one of five weighted
+`hermit_guest` slots, allowing the runner's `-j` and memory limits to execute
+independent buckets in parallel. Legacy guest gates reserve all five slots and
+therefore remain exclusive from the bucket fan-out.
+Each bucket still writes JSONL, summary JSON, and JUnit below
+`target/e2e/<lane>/<bucket>/`, preserving the workflow artifact contract.
+`tests/e2e/manifests/manifest-harness.rs dag --lane portable` emits the same
+build-then-fan-out shape for auditing and for newly added manifest buckets.
+
 ### Command fidelity
 
 Node `cmd`s are the **verbatim** commands `validate.sh` runs, with three
@@ -118,14 +138,14 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 **Outer** — how many gates may co-run:
 
 - `resource_caps` gates *scarce* resources. `portable.json` sets
-  `{"hermit_guest": 1}`; every gate that executes Hermit on guest programs
-  carries `resources: {"hermit_guest": 1}`, so they run **one at a time**
-  (they share the working filesystem, are mutually nondeterministic, and on a
-  PMU host contend for the counter). Non-guest gates — `build`, `clippy`,
-  `rustfmt`, doctests, `rustdoc`, nextest of non-Hermit crates — carry no
-  scarce resource and parallelize freely. `privileged.json` uses `{"pmu": 1}`
-  the same way; the PMU is genuinely exclusive, so that lane is essentially
-  serial after the initial builds.
+  `{"hermit_guest": 5}`. Legacy guest gates that share working state reserve
+  all five units; each schema-v2 manifest bucket reserves one because it has a
+  disjoint cell directory and consumes read-only prebuilt guests. Independent
+  manifest buckets can therefore run concurrently without overlapping a
+  legacy guest gate. Non-guest gates — `build`,
+  `clippy`, `rustfmt`, doctests, `rustdoc`, nextest of non-Hermit crates — also
+  carry no scarce resource and parallelize freely. `privileged.json` uses
+  `{"pmu": 1}` and `{"kvm": 1}` for genuinely exclusive hardware.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
   runner picks the largest `-j` whose modeled worst-case footprint (summed
   `rss_baseline_bytes` of a schedulable set) fits the budget.
@@ -149,9 +169,8 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 ## Conservatism and how to relax it
 
-The `hermit_guest: 1` / `pmu: 1` serialization faithfully reproduces
-`validate.sh`, which ran these gates strictly one-after-another. It is
-intentionally conservative: as individual guest gates are shown to be safe to
-co-run (e.g. distinct scratch directories, no shared fixture), drop their
-`resources` hint (or raise the cap) to unlock more parallelism. The DAG shape
-and dependencies stay the same.
+Legacy gates reserving all five `hermit_guest` units and hardware `pmu: 1` /
+`kvm: 1` gates remain conservative. Manifest buckets have crossed the narrower
+audit boundary needed to share those units with one another and fan out after
+`build.manifest_guests`; their benchmark and cell isolation are the evidence.
+Apply the same standard before relaxing any remaining resource reservation.

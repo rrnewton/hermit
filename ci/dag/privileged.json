@@ -35,18 +35,28 @@
     },
     {
       "group": "e2e", "job": "metadata",
-      "desc": "Validate multi-mode E2E metadata and required-cell plan",
-      "cmd": "./ci/test_harness.sh validate",
+      "desc": "Validate centralized schema-v2 E2E manifests and required-cell plan",
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs validate",
       "timeout": 60,
       "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
                "classification": "light"}
     },
     {
+      "group": "build", "job": "manifest_guests",
+      "desc": "Build all direct privileged manifest guests before bucket fan-out",
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs build --all --lane privileged",
+      "deps": ["e2e.metadata"],
+      "timeout": 1800,
+      "hint": {"est_duration_s": 180,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "cpu-bound"}
+    },
+    {
       "group": "e2e", "job": "applications",
       "desc": "Privileged KVM shell, environment, and Python example verification",
-      "cmd": "./ci/test_harness.sh run --lane privileged --category applications --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
-      "deps": ["build.privileged_tests", "e2e.metadata"],
+      "cmd": "./tests/e2e/manifests/manifest-harness.rs run --bucket applications --lane privileged --prebuilt --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
+      "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 60,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 15,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
