@@ -44,6 +44,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
@@ -442,13 +443,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (fd_type, resource, random_device_offset) =
+        let (fd_type, physically_nonblocking, resource, random_device_offset) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.resource(), detfd.random_device_offset())
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.resource(),
+                    detfd.random_device_offset(),
+                )
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if guest.config().discover_live_file_metadata
+                && fd_type == FdType::Pipe
+                && physically_nonblocking
+            {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -809,7 +821,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if guest.config().discover_live_file_metadata
+                && fd_type == FdType::Pipe
+                && physically_nonblocking
+            {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -970,7 +988,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if guest.config().discover_live_file_metadata
+                && fd_type == FdType::Pipe
+                && physically_nonblocking
+            {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -1021,7 +1045,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if guest.config().discover_live_file_metadata
+                && fd_type == FdType::Pipe
+                && physically_nonblocking
+            {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
