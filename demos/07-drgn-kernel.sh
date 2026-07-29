@@ -19,6 +19,7 @@ Each drgn read interval executes no guest instructions.
 
 Useful overrides:
   DEMO07_RUNS=2              independent restores (minimum and default: 2)
+  DEMO07_TASK_LIMIT=16       displayed task-list prefix (all rows are compared)
   HERMIT_RELEASE=/path       release Hermit binary
   QEMU_BIN=/path             qemu-system-x86_64 binary
   QEMU_ASSETS=/path          bzImage/initramfs cache
