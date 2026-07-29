@@ -115,6 +115,19 @@ pub struct Config {
     #[clap(skip)]
     pub backend_virtualizes_capability_prctls: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-kvm-vfork-barrier): Review deferred vfork child registration.
+    /// The execution backend does not keep a `CLONE_VFORK` parent blocked inside the injected
+    /// `clone(2)` until the child registers. Ptrace relies on the kernel to suspend the vfork
+    /// parent until the child execs/exits, so the child always registers before the parent asks
+    /// to continue. Out-of-process backends such as KVM service the clone by deferring the child
+    /// spawn, so the child registers only *after* the parent posts its continuation. The scheduler
+    /// must therefore keep an unfulfilled vfork barrier in place at parent continuation on such a
+    /// backend instead of treating it as a failed clone.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_defers_vfork_child_registration: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
