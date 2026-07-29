@@ -281,9 +281,13 @@ pub struct Scheduler {
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
 
-    /// Threads removed by logical teardown. Backends which cannot stop all siblings before
-    /// teardown need this to distinguish a late request from an unregistered thread.
-    logically_killed_threads: BTreeSet<DetTid>,
+    /// Most recent scheduler registration for each TID. Entries survive logical teardown so a
+    /// delayed RPC remains recognizable even after that TID has been registered again.
+    latest_registration_generations: BTreeMap<DetTid, u64>,
+
+    /// Exact scheduler registrations removed by logical teardown. A TID may be reused, so the
+    /// generation is part of the tombstone identity.
+    logically_killed_registration_generations: BTreeSet<(DetTid, u64)>,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -908,7 +912,8 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
-            logically_killed_threads: Default::default(),
+            latest_registration_generations: Default::default(),
+            logically_killed_registration_generations: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1092,7 +1097,12 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
-        self.logically_killed_threads.insert(*dtid);
+        if self.cancel_killed_thread_rpcs
+            && let Some(generation) = self.latest_registration_generations.get(dtid)
+        {
+            self.logically_killed_registration_generations
+                .insert((*dtid, *generation));
+        }
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1143,13 +1153,40 @@ impl Scheduler {
     }
 
     // TODO-HUMAN-REVIEW(PR-1023): Review late SaBRe resource-request cancellation.
-    pub(crate) fn should_cancel_late_killed_thread_request(&self, dettid: DetTid) -> bool {
-        self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+    pub(crate) fn stale_resource_request_should_exit(
+        &self,
+        dettid: DetTid,
+        generation: u64,
+    ) -> bool {
+        if !self.cancel_killed_thread_rpcs {
+            return false;
+        }
+        self.latest_registration_generations
+            .get(&dettid)
+            .is_some_and(|latest| generation < *latest)
+            || self
+                .logically_killed_registration_generations
+                .contains(&(dettid, generation))
     }
 
     // TODO-HUMAN-REVIEW(PR-1023): Review deterministic-TID reuse handling.
-    pub(crate) fn note_thread_registered(&mut self, dettid: DetTid) {
-        self.logically_killed_threads.remove(&dettid);
+    pub(crate) fn note_thread_registered(&mut self, dettid: DetTid) -> u64 {
+        let generation = self
+            .latest_registration_generations
+            .entry(dettid)
+            .or_default();
+        *generation = generation
+            .checked_add(1)
+            .expect("scheduler registration generation overflow");
+        // Older generations are already rejected by the monotonic counter, so only the current
+        // generation can require an explicit logical-death tombstone.
+        self.logically_killed_registration_generations
+            .retain(|(registered_tid, _)| *registered_tid != dettid);
+        *generation
+    }
+
+    pub(crate) fn current_thread_registration(&self, dettid: DetTid) -> Option<u64> {
+        self.latest_registration_generations.get(&dettid).copied()
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.

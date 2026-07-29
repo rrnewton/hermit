@@ -535,6 +535,25 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let time_from_guest = gr.0.as_nanos();
 
+        // Reject a delayed resource RPC before it can advance a reused TID's clock or fill the
+        // reused thread's scheduler request slot. The local half treats this as a terminal reply.
+        if let GlobalRequest::RequestResources(_, _, generation) = &gr.1
+            && self
+                .sched
+                .lock()
+                .unwrap()
+                .stale_resource_request_should_exit(dtid, *generation)
+        {
+            trace!(
+                "[detcore, dtid {}] terminating stale resource request from registration {}",
+                dtid, generation
+            );
+            return (
+                None,
+                R::RequestResources(ResourceRequestResponse::ThreadExited),
+            );
+        }
+
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-845): Review SaBRe exec-reload clock recovery.
         // SaBRe reloads its plugin after exec, so the root thread reconnects
@@ -567,8 +586,9 @@ impl GlobalTool for GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match gr.1 {
-            GlobalRequest::RequestResources(rs, pid) => {
-                let (response, _endtime) = self.recv_request_resources(from, pid, rs).await;
+            GlobalRequest::RequestResources(rs, pid, generation) => {
+                let (response, _endtime) =
+                    self.recv_request_resources(from, pid, generation, rs).await;
                 R::RequestResources(response)
             }
             GlobalRequest::ReleaseResources(rs) => {
@@ -649,11 +669,8 @@ impl GlobalTool for GlobalState {
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats) => {
-                R::DeregisterThread(
-                    self.recv_deregister_thread(from, dettid, detpid, mm, timeslice_stats)
-                        .await,
-                )
+            GlobalRequest::DeregisterThread(deregistration) => {
+                R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -774,26 +791,43 @@ impl GlobalState {
         &self,
         from: Tid,
         detpid: DetPid,
+        generation: u64,
         rs: Resources,
-    ) -> (ResumeStatus, Option<LogicalTime>) {
+    ) -> (ResourceRequestResponse, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
             let mut sched = self.sched.lock().unwrap();
             let Some(nextturn) = sched.next_turns.get(&dettid).cloned() else {
-                if sched.should_cancel_late_killed_thread_request(dettid) {
+                if sched.stale_resource_request_should_exit(dettid, generation) {
                     // TODO-HUMAN-REVIEW(PR-1023): Review late SaBRe resource-request cancellation.
                     trace!(
-                        "[detcore, dtid {}] cancelling resource request after logical thread removal",
-                        dettid
+                        "[detcore, dtid {}] terminating resource request from stale registration {}",
+                        dettid, generation
                     );
-                    return (ResumeStatus::Signaled, None);
+                    return (ResourceRequestResponse::ThreadExited, None);
                 }
                 panic!(
-                    "Detcore internal error: no entry for dettid {} in next_turns during resource request.",
-                    dettid
+                    "Detcore internal error: no entry for dettid {} registration {} in next_turns during resource request.",
+                    dettid, generation
                 );
             };
+            let active_generation = sched
+                .current_thread_registration(dettid)
+                .expect("active scheduler thread must have a registration generation");
+            if generation != active_generation {
+                if sched.stale_resource_request_should_exit(dettid, generation) {
+                    trace!(
+                        "[detcore, dtid {}] terminating stale registration {} after reuse by {}",
+                        dettid, generation, active_generation
+                    );
+                    return (ResourceRequestResponse::ThreadExited, None);
+                }
+                panic!(
+                    "Detcore internal error: future registration {} requested resources for dettid {} at active generation {}",
+                    generation, dettid, active_generation
+                );
+            }
             trace!(
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
@@ -806,6 +840,23 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
+        if self
+            .sched
+            .lock()
+            .unwrap()
+            .stale_resource_request_should_exit(dettid, generation)
+        {
+            // `logically_kill_thread` wakes an already-pending request with a
+            // signal response.  Treat that wake-up as terminal: otherwise a
+            // caller that ignores `ResumeStatus::Signaled` can inject the
+            // original syscall after the thread was logically removed.
+            // TODO-HUMAN-REVIEW(PR-1023): Review pending SaBRe resource-request cancellation.
+            trace!(
+                "[detcore, dtid {}] terminating pending request from stale registration {}",
+                dettid, generation
+            );
+            return (ResourceRequestResponse::ThreadExited, None);
+        }
         if let Some((true, process, mm)) = rs.exit_identity() {
             info!(
                 "Scheduler authorized an exit-group scenario, from dettid {} / detpid {}",
@@ -842,21 +893,27 @@ impl GlobalState {
                     SchedValue::TimeOut => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
-                (ResumeStatus::Normal, endtime_update)
+                (
+                    ResourceRequestResponse::Resume(ResumeStatus::Normal),
+                    endtime_update,
+                )
             }
             SchedResponse::Go(None) => {
                 trace!(
                     "[dtid {}] resources granted but no timeslice specified",
                     dettid,
                 );
-                (ResumeStatus::Normal, None)
+                (ResourceRequestResponse::Resume(ResumeStatus::Normal), None)
             }
             SchedResponse::Signaled() => {
                 trace!(
                     "[dtid {}] resources granted but interrupted by signal",
                     dettid,
                 );
-                (ResumeStatus::Signaled, None)
+                (
+                    ResourceRequestResponse::Resume(ResumeStatus::Signaled),
+                    None,
+                )
             }
         }
     }
@@ -995,7 +1052,13 @@ impl GlobalState {
                 },
                 Permission::W,
             );
-            self.recv_request_resources(rpc_sender, parent_detpid, rs)
+            let parent_generation = self
+                .sched
+                .lock()
+                .unwrap()
+                .current_thread_registration(parent_dettid)
+                .expect("registered parent must have a scheduler generation");
+            self.recv_request_resources(rpc_sender, parent_detpid, parent_generation, rs)
                 .await;
         }
     }
@@ -1008,10 +1071,10 @@ impl GlobalState {
         from: Tid,
         dettid: DetTid,
         detpid: DetPid,
-    ) -> Option<ThreadHistory> {
+    ) -> (u64, Option<ThreadHistory>) {
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
-        let response_ivar = loop {
+        let (response_ivar, registration_generation) = loop {
             yield_once().await;
             let mut sched = self.sched.lock().unwrap();
             // The resources that must be held for the fresh thread to run:
@@ -1049,8 +1112,11 @@ impl GlobalState {
                     entry.get().clone()
                 }
             };
+            let registration_generation = sched
+                .current_thread_registration(dettid)
+                .expect("starting thread must have a scheduler registration generation");
             sched.request_put(&nextturn.req, rsrcs, &self.global_time);
-            break nextturn.resp;
+            break (nextturn.resp, registration_generation);
         };
         debug!(
             "[detcore, dtid {}] New thread will now wait for response on {}...",
@@ -1080,25 +1146,32 @@ impl GlobalState {
                 history.initial_priority(),
                 old_prio,
             );
-            Some(history)
+            (registration_generation, Some(history))
         } else {
-            None
+            (registration_generation, None)
         }
     }
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(
-        &self,
-        _from: Tid,
-        dettid: DetTid,
-        detpid: DetPid,
-        mm: MmId,
-        timeslice_stats: TimesliceStats,
-    ) {
+    async fn recv_deregister_thread(&self, _from: Tid, deregistration: ThreadDeregistration) {
+        let ThreadDeregistration {
+            dettid,
+            detpid,
+            mm,
+            registration_generation,
+            timeslice_stats,
+        } = deregistration;
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
+        if sched.current_thread_registration(dettid) != Some(registration_generation) {
+            trace!(
+                "[detcore, dtid {}] ignoring deregistration from stale scheduler registration {}",
+                dettid, registration_generation
+            );
+            return;
+        }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.logically_kill_thread(&dettid, &detpid, mm);
         drop(sched);
@@ -1292,7 +1365,16 @@ impl GlobalState {
                 let tid = reverie::Tid::from(ev.dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
                 let mut rsrcs = Resources::new(ev.dettid);
                 rsrcs.insert(ResourceID::TraceReplay, Permission::RW);
-                end_of_timeslice = self.recv_request_resources(tid, detpid, rsrcs).await.1;
+                let registration_generation = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .current_thread_registration(ev.dettid)
+                    .expect("trace-replay thread must have a scheduler registration generation");
+                end_of_timeslice = self
+                    .recv_request_resources(tid, detpid, registration_generation, rsrcs)
+                    .await
+                    .1;
                 trace!(
                     "[detcore, dtid {}] Thread reactivated after yielding for replay schedule",
                     &ev.dettid,
@@ -1395,6 +1477,18 @@ impl GlobalState {
     }
 }
 
+/// Identity and final accounting for an asynchronous scheduler deregistration.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1023): Review generation-bound deregistration payload.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct ThreadDeregistration {
+    pub(crate) dettid: DetTid,
+    pub(crate) detpid: DetPid,
+    pub(crate) mm: MmId,
+    pub(crate) registration_generation: u64,
+    pub(crate) timeslice_stats: TimesliceStats,
+}
+
 /// Messages to the global object.
 ///
 /// This is public only so it can be used in the `GlobalTool` trait.
@@ -1403,8 +1497,10 @@ impl GlobalState {
 #[allow(clippy::enum_variant_names)]
 pub enum GlobalRequest {
     /// Lock the resources
-    /// Also contains the `DetPid` of the process containing the thread requesting resources.
-    RequestResources(Resources, DetPid),
+    /// Also contains the `DetPid` and scheduler registration generation of the requesting thread.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1023): Review scheduler-generation RPC identity.
+    RequestResources(Resources, DetPid, u64),
     /// Release the locks
     ReleaseResources(Resources),
     /// For convenience, release all the resources held by the current TID.
@@ -1437,7 +1533,9 @@ pub enum GlobalRequest {
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
     /// further turns. Carries the exiting thread's completed-timeslice distribution
     /// so the scheduler can aggregate it into the final run report.
-    DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1023): Review scheduler-generation deregistration identity.
+    DeregisterThread(ThreadDeregistration),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1509,7 +1607,7 @@ pub enum GlobalRequest {
 #[allow(missing_docs, clippy::unit_arg)]
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub enum GlobalResponse {
-    RequestResources(ResumeStatus),
+    RequestResources(ResourceRequestResponse),
     ReleaseResources(()),
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
@@ -1517,7 +1615,9 @@ pub enum GlobalResponse {
     MarkPastFirstExecve(()),
     CreateChildThread(()),
     /// Includes optional preemption points for the new thread.
-    StartNewThread(Option<ThreadHistory>),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1023): Review scheduler-generation startup handoff.
+    StartNewThread((u64, Option<ThreadHistory>)),
     DeregisterThread(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -1618,6 +1718,16 @@ pub enum ResumeStatus {
     Signaled,
 }
 
+/// Wire-level result of a scheduler resource request. `ThreadExited` is consumed centrally by
+/// [`resource_request`] and never returned to individual syscall handlers.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1023): Review terminal scheduler cancellation response.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum ResourceRequestResponse {
+    Resume(ResumeStatus),
+    ThreadExited,
+}
+
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
@@ -1633,15 +1743,26 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
-        let resp =
-            send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
+        let registration_generation = guest.thread_state().scheduler_registration_generation;
+        let resp = send_and_update_time(
+            guest,
+            GlobalRequest::RequestResources(r.clone(), detpid, registration_generation),
+        )
+        .await;
         match resp.1 {
-            GlobalResponse::RequestResources(x) => {
+            GlobalResponse::RequestResources(ResourceRequestResponse::Resume(x)) => {
                 trace!(
                     "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
                     &dettid, r
                 );
                 x
+            }
+            GlobalResponse::RequestResources(ResourceRequestResponse::ThreadExited) => {
+                trace!(
+                    "[detcore, dtid {}] exiting after terminal scheduler cancellation",
+                    &dettid
+                );
+                guest.tail_inject(reverie::syscalls::Exit::default()).await
             }
             _ => unreachable!(),
         }
@@ -1688,7 +1809,9 @@ where
         trace!("[detcore, dtid {}] new thread BLOCKING on rpc...", &dettid);
         let resp = send_and_update_time(guest, GlobalRequest::StartNewThread(dettid, detpid)).await;
         match resp.1 {
-            GlobalResponse::StartNewThread(preempts) => {
+            GlobalResponse::StartNewThread((registration_generation, preempts)) => {
+                guest.thread_state_mut().scheduler_registration_generation =
+                    registration_generation;
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
                 preempts
             }
@@ -1819,13 +1942,10 @@ pub async fn create_vfork_child_thread<G, T>(
 /// Nonblocking: the future may return immediately, not guaranteeing the changes to the
 /// scheduler have been completed.
 pub async fn deregister_thread<R>(
-    dettid: DetTid,
+    deregistration: ThreadDeregistration,
     threads_time: DetTime,
     cfg: &Config,
     reverie: &R,
-    detpid: DetPid,
-    mm: MmId,
-    timeslice_stats: TimesliceStats,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1835,7 +1955,7 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats),
+                GlobalRequest::DeregisterThread(deregistration),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
@@ -2196,20 +2316,95 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::time::Duration;
 
+    use reverie::GlobalTool;
+
     use super::FutexAction;
+    use super::GlobalRequest;
+    use super::GlobalResponse;
     use super::GlobalState;
-    use super::ResumeStatus;
+    use super::ResourceRequestResponse;
+    use super::ThreadDeregistration;
+    use super::TimesliceStats;
     use super::format_unsupported_syscall_warning;
     use crate::config::Config;
     use crate::ivar::Ivar;
     use crate::resources::Resources;
     use crate::scheduler::DEFAULT_PRIORITY;
+    use crate::scheduler::SchedRequest;
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
     use crate::types::DetPid;
     use crate::types::DetTid;
+    use crate::types::DetTime;
     use crate::types::FutexID;
     use crate::types::MmId;
+
+    fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        let detpid = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(dettid, dettid, true);
+        (config, state, dettid, detpid)
+    }
+
+    fn install_test_registration(
+        state: &GlobalState,
+        dettid: DetTid,
+        request: Ivar<SchedRequest>,
+    ) -> u64 {
+        let mut scheduler = state.sched.lock().unwrap();
+        let generation = scheduler.note_thread_registered(dettid);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: request,
+                resp: Ivar::new(),
+            },
+        );
+        generation
+    }
+
+    #[test]
+    fn live_registration_without_next_turn_is_not_terminal() {
+        let (_, state, dettid, detpid) = cancellation_test_state();
+        let generation = install_test_registration(&state, dettid, Ivar::new());
+        state.sched.lock().unwrap().next_turns.remove(&dettid);
+
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .stale_resource_request_should_exit(dettid, generation),
+            "transient next-turn absence must not imply logical death"
+        );
+
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .stale_resource_request_should_exit(dettid, generation),
+            "explicit logical death must install a generation tombstone"
+        );
+    }
 
     #[test]
     fn unsupported_syscall_report_duplicate_is_close_on_exec() {
@@ -2356,29 +2551,127 @@ mod tests {
 
     #[tokio::test]
     async fn late_resource_request_after_logical_kill_is_cancelled() {
-        let config = Config {
-            sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
-        let state = GlobalState::initialize(&config, false);
-        let dettid = DetTid::from_raw(17);
-        let detpid = DetPid::from_raw(17);
-        {
-            let mut scheduler = state.sched.lock().unwrap();
-            scheduler.thread_tree.add_child(dettid, dettid, true);
-            scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
-        }
+        let (_, state, dettid, detpid) = cancellation_test_state();
+        let generation = install_test_registration(&state, dettid, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
 
         let response = state
             .recv_request_resources(
                 reverie::Tid::from_raw(dettid.as_raw()),
                 detpid,
+                generation,
                 Resources::new(dettid),
             )
             .await;
 
-        assert_eq!(response, (ResumeStatus::Signaled, None));
+        assert_eq!(response, (ResourceRequestResponse::ThreadExited, None));
+    }
+
+    #[tokio::test]
+    async fn stale_resource_request_after_tid_reuse_cannot_fill_new_slot() {
+        let (config, state, dettid, detpid) = cancellation_test_state();
+        let new_request = Ivar::new();
+        let old_generation = install_test_registration(&state, dettid, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+        let new_generation = install_test_registration(&state, dettid, new_request.clone());
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    GlobalRequest::RequestResources(Resources::new(dettid), detpid, old_generation),
+                ),
+            )
+            .await;
+
+        assert_eq!(
+            response,
+            (
+                None,
+                GlobalResponse::RequestResources(ResourceRequestResponse::ThreadExited)
+            )
+        );
+        assert!(
+            new_request.try_read().is_none(),
+            "stale RPC filled the reused TID's scheduler request slot"
+        );
+        assert_eq!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .current_thread_registration(dettid),
+            Some(new_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_deregistration_after_tid_reuse_cannot_kill_new_registration() {
+        let (_, state, dettid, detpid) = cancellation_test_state();
+        let old_generation = install_test_registration(&state, dettid, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+        let new_generation = install_test_registration(&state, dettid, Ivar::new());
+
+        state
+            .recv_deregister_thread(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                ThreadDeregistration {
+                    dettid,
+                    detpid,
+                    mm: MmId::initial(detpid),
+                    registration_generation: old_generation,
+                    timeslice_stats: TimesliceStats::default(),
+                },
+            )
+            .await;
+
+        let scheduler = state.sched.lock().unwrap();
+        assert_eq!(
+            scheduler.current_thread_registration(dettid),
+            Some(new_generation)
+        );
+        assert!(scheduler.next_turns.contains_key(&dettid));
+        assert!(!scheduler.stale_resource_request_should_exit(dettid, new_generation));
+    }
+
+    #[tokio::test]
+    async fn pending_resource_request_woken_by_logical_kill_is_terminal() {
+        let (_, state, dettid, detpid) = cancellation_test_state();
+        let request_seen = Ivar::new();
+        let generation = install_test_registration(&state, dettid, request_seen.clone());
+
+        let request = state.recv_request_resources(
+            reverie::Tid::from_raw(dettid.as_raw()),
+            detpid,
+            generation,
+            Resources::new(dettid),
+        );
+        let kill_after_request = async {
+            while request_seen.try_read().is_none() {
+                tokio::task::yield_now().await;
+            }
+            state.sched.lock().unwrap().logically_kill_thread(
+                &dettid,
+                &detpid,
+                MmId::initial(detpid),
+            );
+        };
+
+        let (response, ()) = tokio::join!(request, kill_after_request);
+        assert_eq!(response, (ResourceRequestResponse::ThreadExited, None));
     }
 
     #[test]

@@ -1082,6 +1082,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    scheduler_registration_generation: 0,
                     open_file_creator: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
@@ -2164,13 +2165,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         let mm_id = thread_state.mm_id;
         deregister_thread(
-            dettid,
+            tool_global::ThreadDeregistration {
+                dettid,
+                detpid,
+                mm: mm_id,
+                registration_generation: thread_state.scheduler_registration_generation,
+                timeslice_stats: thread_state.stats.timeslice_stats,
+            },
             thread_state.thread_logical_time.clone(),
             &self.cfg,
             global_state,
-            detpid,
-            mm_id,
-            thread_state.stats.timeslice_stats,
         )
         .await;
 
