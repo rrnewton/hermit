@@ -90,13 +90,13 @@ demo 4 only requires it when `ANALYZE_PREEMPTION_TIMEOUT` enables preemption.
 
 ## Quick Start
 
-Clone the demo branch, install dependencies once per host, and build Hermit:
+Clone current `main` with its pinned submodules, install dependencies once per
+host, and build Hermit:
 
 ```bash
-git clone https://github.com/rrnewton/dev-hermit.git
+git clone --recurse-submodules https://github.com/rrnewton/dev-hermit.git
 cd dev-hermit
-git checkout demo
-make install-deps
+make install-deps-core
 make
 ```
 
