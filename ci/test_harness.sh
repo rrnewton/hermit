@@ -408,7 +408,7 @@ function validate_dag_correspondence {
         local node_ids dup dep_id
         node_ids=$(jq -r '.steps[] | .group + "." + .job' "$dag" | LC_ALL=C sort)
         dup=$(printf '%s\n' "$node_ids" | uniq -d)
-        [[ -z $dup ]] || die "ci/dag/$lane.json: duplicate node id(s): $(echo $dup)"
+        [[ -z $dup ]] || die "ci/dag/$lane.json: duplicate node id(s): $dup"
         while IFS= read -r dep_id; do
             [[ -z $dep_id ]] && continue
             printf '%s\n' "$node_ids" | grep -Fxq -- "$dep_id" ||
@@ -431,11 +431,11 @@ function validate_dag_correspondence {
             | (.cmd | capture("--lane (?<l>\\S+) --category (?<c>\\S+)"))
             | select(.l != $lane) | .l + ":" + .c' "$dag")
         [[ -z $wrong_lane ]] ||
-            die "ci/dag/$lane.json: e2e run-node targets wrong lane: $(echo $wrong_lane)"
+            die "ci/dag/$lane.json: e2e run-node targets wrong lane: $wrong_lane"
 
         local expected actual
-        expected=$(emit_required_plan | jq -r --arg lane "$lane" \
-            'select(.lane == $lane) | .category' | LC_ALL=C sort -u)
+        expected=$(emit_manifest_buckets | jq -r --arg lane "$lane" \
+            '.[] | select(.lane == $lane) | .category' | LC_ALL=C sort -u)
         actual=$(jq -r '
             .steps[] | select(.group == "e2e")
             | select(.cmd | test("--category "))
@@ -444,18 +444,18 @@ function validate_dag_correspondence {
 
         if [[ $expected != "$actual" ]]; then
             {
-                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane test plan."
-                echo "  planned categories : $(echo $expected)"
-                echo "  DAG run-node cats  : $(echo $actual)"
+                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane manifest buckets."
+                echo "  manifest categories: $expected"
+                echo "  DAG run-node cats  : $actual"
                 comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
                     sed 's/^/  MISSING from DAG (node deleted or renamed?): /'
                 comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
-                    sed 's/^/  EXTRA in DAG (no such planned test category): /'
+                    sed 's/^/  EXTRA in DAG (no such manifest bucket): /'
             } >&2
-            die "DAG/plan correspondence mismatch for lane $lane"
+            die "DAG/manifest-bucket correspondence mismatch for lane $lane"
         fi
     done
-    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the e2e plan with no dangling deps"
+    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the manifest buckets with no dangling deps"
 }
 
 LANE_FILTER=
