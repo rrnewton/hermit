@@ -77,8 +77,18 @@ if [ ! -r "$DEMO07_KERNEL" ] || [ ! -r "$DEMO07_INITRD" ]; then
   exit 1
 fi
 if [ ! -r "$DEMO07_SNAPSHOT_DISK" ]; then
-  echo "error: missing phase-5 snapshot: $DEMO07_SNAPSHOT_DISK" >&2
-  echo "run ./demos/05-qemu-boot.py once before Demo 07" >&2
+  default_snapshot="$ASSETS/hermit-boot.qcow2"
+  if [ "$DEMO07_SNAPSHOT_DISK" != "$default_snapshot" ]; then
+    echo "error: missing custom phase-5 snapshot: $DEMO07_SNAPSHOT_DISK" >&2
+    echo "produce the custom snapshot before Demo 07" >&2
+    exit 1
+  fi
+  echo "Phase-5 snapshot missing; running demo 5 prerequisite..."
+  QEMU_ASSETS="$ASSETS" QEMU_BIN="$QEMU_BIN" HERMIT_RELEASE="$HERMIT_RELEASE" \
+    make -C "$DEMO_DIR" --no-print-directory demo5
+fi
+if [ ! -r "$DEMO07_SNAPSHOT_DISK" ]; then
+  echo "error: Demo 5 did not produce $DEMO07_SNAPSHOT_DISK" >&2
   exit 1
 fi
 

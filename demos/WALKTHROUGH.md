@@ -11,6 +11,39 @@ list without executing guest instructions, Hermit advances the guest through a
 fixed interval, and drgn reads the changed list. Two independent restores must
 produce exactly the same before list, after list, and diff.
 
+## Dependency-aware entry points
+
+Run demos through the repository Makefile when starting from a fresh clone:
+
+```bash
+make demo1                 # any individual checked-in demo, demo1 .. demo7
+make demo6 DEMO6_COMMAND='ls /'
+make demo7
+make demos                 # every checked-in demo in order
+```
+
+The targets model artifact dependencies rather than requiring manual ordering:
+
+```text
+process prerequisites ──> demos 1, 2, 3, 4
+process + QEMU prerequisites ──> demo 5 ──> hermit-boot.qcow2
+                                            ├──> demo 6
+                                            └──> demo 7 (+ drgn/readelf)
+```
+
+Demos 1-4 already build their shared Hermit binaries incrementally. Demo 5
+provisions the fixed kernel/initramfs and atomically publishes
+`ignored/qemu-linux/hermit-boot.qcow2`. That file is a real Make prerequisite
+of demos 6 and 7. If it is present, both restore it without booting Linux. If it
+is missing, `make demo6`, `make demo7`, and the direct demo 6/7 scripts invoke
+Demo 5 once and continue with the newly stored snapshot. A deliberately chosen
+custom snapshot path is never overwritten implicitly; a missing custom path
+fails with a specific remediation message.
+
+The unified directory currently contains demos 1-7; every checked-in demo has
+a dependency-aware target. Add any future Demo 8 to the same graph with its
+actual artifact prerequisites rather than imposing an artificial serial chain.
+
 ## Prepare the suite
 
 From the repository root, initialize the pinned submodules, install the core
@@ -54,10 +87,11 @@ Demo 4 is intentionally the slowest process-level example.
 
 ## Demo 5: boot once and store the Linux snapshot
 
-Run Demo 5 once before either snapshot consumer:
+Run Demo 5 explicitly when you want to prepare the shared snapshot ahead of
+time:
 
 ```bash
-./demos/05-qemu-boot.py
+make demo5
 ```
 
 Hermit runs QEMU with strict checking and deterministic instruction-derived
@@ -88,7 +122,7 @@ post-command machine state. Different commands get independent evidence.
 Run the drgn evolution check:
 
 ```bash
-./demos/07-drgn-kernel.sh
+make demo7
 ```
 
 One invocation performs two complete evolution runs. Each run does the
