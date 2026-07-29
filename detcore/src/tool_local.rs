@@ -45,6 +45,7 @@ use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -1207,6 +1208,40 @@ pub struct ThreadState<T> {
     /// not a relative duration.
     pub end_of_timeslice: Option<LogicalTime>,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact per-thread PMU RCB target for the active preemption-replay slice.
+    /// `None` selects the legacy logical-time deadline path.
+    #[serde(default)]
+    pub replay_rcb_end: Option<u64>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
+    /// Used only to detect epoch transitions for `CHAOSEPOCH` logging; the epoch
+    /// itself is recomputed each slice from `thread_logical_time`. Sentinel
+    /// `u64::MAX` guarantees the first slice always logs its initial epoch.
+    #[serde(default = "chaos_epoch_sentinel")]
+    pub chaos_epoch: u64,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact multiplier currently used to convert this thread's RCBs to virtual time.
+    #[serde(default)]
+    pub chaos_slowdown_factor: RcbTimeMultiplier,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// True when live chaos configuration or a replay artifact supplies the factor.
+    #[serde(default)]
+    pub chaos_slowdown_active: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Transitions waiting to be committed into the preemption artifact.
+    #[serde(default)]
+    pub pending_chaos_epochs: Vec<ChaosEpochTransition>,
+
     /// Absolute deadline enforced by the PMU-backed `--max-timeslice` timer. This is separate from
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
@@ -1245,6 +1280,10 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("thread_logical_time", &self.thread_logical_time)
             .field("committed_clock_value", &self.committed_clock_value)
             .field("end_of_timeslice", &self.end_of_timeslice)
+            .field("replay_rcb_end", &self.replay_rcb_end)
+            .field("chaos_epoch", &self.chaos_epoch)
+            .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
+            .field("chaos_slowdown_active", &self.chaos_slowdown_active)
             .field("max_timeslice_end", &self.max_timeslice_end)
             .field("last_rcb_timer", &self.last_rcb_timer)
             .field("last_rcb_timer_is_max", &self.last_rcb_timer_is_max)
@@ -1256,6 +1295,15 @@ impl<T> Default for ThreadState<T> {
     fn default() -> Self {
         unreachable!()
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// Sentinel for `ThreadState::chaos_epoch` before the first `next_timeslice`.
+/// `u64::MAX` can never equal a real epoch (`current_ns / N`), so the first
+/// chaos slice always emits its `CHAOSEPOCH` transition.
+pub(crate) fn chaos_epoch_sentinel() -> u64 {
+    u64::MAX
 }
 
 impl<T> AsRef<T> for ThreadState<T> {
@@ -1311,29 +1359,44 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 ///
 /// `max_factor <= 1.0` disables the spread and returns `1.0` (nominal) for
 /// every thread; callers validate `max_factor >= 1.0`.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// `epoch` selects a deterministic chaos EPOCH: the factor is redrawn per
+/// (thread, epoch) so a thread's bias changes in deterministic phases across a
+/// long run instead of staying fixed. `epoch == 0` reproduces the epoch-less
+/// per-thread-slowdown value EXACTLY (the epoch term is `0` and cancels out of
+/// the mix), so enabling epochs never perturbs the first epoch's behavior.
 pub(crate) fn chaos_per_thread_slowdown_factor(
     sched_seed: u64,
     dettid: DetTid,
+    epoch: u64,
     max_factor: f64,
-) -> f64 {
+) -> RcbTimeMultiplier {
     // `<=` (rather than `!(max_factor > 1.0)`) keeps clippy's partial-ord lint
     // happy; validate_invariants already rejects non-finite factors upstream.
     if max_factor <= 1.0 {
-        return 1.0;
+        return RcbTimeMultiplier::ONE;
     }
     // Mix the seed with the (stable) deterministic thread id to give each
     // thread its own point in the factor distribution. The salt keeps this
     // stream distinct from other sched_seed-derived streams.
     const SLOWDOWN_SALT: u64 = 0x736c_6f77_646f_776e; // "slowdown"
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    // Fold the epoch into the mix with its own golden-ratio multiplier. At
+    // `epoch == 0` this term is 0, leaving `mixed` identical to the epoch-less
+    // factor; each successive epoch decorrelates the draw deterministically.
+    const EPOCH_GOLDEN: u64 = 0xbf58_476d_1ce4_e5b9;
     let mixed = sched_seed
         ^ SLOWDOWN_SALT
-        ^ ((dettid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        ^ ((dettid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        ^ epoch.wrapping_mul(EPOCH_GOLDEN);
     let mut prng = Pcg64Mcg::seed_from_u64(mixed);
     // u in [0,1); map to exponent in [-1, 1) then factor = max_factor^exp,
     // i.e. a log-uniform draw over [1/max_factor, max_factor).
     let u: f64 = prng.random::<f64>();
     let exponent = 2.0 * u - 1.0;
-    max_factor.powf(exponent)
+    RcbTimeMultiplier::from_f64(max_factor.powf(exponent))
 }
 
 impl<T> ThreadState<T> {
@@ -1483,6 +1546,15 @@ impl<T> ThreadState<T> {
             thread_logical_time,
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.
+            replay_rcb_end: None,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            chaos_epoch: chaos_epoch_sentinel(),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            chaos_slowdown_factor: RcbTimeMultiplier::ONE,
+            chaos_slowdown_active: false,
+            pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
@@ -1659,9 +1731,47 @@ impl<T> ThreadState<T> {
 
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
+        if let Some(replay_rcb_end) = self.replay_rcb_end {
+            return self.committed_clock_value >= replay_rcb_end;
+        }
         let current_time = self.thread_logical_time.as_nanos();
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Current RCB virtual-time multiplier, including recorded replay state.
+    pub(crate) fn rcb_time_multiplier(&self) -> RcbTimeMultiplier {
+        if self.chaos_slowdown_active {
+            self.chaos_slowdown_factor
+        } else {
+            RcbTimeMultiplier::ONE
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    pub(crate) fn take_pending_chaos_epochs(&mut self) -> Vec<ChaosEpochTransition> {
+        std::mem::take(&mut self.pending_chaos_epochs)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    fn install_chaos_epoch(&mut self, transition: ChaosEpochTransition, record: bool) {
+        self.chaos_epoch = transition.epoch;
+        self.chaos_slowdown_factor = transition.factor;
+        self.chaos_slowdown_active = true;
+        if record {
+            self.pending_chaos_epochs.push(transition);
+        }
+        detlog!(
+            "[dtid {}] CHAOSEPOCH => epoch = {}, factor = {}, logical_time = {}",
+            self.dettid,
+            transition.epoch,
+            transition.factor.as_f64(),
+            transition.logical_time
+        );
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1678,7 +1788,62 @@ impl<T> ThreadState<T> {
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            // Redraw only at scheduler commit boundaries, keyed to elapsed
+            // deterministic logical time. Replay artifacts take precedence and
+            // restore the exact recorded Q32 factor even without ambient flags.
+            let replay_has_epochs = self
+                .preemption_points
+                .as_ref()
+                .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
+            if replay_has_epochs {
+                // Precise PMU replay deliberately checks in up to one RCB
+                // before the recorded logical boundary. The new slice still
+                // begins at that recorded boundary, so install its factor
+                // against the prior slice's exact target rather than the
+                // slightly-early observed clock. Otherwise a short epoch can
+                // be skipped and the following RCBs receive the wrong weight.
+                let transition_time = self.end_of_timeslice.unwrap_or(current_ns);
+                let transition = self
+                    .preemption_points
+                    .as_mut()
+                    .and_then(|history| history.advance_chaos_epoch(transition_time));
+                if let Some(transition) = transition {
+                    self.install_chaos_epoch(transition, false);
+                }
+            } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
+                let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
+                let epoch = elapsed_ns
+                    .checked_div(cfg.chaos_epoch_length_ns)
+                    .unwrap_or(0);
+                let factor = chaos_per_thread_slowdown_factor(
+                    cfg.sched_seed(),
+                    self.dettid,
+                    epoch,
+                    cfg.chaos_slowdown_max_factor,
+                );
+                if epoch != self.chaos_epoch {
+                    self.install_chaos_epoch(
+                        ChaosEpochTransition {
+                            logical_time: current_ns,
+                            epoch,
+                            factor,
+                        },
+                        true,
+                    );
+                } else {
+                    self.chaos_slowdown_factor = factor;
+                    self.chaos_slowdown_active = true;
+                }
+            } else {
+                self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
+                self.chaos_slowdown_active = false;
+                self.pending_chaos_epochs.clear();
+            }
+
             let mut result = None;
+            self.replay_rcb_end = None;
             let replay_controls_deadline =
                 self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
 
@@ -1686,7 +1851,7 @@ impl<T> ThreadState<T> {
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio)) = thi.next() {
+                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -1695,13 +1860,25 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        if end_time <= current_ns {
+                        let current_rcbs = self.committed_clock_value;
+                        if let Some(target_rcbs) = replay_rcb_end
+                            && target_rcbs < current_rcbs
+                        {
+                            panic!(
+                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
+                                target_rcbs, self.dettid, current_rcbs
+                            )
+                        }
+                        let exact_deadline_is_now =
+                            replay_rcb_end.is_some_and(|target| target == current_rcbs);
+                        if end_time <= current_ns && !exact_deadline_is_now {
                             panic!(
                                 "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}.",
                                 end_time, self.dettid, current_ns
                             )
                         }
                         self.end_of_timeslice = Some(end_time);
+                        self.replay_rcb_end = replay_rcb_end;
                         result = Some(prio);
                     } else {
                         let max = LogicalTime::MAX;
@@ -1758,31 +1935,20 @@ impl<T> ThreadState<T> {
                     );
                 }
             } else {
-                let nanos_per_rcb = NANOS_PER_RCB * cfg.clock_multiplier.unwrap_or(1.0);
-                let mut target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-1149)
-                // RR-style stable per-thread slowdown: scale the MEAN chaos
-                // timeslice length by a factor that is constant for this thread
-                // over the whole run (a slower thread gets longer slices, so it
-                // is preempted less often and effectively runs "slower" relative
-                // to its peers). This is an out-of-band scheduling budget: it
-                // changes only WHEN preemptions happen, never the guest-visible
-                // ns-per-RCB mapping, so determinism (L1/L2) is preserved and
-                // the mode is --strict-safe. The factor is a pure function of
-                // (sched_seed, dettid), hence replayable under a fixed seed.
-                if cfg.chaos && cfg.chaos_per_thread_slowdown {
-                    let factor = chaos_per_thread_slowdown_factor(
-                        cfg.sched_seed(),
-                        self.dettid,
-                        cfg.chaos_slowdown_max_factor,
-                    );
-                    target_timeout_rcbs *= factor;
+                // TODO-HUMAN-REVIEW(PR-1151)
+                // The slowdown changes RCB-to-virtual-time progression. Converting
+                // the sampled virtual duration back to RCBs with the SAME factor
+                // keeps the deadline and guest-visible clock internally consistent.
+                let slowdown = self.rcb_time_multiplier().as_f64();
+                let nanos_per_rcb = NANOS_PER_RCB * cfg.clock_multiplier.unwrap_or(1.0) * slowdown;
+                let target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
+                if self.chaos_slowdown_active {
                     detlog!(
-                        "[dtid {}] CHAOSSLOWDOWN => factor = {}, scaled mean rcbs = {}",
+                        "[dtid {}] CHAOSSLOWDOWN => factor = {}, virtual ns/rcb = {}",
                         self.dettid,
-                        factor,
-                        target_timeout_rcbs
+                        slowdown,
+                        nanos_per_rcb
                     );
                 }
                 let next_rcbs: u64 = if cfg.chaos {
@@ -1817,7 +1983,13 @@ impl<T> ThreadState<T> {
                 .map(|max_timeslice| current_ns + Duration::from_nanos(u64::from(max_timeslice)));
             self.max_timeslice_end = if replay_controls_deadline {
                 if cfg.max_timeslice.is_some() {
+                    // A replay history uses `LogicalTime::MAX` after its last
+                    // recorded preemption. Keep periodic PMU check-ins bounded
+                    // instead of trying to program that sentinel as an RCB
+                    // timer, which the kernel rejects with EINVAL.
                     self.end_of_timeslice
+                        .filter(|end| *end != LogicalTime::MAX)
+                        .or(configured_max_end)
                 } else {
                     None
                 }
@@ -1845,6 +2017,7 @@ impl<T> ThreadState<T> {
             result
         } else {
             self.end_of_timeslice = None;
+            self.replay_rcb_end = None;
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
@@ -1887,6 +2060,8 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+    use crate::DEFAULT_PRIORITY;
+    use crate::preemptions::ThreadHistory;
 
     #[test]
     fn guest_clock_rebases_backend_startup_work_and_preserves_deltas() {
@@ -1965,14 +2140,18 @@ mod timeslice_tests {
     #[test]
     fn chaos_per_thread_slowdown_factor_is_stable_and_deterministic() {
         let seed = 0xdead_beef_u64;
-        let max_factor = 10.0;
+        let max_factor: f64 = 10.0;
         // Deterministic: same (seed, dettid) -> identical factor, every call.
         for raw in 1..=64 {
             let tid = DetTid::from_raw(raw);
-            let a = chaos_per_thread_slowdown_factor(seed, tid, max_factor);
-            let b = chaos_per_thread_slowdown_factor(seed, tid, max_factor);
-            assert_eq!(a, b, "factor must be a pure function of (seed, dettid)");
+            let a = chaos_per_thread_slowdown_factor(seed, tid, 0, max_factor);
+            let b = chaos_per_thread_slowdown_factor(seed, tid, 0, max_factor);
+            assert_eq!(
+                a, b,
+                "factor must be a pure function of (seed, dettid, epoch)"
+            );
             // Log-uniform in [1/R, R].
+            let a = a.as_f64();
             assert!(
                 a >= 1.0 / max_factor - 1e-9 && a <= max_factor + 1e-9,
                 "factor {} out of [1/{max_factor}, {max_factor}] for tid {raw}",
@@ -1988,7 +2167,10 @@ mod timeslice_tests {
         let max_factor = 10.0;
         // Different threads (same seed) get a spread of factors, not all equal.
         let factors: Vec<f64> = (1..=32)
-            .map(|raw| chaos_per_thread_slowdown_factor(1234, DetTid::from_raw(raw), max_factor))
+            .map(|raw| {
+                chaos_per_thread_slowdown_factor(1234, DetTid::from_raw(raw), 0, max_factor)
+                    .as_f64()
+            })
             .collect();
         let first = factors[0];
         assert!(
@@ -1997,8 +2179,8 @@ mod timeslice_tests {
         );
         // Different seeds give a different factor for the same thread.
         let tid = DetTid::from_raw(7);
-        let f_a = chaos_per_thread_slowdown_factor(1, tid, max_factor);
-        let f_b = chaos_per_thread_slowdown_factor(2, tid, max_factor);
+        let f_a = chaos_per_thread_slowdown_factor(1, tid, 0, max_factor).as_f64();
+        let f_b = chaos_per_thread_slowdown_factor(2, tid, 0, max_factor).as_f64();
         assert!(
             (f_a - f_b).abs() > 1e-12,
             "different seeds should yield different factors for the same thread"
@@ -2012,9 +2194,78 @@ mod timeslice_tests {
         // max_factor <= 1.0 disables the spread: every thread is nominal (1.0).
         for raw in 1..=16 {
             let tid = DetTid::from_raw(raw);
-            assert_eq!(chaos_per_thread_slowdown_factor(99, tid, 1.0), 1.0);
-            assert_eq!(chaos_per_thread_slowdown_factor(99, tid, 0.5), 1.0);
+            assert_eq!(
+                chaos_per_thread_slowdown_factor(99, tid, 0, 1.0),
+                RcbTimeMultiplier::ONE
+            );
+            assert_eq!(
+                chaos_per_thread_slowdown_factor(99, tid, 0, 0.5),
+                RcbTimeMultiplier::ONE
+            );
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn chaos_epoch_zero_reproduces_epochless_factor() {
+        // Enabling epochs must never perturb the FIRST epoch: epoch 0 has to
+        // yield exactly the value the epoch-less #1149 code produced (the epoch
+        // term folds to 0 in the mix).
+        use rand::RngExt as _;
+        use rand::SeedableRng as _;
+        let max_factor: f64 = 10.0;
+        for raw in 1..=64 {
+            let tid = DetTid::from_raw(raw);
+            for &seed in &[0u64, 1, 7, 0xdead_beef, u64::MAX] {
+                let epochless = {
+                    // Reconstruct the exact epoch-less mix inline to pin the
+                    // invariant independent of the production function body.
+                    const SLOWDOWN_SALT: u64 = 0x736c_6f77_646f_776e;
+                    let mixed = seed
+                        ^ SLOWDOWN_SALT
+                        ^ ((tid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    let mut prng = Pcg64Mcg::seed_from_u64(mixed);
+                    let u: f64 = prng.random::<f64>();
+                    max_factor.powf(2.0 * u - 1.0)
+                };
+                assert_eq!(
+                    chaos_per_thread_slowdown_factor(seed, tid, 0, max_factor),
+                    RcbTimeMultiplier::from_f64(epochless),
+                    "epoch 0 must reproduce the epoch-less factor for seed {seed}, tid {raw}"
+                );
+            }
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn chaos_epoch_factor_varies_deterministically_across_epochs() {
+        let max_factor = 10.0;
+        let seed = 0x1234_5678_u64;
+        let tid = DetTid::from_raw(3);
+        // Each epoch draws a fresh factor for the same thread; the sequence is
+        // a pure function of (seed, dettid, epoch), hence replayable.
+        let factors: Vec<f64> = (0..16)
+            .map(|epoch| chaos_per_thread_slowdown_factor(seed, tid, epoch, max_factor).as_f64())
+            .collect();
+        // Purity: recomputing any epoch yields the identical value.
+        for (epoch, &f) in factors.iter().enumerate() {
+            assert_eq!(
+                chaos_per_thread_slowdown_factor(seed, tid, epoch as u64, max_factor).as_f64(),
+                f,
+                "factor must be pure in epoch"
+            );
+            // Stays in the log-uniform range.
+            assert!(f >= 1.0 / max_factor - 1e-9 && f <= max_factor + 1e-9);
+        }
+        // The factor actually changes across epochs (not a constant stream).
+        let first = factors[0];
+        assert!(
+            factors.iter().any(|&f| (f - first).abs() > 1e-6),
+            "per-epoch factors should differ across epochs"
+        );
     }
 
     fn cpu_snapshot(
@@ -2075,6 +2326,191 @@ mod timeslice_tests {
 
     fn nz(value: u64) -> Option<NonZeroU64> {
         NonZeroU64::new(value)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn constant_slowdown_is_the_single_epoch_case() {
+        let config = Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_epoch_length_ns: 0,
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let first = state.take_pending_chaos_epochs().pop().unwrap();
+        assert_eq!(first.epoch, 0);
+        assert_eq!(state.chaos_epoch, 0);
+
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(10_000, first.factor);
+        state.next_timeslice(&config);
+        assert_eq!(state.chaos_epoch, 0);
+        assert_eq!(state.chaos_slowdown_factor, first.factor);
+        assert!(state.take_pending_chaos_epochs().is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn epoch_redraw_uses_elapsed_logical_time_at_commit_boundaries() {
+        let config = Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_epoch_length_ns: 100,
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let tid = DetPid::from_raw(5);
+        let mut state = ThreadState::new(tid, &config, ());
+        state.next_timeslice(&config);
+        let first = state.pending_chaos_epochs[0];
+
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(1_000, first.factor);
+        let expected_epoch =
+            state.thread_logical_time.without_starting().as_nanos() / config.chaos_epoch_length_ns;
+        assert!(expected_epoch > 0);
+
+        state.next_timeslice(&config);
+        let transitions = state.take_pending_chaos_epochs();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0], first);
+        let redraw = transitions[1];
+        assert_eq!(redraw.epoch, expected_epoch);
+        assert_eq!(
+            redraw.factor,
+            chaos_per_thread_slowdown_factor(
+                config.sched_seed(),
+                tid,
+                expected_epoch,
+                config.chaos_slowdown_max_factor,
+            )
+        );
+        assert!(redraw.logical_time > first.logical_time);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn replay_installs_recorded_epoch_without_ambient_chaos_flags() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let transition = ChaosEpochTransition {
+            logical_time: LogicalTime::ZERO,
+            epoch: 7,
+            factor: RcbTimeMultiplier::from_f64(3.25),
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        state.preemption_points = Some(
+            ThreadHistory::new()
+                .with_chaos_epochs(vec![transition])
+                .into_iter(),
+        );
+
+        state.next_timeslice(&config);
+
+        assert!(state.chaos_slowdown_active);
+        assert_eq!(state.chaos_epoch, transition.epoch);
+        assert_eq!(state.chaos_slowdown_factor, transition.factor);
+        assert!(state.take_pending_chaos_epochs().is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn replay_installs_boundary_epoch_when_pmu_checks_in_early() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let first = ChaosEpochTransition {
+            logical_time: now,
+            epoch: 0,
+            factor: RcbTimeMultiplier::from_f64(2.0),
+        };
+        let second = ChaosEpochTransition {
+            logical_time: now + Duration::from_nanos(100),
+            epoch: 1,
+            factor: RcbTimeMultiplier::from_f64(3.0),
+        };
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(100), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(200), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 8])
+            .with_chaos_epochs(vec![first, second]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.chaos_slowdown_factor, first.factor);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(100))
+        );
+
+        // Four 2x RCBs advance to 80ns: within one RCB of the exact 100ns
+        // boundary, matching the early check-in path in post_handler_hook.
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(4, first.factor);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+        state.next_timeslice(&config);
+
+        assert_eq!(
+            state.thread_logical_time.as_nanos(),
+            now + Duration::from_nanos(80)
+        );
+        assert_eq!(state.chaos_epoch, second.epoch);
+        assert_eq!(state.chaos_slowdown_factor, second.factor);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(200))
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn replay_preserves_adjacent_zero_rcb_slices() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(70), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(80), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 4]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(4);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.replay_rcb_end, Some(4));
+        assert!(state.timeslice_expired());
     }
 
     #[test]
@@ -2172,6 +2608,23 @@ mod timeslice_tests {
         let expected = now + Duration::from_nanos(100_000);
         assert_eq!(state.end_of_timeslice, Some(expected));
         assert_eq!(state.max_timeslice_end, Some(expected));
+    }
+
+    #[test]
+    fn exhausted_preemption_replay_uses_bounded_pmu_maximum() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.preemption_points = Some(ThreadHistory::new().into_iter());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.next_timeslice(&config);
+
+        let bounded_end = Some(now + Duration::from_nanos(100_000));
+        assert_eq!(state.end_of_timeslice, bounded_end);
+        assert_eq!(state.max_timeslice_end, bounded_end);
     }
 
     #[test]

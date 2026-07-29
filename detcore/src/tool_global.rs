@@ -58,6 +58,7 @@ use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -1200,6 +1201,7 @@ impl GlobalState {
             detpid,
             mm,
             timeslice_stats,
+            chaos_epochs,
         } = deregistration;
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
@@ -1210,6 +1212,11 @@ impl GlobalState {
                 dettid
             );
             return;
+        }
+        if let Some(writer) = &mut sched.preemption_writer {
+            for transition in chaos_epochs {
+                writer.insert_chaos_epoch(dettid, transition);
+            }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         if !sched.thread_is_logically_killed(dettid) {
@@ -1542,6 +1549,7 @@ pub struct ThreadDeregistration {
     pub(crate) detpid: DetPid,
     pub(crate) mm: MmId,
     pub(crate) timeslice_stats: TimesliceStats,
+    pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
 /// Messages to the global object.
@@ -1583,9 +1591,9 @@ pub enum GlobalRequest {
     /// and detpid of the new child.
     StartNewThread(DetTid, DetPid),
 
-    /// Remove thread from scheduler data structure, guaranteeing it will consume no
-    /// further turns. Carries the exiting thread's completed-timeslice distribution
-    /// so the scheduler can aggregate it into the final run report.
+    /// Remove a thread from scheduler data structures, guaranteeing that it will
+    /// consume no further turns. Carries its final timeslice distribution and any
+    /// chaos-epoch transitions not yet flushed by a priority-change commit.
     DeregisterThread(ThreadDeregistration),
 
     /// Notify scheduler before/after futex action.
@@ -1989,11 +1997,11 @@ pub async fn create_vfork_child_thread<G, T>(
 ///
 /// Nonblocking: the future may return immediately, not guaranteeing the changes to the
 /// scheduler have been completed.
-pub async fn deregister_thread<R>(
-    deregistration: ThreadDeregistration,
+pub(crate) async fn deregister_thread<R>(
     threads_time: DetTime,
     cfg: &Config,
     reverie: &R,
+    thread: ThreadDeregistration,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -2001,10 +2009,7 @@ pub async fn deregister_thread<R>(
     if cfg.sequentialize_threads {
         // TODO: void_send_rpc
         let resp = reverie
-            .send_rpc((
-                threads_time,
-                GlobalRequest::DeregisterThread(deregistration),
-            ))
+            .send_rpc((threads_time, GlobalRequest::DeregisterThread(thread)))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
         match resp.1 {
@@ -2745,6 +2750,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        chaos_epochs: Vec::new(),
                     }),
                 ),
             )
@@ -2771,6 +2777,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        chaos_epochs: Vec::new(),
                     }),
                 ),
             )

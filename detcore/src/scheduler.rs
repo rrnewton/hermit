@@ -1988,8 +1988,8 @@ impl Scheduler {
             }
 
             // Thread requests change in priority
-            ResourceID::PriorityChangePoint(prio, change_time) => {
-                self.perform_priority_changepoint(dettid, *prio, *change_time)
+            ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs) => {
+                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs)
             }
 
             // For now, all other resource types are immediately granted.
@@ -2050,6 +2050,10 @@ impl Scheduler {
 
         new_priority: Priority,
         guest_time: LogicalTime,
+        guest_rcbs: u64,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        chaos_epochs: &[crate::resources::ChaosEpochTransition],
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
         // Alter the threads priority and requeue.
@@ -2064,7 +2068,10 @@ impl Scheduler {
                 "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
                 dettid, guest_time, old_prio, new_priority
             );
-            pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
+            for transition in chaos_epochs {
+                pw.insert_chaos_epoch(dettid, *transition);
+            }
+            pw.insert_reprioritization(dettid, guest_time, guest_rcbs, old_prio, new_priority);
             pw.set_current(dettid, new_priority);
         }
 
