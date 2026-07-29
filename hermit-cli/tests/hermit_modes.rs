@@ -528,11 +528,24 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
     let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let executable_dir = hermit_binary.parent().unwrap();
     let target_dir = executable_dir.parent().unwrap();
-    let loader = std::env::var_os("HERMIT_SABRE_BINARY")
-        .map(PathBuf::from)
+    let configured_loader = std::env::var_os("HERMIT_SABRE_BINARY").map(PathBuf::from);
+    let loader = configured_loader
+        .clone()
         .unwrap_or_else(|| target_dir.join("sabre/sabre"));
     let plugin = executable_dir.join("libdetcore_sabre.so");
     if !loader.is_file() || !plugin.is_file() {
+        if configured_loader.is_some() {
+            panic!(
+                "configured SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+                loader.display(),
+                plugin.display(),
+            );
+        }
+        eprintln!(
+            "skipping {label}: SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+            loader.display(),
+            plugin.display(),
+        );
         return;
     }
 
