@@ -1471,13 +1471,6 @@ function strict_compatibility_probe {
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
         run_args=(run --backend sabre --strict --verify --)
-        # Cargo's functional row runs two instrumented processes per verify run. On a shared
-        # development host the complete L2 pair can exhaust the generic 60-second whole-row
-        # budget even though the unchanged probe completes in seconds when scheduled fairly.
-        # Keep the exact strict+verify gate and give only this existing passing row headroom.
-        if [[ $label == cargo ]]; then
-            probe_timeout=120
-        fi
     elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
         assurance="e9patch L2"
         run_args=(run --backend e9patch)
