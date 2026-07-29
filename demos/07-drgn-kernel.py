@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Show reproducible Linux task evolution through zero-Heisenberg drgn reads."""
 
-import hashlib
 import os
 from pathlib import Path
 import sys
@@ -18,7 +17,9 @@ from drgn_hermit import GuestConfig, program_from_hermit  # noqa: E402
 ADVANCE_MARKER = b"__HERMIT_DEMO07_ADVANCE_DONE__"
 DEFAULT_ADVANCE_COMMAND = (
     "for n in 1 2; do sleep 1000 & done; "
-    "usleep 1000; echo " + ADVANCE_MARKER.decode()
+    # Split the marker in the command text so terminal echo cannot satisfy the
+    # wait; only the shell's post-timer output contains the complete marker.
+    'usleep 1000; echo __HERMIT_DEMO07_ADVANCE_"DONE__"'
 )
 
 
@@ -70,10 +71,6 @@ def _canonical(rows):
     return "\n".join("{} {}".format(pid, comm) for pid, comm in rows)
 
 
-def _digest(rows):
-    return hashlib.sha256(_canonical(rows).encode()).hexdigest()
-
-
 def _task_diff(before, after):
     before_set = set(before)
     after_set = set(after)
@@ -100,10 +97,17 @@ def _run_once(config, command):
     return before, after, removed, added, before_metrics, after_metrics
 
 
-def _print_tasks(label, rows):
-    print("{} tasks (pid comm):".format(label))
-    for pid, comm in rows:
+def _print_tasks(label, rows, limit):
+    shown = rows[:limit]
+    print(
+        "{} tasks ({} total; first {} shown, pid comm):".format(
+            label, len(rows), len(shown)
+        )
+    )
+    for pid, comm in shown:
         print("  {:5d} {}".format(pid, comm))
+    if len(rows) > limit:
+        print("  ... {} unchanged rows omitted from display".format(len(rows) - limit))
 
 
 def _print_diff(removed, added):
@@ -117,9 +121,12 @@ def _print_diff(removed, added):
 def main() -> int:
     config = _config()
     runs = int(os.environ.get("DEMO07_RUNS", "2"))
-    command = os.environ.get("DEMO07_ADVANCE_COMMAND", DEFAULT_ADVANCE_COMMAND)
+    task_limit = int(os.environ.get("DEMO07_TASK_LIMIT", "16"))
+    command = DEFAULT_ADVANCE_COMMAND
     if runs < 2:
         raise ValueError("DEMO07_RUNS must be at least 2 to prove reproducibility")
+    if task_limit < 1:
+        raise ValueError("DEMO07_TASK_LIMIT must be positive")
 
     baseline = None
     all_metrics = []
@@ -141,22 +148,24 @@ def main() -> int:
             )
         all_metrics.extend((before_metrics, after_metrics))
         print(
-            "evolution {}: before_sha256={} after_sha256={} "
-            "removed={} added={} reads={}/{} serial_delta=0/0".format(
+            "evolution {}: before_tasks={} after_tasks={} removed={} added={} "
+            "read_states={}/{},{}/{} serial_delta=0/0".format(
                 run,
-                _digest(before),
-                _digest(after),
+                len(before),
+                len(after),
                 len(removed),
                 len(added),
-                before_metrics.physical_reads,
-                after_metrics.physical_reads,
+                before_metrics.qemu_state,
+                before_metrics.tracer_state,
+                after_metrics.qemu_state,
+                after_metrics.tracer_state,
             ),
             flush=True,
         )
 
     before, after, removed, added, _, _ = baseline
-    _print_tasks("before", before)
-    _print_tasks("after", after)
+    _print_tasks("before", before, task_limit)
+    _print_tasks("after", after, task_limit)
     _print_diff(removed, added)
     if any(item.serial_bytes_delta != 0 for item in all_metrics):
         raise RuntimeError("guest serial output advanced during a drgn read")
