@@ -572,6 +572,7 @@ fn dbi_unavailable_reason() -> Option<String> {
 }
 
 #[cfg(not(feature = "dbi"))]
+// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBI compile-time feature boundary.
 fn dbi_unavailable_reason() -> Option<String> {
     Some("DBI support was not included in this build".to_owned())
 }
