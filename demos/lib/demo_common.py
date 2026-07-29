@@ -538,12 +538,37 @@ def wait_for_process(
     timeout: float,
     stream_path: Optional[Path] = None,
     progress_label: Optional[str] = None,
+    first_output_label: Optional[str] = None,
 ) -> int:
-    """Wait for a process, optionally streaming a growing file or showing progress."""
+    """Wait for a process, optionally streaming a growing file or showing progress.
+
+    When ``first_output_label`` is set (used with ``stream_path``), a live
+    seconds-counter ticks until the very first byte of streamed output appears,
+    then freezes as ``(N.Ns to first output)``. For the QEMU boot demo this makes
+    the healthy ~10-20s time-to-first-serial-line obvious at a glance and turns a
+    wedged boot (counter climbing toward the timeout with no output) into an
+    immediately visible symptom.
+    """
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     stream = None
     last_progress = -1
+    last_wait_tick = -1.0
+    first_output_at: Optional[float] = None
+
+    def note_first_output() -> None:
+        nonlocal first_output_at
+        if first_output_label is not None and first_output_at is None:
+            first_output_at = time.monotonic() - started
+            # Freeze the ticking counter on its own line, then let the streamed
+            # output follow on the next line.
+            print(
+                "\r{}: {:.1f}s  ({:.1f}s to first output)".format(
+                    first_output_label, first_output_at, first_output_at
+                ),
+                flush=True,
+            )
+
     try:
         while True:
             if (
@@ -555,6 +580,7 @@ def wait_for_process(
             if stream is not None:
                 chunk = stream.read()
                 if chunk:
+                    note_first_output()
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()
 
@@ -563,6 +589,7 @@ def wait_for_process(
                 if stream is not None:
                     chunk = stream.read()
                     if chunk:
+                        note_first_output()
                         sys.stdout.buffer.write(chunk)
                         sys.stdout.buffer.flush()
                 if progress_label is not None:
@@ -583,6 +610,15 @@ def wait_for_process(
                         "\r{}: {}s".format(progress_label, elapsed), end="", flush=True
                     )
                     last_progress = elapsed
+            if first_output_label is not None and first_output_at is None:
+                waited = now - started
+                if waited - last_wait_tick >= 0.1:
+                    print(
+                        "\r{}: {:.1f}s".format(first_output_label, waited),
+                        end="",
+                        flush=True,
+                    )
+                    last_wait_tick = waited
             time.sleep(0.1)
     finally:
         if stream is not None:
