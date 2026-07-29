@@ -86,6 +86,26 @@ def command_output(transcript: bytes, begin: str, end: str) -> bytes:
     return ("\n".join(output) + "\n").encode()
 
 
+def ensure_boot_snapshot() -> None:
+    """Build the default phase-5 prerequisite; never guess for custom paths."""
+    if BOOT_SNAPSHOT_DISK.is_file():
+        return
+    default_snapshot = ASSETS / "hermit-boot.qcow2"
+    if BOOT_SNAPSHOT_DISK != default_snapshot:
+        raise RuntimeError(
+            "missing custom boot snapshot: {}; produce it before Demo 6".format(
+                BOOT_SNAPSHOT_DISK
+            )
+        )
+    print("Phase-5 snapshot missing; running demo 5 prerequisite...", flush=True)
+    run_checked(
+        ["make", "--no-print-directory", "-C", str(DEMO_DIR), "demo5"],
+        cwd=ROOT,
+    )
+    if not BOOT_SNAPSHOT_DISK.is_file():
+        raise RuntimeError("Demo 5 did not produce {}".format(BOOT_SNAPSHOT_DISK))
+
+
 def main() -> int:
     arguments = parse_args()
     guest_command = " ".join(arguments.command).strip() or "uname -a"
@@ -94,6 +114,7 @@ def main() -> int:
 
     os.environ["HERMIT_RELEASE"] = str(HERMIT)
     os.environ["QEMU_BIN"] = QEMU
+    os.environ["QEMU_ASSETS"] = str(ASSETS)
     dependency = check_dependencies(ROOT)
     print_header(
         DEMO_LABEL,
@@ -106,8 +127,7 @@ def main() -> int:
     run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     if not QEMU:
         raise RuntimeError("qemu-system-x86_64 is required")
-    if not BOOT_SNAPSHOT_DISK.is_file():
-        raise RuntimeError("missing boot snapshot; run ./demos/05-qemu-boot.py first")
+    ensure_boot_snapshot()
 
     command_digest = hashlib.sha256(guest_command.encode()).hexdigest()
     command_root = ASSETS / "resume-metadata" / command_digest
