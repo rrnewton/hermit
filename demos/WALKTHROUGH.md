@@ -11,14 +11,20 @@ list without executing guest instructions, Hermit advances the guest through a
 fixed interval, and drgn reads the changed list. Two independent restores must
 produce exactly the same before list, after list, and diff.
 
+Demo 8 returns from the whole-system track to a single multithreaded userspace
+program and closes the loop on chaos scheduling: it takes a real concurrency
+bug that blind execution almost never hits, surfaces it deterministically on a
+recorded seed, and replays the crash bit-for-bit.
+
 ## Dependency-aware entry points
 
 Run demos through the repository Makefile when starting from a fresh clone:
 
 ```bash
-make demo1                 # any individual checked-in demo, demo1 .. demo7
+make demo1                 # any individual checked-in demo, demo1 .. demo8
 make demo6 DEMO6_COMMAND='ls /'
 make demo7
+make demo8                 # skips cleanly if its prebuilt assets are absent
 make demos                 # every checked-in demo in order
 ```
 
@@ -26,6 +32,7 @@ The targets model artifact dependencies rather than requiring manual ordering:
 
 ```text
 process prerequisites ──> demos 1, 2, 3, 4
+                          └──> demo 8 (+ prebuilt ASAN btrfs-convert assets)
 process + QEMU prerequisites ──> demo 5 ──> hermit-boot.qcow2
                                             ├──> demo 6
                                             └──> demo 7 (+ drgn/readelf)
@@ -40,9 +47,10 @@ Demo 5 once and continue with the newly stored snapshot. A deliberately chosen
 custom snapshot path is never overwritten implicitly; a missing custom path
 fails with a specific remediation message.
 
-The unified directory currently contains demos 1-7; every checked-in demo has
-a dependency-aware target. Add any future Demo 8 to the same graph with its
-actual artifact prerequisites rather than imposing an artificial serial chain.
+The unified directory contains demos 1-8; every checked-in demo has a
+dependency-aware target. Demo 8 joins the graph on the process prerequisites
+plus its prebuilt ASAN assets rather than an artificial serial chain, and skips
+cleanly when those assets are absent.
 
 ## Prepare the suite
 
@@ -224,3 +232,111 @@ measure.
 On hosts that require the forward proxy for first-use public downloads, prefix
 the asset-producing commands with `with-proxy`. Restores of already-cached
 assets do not require network access.
+
+## Demo 8: find and replay a schedule-dependent use-after-free
+
+Demo 8 uses a real multithreaded userspace program to show the payoff of
+deterministic chaos scheduling. `btrfs-convert` (btrfs-progs) runs a background
+progress thread that dereferences a shared `struct task_info *info` while the
+main thread copies inodes. Before upstream commit `73e211a7` the teardown path
+detached that thread and never joined it, so `task_deinit()` could `free(info)`
+while the progress thread was still reading it — a heap use-after-free whose
+occurrence depends entirely on the teardown interleaving. That is exactly the
+kind of rare, order-sensitive bug chaos scheduling is built to expose.
+
+```bash
+make demo8                       # or: ./demos/08-btrfs-convert-uaf.sh
+```
+
+Two prebuilt AddressSanitizer binaries (`buggy` = pre-73e211a7, `fixed` =
+73e211a7) and a populated ext4 image live under `ignored/demo08-btrfs/`. ASAN
+turns the latent UAF into an observable abort with a precise report. When the
+assets are absent the demo prints `SKIPPED` and exits 0, so `make all` stays
+green; `demos/08-btrfs-convert-uaf.md` has the build recipe.
+
+### Blind execution almost never hits it
+
+Native execution misses the bug because the teardown window is tiny on real
+hardware. The experiment behind this demo swept the buggy binary 40 times
+natively and across 32 chaos seeds:
+
+| Execution | Runs | UAF crashes |
+| --- | --- | --- |
+| native (blind) buggy | 40 | **0** — dormant |
+| hermit `--chaos` buggy, seeds 0-31 | 32 | **2** (seeds **15**, **19**) |
+| hermit `--chaos` fixed, seeds 0-31 | 32 | **0** — the fix closes the window |
+
+(from `experiments/btrfs-convert-progress-uaf-chaos_20260729/results.csv`.)
+
+The demo then drives one known crashing seed end to end. Step 1 confirms the
+blind baseline — the same buggy binary, run natively, exits cleanly:
+
+```text
+=== Demo 08: schedule-dependent btrfs-convert progress-thread UAF ===
+seed=15 timeout=90s
+...
+--- Step 1: native buggy btrfs-convert (blind execution) ---
+native buggy: clean exit (UAF dormant, as expected)
+```
+
+### Chaos finds the crash on the recorded seed
+
+With `--sched-seed 15` the chaos scheduler lands the main thread's `free` before
+the progress thread's post-wake dereference, and ASAN aborts with the textbook
+73e211a7 signature. Frame `#0` is the progress thread's read of `*info` in
+`task_period_wait`; frame `#1` is its caller `print_copied_inodes` — the load
+happens *after* `task_deinit` freed `info`:
+
+```text
+--- Step 2: chaos buggy, --sched-seed 15 (expect ASAN UAF) ---
+==3==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000330 at pc 0x00000052793b bp 0x7ffff3ffeaf0 sp 0x7ffff3ffeae0
+    #0 0x52793a in task_period_wait common/task-utils.c:154
+    #1 0x41218a in print_copied_inodes convert/main.c:170
+SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_period_wait
+chaos buggy: reproduced the use-after-free
+```
+
+`--sched-seed 15` is the recorded seed: it names the exact interleaving, so the
+crash is reproducible rather than a lucky one-off.
+
+### The fix closes the window on the same seed
+
+The differential runs the `fixed` binary under the *same* seed and schedule.
+The no-detach + join teardown removes the race, so it exits cleanly:
+
+```text
+--- Step 3: chaos fixed, --sched-seed 15 (expect clean) ---
+chaos fixed: clean exit on the crashing seed (73e211a7 closes the window)
+```
+
+### The crash replays bit-for-bit
+
+Re-running the crashing seed with the identical image path (hermit determinism
+is per-input, and the faulting heap address depends on `argv`) reproduces a
+byte-identical guest ASAN report — same heap address, PC, and frames:
+
+```text
+--- Step 4: replay --sched-seed 15, confirm identical crash ---
+replay: guest ASAN report byte-identical (same heap address, PC, frames)
+
+=== Demo 08: SUCCESS ===
+native missed the UAF; chaos found it on seed 15, the fix closed
+it, and the crash replayed deterministically.
+```
+
+### Observability adaptation (stated plainly)
+
+The historical code paces the progress thread with a wall-clock
+`CLOCK_MONOTONIC` timerfd. Hermit virtualizes `CLOCK_MONOTONIC` to logical
+(instruction-derived) time, which barely advances during this I/O-bound
+conversion, so the timer never fires and the race stays dormant even under
+chaos. Both demo binaries therefore replace the timerfd with a pipe woken by a
+single teardown byte — applied **identically** to the buggy and fixed variants,
+so the only behavioral difference between them remains the real detach/no-join
+bug. ASAN options are baked into the binaries because the host `ASAN_OPTIONS`
+does not reach the hermit guest. Neither change alters which teardown ordering
+is safe; they only make the existing race reachable and observable under
+hermit's logical clock. Full detail: `demos/08-btrfs-convert-uaf.md`.
+
+Useful overrides: `DEMO08_CRASH_SEED` (default 15), `DEMO08_TIMEOUT` (default
+90), `DEMO08_DIR`, `DEMO08_ARTIFACTS`, and `HERMIT_RELEASE`.
