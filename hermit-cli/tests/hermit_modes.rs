@@ -589,7 +589,7 @@ fn sabre_exit_group_cancels_parked_futex_thread() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the SaBRe fork/exec pipe-state regression.
+// TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe fork/exec pipe-state regression.
 #[test]
 fn sabre_exec_pipeline_preserves_blocking_pipe_semantics() {
     run_bounded_sabre_strict_verify(

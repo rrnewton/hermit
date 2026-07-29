@@ -86,7 +86,7 @@ pub struct FileMetadata {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe exec descriptor-status handoff state.
+// TODO-HUMAN-REVIEW(PR-1154): Review SaBRe exec descriptor-status handoff state.
 /// Descriptor numbers that Detcore keeps physically nonblocking while presenting them as
 /// blocking to the guest. SaBRe carries this narrow status set across an exec plugin reload.
 pub type ExecFdBlockingOverrides = BTreeSet<RawFd>;

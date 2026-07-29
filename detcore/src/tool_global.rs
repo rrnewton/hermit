@@ -273,7 +273,7 @@ pub struct GlobalState {
     past_first_execve: AtomicBool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the SaBRe exec descriptor-status handoff.
+    // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Logically blocking descriptors awaiting restoration after a SaBRe exec reload.
     pending_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
 
@@ -1607,7 +1607,7 @@ pub enum GlobalRequest {
     ReportUnsupportedSyscall(String),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the SaBRe exec descriptor-status handoff.
+    // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Save logically blocking descriptors before a backend reloads its tool across exec.
     /// An empty set clears a failed exec attempt.
     PrepareExecFdBlocking(ExecFdBlockingOverrides),
@@ -1768,7 +1768,7 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the SaBRe exec descriptor-status handoff.
+// TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
 pub async fn set_pending_exec_fd_blocking<G, T>(guest: &mut G, overrides: ExecFdBlockingOverrides)
 where
     G: Guest<Detcore<T>>,

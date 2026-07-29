@@ -321,7 +321,7 @@ readonly RR_COMPAT_EXPECTED=139
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=198
 # AUTONOMOUS-BOT-IMPLEMENTED
-# TODO-HUMAN-REVIEW(PR-TBD): Review synchronization of the measured SaBRe corpus size.
+# TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
 readonly E9PATCH_COMPAT_TOTAL=155
 COMPATIBILITY_MODE=strict
