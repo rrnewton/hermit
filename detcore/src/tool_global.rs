@@ -1762,6 +1762,9 @@ where
                     "[detcore, dtid {}] exiting after terminal scheduler cancellation",
                     &dettid
                 );
+                // The terminal response must never return to the original syscall handler.
+                // Reverie SaBRe runs exactly-once Tool cleanup for this non-original thread exit,
+                // then executes the raw exit without restoring the callback's guest frame.
                 guest.tail_inject(reverie::syscalls::Exit::default()).await
             }
             _ => unreachable!(),
