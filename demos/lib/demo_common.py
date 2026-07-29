@@ -476,6 +476,29 @@ def check_dependencies(root: Path) -> str:
     return lines[0]
 
 
+def check_qemu_dependencies(root: Path) -> str:
+    """Run the zero-build QEMU demo preflight and return its summary."""
+    result = subprocess.run(
+        [str(root / "demos/lib/qemu-assets.sh"), "--check"],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        sys.stderr.write(result.stdout)
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+    lines = [line for line in result.stdout.splitlines() if line]
+    if len(lines) != 1 or not lines[0].startswith(
+        "QEMU dependency check passed:"
+    ):
+        raise RuntimeError(
+            "unexpected QEMU dependency-check output: {!r}".format(result.stdout)
+        )
+    return lines[0]
+
+
 def print_header(title: str, description: Sequence[str], dependency: str) -> None:
     width = 80
     title_width = width - 10

@@ -17,6 +17,7 @@ from demo_common import (  # noqa: E402
     banner,
     canonicalize_qcow2_snapshot_timestamp,
     check_dependencies,
+    check_qemu_dependencies,
     compare_runs,
     copy_file,
     extract_info_tail,
@@ -65,6 +66,8 @@ def snapshot_exists(path: Path, name: str) -> bool:
 def main() -> int:
     os.environ["HERMIT_RELEASE"] = str(HERMIT)
     os.environ["QEMU_BIN"] = QEMU
+    os.environ["QEMU_DEMO_PYTHON"] = sys.executable
+    qemu_dependency = check_qemu_dependencies(ROOT)
     dependency = check_dependencies(ROOT)
     print_header(
         DEMO_LABEL,
@@ -72,7 +75,7 @@ def main() -> int:
             "Hermit boots QEMU/Linux, streams the serial console, saves a live snapshot,",
             "and compares every repeat run with the first run.",
         ),
-        dependency,
+        dependency + "\n" + qemu_dependency,
     )
     run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     banner("Verify QEMU kernel and initramfs")

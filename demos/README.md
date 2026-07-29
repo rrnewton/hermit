@@ -49,10 +49,29 @@ Cargo starts and points back to `make install-deps`. Running `make` initializes
 the `hermit/` submodule when needed and builds the release Hermit binary.
 
 The demos use private temporary and ignored build-artifact directories. Demos 5
-and 6 additionally need `qemu-system-x86_64`, `qemu-img`, the Meta `manifold`
-CLI, Ncat (`nc`), static BusyBox, `cpio`, and `gzip`. Demo 5 downloads a fixed
-kernel from Manifold, verifies its SHA-256, and caches it with the generated
-initramfs and qcow2 snapshot disk under `ignored/qemu-linux`.
+and 6 additionally need Python 3, `qemu-system-x86_64`, `qemu-img`, a statically
+linked BusyBox, `cpio`, `gzip`, `curl`, `file`, and `sha256sum`. Install the
+QEMU-demo packages with one of:
+
+```bash
+# Debian/Ubuntu
+sudo apt install python3 qemu-system-x86 qemu-utils busybox-static \
+  cpio gzip curl file
+
+# Fedora
+sudo dnf install python3 qemu-system-x86-core qemu-img busybox \
+  cpio gzip curl file
+```
+
+On CentOS/RHEL, install `qemu-kvm-core`, `qemu-img`, and the EPEL `busybox`
+package. That BusyBox is static but is commonly installed at
+`/usr/sbin/busybox`; set `QEMU_BIN=/usr/libexec/qemu-kvm` and
+`BUSYBOX=/usr/sbin/busybox` when those binaries are not on `PATH`. Run
+`./demos/lib/qemu-assets.sh --check` for one complete, zero-build dependency
+report before starting Demo 5.
+
+Demo 5 downloads a fixed public kernel, verifies its SHA-256, and caches it with
+the generated initramfs and qcow2 snapshot disk under `ignored/qemu-linux`.
 
 ## Layout
 
@@ -70,7 +89,7 @@ demos/
   lib/
     demo_common.py          # hashes, metadata, QMP, serial, strict log diff
     qemu_controller.py      # deterministic in-Hermit QEMU serial/QMP controller
-    qemu-assets.sh          # internal first-run kernel/initramfs helper
+    qemu-assets.sh          # portable kernel/initramfs helper + preflight
     qemu-snapshot.sh        # QMP, snapshot, and stable-log helpers
 ```
 
@@ -210,16 +229,18 @@ On first use, `demos/lib/qemu-assets.sh` downloads this content-addressed
 kernel and verifies it before atomically populating the cache:
 
 ```text
-manifold://test/tree/dev-hermit/qemu-kernels/e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2/bzImage
+https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2/bzImage
 sha256: e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2
 ```
 
 The helper also builds a small static BusyBox initramfs. Later runs reuse the
 kernel only after checking its SHA again, so stale or host-specific cache
 contents are replaced. `KERNEL_IMAGE` supplies a local copy of the same fixed
-kernel for offline testing. `QEMU_KERNEL_MANIFOLD_PATH` and
-`QEMU_KERNEL_SHA256` provide an explicit paired override for intentional kernel
-updates; `BUSYBOX` and `QEMU_ASSETS` retain their existing overrides.
+kernel for offline testing. `QEMU_KERNEL_URL` and `QEMU_KERNEL_SHA256` provide
+an explicit paired override for intentional public-kernel updates;
+`QEMU_KERNEL_MANIFOLD_PATH` selects an optional internal mirror.
+`QEMU_KERNEL_MANIFOLD_PATH` takes precedence over the default public URL.
+`BUSYBOX`, `QEMU_BIN`, and `QEMU_ASSETS` retain their existing overrides.
 
 The boot and every resume use `--strict`, `--no-rcb-time`,
 `--target-timeslice 100000`, and `--max-timeslice disabled`. Strict mode fails

@@ -9,31 +9,95 @@ HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 ARTIFACT_DIR="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || true)}"
 KERNEL_SHA256="${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}"
-KERNEL_URL="${QEMU_KERNEL_URL:-}"
+DEFAULT_KERNEL_URL="https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-$KERNEL_SHA256/bzImage"
+KERNEL_URL="${QEMU_KERNEL_URL:-$DEFAULT_KERNEL_URL}"
 KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-}"
+QEMU="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
+PYTHON="${QEMU_DEMO_PYTHON:-$(command -v python3 || true)}"
 INITRAMFS_VERSION=3
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
+CHECK_ONLY=0
 
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
 }
 
+case "${1:-}" in
+  "") ;;
+  --check) CHECK_ONLY=1 ;;
+  *) fail "usage: $0 [--check]" ;;
+esac
+
 size_mb() {
   awk -v bytes="$1" 'BEGIN { printf "%.1f", bytes / 1000000 }'
 }
 
-if [ -z "$BUSYBOX" ] || [ ! -x "$BUSYBOX" ]; then
-  fail "a statically linked BusyBox is required; set BUSYBOX=/path/to/busybox"
-fi
+available_executable() {
+  [ -n "$1" ] || return 1
+  case "$1" in
+    */*) [ -x "$1" ] ;;
+    *) command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
 
-for tool in file cpio gzip sha256sum; do
-  command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
-done
-file "$BUSYBOX" | grep -q 'statically linked' || \
-  fail "$BUSYBOX is not statically linked"
-[[ $KERNEL_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
-  fail "QEMU_KERNEL_SHA256 must be a lowercase 64-character SHA-256"
+preflight() {
+  local issue
+  local -a issues=()
+
+  available_executable "$QEMU" || \
+    issues+=("missing qemu-system-x86_64 (or set QEMU_BIN=/path/to/qemu)")
+  command -v qemu-img >/dev/null 2>&1 || \
+    issues+=("missing qemu-img")
+  available_executable "$PYTHON" || \
+    issues+=("missing Python 3 (or set QEMU_DEMO_PYTHON=/path/to/python3)")
+
+  for tool in file cpio gzip sha256sum; do
+    command -v "$tool" >/dev/null 2>&1 || \
+      issues+=("missing required tool: $tool")
+  done
+
+  if [ -z "$BUSYBOX" ] || [ ! -x "$BUSYBOX" ]; then
+    issues+=("missing statically linked BusyBox (or set BUSYBOX=/path/to/busybox)")
+  elif command -v file >/dev/null 2>&1 \
+       && ! file "$BUSYBOX" | grep -q 'statically linked'; then
+    issues+=("BUSYBOX is not statically linked: $BUSYBOX")
+  fi
+
+  if [ -n "${KERNEL_IMAGE:-}" ]; then
+    [ -r "$KERNEL_IMAGE" ] || issues+=("unreadable KERNEL_IMAGE: $KERNEL_IMAGE")
+  elif [ -n "$KERNEL_MANIFOLD_PATH" ]; then
+    command -v manifold >/dev/null 2>&1 || \
+      issues+=("missing manifold for QEMU_KERNEL_MANIFOLD_PATH")
+  elif [ -n "$KERNEL_URL" ]; then
+    command -v curl >/dev/null 2>&1 || \
+      issues+=("missing curl for QEMU_KERNEL_URL")
+  else
+    issues+=("no kernel source; set KERNEL_IMAGE, QEMU_KERNEL_URL, or QEMU_KERNEL_MANIFOLD_PATH")
+  fi
+
+  [[ $KERNEL_SHA256 =~ ^[0-9a-f]{64}$ ]] || \
+    issues+=("QEMU_KERNEL_SHA256 must be a lowercase 64-character SHA-256")
+
+  if [ "${#issues[@]}" -ne 0 ]; then
+    printf 'QEMU demo dependency check failed (%d issues):\n' \
+      "${#issues[@]}" >&2
+    for issue in "${issues[@]}"; do
+      printf '  - %s\n' "$issue" >&2
+    done
+    printf '\nDebian/Ubuntu: sudo apt install python3 qemu-system-x86 qemu-utils busybox-static cpio gzip curl file\n' >&2
+    printf 'Fedora: sudo dnf install python3 qemu-system-x86-core qemu-img busybox cpio gzip curl file\n' >&2
+    printf 'CentOS/RHEL: install qemu-kvm-core, qemu-img, and EPEL busybox; set QEMU_BIN and BUSYBOX if their paths differ.\n' >&2
+    return 1
+  fi
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    echo 'QEMU dependency check passed: qemu-system-x86_64 qemu-img python3 static-busybox file cpio gzip sha256sum kernel-source'
+  fi
+}
+
+preflight || exit 1
+[ "$CHECK_ONLY" -eq 0 ] || exit 0
 
 mkdir -p "$ARTIFACT_DIR" "$HERMIT_REPO/target"
 
@@ -64,22 +128,18 @@ if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
     [ -r "$KERNEL_IMAGE" ] || fail "unreadable KERNEL_IMAGE: $KERNEL_IMAGE"
     cp "$KERNEL_IMAGE" "$kernel_tmp"
     kernel_source="$KERNEL_IMAGE"
-  elif [ -n "$KERNEL_URL" ]; then
-    command -v curl >/dev/null 2>&1 || \
-      fail "curl is required to download QEMU_KERNEL_URL"
-    echo 'Downloading kernel...'
-    curl --fail --location --silent --show-error \
-      "$KERNEL_URL" --output "$kernel_tmp" || \
-      fail "kernel download failed: $KERNEL_URL"
-    kernel_source="$KERNEL_URL"
   elif [ -n "$KERNEL_MANIFOLD_PATH" ]; then
-    command -v manifold >/dev/null 2>&1 || \
-      fail "manifold is required for QEMU_KERNEL_MANIFOLD_PATH"
     echo 'Downloading kernel from configured artifact storage...'
     manifold --quiet get --threads 20 \
       "$KERNEL_MANIFOLD_PATH" "$kernel_tmp" >/dev/null 2>&1 || \
       fail "kernel download failed from configured artifact storage"
     kernel_source="configured artifact storage"
+  elif [ -n "$KERNEL_URL" ]; then
+    echo 'Downloading kernel...'
+    curl --fail --location --silent --show-error \
+      "$KERNEL_URL" --output "$kernel_tmp" || \
+      fail "kernel download failed: $KERNEL_URL"
+    kernel_source="$KERNEL_URL"
   else
     fail "set KERNEL_IMAGE, QEMU_KERNEL_URL, or QEMU_KERNEL_MANIFOLD_PATH"
   fi
