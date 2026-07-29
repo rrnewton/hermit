@@ -91,7 +91,10 @@ def main() -> int:
     # of runs can boot QEMU concurrently without sharing sockets, disks, or logs.
     run_dir = make_temp_result_dir(ASSETS, "boot")
     qmp_socket = run_dir / "qmp.sock"
-    serial_socket = run_dir / "serial.sock"
+    # Boot backs the serial console with a `-serial file:` transcript, not a unix
+    # socket: a socket chardev adds a host-timing-driven pollable fd that starves
+    # the -icount vCPU under `hermit --no-rcb-time` (the 600s boot timeout). QEMU
+    # writes this file directly and the controller tails it for boot markers.
     serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
     snapshot_disk = (
@@ -117,7 +120,7 @@ def main() -> int:
         qemu_argv = build_qemu_command(
             QEMU,
             qmp_socket,
-            serial_socket,
+            serial_log,
             snapshot_disk,
             ASSETS / "bzImage",
             ASSETS / "initramfs.cpio.gz",
@@ -139,8 +142,6 @@ def main() -> int:
             QEMU,
             "--qmp-socket",
             str(qmp_socket),
-            "--serial-socket",
-            str(serial_socket),
             "--serial-log",
             str(serial_log),
             "--disk",
@@ -171,7 +172,12 @@ def main() -> int:
                 env=environment,
                 cwd=str(ROOT),
             )
-            return_code = wait_for_process(process, TIMEOUT, stream_path=serial_log)
+            return_code = wait_for_process(
+                process,
+                TIMEOUT,
+                stream_path=serial_log,
+                first_output_label="Waiting for first serial line",
+            )
         if return_code != 0:
             raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
         if not snapshot_exists(snapshot_disk, SNAPSHOT_NAME):
@@ -228,10 +234,10 @@ def main() -> int:
                 "serial_sha256": hash_file(serial_log),
             },
         )
-        # Remove the run's sockets before publishing so they never pollute the
-        # anchor (or the archived run) directory.
-        for socket_path in (qmp_socket, serial_socket):
-            socket_path.unlink(missing_ok=True)
+        # Remove the run's QMP socket before publishing so it never pollutes the
+        # anchor (or the archived run) directory. (Serial is a file, not a
+        # socket, and lives on as the transcript.)
+        qmp_socket.unlink(missing_ok=True)
         # Drop the working snapshot copy before publishing: the archived
         # boot-snapshot.qcow2 plus the metadata's qcow2_sha256 retain everything
         # needed, so keeping it too would double the per-run disk footprint. An
@@ -278,8 +284,7 @@ def main() -> int:
         return 1 if result == "PARTIAL" else 0
     finally:
         stop_process(process)
-        for socket_path in (qmp_socket, serial_socket):
-            socket_path.unlink(missing_ok=True)
+        qmp_socket.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
