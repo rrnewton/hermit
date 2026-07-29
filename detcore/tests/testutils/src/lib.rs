@@ -82,6 +82,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
@@ -154,6 +155,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
@@ -226,6 +228,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,
