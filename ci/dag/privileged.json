@@ -47,8 +47,8 @@
       "desc": "Prepare every CI-enabled privileged manifest guest",
       "cmd": "./ci/test_harness.sh build --lane privileged --ci-only",
       "deps": ["e2e.metadata"],
-      "timeout": 60,
-      "hint": {"est_duration_s": 20,
+      "timeout": 90,
+      "hint": {"est_duration_s": 75,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "cpu-bound"}
     },
