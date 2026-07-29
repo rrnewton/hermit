@@ -14,7 +14,7 @@ BOOT_SNAPSHOT := $(QEMU_ASSETS)/hermit-boot.qcow2
 DEMO6_COMMAND ?= uname -a
 PROCESS_DEMOS := demo1 demo2 demo3 demo4
 QEMU_DEMOS := demo5 demo6
-DEMO_TARGETS := $(PROCESS_DEMOS) $(QEMU_DEMOS) demo7
+DEMO_TARGETS := $(PROCESS_DEMOS) $(QEMU_DEMOS) demo7 demo8
 
 .PHONY: $(DEMO_TARGETS) all clean distclean help process-prereqs \
 	qemu-prereqs drgn-prereqs test
@@ -24,7 +24,8 @@ help:
 	@echo "make demo5           Ensure the reusable Linux boot snapshot exists."
 	@echo "make demo6           Restore it and run DEMO6_COMMAND='uname -a'."
 	@echo "make demo7           Ensure demo5's snapshot exists, then run drgn."
-	@echo "make all             Run every checked-in demo (1-7) in order."
+	@echo "make demo8           Chaos-reproduce the btrfs-convert UAF (skips w/o assets)."
+	@echo "make all             Run every checked-in demo (1-8) in order."
 	@echo "make clean           Wipe computed results, including the snapshot."
 	@echo "make distclean       Also remove downloaded kernel/initramfs blobs."
 	@echo "make test            Run fast, hermetic unit tests (no QEMU)."
@@ -75,6 +76,12 @@ demo7: $(BOOT_SNAPSHOT) | drgn-prereqs
 	@QEMU_ASSETS="$(QEMU_ASSETS)" \
 		DEMO07_SNAPSHOT_DISK="$(BOOT_SNAPSHOT)" \
 		"$(DEMO_DIR)07-drgn-kernel.sh"
+
+# Demo 8 gates on prebuilt ASAN btrfs-convert assets in the ignored asset
+# directory and prints SKIPPED (exit 0) when they are absent, so it is safe in
+# `all` even though its large binary/image inputs are not checked in.
+demo8: | process-prereqs
+	@"$(DEMO_DIR)08-btrfs-convert-uaf.sh"
 
 # Recursive Make preserves the declared order even when the caller uses -j.
 all:
