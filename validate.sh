@@ -302,15 +302,15 @@ fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 # The compatibility corpus contains semantic workloads only. Banner-only wget,
 # netcat, socat, and sensors probes were removed when the E2E harness landed.
-readonly STRICT_COMPAT_TOTAL=191
+readonly STRICT_COMPAT_TOTAL=195
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=144
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=198
-readonly SABRE_COMPAT_TOTAL=198
+readonly SABRE_COMPAT_EXPECTED=202
+readonly SABRE_COMPAT_TOTAL=202
 readonly E9PATCH_COMPAT_TOTAL=155
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
@@ -2004,6 +2004,24 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ls /usr/bin/ls -1 README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Expand temporary paths and substitutions inside the guest shell.
+    # shellcheck disable=SC2016
+    if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
+        strict_compatibility_probe dir bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; touch "$d/b" "$d/a"; output=$(/usr/bin/dir -1 "$d"); test "$output" = $'\''a\nb'\''; printf "dir:%s\n" "${output//$'\''\n'\''/,}"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        # Keep the two child processes file-backed. SaBRe's tracked pipe-read
+        # gap can otherwise surface as EAGAIN before awk consumes vdir output.
+        strict_compatibility_probe vdir bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; touch -t 200001010000 "$d/b" "$d/a"; /usr/bin/vdir --time-style=+%s "$d" >"$d/listing"; output=$(/usr/bin/awk '\''NR > 1 && $NF != "listing" { print $NF }'\'' "$d/listing"); test "$output" = $'\''a\nb'\''; printf "vdir:%s\n" "${output//$'\''\n'\''/,}"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe link bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf payload >"$d/source"; /usr/bin/link "$d/source" "$d/hard"; /usr/bin/cmp "$d/source" "$d/hard"; links=$(stat -c %h "$d/source"); test "$links" = 2; printf "link:hardlinks=%s\n" "$links"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe unlink bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf payload >"$d/file"; /usr/bin/unlink "$d/file"; test ! -e "$d/file"; printf "unlink:removed\n"' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     functional_compatibility_probe xargs bash -c \
         'printf "one\ntwo\n" | /usr/bin/xargs -n1 /bin/echo' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
