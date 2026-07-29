@@ -1986,13 +1986,19 @@ impl Scheduler {
                 self.run_queue
                     .tentative_pop_tid(child)
                     .expect("vfork child disappeared from run queue")
-            } else if self.sched_heuristic == SchedHeuristic::MinVtime {
+            } else if matches!(
+                self.sched_heuristic,
+                SchedHeuristic::MinVtime | SchedHeuristic::MinVtimeAllTurns
+            ) {
                 // EXPERIMENTAL (branch-only prototype,
                 // study-min-vtime-scheduler-alternatives): pick the runnable thread
                 // with the least accumulated deterministic vruntime (ties broken by
                 // canonical DetTid). Selection happens here at the scheduler level
                 // rather than inside the run queue because vruntime lives on the
-                // Scheduler. vfork barriers still take precedence above.
+                // Scheduler. vfork barriers still take precedence above. Both the
+                // deterministic `MinVtime` and the live-but-nondeterministic
+                // `MinVtimeAllTurns` control variant share this selection rule; they
+                // differ only in which turns are charged in `step6_reenquue`.
                 let chosen = self
                     .min_vtime_pick()
                     .expect("run_queue nonempty but min_vtime_pick found nothing");
@@ -2576,11 +2582,20 @@ impl Scheduler {
         // A thread that spins on `sched_yield` while waiting must advance its clock, or
         // (per Kendo's nested-lock deadlock, ASPLOS'09 Fig.3) it stays the global minimum
         // forever and monopolizes selection -- the livelock this variant otherwise hits.
-        // We EXCLUDE `is_polling` (InternalIOPolling retry) turns: their *count* is
-        // host-timing nondeterministic, so charging them would leak nondeterminism into
-        // selection. That exclusion is exactly why this variant cannot schedule
-        // polling-based blocking (make -jN jobserver/wait4) fairly; see the study ai_doc.
-        if self.sched_heuristic == SchedHeuristic::MinVtime && !is_polling {
+        // `MinVtime` EXCLUDES `is_polling` (InternalIOPolling retry) turns: their
+        // *count* is host-timing nondeterministic, so charging them would leak
+        // nondeterminism into selection. That exclusion is exactly why `MinVtime`
+        // cannot schedule polling-based blocking (make -jN jobserver/wait4) fairly;
+        // see the study ai_doc. `MinVtimeAllTurns` is the complementary control that
+        // charges polling turns too: it stays live (the poller cedes selection) but
+        // becomes nondeterministic under --verify -- proving the tradeoff is
+        // fundamental, not an artifact of one charging choice.
+        let charge = match self.sched_heuristic {
+            SchedHeuristic::MinVtime => !is_polling,
+            SchedHeuristic::MinVtimeAllTurns => true,
+            _ => false,
+        };
+        if charge {
             let base = self
                 .vruntime
                 .values()

@@ -793,6 +793,9 @@ impl fmt::Display for Config {
             SchedHeuristic::MinVtime => {
                 write!(f, " --sched-heuristic=minvtime")?;
             }
+            SchedHeuristic::MinVtimeAllTurns => {
+                write!(f, " --sched-heuristic=minvtime-allturns")?;
+            }
         }
         if let Some(s) = self.sched_seed {
             write!(f, " --sched-seed={}", s)?;
@@ -957,6 +960,16 @@ pub enum SchedHeuristic {
     /// scheduled -- the structural starvation-freedom property. This is a
     /// research variant; NOT wired into chaos/replay and NOT for landing.
     MinVtime,
+    /// EXPERIMENTAL (branch-only prototype, study-min-vtime-scheduler-alternatives):
+    /// The complementary "control" variant to `MinVtime`. Identical selection
+    /// (argmin vruntime, tie-break DetTid), but charges vruntime on EVERY
+    /// committed turn, INCLUDING host-timed InternalIOPolling retries. This
+    /// intentionally trades determinism for liveness: a busy poller's vruntime
+    /// now climbs on each retry, so it cedes selection and `make -jN` no longer
+    /// livelocks -- but the per-turn count is a host-timing channel, so
+    /// `--verify` diverges. It exists only to empirically bracket the
+    /// determinism-vs-poller-liveness tradeoff. NOT for landing.
+    MinVtimeAllTurns,
     // TODO: make all sleeps "instant".
 }
 
@@ -971,8 +984,9 @@ impl FromStr for SchedHeuristic {
             "random" => Ok(SchedHeuristic::Random),
             "stickyrandom" => Ok(SchedHeuristic::StickyRandom),
             "minvtime" | "minvruntime" | "cfs" => Ok(SchedHeuristic::MinVtime),
+            "minvtime-allturns" | "minvtime-live" => Ok(SchedHeuristic::MinVtimeAllTurns),
             _ => Err(format!(
-                "Expected None|ConnectBind|Random|StickyRandom|MinVtime, could not parse: {:?}",
+                "Expected None|ConnectBind|Random|StickyRandom|MinVtime|MinVtimeAllTurns, could not parse: {:?}",
                 s
             )),
         }
