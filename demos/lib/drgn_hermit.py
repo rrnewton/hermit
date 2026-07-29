@@ -418,7 +418,8 @@ class HermitGuestProgram:
         self._process_group = os.getpgid(self._process.pid)
         self._qmp = QmpClient.connect(qmp_socket, self._process, self.config.timeout)
         self._serial = _connect_serial(serial_socket, self._process, self.config.timeout)
-        if self._qmp.status() != "paused":
+        initial_status = self._qmp.status()
+        if initial_status not in ("paused", "prelaunch"):
             self._qmp.execute("stop")
             if self._qmp.status() != "paused":
                 raise RuntimeError("QEMU did not start with guest CPUs paused")
