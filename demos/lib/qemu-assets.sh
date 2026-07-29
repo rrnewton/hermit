@@ -17,6 +17,9 @@ PYTHON="${QEMU_DEMO_PYTHON:-$(command -v python3 || true)}"
 INITRAMFS_VERSION=3
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 CHECK_ONLY=0
+# Bounds for the direct-connectivity smoke test in fetch_url (seconds).
+FETCH_CONNECT_TIMEOUT="${QEMU_FETCH_CONNECT_TIMEOUT:-10}"
+FETCH_PROBE_TIMEOUT="${QEMU_FETCH_PROBE_TIMEOUT:-20}"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -39,6 +42,40 @@ available_executable() {
     */*) [ -x "$1" ] ;;
     *) command -v "$1" >/dev/null 2>&1 ;;
   esac
+}
+
+# Download a URL to a file, portably across open-internet and proxied networks.
+# Strategy, in order:
+#   1. Smoke-test a direct connection to the asset host (a lightweight, bounded
+#      HEAD request).
+#   2. If the direct probe succeeds, download directly (external machines, and
+#      any host whose environment already routes to the internet).
+#   3. If the direct probe fails but an optional `with-proxy` helper is on PATH,
+#      retry the whole fetch through it (networks that require an egress proxy).
+#   4. Otherwise fail with actionable guidance.
+# No network-specific details are hardcoded: the only environment assumption is
+# probing for an optional `with-proxy` command. curl additionally honors any
+# http_proxy / https_proxy / ALL_PROXY variables already present in either the
+# direct or the with-proxy attempt.
+fetch_url() {
+  local url="$1" out="$2"
+
+  if curl --fail --location --silent --show-error --head \
+       --connect-timeout "$FETCH_CONNECT_TIMEOUT" \
+       --max-time "$FETCH_PROBE_TIMEOUT" \
+       "$url" -o /dev/null 2>/dev/null; then
+    curl --fail --location --silent --show-error "$url" --output "$out"
+    return $?
+  fi
+
+  if command -v with-proxy >/dev/null 2>&1; then
+    echo '  direct connection failed; retrying through with-proxy...' >&2
+    with-proxy curl --fail --location --silent --show-error \
+      "$url" --output "$out"
+    return $?
+  fi
+
+  fail "cannot reach $url: direct connection failed and no 'with-proxy' helper is on PATH. Set http(s)_proxy for your network, or provide the kernel locally via KERNEL_IMAGE=/path/to/bzImage or QEMU_KERNEL_MANIFOLD_PATH."
 }
 
 preflight() {
@@ -136,8 +173,7 @@ if [ "$cached_kernel_sha" != "$KERNEL_SHA256" ]; then
     kernel_source="configured artifact storage"
   elif [ -n "$KERNEL_URL" ]; then
     echo 'Downloading kernel...'
-    curl --fail --location --silent --show-error \
-      "$KERNEL_URL" --output "$kernel_tmp" || \
+    fetch_url "$KERNEL_URL" "$kernel_tmp" || \
       fail "kernel download failed: $KERNEL_URL"
     kernel_source="$KERNEL_URL"
   else
