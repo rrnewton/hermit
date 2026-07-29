@@ -1112,11 +1112,6 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
-    /// Scheduler registration identity assigned when this thread starts. A raw Linux TID may be
-    /// reused after exit, so resource RPCs include this generation to reject delayed messages.
-    #[serde(default)]
-    pub(crate) scheduler_registration_generation: u64,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -1466,7 +1461,6 @@ impl<T> ThreadState<T> {
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
-            scheduler_registration_generation: 0,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
