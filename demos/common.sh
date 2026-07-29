@@ -44,7 +44,11 @@ else
       ;;
     all)
       make --no-print-directory -s -C "$ROOT" check-deps
-      ( cd "$HERMIT_REPO" && cargo build --release && cargo build )
+      ( cd "$HERMIT_REPO" && \
+        cargo build --release -p hermit --bin hermit --no-default-features && \
+        cargo build -p hermit --bin hermit --no-default-features && \
+        cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race && \
+        cargo build -p hermetic_infra_hermit_tests --bin rustbin_heap_ptrs )
       ;;
     *)
       echo "ERROR: unsupported DEMO_BUILD_MODE: $DEMO_BUILD_MODE" >&2
