@@ -56,6 +56,7 @@ use tracing::trace;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
+use crate::config::SchedHeuristic;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -291,6 +292,23 @@ pub struct Scheduler {
 
     /// The logical, global time consumed by actions that have been committed already.
     pub committed_time: LogicalTime,
+
+    /// EXPERIMENTAL (branch-only prototype, study-min-vtime-scheduler-alternatives):
+    /// The configured scheduling heuristic, copied here so the scheduler loop can
+    /// dispatch min-vtime selection at `step3_peek` without reaching into the run
+    /// queue's private strategy field.
+    sched_heuristic: SchedHeuristic,
+
+    /// EXPERIMENTAL (branch-only prototype): per-thread accumulated *deterministic*
+    /// virtual runtime, used only when `sched_heuristic == MinVtime`. Charged one
+    /// deterministic scheduler tick per committed, non-polling progress turn to the
+    /// thread that ran (see `bump_global_time`). A blocked thread's vruntime freezes
+    /// while runnable siblings advance, so on wakeup it becomes the minimum and is
+    /// selected next -- the structural starvation-freedom property. BTreeMap for
+    /// deterministic iteration/printing. NOT charged from raw `committed_time`
+    /// deltas on purpose: those include host-timing-perturbed IO-polling retry
+    /// advances (see `bump_global_time`), which would make selection nondeterministic.
+    vruntime: BTreeMap<DetTid, LogicalTime>,
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
@@ -815,7 +833,8 @@ pub async fn do_a_turn_blocking(
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
         let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-        mg.step6_reenquue(next_dtid, sched_yield);
+        let is_polling = Scheduler::is_polling_turn(&rsrcs);
+        mg.step6_reenquue(next_dtid, sched_yield, is_polling);
         if let Some(call) = rsrcs.as_exit_syscall() {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -942,6 +961,8 @@ impl Scheduler {
             next_turns: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
+            sched_heuristic: cfg.sched_heuristic,
+            vruntime: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
@@ -1891,6 +1912,45 @@ impl Scheduler {
     /// Return `None` if the queue is empty.
     ///
     /// This is a "peek" in the sense that it leaves the thread in the run queue.
+    /// EXPERIMENTAL (branch-only prototype, study-min-vtime-scheduler-alternatives):
+    /// among the currently-runnable threads, return the one with the least
+    /// accumulated deterministic vruntime, breaking ties by canonical DetTid so the
+    /// choice is a pure function of committed state. A thread not yet in `vruntime`
+    /// is treated as sitting at the current minimum vruntime (fair placement). This
+    /// is a read-only computation safe to call before a tentative pop.
+    fn min_vtime_pick(&mut self) -> Option<DetTid> {
+        // Baseline is the minimum vruntime among currently-runnable threads (the
+        // CFS min_vruntime), so stale entries for exited threads cannot drag it down.
+        let base = self
+            .run_queue
+            .tids()
+            .filter_map(|t| self.vruntime.get(t).copied())
+            .min()
+            .unwrap_or(LogicalTime::ZERO);
+        // Freeze a newcomer's vruntime at the current minimum EXACTLY ONCE (CFS-style
+        // fair placement). Without this, a not-yet-run thread would be re-evaluated as
+        // `base` on every call, and `base` tracks the running thread's ever-growing
+        // vruntime -- so the newcomer stays perpetually TIED with the runner and loses
+        // the DetTid tie-break forever (the observed livelock: a spinning parent starves
+        // a freshly-cloned worker). Persisting the entry lets the runner's clock climb
+        // past the frozen newcomer, which then becomes the strict minimum and is
+        // scheduled. This snapshot is deterministic: `base` and the admission point are
+        // both pure functions of the committed turn sequence.
+        let newcomers: Vec<DetTid> = self
+            .run_queue
+            .tids()
+            .filter(|t| !self.vruntime.contains_key(t))
+            .copied()
+            .collect();
+        for t in newcomers {
+            self.vruntime.insert(t, base);
+        }
+        self.run_queue
+            .tids()
+            .copied()
+            .min_by_key(|tid| (self.vruntime.get(tid).copied().unwrap_or(base), *tid))
+    }
+
     fn step3_peek(&mut self) -> Option<(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>)> {
         debug!(
             "[sched-step3] Stepping scheduler, queue len {}, current turn {}, committed_time {}",
@@ -1916,9 +1976,7 @@ impl Scheduler {
         if self.run_queue.is_empty() {
             None
         } else {
-            let next_dtid = if self.vfork_barriers.is_empty() {
-                self.run_queue.tentative_pop_next().expect("impossible")
-            } else {
+            let next_dtid = if !self.vfork_barriers.is_empty() {
                 let child = self
                     .vfork_barriers
                     .values()
@@ -1928,6 +1986,21 @@ impl Scheduler {
                 self.run_queue
                     .tentative_pop_tid(child)
                     .expect("vfork child disappeared from run queue")
+            } else if self.sched_heuristic == SchedHeuristic::MinVtime {
+                // EXPERIMENTAL (branch-only prototype,
+                // study-min-vtime-scheduler-alternatives): pick the runnable thread
+                // with the least accumulated deterministic vruntime (ties broken by
+                // canonical DetTid). Selection happens here at the scheduler level
+                // rather than inside the run queue because vruntime lives on the
+                // Scheduler. vfork barriers still take precedence above.
+                let chosen = self
+                    .min_vtime_pick()
+                    .expect("run_queue nonempty but min_vtime_pick found nothing");
+                self.run_queue
+                    .tentative_pop_tid(chosen)
+                    .expect("min-vtime choice disappeared from run queue")
+            } else {
+                self.run_queue.tentative_pop_next().expect("impossible")
             };
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
@@ -2361,6 +2434,10 @@ impl Scheduler {
                         "[sched] advance global time for scheduler turn, new time {:?}",
                         newtime,
                     );
+                    // NB (study-min-vtime-scheduler-alternatives): virtual-runtime
+                    // charging for the MinVtime heuristic now happens in
+                    // `step6_reenquue`, the single per-committed-turn commit point, so
+                    // that sched_yield cedes also advance the yielding thread's clock.
                 }
             }
             gtime.as_nanos()
@@ -2486,11 +2563,33 @@ impl Scheduler {
     }
 
     /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool) {
+    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool, is_polling: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
         let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
         assert_eq!(next_dtid, dt2);
+        // EXPERIMENTAL (branch-only prototype, study-min-vtime-scheduler-alternatives):
+        // charge one deterministic tick of virtual runtime to the thread that just
+        // completed a committed turn. We charge here (the single per-committed-turn
+        // commit point) rather than in `bump_global_time` so that *every* deterministic
+        // turn a thread takes -- including a `sched_yield` cede -- advances its vruntime.
+        // A thread that spins on `sched_yield` while waiting must advance its clock, or
+        // (per Kendo's nested-lock deadlock, ASPLOS'09 Fig.3) it stays the global minimum
+        // forever and monopolizes selection -- the livelock this variant otherwise hits.
+        // We EXCLUDE `is_polling` (InternalIOPolling retry) turns: their *count* is
+        // host-timing nondeterministic, so charging them would leak nondeterminism into
+        // selection. That exclusion is exactly why this variant cannot schedule
+        // polling-based blocking (make -jN jobserver/wait4) fairly; see the study ai_doc.
+        if self.sched_heuristic == SchedHeuristic::MinVtime && !is_polling {
+            let base = self
+                .vruntime
+                .values()
+                .min()
+                .copied()
+                .unwrap_or(LogicalTime::ZERO);
+            let e = self.vruntime.entry(next_dtid).or_insert(base);
+            *e = *e + LogicalTime::from_nanos(1);
+        }
         // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
         // queue placement is transient, so persistent priorities remain unchanged.
         let pos = if sched_yield {

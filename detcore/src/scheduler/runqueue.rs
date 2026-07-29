@@ -416,7 +416,10 @@ impl RunQueue {
             .yielded_skip
             .filter(|tid| self.queue.len() > 1 && self.contains_tid(*tid));
         self.tentative_selection = match self.sched_strategy {
-            SchedHeuristic::None | SchedHeuristic::ConnectBind => self
+            // MinVtime performs its selection at the scheduler level (step3_peek)
+            // via `tentative_pop_tid`, so this heuristic path only serves as a
+            // safe fallback; it behaves like the deterministic first-in-order pick.
+            SchedHeuristic::None | SchedHeuristic::ConnectBind | SchedHeuristic::MinVtime => self
                 .queue
                 .values()
                 .find(|value| Some(value.tid) != skip)
@@ -501,7 +504,10 @@ impl RunQueue {
             self.queue.remove(&key).map(|value| value.tid)
         } else {
             match self.sched_strategy {
-                SchedHeuristic::None | SchedHeuristic::ConnectBind | SchedHeuristic::Random => {
+                SchedHeuristic::None
+                | SchedHeuristic::ConnectBind
+                | SchedHeuristic::Random
+                | SchedHeuristic::MinVtime => {
                     let key = *self
                         .queue
                         .iter()

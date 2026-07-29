@@ -790,6 +790,9 @@ impl fmt::Display for Config {
             SchedHeuristic::StickyRandom => {
                 write!(f, " --sched-heuristic=stickyrandom")?;
             }
+            SchedHeuristic::MinVtime => {
+                write!(f, " --sched-heuristic=minvtime")?;
+            }
         }
         if let Some(s) = self.sched_seed {
             write!(f, " --sched-seed={}", s)?;
@@ -946,6 +949,14 @@ pub enum SchedHeuristic {
     /// and after the thread is parked, randomly choose if we will continue
     /// executing on the same thread, or picking another one.
     StickyRandom,
+    /// EXPERIMENTAL (branch-only prototype, study-min-vtime-scheduler-alternatives):
+    /// Completely-fair min-virtual-time selection. Among the runnable threads,
+    /// always pick the one with the least accumulated deterministic vruntime
+    /// (ties broken by canonical DetTid). A blocked thread's vruntime freezes
+    /// while others advance, so on wakeup it is the minimum and must be
+    /// scheduled -- the structural starvation-freedom property. This is a
+    /// research variant; NOT wired into chaos/replay and NOT for landing.
+    MinVtime,
     // TODO: make all sleeps "instant".
 }
 
@@ -959,8 +970,9 @@ impl FromStr for SchedHeuristic {
             "connectbind" => Ok(SchedHeuristic::ConnectBind),
             "random" => Ok(SchedHeuristic::Random),
             "stickyrandom" => Ok(SchedHeuristic::StickyRandom),
+            "minvtime" | "minvruntime" | "cfs" => Ok(SchedHeuristic::MinVtime),
             _ => Err(format!(
-                "Expected None|ConnectBind|Random|StickyRandom, could not parse: {:?}",
+                "Expected None|ConnectBind|Random|StickyRandom|MinVtime, could not parse: {:?}",
                 s
             )),
         }
