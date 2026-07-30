@@ -12,18 +12,29 @@ if (( $# != 3 )); then
 fi
 
 liteinst_profile=$1
-liteinst_stable_stage=$(realpath -m -- "$2")
+liteinst_stable_input=$2
 liteinst_target_dir=$(realpath -m -- "$3")
-liteinst_stage_dir=$(dirname -- "$liteinst_stable_stage")
-liteinst_stage_name=$(basename -- "$liteinst_stable_stage")
+liteinst_stage_dir=$(dirname -- "$liteinst_stable_input")
+liteinst_stage_name=$(basename -- "$liteinst_stable_input")
+
+if [[ -z $liteinst_stable_input || $liteinst_stage_name == . || $liteinst_stage_name == / ]]; then
+    echo "Stable LiteInst runtime path must name a file: $liteinst_stable_input" >&2
+    exit 2
+fi
 
 mkdir -p -- "$liteinst_stage_dir"
-liteinst_temp_stage=$(
-    mktemp --tmpdir="$liteinst_stage_dir" ".${liteinst_stage_name}.stage.XXXXXX"
+liteinst_stage_dir=$(realpath -e -- "$liteinst_stage_dir")
+liteinst_stable_stage=$liteinst_stage_dir/$liteinst_stage_name
+liteinst_temp_dir=$(
+    mktemp -d --tmpdir="$liteinst_stage_dir" ".${liteinst_stage_name}.stage.XXXXXX"
 )
+liteinst_temp_stage=$liteinst_temp_dir/runtime.so
 cleanup_liteinst_temp_stage() {
     if [[ -n ${liteinst_temp_stage:-} ]]; then
         rm -f -- "$liteinst_temp_stage"
+    fi
+    if [[ -n ${liteinst_temp_dir:-} ]]; then
+        rmdir -- "$liteinst_temp_dir"
     fi
 }
 trap cleanup_liteinst_temp_stage EXIT
@@ -43,3 +54,5 @@ fi
 # It is adjacent to the stable path, so this rename is an atomic replacement.
 mv -fT -- "$liteinst_temp_stage" "$liteinst_stable_stage"
 liteinst_temp_stage=
+rmdir -- "$liteinst_temp_dir"
+liteinst_temp_dir=

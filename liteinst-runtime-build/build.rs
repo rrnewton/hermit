@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -55,6 +57,24 @@ fn has_preload_constructor(path: &Path) -> io::Result<bool> {
         .iter()
         .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
     Ok(relocated || direct)
+}
+
+fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut source_file = File::open(source)?;
+    let source_permissions = source_file.metadata()?.permissions();
+    let mut destination_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    if !destination_file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LiteInst stage is not a regular file",
+        ));
+    }
+    io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.set_permissions(source_permissions)?;
+    destination_file.sync_all()
 }
 
 fn main() {
@@ -124,19 +144,7 @@ fn main() {
         "current LiteInst artifact lacks the preload constructor: {}",
         candidates[0].display()
     );
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .unwrap_or_else(|error| panic!("failed to create {}: {error}", parent.display()));
-    }
-    if fs::symlink_metadata(&destination).is_ok() {
-        fs::remove_file(&destination).unwrap_or_else(|error| {
-            panic!(
-                "failed to replace existing LiteInst stage {}: {error}",
-                destination.display()
-            )
-        });
-    }
-    fs::copy(&candidates[0], &destination).unwrap_or_else(|error| {
+    copy_into_protected_stage(&candidates[0], &destination).unwrap_or_else(|error| {
         panic!(
             "failed to stage {} as {}: {error}",
             candidates[0].display(),
