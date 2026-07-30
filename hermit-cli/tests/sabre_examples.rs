@@ -1,0 +1,162 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
+
+const NON_RACY_EXAMPLES: [&str; 4] = ["date.sh", "devrand.sh", "rand.py", "timed-progress-bar.py"];
+
+fn hermit_binary() -> PathBuf {
+    std::env::var_os("HERMIT_SABRE_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_hermit")))
+}
+
+fn sabre_loader() -> Option<PathBuf> {
+    let hermit = hermit_binary();
+    let executable_dir = hermit.parent().expect("Hermit binary should have a parent");
+    let target_dir = executable_dir
+        .parent()
+        .expect("Hermit binary should be inside a profile directory");
+    let configured = std::env::var_os("HERMIT_SABRE_BINARY").map(PathBuf::from);
+    let loader = configured
+        .clone()
+        .unwrap_or_else(|| target_dir.join("sabre/sabre"));
+    let plugin = executable_dir.join("libdetcore_sabre.so");
+    if loader.is_file() && plugin.is_file() {
+        return Some(loader);
+    }
+    if configured.is_some() {
+        panic!(
+            "configured SaBRe artifacts are unavailable: loader={}, plugin={}",
+            loader.display(),
+            plugin.display(),
+        );
+    }
+    eprintln!(
+        "skipping SaBRe example parity: artifacts are unavailable: loader={}, plugin={}",
+        loader.display(),
+        plugin.display(),
+    );
+    None
+}
+
+fn kill_process_group(pid: u32, label: &str) {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            panic!("failed to kill {label} process group {pid}: {error}");
+        }
+    }
+}
+
+fn run_bounded(mut command: Command, label: &str) -> Output {
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let rendered = format!("{command:?}");
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() >= Duration::from_secs(45) => {
+                kill_process_group(child.id(), label);
+                break true;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                kill_process_group(child.id(), label);
+                let _ = child.wait();
+                panic!("failed to poll {label}: {rendered}: {error}");
+            }
+        }
+    };
+    // Hermit should drain its process tree before exiting. Kill any survivors anyway so leaked
+    // guest processes cannot retain a pipe descriptor and hang `wait_with_output`.
+    kill_process_group(child.id(), label);
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
+    assert!(
+        !timed_out && output.status.success(),
+        "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn example_command(example: &Path, backend: Option<&Path>, verify: bool) -> Command {
+    let mut command = Command::new(hermit_binary());
+    command.arg(if verify { "--log=info" } else { "--log=error" });
+    command.arg("run");
+    if let Some(loader) = backend {
+        command
+            .env("HERMIT_SABRE_BINARY", loader)
+            .args(["--backend", "sabre"]);
+    }
+    command.arg("--strict");
+    if verify {
+        command.arg("--verify");
+    }
+    command.arg("--").arg(example);
+    command
+}
+
+#[test]
+fn sabre_non_racy_examples_verify_and_match_ptrace() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+
+    // race.sh is deliberately outside this ratchet: its output is the schedule itself, and the
+    // in-process backend does not yet serialize arbitrary guest instructions between callbacks.
+    for name in NON_RACY_EXAMPLES {
+        let example = repository.join("examples").join(name);
+        let verify = run_bounded(
+            example_command(&example, Some(&loader), true),
+            &format!("SaBRe strict verification for {name}"),
+        );
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&verify.stdout),
+            String::from_utf8_lossy(&verify.stderr),
+        );
+        assert!(
+            diagnostics.contains("Success: deterministic. Determinism verified."),
+            "SaBRe verifier omitted its success verdict for {name}:\n{diagnostics}",
+        );
+
+        let ptrace = run_bounded(
+            example_command(&example, None, false),
+            &format!("ptrace strict reference for {name}"),
+        );
+        let sabre = run_bounded(
+            example_command(&example, Some(&loader), false),
+            &format!("SaBRe strict parity run for {name}"),
+        );
+        assert_eq!(sabre.status.code(), ptrace.status.code(), "example: {name}");
+        assert_eq!(sabre.stdout, ptrace.stdout, "stdout parity: {name}");
+        assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: {name}");
+    }
+}
