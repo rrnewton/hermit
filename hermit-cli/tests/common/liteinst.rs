@@ -33,13 +33,19 @@ pub(super) fn ensure_liteinst_runtime() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
+        let runtime_build = repository.join("liteinst-runtime-build/Cargo.toml");
+        let runtime_target = target_dir.join("liteinst-runtime-build-a8195cfc");
+        let runtime = profile_dir.join("libreverie_liteinst.so");
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
             .current_dir(repository)
-            .args(["build", "--locked", "-p", "reverie-liteinst", "--profile"])
+            .env("HERMIT_LITEINST_STAGE", &runtime)
+            .args(["build", "--locked", "--manifest-path"])
+            .arg(&runtime_build)
+            .arg("--profile")
             .arg(cargo_profile)
             .arg("--target-dir")
-            .arg(target_dir)
+            .arg(&runtime_target)
             .output()
             .expect("failed to build the LiteInst runtime");
         assert!(
@@ -48,10 +54,9 @@ pub(super) fn ensure_liteinst_runtime() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        let runtime = profile_dir.join("libreverie_liteinst.so");
         assert!(
             runtime.is_file(),
-            "reverie-liteinst build did not create {}",
+            "standalone LiteInst runtime build did not stage {}",
             runtime.display(),
         );
     });

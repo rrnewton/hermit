@@ -255,6 +255,58 @@ fn replace_symlink(destination: &Path, target: &Path) -> io::Result<()> {
     symlink(target, destination)
 }
 
+fn replace_copy(source: &Path, destination: &Path) {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => {
+            panic!(
+                "refusing to replace directory {} with a runtime file",
+                destination.display()
+            )
+        }
+        Ok(_) => fs::remove_file(destination)
+            .unwrap_or_else(|error| panic!("failed to remove {}: {error}", destination.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to inspect {}: {error}", destination.display()),
+    }
+    copy_file(source, destination);
+}
+
+fn build_liteinst_runtime(
+    repository: &Path,
+    build_root: &Path,
+    profile_dir: &Path,
+    resources: &Path,
+) {
+    let manifest = repository.join("liteinst-runtime-build/Cargo.toml");
+    let target = build_root.join("liteinst-runtime-a8195cfc");
+    if target.exists() {
+        fs::remove_dir_all(&target).unwrap_or_else(|error| {
+            panic!(
+                "failed to reset LiteInst build {}: {error}",
+                target.display()
+            )
+        });
+    }
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let runtime = profile_dir.join("libreverie_liteinst.so");
+    run(
+        Command::new(cargo)
+            .current_dir(repository)
+            .env("HERMIT_LITEINST_STAGE", &runtime)
+            .args(["build", "--locked", "--manifest-path"])
+            .arg(&manifest)
+            .args(["--release", "--target-dir"])
+            .arg(&target),
+        "build the constructor-enabled LiteInst runtime",
+    );
+    assert!(
+        runtime.is_file(),
+        "standalone build did not stage {}",
+        runtime.display()
+    );
+    replace_copy(&runtime, &resources.join("libreverie_liteinst.so"));
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
@@ -290,11 +342,7 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    for library in [
-        "libdetcore_dbi.so",
-        "libreverie_liteinst.so",
-        "libdetcore_sabre.so",
-    ] {
+    for library in ["libdetcore_dbi.so", "libdetcore_sabre.so"] {
         replace_symlink(
             &resources.join(library),
             &Path::new("../../release").join(library),
@@ -305,19 +353,18 @@ fn main() {
     let dynamorio_cmake = copy_dynamorio(&resources);
     build_dbi_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
 
+    let repository = manifest_dir
+        .parent()
+        .expect("hermit-install is not inside the Hermit repository");
+    build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
+
     let reverie_root = reverie_dbi::native_client_source_dir()
         .parent()
         .and_then(Path::parent)
         .expect("reverie-dbi source is not inside the Reverie repository");
     build_sabre(reverie_root, &build_root, &resources);
     build_e9patch(reverie_root, &build_root, &resources);
-    copy_licenses(
-        manifest_dir
-            .parent()
-            .expect("hermit-install is not inside the Hermit repository"),
-        reverie_root,
-        &install,
-    );
+    copy_licenses(repository, reverie_root, &install);
 
     replace_symlink(&install.join("hermit"), Path::new("../release/hermit"))
         .unwrap_or_else(|error| panic!("failed to link install_pkg/hermit: {error}"));

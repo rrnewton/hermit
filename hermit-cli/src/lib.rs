@@ -79,6 +79,9 @@ pub use detcore_dbi::reverie_dbi_runtime_totals;
 pub use error::Context;
 pub use error::Error;
 pub use error::SerializableError;
+use goblin::elf::Elf;
+use goblin::elf::header;
+use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
 use record::Record;
@@ -408,23 +411,127 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    let bytes = fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read LiteInst runtime {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let elf = Elf::parse(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} is not an ELF DSO: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} is not an x86-64 shared object",
+                path.display()
+            ),
+        ));
+    }
+
+    let required = [
+        "reverie_liteinst_initialize",
+        "reverie_liteinst_site_trap_count",
+        "reverie_liteinst_site_hook_count",
+    ];
+    for name in required {
+        if !elf
+            .dynsyms
+            .iter()
+            .any(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LiteInst runtime {} is missing required export {name}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let (initializer_index, initializer) = elf
+        .dynsyms
+        .iter()
+        .enumerate()
+        .find(|(_, symbol)| {
+            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
+        })
+        .ok_or_else(|| io::Error::other("checked LiteInst initializer disappeared"))?;
+    let init_array = elf
+        .section_headers
+        .iter()
+        .find(|section| section.sh_type == section_header::SHT_INIT_ARRAY)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LiteInst runtime {} has no constructor array",
+                    path.display()
+                ),
+            )
+        })?;
+    let init_start = init_array.sh_addr;
+    let init_end = init_start.saturating_add(init_array.sh_size);
+    let relocated_initializer = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .any(|relocation| {
+            (init_start..init_end).contains(&relocation.r_offset)
+                && relocation.r_sym == initializer_index
+        });
+    let init_bytes = usize::try_from(init_array.sh_offset)
+        .ok()
+        .and_then(|start| {
+            usize::try_from(init_array.sh_size)
+                .ok()
+                .and_then(|size| bytes.get(start..start.checked_add(size)?))
+        })
+        .unwrap_or_default();
+    let direct_initializer = init_bytes.chunks_exact(8).any(|entry| {
+        u64::from_le_bytes(entry.try_into().expect("eight-byte constructor entry"))
+            == initializer.st_value
+    });
+    if !relocated_initializer && !direct_initializer {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} does not register reverie_liteinst_initialize as a preload constructor",
+                path.display()
+            ),
+        ));
+    }
+    path.canonicalize()
+}
+
 /// Returns the LiteInst preload cdylib produced beside the Hermit binary.
 #[doc(hidden)]
 pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("HERMIT_LITEINST_RUNTIME") {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path).ok_or_else(|| {
-            io::Error::new(
+        if !path.is_file() {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "HERMIT_LITEINST_RUNTIME does not name a regular file",
+            ));
+        }
+        return validate_liteinst_runtime_library(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("HERMIT_LITEINST_RUNTIME is invalid: {error}"),
             )
         });
-    }
-
-    if let Some(path) = hermit_resources::resource("libreverie_liteinst.so")?
-        && path.is_file()
-    {
-        return Ok(path);
     }
 
     let executable = std::env::current_exe()?;
@@ -434,27 +541,33 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
             "Hermit executable has no parent directory",
         )
     })?;
-    [
+    if let Some(path) = [
         directory.join("libreverie_liteinst.so"),
         directory.join("deps/libreverie_liteinst.so"),
     ]
     .into_iter()
     .find(|path| path.is_file())
-    .ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "libreverie_liteinst.so was not built beside {}",
-                executable.display()
-            ),
-        )
-    })
+    {
+        return validate_liteinst_runtime_library(&path);
+    }
+    if let Some(path) = hermit_resources::resource("libreverie_liteinst.so")?
+        && path.is_file()
+    {
+        return validate_liteinst_runtime_library(&path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "libreverie_liteinst.so was not built beside {} or staged as an installed resource",
+            executable.display()
+        ),
+    ))
 }
 
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_runtime_library_path().err().map(|error| {
         format!(
-            "the LiteInst preload runtime is unavailable: {error}; build reverie-liteinst and hermit in the same target directory"
+            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
         )
     })
 }

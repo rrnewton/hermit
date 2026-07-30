@@ -94,7 +94,9 @@ fn strict_verify_with_ptrace_rcb_preemption(program: &Path, args: &[&str]) -> Ou
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("liteinst host hybrid] Detcore Tool active in ptrace host"),
+        stderr.contains(
+            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+        ),
         "{stderr}"
     );
     assert!(

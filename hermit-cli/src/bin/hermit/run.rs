@@ -1437,6 +1437,31 @@ impl RunOpts {
         }
     }
 
+    fn verify_liteinst_activation(&self) -> Result<(), Error> {
+        let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .env(super::LITEINST_ACTIVATION_PROBE_ENV, "1");
+        let output = hermit::run_with_output_backend(
+            command,
+            self.effective_det_config(),
+            false,
+            &None,
+            Backend::Liteinst,
+        )?;
+        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
+        if output.status != ExitStatus::Exited(0) || output.stdout != expected {
+            anyhow::bail!(
+                "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        Ok(())
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -1517,7 +1542,10 @@ impl RunOpts {
         }
 
         if backend == Backend::Liteinst {
-            eprintln!("hermit: [liteinst host hybrid] Detcore Tool active in ptrace host");
+            self.verify_liteinst_activation()?;
+            eprintln!(
+                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            );
         }
 
         if self.no_namespace {
