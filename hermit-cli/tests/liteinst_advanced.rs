@@ -30,6 +30,15 @@ const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
     "e5c4447a0a9f796a0b72bb47875e9879aa7722c74e601385e74058f029ae60cd";
 
+fn group_name_by_gid<'a>(contents: &'a str, gid: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        fields.next()?;
+        (fields.next()? == gid).then_some(name)
+    })
+}
+
 fn advanced_guest() -> &'static Path {
     LITEINST_ADVANCED_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -148,7 +157,15 @@ fn liteinst_strict_verify_virtual_identity_and_time() {
         &[],
         b"hermetic-container.local\n",
     );
-    assert_liteinst_strict_verify(Path::new("/usr/bin/groups"), &[], b"root nobody\n");
+    let group_file = fs::read_to_string("/etc/group").expect("failed to read host group database");
+    let root_group = group_name_by_gid(&group_file, "0").expect("GID 0 should have a name");
+    let overflow_group = group_name_by_gid(&group_file, "65534").unwrap_or("nobody");
+    let expected_groups = format!("{root_group} {overflow_group}\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/groups"),
+        &[],
+        expected_groups.as_bytes(),
+    );
 }
 
 #[test]
