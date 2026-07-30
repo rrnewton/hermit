@@ -392,3 +392,81 @@ fn rdtsc_deltas() {
         true,
     );
 }
+
+// A periodic timerfd is armed and read against detcore's virtual clock (not host
+// wall-clock) when threads are sequentialized and time is virtualized. This is
+// the mechanism that determinizes GHC's RTS context-switch ticker, which is a
+// periodic timerfd whose blocking read() on a dedicated thread drives green-
+// thread preemption. gettime must reflect the virtual arming, and each blocking
+// read must report at least one expiration and return the 8-byte count.
+#[test]
+fn timerfd_periodic_virtual_time() {
+    const PERIOD_NS: i64 = 10_000_000; // 10ms
+
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+            assert!(fd >= 0, "timerfd_create failed: {}", unsafe {
+                *libc::__errno_location()
+            });
+
+            // Arm as a 10ms periodic timer (relative initial expiration).
+            let new = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+            };
+            let rc = unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) };
+            assert_eq!(rc, 0, "timerfd_settime failed");
+
+            // gettime reflects the virtual arming: interval preserved, remaining
+            // in (0, PERIOD].
+            let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+            let rc = unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) };
+            assert_eq!(rc, 0, "timerfd_gettime failed");
+            let cur = unsafe { cur.assume_init() };
+            assert_eq!(cur.it_interval.tv_sec, 0);
+            assert_eq!(cur.it_interval.tv_nsec, PERIOD_NS);
+            let remaining = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
+            assert!(
+                remaining > 0 && remaining <= PERIOD_NS,
+                "unexpected remaining ns: {}",
+                remaining
+            );
+
+            // Three blocking reads: each descheduled as a timed waiter until the
+            // virtual deadline, then reporting at least one expiration.
+            for i in 0..3 {
+                let mut expirations: u64 = 0;
+                let n = unsafe {
+                    libc::read(
+                        fd,
+                        &mut expirations as *mut u64 as *mut libc::c_void,
+                        std::mem::size_of::<u64>(),
+                    )
+                };
+                assert_eq!(n, 8, "timerfd read #{} returned {} bytes", i, n);
+                assert!(
+                    expirations >= 1,
+                    "timerfd read #{} reported {} expirations",
+                    i,
+                    expirations
+                );
+            }
+
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        },
+        config,
+        true,
+    );
+}
