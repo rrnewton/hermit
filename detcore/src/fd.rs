@@ -445,9 +445,9 @@ impl DetFd {
         self.description().sock_diag
     }
 
-    /// Mark this open file as connected to a loopback peer.
-    pub(crate) fn set_loopback_peer(&self) {
-        self.description().loopback_peer = true;
+    /// Update whether this open file is connected to a loopback peer.
+    pub(crate) fn set_loopback_peer(&self, loopback_peer: bool) {
+        self.description().loopback_peer = loopback_peer;
     }
 
     /// Whether this open file is a socket connected to a loopback peer.
@@ -509,10 +509,15 @@ mod tests {
         );
 
         assert!(!original.is_loopback_peer());
-        duplicate.set_loopback_peer();
+        duplicate.set_loopback_peer(true);
         assert!(
             original.is_loopback_peer(),
             "loopback-peer marking through one alias must be visible through every alias"
+        );
+        original.set_loopback_peer(false);
+        assert!(
+            !duplicate.is_loopback_peer(),
+            "reconnects through one alias must clear loopback state for every alias"
         );
     }
 

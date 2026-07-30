@@ -82,6 +82,14 @@ fn zero_timeout_poll_request(dettid: DetTid, yield_to_peer: bool) -> Resources {
     request
 }
 
+fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(Error::Errno(errno)) => *errno == Errno::EINPROGRESS,
+        Err(_) => false,
+    }
+}
+
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
 const PSELECT6_INTERNAL_MAX_NFDS: i32 = (std::mem::size_of::<libc::c_ulong>() * 8) as i32;
 
@@ -1132,36 +1140,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Connect,
     ) -> Result<i64, Error> {
-        let loopback_peer = if let Some(address) = call.uservaddr() {
-            let addrlen = usize::try_from(call.addrlen()).unwrap_or(0);
-            let family = if addrlen >= std::mem::size_of::<u16>() {
-                let family: u16 = guest.memory().read_value(address.cast())?;
-                Some(family)
-            } else {
-                None
-            };
-            if family == Some(libc::AF_INET as u16)
-                && addrlen >= std::mem::size_of::<libc::sockaddr_in>()
-            {
-                let address: libc::sockaddr_in = guest.memory().read_value(address.cast())?;
-                Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).is_loopback()
-            } else if family == Some(libc::AF_INET6 as u16)
-                && addrlen >= std::mem::size_of::<libc::sockaddr_in6>()
-            {
-                let address: libc::sockaddr_in6 = guest.memory().read_value(address.cast())?;
-                Ipv6Addr::from(address.sin6_addr.s6_addr).is_loopback()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
         let fd = call.fd();
-        if loopback_peer {
-            guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.set_loopback_peer())?;
-        }
+        let uservaddr = call.uservaddr();
+        let addrlen = call.addrlen();
 
         if guest.config().sched_heuristic == SchedHeuristic::ConnectBind {
             trace!("Scheduling heuristic: reprioritizing connect");
@@ -1175,7 +1156,55 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, req).await;
         }
 
-        self.execute_nonblockable_fd_syscall(guest, call).await
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        if self.cfg.discover_live_file_metadata
+            && connect_result_allows_peer_classification(&result)
+        {
+            // This metadata is a SaBRe-only scheduling hint, not part of connect's semantics.
+            // Let the kernel establish the authoritative result first, then classify the peer
+            // best-effort so an invalid guest pointer or an untracked fd can never replace the
+            // kernel's errno.
+            let loopback_peer = (|| -> Result<Option<bool>, Error> {
+                let Some(address) = uservaddr else {
+                    return Ok(None);
+                };
+                let addrlen = usize::try_from(addrlen).unwrap_or(0);
+                if addrlen < std::mem::size_of::<u16>() {
+                    return Ok(None);
+                }
+                let family: u16 = guest.memory().read_value(address.cast())?;
+                if family == libc::AF_INET as u16 {
+                    if addrlen < std::mem::size_of::<libc::sockaddr_in>() {
+                        return Ok(None);
+                    }
+                    let address: libc::sockaddr_in = guest.memory().read_value(address.cast())?;
+                    Ok(Some(
+                        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).is_loopback(),
+                    ))
+                } else if family == libc::AF_INET6 as u16 {
+                    if addrlen < std::mem::size_of::<libc::sockaddr_in6>() {
+                        return Ok(None);
+                    }
+                    let address: libc::sockaddr_in6 = guest.memory().read_value(address.cast())?;
+                    Ok(Some(
+                        Ipv6Addr::from(address.sin6_addr.s6_addr).is_loopback(),
+                    ))
+                } else {
+                    // This includes a successful AF_UNSPEC disconnect and successful connects
+                    // to non-IP families, neither of which has a loopback IP peer.
+                    Ok(Some(false))
+                }
+            })()
+            .ok()
+            .flatten();
+            if let Some(loopback_peer) = loopback_peer {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_loopback_peer(loopback_peer));
+            }
+        }
+
+        result
     }
 
     /// Handles sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
@@ -1451,6 +1480,23 @@ mod tests {
 
         assert!(request.resources.is_empty());
         assert!(request.fyi.is_empty());
+    }
+
+    #[test]
+    fn connect_peer_classification_never_overrides_kernel_errors() {
+        assert!(connect_result_allows_peer_classification(&Ok(0)));
+        assert!(connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EINPROGRESS)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EALREADY)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EBADF)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EFAULT)
+        )));
     }
 
     #[test]
