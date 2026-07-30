@@ -8,9 +8,6 @@
 
 use std::env;
 use std::fs;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -69,7 +66,12 @@ fn copy_file(source: &Path, destination: &Path) {
     });
 }
 
-fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str) -> PathBuf {
+fn ensure_submodule(
+    repository: &Path,
+    name: &str,
+    relative: &str,
+    marker: &str,
+) -> (PathBuf, String) {
     let source = repository.join(relative);
     if !source.join(marker).is_file() {
         run(
@@ -108,17 +110,20 @@ fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str)
         actual, expected,
         "{name} source is not at the pinned revision"
     );
-    source
+    (source, expected)
 }
 
 fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
-    let source = ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
-    // CMake records the absolute source directory in CMakeCache.txt. Cargo
-    // checks each pinned Reverie revision out under a different path, so a
-    // stable build directory becomes invalid as soon as the pin advances.
-    let mut source_hash = DefaultHasher::new();
-    source.hash(&mut source_hash);
-    let build = build_root.join(format!("sabre-{:016x}", source_hash.finish()));
+    let (source, revision) =
+        ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
+    // The target directory is restored by CI caches, while the installed
+    // package is a Cargo-external side effect. Key the CMake directory by the
+    // verified gitlink rather than the checkout path so a stale build from a
+    // previous SaBRe revision can never be copied into the current package.
+    let short_revision = revision
+        .get(..16)
+        .expect("pinned SaBRe revision should be a full Git object ID");
+    let build = build_root.join(format!("sabre-{short_revision}"));
     run(
         Command::new("cmake")
             .arg("-S")
@@ -141,7 +146,7 @@ fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
 }
 
 fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
-    let source = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
+    let (source, _) = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
     let build = build_root.join("e9patch");
     if build.exists() {
         fs::remove_dir_all(&build)
