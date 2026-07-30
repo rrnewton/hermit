@@ -8,6 +8,9 @@
 
 use std::env;
 use std::fs;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -117,10 +120,13 @@ fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     let (source, revision) =
         ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
     // The target directory is restored by CI caches, while the installed
-    // package is a Cargo-external side effect. Key the CMake directory by the
-    // verified gitlink rather than the checkout path so a stale build from a
-    // previous SaBRe revision can never be copied into the current package.
-    let build = build_root.join(format!("sabre-{revision}"));
+    // package is a Cargo-external side effect. Include both the verified
+    // gitlink and the checkout path: the revision keeps stale SaBRe builds
+    // unreachable, while the path keeps CMakeCache.txt bound to its original
+    // absolute source directory.
+    let mut source_hash = DefaultHasher::new();
+    source.hash(&mut source_hash);
+    let build = build_root.join(format!("sabre-{revision}-{:016x}", source_hash.finish()));
     run(
         Command::new("cmake")
             .arg("-S")
