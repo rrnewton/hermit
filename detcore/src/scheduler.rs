@@ -228,6 +228,23 @@ pub struct BlockedPool {
     /// re-admitted to the run queue. Their `InboundSignal` turn must now be
     /// granted rather than deferred again on the turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
+
+    /// Per-parent count of host-async child-exit `SIGCHLD`s the kernel still
+    /// owes but that Detcore will swallow, because the deterministic synthetic
+    /// child-exit `SIGCHLD` (fired by `step2b_process_timed` at a logical
+    /// deadline) is the canonical delivery. Incremented at each `Exit` grant
+    /// for a reaping parent; decremented in `take_inbound_sigchld_disposition`
+    /// when the redundant real signal arrives and is dropped. Keying by
+    /// `DetPid` matches the process the signal is directed at.
+    pub owed_real_sigchld: HashMap<DetPid, u32>,
+
+    /// Per-parent count of synthetic child-exit `SIGCHLD`s Detcore has
+    /// physically delivered (via `fire_alarm`) but whose resulting guest trap
+    /// has not yet reached `handle_signal_event`. Incremented just before the
+    /// synthetic `signal::kill` in `step2b_process_timed`; decremented in
+    /// `take_inbound_sigchld_disposition` so the synthetic's own trap is
+    /// delivered (not mistaken for a redundant real signal and swallowed).
+    pub synthetic_sigchld_inflight: HashMap<DetPid, u32>,
 }
 
 impl BlockedPool {
@@ -1539,12 +1556,66 @@ impl Scheduler {
                     if self.blocked.sigchld_deferred.remove(&parent) {
                         self.run_queue.push_eager_io_repoll(parent);
                     } else {
+                        // Record the synthetic delivery so its own guest trap is
+                        // recognized in `take_inbound_sigchld_disposition` and
+                        // delivered, rather than being mistaken for a redundant
+                        // real host-async `SIGCHLD` and swallowed.
+                        *self
+                            .blocked
+                            .synthetic_sigchld_inflight
+                            .entry(parent)
+                            .or_default() += 1;
                         self.fire_alarm(parent, dtid, sig);
                     }
                 }
                 TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
+    }
+
+    /// Decide the fate of an inbound `SIGCHLD` directed at process `parent`,
+    /// consuming the matching accounting slot. Returns `true` to DELIVER the
+    /// signal to the guest and `false` to SWALLOW it.
+    ///
+    /// Child-exit `SIGCHLD` is determinized by delivering exactly one synthetic
+    /// signal per exit at a logical deadline (`step2b_process_timed`). The
+    /// kernel independently raises its own host-async `SIGCHLD` for the same
+    /// exit at a nondeterministic moment. The three cases, in priority order:
+    ///
+    /// 1. `synthetic_sigchld_inflight > 0`: this trap is our own deterministic
+    ///    synthetic delivery. DELIVER and decrement.
+    /// 2. `owed_real_sigchld > 0`: this is the redundant, host-timed kernel
+    ///    signal for an exit we already synthesized. SWALLOW and decrement so
+    ///    it never perturbs scheduling (its arrival time is nondeterministic).
+    /// 3. neither: a genuine external `SIGCHLD` (e.g. `kill -CHLD`). DELIVER.
+    ///
+    /// Because standard signals coalesce, a synthetic and a real `SIGCHLD` can
+    /// merge into one trap; then case 1 delivers it and one `owed_real_sigchld`
+    /// slot leaks. A leaked owed slot can at worst swallow one later genuine
+    /// external `SIGCHLD` to the same process. Child-exit-dominated workloads
+    /// (`make -jN`, redis) are unaffected; precise disambiguation would require
+    /// inspecting `si_code`, which is not available here without a Reverie API
+    /// change.
+    pub fn take_inbound_sigchld_disposition(&mut self, parent: DetPid) -> bool {
+        if let Some(n) = self.blocked.synthetic_sigchld_inflight.get_mut(&parent)
+            && *n > 0
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.blocked.synthetic_sigchld_inflight.remove(&parent);
+            }
+            return true;
+        }
+        if let Some(n) = self.blocked.owed_real_sigchld.get_mut(&parent)
+            && *n > 0
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.blocked.owed_real_sigchld.remove(&parent);
+            }
+            return false;
+        }
+        true
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2180,6 +2251,12 @@ impl Scheduler {
                     self.blocked
                         .timed_waiters
                         .insert_child_exit(deadline, *process, parent, parent);
+                    // The kernel will also raise a host-async `SIGCHLD` on the
+                    // parent for this exit at a host-timed moment. That real
+                    // signal is redundant with the synthetic delivery above and
+                    // its arrival time is nondeterministic, so record that one is
+                    // owed and must be swallowed when it arrives.
+                    *self.blocked.owed_real_sigchld.entry(parent).or_default() += 1;
                 }
                 Ok(())
             }

@@ -206,6 +206,7 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+use crate::tool_global::inbound_sigchld_disposition;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -1061,6 +1062,31 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid, mycount, signal
             );
             guest.thread_state_mut().stats.count_signal();
+
+            // A child-exit `SIGCHLD` is determinized by delivering exactly one
+            // synthetic signal per exit at a logical deadline (see the scheduler
+            // `Exit` grant and `step2b_process_timed`). The kernel also raises
+            // its own host-async `SIGCHLD` for the same exit at a
+            // nondeterministic moment; that redundant signal must be swallowed
+            // here BEFORE it is traced or turned into an `InboundSignal` turn,
+            // otherwise its host-timed arrival perturbs scheduling and
+            // `--strict --verify` diverges (and it can wedge the deferral gate
+            // that governed the pre-synthetic behavior). The scheduler consults
+            // deterministic per-parent accounting to distinguish our synthetic
+            // delivery (deliver), a redundant real signal (swallow), and a
+            // genuine external `SIGCHLD` (deliver).
+            if signal == Signal::SIGCHLD {
+                let detpid = guest.thread_state().detpid.unwrap_or(dettid);
+                if !inbound_sigchld_disposition(guest, detpid).await {
+                    info!(
+                        "[dtid {}] swallowing redundant host-async SIGCHLD (#{}); deterministic delivery already scheduled",
+                        dettid, mycount
+                    );
+                    self.post_handler_hook(guest).await;
+                    return Ok(None);
+                }
+            }
+
             let time = &guest.thread_state().thread_logical_time;
             let nanos = time.as_nanos();
 

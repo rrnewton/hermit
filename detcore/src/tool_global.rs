@@ -825,6 +825,12 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
+            GlobalRequest::InboundSigchldDisposition(dpid) => R::InboundSigchldDisposition(
+                self.sched
+                    .lock()
+                    .unwrap()
+                    .take_inbound_sigchld_disposition(dpid),
+            ),
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -1723,6 +1729,11 @@ pub enum GlobalRequest {
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
 
+    /// Decide whether an inbound `SIGCHLD` to this process should be delivered
+    /// (`true`) or swallowed (`false`) as a redundant host-async child-exit
+    /// signal already covered by the deterministic synthetic delivery.
+    InboundSigchldDisposition(DetPid),
+
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
@@ -1777,6 +1788,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
+    InboundSigchldDisposition(bool),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -2436,6 +2448,23 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
         GlobalResponse::ResolveKillTargets(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+/// Ask the scheduler whether an inbound `SIGCHLD` to process `detpid` should be
+/// delivered to the guest (`true`) or swallowed (`false`) as a redundant
+/// host-async child-exit signal. This is a pure query that never advances
+/// logical time on its own.
+pub async fn inbound_sigchld_disposition<G, T>(guest: &mut G, detpid: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::InboundSigchldDisposition(detpid)).await;
+    match response.1 {
+        GlobalResponse::InboundSigchldDisposition(deliver) => deliver,
         _ => unreachable!(),
     }
 }
