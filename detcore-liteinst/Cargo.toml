@@ -18,4 +18,4 @@ doctest = false
 [dependencies]
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.186"
-reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "1ca7e36225809b268cfb88b31934bb489589953b", default-features = false }
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "2afd1ecc576085332f71f02dfcea0de635d7026b", default-features = false }
