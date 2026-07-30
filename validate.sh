@@ -169,7 +169,7 @@ case "$VALIDATION_PROFILE" in
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
-    liteinst-compat-only) VALIDATION_ESTIMATE="about 1-5 minutes" ;;
+    liteinst-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
@@ -3217,8 +3217,20 @@ if ((STRICT_COMPAT_ONLY == 1)); then
 fi
 
 if ((LITEINST_COMPAT_ONLY == 1)); then
-    run_check_with_timeout 300 "Portable CI liteinst_strict" \
-        cargo test -p hermit --test liteinst_advanced -- --test-threads=1
+    run_check_with_timeout 1200 "Build release Hermit for LiteInst compatibility" \
+        cargo build --release --locked -p hermit
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Build release LiteInst runtime" \
+            env HERMIT_LITEINST_STAGE="$ROOT_DIR/target/release/libreverie_liteinst.so" \
+            cargo build --release --locked \
+            --manifest-path liteinst-runtime-build/Cargo.toml \
+            --target-dir "$ROOT_DIR/target/liteinst-runtime-build-4cee948e"
+    fi
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Portable CI liteinst_strict" \
+            env HERMIT_LITEINST_TEST_BINARY="$ROOT_DIR/target/release/hermit" \
+            cargo test -p hermit --test liteinst_advanced -- --test-threads=1
+    fi
     print_summary
     ((failures == 0))
     exit $?

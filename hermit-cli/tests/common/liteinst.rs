@@ -8,14 +8,28 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
 static LITEINST_RUNTIME: OnceLock<()> = OnceLock::new();
 
+pub(super) fn hermit_binary() -> PathBuf {
+    std::env::var_os("HERMIT_LITEINST_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_hermit")))
+}
+
+pub(super) fn liteinst_runtime_library() -> PathBuf {
+    hermit_binary()
+        .parent()
+        .expect("Hermit test binary should have a profile directory")
+        .join("libreverie_liteinst.so")
+}
+
 pub(super) fn ensure_liteinst_runtime() {
     LITEINST_RUNTIME.get_or_init(|| {
-        let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
+        let hermit = hermit_binary();
         let profile_dir = hermit
             .parent()
             .expect("Hermit test binary should have a profile directory");
@@ -35,7 +49,7 @@ pub(super) fn ensure_liteinst_runtime() {
             .expect("hermit-cli should be inside the repository");
         let runtime_build = repository.join("liteinst-runtime-build/Cargo.toml");
         let runtime_target = target_dir.join("liteinst-runtime-build-4cee948e");
-        let runtime = profile_dir.join("libreverie_liteinst.so");
+        let runtime = liteinst_runtime_library();
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
             .current_dir(repository)

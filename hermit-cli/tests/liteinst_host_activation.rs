@@ -84,10 +84,7 @@ fn activation_guest() -> (tempfile::TempDir, PathBuf) {
 #[tokio::test(flavor = "current_thread")]
 async fn exact_staged_runtime_activates_with_a_minimal_tool() {
     liteinst_runtime::ensure_liteinst_runtime();
-    let runtime = Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit test binary should have a profile directory")
-        .join("libreverie_liteinst.so");
+    let runtime = liteinst_runtime::liteinst_runtime_library();
     let (_directory, guest) = activation_guest();
     let native = std::process::Command::new(&guest)
         .output()

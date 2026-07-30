@@ -10,6 +10,8 @@
 mod liteinst_runtime;
 
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -65,7 +67,7 @@ fn compatibility_fixture() -> &'static Path {
 
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(liteinst_runtime::hermit_binary());
     command.args(["--log=info", "run", "--backend", "liteinst", "--strict"]);
     if verify {
         command.arg("--verify");
@@ -221,7 +223,7 @@ fn liteinst_strict_verify_python_entropy() {
 
 fn assert_clone_boundary(mode: &str) {
     liteinst_runtime::ensure_liteinst_runtime();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let mut child = Command::new(liteinst_runtime::hermit_binary())
         .args([
             "--log=error",
             "run",
@@ -274,10 +276,7 @@ fn assert_clone_boundary(mode: &str) {
 /// test binary, so it lives in the same profile directory.
 fn liteinst_runtime_library() -> PathBuf {
     liteinst_runtime::ensure_liteinst_runtime();
-    Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit test binary should have a profile directory")
-        .join("libreverie_liteinst.so")
+    liteinst_runtime::liteinst_runtime_library()
 }
 
 /// A bare preload must not create a second in-guest Detcore Tool.
@@ -331,7 +330,12 @@ fn liteinst_fork_fails_closed_without_hanging() {
 #[test]
 fn liteinst_abnormal_exit_after_registration_does_not_hang() {
     liteinst_runtime::ensure_liteinst_runtime();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    // INFO-level Detcore diagnostics can exceed a pipe's capacity before the
+    // guest reaches its fatal signal. Keep draining out of the child process
+    // while retaining the diagnostics for the scheduler-start assertion.
+    let mut stderr = tempfile::tempfile().expect("create LiteInst diagnostic sink");
+    let stderr_sink = stderr.try_clone().expect("clone LiteInst diagnostic sink");
+    let mut child = Command::new(liteinst_runtime::hermit_binary())
         .args([
             "--log",
             "info",
@@ -347,7 +351,7 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
             "kill -9 $$",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_sink))
         .spawn()
         .expect("failed to start Hermit LiteInst fatal-exit guest");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -367,11 +371,15 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
     let output = child
         .wait_with_output()
         .expect("failed to collect Hermit LiteInst output");
+    stderr.rewind().expect("rewind LiteInst diagnostic sink");
+    let mut diagnostics = String::new();
+    stderr
+        .read_to_string(&mut diagnostics)
+        .expect("read LiteInst diagnostics");
     assert_eq!(status.signal(), Some(libc::SIGKILL), "{output:?}");
     assert_eq!(output.status, status);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("[scheduler] guest in queue"),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr),
+        diagnostics.contains("[scheduler] guest in queue"),
+        "stderr={diagnostics}",
     );
 }
