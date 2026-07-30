@@ -392,6 +392,15 @@ pub(super) fn run_dbi(
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
+    // Deterministic branch-count preemption (default off). When
+    // HERMIT_DBI_PREEMPT_QUANTUM is a positive integer, the native client injects
+    // a synthetic sched_yield turn every N counted app branches so a busy-waiting
+    // guest thread returns control to Detcore's scheduler between syscalls.
+    if let Some(quantum) = detcore_dbi::preempt_quantum_from_env() {
+        runner = runner
+            .client_argument("-preemption-quantum")
+            .client_argument(quantum.to_string());
+    }
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",

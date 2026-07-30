@@ -1349,6 +1349,12 @@ async fn run_dbi(
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
+    // Deterministic branch-count preemption (default off); see backends.rs.
+    if let Some(quantum) = detcore_dbi::preempt_quantum_from_env() {
+        runner = runner
+            .client_argument("-preemption-quantum")
+            .client_argument(quantum.to_string());
+    }
 
     let program = command.get_program().to_owned();
     let mut environment = command.get_captured_envs();

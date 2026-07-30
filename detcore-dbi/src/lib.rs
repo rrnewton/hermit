@@ -222,6 +222,25 @@ fn init_dbi_tracing(emit: Emitter) -> bool {
 /// they reach the ptrace backend.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBI_DETCONFIG";
 
+/// Environment variable selecting the deterministic branch-count preemption
+/// quantum for the DBI backend. When set to a positive integer N, the native
+/// client injects a synthetic `sched_yield` scheduler turn every N counted app
+/// branches (see `reverie_dbi_runtime_preempt`), which lets a busy-waiting or
+/// tight-looping guest thread return control to Detcore's scheduler between
+/// syscalls. Unset or `0` disables preemption, preserving current behavior.
+pub const PREEMPT_QUANTUM_ENV: &str = "HERMIT_DBI_PREEMPT_QUANTUM";
+
+/// Reads [`PREEMPT_QUANTUM_ENV`] and returns the branch-count preemption quantum
+/// to pass to the native client, or `None` when preemption is disabled (the
+/// variable is unset, empty, unparsable, or `0`).
+pub fn preempt_quantum_from_env() -> Option<u64> {
+    let raw = std::env::var(PREEMPT_QUANTUM_ENV).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(quantum) if quantum > 0 => Some(quantum),
+        _ => None,
+    }
+}
+
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
     /// Deserialized from [`DETCONFIG_ENV`] provided by `hermit run`.
@@ -388,6 +407,13 @@ struct NativeThreadScratch {
     virtual_tid: i32,
     pending_virtual_child: i32,
     pending_clone_flags: u64,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-dbi-preempt): Review the branch-count preemption ABI.
+    // Branch count observed at this thread's most recent synthetic sched_yield
+    // preemption. Appended at the end so the existing scratch layout shared with
+    // the DynamoRIO client (`prototype_counters_t`) is unchanged; the client
+    // `memset`s the scratch to zero at thread init.
+    last_yield_branch: u64,
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
@@ -935,6 +961,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
                     virtual_tid: 0,
                     pending_virtual_child: 0,
                     pending_clone_flags: 0,
+                    last_yield_branch: 0,
                 });
         }
         return 0;
@@ -1524,6 +1551,96 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
+        }
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-preempt): Review deterministic branch-count preemption
+// (core DetCore scheduling change: introduces preemption on the DBI backend).
+/// Injects one synthetic `sched_yield` scheduler turn to preempt a running guest
+/// thread at a deterministic branch-count boundary.
+///
+/// The DBI backend sequentializes guest threads and only re-enters the
+/// deterministic scheduler at a syscall. A thread that busy-waits or tight-loops
+/// without reaching a syscall therefore never relinquishes its scheduler turn and
+/// starves co-runnable siblings. The native client calls this at a fixed
+/// per-thread branch quantum (see `maybe_preempt` in `native/client.c`) to return
+/// control to Detcore between syscalls.
+///
+/// Determinism: `branches` (the counted-app-branch total) is a deterministic
+/// function of the executed instruction stream and the quantum is fixed, so the
+/// preemption points are deterministic. The injected syscall is Detcore's own,
+/// already-deterministic `sched_yield`, which ends the caller's timeslice and
+/// requests a one-turn yield; the caller parks in `run_ready` until the scheduler
+/// reselects it. `handle_sched_yield` returns `Ok(0)` and writes no guest
+/// registers, so injecting it between syscalls does not perturb the guest's live
+/// register state. The outcome is discarded.
+///
+/// Returns 0 on success, or a negative value to terminate the isolated runtime
+/// with an enforcement failure.
+///
+/// # Safety
+///
+/// `scratch` must point at this thread's [`NativeThreadScratch`], `context` must
+/// be the current DynamoRIO context, and the callback pointers must be valid for
+/// the call.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_preempt(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    _tid: i32,
+    pid: i32,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    // Only a thread that has already dispatched a syscall through Detcore has an
+    // initialized thread runtime and a scheduler turn to yield. A thread still in
+    // setup (null / uninitialized / post-exec pending) has nothing to preempt;
+    // skip it. This is a deterministic function of the executed syscall stream.
+    if scratch.runtime_state.is_null() {
+        return 0;
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    if !thread.initialized || thread.post_exec_pending {
+        return 0;
+    }
+    let runtime = current_runtime();
+    // The tool is constructed lazily on the first syscall; an initialized thread
+    // implies it exists, but guard defensively rather than re-initialize here.
+    let Some(tool) = runtime.tool.get() else {
+        return 0;
+    };
+    let pid = Pid::from_raw(pid);
+    let det_tid = thread.tid;
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let syscall = Syscall::from_raw(Sysno::sched_yield, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+    let outcome = reverie_dbi::run_tool_syscall(
+        tool,
+        context as usize,
+        det_tid,
+        pid,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        syscall,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match outcome {
+        // Discard the outcome: the scheduler side effect (yield + reselect)
+        // already happened inside the handler. A `sched_yield` never asks to
+        // execute an original syscall, but treat either resolution as success.
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("detcore-dbi: preemption sched_yield failed: {error}");
+            -1
         }
     }
 }
