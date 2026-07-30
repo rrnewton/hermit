@@ -200,9 +200,12 @@ serial-output, and QEMU binary hashes. INFO logs are compared byte-for-byte
 after removing only each line's leading ISO-8601 wallclock timestamp. No
 address, path, virtual time, scheduler count, or other number is normalized.
 
-Both Python QEMU demos keep the QEMU-visible paths fixed at
-`ignored/qemu-linux/qmp.sock`, `serial.sock`, and `hermit-snapshot.qcow2`.
-Changing a socket or image path changes QEMU's initial stack and heap, so a
+The demo-6 resume path keeps the QEMU-visible paths fixed at
+`ignored/qemu-linux/qmp.sock`, the `serial-pipe.in`/`serial-pipe.out` FIFO pair,
+and `hermit-snapshot.qcow2`. (Resume uses a `-serial pipe:` FIFO pair, not a
+unix socket, because a socket chardev's poll fd starves the -icount vCPU under
+`hermit --no-rcb-time`; boot uses a `-serial file:` transcript for the same
+reason.) Changing a socket or image path changes QEMU's initial stack and heap, so a
 timestamped runtime directory would invalidate repeat comparisons before Linux
 boots. A shared lock prevents concurrent demos from colliding on these paths.
 The serial transcript is written to the fixed `serial.log` and copied into each

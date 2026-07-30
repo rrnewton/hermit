@@ -133,7 +133,12 @@ def main() -> int:
     command_root = ASSETS / "resume-metadata" / command_digest
     lock = acquire_demo_lock(ASSETS / ".qemu-demo.lock")
     run_dir = make_run_dir(command_root, "resume")
-    serial_socket = ASSETS / "serial.sock"
+    # Resume serial is a bidirectional `-serial pipe:` FIFO pair (base path plus
+    # .in/.out), not a unix socket: a socket chardev's poll fd starves the vCPU
+    # under `hermit --no-rcb-time` (same class as the demo-5 boot bug).
+    serial_pipe = ASSETS / "serial-pipe"
+    serial_pipe_in = Path(str(serial_pipe) + ".in")
+    serial_pipe_out = Path(str(serial_pipe) + ".out")
     qmp_socket = ASSETS / "qmp.sock"
     serial_log = ASSETS / "serial.log"
     archived_serial_log = run_dir / "serial.log"
@@ -145,12 +150,17 @@ def main() -> int:
     saved_snapshot = not arguments.no_save_snapshot
 
     try:
-        for runtime_path in (qmp_socket, serial_socket, serial_log):
+        for runtime_path in (
+            qmp_socket,
+            serial_pipe_in,
+            serial_pipe_out,
+            serial_log,
+        ):
             runtime_path.unlink(missing_ok=True)
         qemu_argv = build_qemu_command(
             QEMU,
             qmp_socket,
-            serial_socket,
+            serial_pipe,
             SNAPSHOT_DISK,
             ASSETS / "bzImage",
             ASSETS / "initramfs.cpio.gz",
@@ -174,8 +184,8 @@ def main() -> int:
             QEMU,
             "--qmp-socket",
             str(qmp_socket),
-            "--serial-socket",
-            str(serial_socket),
+            "--serial-pipe",
+            str(serial_pipe),
             "--serial-log",
             str(serial_log),
             "--disk",
@@ -272,8 +282,8 @@ def main() -> int:
         return 1 if result == "PARTIAL" else 0
     finally:
         stop_process(process)
-        for socket_path in (qmp_socket, serial_socket):
-            socket_path.unlink(missing_ok=True)
+        for runtime_path in (qmp_socket, serial_pipe_in, serial_pipe_out):
+            runtime_path.unlink(missing_ok=True)
         release_demo_lock(lock)
 
 

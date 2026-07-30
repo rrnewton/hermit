@@ -62,7 +62,8 @@ computed=(
   "hermit-snapshot.qcow2.id"
   "hermit-boot.qcow2"          # archived boot snapshot
   "serial.log"                 # runtime serial capture
-  "serial.sock"                # runtime QEMU serial socket
+  "serial-pipe.in"             # runtime QEMU serial input FIFO (demo 6 resume)
+  "serial-pipe.out"            # runtime QEMU serial output FIFO (demo 6 resume)
   "qmp.sock"                   # runtime QEMU QMP socket
   ".qemu-demo.lock"            # single-writer demo lock (demo 6)
 )
