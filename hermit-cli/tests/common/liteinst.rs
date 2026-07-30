@@ -34,7 +34,7 @@ pub(super) fn ensure_liteinst_runtime() {
             .parent()
             .expect("hermit-cli should be inside the repository");
         let runtime_build = repository.join("liteinst-runtime-build/Cargo.toml");
-        let runtime_target = target_dir.join("liteinst-runtime-build-a8195cfc");
+        let runtime_target = target_dir.join("liteinst-runtime-build-87aa36f9");
         let runtime = profile_dir.join("libreverie_liteinst.so");
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
