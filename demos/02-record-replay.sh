@@ -37,7 +37,9 @@ demo_banner "Record /bin/echo, list the recording, and replay it"
 "$HERMIT" --log=error replay --autopilot --data-dir="$DEMO_DATA_DIR"
 
 demo_banner "Record and immediately verify a replay (temp recording auto-deleted)"
-"$HERMIT" --log=error record start --verify \
+# --verify compares the deterministic execution log, which is empty at
+# --log=error; hermit therefore requires --log=info (or more verbose) here.
+"$HERMIT" --log=info record start --verify \
   --data-dir="$DEMO_TMP/verified-recording" -- /bin/echo verified-recording
 
 demo_banner "Replay under GDB (noninteractive: continue to completion)"
