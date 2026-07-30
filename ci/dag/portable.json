@@ -39,8 +39,8 @@
     },
     {
       "group": "build", "job": "dbi_release",
-      "desc": "Build release Hermit and install backend resources",
-      "cmd": "cargo build --release --locked -p hermit -p hermit-install",
+      "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
+      "cmd": "cargo build --release --locked -p hermit -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
