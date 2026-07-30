@@ -42,6 +42,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix;
 #                                            # needs executable HERMIT_SABRE_BINARY
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
+#   ./validate.sh --liteinst-compat-only      # run the portable CI liteinst_strict test
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --portable-only               # no PMU/CPUID hardware required
 #   ./validate.sh --privileged-only             # PMU/CPUID-dependent tests only
@@ -82,6 +83,7 @@ PORTABLE_STRICT_PROBE_ARGS=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
+LITEINST_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 PRIVILEGED_ONLY=0
 LABEL_PR=1
@@ -115,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
+        --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
@@ -134,6 +137,7 @@ only_modes=0
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
@@ -151,6 +155,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
+((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
 
@@ -164,6 +169,7 @@ case "$VALIDATION_PROFILE" in
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
+    liteinst-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
@@ -207,7 +213,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY
-readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
+readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -320,7 +326,7 @@ readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
 # rows to make the aggregate floor alternate between green and red.
-readonly SABRE_COMPAT_EXPECTED=203
+readonly SABRE_COMPAT_EXPECTED=205
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
@@ -1640,12 +1646,14 @@ function run_compatibility_corpus {
     local known_flaky=0
     local unavailable=0
     local total=0
+    local sabre_cargo_passed=0
     local sabre_cpp_passed=0
     local sabre_flex_passed=0
     local sabre_gcc_passed=0
     local sabre_gxx_passed=0
     local sabre_ld_passed=0
     local sabre_make_passed=0
+    local sabre_rustc_passed=0
     PORTABLE_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
@@ -1770,13 +1778,25 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         rm -rf "$shell_build_dir"
     fi
-    functional_compatibility_probe cargo \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if functional_compatibility_probe cargo; then
+        passed=$((passed + 1))
+        if [[ $COMPATIBILITY_MODE == sabre ]]; then
+            sabre_cargo_passed=1
+        fi
+    else
+        failed=$((failed + 1))
+    fi
     if defer_portable_strict_diagnostic_to_super rustc; then
         unavailable=$((unavailable + 1))
     else
-        functional_compatibility_probe rustc \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        if functional_compatibility_probe rustc; then
+            passed=$((passed + 1))
+            if [[ $COMPATIBILITY_MODE == sabre ]]; then
+                sabre_rustc_passed=1
+            fi
+        else
+            failed=$((failed + 1))
+        fi
     fi
     if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe clang \
@@ -2432,6 +2452,10 @@ function run_compatibility_corpus {
             printf "❌ SaBRe compatibility required row flex regressed\n"
             return 1
         fi
+        if ((sabre_cargo_passed != 1)); then
+            printf "❌ SaBRe compatibility required row cargo regressed\n"
+            return 1
+        fi
         if ((sabre_cpp_passed != 1)); then
             printf "❌ SaBRe compatibility required row cpp regressed\n"
             return 1
@@ -2450,6 +2474,10 @@ function run_compatibility_corpus {
         fi
         if ((sabre_make_passed != 1)); then
             printf "❌ SaBRe compatibility required row make regressed\n"
+            return 1
+        fi
+        if ((sabre_rustc_passed != 1)); then
+            printf "❌ SaBRe compatibility required row rustc regressed\n"
             return 1
         fi
         if ((passed < SABRE_COMPAT_EXPECTED)); then
@@ -3066,6 +3094,10 @@ function run_portable_slow_strict_diagnostics {
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
 function run_super_diagnostic_suite {
+    run_check_with_timeout 1800 "Relaxed Hermit flag matrix" \
+        env HERMIT_FLAG_MATRIX_REPORT="$ROOT_DIR/target/relaxed-flag-matrix/results.tsv" \
+        cargo test -p hermit --test relaxed_flag_matrix \
+        meaningful_flag_combinations_run_without_crashing -- --exact --ignored --test-threads=1 --nocapture
     # These probes are useful for trend detection but do not gate PRs. On the
     # portable runner they consumed about 20 minutes after the blocking suite had
     # already passed, so keep their signal in the scheduled super tier.
@@ -3181,6 +3213,25 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         exit 1
     fi
     run_strict_compatibility_envelope
+    exit $?
+fi
+
+if ((LITEINST_COMPAT_ONLY == 1)); then
+    run_check_with_timeout 1200 "Build release Hermit for LiteInst compatibility" \
+        cargo build --release --locked -p hermit
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Build release LiteInst runtime" \
+            "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
+            "$ROOT_DIR/target/release/libreverie_liteinst.so" \
+            "$ROOT_DIR/target/liteinst-runtime-build-4cee948e"
+    fi
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Portable CI liteinst_strict" \
+            env HERMIT_LITEINST_TEST_BINARY="$ROOT_DIR/target/release/hermit" \
+            cargo test -p hermit --test liteinst_advanced -- --test-threads=1
+    fi
+    print_summary
+    ((failures == 0))
     exit $?
 fi
 
