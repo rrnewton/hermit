@@ -278,7 +278,7 @@ fn build_liteinst_runtime(
     resources: &Path,
 ) {
     let manifest = repository.join("liteinst-runtime-build/Cargo.toml");
-    let target = build_root.join("liteinst-runtime-5e92f4f1");
+    let target = build_root.join("liteinst-runtime-4cee948e");
     if target.exists() {
         fs::remove_dir_all(&target).unwrap_or_else(|error| {
             panic!(
