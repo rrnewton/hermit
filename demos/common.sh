@@ -5,12 +5,14 @@
 # pinned hermit/ submodule inside this parent workspace, builds the binaries the
 # walkthrough uses, and defines the helper wrappers the demos share.
 #
-# The demos deliberately disable CPUID virtualization and PMU timer preemption
-# so the short examples also run on hosts without those features. CPUID is
-# therefore a host input in these commands, and CPU-bound guests receive fewer
-# preemption opportunities. The schedule-bisection demo uses the same portable
-# syscall-boundary mode by default and offers precise PMU preemption as an
-# explicit opt-in.
+# The demos deliberately disable CPUID virtualization so the short examples also
+# run on hosts without CPUID faulting; CPUID is therefore a host input in these
+# commands. PMU timer preemption is disabled for the chaos wrapper (portable
+# syscall-boundary scheduling) but ENABLED for demo 1's run_hermit wrapper, whose
+# --verify step already needs PMU and whose many-threaded python3 guest hangs
+# under syscall-boundary-only scheduling (see run_hermit and HERMIT_DEMO_MAX_TIMESLICE).
+# The schedule-bisection demo uses the portable syscall-boundary mode by default
+# and offers precise PMU preemption as an explicit opt-in.
 
 set -euo pipefail
 
@@ -32,9 +34,10 @@ if ! command -v make >/dev/null 2>&1; then
   echo "ERROR: make is required to check the Hermit build dependencies." >&2
   exit 1
 fi
-# Build the debug binaries used for the validated record/replay path and
-# source-resolved analyzer output. The release build remains available for
-# normal use. Set DEMO_SKIP_BUILD=1 to reuse an existing build.
+# Build the release hermit binary (the portable run/verify wrappers below use
+# it: the debug build serializes many-threaded guests like python3 so slowly it
+# can OOM under load) plus the debug guest binaries whose source info the
+# analyzer resolves (demo 4). Set DEMO_SKIP_BUILD=1 to reuse an existing build.
 if [ "${DEMO_SKIP_BUILD:-0}" = "1" ]; then
   make --no-print-directory -s -C "$ROOT" check-deps
 else
@@ -46,7 +49,6 @@ else
       make --no-print-directory -s -C "$ROOT" check-deps
       ( cd "$HERMIT_REPO" && \
         cargo build --release -p hermit --bin hermit --no-default-features && \
-        cargo build -p hermit --bin hermit --no-default-features && \
         cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race && \
         cargo build -p hermetic_infra_hermit_tests --bin rustbin_heap_ptrs )
       ;;
@@ -57,7 +59,10 @@ else
   esac
 fi
 
-export HERMIT="${HERMIT:-$HERMIT_REPO/target/debug/hermit}"
+# The hermit binary is the release build (fast, non-OOM for python3 and other
+# many-threaded guests). The guest programs stay debug so demo 4's analyzer can
+# resolve their source locations.
+export HERMIT="${HERMIT:-$HERMIT_REPO/target/release/hermit}"
 export HELLO_RACE="${HELLO_RACE:-$HERMIT_REPO/target/debug/hello_race}"
 export HEAP_PTRS="${HEAP_PTRS:-$HERMIT_REPO/target/debug/rustbin_heap_ptrs}"
 export RACE_SH="${RACE_SH:-$HERMIT_REPO/examples/race.sh}"
@@ -87,13 +92,27 @@ export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
 export DEMO_ARTIFACTS="${DEMO_ARTIFACTS:-$HERMIT_REPO/target/${DEMO_TMP##*/}}"
 mkdir -p "$DEMO_TMP" "$DEMO_ARTIFACTS"
 
-# Portable run wrapper: minimal environment, CPUID and PMU preemption disabled.
+# Run wrapper: minimal environment, CPUID virtualization disabled, PMU-backed
+# preemption ENABLED. run_hermit is used only by demo 1, whose final --verify
+# step already requires user-accessible CPU performance counters (PMU), so the
+# earlier steps use PMU preemption too. This matters for many-threaded guests
+# such as python3: with preemption disabled (--max-timeslice=disabled) a
+# CPU-spinning guest thread only yields at syscall boundaries, so under hermit's
+# deterministic scheduler python3 can intermittently starve and hang for minutes
+# (a hermit scheduler limitation, not a demo defect). PMU preemption makes each
+# such run finish in about a second. On a host without accessible performance
+# counters, set HERMIT_DEMO_MAX_TIMESLICE=disabled to restore the portable
+# syscall-boundary-only behavior (python3 may then hang).
+HERMIT_PREEMPTION_FLAGS=()
+if [ -n "${HERMIT_DEMO_MAX_TIMESLICE:-}" ]; then
+  HERMIT_PREEMPTION_FLAGS=(--max-timeslice="$HERMIT_DEMO_MAX_TIMESLICE")
+fi
 run_hermit() {
   "$HERMIT" --log=error run \
     "${HERMIT_TMP_FLAGS[@]}" \
+    "${HERMIT_PREEMPTION_FLAGS[@]}" \
     --base-env=minimal \
     --no-virtualize-cpuid \
-    --preemption-timeout=disabled \
     "$@"
 }
 
