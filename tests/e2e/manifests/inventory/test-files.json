@@ -335,13 +335,13 @@
       "path": "tests/c/liteinst_host_activation.c",
       "disposition": "guest-fixture",
       "runner": "hermit-cli/tests/liteinst_host_activation.rs",
-      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this constructor-aware guest and asserts host-selected LiteInst activation through registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
+      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
     },
     {
       "path": "tests/c/liteinst_inert_runtime.c",
       "disposition": "guest-fixture",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this constructor-bearing but host-unselected runtime and asserts that it remains inert without LiteInst backend selection; it remains a guest fixture because a generic manifest cannot inject the preload override while enforcing the negative activation contract."
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
     },
     {
       "path": "tests/c/lsm_get_self_attr_enosys.c",
