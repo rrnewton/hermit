@@ -146,6 +146,8 @@ fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     }
     run(&mut command, "build SaBRe");
     copy_file(&build.join("sabre"), &resources.join("sabre"));
+    fs::write(resources.join("sabre.revision"), format!("{revision}\n"))
+        .expect("failed to write SaBRe revision provenance");
 }
 
 fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
@@ -305,6 +307,8 @@ fn build_liteinst_runtime(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
