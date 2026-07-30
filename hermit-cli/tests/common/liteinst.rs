@@ -36,7 +36,7 @@ pub(super) fn ensure_liteinst_runtime() {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
             .current_dir(repository)
-            .args(["build", "--locked", "-p", "detcore-liteinst", "--profile"])
+            .args(["build", "--locked", "-p", "reverie-liteinst", "--profile"])
             .arg(cargo_profile)
             .arg("--target-dir")
             .arg(target_dir)
@@ -48,10 +48,10 @@ pub(super) fn ensure_liteinst_runtime() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        let runtime = profile_dir.join("libdetcore_liteinst.so");
+        let runtime = profile_dir.join("libreverie_liteinst.so");
         assert!(
             runtime.is_file(),
-            "detcore-liteinst build did not create {}",
+            "reverie-liteinst build did not create {}",
             runtime.display(),
         );
     });

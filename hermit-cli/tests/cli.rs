@@ -678,7 +678,7 @@ fn run_liteinst_verifies_detcore_backend() {
     assert_eq!(stdout(&output), "liteinst-cli-ok\n");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("liteinst backend] Detcore Tool active"),
+        stderr.contains("liteinst host hybrid] Detcore Tool active in ptrace host"),
         "{stderr}"
     );
     assert!(
@@ -686,7 +686,9 @@ fn run_liteinst_verifies_detcore_backend() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+        stderr.contains(
+            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+        ),
         "{stderr}"
     );
 }

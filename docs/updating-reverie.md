@@ -15,7 +15,6 @@ build. As of this writing the deps are:
 - `hermit-cli/Cargo.toml`
 - `detcore/Cargo.toml`
 - `detcore-dbi/Cargo.toml`
-- `detcore-liteinst/Cargo.toml`
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
 - `detcore-sabre/Cargo.toml`
 - `detcore/tests/testutils/Cargo.toml`

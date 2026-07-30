@@ -74,16 +74,16 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     command.output().expect("failed to run Hermit LiteInst")
 }
 
-fn assert_strict_verify_without_rcb_preemption(
+fn assert_strict_verify_with_ptrace_rcb_preemption(
     program: &Path,
     args: &[&str],
     expected_stdout: &[u8],
 ) {
-    let output = strict_verify_without_rcb_preemption(program, args);
+    let output = strict_verify_with_ptrace_rcb_preemption(program, args);
     assert_eq!(output.stdout, expected_stdout);
 }
 
-fn strict_verify_without_rcb_preemption(program: &Path, args: &[&str]) -> Output {
+fn strict_verify_with_ptrace_rcb_preemption(program: &Path, args: &[&str]) -> Output {
     let output = run_liteinst(program, args, true);
     assert!(
         output.status.success(),
@@ -94,11 +94,11 @@ fn strict_verify_without_rcb_preemption(program: &Path, args: &[&str]) -> Output
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("liteinst backend] Detcore Tool active"),
+        stderr.contains("liteinst host hybrid] Detcore Tool active in ptrace host"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("continuing with --max-timeslice=disabled"),
+        !stderr.contains("continuing with --max-timeslice=disabled"),
         "{stderr}"
     );
     assert!(
@@ -106,7 +106,9 @@ fn strict_verify_without_rcb_preemption(program: &Path, args: &[&str]) -> Output
         "{stderr}"
     );
     assert!(
-        stderr.contains("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+        stderr.contains(
+            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+        ),
         "{stderr}"
     );
     output
@@ -114,15 +116,15 @@ fn strict_verify_without_rcb_preemption(program: &Path, args: &[&str]) -> Output
 
 #[test]
 fn liteinst_detcore_strict_verify_micro_suite() {
-    assert_strict_verify_without_rcb_preemption(Path::new("/bin/true"), &[], b"");
-    assert_strict_verify_without_rcb_preemption(Path::new("/bin/echo"), &["hello"], b"hello\n");
+    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/bin/true"), &[], b"");
+    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/bin/echo"), &["hello"], b"hello\n");
 
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
     let readme = repository.join("README.md");
     let expected = fs::read(&readme).expect("read README fixture");
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,
@@ -131,9 +133,13 @@ fn liteinst_detcore_strict_verify_micro_suite() {
 
 #[test]
 fn liteinst_strict_verify_identity_utilities() {
-    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/uname"), &["-s"], b"Linux\n");
-    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/id"), &["-u"], b"0\n");
-    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/whoami"), &[], b"root\n");
+    assert_strict_verify_with_ptrace_rcb_preemption(
+        Path::new("/usr/bin/uname"),
+        &["-s"],
+        b"Linux\n",
+    );
+    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/usr/bin/id"), &["-u"], b"0\n");
+    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/usr/bin/whoami"), &[], b"root\n");
 }
 
 #[test]
@@ -141,35 +147,35 @@ fn liteinst_strict_verify_file_and_text_utilities() {
     let fixture = compatibility_fixture();
     let fixture = fixture.to_str().expect("fixture path should be UTF-8");
 
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/printf"),
         &["liteinst-printf-ok\n"],
         b"liteinst-printf-ok\n",
     );
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/grep"),
         &["^liteinst", fixture],
         COMPAT_FIXTURE_CONTENT,
     );
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/head"),
         &["-n", "1", fixture],
         COMPAT_FIXTURE_CONTENT,
     );
 
     let expected_wc = format!("{} {fixture}\n", COMPAT_FIXTURE_CONTENT.len());
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/wc"),
         &["-c", fixture],
         expected_wc.as_bytes(),
     );
     let expected_sha256 = format!("{COMPAT_FIXTURE_SHA256}  {fixture}\n");
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/sha256sum"),
         &[fixture],
         expected_sha256.as_bytes(),
     );
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/stat"),
         &["-c", "%s", fixture],
         format!("{}\n", COMPAT_FIXTURE_CONTENT.len()).as_bytes(),
@@ -178,12 +184,12 @@ fn liteinst_strict_verify_file_and_text_utilities() {
 
 #[test]
 fn liteinst_strict_verify_shell_and_entropy_consumer() {
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/bin/sh"),
         &["-c", "printf 'liteinst-shell-ok\\n'"],
         b"liteinst-shell-ok\n",
     );
-    assert_strict_verify_without_rcb_preemption(
+    assert_strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/hexdump"),
         &["/dev/urandom", "--length", "16"],
         b"0000000 7229 04bb 964d 28df ba71 4c03 de95 7027\n0000010\n",
@@ -192,7 +198,7 @@ fn liteinst_strict_verify_shell_and_entropy_consumer() {
 
 #[test]
 fn liteinst_strict_verify_python_entropy() {
-    let output = strict_verify_without_rcb_preemption(
+    let output = strict_verify_with_ptrace_rcb_preemption(
         Path::new("/usr/bin/python3"),
         &[
             "-c",
@@ -211,10 +217,41 @@ fn liteinst_strict_verify_python_entropy() {
     );
 }
 
-fn assert_clone_boundary(mode: &str, operation: &str) {
-    let output = run_liteinst(advanced_guest(), &[mode], false);
+fn assert_clone_boundary(mode: &str) {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=error",
+            "run",
+            "--backend",
+            "liteinst",
+            "--strict",
+            "--",
+        ])
+        .arg(advanced_guest())
+        .arg(mode)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start Hermit LiteInst clone-boundary guest");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll Hermit LiteInst") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Hermit LiteInst hung while rejecting {mode}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect Hermit LiteInst clone-boundary output");
+    assert_eq!(output.status, status);
     assert_eq!(
-        output.status.code(),
+        status.code(),
         Some(1),
         "status={:?}\nstdout={}\nstderr={}",
         output.status,
@@ -222,11 +259,14 @@ fn assert_clone_boundary(mode: &str, operation: &str) {
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(operation), "{stderr}");
+    assert!(
+        stderr.contains("ENOTSUPP (Operation is not supported)"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("Bad system call"), "{stderr}");
 }
 
-/// Path to the freshly built `libdetcore_liteinst.so` preload runtime.
+/// Path to the freshly built `libreverie_liteinst.so` preload runtime.
 ///
 /// [`liteinst_runtime::ensure_liteinst_runtime`] builds it beside the Hermit
 /// test binary, so it lives in the same profile directory.
@@ -235,20 +275,16 @@ fn liteinst_runtime_library() -> PathBuf {
     Path::new(env!("CARGO_BIN_EXE_hermit"))
         .parent()
         .expect("Hermit test binary should have a profile directory")
-        .join("libdetcore_liteinst.so")
+        .join("libreverie_liteinst.so")
 }
 
-/// Regression guard for the nextest-exclusion fix (`[lib] test = false` in
-/// `detcore-liteinst/Cargo.toml`).
+/// A bare preload must not create a second in-guest Detcore Tool.
 ///
-/// The manifest change only disables the generated unit-test binary; it must
-/// NOT weaken the constructor's fail-closed behavior. Loading the cdylib as a
-/// bare `LD_PRELOAD` without the coordinator socket must still `_exit(127)` from
-/// the `.init_array` constructor before the host program runs — exactly the
-/// abort that broke `nextest --list`, which is now proven to be a deliberate,
-/// preserved security property rather than an accident.
+/// Host mode is selected only by `run_host_with_preload`. Without that private
+/// selector, even a stale legacy coordinator variable must leave the patch DSO
+/// inert and let the program run normally.
 #[test]
-fn liteinst_preload_fails_closed_without_coordinator_env() {
+fn liteinst_preload_is_inert_without_host_runtime_selector() {
     let runtime = liteinst_runtime_library();
     assert!(
         runtime.is_file(),
@@ -257,35 +293,37 @@ fn liteinst_preload_fails_closed_without_coordinator_env() {
     );
 
     let output = Command::new("/bin/true")
-        .env(reverie_liteinst::COORDINATOR_ENV, "") // ensure any inherited value is overwritten...
-        .env_remove(reverie_liteinst::COORDINATOR_ENV) // ...then removed entirely
+        .env(
+            reverie_liteinst::COORDINATOR_ENV,
+            "/definitely/not/a/coordinator.sock",
+        )
         .env("LD_PRELOAD", &runtime)
         .output()
         .expect("failed to launch /bin/true under the LiteInst preload");
 
     assert_eq!(
         output.status.code(),
-        Some(127),
-        "preload must fail closed with exit 127\nstatus={:?}\nstdout={}\nstderr={}",
+        Some(0),
+        "bare patch preload must remain inert\nstatus={:?}\nstdout={}\nstderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("coordinator socket environment variable is missing"),
-        "expected fail-closed diagnostic; stderr={stderr}",
+        !String::from_utf8_lossy(&output.stderr).contains("reverie-liteinst initialization failed"),
+        "bare preload attempted to install an in-guest Detcore Tool: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
 #[test]
 fn liteinst_thread_clone_fails_closed_without_sigsys() {
-    assert_clone_boundary("threads", "pthread_create: Operation not supported");
+    assert_clone_boundary("threads");
 }
 
 #[test]
 fn liteinst_fork_fails_closed_without_hanging() {
-    assert_clone_boundary("fork", "fork: Operation not supported");
+    assert_clone_boundary("fork");
 }
 
 #[test]

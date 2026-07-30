@@ -421,7 +421,7 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
         });
     }
 
-    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")?
+    if let Some(path) = hermit_resources::resource("libreverie_liteinst.so")?
         && path.is_file()
     {
         return Ok(path);
@@ -435,8 +435,8 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
         )
     })?;
     [
-        directory.join("libdetcore_liteinst.so"),
-        directory.join("deps/libdetcore_liteinst.so"),
+        directory.join("libreverie_liteinst.so"),
+        directory.join("deps/libreverie_liteinst.so"),
     ]
     .into_iter()
     .find(|path| path.is_file())
@@ -444,7 +444,7 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "libdetcore_liteinst.so was not built beside {}",
+                "libreverie_liteinst.so was not built beside {}",
                 executable.display()
             ),
         )
@@ -454,7 +454,7 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_runtime_library_path().err().map(|error| {
         format!(
-            "the LiteInst preload runtime is unavailable: {error}; build detcore-liteinst and hermit in the same target directory"
+            "the LiteInst preload runtime is unavailable: {error}; build reverie-liteinst and hermit in the same target directory"
         )
     })
 }
@@ -482,7 +482,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the LiteInst in-process backend with the Detcore Tool.
+    /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -1294,12 +1294,6 @@ pub fn run_with_backend(
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
-    if backend == Backend::Liteinst && config.max_timeslice.is_some() {
-        eprintln!(
-            "WARNING: --backend=liteinst does not implement PMU/RCB timer delivery; continuing with --max-timeslice=disabled."
-        );
-        config.max_timeslice = None;
-    }
     config.discover_live_file_metadata = backend == Backend::Sabre;
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
@@ -1366,7 +1360,7 @@ async fn run_with_backend_inner(
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
         let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1475,11 +1469,11 @@ async fn run_with_output_backend_inner(
         command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
         let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
-        let status = output.status.into();
+        let status = output.status;
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
@@ -1806,13 +1800,13 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_backend_config_disables_unsupported_rcb_timeslices() {
+    fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         assert!(
             prepare_backend_config(config.clone(), Backend::Liteinst)
                 .max_timeslice
-                .is_none()
+                .is_some()
         );
         assert!(
             prepare_backend_config(config, Backend::Ptrace)
@@ -1865,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_public_dispatch_runs_default_config_without_rcb_timers() {
+    fn liteinst_public_dispatch_runs_ptrace_host_hybrid() {
         if Backend::Liteinst.ensure_available().is_err() {
             return;
         }
@@ -1879,7 +1873,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/echo through LiteinstGuest<Detcore>");
+        .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
 
@@ -1890,7 +1884,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/true through LiteinstGuest<Detcore>");
+        .expect("run /bin/true through the ptrace-hosted LiteInst hybrid");
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 

@@ -292,7 +292,7 @@ fn main() {
 
     for library in [
         "libdetcore_dbi.so",
-        "libdetcore_liteinst.so",
+        "libreverie_liteinst.so",
         "libdetcore_sabre.so",
     ] {
         replace_symlink(
