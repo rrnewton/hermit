@@ -35,43 +35,55 @@ fn sabre_loader() -> Option<PathBuf> {
         .unwrap_or_else(|| target_dir.join("sabre/sabre"));
     let plugin = executable_dir.join("libdetcore_sabre.so");
     let revision_file = loader.with_file_name("sabre.revision");
-    if loader.is_file() && plugin.is_file() && revision_file.is_file() {
-        let revision = std::fs::read_to_string(&revision_file).unwrap_or_else(|error| {
+    if !loader.is_file() || !plugin.is_file() {
+        if configured.is_some() {
             panic!(
-                "failed to read SaBRe revision provenance {}: {error}",
+                "configured SaBRe artifacts are unavailable: loader={}, plugin={}, revision={}",
+                loader.display(),
+                plugin.display(),
                 revision_file.display(),
-            )
-        });
-        let digest = Command::new("sha256sum")
-            .arg(&loader)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|output| output.split_whitespace().next().map(str::to_owned))
-            .unwrap_or_else(|| "unavailable".to_owned());
+            );
+        }
         eprintln!(
-            "SaBRe loader: path={}, revision={}, sha256={digest}",
-            loader.display(),
-            revision.trim(),
-        );
-        return Some(loader);
-    }
-    if configured.is_some() {
-        panic!(
-            "configured SaBRe artifacts are unavailable: loader={}, plugin={}, revision={}",
+            "skipping SaBRe example parity: artifacts are unavailable: loader={}, plugin={}, revision={}",
             loader.display(),
             plugin.display(),
             revision_file.display(),
         );
+        return None;
     }
+
+    let revision = if revision_file.is_file() {
+        std::fs::read_to_string(&revision_file).unwrap_or_else(|error| {
+            panic!(
+                "failed to read SaBRe revision provenance {}: {error}",
+                revision_file.display(),
+            )
+        })
+    } else if configured.is_some() {
+        panic!(
+            "configured SaBRe revision provenance is unavailable: loader={}, plugin={}, revision={}",
+            loader.display(),
+            plugin.display(),
+            revision_file.display(),
+        )
+    } else {
+        "unavailable".to_owned()
+    };
+    let digest = Command::new("sha256sum")
+        .arg(&loader)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| output.split_whitespace().next().map(str::to_owned))
+        .unwrap_or_else(|| "unavailable".to_owned());
     eprintln!(
-        "skipping SaBRe example parity: artifacts are unavailable: loader={}, plugin={}, revision={}",
+        "SaBRe loader: path={}, revision={}, sha256={digest}",
         loader.display(),
-        plugin.display(),
-        revision_file.display(),
+        revision.trim(),
     );
-    None
+    Some(loader)
 }
 
 fn kill_process_group(pid: u32, label: &str) {
