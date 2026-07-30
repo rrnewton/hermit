@@ -22,3 +22,15 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# LOCAL-ONLY: redirect reverie git deps to the local worktree for KVM fd-table
+# investigation. DO NOT COMMIT.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-kvm" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-ptrace" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-rpc-transport" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-syscalls" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-process" }
+reverie-util = { path = "/home/newton/work/dev-hermit/worktrees/kvm/reverie/reverie-util" }
