@@ -2303,7 +2303,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Determinism: strict execution serializes creation, which exposes only kernel validation,
     /// guest-visible flags, and a descriptor number; this operation does not read the clock.
-    /// The descriptor's virtual-time arming state starts disarmed (see [`TimerfdState`]).
+    /// The descriptor's virtual-time arming state (`TimerfdState`) starts disarmed.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_create<G: Guest<Self>>(
@@ -2343,7 +2343,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// clock so that a subsequent `read()` reports expirations as a function of
     /// the deterministic schedule rather than host wall-clock.
     ///
-    /// The virtual arming ([`TimerfdState`]) is what `read()` and `gettime`
+    /// The virtual arming (`TimerfdState`) is what `read()` and `gettime`
     /// consult. The host timer is still armed (with `old_value` cleared so it
     /// cannot overwrite guest memory) to keep `poll`/`epoll` readiness working
     /// for consumers that wait that way; Detcore never itself reads the host
