@@ -15,13 +15,15 @@ build. As of this writing the deps are:
 - `hermit-cli/Cargo.toml`
 - `detcore/Cargo.toml`
 - `detcore-dbi/Cargo.toml`
+- `detcore-liteinst/Cargo.toml`
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
 - `detcore-sabre/Cargo.toml`
 - `detcore/tests/testutils/Cargo.toml`
 - `hermit-install/Cargo.toml`
 - `liteinst-runtime-build/runtime/Cargo.toml` — isolated constructor-runtime build
 
-The first eight hexadecimal digits also key LiteInst build caches. Update the
+The first nine manifest locations above must stay on one exact revision. The
+first eight hexadecimal digits also key LiteInst build caches. Update the
 embedded short revision in all four locations so a new Reverie pin cannot reuse
 or mislabel artifacts from the previous revision:
 

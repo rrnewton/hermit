@@ -1229,6 +1229,19 @@ async fn run_kvm(
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
+    // The KVM backend now defaults to Tool-owned guest threads: CLONE_THREAD
+    // workers are driven through the Detcore tool loop and their futex/CLEARTID
+    // synchronization routes to Detcore, matching the golden ptrace model
+    // ("follow children"). Detcore's own clone logic treats a CLONE_THREAD as
+    // backend-uninstrumented iff `backend_dispatches_thread_tools` is false (see
+    // detcore/src/syscalls/threads.rs), so in exactly that case opt the backend
+    // out to host-owned threads to keep worker execution and futex ownership in
+    // one synchronization domain (mixing them deadlocks pthread_join). In the
+    // default (true) case the backend already follows children, so no call is
+    // needed.
+    if !config.backend_dispatches_thread_tools {
+        backend.unmonitored_threads();
+    }
 
     let execution_started = Instant::now();
     let (global_state, code, stdout, stderr) = backend
@@ -1416,7 +1429,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
-    config.backend_dispatches_thread_tools = backend != Backend::Kvm;
+    config.backend_dispatches_thread_tools = true;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1968,7 +1981,7 @@ mod tests {
         let config = super::DetConfig::default();
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(!kvm.backend_serializes_fork_children);
-        assert!(!kvm.backend_dispatches_thread_tools);
+        assert!(kvm.backend_dispatches_thread_tools);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
         assert!(kvm.backend_defers_vfork_child_registration);
