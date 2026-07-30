@@ -76,16 +76,12 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     command.output().expect("failed to run Hermit LiteInst")
 }
 
-fn assert_strict_verify_with_ptrace_rcb_preemption(
-    program: &Path,
-    args: &[&str],
-    expected_stdout: &[u8],
-) {
-    let output = strict_verify_with_ptrace_rcb_preemption(program, args);
+fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout: &[u8]) {
+    let output = run_liteinst_strict_verify(program, args);
     assert_eq!(output.stdout, expected_stdout);
 }
 
-fn strict_verify_with_ptrace_rcb_preemption(program: &Path, args: &[&str]) -> Output {
+fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
     let output = run_liteinst(program, args, true);
     assert!(
         output.status.success(),
@@ -101,9 +97,11 @@ fn strict_verify_with_ptrace_rcb_preemption(program: &Path, args: &[&str]) -> Ou
         ),
         "{stderr}"
     );
-    assert!(
-        !stderr.contains("continuing with --max-timeslice=disabled"),
-        "{stderr}"
+    let perf_supported = reverie_ptrace::is_perf_supported();
+    assert_eq!(
+        stderr.contains("perf_event_open is unavailable; continuing with --max-timeslice=disabled"),
+        !perf_supported,
+        "perf_supported={perf_supported}\n{stderr}"
     );
     assert!(
         stderr.contains("Success: deterministic. Determinism verified."),
@@ -120,15 +118,15 @@ fn strict_verify_with_ptrace_rcb_preemption(program: &Path, args: &[&str]) -> Ou
 
 #[test]
 fn liteinst_detcore_strict_verify_micro_suite() {
-    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/bin/true"), &[], b"");
-    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/bin/echo"), &["hello"], b"hello\n");
+    assert_liteinst_strict_verify(Path::new("/bin/true"), &[], b"");
+    assert_liteinst_strict_verify(Path::new("/bin/echo"), &["hello"], b"hello\n");
 
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
     let readme = repository.join("README.md");
     let expected = fs::read(&readme).expect("read README fixture");
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,
@@ -137,13 +135,9 @@ fn liteinst_detcore_strict_verify_micro_suite() {
 
 #[test]
 fn liteinst_strict_verify_identity_utilities() {
-    assert_strict_verify_with_ptrace_rcb_preemption(
-        Path::new("/usr/bin/uname"),
-        &["-s"],
-        b"Linux\n",
-    );
-    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/usr/bin/id"), &["-u"], b"0\n");
-    assert_strict_verify_with_ptrace_rcb_preemption(Path::new("/usr/bin/whoami"), &[], b"root\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/uname"), &["-s"], b"Linux\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/id"), &["-u"], b"0\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/whoami"), &[], b"root\n");
 }
 
 #[test]
@@ -151,35 +145,35 @@ fn liteinst_strict_verify_file_and_text_utilities() {
     let fixture = compatibility_fixture();
     let fixture = fixture.to_str().expect("fixture path should be UTF-8");
 
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/printf"),
         &["liteinst-printf-ok\n"],
         b"liteinst-printf-ok\n",
     );
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/grep"),
         &["^liteinst", fixture],
         COMPAT_FIXTURE_CONTENT,
     );
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/head"),
         &["-n", "1", fixture],
         COMPAT_FIXTURE_CONTENT,
     );
 
     let expected_wc = format!("{} {fixture}\n", COMPAT_FIXTURE_CONTENT.len());
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/wc"),
         &["-c", fixture],
         expected_wc.as_bytes(),
     );
     let expected_sha256 = format!("{COMPAT_FIXTURE_SHA256}  {fixture}\n");
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/sha256sum"),
         &[fixture],
         expected_sha256.as_bytes(),
     );
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/stat"),
         &["-c", "%s", fixture],
         format!("{}\n", COMPAT_FIXTURE_CONTENT.len()).as_bytes(),
@@ -188,12 +182,12 @@ fn liteinst_strict_verify_file_and_text_utilities() {
 
 #[test]
 fn liteinst_strict_verify_shell_and_entropy_consumer() {
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/bin/sh"),
         &["-c", "printf 'liteinst-shell-ok\\n'"],
         b"liteinst-shell-ok\n",
     );
-    assert_strict_verify_with_ptrace_rcb_preemption(
+    assert_liteinst_strict_verify(
         Path::new("/usr/bin/hexdump"),
         &["/dev/urandom", "--length", "16"],
         b"0000000 7229 04bb 964d 28df ba71 4c03 de95 7027\n0000010\n",
@@ -202,7 +196,7 @@ fn liteinst_strict_verify_shell_and_entropy_consumer() {
 
 #[test]
 fn liteinst_strict_verify_python_entropy() {
-    let output = strict_verify_with_ptrace_rcb_preemption(
+    let output = run_liteinst_strict_verify(
         Path::new("/usr/bin/python3"),
         &[
             "-c",
