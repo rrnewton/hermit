@@ -19,7 +19,16 @@ build. As of this writing the deps are:
 - `detcore-sabre/Cargo.toml`
 - `detcore/tests/testutils/Cargo.toml`
 - `hermit-install/Cargo.toml`
-- `liteinst-runtime-build/Cargo.toml` — isolated constructor-runtime build
+- `liteinst-runtime-build/runtime/Cargo.toml` — isolated constructor-runtime build
+
+The first eight hexadecimal digits also key LiteInst build caches. Update the
+embedded short revision in all four locations so a new Reverie pin cannot reuse
+or mislabel artifacts from the previous revision:
+
+- `ci/dag/portable.json`
+- `validate.sh`
+- `hermit-install/build.rs`
+- `hermit-cli/tests/common/liteinst.rs`
 
 ## How to bump
 
@@ -38,7 +47,10 @@ build. As of this writing the deps are:
    grep -rl "$OLD" --include=Cargo.toml . | xargs sed -i "s/$OLD/$NEW/g"
    ```
 
-3. Re-resolve and build:
+3. Replace the old eight-digit short revision in all four LiteInst cache paths
+   listed above with the new pin's first eight digits.
+
+4. Re-resolve and build:
 
    ```bash
    with-proxy cargo update -p reverie   # refresh the lock for the new rev
@@ -46,7 +58,7 @@ build. As of this writing the deps are:
    with-proxy cargo build --workspace
    ```
 
-4. Run the test suite before landing the bump; a Reverie change can alter
+5. Run the test suite before landing the bump; a Reverie change can alter
    interception/behavior even when it compiles.
 
 ## Notes
