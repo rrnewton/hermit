@@ -2,14 +2,30 @@
 """Run QEMU plus its serial/QMP controller inside Hermit's boundary."""
 
 import argparse
+import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import time
 from typing import List, Optional
 
 from demo_common import qmp_command, stop_process, wait_for_socket
+
+
+# Force subprocess to launch QEMU with fork()+execve, never vfork(). CPython
+# (3.11+) uses vfork() by default, which suspends the PARENT until the child
+# execs. This controller runs *inside* Hermit alongside QEMU, so both are guests
+# of the same deterministic scheduler. Under `hermit run --no-rcb-time`, once the
+# vforked child execs QEMU, QEMU's `-icount sleep=off` main loop immediately
+# busy-loops (clock_gettime + ppoll) on the restored idle guest and races virtual
+# time forward, and the scheduler never resumes the suspended vfork parent: the
+# controller freezes at vfork() forever and the run hits the wall-clock timeout
+# (observed: controller stuck at syscall 58, 0 serial bytes, 120s timeout). Plain
+# fork() leaves the parent runnable, so the controller keeps its (earlier) logical
+# clock and is scheduled ahead of QEMU by virtual time, exactly like the demo-5
+# boot path. This attribute exists on CPython 3.11+; guard for older runtimes.
+if hasattr(subprocess, "_USE_VFORK"):
+    subprocess._USE_VFORK = False
 
 
 BOOT_MARKER = "HERMIT-QEMU-BASELINE-BOOT-OK"
@@ -26,36 +42,84 @@ QEMU_ENV = {
 }
 
 
-class BlockingSerial:
-    """Single-threaded serial transport used inside Hermit's scheduler."""
+class PipeSerial:
+    """Bidirectional serial over a QEMU `-serial pipe:` FIFO pair.
 
-    def __init__(self, socket_path: Path, transcript: Path) -> None:
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.connect(str(socket_path))
+    QEMU reads guest input from ``<base>.in`` and writes guest output to
+    ``<base>.out``. Resume must type a shell command and read its output, so it
+    needs a bidirectional transport -- but a connected unix-socket chardev
+    starves the -icount vCPU under `hermit run --no-rcb-time` exactly like the
+    demo-5 boot bug: its fd is host-timing poll-ready, so QEMU's glib main loop
+    spins on poll() and monopolizes the deterministic scheduler. A pipe's input
+    FIFO is poll-ready only while a command is actually queued, so the main loop
+    blocks in poll() between commands instead of spinning, and the vCPU advances.
+
+    Every FIFO access here is NON-BLOCKING. This controller runs *inside* Hermit
+    alongside QEMU, so both are guests of the same deterministic scheduler. A
+    blocking FIFO open/read never voluntarily yields, so under `--no-rcb-time`
+    the scheduler keeps running QEMU's always-runnable `-icount sleep=off` vCPU
+    and starves this controller (observed: the controller never opened the FIFOs
+    and the run hit the 120s timeout). The demo-5 boot path avoids this by
+    polling its `-serial file:` transcript with `time.sleep` between reads, which
+    yields; mirror that here with `O_NONBLOCK` opens/reads plus a short sleep so
+    every wait yields the scheduler to QEMU. Like FileSerial there is no internal
+    deadline: the out-of-container demo process enforces the real wall-clock
+    timeout because time is virtualized inside Hermit.
+
+    QEMU opens (does not create) both FIFOs, each O_RDWR, at chardev init, so the
+    controller must ``create_fifos`` before launching QEMU.
+    """
+
+    def __init__(self, base: Path, transcript: Path) -> None:
+        self.base = Path(base)
+        # O_RDONLY|O_NONBLOCK on a FIFO returns immediately even with no writer;
+        # QEMU holds .out open O_RDWR anyway (QMP is already up before we get
+        # here). O_WRONLY|O_NONBLOCK raises ENXIO until QEMU has .in open for
+        # reading, so retry with a yielding sleep rather than a blocking open.
+        self.reader = os.open(str(self.base) + ".out", os.O_RDONLY | os.O_NONBLOCK)
+        while True:
+            try:
+                self.writer = os.open(str(self.base) + ".in", os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                time.sleep(0.05)
         self.transcript = Path(transcript).open("wb")
         self.buffer = bytearray()
+
+    @staticmethod
+    def create_fifos(base: Path) -> None:
+        for path in (Path(str(base) + ".in"), Path(str(base) + ".out")):
+            path.unlink(missing_ok=True)
+            os.mkfifo(path)
 
     def wait_for(self, marker: str, count: int = 1) -> None:
         marker_bytes = marker.encode()
         while self.buffer.count(marker_bytes) < count:
-            chunk = self.socket.recv(65536)
+            try:
+                chunk = os.read(self.reader, 65536)
+            except BlockingIOError:
+                # No guest output yet; QEMU still holds .out's write end open
+                # (O_RDWR), so this is a wait, not EOF. Sleep to yield the
+                # deterministic scheduler to QEMU's vCPU, then poll again.
+                time.sleep(0.02)
+                continue
             if not chunk:
                 raise RuntimeError(
-                    "serial disconnected before marker {!r}".format(marker)
+                    "serial pipe closed before marker {!r}".format(marker)
                 )
             self.buffer.extend(chunk)
             self.transcript.write(chunk)
             self.transcript.flush()
 
     def send_line(self, line: str) -> None:
-        self.socket.sendall(line.encode() + b"\n")
+        os.write(self.writer, line.encode() + b"\n")
 
     def close(self) -> None:
-        try:
-            self.socket.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self.socket.close()
+        for descriptor in (self.reader, self.writer):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         self.transcript.close()
 
 
@@ -137,11 +201,15 @@ def build_qemu_command(
         command.extend(["-serial", "file:{}".format(serial_endpoint)])
     else:
         # Resume must type a command into the console, so it needs a
-        # bidirectional transport and keeps the unix-socket serial chardev.
-        # `serial_endpoint` is the unix socket path.
-        command.extend(
-            ["-serial", "unix:{},server=on,wait=off".format(serial_endpoint)]
-        )
+        # bidirectional transport. Use a `-serial pipe:` FIFO pair rather than a
+        # unix socket: a connected socket's fd is host-timing poll-ready and
+        # starves the -icount vCPU under `hermit --no-rcb-time` (the same failure
+        # as the demo-5 boot bug), whereas the pipe's input FIFO is poll-ready
+        # only while a command is queued, so QEMU's main loop blocks in poll()
+        # between commands instead of spinning. `serial_endpoint` is the pipe
+        # base path; QEMU opens `<base>.in`/`<base>.out` (created by the
+        # controller before launch).
+        command.extend(["-serial", "pipe:{}".format(serial_endpoint)])
     command.extend(
         [
             "-qmp",
@@ -174,9 +242,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("mode", choices=("boot", "resume"))
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--qmp-socket", type=Path, required=True)
-    # Boot uses a `-serial file:` transcript (--serial-log) and needs no socket;
-    # resume keeps the bidirectional unix-socket serial transport.
-    parser.add_argument("--serial-socket", type=Path)
+    # Boot uses a `-serial file:` transcript (--serial-log) and needs no pipe;
+    # resume uses a bidirectional `-serial pipe:` FIFO pair rooted at this base
+    # path (QEMU opens <base>.in and <base>.out).
+    parser.add_argument("--serial-pipe", type=Path)
     parser.add_argument("--serial-log", type=Path, required=True)
     parser.add_argument("--disk", type=Path, required=True)
     parser.add_argument("--kernel", type=Path, required=True)
@@ -191,12 +260,19 @@ def parse_args() -> argparse.Namespace:
 
 def run_controller(arguments: argparse.Namespace) -> int:
     load_snapshot = arguments.snapshot_name if arguments.mode == "resume" else None
-    # Boot backs serial with a file (deterministic, no socket poll); resume backs
-    # it with the bidirectional unix socket. build_qemu_command selects the
-    # backend from load_snapshot, so pass the matching endpoint.
+    # Boot backs serial with a file (deterministic, no poll fd); resume backs it
+    # with a bidirectional pipe FIFO pair (no host-timing poll fd either).
+    # build_qemu_command selects the backend from load_snapshot, so pass the
+    # matching endpoint.
     serial_endpoint = (
-        arguments.serial_log if arguments.mode == "boot" else arguments.serial_socket
+        arguments.serial_log if arguments.mode == "boot" else arguments.serial_pipe
     )
+    if arguments.mode == "resume":
+        if arguments.serial_pipe is None:
+            raise ValueError("resume mode requires --serial-pipe")
+        # QEMU's pipe chardev opens (does not create) the FIFOs, so create them
+        # before QEMU is launched below.
+        PipeSerial.create_fifos(arguments.serial_pipe)
     command = build_qemu_command(
         arguments.qemu,
         arguments.qmp_socket,
@@ -228,10 +304,9 @@ def run_controller(arguments: argparse.Namespace) -> int:
         else:
             if not arguments.guest_command:
                 raise ValueError("resume mode requires --guest-command")
-            if arguments.serial_socket is None:
-                raise ValueError("resume mode requires --serial-socket")
-            wait_for_socket(arguments.serial_socket, process, arguments.timeout)
-            serial = BlockingSerial(arguments.serial_socket, arguments.serial_log)
+            # FIFOs were created before launch; QEMU (up now, per the QMP wait
+            # above) holds both ends open, so PipeSerial's opens do not block.
+            serial = PipeSerial(arguments.serial_pipe, arguments.serial_log)
             serial.send_line("")
             serial.wait_for(SHELL_PROMPT)
             serial.send_line("echo {}".format(BEGIN_MARKER))
