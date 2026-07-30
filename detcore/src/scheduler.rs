@@ -140,6 +140,17 @@ pub struct ThreadNextTurn {
     pub resp: Ivar<SchedResponse>,
 }
 
+/// State needed to replace a process's scheduler identity after successful exec.
+pub(crate) struct ExecReconnect {
+    pub caller: DetTid,
+    pub new_leader: DetTid,
+    pub detpid: DetPid,
+    pub pre_exec_mm: MmId,
+    pub post_exec_mm: MmId,
+    pub child_tid_addr: usize,
+    pub reconnect_priority: Option<Priority>,
+}
+
 /// Request for resources when the thread next parks.
 /// OR the thread might "park" because it's really exited.
 pub type SchedRequest = Result<Resources, ThreadExited>;
@@ -1199,16 +1210,16 @@ impl Scheduler {
     /// caller registration is retired and a fresh leader registration is installed
     /// before it is removed, so process-exit barriers cannot observe a transiently
     /// empty thread group.
-    pub fn reconnect_after_exec(
-        &mut self,
-        caller: DetTid,
-        new_leader: DetTid,
-        detpid: DetPid,
-        mm: MmId,
-        post_exec_mm: MmId,
-        child_tid_addr: usize,
-        reconnect_priority: Option<Priority>,
-    ) -> Vec<DetTid> {
+    pub fn reconnect_after_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
+        let ExecReconnect {
+            caller,
+            new_leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm,
+            child_tid_addr,
+            reconnect_priority,
+        } = reconnect;
         let group = self.thread_tree.my_thread_group(&detpid);
         assert!(group.contains(&caller));
         assert!(group.contains(&new_leader));
@@ -1217,7 +1228,7 @@ impl Scheduler {
         if caller == new_leader {
             let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
             for sibling in &siblings {
-                self.logically_kill_thread(sibling, &detpid, mm);
+                self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
                 self.timeslices.remove(sibling);
             }
             self.remove_exec_vfork_barriers(&siblings);
@@ -1232,7 +1243,7 @@ impl Scheduler {
             .expect("exec caller must have a scheduler priority");
         let mut retired = Vec::new();
         for old_tid in group.into_iter().filter(|tid| *tid != caller) {
-            self.logically_kill_thread(&old_tid, &detpid, mm);
+            self.logically_kill_thread(&old_tid, &detpid, pre_exec_mm);
             self.timeslices.remove(&old_tid);
             retired.push(old_tid);
         }
@@ -1264,7 +1275,7 @@ impl Scheduler {
         self.runqueue_push_back(new_leader);
         self.started_up.try_put(());
 
-        self.logically_kill_thread(&caller, &detpid, mm);
+        self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
         self.timeslices.remove(&caller);
         retired.push(caller);
         self.remove_exec_vfork_barriers(&retired);

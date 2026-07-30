@@ -65,6 +65,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
+use crate::scheduler::ExecReconnect;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
@@ -132,6 +133,12 @@ struct PendingExecState {
     process: DetPid,
     mm: MmId,
     fd_blocking: ExecFdBlockingOverrides,
+}
+
+#[derive(Clone, Copy)]
+struct RpcIncarnation {
+    dettid: DetTid,
+    mm: MmId,
 }
 
 impl Default for InodePool {
@@ -773,15 +780,19 @@ impl GlobalTool for GlobalState {
                         (pending, post_exec_mm)
                     };
                     assert_eq!(pending.process, parent_detpid);
-                    let retired = self.sched.lock().unwrap().reconnect_after_exec(
-                        pending.caller,
-                        dettid,
-                        parent_detpid,
-                        pending.mm,
-                        post_exec_mm,
-                        ctid,
-                        priority,
-                    );
+                    let retired = self
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .reconnect_after_exec(ExecReconnect {
+                            caller: pending.caller,
+                            new_leader: dettid,
+                            detpid: parent_detpid,
+                            pre_exec_mm: pending.mm,
+                            post_exec_mm,
+                            child_tid_addr: ctid,
+                            reconnect_priority: priority,
+                        });
                     if pending.caller != dettid {
                         self.global_time
                             .lock()
@@ -862,8 +873,17 @@ impl GlobalTool for GlobalState {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
-                self.recv_futex_action(from, dettid, action, futexid, init_read, mask, request_mm)
-                    .await,
+                self.recv_futex_action(
+                    RpcIncarnation {
+                        dettid,
+                        mm: request_mm,
+                    },
+                    action,
+                    futexid,
+                    init_read,
+                    mask,
+                )
+                .await,
             ),
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
@@ -893,7 +913,17 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 match self
-                    .recv_register_alarm(dpid, dtid, now, duration, interval, sig, request_mm)
+                    .recv_register_alarm(
+                        dpid,
+                        RpcIncarnation {
+                            dettid: dtid,
+                            mm: request_mm,
+                        },
+                        now,
+                        duration,
+                        interval,
+                        sig,
+                    )
                     .await
                 {
                     SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(remaining),
@@ -911,7 +941,15 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
                 match self
                     .recv_register_posix_timer(
-                        dpid, dtid, timer_id, deadline, interval, sig, request_mm,
+                        dpid,
+                        RpcIncarnation {
+                            dettid: dtid,
+                            mm: request_mm,
+                        },
+                        timer_id,
+                        deadline,
+                        interval,
+                        sig,
                     )
                     .await
                 {
@@ -1432,19 +1470,18 @@ impl GlobalState {
 
     async fn recv_futex_action(
         &self,
-        _from: Tid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         action: FutexAction,
         futexid: FutexID,
         init_read: i32,
         mask: u32,
-        request_mm: MmId,
     ) -> Option<SchedValue> {
+        let RpcIncarnation { dettid, mm } = caller;
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
             if sched.thread_is_logically_killed(dettid)
-                || !sched.rpc_incarnation_matches(dettid, request_mm)
+                || !sched.rpc_incarnation_matches(dettid, mm)
             {
                 return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
             }
@@ -1725,17 +1762,15 @@ impl GlobalState {
     async fn recv_register_alarm(
         &self,
         detpid: DetPid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         now: LogicalTime,
         duration: LogicalTime,
         interval: LogicalTime,
         sig: SigWrapper,
-        request_mm: MmId,
     ) -> SchedulerRpcResult<(LogicalTime, LogicalTime)> {
+        let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.sched.lock().unwrap();
-        if sched.thread_is_logically_killed(dettid)
-            || !sched.rpc_incarnation_matches(dettid, request_mm)
-        {
+        if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
         SchedulerRpcResult::Continue(
@@ -1749,17 +1784,15 @@ impl GlobalState {
     async fn recv_register_posix_timer(
         &self,
         detpid: DetPid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
         sig: SigWrapper,
-        request_mm: MmId,
     ) -> SchedulerRpcResult<()> {
+        let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.sched.lock().unwrap();
-        if sched.thread_is_logically_killed(dettid)
-            || !sched.rpc_incarnation_matches(dettid, request_mm)
-        {
+        if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
         sched.register_posix_timer(detpid, dettid, timer_id, deadline, interval, sig.0);
@@ -2651,6 +2684,7 @@ mod tests {
     use super::GlobalResponse;
     use super::GlobalState;
     use super::PendingExecState;
+    use super::RpcIncarnation;
     use super::SchedulerRpcResult;
     use super::SigWrapper;
     use super::ThreadDeregistration;
@@ -3040,11 +3074,12 @@ mod tests {
                 GlobalResponse::StartNewThread(None)
             )
         );
-        let global_time = state.global_time.lock().unwrap();
-        assert_eq!(global_time.as_nanos(), total_before);
-        assert_eq!(global_time.threads_time(leader), worker_clock.as_nanos());
-        assert!(!global_time.contains_thread(worker));
-        drop(global_time);
+        {
+            let global_time = state.global_time.lock().unwrap();
+            assert_eq!(global_time.as_nanos(), total_before);
+            assert_eq!(global_time.threads_time(leader), worker_clock.as_nanos());
+            assert!(!global_time.contains_thread(worker));
+        }
 
         let mark_response = state
             .receive_rpc(
@@ -3108,11 +3143,12 @@ mod tests {
             .await;
         assert_eq!(cancelled.1, GlobalResponse::CancelExec(()));
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
-        let scheduler = state.sched.lock().unwrap();
-        assert!(!scheduler.thread_is_logically_killed(leader));
-        assert!(!scheduler.thread_is_logically_killed(sibling));
-        assert_eq!(scheduler.next_turns.len(), 2);
-        drop(scheduler);
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert!(!scheduler.thread_is_logically_killed(leader));
+            assert!(!scheduler.thread_is_logically_killed(sibling));
+            assert_eq!(scheduler.next_turns.len(), 2);
+        }
 
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
@@ -3259,13 +3295,14 @@ mod tests {
         let detpid = DetPid::from_raw(17);
         let response = state
             .recv_futex_action(
-                reverie::Tid::from_raw(17),
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 FutexAction::WaitRequest(None),
                 FutexID::private(MmId::initial(detpid), 0x1000),
                 0,
                 u32::MAX,
-                MmId::initial(detpid),
             )
             .await;
 
@@ -3316,13 +3353,14 @@ mod tests {
 
         let response = state
             .recv_futex_action(
-                reverie::Tid::from_raw(detpid.as_raw()),
-                detpid,
+                RpcIncarnation {
+                    dettid: detpid,
+                    mm: MmId::initial(detpid),
+                },
                 FutexAction::WaitRequest(None),
                 futex,
                 child.as_raw(),
                 u32::MAX,
-                MmId::initial(detpid),
             )
             .await;
 
@@ -3639,12 +3677,14 @@ mod tests {
         let alarm = state
             .recv_register_alarm(
                 detpid,
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 now,
                 LogicalTime::from_nanos(10),
                 LogicalTime::ZERO,
                 SigWrapper(Signal::SIGALRM),
-                MmId::initial(detpid),
             )
             .await;
         assert_eq!(alarm, SchedulerRpcResult::ThreadExited);
@@ -3652,12 +3692,14 @@ mod tests {
         let posix = state
             .recv_register_posix_timer(
                 detpid,
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 1,
                 Some(now + LogicalTime::from_nanos(10)),
                 LogicalTime::ZERO,
                 SigWrapper(Signal::SIGALRM),
-                MmId::initial(detpid),
             )
             .await;
         assert_eq!(posix, SchedulerRpcResult::ThreadExited);
