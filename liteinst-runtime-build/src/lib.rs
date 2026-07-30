@@ -5,5 +5,9 @@
 //! cdylib. This standalone locked graph makes the constructor-bearing runtime
 //! an explicit artifact without linking its constructor into the Hermit host.
 
-// The constructor-enabled runtime is a build dependency so Cargo must finish
-// it before this package's build script validates and stages the cdylib.
+//! The build script compiles the runtime member in an isolated target directory
+//! and stages the exact cdylib reported by that Cargo invocation.
+
+#[cfg(test)]
+#[path = "../artifact.rs"]
+mod artifact;

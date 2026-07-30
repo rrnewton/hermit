@@ -3,10 +3,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
+
+mod artifact;
 
 fn has_preload_constructor(path: &Path) -> io::Result<bool> {
     let bytes = fs::read(path)?;
@@ -57,6 +60,9 @@ fn has_preload_constructor(path: &Path) -> io::Result<bool> {
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
     println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=artifact.rs");
+    println!("cargo:rerun-if-changed=runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=runtime/src/lib.rs");
     let destination = PathBuf::from(
         env::var_os("HERMIT_LITEINST_STAGE")
             .expect("HERMIT_LITEINST_STAGE must name the stable runtime output path"),
@@ -66,27 +72,57 @@ fn main() {
         .ancestors()
         .nth(3)
         .expect("standalone runtime OUT_DIR has no profile ancestor");
-    let deps = profile_dir.join("deps");
-    let candidates = fs::read_dir(&deps)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", deps.display()))
-        .map(|entry| entry.expect("failed to read LiteInst build dependency artifact"))
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name().is_some_and(|name| {
-                let name = name.as_encoded_bytes();
-                name.starts_with(b"libreverie_liteinst-") && name.ends_with(b".so")
-            })
-        })
-        .filter(|path| {
-            has_preload_constructor(path)
-                .unwrap_or_else(|error| panic!("failed to validate {}: {error}", path.display()))
-        })
-        .collect::<Vec<_>>();
+    let profile = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| if name == "debug" { "dev" } else { name })
+        .expect("standalone runtime profile path is not valid UTF-8");
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
+    );
+    let nested_target = out_dir.join("runtime-target");
+    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args([
+            "build",
+            "--locked",
+            "--manifest-path",
+            "Cargo.toml",
+            "-p",
+            "hermit-liteinst-runtime-artifact",
+            "--profile",
+            profile,
+            "--target-dir",
+        ])
+        .arg(&nested_target)
+        .arg("--message-format=json-render-diagnostics")
+        .current_dir(&manifest_dir)
+        .env_remove("HERMIT_LITEINST_STAGE")
+        .output()
+        .expect("failed to invoke Cargo for the isolated LiteInst runtime build");
+    if !output.status.success() {
+        panic!(
+            "isolated LiteInst runtime build failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let messages = String::from_utf8(output.stdout)
+        .expect("isolated LiteInst runtime Cargo output was not UTF-8");
+    let candidates = artifact::liteinst_cdylibs_from_cargo_messages(&messages)
+        .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
     assert_eq!(
         candidates.len(),
         1,
-        "expected one constructor-enabled LiteInst DSO in {}, found {candidates:?}",
-        deps.display(),
+        "expected exactly one LiteInst cdylib in current isolated Cargo output, found {candidates:?}",
+    );
+    assert!(
+        has_preload_constructor(&candidates[0]).unwrap_or_else(|error| panic!(
+            "failed to validate current LiteInst artifact {}: {error}",
+            candidates[0].display()
+        )),
+        "current LiteInst artifact lacks the preload constructor: {}",
+        candidates[0].display()
     );
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
