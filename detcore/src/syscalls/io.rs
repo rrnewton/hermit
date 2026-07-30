@@ -10,6 +10,8 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
@@ -34,6 +36,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
@@ -41,6 +44,7 @@ use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
+use crate::types::DetTid;
 use crate::types::LogicalTime;
 
 // Printing helper
@@ -58,6 +62,24 @@ fn print_poll(call: &syscalls::Poll) {
             );
         }
     }
+}
+
+/// Build the scheduler request for a zero-timeout poll.
+///
+/// An empty request only rotates the caller within its current priority band. That is not a
+/// yield when a busy poller has a higher priority than the producer whose readiness it is
+/// probing. `SchedYield` excludes the caller from the next selection, allowing exactly one
+/// other runnable guest to make progress before the nonblocking poll executes. Limit that strong
+/// yield to SaBRe tasks with a loopback peer: libcurl alternates its loopback socket with an
+/// internal wakeup fd, and either zero-timeout probe can otherwise starve the peer. General
+/// build-tool polling retains the existing empty-turn behavior.
+fn zero_timeout_poll_request(dettid: DetTid, yield_to_peer: bool) -> Resources {
+    let mut request = Resources::new(dettid);
+    if yield_to_peer {
+        request.insert(ResourceID::SchedYield, Permission::W);
+        request.fyi(SABRE_LOOPBACK_POLL_YIELD_FYI);
+    }
+    request
 }
 
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
@@ -358,7 +380,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
-            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            let yield_to_peer =
+                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            resource_request(
+                guest,
+                zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+            )
+            .await;
             if self.cfg.recordreplay_modes {
                 Ok(self.record_or_replay(guest, call).await?)
             } else {
@@ -943,7 +971,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A nonblocking poll can still be the synchronization point in a
             // userspace polling loop. Yield once before probing so backends
             // without PMU preemption cannot let that loop starve its producer.
-            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            let yield_to_peer =
+                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            resource_request(
+                guest,
+                zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+            )
+            .await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -1098,6 +1132,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Connect,
     ) -> Result<i64, Error> {
+        let loopback_peer = if let Some(address) = call.uservaddr() {
+            let addrlen = usize::try_from(call.addrlen()).unwrap_or(0);
+            let family = if addrlen >= std::mem::size_of::<u16>() {
+                let family: u16 = guest.memory().read_value(address.cast())?;
+                Some(family)
+            } else {
+                None
+            };
+            if family == Some(libc::AF_INET as u16)
+                && addrlen >= std::mem::size_of::<libc::sockaddr_in>()
+            {
+                let address: libc::sockaddr_in = guest.memory().read_value(address.cast())?;
+                Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).is_loopback()
+            } else if family == Some(libc::AF_INET6 as u16)
+                && addrlen >= std::mem::size_of::<libc::sockaddr_in6>()
+            {
+                let address: libc::sockaddr_in6 = guest.memory().read_value(address.cast())?;
+                Ipv6Addr::from(address.sin6_addr.s6_addr).is_loopback()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let fd = call.fd();
+        if loopback_peer {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_loopback_peer())?;
+        }
+
         if guest.config().sched_heuristic == SchedHeuristic::ConnectBind {
             trace!("Scheduling heuristic: reprioritizing connect");
             let resource = ResourceID::PriorityChangePoint(
@@ -1367,6 +1432,26 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_timeout_socket_poll_requests_a_strong_one_turn_yield() {
+        let request = zero_timeout_poll_request(DetTid::from_raw(17), true);
+
+        assert_eq!(request.resources.len(), 1);
+        assert_eq!(
+            request.resources.get(&ResourceID::SchedYield),
+            Some(&Permission::W)
+        );
+        assert_eq!(request.fyi, SABRE_LOOPBACK_POLL_YIELD_FYI);
+    }
+
+    #[test]
+    fn zero_timeout_non_socket_poll_keeps_the_existing_empty_turn() {
+        let request = zero_timeout_poll_request(DetTid::from_raw(17), false);
+
+        assert!(request.resources.is_empty());
+        assert!(request.fyi.is_empty());
+    }
 
     #[test]
     fn ppoll_timeout_uses_timespec_units() {
