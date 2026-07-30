@@ -598,6 +598,13 @@ def wait_for_process(
                 ),
                 flush=True,
             )
+            # Stable, greppable marker so timing harnesses can recover the
+            # frozen time-to-first-output from a log without parsing the
+            # human-facing counter line (which carries a leading '\r').
+            print(
+                "FIRST_OUTPUT_ELAPSED={:.1f}s".format(first_output_at),
+                flush=True,
+            )
 
     try:
         while True:
@@ -623,10 +630,18 @@ def wait_for_process(
                         sys.stdout.buffer.write(chunk)
                         sys.stdout.buffer.flush()
                 if progress_label is not None:
+                    done_elapsed = time.monotonic() - started
                     print(
                         "\r{}: done ({:.1f}s)".format(
-                            progress_label, time.monotonic() - started
+                            progress_label, done_elapsed
                         )
+                    )
+                    # Stable, greppable end-of-timer marker.
+                    print(
+                        "TIMER_DONE label={} elapsed={:.1f}s".format(
+                            progress_label, done_elapsed
+                        ),
+                        flush=True,
                     )
                 return return_code
 
