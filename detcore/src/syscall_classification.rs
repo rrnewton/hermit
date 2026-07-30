@@ -550,7 +550,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // registers the result as FdType::Pidfd before later fd operations.
         | Sysno::pidfd_open
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-PIDFDSIG): pidfd_send_signal/pidfd_getfd operate on
+        // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal/pidfd_getfd operate on
         // a pidfd that names one specific process fixed at pidfd_open time, so
         // there is no numeric-PID ambiguity to resolve. Delivery/duplication runs
         // inside the serialized scheduler turn (like tgkill), and the handlers add

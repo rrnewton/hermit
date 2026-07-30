@@ -837,7 +837,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-862): Keep modeled pidfd creation intercepted.
                 Sysno::pidfd_open,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-PIDFDSIG): Keep pidfd signal/get-fd
+                // TODO-HUMAN-REVIEW(PR-1175): Keep pidfd signal/get-fd
                 // determinization from being bypassed under the passthru opt-in.
                 Sysno::pidfd_send_signal,
                 Sysno::pidfd_getfd,
@@ -1482,7 +1482,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PIDFDSIG): The pinned Reverie revision exposes
+            // TODO-HUMAN-REVIEW(PR-1175): The pinned Reverie revision exposes
             // pidfd_send_signal/pidfd_getfd only as raw calls, so dispatch on the
             // Sysno. See the handlers in syscalls/files.rs for the determinism
             // argument.
@@ -1501,7 +1501,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PIDFDSIG): pidfd_getfd, likewise untyped.
+            // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd, likewise untyped.
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
                 match call {
                     Syscall::Other(_, args) => {

@@ -2371,7 +2371,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PIDFDSIG): pidfd_send_signal(2) determinization.
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal(2) determinization.
     /// Deliver a signal to the process referred to by a pidfd.
     ///
     /// `pidfd_send_signal(pidfd, sig, info, flags)` names its target by an open
@@ -2412,7 +2412,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PIDFDSIG): pidfd_getfd(2) determinization and the
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd(2) determinization and the
     // FdType of the duplicated descriptor.
     /// Duplicate a descriptor from the process referred to by a pidfd.
     ///
