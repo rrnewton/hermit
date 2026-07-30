@@ -227,24 +227,40 @@ def _wait_for_qemu(process: subprocess.Popen, process_group: int, timeout: float
     raise TimeoutError("QEMU child not found in Hermit's process group")
 
 
-def _connect_serial(path: Path, process: subprocess.Popen, timeout: float) -> socket.socket:
+def _open_serial_pipe(
+    base: Path, process: subprocess.Popen, timeout: float
+) -> Tuple[int, int]:
+    """Open a QEMU `-serial pipe:` FIFO pair (``<base>.in``/``<base>.out``).
+
+    A connected unix-socket serial chardev keeps a host-timing poll-ready fd in
+    QEMU's main loop and starves the -icount vCPU under `hermit --no-rcb-time`
+    (the demo-5 boot bug). A pipe's input FIFO is poll-ready only while a command
+    is queued, so QEMU's main loop blocks in poll() between commands. QEMU opens
+    both ends O_RDWR at chardev init, so these opens do not block once QEMU is up
+    (guaranteed by the preceding QMP connect). The read end is non-blocking so
+    the advance loop can poll for guest liveness, matching the old socket's
+    per-recv timeout.
+    """
+    read_fd = os.open(str(base) + ".out", os.O_RDONLY | os.O_NONBLOCK)
     deadline = time.monotonic() + timeout
-    last_error = None
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                "Hermit exited before serial connected (status {})".format(process.returncode)
-            )
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(0.25)
+    while True:
         try:
-            connection.connect(str(path))
-            return connection
-        except (FileNotFoundError, ConnectionRefusedError) as error:
-            last_error = error
-            connection.close()
+            write_fd = os.open(str(base) + ".in", os.O_WRONLY | os.O_NONBLOCK)
+            return read_fd, write_fd
+        except OSError as error:
+            if process.poll() is not None:
+                os.close(read_fd)
+                raise RuntimeError(
+                    "Hermit exited before serial pipe opened (status {})".format(
+                        process.returncode
+                    )
+                )
+            if time.monotonic() >= deadline:
+                os.close(read_fd)
+                raise TimeoutError(
+                    "serial input pipe did not open: {}.in ({})".format(base, error)
+                )
             time.sleep(0.05)
-    raise TimeoutError("serial socket did not become ready: {} ({})".format(path, last_error))
 
 
 def _freeze_exact_tracer(qemu_pid: int, timeout: float = 20.0) -> Tuple[int, int]:
@@ -331,7 +347,8 @@ class HermitGuestProgram:
         self._tracer_tgid = None  # type: Optional[int]
         self._memory = None  # type: Optional[int]
         self._qmp = None  # type: Optional[QmpClient]
-        self._serial = None  # type: Optional[socket.socket]
+        self._serial_read_fd = None  # type: Optional[int]
+        self._serial_write_fd = None  # type: Optional[int]
         self._ram_first = 0
         self._ram_size = 0
         self._vmcoreinfo = b""
@@ -360,7 +377,13 @@ class HermitGuestProgram:
         self.serial_log = self.run_dir / "serial.log"
         hermit_log = self.run_dir / "hermit.log"
         qmp_socket = self.run_dir / "qmp.sock"
-        serial_socket = self.run_dir / "serial.sock"
+        # Bidirectional serial over a `-serial pipe:` FIFO pair, not a unix
+        # socket: a socket chardev's poll fd starves the -icount vCPU under
+        # `hermit --no-rcb-time` (the demo-5 boot bug). QEMU opens (does not
+        # create) the FIFOs, so make them before launch.
+        serial_pipe = self.run_dir / "serial"
+        for suffix in (".in", ".out"):
+            os.mkfifo(str(serial_pipe) + suffix)
         working_snapshot = self.run_dir / "snapshot.qcow2"
         shutil.copyfile(str(self.config.snapshot_disk), str(working_snapshot))
 
@@ -373,7 +396,7 @@ class HermitGuestProgram:
             "-m", "512M",
             "-display", "none",
             "-monitor", "none",
-            "-serial", "unix:{},server=on,wait=off".format(serial_socket),
+            "-serial", "pipe:{}".format(serial_pipe),
             "-qmp", "unix:{},server=on,wait=off".format(qmp_socket),
             "-drive", "if=none,id=hermit-snapshot-store,file={},format=qcow2".format(
                 working_snapshot
@@ -417,7 +440,9 @@ class HermitGuestProgram:
             )
         self._process_group = os.getpgid(self._process.pid)
         self._qmp = QmpClient.connect(qmp_socket, self._process, self.config.timeout)
-        self._serial = _connect_serial(serial_socket, self._process, self.config.timeout)
+        self._serial_read_fd, self._serial_write_fd = _open_serial_pipe(
+            serial_pipe, self._process, self.config.timeout
+        )
         initial_status = self._qmp.status()
         if initial_status not in ("paused", "prelaunch"):
             self._qmp.execute("stop")
@@ -501,7 +526,11 @@ class HermitGuestProgram:
             )
 
     def _wait_for_serial(self, marker: bytes) -> None:
-        if self._serial is None or self.serial_log is None or self._process is None:
+        if (
+            self._serial_read_fd is None
+            or self.serial_log is None
+            or self._process is None
+        ):
             raise RuntimeError("serial transport is unavailable")
         deadline = time.monotonic() + self.config.timeout
         transcript = bytearray()
@@ -514,8 +543,11 @@ class HermitGuestProgram:
                         )
                     )
                 try:
-                    chunk = self._serial.recv(65536)
-                except socket.timeout:
+                    chunk = os.read(self._serial_read_fd, 65536)
+                except BlockingIOError:
+                    # No guest output yet; QEMU still holds the pipe's write end
+                    # open (O_RDWR), so this is a wait, not EOF.
+                    time.sleep(0.02)
                     continue
                 if not chunk:
                     raise RuntimeError("guest serial disconnected during advance")
@@ -529,7 +561,7 @@ class HermitGuestProgram:
 
     def advance(self, command: str, marker: bytes) -> None:
         """Run one fixed guest command interval, then freeze at its marker."""
-        if not self._frozen or self._serial is None or self._qmp is None:
+        if not self._frozen or self._serial_write_fd is None or self._qmp is None:
             raise RuntimeError("guest is not ready for deterministic advance")
         if self._tracer_tgid is None or self._qemu_pid is None:
             raise RuntimeError("traced processes are unavailable")
@@ -539,7 +571,7 @@ class HermitGuestProgram:
         # Queue the deterministic input while the tracee and tracer are frozen.
         # Once the tracer resumes, QEMU can accept it but the vCPU remains paused
         # until the explicit QMP cont below.
-        self._serial.sendall(command.encode("utf-8") + b"\n")
+        os.write(self._serial_write_fd, command.encode("utf-8") + b"\n")
         os.kill(self._tracer_tgid, signal.SIGCONT)
         self._frozen = False
         self._qmp.execute("cont")
@@ -560,12 +592,14 @@ class HermitGuestProgram:
             except OSError:
                 pass
             self._qmp = None
-        if self._serial is not None:
-            try:
-                self._serial.close()
-            except OSError:
-                pass
-            self._serial = None
+        for attribute in ("_serial_read_fd", "_serial_write_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, attribute, None)
         if self._process_group is not None:
             try:
                 os.killpg(self._process_group, signal.SIGKILL)
