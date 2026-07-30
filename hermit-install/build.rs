@@ -120,10 +120,7 @@ fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     // package is a Cargo-external side effect. Key the CMake directory by the
     // verified gitlink rather than the checkout path so a stale build from a
     // previous SaBRe revision can never be copied into the current package.
-    let short_revision = revision
-        .get(..16)
-        .expect("pinned SaBRe revision should be a full Git object ID");
-    let build = build_root.join(format!("sabre-{short_revision}"));
+    let build = build_root.join(format!("sabre-{revision}"));
     run(
         Command::new("cmake")
             .arg("-S")
