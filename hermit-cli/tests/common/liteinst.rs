@@ -47,18 +47,12 @@ pub(super) fn ensure_liteinst_runtime() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let runtime_build = repository.join("liteinst-runtime-build/Cargo.toml");
         let runtime_target = target_dir.join("liteinst-runtime-build-4cee948e");
         let runtime = liteinst_runtime_library();
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
+        let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
-            .env("HERMIT_LITEINST_STAGE", &runtime)
-            .args(["build", "--locked", "--manifest-path"])
-            .arg(&runtime_build)
-            .arg("--profile")
             .arg(cargo_profile)
-            .arg("--target-dir")
+            .arg(&runtime)
             .arg(&runtime_target)
             .output()
             .expect("failed to build the LiteInst runtime");

@@ -170,9 +170,9 @@ Build and stage the constructor-enabled runtime with its locked standalone
 manifest before building Hermit:
 
 ```bash
-HERMIT_LITEINST_STAGE="$PWD/target/debug/libreverie_liteinst.so" \
-  cargo build --locked --manifest-path liteinst-runtime-build/Cargo.toml \
-  --target-dir target/liteinst-runtime-build
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --bin hermit
 ```
 

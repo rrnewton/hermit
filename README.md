@@ -108,9 +108,9 @@ explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
 dynamically linked Linux x86-64 guests:
 
 ```bash
-HERMIT_LITEINST_STAGE="$PWD/target/debug/libreverie_liteinst.so" \
-  cargo build --locked --manifest-path liteinst-runtime-build/Cargo.toml \
-  --target-dir target/liteinst-runtime-build
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --bin hermit
 ./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
 ```

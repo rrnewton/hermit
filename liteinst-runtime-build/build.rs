@@ -65,7 +65,7 @@ fn main() {
     println!("cargo:rerun-if-changed=runtime/src/lib.rs");
     let destination = PathBuf::from(
         env::var_os("HERMIT_LITEINST_STAGE")
-            .expect("HERMIT_LITEINST_STAGE must name the stable runtime output path"),
+            .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
     );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
     let profile_dir = out_dir

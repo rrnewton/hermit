@@ -277,25 +277,13 @@ fn build_liteinst_runtime(
     profile_dir: &Path,
     resources: &Path,
 ) {
-    let manifest = repository.join("liteinst-runtime-build/Cargo.toml");
     let target = build_root.join("liteinst-runtime-4cee948e");
-    if target.exists() {
-        fs::remove_dir_all(&target).unwrap_or_else(|error| {
-            panic!(
-                "failed to reset LiteInst build {}: {error}",
-                target.display()
-            )
-        });
-    }
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
-        Command::new(cargo)
+        Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
-            .env("HERMIT_LITEINST_STAGE", &runtime)
-            .args(["build", "--locked", "--manifest-path"])
-            .arg(&manifest)
-            .args(["--release", "--target-dir"])
+            .arg("release")
+            .arg(&runtime)
             .arg(&target),
         "build the constructor-enabled LiteInst runtime",
     );
@@ -309,6 +297,7 @@ fn build_liteinst_runtime(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
 

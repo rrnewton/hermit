@@ -3221,10 +3221,9 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         cargo build --release --locked -p hermit
     if ((failures == 0)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
-            env HERMIT_LITEINST_STAGE="$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            cargo build --release --locked \
-            --manifest-path liteinst-runtime-build/Cargo.toml \
-            --target-dir "$ROOT_DIR/target/liteinst-runtime-build-4cee948e"
+            "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
+            "$ROOT_DIR/target/release/libreverie_liteinst.so" \
+            "$ROOT_DIR/target/liteinst-runtime-build-4cee948e"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
