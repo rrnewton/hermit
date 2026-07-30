@@ -119,6 +119,23 @@ make install-deps-core
 make
 ```
 
+Run the scheduled superset locally with one command. It executes Hermit's
+existing `super` stress profile, prepares the pinned Demo 8 btrfs/ASAN assets,
+then runs demos 1-8 with a PASS/FAIL row and log for each demo:
+
+```bash
+scripts/super-validate.sh
+```
+
+Use `scripts/super-validate.sh --demos-only` when the product super profile has
+already passed and only the full demo sweep needs to be repeated. Demo logs and
+the machine-readable summary are written under `target/demo-sweep/`. The full
+super profile is scheduled nightly. Pull requests and main commits run the
+demos-only profile when they change the Hermit or Reverie gitlink, demos, QEMU
+assets, or the sweep tooling; unrelated parent changes do not pay this cost.
+Every triggered red is a P0 demo regression: the workflow names the exact
+commit, annotates the run, preserves per-demo logs, and stays failed.
+
 Run each demo individually so its output and result remain easy to inspect:
 
 ```bash
