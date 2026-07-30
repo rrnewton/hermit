@@ -279,6 +279,10 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
+fn should_pause_runtime_for_exec(sysnum: i64, pid: i32, runtime_owner_pid: i32) -> bool {
+    sysnum == libc::SYS_execve && pid == runtime_owner_pid
+}
+
 // TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
 // TODO-HUMAN-REVIEW(PR-1065): Review DBI self-target prlimit64 translation.
 fn translate_self_identity_targets(
@@ -396,6 +400,7 @@ static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static RUNTIME_OWNER_PID: AtomicI32 = AtomicI32::new(0);
 static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 static COPIED_UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -837,6 +842,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
     let emit = callbacks.emit;
+    RUNTIME_OWNER_PID.store(std::process::id() as i32, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
@@ -1433,7 +1439,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
-        if sysnum == libc::SYS_execve {
+        if should_pause_runtime_for_exec(sysnum, pid, RUNTIME_OWNER_PID.load(Ordering::Acquire)) {
             READY_IMAGE.store(0, Ordering::Release);
             RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
             while !RUNTIME_PAUSED.load(Ordering::Acquire) {
@@ -1877,6 +1883,22 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    #[test]
+    fn only_runtime_owner_waits_for_scheduler_pause_before_exec() {
+        let owner = 100;
+        assert!(should_pause_runtime_for_exec(
+            libc::SYS_execve,
+            owner,
+            owner
+        ));
+        assert!(!should_pause_runtime_for_exec(
+            libc::SYS_execve,
+            owner + 1,
+            owner
+        ));
+        assert!(!should_pause_runtime_for_exec(libc::SYS_read, owner, owner));
     }
 
     // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBI-child keyring

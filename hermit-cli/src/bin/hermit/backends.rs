@@ -334,7 +334,10 @@ pub(super) fn run_dbi(
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbi",
         ));
     }
-    let config_json = serde_json::to_string(config).map_err(|error| {
+    let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
+    let mut dbi_config = config.clone();
+    dbi_config.unsupported_syscall_report_fd = Some(detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD);
+    let config_json = serde_json::to_string(&dbi_config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBI backend: {error}"
         ))
@@ -360,6 +363,7 @@ pub(super) fn run_dbi(
             ))
         })?
         .summary(true)
+        .terminate_process_group_on_exit(true)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -370,7 +374,6 @@ pub(super) fn run_dbi(
         drrun.display()
     );
 
-    let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
     let prepared = prepare_dbi_guest_command(
         program,
         args,

@@ -2385,6 +2385,21 @@ impl Scheduler {
         self.run_queue.push_front(dettid, priority)
     }
 
+    /// Register a newly discovered child without invalidating a scheduler turn
+    /// selected before the child-registration RPC arrived.
+    pub(crate) fn runqueue_push_new_child(
+        &mut self,
+        dettid: DetTid,
+        child_first: bool,
+    ) -> PrioritizedOrder {
+        let priority = self.get_priority(dettid);
+        if child_first {
+            self.run_queue.push_new_thread_front(dettid, priority)
+        } else {
+            self.run_queue.push_new_thread_back(dettid, priority)
+        }
+    }
+
     /// Decide which side gets the first post-fork turn for an ordinary clone.
     pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
         match mode {

@@ -252,6 +252,19 @@ impl RunQueue {
         self.push_back_inner(tid, priority, None)
     }
 
+    /// Add a newly discovered thread behind its peers while preserving an
+    /// already selected scheduler turn.
+    ///
+    /// Child registration can arrive while the scheduler awaits the selected
+    /// thread's request. The selection is stored by TID, so inserting a distinct
+    /// child does not invalidate that transaction; the child becomes eligible
+    /// on the following turn.
+    pub fn push_new_thread_back(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+        self.push_safety_check(tid);
+        assert!(is_ordinary_priority(priority));
+        self.push_back_inner(tid, priority, None)
+    }
+
     /// Requeue an explicitly yielding thread at its persistent priority while
     /// excluding it from the next selection. The exclusion, rather than the
     /// queue key, makes this a one-turn operation under every heuristic.
@@ -304,6 +317,14 @@ impl RunQueue {
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn push_front(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
         assert!(self.tentative_selection.is_none());
+        self.push_safety_check(tid);
+        assert!(is_ordinary_priority(priority));
+        self.push_front_inner(tid, priority, None)
+    }
+
+    /// Add a newly discovered thread ahead of its peers while preserving an
+    /// already selected scheduler turn. See [`Self::push_new_thread_back`].
+    pub fn push_new_thread_front(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
         self.push_safety_check(tid);
         assert!(is_ordinary_priority(priority));
         self.push_front_inner(tid, priority, None)
@@ -677,5 +698,27 @@ mod tests {
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
         assert_eq!(queue.yielded_skip, None);
+    }
+
+    #[test]
+    fn new_thread_enqueue_preserves_tentative_selection() {
+        for strategy in [
+            SchedHeuristic::None,
+            SchedHeuristic::ConnectBind,
+            SchedHeuristic::Random,
+            SchedHeuristic::StickyRandom,
+        ] {
+            let selected = DetTid::from_raw(1);
+            let child = DetTid::from_raw(2);
+            let mut queue = RunQueue::new(strategy, 0, 1.0);
+
+            queue.push_back(selected, DEFAULT_PRIORITY);
+            assert_eq!(queue.tentative_pop_next(), Some(selected), "{strategy:?}");
+            queue.push_new_thread_front(child, DEFAULT_PRIORITY);
+
+            assert_eq!(queue.commit_tentative_pop(), selected, "{strategy:?}");
+            assert_eq!(queue.tentative_pop_next(), Some(child), "{strategy:?}");
+            assert_eq!(queue.commit_tentative_pop(), child, "{strategy:?}");
+        }
     }
 }

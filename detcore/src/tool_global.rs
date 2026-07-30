@@ -956,11 +956,7 @@ impl GlobalState {
             let child_first = self.cfg.sequentialize_threads
                 && !parent_is_kernel_blocked
                 && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
-            let pos = if child_first {
-                sched.runqueue_push_front(child_dettid)
-            } else {
-                sched.runqueue_push_back(child_dettid)
-            };
+            let pos = sched.runqueue_push_new_child(child_dettid, child_first);
             debug!(
                 "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
                 child_dettid,

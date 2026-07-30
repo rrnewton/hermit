@@ -1159,6 +1159,7 @@ async fn run_dbi(
             )
         })?
         .summary(print_summary)
+        .terminate_process_group_on_exit(true)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
