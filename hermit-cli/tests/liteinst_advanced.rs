@@ -30,6 +30,15 @@ const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
     "e5c4447a0a9f796a0b72bb47875e9879aa7722c74e601385e74058f029ae60cd";
 
+fn group_name_by_gid<'a>(contents: &'a str, gid: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        fields.next()?;
+        (fields.next()? == gid).then_some(name)
+    })
+}
+
 fn advanced_guest() -> &'static Path {
     LITEINST_ADVANCED_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -141,6 +150,25 @@ fn liteinst_strict_verify_identity_utilities() {
 }
 
 #[test]
+fn liteinst_strict_verify_virtual_identity_and_time() {
+    assert_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"], b"1767225600\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/hostname"),
+        &[],
+        b"hermetic-container.local\n",
+    );
+    let group_file = fs::read_to_string("/etc/group").expect("failed to read host group database");
+    let root_group = group_name_by_gid(&group_file, "0").expect("GID 0 should have a name");
+    let overflow_group = group_name_by_gid(&group_file, "65534").unwrap_or("nobody");
+    let expected_groups = format!("{root_group} {overflow_group}\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/groups"),
+        &[],
+        expected_groups.as_bytes(),
+    );
+}
+
+#[test]
 fn liteinst_strict_verify_file_and_text_utilities() {
     let fixture = compatibility_fixture();
     let fixture = fixture.to_str().expect("fixture path should be UTF-8");
@@ -181,6 +209,40 @@ fn liteinst_strict_verify_file_and_text_utilities() {
 }
 
 #[test]
+fn liteinst_strict_verify_path_and_language_utilities() {
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/basename"),
+        &["/tmp/hermit-example.txt", ".txt"],
+        b"hermit-example\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/dirname"),
+        &["/tmp/hermit-example.txt"],
+        b"/tmp\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/realpath"),
+        &["/etc/../etc/passwd"],
+        b"/etc/passwd\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/ls"),
+        &["-1", "/etc/hostname"],
+        b"/etc/hostname\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/awk"),
+        &["BEGIN { for (i = 1; i <= 10; ++i) sum += i; print sum }"],
+        b"55\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/perl"),
+        &["-e", r#"print join(q{,}, map { $_ * $_ } 1..5), qq{\n}"#],
+        b"1,4,9,16,25\n",
+    );
+}
+
+#[test]
 fn liteinst_strict_verify_shell_and_entropy_consumer() {
     assert_liteinst_strict_verify(
         Path::new("/bin/sh"),
@@ -211,6 +273,24 @@ fn liteinst_strict_verify_python_entropy() {
     assert_eq!(fields[2].len(), 16, "stdout={stdout:?}");
     assert!(
         fields[2].bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "stdout={stdout:?}"
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_python_random_example() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let output = run_liteinst_strict_verify(&repository.join("examples/rand.py"), &[]);
+    let stdout = String::from_utf8(output.stdout).expect("Python output should be UTF-8");
+    let values = stdout
+        .split_whitespace()
+        .map(|field| field.parse::<u8>().expect("random value should be decimal"))
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 10, "stdout={stdout:?}");
+    assert!(
+        values.iter().all(|value| (1..=101).contains(value)),
         "stdout={stdout:?}"
     );
 }
