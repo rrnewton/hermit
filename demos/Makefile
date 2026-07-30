@@ -25,7 +25,7 @@ help:
 	@echo "make demo6           Restore it and run DEMO6_COMMAND='uname -a'."
 	@echo "make demo7           Ensure demo5's snapshot exists, then run drgn."
 	@echo "make demo8           Chaos-reproduce the btrfs-convert UAF (skips w/o assets)."
-	@echo "make all             Run every checked-in demo (1-8) in order."
+	@echo "make all             Run demos 1-8 with per-demo PASS/FAIL reporting."
 	@echo "make clean           Wipe computed results, including the snapshot."
 	@echo "make distclean       Also remove downloaded kernel/initramfs blobs."
 	@echo "make test            Run fast, hermetic unit tests (no QEMU)."
@@ -83,11 +83,11 @@ demo7: $(BOOT_SNAPSHOT) | drgn-prereqs
 demo8: | process-prereqs
 	@"$(DEMO_DIR)08-btrfs-convert-uaf.sh"
 
-# Recursive Make preserves the declared order even when the caller uses -j.
+# The runner invokes each dependency-aware target separately, preserves order
+# even under an outer `make -j`, writes one log per demo, and returns nonzero if
+# any demo fails.
 all:
-	@set -e; for demo in $(DEMO_TARGETS); do \
-		$(MAKE) --no-print-directory "$$demo"; \
-	done
+	@"$(DEMO_DIR)run-all.sh" --all
 
 test:
 	@$(PYTHON) -m unittest discover -s "$(DEMO_DIR)tests" -p 'test_*.py' -v

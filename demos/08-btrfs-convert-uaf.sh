@@ -43,9 +43,10 @@ When those assets are absent the demo prints SKIPPED and exits 0.
 Useful overrides:
   DEMO08_DIR=/path        asset directory (buggy/, fixed/, pop-tiny.img)
   DEMO08_ARTIFACTS=/path  per-run scratch + saved ASAN report
-  DEMO08_CRASH_SEED=15    a --sched-seed known to reproduce the UAF
+  DEMO08_CRASH_SEED=N     override the fixture's recorded crashing seed
   DEMO08_TIMEOUT=90       per-run wall-clock timeout in seconds
   HERMIT_RELEASE=/path    release Hermit binary
+  DEMO08_REQUIRE_ASSETS=1 fail instead of skipping when assets are absent
 EOF
 }
 
@@ -58,6 +59,11 @@ esac
 BUGGY="$ASSETS/buggy/btrfs-convert"
 FIXED="$ASSETS/fixed/btrfs-convert"
 IMAGE="$ASSETS/pop-tiny.img"
+REQUIRE_ASSETS="${DEMO08_REQUIRE_ASSETS:-0}"
+if [ "$REQUIRE_ASSETS" != 0 ] && [ "$REQUIRE_ASSETS" != 1 ]; then
+  echo "error: DEMO08_REQUIRE_ASSETS must be 0 or 1" >&2
+  exit 2
+fi
 
 # Gate: the ASAN binaries and populated image are large and host-specific, so
 # they live in the ignored asset directory rather than the repository. Skip
@@ -65,10 +71,15 @@ IMAGE="$ASSETS/pop-tiny.img"
 # have not built them.
 for f in "$BUGGY" "$FIXED" "$IMAGE"; do
   if [ ! -r "$f" ]; then
-    echo "=== Demo 08: SKIPPED — missing asset: $f ==="
+    if [ "$REQUIRE_ASSETS" = 1 ]; then
+      echo "=== Demo 08: FAILURE — required asset is missing: $f ===" >&2
+    else
+      echo "=== Demo 08: SKIPPED — missing asset: $f ==="
+    fi
     echo "Build the ASAN btrfs-convert variants and image first; see"
     echo "  demos/08-btrfs-convert-uaf.md (Build recipe)."
-    exit 0
+    [ "$REQUIRE_ASSETS" = 0 ] && exit 0
+    exit 1
   fi
 done
 
@@ -81,7 +92,19 @@ if [ ! -x "$HERMIT_RELEASE" ]; then
   exit 1
 fi
 
-CRASH_SEED="${DEMO08_CRASH_SEED:-15}"
+if [ -n "${DEMO08_CRASH_SEED:-}" ]; then
+  CRASH_SEED="$DEMO08_CRASH_SEED"
+elif [ -r "$ASSETS/.crash-seed" ]; then
+  CRASH_SEED="$(cat "$ASSETS/.crash-seed")"
+else
+  # Backwards-compatible seed for the original hand-built checked-in demo
+  # fixture. Nightly-generated fixtures persist their calibrated seed above.
+  CRASH_SEED=15
+fi
+[[ $CRASH_SEED =~ ^[0-9]+$ ]] || {
+  echo "error: Demo 8 crash seed must be a non-negative integer" >&2
+  exit 2
+}
 TIMEOUT="${DEMO08_TIMEOUT:-90}"
 mkdir -p "$ARTIFACTS"
 
