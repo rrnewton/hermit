@@ -78,7 +78,7 @@ pub enum FdType {
 /// preemption — fires as a function of the virtual schedule and is reproducible
 /// under `--strict --verify`.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+// TODO-HUMAN-REVIEW(#1169)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerfdState {
     /// Clock the timer was created against (`CLOCK_MONOTONIC`/`CLOCK_REALTIME`).
@@ -152,7 +152,7 @@ struct OpenFileDescription {
     sock_diag: bool,
     /// Virtual-time arming state when this open file description is a `timerfd`.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     #[serde(default)]
     timerfd: Option<TimerfdState>,
 }
@@ -469,7 +469,7 @@ impl DetFd {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     /// Initialize virtual-time timer state for a freshly created `timerfd`. The
     /// timer starts disarmed, matching `timerfd_create` semantics.
     pub(crate) fn init_timerfd(&self, clockid: i32) {
@@ -487,7 +487,7 @@ impl DetFd {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     /// Replace the virtual-time timer arming shared by every alias of this
     /// `timerfd`. Used by `timerfd_settime` and by `read()` when advancing a
     /// periodic timer past the expirations it has just reported.

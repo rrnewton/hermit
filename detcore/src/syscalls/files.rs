@@ -2305,7 +2305,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest-visible flags, and a descriptor number; this operation does not read the clock.
     /// The descriptor's virtual-time arming state starts disarmed (see [`TimerfdState`]).
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2350,7 +2350,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// timerfd. `old_value`, when requested, is reported from the prior virtual
     /// arming, keeping the whole operation deterministic.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2426,7 +2426,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `timerfd_gettime`: report the time remaining until the next expiration and
     /// the reload interval, both computed from the virtual clock.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2466,7 +2466,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// disarmed one defers to the host path, which blocks indefinitely exactly
     /// as the kernel would.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-timerfd-virtual-time)
+    // TODO-HUMAN-REVIEW(#1169)
     async fn handle_timerfd_read<G: Guest<Self>>(
         &self,
         guest: &mut G,
