@@ -108,14 +108,18 @@ explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
 dynamically linked Linux x86-64 guests:
 
 ```bash
-cargo build -p hermit --bin hermit
-cargo build -p reverie-liteinst --lib
-hermit run --backend=liteinst --strict --verify -- /bin/echo hello
+HERMIT_LITEINST_STAGE="$PWD/target/debug/libreverie_liteinst.so" \
+  cargo build --locked --manifest-path liteinst-runtime-build/Cargo.toml \
+  --target-dir target/liteinst-runtime-build
+cargo build --locked -p hermit --bin hermit
+./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
 ```
 
 The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.
-The Reverie preload DSO initializes only the LiteInst patch/helper side; it
-never installs another Tool in the guest. The host observes the first
+The standalone manifest enables and statically verifies the preload constructor;
+Hermit rejects non-runtime or constructor-free overrides before activation.
+The resulting Reverie preload DSO initializes only the LiteInst patch/helper
+side; it never installs another Tool in the guest. The host observes the first
 invocation of each eligible syscall site and installs an instruction-punning
 hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.

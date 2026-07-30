@@ -12,4 +12,4 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 goblin = "0.10.7"
-reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "87aa36f9d3ffab13ad34cce1e7ca958923185d78", default-features = false, features = ["preload-constructor"] }
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "d96ee8119df5fa175db53ce1e49a2a569f87de70", default-features = false, features = ["preload-constructor"] }

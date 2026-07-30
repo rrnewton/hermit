@@ -499,10 +499,11 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
                 .and_then(|size| bytes.get(start..start.checked_add(size)?))
         })
         .unwrap_or_default();
-    let direct_initializer = init_bytes.chunks_exact(8).any(|entry| {
-        u64::from_le_bytes(entry.try_into().expect("eight-byte constructor entry"))
-            == initializer.st_value
-    });
+    let direct_initializer = init_bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
     if !relocated_initializer && !direct_initializer {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

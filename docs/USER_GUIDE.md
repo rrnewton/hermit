@@ -166,6 +166,20 @@ sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
 syscall at each site and installs a LiteInst trampoline for later invocations.
 There is no second in-guest Detcore instance or coordinator RPC Tool.
 
+Build and stage the constructor-enabled runtime with its locked standalone
+manifest before building Hermit:
+
+```bash
+HERMIT_LITEINST_STAGE="$PWD/target/debug/libreverie_liteinst.so" \
+  cargo build --locked --manifest-path liteinst-runtime-build/Cargo.toml \
+  --target-dir target/liteinst-runtime-build
+cargo build --locked -p hermit --bin hermit
+```
+
+Hermit verifies the DSO architecture, required exports, and preload constructor
+before activation; an arbitrary shared object or constructor-free runtime is
+rejected rather than silently falling back.
+
 LiteInst uses the normal Hermit run and verification paths. A successful
 `--strict --verify` run compares captured status/output and Detcore scheduler
 logs and is therefore an L2 result. Verification currently supplies

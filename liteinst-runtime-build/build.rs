@@ -47,11 +47,10 @@ fn has_preload_constructor(path: &Path) -> io::Result<bool> {
                 .and_then(|size| bytes.get(start..start.checked_add(size)?))
         })
         .unwrap_or_default()
-        .chunks_exact(8)
-        .any(|entry| {
-            u64::from_le_bytes(entry.try_into().expect("eight-byte constructor entry"))
-                == initializer.st_value
-        });
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
     Ok(relocated || direct)
 }
 

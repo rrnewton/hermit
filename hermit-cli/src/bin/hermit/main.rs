@@ -84,7 +84,7 @@ unsafe fn liteinst_count_function(name: &std::ffi::CStr) -> Option<LiteinstCount
         return None;
     }
     // SAFETY: both required runtime counter exports have this exact C ABI.
-    Some(unsafe { core::mem::transmute(symbol) })
+    Some(unsafe { core::mem::transmute::<*mut libc::c_void, LiteinstCountFn>(symbol) })
 }
 
 fn liteinst_activation_probe() -> Option<ExitStatus> {
