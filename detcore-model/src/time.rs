@@ -822,7 +822,7 @@ impl GlobalTime {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-NUMBER): Review SaBRe exec clock reassignment.
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec clock reassignment.
     /// Move a surviving thread's clock component to the process-leader TID
     /// installed by Linux after a non-leader thread successfully execs.
     ///

@@ -1191,7 +1191,7 @@ impl Scheduler {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-NUMBER): Review SaBRe exec incarnation reconciliation.
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation reconciliation.
     /// Apply Linux's successful-exec rule when a backend reloads its tool.
     ///
     /// Every sibling disappears. If a non-leader called exec, Linux also changes

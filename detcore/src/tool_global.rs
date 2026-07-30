@@ -283,7 +283,7 @@ pub struct GlobalState {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Pre-exec identity and descriptor state awaiting a SaBRe exec reload.
-    // TODO-HUMAN-REVIEW(PR-NUMBER): Review SaBRe exec incarnation fencing.
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
     pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
