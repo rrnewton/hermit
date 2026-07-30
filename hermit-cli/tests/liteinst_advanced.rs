@@ -141,6 +141,17 @@ fn liteinst_strict_verify_identity_utilities() {
 }
 
 #[test]
+fn liteinst_strict_verify_virtual_identity_and_time() {
+    assert_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"], b"1767225600\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/hostname"),
+        &[],
+        b"hermetic-container.local\n",
+    );
+    assert_liteinst_strict_verify(Path::new("/usr/bin/groups"), &[], b"root nobody\n");
+}
+
+#[test]
 fn liteinst_strict_verify_file_and_text_utilities() {
     let fixture = compatibility_fixture();
     let fixture = fixture.to_str().expect("fixture path should be UTF-8");
@@ -177,6 +188,40 @@ fn liteinst_strict_verify_file_and_text_utilities() {
         Path::new("/usr/bin/stat"),
         &["-c", "%s", fixture],
         format!("{}\n", COMPAT_FIXTURE_CONTENT.len()).as_bytes(),
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_path_and_language_utilities() {
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/basename"),
+        &["/tmp/hermit-example.txt", ".txt"],
+        b"hermit-example\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/dirname"),
+        &["/tmp/hermit-example.txt"],
+        b"/tmp\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/realpath"),
+        &["/etc/../etc/passwd"],
+        b"/etc/passwd\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/ls"),
+        &["-1", "/etc/hostname"],
+        b"/etc/hostname\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/awk"),
+        &["BEGIN { for (i = 1; i <= 10; ++i) sum += i; print sum }"],
+        b"55\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/perl"),
+        &["-e", r#"print join(q{,}, map { $_ * $_ } 1..5), qq{\n}"#],
+        b"1,4,9,16,25\n",
     );
 }
 
