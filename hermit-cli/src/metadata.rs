@@ -210,6 +210,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         debug_futex_mode: BlockingMode::Precise,
         sched_sticky_random_param: 0.0,
         no_rcb_time: false,
+        sched_no_scheduler_time: false,
         detlog_heap: false,
         detlog_stack: false,
         sysinfo_uptime_offset: 120,

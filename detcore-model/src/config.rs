@@ -474,6 +474,16 @@ pub struct Config {
     #[clap(long)]
     pub no_rcb_time: bool,
 
+    /// **Prototype (branch-only, cause-B validation — do NOT land):** Do not add
+    /// the fixed per-turn scheduler-time increment (`add_scheduler_time`,
+    /// `NANOS_PER_SCHED`) to global committed time. Committed time then advances
+    /// only by real per-thread work. Used to measure whether scheduler-time
+    /// inflation is the cause of the demo5/QEMU wedge. This is the maximal form
+    /// of the "suppress unproductive committed tick" (cause-B) lever from the
+    /// vtime-jump design doc. It is NOT a determinism-preserving option.
+    #[clap(long, hide = true)]
+    pub sched_no_scheduler_time: bool,
+
     /// An option to enable logging the hash of heap memory maps for the purpose of determinism checking
     #[clap(long)]
     pub detlog_heap: bool,

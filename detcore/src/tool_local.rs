@@ -2691,6 +2691,7 @@ mod timeslice_tests {
     fn schedule_replay_without_rcb_time_arms_pmu_maximum() {
         let config = Config {
             no_rcb_time: true,
+            sched_no_scheduler_time: false,
             max_timeslice: nz(100_000),
             replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
             ..Default::default()

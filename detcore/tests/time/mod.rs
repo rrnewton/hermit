@@ -203,6 +203,7 @@ fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
         target_timeslice: std::num::NonZeroU64::new(100_000),
         sequentialize_threads: true,
         no_rcb_time: true,
+        sched_no_scheduler_time: false,
         // Cancel no_rcb_time's 500x fallback so the target is literal virtual nanoseconds.
         clock_multiplier: Some(1.0 / 500.0),
         ..Default::default()
@@ -254,6 +255,7 @@ fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
         target_timeslice: None,
         sequentialize_threads: true,
         no_rcb_time: true,
+        sched_no_scheduler_time: false,
         clock_multiplier: Some(1.0),
         record_preemptions: true,
         ..Default::default()

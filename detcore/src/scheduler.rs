@@ -410,6 +410,10 @@ pub struct Scheduler {
     stop_after_iter: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
     recordreplay_modes: bool,
+    /// Prototype (branch-only, cause-B validation): when set, skip the per-turn
+    /// `add_scheduler_time` bump in `bump_global_time`. Cached copy of the
+    /// same-named immutable Config field.
+    sched_no_scheduler_time: bool,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
     /// A cached copy of the same (immutable) field in Config. When set (and only
@@ -956,6 +960,7 @@ impl Scheduler {
             stop_after_turn: cfg.stop_after_turn,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
+            sched_no_scheduler_time: cfg.sched_no_scheduler_time,
             run_queue: RunQueue::new(
                 cfg.sched_heuristic,
                 cfg.sched_seed(),
@@ -2519,6 +2524,14 @@ impl Scheduler {
             {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn was an internal book-keeping one"
+                );
+            } else if self.sched_no_scheduler_time {
+                // Prototype (branch-only, cause-B validation): committed time
+                // advances only by real per-thread work, never by the fixed
+                // per-turn scheduler-time increment. Measures whether committed
+                // scheduler-time inflation is what wedges demo5/QEMU.
+                trace!(
+                    "[sched] PROTOTYPE sched_no_scheduler_time: suppressing per-turn scheduler-time bump"
                 );
             } else {
                 let newtime = gtime.add_scheduler_time();
