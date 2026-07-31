@@ -250,6 +250,15 @@ impl RunQueue {
             .any(|(k, v)| v.tid != exclude && k.priority < LAST_PRIORITY)
     }
 
+    /// True while a `tentative_pop`/commit transaction is underway, i.e. the
+    /// daemon has peeked a selection and may have released the scheduler lock
+    /// across an await. Callers holding the lock use this to route run-queue
+    /// admissions to a deferred, deterministic drain point instead of pushing
+    /// (which would trip the tentative-selection guard). Read-only.
+    pub fn tentative_pop_in_progress(&self) -> bool {
+        self.tentative_selection.is_some()
+    }
+
     /// Push a thread to the back of the specified priority. Return the
     /// resulting overall position in the queue.
     ///
@@ -688,5 +697,34 @@ mod tests {
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
         assert_eq!(queue.yielded_skip, None);
+    }
+
+    #[test]
+    fn tentative_pop_in_progress_tracks_the_transaction() {
+        let a = DetTid::from_raw(1);
+        let b = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+
+        // No selection: safe to push.
+        assert!(!queue.tentative_pop_in_progress());
+        queue.push_back(a, DEFAULT_PRIORITY);
+        queue.push_back(b, DEFAULT_PRIORITY);
+        assert!(!queue.tentative_pop_in_progress());
+
+        // Peeking a tentative selection opens the transaction; this is exactly
+        // the window in which a concurrent handler must defer its admission
+        // rather than push (a push here trips the tentative-selection guard).
+        assert_eq!(queue.tentative_pop_next(), Some(a));
+        assert!(queue.tentative_pop_in_progress());
+
+        // Committing closes it again.
+        assert_eq!(queue.commit_tentative_pop(), a);
+        assert!(!queue.tentative_pop_in_progress());
+
+        // The exact-selection form and undo path behave the same way.
+        assert_eq!(queue.tentative_pop_tid(b), Some(b));
+        assert!(queue.tentative_pop_in_progress());
+        queue.undo_tentative_pop();
+        assert!(!queue.tentative_pop_in_progress());
     }
 }
