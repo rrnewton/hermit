@@ -1159,33 +1159,22 @@ impl ProcessCpuTime {
     }
 }
 
-/// Guest-visible wall-clock calibration shared by every thread in a process.
+/// Guest-visible logical clock shared by an entire process tree.
 ///
-/// Detcore's raw logical clock includes backend-specific implementation work
-/// (for example, ptrace RCBs versus DBI's syscall-only fallback). Calibrating
-/// the first observation after exec keeps that startup work out of the clock
-/// exposed to the new executable while preserving subsequent logical deltas.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// The scheduler's raw logical time already includes the configured epoch and
+/// is the clock used to judge absolute deadlines. Guest time must therefore
+/// track it directly: subtracting a per-process or per-exec origin can put a
+/// newly computed absolute deadline in the scheduler's past. The shared floor
+/// preserves monotonicity if a backend supplies a stale local observation.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct GuestClock {
-    origin: Option<LogicalTime>,
-    elapsed: LogicalTime,
+    now: LogicalTime,
 }
 
 impl GuestClock {
-    fn observe(&mut self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
-        let origin = *self.origin.get_or_insert(raw);
-        let candidate = if raw >= origin {
-            raw - origin
-        } else {
-            LogicalTime::ZERO
-        };
-        self.elapsed = self.elapsed.max(candidate);
-        epoch + self.elapsed
-    }
-
-    fn reset(&mut self) {
-        self.origin = None;
-        self.elapsed = LogicalTime::ZERO;
+    fn observe(&mut self, raw: LogicalTime) -> LogicalTime {
+        self.now = self.now.max(raw);
+        self.now
     }
 }
 
@@ -1256,7 +1245,7 @@ pub struct ThreadState<T> {
     /// Logical CPU accounting shared by all threads in this process.
     pub(crate) process_cpu_time: Arc<Mutex<ProcessCpuTime>>,
 
-    /// Wall-clock calibration shared by all threads in this process.
+    /// Guest-visible logical clock shared by every task in this process tree.
     #[serde(default)]
     pub(crate) guest_clock: Arc<Mutex<GuestClock>>,
 
@@ -1484,18 +1473,11 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
-    pub(crate) fn observe_guest_clock(&self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
+    pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         self.guest_clock
             .lock()
             .expect("guest clock mutex poisoned")
-            .observe(raw, epoch)
-    }
-
-    pub(crate) fn reset_guest_clock(&self) {
-        self.guest_clock
-            .lock()
-            .expect("guest clock mutex poisoned")
-            .reset();
+            .observe(raw)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2153,41 +2135,65 @@ mod timeslice_tests {
     use crate::preemptions::ThreadHistory;
 
     #[test]
-    fn guest_clock_rebases_backend_startup_work_and_preserves_deltas() {
+    fn guest_clock_tracks_raw_logical_time_without_lag() {
         let epoch = LogicalTime::from_secs(1_000);
-        let mut ptrace = GuestClock::default();
-        let mut dbi = GuestClock::default();
+        let mut clock = GuestClock::default();
 
         assert_eq!(
-            ptrace.observe(epoch + Duration::from_nanos(41_000_000), epoch),
-            epoch
+            clock.observe(epoch + Duration::from_nanos(41_000_000)),
+            epoch + Duration::from_nanos(41_000_000)
         );
         assert_eq!(
-            dbi.observe(epoch + Duration::from_nanos(822_000_000), epoch),
-            epoch
+            clock.observe(epoch + Duration::from_nanos(41_025_000)),
+            epoch + Duration::from_nanos(41_025_000)
         );
+        // A stale backend-local sample cannot move the process-tree clock back.
         assert_eq!(
-            ptrace.observe(epoch + Duration::from_nanos(41_025_000), epoch),
-            epoch + Duration::from_nanos(25_000)
-        );
-        assert_eq!(
-            dbi.observe(epoch + Duration::from_nanos(822_025_000), epoch),
-            epoch + Duration::from_nanos(25_000)
+            clock.observe(epoch + Duration::from_nanos(41_010_000)),
+            epoch + Duration::from_nanos(41_025_000)
         );
     }
 
     #[test]
-    fn guest_clock_reset_starts_a_new_executable_at_epoch() {
-        let epoch = LogicalTime::from_secs(1_000);
+    fn guest_clock_absolute_deadline_stays_ahead_of_committed_time() {
+        let committed_time = LogicalTime::from_secs(1_000) + Duration::from_millis(250);
         let mut clock = GuestClock::default();
-        assert_eq!(clock.observe(epoch + Duration::from_secs(1), epoch), epoch);
+        let guest_now = clock.observe(committed_time);
+        let deadline = guest_now + Duration::from_millis(100);
+
+        assert_eq!(guest_now, committed_time);
+        assert!(deadline > committed_time);
+    }
+
+    #[test]
+    fn guest_clock_process_tree_shares_one_monotonic_domain() {
+        let epoch = LogicalTime::from_secs(1_000);
+        let root = Arc::new(Mutex::new(GuestClock::default()));
+        let forked_child = Arc::clone(&root);
+
+        assert!(Arc::ptr_eq(&root, &forked_child));
         assert_eq!(
-            clock.observe(epoch + Duration::from_secs(2), epoch),
+            root.lock().unwrap().observe(epoch + Duration::from_secs(1)),
             epoch + Duration::from_secs(1)
         );
+        assert_eq!(
+            forked_child
+                .lock()
+                .unwrap()
+                .observe(epoch + Duration::from_secs(2)),
+            epoch + Duration::from_secs(2)
+        );
 
-        clock.reset();
-        assert_eq!(clock.observe(epoch + Duration::from_secs(9), epoch), epoch);
+        // Exec retains the same clock object and does not rebase elapsed time.
+        let execed_child = Arc::clone(&forked_child);
+        assert!(Arc::ptr_eq(&root, &execed_child));
+        assert_eq!(
+            execed_child
+                .lock()
+                .unwrap()
+                .observe(epoch + Duration::from_secs(9)),
+            epoch + Duration::from_secs(9)
+        );
     }
 
     #[test]
