@@ -2020,34 +2020,77 @@ impl Scheduler {
                 debug!(
                     "[scheduler] Deadlock avoidance! Empty run-queue, so waking next timed event."
                 );
-                let (event_ns, evt) = self
-                    .blocked
-                    .timed_waiters
-                    .pop()
-                    .expect("internal error: no timed events found");
-                info!("[scheduler] Skipping global time ahead to {}.", event_ns);
-                {
-                    let mut gt = global_time.lock().unwrap();
-                    let gt_now_ns = gt.as_nanos();
-                    let delta = event_ns.duration_since(gt_now_ns);
-                    detlog_debug!(
-                        "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
-                        delta,
-                        gt_now_ns,
-                    );
-                    gt.add_extra_time(delta);
-                }
-
-                match evt {
-                    TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
-                    TimedEvent::SignalEvt(id, dtid, sig) => {
-                        self.fire_alarm(id.process(), dtid, sig)
-                    }
-                }
+                self.fast_forward_to_next_timed_event(global_time);
                 return Err(SkipTurn);
             }
+        } else if !timed_empty && self.run_queue_only_immediate_pollers() {
+            // The run queue is non-empty, but every runnable thread is an
+            // unproductive immediate poller sitting at LAST_PRIORITY -- e.g. a
+            // pair of guest threads busy-handshaking on a futex and re-committing
+            // `SleepUntil(LogicalTime(0))` every turn (QEMU's internal
+            // BQL/iothread handshake in the demo5 boot). Advancing committed time
+            // by one fixed scheduler tick per turn would crawl toward the next
+            // registered deadline across many thousands of wasted poller turns,
+            // burning wall-clock while no guest makes progress -- the demo5 boot
+            // wedge. Because the only runnable work is unproductive, fast-forward
+            // committed time straight to the next *already-registered* timed event
+            // and wake it, exactly as the empty-queue deadlock-avoidance path
+            // does. This keeps virtual time continuous (we only ever jump forward
+            // to a real registered event -- never freeze, round, or synthesize
+            // time) and deterministic (the timed-waiter heap pop and the
+            // only-pollers predicate are pure functions of scheduler state, not
+            // host timing). The pollers keep their run-queue slots and run after
+            // the woken event, so none is starved.
+            if !self.pending_physical_process_exits.is_empty() {
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
+            self.fast_forward_to_next_timed_event(global_time);
+            return Err(SkipTurn);
         }
         Ok(())
+    }
+
+    /// True when the run queue is non-empty but every runnable thread sits at
+    /// `LAST_PRIORITY`, i.e. only unproductive pollers are runnable. Mirrors the
+    /// `only_pollers` gate used by the external-IO and deferred-signal paths.
+    fn run_queue_only_immediate_pollers(&self) -> bool {
+        !self.run_queue.is_empty()
+            && match self.run_queue.first_priority() {
+                Some(fp) => fp >= LAST_PRIORITY,
+                None => false,
+            }
+    }
+
+    /// Advance committed global time to the next registered timed event and wake
+    /// it. Only sound to call when no productive thread is runnable -- either the
+    /// run queue is empty, or it holds only unproductive immediate pollers
+    /// (`run_queue_only_immediate_pollers`). By construction `step2b_process_timed`
+    /// has already woken every past-due event before this runs, so the popped
+    /// event is strictly in the future and committed time only moves forward.
+    fn fast_forward_to_next_timed_event(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        let (event_ns, evt) = self
+            .blocked
+            .timed_waiters
+            .pop()
+            .expect("internal error: no timed events found");
+        info!("[scheduler] Skipping global time ahead to {}.", event_ns);
+        {
+            let mut gt = global_time.lock().unwrap();
+            let gt_now_ns = gt.as_nanos();
+            let delta = event_ns.duration_since(gt_now_ns);
+            detlog_debug!(
+                "[sched] add extra global time for deadlock avoidance {:?} on current time {}",
+                delta,
+                gt_now_ns,
+            );
+            gt.add_extra_time(delta);
+        }
+
+        match evt {
+            TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
+            TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
+        }
     }
 
     /// Step: Find the next thread to run for this scheduling run.
@@ -3673,5 +3716,66 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    #[test]
+    fn only_pollers_run_queue_fast_forwards_to_next_timed_event() {
+        // Regression for the demo5 boot wedge: when the run queue holds nothing
+        // but unproductive immediate pollers (LAST_PRIORITY) and a future timed
+        // event is registered, step2d must fast-forward committed time straight
+        // to that event, exactly as it does for a strictly-empty run queue --
+        // rather than leaving committed time to crawl one scheduler tick at a
+        // time across thousands of wasted poller turns.
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let poller = DetTid::from_raw(100);
+        let sleeper = DetTid::from_raw(200);
+
+        // A future timed waiter to fast-forward to.
+        scheduler.next_turns.insert(
+            sleeper,
+            ThreadNextTurn {
+                dettid: sleeper,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.blocked.timed_waiters.insert(deadline, sleeper);
+
+        // The only runnable thread is an immediate poller at LAST_PRIORITY, so
+        // the run queue is non-empty but holds no productive work.
+        scheduler.run_queue.push_back(poller, LAST_PRIORITY);
+        assert!(scheduler.run_queue_only_immediate_pollers());
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn productive_run_queue_does_not_fast_forward_over_pollers() {
+        // The poller fast-forward must not fire when a productive (non-poller)
+        // thread is runnable: real work must run and advance committed time
+        // normally, never be skipped by a jump to a future timed event.
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let worker = DetTid::from_raw(100);
+        let sleeper = DetTid::from_raw(200);
+
+        scheduler.blocked.timed_waiters.insert(deadline, sleeper);
+        scheduler.run_queue.push_back(worker, DEFAULT_PRIORITY);
+        assert!(!scheduler.run_queue_only_immediate_pollers());
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+        assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
     }
 }
