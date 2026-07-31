@@ -815,7 +815,8 @@ pub async fn do_a_turn_blocking(
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
         let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-        mg.step6_reenquue(next_dtid, sched_yield);
+        let is_polling = Scheduler::is_polling_turn(&rsrcs);
+        mg.step6_reenquue(next_dtid, sched_yield, is_polling);
         if let Some(call) = rsrcs.as_exit_syscall() {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -2486,10 +2487,16 @@ impl Scheduler {
     }
 
     /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool) {
+    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool, is_polling: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
-        let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
+        // InternalIOPolling retry counts depend on host readiness timing, so
+        // they must not advance the prototype's deterministic aging clock.
+        // Pollers retain the queue's existing FIFO/backoff/periodic-upgrade
+        // liveness; productive guest turns advance bounded aging.
+        let dt2 = self
+            .run_queue
+            .commit_tentative_pop_completed_turn(!is_polling);
         assert_eq!(next_dtid, dt2);
         // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
         // queue placement is transient, so persistent priorities remain unchanged.

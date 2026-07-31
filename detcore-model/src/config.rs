@@ -790,6 +790,9 @@ impl fmt::Display for Config {
             SchedHeuristic::StickyRandom => {
                 write!(f, " --sched-heuristic=stickyrandom")?;
             }
+            SchedHeuristic::PriorityAging => {
+                write!(f, " --sched-heuristic=priority-aging")?;
+            }
         }
         if let Some(s) = self.sched_seed {
             write!(f, " --sched-seed={}", s)?;
@@ -946,6 +949,10 @@ pub enum SchedHeuristic {
     /// and after the thread is parked, randomly choose if we will continue
     /// executing on the same thread, or picking another one.
     StickyRandom,
+    /// EXPERIMENTAL, branch-only prototype: preserve priority/FIFO scheduling,
+    /// but promote an ordinary runnable thread after a bounded number of
+    /// completed guest turns so fixed or chaos-assigned priority cannot starve it.
+    PriorityAging,
     // TODO: make all sleeps "instant".
 }
 
@@ -959,8 +966,9 @@ impl FromStr for SchedHeuristic {
             "connectbind" => Ok(SchedHeuristic::ConnectBind),
             "random" => Ok(SchedHeuristic::Random),
             "stickyrandom" => Ok(SchedHeuristic::StickyRandom),
+            "priority-aging" | "priorityaging" | "aging" => Ok(SchedHeuristic::PriorityAging),
             _ => Err(format!(
-                "Expected None|ConnectBind|Random|StickyRandom, could not parse: {:?}",
+                "Expected None|ConnectBind|Random|StickyRandom|PriorityAging, could not parse: {:?}",
                 s
             )),
         }
@@ -1131,6 +1139,19 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    #[test]
+    fn priority_aging_heuristic_is_opt_in_and_round_trips() {
+        assert_eq!(Config::default().sched_heuristic, SchedHeuristic::None);
+
+        let config = Config::parse_from(["detcore", "--sched-heuristic=priority-aging"]);
+        assert_eq!(config.sched_heuristic, SchedHeuristic::PriorityAging);
+        assert!(
+            config
+                .to_string()
+                .contains(" --sched-heuristic=priority-aging")
+        );
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -138,11 +138,19 @@ impl fmt::Display for PrioritizedOrder {
 /// temporarily negating backoff behavior.
 const POLLING_UPGRADE_INTERVAL: u64 = 200;
 
+/// Maximum number of completed guest turns that an ordinary queued thread may
+/// wait before the branch-only priority-aging heuristic promotes it to the
+/// front ordinary priority. This clock advances only when Detcore grants a
+/// guest turn; it never observes host time or host polling latency.
+const PRIORITY_AGING_BOUND_TURNS: u64 = 256;
+
 #[derive(Debug, Copy, Clone)]
 struct QueueValue {
     tid: DetTid,
     /// Upgrade to this priority during polling upgrades
     poll_upgrade: Option<Priority>,
+    /// Deterministic guest-turn clock when this queue residency began.
+    enqueued_at_completed_turn: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +189,12 @@ pub struct RunQueue {
 
     sticky_random_param: f64,
     sticky_random_selection: Option<DetTid>,
+
+    /// Logical scheduling clock used only by the branch-only priority-aging
+    /// prototype. It advances on completed productive guest turns, but not on
+    /// scheduler bookkeeping, host time, or host-timing-sensitive polling
+    /// retries.
+    completed_guest_turns: u64,
 }
 
 /// A multi-line print of the runqueue.
@@ -216,6 +230,7 @@ impl RunQueue {
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
             sticky_random_selection: None,
+            completed_guest_turns: 0,
         }
     }
 
@@ -350,7 +365,11 @@ impl RunQueue {
         prio: PrioritizedOrder,
         poll_upgrade: Option<Priority>,
     ) -> PrioritizedOrder {
-        let qval = QueueValue { tid, poll_upgrade };
+        let qval = QueueValue {
+            tid,
+            poll_upgrade,
+            enqueued_at_completed_turn: self.completed_guest_turns,
+        };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
         self.check_poll_upgrade();
@@ -421,6 +440,7 @@ impl RunQueue {
                 .values()
                 .find(|value| Some(value.tid) != skip)
                 .map(|value| value.tid),
+            SchedHeuristic::PriorityAging => self.priority_aging_pick(skip),
             SchedHeuristic::Random => {
                 if self.queue.is_empty() {
                     return None;
@@ -510,6 +530,15 @@ impl RunQueue {
                         .unwrap();
                     self.queue.remove(&key).map(|v| v.tid)
                 }
+                SchedHeuristic::PriorityAging => {
+                    let key = *self
+                        .queue
+                        .iter()
+                        .find(|(_key, value)| value.tid == tentative_selection)
+                        .map(|(key, _value)| key)
+                        .unwrap();
+                    self.queue.remove(&key).map(|value| value.tid)
+                }
                 SchedHeuristic::StickyRandom => {
                     let tid = self.sticky_random_selection.unwrap();
                     // Probability of staying to our current thread on the next round.
@@ -540,8 +569,11 @@ impl RunQueue {
     /// Commit a tentative pop for a guest turn that will actually run. A
     /// yielded thread's one-turn exclusion is consumed only here, not by
     /// scheduler bookkeeping turns that never unblock a guest.
-    pub fn commit_tentative_pop_completed_turn(&mut self) -> DetTid {
+    pub fn commit_tentative_pop_completed_turn(&mut self, advance_aging_clock: bool) -> DetTid {
         let tid = self.commit_tentative_pop();
+        if advance_aging_clock {
+            self.completed_guest_turns = self.completed_guest_turns.saturating_add(1);
+        }
         self.consume_yield_exclusion();
         tid
     }
@@ -569,6 +601,54 @@ impl RunQueue {
         if self.turn_counter().is_multiple_of(POLLING_UPGRADE_INTERVAL) {
             self.do_poll_upgrade()
         }
+    }
+
+    /// Select with the existing priority/FIFO order unless a thread has spent
+    /// the bounded number of logical guest turns continuously runnable. An
+    /// overdue entry is treated as FIRST_PRIORITY and the oldest overdue entry
+    /// wins. Eager IO (priority zero) remains a protocol override, and the
+    /// one-turn explicit-yield exclusion remains in force.
+    fn priority_aging_pick(&self, skip: Option<DetTid>) -> Option<DetTid> {
+        // Priority zero is a short-lived IO/protocol override and remains
+        // stronger than the starvation backstop.
+        if let Some(eager) = self
+            .queue
+            .iter()
+            .find(|(key, value)| {
+                key.priority == EAGER_IO_REPOLL_PRIORITY && Some(value.tid) != skip
+            })
+            .map(|(_key, value)| value.tid)
+        {
+            return Some(eager);
+        }
+
+        let overdue = self
+            .queue
+            .iter()
+            .filter(|(_key, value)| Some(value.tid) != skip)
+            .filter_map(|(key, value)| {
+                if key.priority == EAGER_IO_REPOLL_PRIORITY {
+                    return None;
+                }
+                let age = self
+                    .completed_guest_turns
+                    .saturating_sub(value.enqueued_at_completed_turn);
+                (age >= PRIORITY_AGING_BOUND_TURNS).then_some((age, key.turn, value.tid))
+            })
+            .max_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    // Earlier FIFO insertion wins equal-age ties.
+                    .then_with(|| right.1.cmp(&left.1))
+            })
+            .map(|(_age, _turn, tid)| tid);
+
+        overdue.or_else(|| {
+            self.queue
+                .values()
+                .find(|value| Some(value.tid) != skip)
+                .map(|value| value.tid)
+        })
     }
 
     /// Upgrade polled tasks to their specified normal priority.
@@ -623,7 +703,7 @@ mod tests {
             queue.push_back(peer, LAST_PRIORITY);
             assert_eq!(queue.tentative_pop_next(), Some(peer), "{strategy:?}");
             assert_eq!(
-                queue.commit_tentative_pop_completed_turn(),
+                queue.commit_tentative_pop_completed_turn(true),
                 peer,
                 "{strategy:?}"
             );
@@ -686,7 +766,7 @@ mod tests {
         queue.push_back(peer, DEFAULT_PRIORITY);
         assert_eq!(queue.yielded_skip, Some(yielding));
         assert_eq!(queue.tentative_pop_next(), Some(peer));
-        assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
+        assert_eq!(queue.commit_tentative_pop_completed_turn(true), peer);
         assert_eq!(queue.yielded_skip, None);
     }
 }
