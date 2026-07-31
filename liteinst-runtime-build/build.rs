@@ -79,6 +79,7 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
+    println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=artifact.rs");
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
@@ -88,15 +89,21 @@ fn main() {
             .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
     );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
-    let profile_dir = out_dir
-        .ancestors()
-        .nth(3)
-        .expect("standalone runtime OUT_DIR has no profile ancestor");
-    let profile = profile_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| if name == "debug" { "dev" } else { name })
-        .expect("standalone runtime profile path is not valid UTF-8");
+    // Derive the nested runtime build's `--profile` from cargo's `PROFILE`
+    // build-script env var: it is `release` for release-like profiles and
+    // `debug` otherwise, which map to the `--profile` values `release` and
+    // `dev`. The previous approach walked `out_dir.ancestors().nth(3)` to guess
+    // the profile directory name; a cargo nightly changed the build-script
+    // OUT_DIR layout so that ancestor now resolves to the literal `build`
+    // directory, and passing `--profile build` fails with
+    // "error: profile name `build` is reserved". Sourcing the profile from the
+    // documented env var is robust against that layout drift.
+    let profile = match env::var("PROFILE").as_deref() {
+        Ok("debug") => "dev",
+        Ok("release") => "release",
+        Ok(other) => panic!("unexpected Cargo PROFILE {other:?}; expected debug or release"),
+        Err(error) => panic!("Cargo did not set PROFILE: {error}"),
+    };
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
     );
