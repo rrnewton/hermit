@@ -96,7 +96,19 @@ fn kill_process_group(pid: u32, label: &str) {
     }
 }
 
-fn run_bounded(mut command: Command, label: &str) -> Output {
+fn controller_diagnostics(path: Option<&Path>) -> String {
+    path.map(|path| {
+        std::fs::read_to_string(path).unwrap_or_else(|error| {
+            format!(
+                "failed to read controller diagnostics {}: {error}",
+                path.display()
+            )
+        })
+    })
+    .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
     command
         .process_group(0)
         .stdout(Stdio::piped())
@@ -117,7 +129,10 @@ fn run_bounded(mut command: Command, label: &str) -> Output {
             Err(error) => {
                 kill_process_group(child.id(), label);
                 let _ = child.wait();
-                panic!("failed to poll {label}: {rendered}: {error}");
+                panic!(
+                    "failed to poll {label}: {rendered}: {error}\ncontroller diagnostics:\n{}",
+                    controller_diagnostics(diagnostic_log),
+                );
             }
         }
     };
@@ -127,19 +142,29 @@ fn run_bounded(mut command: Command, label: &str) -> Output {
     let output = child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
-    assert!(
-        !timed_out && output.status.success(),
-        "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    if timed_out || !output.status.success() {
+        panic!(
+            "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            controller_diagnostics(diagnostic_log),
+        );
+    }
     output
 }
 
-fn example_command(example: &Path, backend: Option<&Path>, verify: bool) -> Command {
+fn example_command(
+    example: &Path,
+    backend: Option<&Path>,
+    verify: bool,
+    diagnostic_log: Option<&Path>,
+) -> Command {
     let mut command = Command::new(hermit_binary());
-    command.arg(if verify { "--log=info" } else { "--log=off" });
+    command.arg(if verify { "--log=info" } else { "--log=error" });
+    if let Some(path) = diagnostic_log {
+        command.arg("--log-file").arg(path);
+    }
     command.arg("run");
     if let Some(loader) = backend {
         command
@@ -158,6 +183,16 @@ fn example_command(example: &Path, backend: Option<&Path>, verify: bool) -> Comm
     command
 }
 
+fn parity_run(example: &Path, backend: Option<&Path>, label: &str) -> Output {
+    let diagnostic_log = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
+    run_bounded(
+        example_command(example, backend, false, Some(diagnostic_log.path())),
+        label,
+        Some(diagnostic_log.path()),
+    )
+}
+
 #[test]
 fn sabre_non_racy_examples_verify_and_match_ptrace() {
     let Some(loader) = sabre_loader() else {
@@ -170,16 +205,18 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
     // race.sh is deliberately outside this ratchet: its output is the schedule itself, and the
     // in-process backend does not yet serialize arbitrary guest instructions between callbacks.
     // Both parity sides use the portable profile because this job intentionally runs without PMU
-    // or CPUID-faulting support. Disable Hermit diagnostics while comparing guest output; strict
-    // syscall handling remains enabled, and the separate SaBRe verification run keeps info logs.
+    // or CPUID-faulting support. Route Hermit diagnostics to failure-only sidecars while comparing
+    // guest output; strict handling remains enabled, and SaBRe verification keeps info logs.
     for name in NON_RACY_EXAMPLES {
         let example = repository.join("examples").join(name);
-        let ptrace = run_bounded(
-            example_command(&example, None, false),
+        let ptrace = parity_run(
+            &example,
+            None,
             &format!("ptrace strict portable reference for {name}"),
         );
-        let sabre = run_bounded(
-            example_command(&example, Some(&loader), false),
+        let sabre = parity_run(
+            &example,
+            Some(&loader),
             &format!("SaBRe strict portable parity run for {name}"),
         );
         assert_eq!(sabre.status.code(), ptrace.status.code(), "example: {name}");
@@ -187,8 +224,9 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
         assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: {name}");
 
         let verify = run_bounded(
-            example_command(&example, Some(&loader), true),
+            example_command(&example, Some(&loader), true, None),
             &format!("SaBRe strict portable verification for {name}"),
+            None,
         );
         let diagnostics = format!(
             "{}{}",
