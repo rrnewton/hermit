@@ -276,6 +276,21 @@ fn external_continue_id(req: &Resources) -> ExternalOpId {
     }
 }
 
+/// Which end of a thread's priority band a deferred run-queue admission targets.
+///
+/// Recorded at the moment a global-request handler decides admission (so any
+/// PRNG draw that picks the side, e.g. `child_runs_first_post_fork`, happens in
+/// the same deterministic order as an immediate push would) and replayed when
+/// the scheduler drains the admission buffer. See
+/// [`Scheduler::admit_to_run_queue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitSide {
+    /// Run before an equal-priority peer (`runqueue_push_front`).
+    Front,
+    /// Ordinary tail admission (`runqueue_push_back`).
+    Back,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -311,6 +326,15 @@ pub struct Scheduler {
 
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
+
+    /// Threads whose run-queue admission was recorded by a global-request
+    /// handler while a `tentative_pop` transaction was live, deferred to the
+    /// next deterministic drain point (`step2`) so it cannot mutate the run
+    /// queue underneath the daemon's tentative selection. Keyed by `DetTid`
+    /// so the drain order among co-pending admissions is canonical rather than
+    /// lock-acquisition dependent. See [`Scheduler::admit_to_run_queue`] and
+    /// [`Scheduler::drain_pending_run_queue_admissions`].
+    pending_run_queue_admissions: BTreeMap<DetTid, AdmitSide>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -727,6 +751,7 @@ async fn sched_loop_inner(
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
                 && sched.pending_physical_process_exits.is_empty()
+                && sched.pending_run_queue_admissions.is_empty()
             {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
@@ -967,6 +992,7 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            pending_run_queue_admissions: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             logically_killed_threads: Default::default(),
@@ -1282,7 +1308,12 @@ impl Scheduler {
         if let Some(writer) = &mut self.preemption_writer {
             writer.set_current(new_leader, survivor_priority);
         }
-        self.runqueue_push_back(new_leader);
+        // Post-exec reconnection can arrive asynchronously on backends whose
+        // exec-child self-bootstraps outside a scheduler turn (DBI), so route
+        // the new leader's admission through the tentative-safe buffer rather
+        // than pushing directly. Under ptrace this runs post-commit and admits
+        // immediately, unchanged.
+        self.admit_to_run_queue(new_leader, AdmitSide::Back);
         self.started_up.try_put(());
 
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
@@ -1369,6 +1400,7 @@ impl Scheduler {
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
+        self.pending_run_queue_admissions.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
     }
 
@@ -1547,6 +1579,10 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Admit any run-queue entries deferred by asynchronous global-request
+        // handlers first, at this fixed deterministic point, before any early
+        // return below and before step3 opens a tentative-pop window.
+        self.drain_pending_run_queue_admissions();
         self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
@@ -2749,6 +2785,78 @@ impl Scheduler {
     pub(crate) fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
         let priority = self.get_priority(dettid);
         self.run_queue.push_front(dettid, priority)
+    }
+
+    /// Admit `dtid` to the run queue now, or defer it to the next deterministic
+    /// drain point if the daemon is mid-`tentative_pop`.
+    ///
+    /// Global-request handlers (`recv_create_child_thread`,
+    /// `reconnect_after_exec`) hold the scheduler lock but run on whichever
+    /// backend worker fielded the RPC, not on the scheduler daemon's turn. On
+    /// asynchronous backends (e.g. DBI) such a handler can acquire the lock in
+    /// the window where the daemon has peeked a `tentative_selection` and
+    /// released the lock across `req.get().await` (see `do_a_turn_blocking`).
+    /// Pushing then would trip the run queue's `tentative_selection.is_none()`
+    /// guard, poisoning the scheduler mutex and hanging the run.
+    ///
+    /// The tentative flag lives in the lock-protected `RunQueue`, so a handler
+    /// holding the lock observes it consistently: if it is set, the daemon is
+    /// strictly between `step3_peek` and `step4`'s commit and will reach the next
+    /// `step2` (which drains this buffer) before opening another tentative
+    /// window. On synchronous backends (ptrace) these handlers run after the
+    /// selecting thread's turn has committed, i.e. with no tentative selection
+    /// live, so this always pushes immediately and preserves existing behavior.
+    pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, side: AdmitSide) {
+        if self.run_queue.tentative_pop_in_progress() {
+            let prev = self.pending_run_queue_admissions.insert(dtid, side);
+            debug_assert!(
+                prev.is_none(),
+                "thread {:?} recorded for run-queue admission twice before draining",
+                dtid
+            );
+        } else {
+            match side {
+                AdmitSide::Front => {
+                    let _ = self.runqueue_push_front(dtid);
+                }
+                AdmitSide::Back => {
+                    let _ = self.runqueue_push_back(dtid);
+                }
+            }
+        }
+    }
+
+    /// Drain admissions deferred by [`Scheduler::admit_to_run_queue`] into the
+    /// run queue at a single deterministic point: the very start of `step2`,
+    /// before `step3_peek` opens a tentative window (so `tentative_selection` is
+    /// guaranteed `None` here). Draining a `BTreeMap` visits `DetTid`s in sorted
+    /// order, so the resulting run-queue state is a pure function of the
+    /// deterministic schedule rather than of RPC/lock-acquisition timing.
+    fn drain_pending_run_queue_admissions(&mut self) {
+        if self.pending_run_queue_admissions.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_run_queue_admissions);
+        for (dtid, side) in pending {
+            // A thread retired (exec/kill) between record and drain is skipped.
+            // `remove_blocking_entries` also clears the buffer on teardown, so
+            // this guard is defensive against any teardown path that does not.
+            if !self.next_turns.contains_key(&dtid) {
+                trace!(
+                    "[step2] skipping deferred admission of retired thread {:?}",
+                    dtid
+                );
+                continue;
+            }
+            match side {
+                AdmitSide::Front => {
+                    let _ = self.runqueue_push_front(dtid);
+                }
+                AdmitSide::Back => {
+                    let _ = self.runqueue_push_back(dtid);
+                }
+            }
+        }
     }
 
     /// Decide which side gets the first post-fork turn for an ordinary clone.
