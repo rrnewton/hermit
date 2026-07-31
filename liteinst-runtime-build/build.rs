@@ -89,6 +89,15 @@ fn main() {
             .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
     );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
+    // Derive the nested runtime build's `--profile` from cargo's `PROFILE`
+    // build-script env var: it is `release` for release-like profiles and
+    // `debug` otherwise, which map to the `--profile` values `release` and
+    // `dev`. The previous approach walked `out_dir.ancestors().nth(3)` to guess
+    // the profile directory name; a cargo nightly changed the build-script
+    // OUT_DIR layout so that ancestor now resolves to the literal `build`
+    // directory, and passing `--profile build` fails with
+    // "error: profile name `build` is reserved". Sourcing the profile from the
+    // documented env var is robust against that layout drift.
     let profile = match env::var("PROFILE").as_deref() {
         Ok("debug") => "dev",
         Ok("release") => "release",
