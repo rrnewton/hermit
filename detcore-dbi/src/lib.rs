@@ -394,6 +394,13 @@ struct NativeThreadScratch {
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
 static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Host pid of the traced-tree root process, latched on the first syscall
+/// callback. The root is the first process to run, so this records its pid; a
+/// forked child inherits the already-latched value through its copy-on-write
+/// address space (fork does not reset statics) and never overwrites it. Used to
+/// restrict the exec `PrepareExec` notification to the tree-root process leader
+/// (see `reverie_dbi_runtime_pre_syscall`).
+static ROOT_HOST_PID: AtomicI32 = AtomicI32::new(0);
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -1388,6 +1395,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         let message = b"detcore-dbi: entered Rust syscall callback\n";
         unsafe { emit(message.as_ptr(), message.len()) };
     }
+    // Latch the traced-tree root's host pid on the first process leader to run.
+    // The CAS keeps the earliest such pid; a forked child inherits this value
+    // and never overwrites it. Used below to scope PrepareExec to the tree-root
+    // exec.
+    if tid == pid {
+        let _ = ROOT_HOST_PID.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed);
+    }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
@@ -1446,20 +1460,33 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
         if sysnum == libc::SYS_execve {
-            // Mirror the ptrace/SaBRe execve path: while the pre-exec thread is
-            // still live, tell the coordinator an exec is pending on this
-            // process. This populates the coordinator's `pending_exec_states`
-            // so that when the post-exec image re-registers itself (a
-            // `CreateChildThread` self-registration on a freshly initialized
-            // thread state whose logical clock has reset to the container
-            // epoch), the coordinator recognizes it as an exec-reconnect. The
-            // reconnect path reuses this thread's established scheduler identity
-            // and logical clock instead of registering a brand-new thread whose
-            // epoch-reset time would rewind global time and panic
-            // `update_global_time`. The RPC is delivered out-of-process to the
-            // coordinator, which survives the `execve` that wipes this guest's
-            // address space, so no guest-side state has to persist across exec.
-            if !scratch.runtime_state.is_null() {
+            // Mirror the ptrace/SaBRe execve path for the tree-root process
+            // leader: while the pre-exec thread is still live, tell the
+            // coordinator an exec is pending on this process. This populates the
+            // coordinator's `pending_exec_states` so that when the post-exec
+            // image re-registers itself (a `CreateChildThread` self-registration
+            // on a freshly initialized thread state whose logical clock has
+            // reset to the container epoch), the coordinator recognizes it as an
+            // exec-reconnect. The reconnect path reuses this thread's
+            // established scheduler identity and logical clock instead of
+            // registering a brand-new thread whose epoch-reset time would rewind
+            // global time and panic `update_global_time`. The RPC is delivered
+            // out-of-process to the coordinator, which survives the `execve`
+            // that wipes this guest's address space, so no guest-side state has
+            // to persist across exec.
+            //
+            // Scope: ONLY the tree-root process leader re-registers via a
+            // `CreateChildThread` self-registration post-exec (the only exec
+            // that would rewind global time). A forked child that execs is not
+            // the root of the traced tree; its post-exec image does not
+            // self-register that way and never rewinds, so it must not send
+            // PrepareExec — an unmatched exec-reconnect for a thread that never
+            // reconnects deadlocks the child-heavy fork/exec and vfork/exec
+            // paths.
+            if tid == pid
+                && pid == ROOT_HOST_PID.load(Ordering::Acquire)
+                && !scratch.runtime_state.is_null()
+            {
                 let thread = unsafe { &mut *scratch.runtime_state };
                 // Only a thread that has completed its Detcore thread-start hook
                 // has a `detpid` and a scheduler identity to reconnect; a thread
