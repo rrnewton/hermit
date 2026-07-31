@@ -230,18 +230,22 @@ impl Supervisor {
                         if !matches!(signal, Signal::SIGSTOP | Signal::SIGCHLD) {
                             let registers = ptrace::getregs(pid).ok();
                             let rip = registers.as_ref().map_or(0, |registers| registers.rip);
-                            if matches!(
+                            let captures_fault_context = matches!(
                                 signal,
                                 Signal::SIGSEGV
                                     | Signal::SIGILL
                                     | Signal::SIGBUS
                                     | Signal::SIGFPE
                                     | Signal::SIGABRT
-                            ) && let Some(registers) = registers
-                            {
+                            );
+                            if captures_fault_context {
+                                self.signal_diagnostics.remove(&pid);
+                            }
+                            if captures_fault_context && let Some(registers) = registers {
                                 let siginfo = ptrace::getsiginfo(pid).ok();
                                 let fault_address = siginfo
                                     .as_ref()
+                                    .filter(|info| info.si_code > 0)
                                     .map(|info| unsafe { info.si_addr() as usize });
                                 let mapping =
                                     fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))
