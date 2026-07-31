@@ -73,7 +73,7 @@ struct MappingDiagnostic {
 }
 
 fn should_replace_signal_diagnostic(
-    existing: Option<(Signal, Option<i32>)>,
+    existing: Option<(Signal, Option<i32>, bool)>,
     signal: Signal,
     si_code: Option<i32>,
 ) -> bool {
@@ -81,14 +81,20 @@ fn should_replace_signal_diagnostic(
     // restores SIG_DFL and raises SIGILL again, producing a second ptrace stop from SI_TKILL.
     // Preserve the original kernel fault context across that re-raise, but let a later hardware
     // fault replace it so a successfully handled marker cannot leave stale diagnostics behind.
-    if let Some((Signal::SIGILL, Some(existing_code))) = existing
+    if let Some((Signal::SIGILL, Some(existing_code), existing_is_marker)) = existing
         && signal == Signal::SIGILL
         && existing_code > 0
+        && !existing_is_marker
         && !si_code.is_some_and(|code| code > 0)
     {
         return false;
     }
     true
+}
+
+fn is_sabre_sigill_marker(instruction_bytes: Option<&[u8; 16]>) -> bool {
+    instruction_bytes
+        .is_some_and(|bytes| matches!(&bytes[..2], [0x0f, 0xff] | [0x0f, 0x0b] | [0x0f, 0x0c]))
 }
 
 fn final_physical_exit(status: &WaitStatus) -> Option<(Pid, ExitStatus)> {
@@ -257,38 +263,50 @@ impl Supervisor {
                                     | Signal::SIGFPE
                                     | Signal::SIGABRT
                             );
-                            if captures_fault_context && let Some(registers) = registers {
+                            if captures_fault_context {
                                 let siginfo = ptrace::getsiginfo(pid).ok();
                                 let si_code = siginfo.as_ref().map(|info| info.si_code);
-                                let existing = self
-                                    .signal_diagnostics
-                                    .get(&pid)
-                                    .map(|diagnostic| (diagnostic.signal, diagnostic.si_code));
+                                let existing =
+                                    self.signal_diagnostics.get(&pid).map(|diagnostic| {
+                                        (
+                                            diagnostic.signal,
+                                            diagnostic.si_code,
+                                            is_sabre_sigill_marker(
+                                                diagnostic.instruction_bytes.as_ref(),
+                                            ),
+                                        )
+                                    });
                                 if should_replace_signal_diagnostic(existing, signal, si_code) {
-                                    let fault_address = siginfo
-                                        .as_ref()
-                                        .filter(|info| info.si_code > 0)
-                                        .map(|info| unsafe { info.si_addr() as usize });
-                                    let mapping =
-                                        fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))
-                                            .ok()
-                                            .and_then(|maps| {
-                                                mapping_diagnostic(&maps, rip as usize)
-                                            });
-                                    let instruction_bytes =
-                                        read_diagnostic_bytes(pid, rip as usize).ok();
-                                    self.signal_diagnostics.insert(
-                                        pid,
-                                        SignalDiagnostic {
-                                            signal,
-                                            si_code,
-                                            si_errno: siginfo.as_ref().map(|info| info.si_errno),
-                                            fault_address,
-                                            mapping,
-                                            instruction_bytes,
-                                            registers,
-                                        },
-                                    );
+                                    if let Some(registers) = registers {
+                                        let fault_address = siginfo
+                                            .as_ref()
+                                            .filter(|info| info.si_code > 0)
+                                            .map(|info| unsafe { info.si_addr() as usize });
+                                        let mapping = fs::read_to_string(format!(
+                                            "/proc/{}/maps",
+                                            pid.as_raw()
+                                        ))
+                                        .ok()
+                                        .and_then(|maps| mapping_diagnostic(&maps, rip as usize));
+                                        let instruction_bytes =
+                                            read_diagnostic_bytes(pid, rip as usize).ok();
+                                        self.signal_diagnostics.insert(
+                                            pid,
+                                            SignalDiagnostic {
+                                                signal,
+                                                si_code,
+                                                si_errno: siginfo
+                                                    .as_ref()
+                                                    .map(|info| info.si_errno),
+                                                fault_address,
+                                                mapping,
+                                                instruction_bytes,
+                                                registers,
+                                            },
+                                        );
+                                    } else {
+                                        self.signal_diagnostics.remove(&pid);
+                                    }
                                 }
                             }
                             tracing::debug!(
@@ -396,6 +414,7 @@ impl Supervisor {
             self.mapping_cache
                 .retain(|(cached_pid, _), _| *cached_pid != pid);
             self.states.insert(pid, TraceeState::default());
+            self.signal_diagnostics.remove(&pid);
         }
         self.resume(pid, None)
     }
@@ -694,7 +713,7 @@ mod tests {
     fn preserves_hardware_sigill_across_userspace_reraise() {
         const KERNEL_FAULT: i32 = 2;
         const USER_RERAISE: i32 = -6;
-        let hardware = Some((Signal::SIGILL, Some(KERNEL_FAULT)));
+        let hardware = Some((Signal::SIGILL, Some(KERNEL_FAULT), false));
 
         assert!(!should_replace_signal_diagnostic(
             hardware,
@@ -717,10 +736,29 @@ mod tests {
             Some(KERNEL_FAULT),
         ));
         assert!(should_replace_signal_diagnostic(
-            Some((Signal::SIGILL, Some(USER_RERAISE))),
+            Some((Signal::SIGILL, Some(KERNEL_FAULT), true)),
             Signal::SIGILL,
             Some(USER_RERAISE),
         ));
+        assert!(should_replace_signal_diagnostic(
+            Some((Signal::SIGILL, Some(USER_RERAISE), false)),
+            Signal::SIGILL,
+            Some(USER_RERAISE),
+        ));
+    }
+
+    #[test]
+    fn recognizes_sabre_sigill_markers() {
+        for marker in [[0x0f, 0xff], [0x0f, 0x0b], [0x0f, 0x0c]] {
+            let mut bytes = [0; 16];
+            bytes[..2].copy_from_slice(&marker);
+            assert!(is_sabre_sigill_marker(Some(&bytes)));
+        }
+
+        let mut unknown = [0; 16];
+        unknown[..2].copy_from_slice(&[0x62, 0xf1]);
+        assert!(!is_sabre_sigill_marker(Some(&unknown)));
+        assert!(!is_sabre_sigill_marker(None));
     }
 
     #[test]
