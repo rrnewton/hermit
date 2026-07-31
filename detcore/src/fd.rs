@@ -68,6 +68,27 @@ pub enum FdType {
     Rng,
 }
 
+/// Virtual-time state for a `timerfd`, shared by every descriptor that refers to
+/// the same open file description (dup/fork aliases, and the reader thread).
+///
+/// Detcore arms and reads the timer against the deterministic virtual clock
+/// instead of host wall-clock, so a periodic timerfd — for example GHC's RTS
+/// context-switch ticker, a `timerfd_settime` with a fixed periodic interval
+/// whose blocking `read()` on a dedicated OS thread drives green-thread
+/// preemption — fires as a function of the virtual schedule and is reproducible
+/// under `--strict --verify`.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerfdState {
+    /// Clock the timer was created against (`CLOCK_MONOTONIC`/`CLOCK_REALTIME`).
+    pub clockid: i32,
+    /// Next expiration in virtual time, or `None` when the timer is disarmed.
+    pub deadline: Option<LogicalTime>,
+    /// Periodic reload interval in nanoseconds; `0` for a one-shot timer.
+    pub interval_ns: u64,
+}
+
 /// Deterministic file descriptor
 ///
 /// Notice `statbuf` can be cached here, this is because
@@ -132,6 +153,11 @@ struct OpenFileDescription {
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
+    /// Virtual-time arming state when this open file description is a `timerfd`.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    #[serde(default)]
+    timerfd: Option<TimerfdState>,
 }
 
 impl PartialEq for DetFd {
@@ -176,6 +202,7 @@ impl DetFd {
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 loopback_peer: false,
+                timerfd: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -453,6 +480,33 @@ impl DetFd {
     /// Whether this open file is a socket connected to a loopback peer.
     pub(crate) fn is_loopback_peer(&self) -> bool {
         self.description().loopback_peer
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    /// Initialize virtual-time timer state for a freshly created `timerfd`. The
+    /// timer starts disarmed, matching `timerfd_create` semantics.
+    pub(crate) fn init_timerfd(&self, clockid: i32) {
+        self.description().timerfd = Some(TimerfdState {
+            clockid,
+            deadline: None,
+            interval_ns: 0,
+        });
+    }
+
+    /// Current virtual-time timer state, shared by every alias of this `timerfd`
+    /// open file description. `None` for a non-`timerfd` or an unmodeled one.
+    pub(crate) fn timerfd_state(&self) -> Option<TimerfdState> {
+        self.description().timerfd
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    /// Replace the virtual-time timer arming shared by every alias of this
+    /// `timerfd`. Used by `timerfd_settime` and by `read()` when advancing a
+    /// periodic timer past the expirations it has just reported.
+    pub(crate) fn set_timerfd_state(&self, state: TimerfdState) {
+        self.description().timerfd = Some(state);
     }
 }
 
