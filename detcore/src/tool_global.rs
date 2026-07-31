@@ -63,6 +63,7 @@ use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::AdmitSide;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::ExecReconnect;
@@ -1268,19 +1269,27 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
+            // Decide the admission side now (this consumes the post-fork PRNG
+            // draw when RunsPostFork::Random, so the draw order matches an
+            // immediate push exactly). The actual run-queue insertion is routed
+            // through `admit_to_run_queue`, which defers it to a deterministic
+            // drain point if this handler raced the daemon's tentative-pop
+            // window (possible on asynchronous backends such as DBI, where the
+            // child self-registers outside a scheduler turn). Under ptrace this
+            // runs post-commit and admits immediately, unchanged.
             let child_first = self.cfg.sequentialize_threads
                 && !parent_is_kernel_blocked
                 && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
-            let pos = if child_first {
-                sched.runqueue_push_front(child_dettid)
+            let side = if child_first {
+                AdmitSide::Front
             } else {
-                sched.runqueue_push_back(child_dettid)
+                AdmitSide::Back
             };
+            sched.admit_to_run_queue(child_dettid, side);
             debug!(
-                "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
+                "[detcore] CreateChildThread with dtid {}: admit child to {} of priority band.",
                 child_dettid,
                 if child_first { "front" } else { "back" },
-                pos,
             );
             sched.started_up.try_put(());
         }
