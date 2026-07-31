@@ -1996,6 +1996,15 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
+/// Notifies the coordinator that `guest` is about to `execve`, recording the
+/// pre-exec address space `mm` and any file-descriptor blocking overrides in
+/// `pending_exec_states`. The coordinator uses this to reconcile the post-exec
+/// image's re-registration as an exec-reconnect (reusing the thread's logical
+/// clock and scheduler identity) instead of a brand-new thread. Backends that
+/// intercept `execve` outside Detcore's syscall handler (for example the DBI
+/// backend, which handles exec natively) must call this before the exec so the
+/// reconnect path is taken; the ptrace/SaBRe path calls it from
+/// `handle_execveat`.
 pub async fn prepare_exec<G, T>(guest: &mut G, mm: MmId, fd_blocking: ExecFdBlockingOverrides)
 where
     G: Guest<Detcore<T>>,

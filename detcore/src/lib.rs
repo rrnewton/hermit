@@ -112,6 +112,7 @@ use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 
 // AUTONOMOUS-BOT-IMPLEMENTED

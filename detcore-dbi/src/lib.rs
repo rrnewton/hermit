@@ -40,6 +40,7 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::prepare_exec;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -1285,6 +1286,72 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
+/// Drives a Detcore handler future to completion on the calling guest thread.
+///
+/// Reverie handlers are `async`, but the DBI coordinator RPC client resolves
+/// each RPC synchronously (see `reverie_dbi`'s `run_ready`), so a handler that
+/// performs only RPCs (like [`prepare_exec`]) is ready on the first poll. A
+/// no-op waker therefore suffices; the bounded fallback loop keeps a stray
+/// `Pending` from wedging the guest thread. Returns `None` if the future never
+/// resolves within the bound.
+fn drive_handler_to_ready<F: Future>(future: F) -> Option<F::Output> {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..1_000_000 {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return Some(value),
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+    None
+}
+
+/// Notifies the coordinator of this thread's pending `execve`, mirroring the
+/// `PrepareExec` that the ptrace/SaBRe path issues from `handle_execveat`.
+///
+/// Must be called while the pre-exec thread is still live (before the native
+/// exec pause). It records `pending_exec_states` in the out-of-process
+/// coordinator so the post-exec image's self-registration is reconciled as an
+/// exec-reconnect that preserves this thread's logical clock and scheduler
+/// identity, rather than a fresh registration whose epoch-reset clock would
+/// rewind coordinator time.
+#[allow(clippy::too_many_arguments)]
+fn send_dbi_prepare_exec(
+    context: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    thread_state: &mut DetcoreThreadState,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) {
+    let runtime = current_runtime();
+    // The pre-exec address-space identity the coordinator maps to the post-exec
+    // incarnation via `MmId::for_exec`.
+    let mm = thread_state.mm_id;
+    let mut guest = DbiGuest::<Detcore>::new(
+        context as usize,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        None,
+        branches,
+        thread_state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    // The DBI backend does not discover live descriptor status, so an empty
+    // fd-blocking override set matches the default execve accounting.
+    drive_handler_to_ready(prepare_exec(
+        &mut guest,
+        mm,
+        std::collections::BTreeSet::new(),
+    ));
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -1379,6 +1446,38 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
         if sysnum == libc::SYS_execve {
+            // Mirror the ptrace/SaBRe execve path: while the pre-exec thread is
+            // still live, tell the coordinator an exec is pending on this
+            // process. This populates the coordinator's `pending_exec_states`
+            // so that when the post-exec image re-registers itself (a
+            // `CreateChildThread` self-registration on a freshly initialized
+            // thread state whose logical clock has reset to the container
+            // epoch), the coordinator recognizes it as an exec-reconnect. The
+            // reconnect path reuses this thread's established scheduler identity
+            // and logical clock instead of registering a brand-new thread whose
+            // epoch-reset time would rewind global time and panic
+            // `update_global_time`. The RPC is delivered out-of-process to the
+            // coordinator, which survives the `execve` that wipes this guest's
+            // address space, so no guest-side state has to persist across exec.
+            if !scratch.runtime_state.is_null() {
+                let thread = unsafe { &mut *scratch.runtime_state };
+                // Only a thread that has completed its Detcore thread-start hook
+                // has a `detpid` and a scheduler identity to reconnect; a thread
+                // that execs before its first dispatched syscall has nothing
+                // registered yet and needs no PrepareExec.
+                if thread.initialized {
+                    send_dbi_prepare_exec(
+                        context,
+                        tid,
+                        pid,
+                        branches,
+                        &mut thread.state,
+                        invoke_syscall,
+                        read_registers,
+                        write_registers,
+                    );
+                }
+            }
             READY_IMAGE.store(0, Ordering::Release);
             RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
             while !RUNTIME_PAUSED.load(Ordering::Acquire) {
