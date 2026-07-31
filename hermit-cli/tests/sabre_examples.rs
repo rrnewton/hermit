@@ -139,7 +139,7 @@ fn run_bounded(mut command: Command, label: &str) -> Output {
 
 fn example_command(example: &Path, backend: Option<&Path>, verify: bool) -> Command {
     let mut command = Command::new(hermit_binary());
-    command.arg(if verify { "--log=info" } else { "--log=error" });
+    command.arg(if verify { "--log=info" } else { "--log=off" });
     command.arg("run");
     if let Some(loader) = backend {
         command
@@ -170,7 +170,8 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
     // race.sh is deliberately outside this ratchet: its output is the schedule itself, and the
     // in-process backend does not yet serialize arbitrary guest instructions between callbacks.
     // Both parity sides use the portable profile because this job intentionally runs without PMU
-    // or CPUID-faulting support; strict syscall handling and SaBRe verification remain enabled.
+    // or CPUID-faulting support. Disable Hermit diagnostics while comparing guest output; strict
+    // syscall handling remains enabled, and the separate SaBRe verification run keeps info logs.
     for name in NON_RACY_EXAMPLES {
         let example = repository.join("examples").join(name);
         let ptrace = run_bounded(
