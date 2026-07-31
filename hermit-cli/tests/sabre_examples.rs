@@ -146,7 +146,11 @@ fn example_command(example: &Path, backend: Option<&Path>, verify: bool) -> Comm
             .env("HERMIT_SABRE_BINARY", loader)
             .args(["--backend", "sabre"]);
     }
-    command.arg("--strict");
+    command.args([
+        "--strict",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
     if verify {
         command.arg("--verify");
     }
@@ -165,15 +169,17 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
 
     // race.sh is deliberately outside this ratchet: its output is the schedule itself, and the
     // in-process backend does not yet serialize arbitrary guest instructions between callbacks.
+    // Both parity sides use the portable profile because this job intentionally runs without PMU
+    // or CPUID-faulting support; strict syscall handling and SaBRe verification remain enabled.
     for name in NON_RACY_EXAMPLES {
         let example = repository.join("examples").join(name);
         let ptrace = run_bounded(
             example_command(&example, None, false),
-            &format!("ptrace strict reference for {name}"),
+            &format!("ptrace strict portable reference for {name}"),
         );
         let sabre = run_bounded(
             example_command(&example, Some(&loader), false),
-            &format!("SaBRe strict parity run for {name}"),
+            &format!("SaBRe strict portable parity run for {name}"),
         );
         assert_eq!(sabre.status.code(), ptrace.status.code(), "example: {name}");
         assert_eq!(sabre.stdout, ptrace.stdout, "stdout parity: {name}");
@@ -181,7 +187,7 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
 
         let verify = run_bounded(
             example_command(&example, Some(&loader), true),
-            &format!("SaBRe strict verification for {name}"),
+            &format!("SaBRe strict portable verification for {name}"),
         );
         let diagnostics = format!(
             "{}{}",
