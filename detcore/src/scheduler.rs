@@ -1310,9 +1310,25 @@ impl Scheduler {
         }
         // Post-exec reconnection can arrive asynchronously on backends whose
         // exec-child self-bootstraps outside a scheduler turn (DBI), so route
-        // the new leader's admission through the tentative-safe buffer rather
-        // than pushing directly. Under ptrace this runs post-commit and admits
-        // immediately, unchanged.
+        // the new leader's admission (a run-queue *push*) through the
+        // tentative-safe buffer rather than pushing directly. Under ptrace this
+        // runs post-commit and admits immediately, unchanged.
+        //
+        // KNOWN LIMITATION: the *removals* in this handler
+        // (`logically_kill_thread` -> `run_queue.remove_tid`, for the exec
+        // caller and its siblings, above and below) are NOT yet tentative-safe:
+        // `remove_tid` carries the same `tentative_selection.is_none()` assert,
+        // so a *multi-threaded* exec that reconnects inside the daemon's
+        // tentative window can still trip it. Making run-queue removal
+        // tentative-safe is not a local buffer change -- a deferred removal
+        // interacts with `are_all_quiesced` (which scans `run_queue.tids()`) and
+        // the tentative-selection lifecycle on the `SkipTurn`/`ThreadExited`
+        // path -- so it requires deterministic-scheduler owner design and is
+        // tracked separately. The single-threaded fork+exec path that produces
+        // the reproduced #1147 hang goes through `recv_create_child_thread`
+        // (`caller == new_leader`, no siblings), which this PR fully fixes;
+        // this push routing hardens the non-leader-exec push without regressing
+        // the pre-existing removal behavior.
         self.admit_to_run_queue(new_leader, AdmitSide::Back);
         self.started_up.try_put(());
 
@@ -2815,13 +2831,30 @@ impl Scheduler {
                 dtid
             );
         } else {
-            match side {
-                AdmitSide::Front => {
-                    let _ = self.runqueue_push_front(dtid);
-                }
-                AdmitSide::Back => {
-                    let _ = self.runqueue_push_back(dtid);
-                }
+            // Drop any admission still buffered from an earlier tentative window
+            // so it cannot be re-applied by a later drain and double-enqueue this
+            // thread. This keeps the immediate and deferred paths mutually
+            // exclusive even in release builds, where the run queue's internal
+            // duplicate assertions are compiled out. (Not currently reachable --
+            // each thread is admitted by exactly one handler invocation -- but
+            // cheap defense against a future second admitter.)
+            self.pending_run_queue_admissions.remove(&dtid);
+            self.admit_now(dtid, side);
+        }
+    }
+
+    /// Push `dtid` onto the run queue immediately, idempotently: a thread
+    /// already queued is left in place rather than enqueued twice.
+    fn admit_now(&mut self, dtid: DetTid, side: AdmitSide) {
+        if self.run_queue.contains_tid(dtid) {
+            return;
+        }
+        match side {
+            AdmitSide::Front => {
+                let _ = self.runqueue_push_front(dtid);
+            }
+            AdmitSide::Back => {
+                let _ = self.runqueue_push_back(dtid);
             }
         }
     }
@@ -2848,14 +2881,7 @@ impl Scheduler {
                 );
                 continue;
             }
-            match side {
-                AdmitSide::Front => {
-                    let _ = self.runqueue_push_front(dtid);
-                }
-                AdmitSide::Back => {
-                    let _ = self.runqueue_push_back(dtid);
-                }
-            }
+            self.admit_now(dtid, side);
         }
     }
 
