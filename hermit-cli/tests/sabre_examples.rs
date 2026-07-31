@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-const NON_RACY_EXAMPLES: [&str; 3] = ["devrand.sh", "rand.py", "timed-progress-bar.py"];
+const NON_RACY_EXAMPLES: [&str; 4] = ["date.sh", "devrand.sh", "rand.py", "timed-progress-bar.py"];
 
 fn hermit_binary() -> PathBuf {
     std::env::var_os("HERMIT_SABRE_TEST_BINARY")
@@ -165,9 +165,6 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
 
     // race.sh is deliberately outside this ratchet: its output is the schedule itself, and the
     // in-process backend does not yet serialize arbitrary guest instructions between callbacks.
-    // date.sh also remains outside this ratchet because its SaBRe strict run still ends in
-    // SIGSEGV with the correctly pinned loader on GitHub's EPYC 7763 runner; keep that hosted
-    // runtime gap explicit instead of weakening strict verification for the examples that pass.
     for name in NON_RACY_EXAMPLES {
         let example = repository.join("examples").join(name);
         let ptrace = run_bounded(
