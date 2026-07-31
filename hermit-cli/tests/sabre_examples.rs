@@ -139,9 +139,12 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
     // Hermit should drain its process tree before exiting. Kill any survivors anyway so leaked
     // guest processes cannot retain a pipe descriptor and hang `wait_with_output`.
     kill_process_group(child.id(), label);
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
+    let output = child.wait_with_output().unwrap_or_else(|error| {
+        panic!(
+            "failed to collect {label}: {rendered}: {error}\ncontroller diagnostics:\n{}",
+            controller_diagnostics(diagnostic_log),
+        )
+    });
     if timed_out || !output.status.success() {
         panic!(
             "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
@@ -184,7 +187,11 @@ fn example_command(
 }
 
 fn parity_run(example: &Path, backend: Option<&Path>, label: &str) -> Output {
-    let diagnostic_log = tempfile::NamedTempFile::new()
+    // Hermit gives the guest a private /tmp, so keep the controller sidecar in the host-visible
+    // Cargo target directory. The freshly created unique file prevents stale or cross-run logs.
+    let diagnostic_log = tempfile::Builder::new()
+        .prefix("sabre-parity-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
     run_bounded(
         example_command(example, backend, false, Some(diagnostic_log.path())),
