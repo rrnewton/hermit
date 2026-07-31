@@ -313,19 +313,23 @@ fn main() {
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
 
-    if env::var("PROFILE").as_deref() != Ok("release")
+    let profile = env::var("PROFILE");
+    if profile.as_deref() != Ok("release")
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
         return;
     }
+    let profile = profile.expect("Cargo did not set PROFILE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let profile_dir = out_dir
         .ancestors()
-        .nth(3)
-        .expect("Cargo OUT_DIR does not have a profile ancestor")
+        .find(|ancestor| {
+            ancestor.file_name().and_then(|name| name.to_str()) == Some(profile.as_str())
+        })
+        .expect("Cargo OUT_DIR does not have the active profile ancestor")
         .to_path_buf();
     let target_dir = profile_dir
         .parent()
