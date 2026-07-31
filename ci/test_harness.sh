@@ -266,10 +266,10 @@ function audit_ci_correspondence {
     # These are literal workflow/validate expressions, not local expansions.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint portable "$ROOT_DIR/.github/workflows/ci-portable.yml" \
-        'env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner ci/run-dag.sh portable --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v'
+        'env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner ci/run-dag.sh portable --allow-cgroup-failure --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v'
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged --allow-cgroup-failure -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
         '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
