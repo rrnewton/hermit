@@ -2,17 +2,17 @@
 
 [package]
 name = "detcore-testutils"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
 [dependencies]
-detcore = { version = "0.0.0", path = "../.." }
+detcore = { version = "0.2.0", path = "../.." }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "adc147342f34754b449b9a24174aca3ac3a2e16b" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "adc147342f34754b449b9a24174aca3ac3a2e16b" }
-test-allocator = { version = "0.0.0", path = "../../../common/test-allocator" }
+test-allocator = { version = "0.2.0", path = "../../../common/test-allocator" }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
