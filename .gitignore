@@ -18,3 +18,7 @@ envelope.json
 
 # Regenerated human-readable commands from tests/e2e/manifests/*.toml.
 /ignored/e2e-commands/
+
+# Default safe-ci-dag-runner (v0.11+) profile store, written to the repo root
+# when validate.sh / ci/run-dag.sh run without an explicit --perf-dir.
+/.safe-ci-dag-runner/

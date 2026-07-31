@@ -60,6 +60,8 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
+      - name: Build DAG runner (rust, zero runtime deps)
+        run: (cd agent-utils && ./setup rs)
       - name: Run portable lane as a DAG
         run: ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
 
@@ -83,6 +85,8 @@ jobs:
         with:
           go-version: stable
           cache: false
+      - name: Build DAG runner (rust, zero runtime deps)
+        run: (cd agent-utils && ./setup rs)
       # PMU access is a single serialized host resource; hold the same lock the
       # validate.sh privileged lane uses. The DAG's own {"pmu": 1} cap keeps
       # gates one-at-a-time within this run.
