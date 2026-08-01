@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -69,6 +69,19 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
+The sendfile row exercises `sendfile(2)`'s in-kernel copy between two temporary
+regular files (both `mkstemp`'d and immediately unlinked, so no path is
+observed). It checks the invariants Detcore must preserve identically: a
+NULL-offset transfer advances the source's own file offset (copying 256 bytes in
+100- then 156-byte calls drives it to 256), an explicit `off_t*` transfer starts
+at the supplied offset, updates the pointer, and leaves the source's own offset
+unchanged, and the bytes that arrive checksum to `0+1+...+255 = 32640`. Only
+those invariants are printed (`sendfile copied=256 checksum=32640 pos=50
+own_offset_kept=1`), never a descriptor number. ptrace and DBI satisfy it, and
+DBI verifies byte-identical under strict verification. It is an explicit KVM gap:
+the KVM `ElfExecutor` personality returns deterministic `ENOSYS` for `sendfile`,
+so the in-kernel copy path is not yet exercised there.
+
 ## Matrix
 
 | Test | ptrace | DBI | KVM |
@@ -92,6 +105,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `sendfile_copy` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
