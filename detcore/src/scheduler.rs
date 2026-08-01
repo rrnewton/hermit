@@ -2145,8 +2145,11 @@ impl Scheduler {
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
                 self.turn, dettid, rs
             );
-            // Requeue the thread as a poller
-            let popped = self.run_queue.commit_tentative_pop();
+            // Requeue the thread as a poller. Use the UNCHARGED commit: the
+            // count of poll retries is host-timing nondeterministic (its
+            // time-advance is likewise excluded from DETLOG), so it must not
+            // consume fairness budget or gate fairness selection (#140).
+            let popped = self.run_queue.commit_tentative_pop_uncharged();
             assert_eq!(dettid, popped);
             self.run_queue
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);

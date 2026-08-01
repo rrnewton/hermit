@@ -653,6 +653,24 @@ impl RunQueue {
     /// operation is only permissible when the queue is locked, i.e. the tentative_pop has
     /// previously returned `Some`.
     pub fn commit_tentative_pop(&mut self) -> DetTid {
+        self.commit_tentative_pop_inner(true)
+    }
+
+    /// Like [`commit_tentative_pop`] but does NOT charge the fairness overlay.
+    ///
+    /// Used only for internal I/O poll-retry requeues (the `poll_attempt > 0`
+    /// NONCOMMIT path in the scheduler). The *count* of those retries is
+    /// host-timing nondeterministic — the scheduler already keeps their
+    /// time-advance out of the determinism log for exactly this reason — so
+    /// charging them would leak host nondeterminism into the selection-gating
+    /// service counter and make `--verify` diverge on poll-heavy, external-actor
+    /// workloads (#140). A poll retry is not guest progress and must not consume
+    /// fairness budget.
+    pub fn commit_tentative_pop_uncharged(&mut self) -> DetTid {
+        self.commit_tentative_pop_inner(false)
+    }
+
+    fn commit_tentative_pop_inner(&mut self, charge: bool) -> DetTid {
         // Check that queue is locked and unlock it.
         let tentative_selection = self
             .tentative_selection
@@ -704,11 +722,16 @@ impl RunQueue {
         // between the peek and tentative_pop and commit_tentative_pop.
         debug_assert!(ret == tentative_selection);
         // Charge the committed scheduling opportunity. This is the single choke
-        // point for every real turn (poller requeue, chaos reprioritization, and
-        // completed guest turns all route through here); `undo_tentative_pop`
-        // deliberately bypasses it so a rolled-back selection is never charged.
-        if let Some(fair) = self.fair.as_mut() {
-            fair.on_commit(ret);
+        // point for every real turn (chaos reprioritization and completed guest
+        // turns route through here with `charge = true`); `undo_tentative_pop`
+        // deliberately bypasses it so a rolled-back selection is never charged,
+        // and the internal I/O poll-retry requeue routes through
+        // `commit_tentative_pop_uncharged` (`charge = false`) so a
+        // host-nondeterministic retry count never gates fairness (#140).
+        if charge {
+            if let Some(fair) = self.fair.as_mut() {
+                fair.on_commit(ret);
+            }
         }
         ret
     }
@@ -943,6 +966,37 @@ mod tests {
         let fair = queue.fair.as_ref().unwrap();
         assert_eq!(fair.service.get(&a).copied(), Some(0));
         assert_eq!(fair.service.get(&b).copied(), Some(0));
+    }
+
+    /// An internal I/O poll-retry requeue commits through the UNCHARGED path, so
+    /// it never advances the service counter. The count of such retries is
+    /// host-timing nondeterministic, so charging them would make fairness (and
+    /// therefore `--verify`) host-dependent (#140). A thread that only ever
+    /// poll-retries keeps service 0 and never becomes ineligible from polling.
+    #[test]
+    fn poll_retry_commit_is_uncharged() {
+        let budget = 2u64;
+        let poller = DetTid::from_raw(1);
+        let peer = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, Some(budget));
+        queue.push_back(poller, DEFAULT_PRIORITY);
+        queue.push_back(peer, DEFAULT_PRIORITY);
+
+        // The poller wins and "poll-retries" many times via the uncharged commit.
+        // Absent the exemption, `budget` charged turns would exclude it; with the
+        // exemption its service stays 0 forever and it remains eligible.
+        for _ in 0..50 {
+            assert_eq!(queue.tentative_pop_next(), Some(poller));
+            assert_eq!(queue.commit_tentative_pop_uncharged(), poller);
+            queue.push_front(poller, DEFAULT_PRIORITY);
+        }
+        let fair = queue.fair.as_ref().unwrap();
+        assert_eq!(
+            fair.service.get(&poller).copied(),
+            Some(0),
+            "uncharged poll-retry commits must not advance the service counter"
+        );
+        assert_eq!(fair.service.get(&peer).copied(), Some(0));
     }
 
     /// A blocked thread's service counter is retained across a block/wake round
