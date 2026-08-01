@@ -1428,6 +1428,8 @@ impl GlobalState {
             detpid,
             mm,
             timeslice_stats,
+            syscall_boundary_preemptions,
+            branch_preemptions,
             chaos_epochs,
         } = deregistration;
         // A fatal signal can tear down the caller after its local state has advanced to the
@@ -1466,6 +1468,7 @@ impl GlobalState {
             }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched.record_preemption_counts(syscall_boundary_preemptions, branch_preemptions);
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
@@ -1815,6 +1818,10 @@ pub struct ThreadDeregistration {
     pub(crate) detpid: DetPid,
     pub(crate) mm: MmId,
     pub(crate) timeslice_stats: TimesliceStats,
+    #[serde(default)]
+    pub(crate) syscall_boundary_preemptions: u64,
+    #[serde(default)]
+    pub(crate) branch_preemptions: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
@@ -3017,6 +3024,8 @@ mod tests {
                         detpid,
                         mm: old_mm,
                         timeslice_stats: TimesliceStats::default(),
+                        syscall_boundary_preemptions: 0,
+                        branch_preemptions: 0,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3180,6 +3189,8 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    syscall_boundary_preemptions: 0,
+                    branch_preemptions: 0,
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -3204,6 +3215,8 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    syscall_boundary_preemptions: 0,
+                    branch_preemptions: 0,
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -3453,6 +3466,8 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        syscall_boundary_preemptions: 4,
+                        branch_preemptions: 5,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3468,6 +3483,8 @@ mod tests {
                 .get(&dettid),
             Some(&final_stats)
         );
+        assert_eq!(state.sched.lock().unwrap().syscall_boundary_preemptions, 4);
+        assert_eq!(state.sched.lock().unwrap().branch_preemptions, 5);
 
         late_time.add_syscall();
         let duplicate_response = state
@@ -3481,6 +3498,8 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        syscall_boundary_preemptions: 4,
+                        branch_preemptions: 5,
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -3490,6 +3509,8 @@ mod tests {
             duplicate_response,
             (None, GlobalResponse::DeregisterThread(()))
         );
+        assert_eq!(state.sched.lock().unwrap().syscall_boundary_preemptions, 4);
+        assert_eq!(state.sched.lock().unwrap().branch_preemptions, 5);
         assert_eq!(
             state
                 .sched

@@ -1035,6 +1035,14 @@ pub struct ThreadStats {
     /// A count of how many signals have arrived at this thread, total.
     pub signal_count: u64,
 
+    /// Timeslices preempted when a syscall handler observed an expired deadline.
+    #[serde(default)]
+    pub syscall_boundary_preemption_count: u64,
+
+    /// PMU/RCB timer preemption events delivered to this thread.
+    #[serde(default)]
+    pub branch_preemption_count: u64,
+
     /// How many syscalls this time slice (since last preemption)?
     pub timeslice_syscall_count: u64,
 
@@ -1077,6 +1085,16 @@ impl ThreadStats {
     pub fn count_signal(&mut self) {
         self.signal_count += 1;
         self.timeslice_signal_count += 1;
+    }
+
+    /// Record timeslices whose deadline was observed at a syscall boundary.
+    pub fn count_syscall_boundary_preemptions(&mut self, count: u64) {
+        self.syscall_boundary_preemption_count += count;
+    }
+
+    /// Record one PMU/RCB timer preemption event.
+    pub fn count_branch_preemption(&mut self) {
+        self.branch_preemption_count += 1;
     }
 
     /// Reset counters for a new timeslice.

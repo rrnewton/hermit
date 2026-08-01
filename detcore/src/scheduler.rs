@@ -382,6 +382,10 @@ pub struct Scheduler {
     /// final run report. BTreeMap for deterministic iteration order.
     pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
 
+    /// Run-wide preemption counts merged from threads at deregistration.
+    pub syscall_boundary_preemptions: u64,
+    pub branch_preemptions: u64,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -981,6 +985,8 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             per_thread_timeslice: Default::default(),
+            syscall_boundary_preemptions: 0,
+            branch_preemptions: 0,
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -2805,6 +2811,12 @@ impl Scheduler {
             .merge(&stats);
     }
 
+    /// Merge one exiting thread's preemption-regime counters into the run summary.
+    pub fn record_preemption_counts(&mut self, syscall_boundary: u64, branch: u64) {
+        self.syscall_boundary_preemptions += syscall_boundary;
+        self.branch_preemptions += branch;
+    }
+
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
     /// does not have all the necessary information.
     ///
@@ -2899,6 +2911,8 @@ impl Scheduler {
 
         Ok(RunSummary {
             sched_turns: self.turn,
+            syscall_boundary_preemptions: self.syscall_boundary_preemptions,
+            branch_preemptions: self.branch_preemptions,
             schedevent_replayed,
             schedevent_recorded: self.recorded_event_count,
             schedevent_desynced: total_desyncs,

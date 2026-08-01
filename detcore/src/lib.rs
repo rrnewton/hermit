@@ -476,7 +476,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
-    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
+    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) -> u64 {
+        let timeslices_before = guest.thread_state().stats.timeslice_count;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -499,6 +500,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         self.end_timeslice_if_needed(guest).await;
+        guest
+            .thread_state()
+            .stats
+            .timeslice_count
+            .saturating_sub(timeslices_before)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -526,7 +532,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
-    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
+    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) -> u64 {
+        let timeslices_before = guest.thread_state().stats.timeslice_count;
         self.end_timeslice_if_needed(guest).await;
 
         let dettid = guest.thread_state().dettid;
@@ -651,6 +658,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.regs().await.display(),
             );
         }
+        guest
+            .thread_state()
+            .stats
+            .timeslice_count
+            .saturating_sub(timeslices_before)
     }
 
     /// End this logical timeslice and talk to the scheduler before continuing.
@@ -1327,6 +1339,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     /// A timer fires to preempt the guest and give other threads a turn.
     async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+        guest.thread_state_mut().stats.count_branch_preemption();
         info!(
             "[detcore, dtid {}] inbound timer preemption event",
             guest.thread_state().dettid
@@ -1415,7 +1428,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        self.pre_handler_hook(guest, false).await;
+        let mut syscall_boundary_preemptions = self.pre_handler_hook(guest, false).await;
 
         let dettid = guest.thread_state().dettid;
 
@@ -2208,7 +2221,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
-        self.post_handler_hook(guest).await;
+        syscall_boundary_preemptions += self.post_handler_hook(guest).await;
+        guest
+            .thread_state_mut()
+            .stats
+            .count_syscall_boundary_preemptions(syscall_boundary_preemptions);
 
         // Defense-in-depth: unless the backend already owns this guarantee,
         // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to
@@ -2258,6 +2275,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 detpid,
                 mm: mm_id,
                 timeslice_stats: thread_state.stats.timeslice_stats,
+                syscall_boundary_preemptions: thread_state.stats.syscall_boundary_preemption_count,
+                branch_preemptions: thread_state.stats.branch_preemption_count,
                 chaos_epochs: pending_chaos_epochs,
             },
         )

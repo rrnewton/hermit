@@ -80,6 +80,14 @@ pub struct RunSummary {
     /// Internal number of steps taken by the scheduler.
     pub sched_turns: u64,
 
+    /// Timeslices preempted when a syscall handler observed an expired logical deadline.
+    #[serde(default)]
+    pub syscall_boundary_preemptions: u64,
+
+    /// PMU/RCB timer events delivered to preempt guest branch execution.
+    #[serde(default)]
+    pub branch_preemptions: u64,
+
     /// **Trace replay:** SchedEvents read and replayed from the input recording.
     pub schedevent_replayed: u64,
     /// **Trace replay:** SchedEvents recorded to disk during execution.
@@ -123,6 +131,8 @@ impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let RunSummary {
             sched_turns,
+            syscall_boundary_preemptions,
+            branch_preemptions,
             schedevent_replayed,
             schedevent_recorded,
             schedevent_desynced,
@@ -147,6 +157,11 @@ impl fmt::Display for RunSummary {
             f,
             "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
             sched_turns, schedevent_recorded, schedevent_replayed, schedevent_desynced,
+        )?;
+        writeln!(
+            f,
+            "Preemptions: syscall-boundary={}, branch/PMU={}",
+            syscall_boundary_preemptions, branch_preemptions,
         )?;
 
         if let Some(txt) = desync_descrip {
@@ -211,6 +226,7 @@ impl fmt::Display for RunSummary {
 Final thread-tree was: [3]
 There were 1 group leaders of 1 thread(s) total.
 Internally, the hermit scheduler ran 8 turns, recorded 0 events, replayed 0 events (0 desynced)
+Preemptions: syscall-boundary=3, branch/PMU=1
 Nondeterministic realtime elapsed: 27.08914ms
 Final virtual global (cpu) time: 1_640_995_199.005_045_040s
 Elapsed virtual global (cpu) time: 5_045_040ns
@@ -219,7 +235,23 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 
 #[cfg(test)]
 mod tests {
+    use super::RunSummary;
     use super::TimesliceStats;
+
+    #[test]
+    fn run_summary_displays_preemption_regime_counts() {
+        let summary = RunSummary {
+            syscall_boundary_preemptions: 12,
+            branch_preemptions: 34,
+            ..RunSummary::default()
+        };
+
+        assert!(
+            summary
+                .to_string()
+                .contains("Preemptions: syscall-boundary=12, branch/PMU=34")
+        );
+    }
 
     #[test]
     fn timeslice_stats_empty() {
