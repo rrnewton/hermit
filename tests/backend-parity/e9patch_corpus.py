@@ -256,6 +256,26 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_socktype": (0, b"socktype=1\n"),
     "setsockopt_reuseaddr": (0, b"setsockopt=0\n"),
     "fcntl_getlk": (0, b"getlk=2\n"),
+    # Round-14 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into a lone AF_UNIX SOCK_DGRAM socket (distinct from socketpair), socket
+    # half-close (shutdown), robust-futex-list registration/query
+    # (set_robust_list/get_robust_list, registration only -- no futex contended),
+    # MADV_WILLNEED advice (distinct from MADV_DONTNEED), shared anonymous mmap
+    # (MAP_SHARED flag path, distinct from MAP_PRIVATE), prctl PR_GET_KEEPCAPS
+    # (distinct op), and arch_prctl ARCH_GET_FS -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. Every printed
+    # value is host-independent: the lowest free fd (3), the PR_GET_KEEPCAPS
+    # default (0), or the syscall return (0 on success); the FS base and robust
+    # head pointer are read but not printed. All eight ran clean under golden
+    # ptrace (no -ENOSYS drop).
+    "socket_dgram": (0, b"socket=3\n"),
+    "shutdown_socketpair": (0, b"shutdown=0\n"),
+    "set_robust_list_ok": (0, b"robust=0\n"),
+    "get_robust_list_ok": (0, b"getrobust=0\n"),
+    "madvise_willneed": (0, b"willneed=0\n"),
+    "mmap_shared_anon": (0, b"shmap=0\n"),
+    "prctl_keepcaps": (0, b"keepcaps=0\n"),
+    "arch_prctl_getfs": (0, b"getfs=0\n"),
 }
 
 FREESTANDING_FLAGS = (

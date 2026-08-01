@@ -122,6 +122,14 @@ thread and hang the run.
 | `getsockopt_socktype` | `getsockopt` `SO_TYPE` on a socketpair (`SOCK_STREAM`=1) |
 | `setsockopt_reuseaddr` | `setsockopt` `SO_REUSEADDR` on a socketpair (return 0) |
 | `fcntl_getlk` | `fcntl` `F_GETLK` on an unlocked memfd (`F_UNLCK`=2) |
+| `socket_dgram` | lone `AF_UNIX`/`SOCK_DGRAM` `socket(2)` fd number (3) |
+| `shutdown_socketpair` | `shutdown` `SHUT_RDWR` on a socketpair (return 0) |
+| `set_robust_list_ok` | `set_robust_list` registration (return 0) |
+| `get_robust_list_ok` | `get_robust_list` query (return 0; head not printed) |
+| `madvise_willneed` | `madvise` `MADV_WILLNEED` on anon memory (return 0) |
+| `mmap_shared_anon` | `mmap` `MAP_SHARED`\|`MAP_ANON` + `munmap` (return 0) |
+| `prctl_keepcaps` | `prctl` `PR_GET_KEEPCAPS` (default 0) |
+| `arch_prctl_getfs` | `arch_prctl` `ARCH_GET_FS` (return 0; base not printed) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -279,6 +287,24 @@ host-independent — the `SOCK_STREAM` (1) and `F_UNLCK` (2) constants, the lowe
 free pipe descriptor (3), a non-empty/valid boolean, or the syscall return (0 on
 success). All eight ran clean under golden ptrace with no `-ENOSYS` drop, so the
 batch stayed at eight. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-14 new-family ratchet batch** (non-time,
+non-gated): a lone `AF_UNIX`/`SOCK_DGRAM` `socket(2)` (`socket_dgram`, distinct
+from `socketpair`), socket half-close (`shutdown_socketpair` `SHUT_RDWR`),
+robust-futex-list registration and query (`set_robust_list_ok`,
+`get_robust_list_ok`, registration only — no futex is contended), `madvise`
+`MADV_WILLNEED` (`madvise_willneed`, distinct advice from `MADV_DONTNEED`),
+shared anonymous mmap (`mmap_shared_anon`, the `MAP_SHARED` flag path distinct
+from `MAP_PRIVATE`), `prctl` `PR_GET_KEEPCAPS` (`prctl_keepcaps`, a distinct op
+from the `PR_GET_NAME`/`PR_GET_DUMPABLE` guests), and `arch_prctl` `ARCH_GET_FS`
+(`arch_prctl_getfs`). These establish that e9patch preprocessing leaves
+`socket`/`shutdown`/`set_robust_list`/`get_robust_list`/`madvise`/`mmap`
+(`MAP_SHARED`)/`prctl`/`arch_prctl` byte-identical to golden ptrace. Every
+printed value is host-independent — the lowest free descriptor (3), the
+`PR_GET_KEEPCAPS` default (0), or the syscall return on success (0); the FS base
+and robust-list head pointer are read but never printed. All eight ran clean
+under golden ptrace with no `-ENOSYS` drop, so the batch stayed at eight. All
+remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
