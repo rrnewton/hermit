@@ -9,17 +9,18 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+memory-layout behavior and the parent-death-signal (`PR_*_PDEATHSIG`) state
+machine. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -52,6 +53,15 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+
+The parent-death-signal row drives the `PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`
+state machine: it sets the signal to `SIGUSR1`, changes it to `SIGUSR2`, and
+clears it, reading each value back. It exercises only the per-thread attribute
+register, never arranging for the parent to die, so no signal is delivered and
+no scheduling or timing channel is involved -- exactly like the signal-mask and
+signal-disposition state rows. ptrace and DBI drive the full state machine;
+KVM's `ElfExecutor` does not implement the `PR_*_PDEATHSIG` requests and returns
+a deterministic `ENOSYS`, so it is recorded as a KVM gap.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -92,6 +102,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `prctl_pdeathsig` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
