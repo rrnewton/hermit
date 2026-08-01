@@ -306,6 +306,13 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/python-dict-hash-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/python-hash-determinism"
     },
     {
