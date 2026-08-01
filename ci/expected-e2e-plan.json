@@ -33,6 +33,7 @@
     {"test":"determinism-stress/thread-output","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/bash-loop-pipe-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/perl-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"language-runtimes/python-dict-hash-iteration","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/python-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/python-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
