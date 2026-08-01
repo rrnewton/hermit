@@ -181,6 +181,12 @@ thread and hang the run.
 | `pwritev2_memfd` | `pwritev2` positional gather write on a memfd (`hi`) |
 | `prctl_cap_ambient` | `prctl(PR_CAP_AMBIENT, IS_SET)` query (boolean 0) |
 | `pidfd_getfd_self` | `pidfd_getfd` on a self pidfd (valid fd => 1) |
+| `setresuid_noop` | `setresuid(-1,-1,-1)` no-op (return 0) |
+| `setresgid_noop` | `setresgid(-1,-1,-1)` no-op (return 0) |
+| `setreuid_noop` | `setreuid(-1,-1)` no-op (return 0) |
+| `setregid_noop` | `setregid(-1,-1)` no-op (return 0) |
+| `accept4_abstract` | `accept4` a pending abstract `AF_UNIX` connection (valid fd => 1) |
+| `ioprio_get_check` | `ioprio_get(IOPRIO_WHO_PROCESS)` query (success boolean 1) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -500,6 +506,23 @@ the fd number not printed). Every printed value is host-independent — the
 syscall return on success (0), a boolean, or fixed round-tripped text (`hi`).
 None changes scheduling, time, or randomness. All seven pass under golden hermit
 ptrace, so the batch kept seven of seven. All remain freestanding
+(`candidate_sites > 0`).
+
+The final six guests are the **round-22 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New syscalls:
+the four credential-changing syscalls in their no-op forms — `setresuid(117)`
+and `setresgid(119)` with `(-1,-1,-1)`, and `setreuid(113)` and `setregid(114)`
+with `(-1,-1)` — which leave every real/effective/saved id unchanged and return
+0 (`setresuid_noop`, `setresgid_noop`, `setreuid_noop`, `setregid_noop`; four
+distinct kernel entry points, an identity change rather than a scheduling
+change); `accept4(288)` accepting a pending connection on a listening abstract
+`AF_UNIX` socket with `SOCK_NONBLOCK` (`accept4_abstract`, a boolean valid-fd,
+the accepted fd number not printed); and `ioprio_get(252)` querying this
+process's I/O priority (`ioprio_get_check`, a success boolean only, since the
+class/level value is host-configuration dependent and not printed). Every
+printed value is host-independent — the syscall return on success (0) or a
+boolean. None changes CPU scheduling, time, or randomness. All six pass under
+golden hermit ptrace, so the batch kept six of six. All remain freestanding
 (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at

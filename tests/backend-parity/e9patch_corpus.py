@@ -444,6 +444,26 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "pwritev2_memfd": (0, b"pwritev2=hi\n"),
     "prctl_cap_ambient": (0, b"capambient=0\n"),
     "pidfd_getfd_self": (0, b"pidfdgetfd=1\n"),
+    # Round-22 new-family ratchet batch (non-time, non-gated). More syscalls with
+    # no existing guest: the four credential-changing syscalls in their no-op
+    # forms -- setresuid(117) and setresgid(119) with (-1,-1,-1), and setreuid(113)
+    # and setregid(114) with (-1,-1) -- which leave every real/effective/saved id
+    # unchanged and return 0 (distinct kernel entry points, an identity change
+    # rather than scheduling); accept4(288) accepting a pending connection on a
+    # listening abstract AF_UNIX socket with SOCK_NONBLOCK (boolean valid-fd; the
+    # accepted fd number is host-specific and not printed); and ioprio_get(252)
+    # querying this process's I/O priority (boolean success only, since the
+    # class/level value is host-configuration dependent and not printed). Every
+    # printed value is host-independent: the syscall return on success (0) or a
+    # boolean. None changes CPU scheduling, time, or randomness, so all are
+    # routine backend-parity coverage that e9patch preprocessing must leave
+    # byte-identical to golden ptrace.
+    "setresuid_noop": (0, b"setresuid=0\n"),
+    "setresgid_noop": (0, b"setresgid=0\n"),
+    "setreuid_noop": (0, b"setreuid=0\n"),
+    "setregid_noop": (0, b"setregid=0\n"),
+    "accept4_abstract": (0, b"accept4=1\n"),
+    "ioprio_get_check": (0, b"ioprio=1\n"),
 }
 
 FREESTANDING_FLAGS = (
