@@ -834,6 +834,23 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_peekoff": (0, b"peekoff=-1\n"),
     "socket_inet_stream": (0, b"inetstream=3\n"),
     "socket_inet_dgram": (0, b"inetdgram=3\n"),
+    # round-42: two more fcntl OPs, a working ioctl, two socket-option ops, a new
+    # madvise advice, and a path-based xattr list. fcntl_setpipe_sz resizes a pipe
+    # (F_SETPIPE_SZ granted 4096); fcntl_ofd_getlk_memfd queries an OFD lock on an
+    # unlocked memfd (l_type rewritten to F_UNLCK=2); ioctl_fioclex_pipe sets
+    # close-on-exec via FIOCLEX (-> 0); getsockopt_rcvtimeo reads SO_RCVTIMEO
+    # (tv_sec -> 0); setsockopt_broadcast enables SO_BROADCAST on a UDP socket
+    # (-> 0); madvise_cold applies MADV_COLD to an anon page (-> 0);
+    # listxattr_devnull size-queries /dev/null's xattrs (-> 0). Every printed value
+    # is a queried constant with no time, randomness, PID, or host-variable input,
+    # so e9patch preprocessing must leave all seven byte-identical to golden ptrace.
+    "fcntl_setpipe_sz": (0, b"setpipesz=4096\n"),
+    "fcntl_ofd_getlk_memfd": (0, b"ofdgetlk=2\n"),
+    "ioctl_fioclex_pipe": (0, b"fioclex=0\n"),
+    "getsockopt_rcvtimeo": (0, b"rcvtimeo=0\n"),
+    "setsockopt_broadcast": (0, b"setbroadcast=0\n"),
+    "madvise_cold": (0, b"madvcold=0\n"),
+    "listxattr_devnull": (0, b"listxattr=0\n"),
 }
 
 FREESTANDING_FLAGS = (
