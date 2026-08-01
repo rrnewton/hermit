@@ -153,6 +153,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "multiprocess_fork_exec": (
+                local / "multiprocess_fork_exec.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "multiprocess_fork_exec": (
+            [str(fixtures.binary("multiprocess_fork_exec"))],
+            0,
+            b"forked=4 exec=ok reaped=4 status_sum=10\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
