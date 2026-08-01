@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -23,7 +23,10 @@ memory-layout behavior. It also deterministically refuses io_uring and listmount
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
-may coalesce), complete reaping, and zeroed child CPU accounting. The
+may coalesce), complete reaping, and zeroed child CPU accounting. It also
+determinizes the `getrusage(RUSAGE_SELF)` CPU-time, page-fault, and
+context-switch accounting a process reads about itself, zeroing those
+host-derived counters. The
 executable-memory contract writes machine code into an anonymous mapping,
 transitions it from writable to executable, and calls it.
 The memory-advice row checks accepted and rejected advice, address validation,
@@ -52,13 +55,25 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The getrusage-self-accounting row is the `RUSAGE_SELF` sibling of the wait
+contract's zeroed child CPU accounting. A process's own resource counters are
+host-derived state: `ru_utime`/`ru_stime` grow with real CPU time and the fault
+and context-switch counters reflect host scheduling. Hermit zeroes those
+accounting fields so the guest cannot observe wall-derived CPU consumption or
+host scheduling artifacts. `getrusage` is accepted and must not spuriously fail;
+the counters it returns are the determinized zeros. `ru_maxrss` is deliberately
+excluded because peak resident set is a legitimate backend-local memory-footprint
+number that each backend reports differently. All three backends pass six
+checks; native passes only the acceptance and always-zero major-fault checks
+because it faithfully reports real CPU time, minor faults, and context switches.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+determinized `getrusage(RUSAGE_SELF)` accounting, repeatable heap growth, and
+private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
@@ -92,6 +107,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `getrusage_self_accounting` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
