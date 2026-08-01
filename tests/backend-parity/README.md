@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -54,11 +54,12 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+repeatable heap growth, private/shared anonymous mapping layouts, and eventfd
+counter and semaphore semantics. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
@@ -68,6 +69,15 @@ descriptors. Serialized child exits support both `wait4` and `waitid`, including
 canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
+
+The eventfd row exercises both eventfd(2) modes in a single process. In default
+counter mode, eight writes (values 1..8) accumulate into the 64-bit counter and
+one read drains the total (36); in semaphore mode (`EFD_SEMAPHORE`), one seed
+write of 5 is drained by five unit reads (sum 5). Every read follows enough
+writes to satisfy it, so no read blocks and there is no timing dependence. The
+observable is the fixed counter arithmetic (`eventfd counter=36 sem=5`) with no
+pid, timing, or address. All three backends satisfy it, and DBI verifies
+byte-identical under strict verification.
 
 ## Matrix
 
@@ -92,6 +102,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `eventfd_semantics` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
