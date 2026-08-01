@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "statfs_free_determinism": (
+                local / "statfs_free_determinism.c",
+                (),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "statfs_free_determinism": (
+            [str(fixtures.binary("statfs_free_determinism"))],
+            0,
+            b"statfs ok=6\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
