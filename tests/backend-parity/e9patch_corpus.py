@@ -667,6 +667,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "memfd_create_check": (0, b"memfd=1\n"),
     "getitimer_real": (0, b"getitimer=0\n"),
     "clock_nanosleep_relative": (0, b"clocknanosleep=0\n"),
+    # round-33: inert futex/time/scheduler query probes. futex_wake_empty issues
+    # futex(FUTEX_WAKE) on a private word with no waiters, deterministically
+    # waking zero threads (return 0) in a single-threaded guest. gettimeofday_check
+    # calls gettimeofday(96) — a distinct syscall from clock_gettime(228) — and
+    # prints only the return (0); the virtualized timeval is not emitted.
+    # sched_getattr_self reads its own sched_attr via the unified query (315),
+    # returning 0. sched_setaffinity_self round-trips the calling thread's CPU
+    # affinity (getaffinity then setaffinity the identical mask), a no-op that
+    # returns 0; the host-dependent mask is never printed. Every printed value is
+    # host-independent and none perturbs scheduling, virtual time, or randomness.
+    "futex_wake_empty": (0, b"futexwake=0\n"),
+    "gettimeofday_check": (0, b"gettimeofday=0\n"),
+    "sched_getattr_self": (0, b"schedgetattr=0\n"),
+    "sched_setaffinity_self": (0, b"setaffinity=0\n"),
 }
 
 FREESTANDING_FLAGS = (
