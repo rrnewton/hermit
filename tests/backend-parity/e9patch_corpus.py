@@ -188,6 +188,21 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "sendmsg_socketpair": (0, b"msg=hi\n"),
     "getsid_check": (0, None),
     "getpgrp_check": (0, None),
+    # Round-10 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into socketpair sendto/recvfrom, getsockname/getpeername address copyout,
+    # fallocate size-extension on a memfd, fdatasync, mincore residency query,
+    # fadvise64 hints, and sysinfo -- all families e9patch preprocessing must
+    # leave byte-identical to golden ptrace. getsockname/getpeername report the
+    # AF_UNIX family constant (1); fdatasync/mincore/fadvise/sysinfo print the
+    # syscall return (0 on success), so every value is host-independent.
+    "sendto_socketpair": (0, b"sf=hi\n"),
+    "getsockname_unix": (0, b"sockname=1\n"),
+    "getpeername_unix": (0, b"peername=1\n"),
+    "fallocate_memfd": (0, b"falloc=8\n"),
+    "fdatasync_memfd": (0, b"fdatasync=0\n"),
+    "mincore_resident": (0, b"mincore=0\n"),
+    "fadvise_memfd": (0, b"fadvise=0\n"),
+    "sysinfo_ok": (0, b"sysinfo=0\n"),
 }
 
 FREESTANDING_FLAGS = (
