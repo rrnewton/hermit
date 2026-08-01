@@ -9,17 +9,17 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
-file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+file-mutation, file-metadata, and faccessat2 flag contracts, plus deterministic
+memory-advice and memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -44,6 +44,13 @@ The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
+The faccessat2 row drives the raw `faccessat2(2)` syscall (439), the
+flag-bearing successor to `access`/`faccessat`: `F_OK`/`R_OK`/`W_OK` on a
+guest-created file, the `AT_EACCESS` flag, a missing path rejected with
+`ENOENT`, invalid flag bits rejected with `EINVAL`, and dirfd-relative
+resolution. Because the guest owns the file it queries, the accessibility
+answer is a pure function of the guest's own actions — independent of host
+user, umask, or real filesystem state — so every backend and native agree.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -57,8 +64,9 @@ KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
-process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+process-memory read/write refusal, faccessat2 flag resolution, io_uring refusal
+with epoll fallback, repeatable heap growth, and private/shared anonymous
+mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
@@ -84,6 +92,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
+| `faccessat2_flags` | pass | pass | pass |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
