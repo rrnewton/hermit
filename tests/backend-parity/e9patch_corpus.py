@@ -276,6 +276,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mmap_shared_anon": (0, b"shmap=0\n"),
     "prctl_keepcaps": (0, b"keepcaps=0\n"),
     "arch_prctl_getfs": (0, b"getfs=0\n"),
+    # Round-15 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into filesystem/memory flush (syncfs on a memfd), memory-ordering
+    # (membarrier CMD_GLOBAL), the getcpu query, the LEGACY getdents(78)
+    # (distinct syscall number from round-13's getdents64), the execution-domain
+    # persona query (personality), an advisory write-lock set/release (fcntl
+    # F_SETLK, distinct from round-13's F_GETLK query), and inotify watch removal
+    # (inotify_rm_watch, distinct from round-12's add-only guest) -- all families
+    # e9patch preprocessing must leave byte-identical to golden ptrace. Every
+    # printed value is host-independent: the syscall return (0 on success) or a
+    # boolean (getdents entries present -> 1, personality query succeeded -> 1).
+    # The cpu/node and persona value are read/used but never printed.
+    # process_vm_readv(self) was DROPPED: it returns -1 under golden hermit
+    # ptrace (the tracer/self read is not supported), so it would encode a hermit
+    # limitation, not parity (no false parity, #152); the batch kept 7 of 8.
+    "syncfs_memfd": (0, b"syncfs=0\n"),
+    "membarrier_global": (0, b"membarrier=0\n"),
+    "getcpu_check": (0, b"getcpu=0\n"),
+    "getdents_legacy": (0, b"getdents=1\n"),
+    "personality_query": (0, b"persona=1\n"),
+    "fcntl_setlk_memfd": (0, b"setlk=0\n"),
+    "inotify_rm_watch": (0, b"inotify_rm=0\n"),
 }
 
 FREESTANDING_FLAGS = (

@@ -130,6 +130,13 @@ thread and hang the run.
 | `mmap_shared_anon` | `mmap` `MAP_SHARED`\|`MAP_ANON` + `munmap` (return 0) |
 | `prctl_keepcaps` | `prctl` `PR_GET_KEEPCAPS` (default 0) |
 | `arch_prctl_getfs` | `arch_prctl` `ARCH_GET_FS` (return 0; base not printed) |
+| `syncfs_memfd` | `syncfs` on a memfd (return 0) |
+| `membarrier_global` | `membarrier` `MEMBARRIER_CMD_GLOBAL` (return 0) |
+| `getcpu_check` | `getcpu` query (return 0; cpu/node not printed) |
+| `getdents_legacy` | legacy `getdents(78)` on `/` (non-empty => 1) |
+| `personality_query` | `personality(0xffffffff)` query (success => 1) |
+| `fcntl_setlk_memfd` | `fcntl` `F_SETLK` write-lock/unlock on a memfd (return 0) |
+| `inotify_rm_watch` | `inotify_rm_watch` after add on `/` (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -305,6 +312,25 @@ printed value is host-independent — the lowest free descriptor (3), the
 and robust-list head pointer are read but never printed. All eight ran clean
 under golden ptrace with no `-ENOSYS` drop, so the batch stayed at eight. All
 remain freestanding (`candidate_sites > 0`).
+
+The final seven guests are the **round-15 new-family ratchet batch** (non-time,
+non-gated): a memfd filesystem flush (`syncfs_memfd`), a process-wide
+memory-ordering barrier (`membarrier_global` `MEMBARRIER_CMD_GLOBAL`), the
+`getcpu` query (`getcpu_check`), the **legacy** `getdents(78)` directory
+enumeration (`getdents_legacy`, a distinct syscall number from round-13's
+`getdents64`), the execution-domain persona query (`personality_query`), an
+advisory write-lock set/release via `fcntl` `F_SETLK` (`fcntl_setlk_memfd`,
+distinct from round-13's `F_GETLK` query), and inotify watch removal
+(`inotify_rm_watch`, distinct from round-12's add-only guest). These establish
+that e9patch preprocessing leaves `syncfs`/`membarrier`/`getcpu`/legacy
+`getdents`/`personality`/`fcntl` `F_SETLK`/`inotify_rm_watch` byte-identical to
+golden ptrace. Every printed value is host-independent — the syscall return on
+success (0) or a boolean (`getdents` entries present => 1, `personality` query
+succeeded => 1); the cpu/node and persona value are read or used but never
+printed. An eighth candidate, `process_vm_readv` from self, was **dropped**: it
+returns `-1` under golden hermit ptrace (a hermit limitation, not parity), so
+keeping it would be a false-parity claim (#152) — the batch kept seven of eight.
+All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
