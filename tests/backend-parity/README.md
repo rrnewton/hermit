@@ -9,17 +9,17 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
-random-source, process wait lifecycle, application executable-memory, and
-file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+random-source, process wait lifecycle, application executable-memory,
+file-mutation, file-metadata, and `ioctl` FIONREAD/FIONBIO contracts, plus
+deterministic memory-advice and memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -52,22 +52,36 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The `ioctl_fionread` row exercises the `ioctl(2)` dispatch (distinct from the
+`fcntl` families) with two classic stream ioctls on a pipe: `FIONREAD` reports
+the byte count immediately readable, and `FIONBIO` toggles non-blocking mode.
+The guest writes the six bytes it then counts, so the `FIONREAD` result is a
+pure function of the guest's own actions; the `FIONBIO` round-trip is a
+process-local status-flag toggle cross-checked with `fcntl(F_GETFL)`. No
+blocking read is performed — a read on an empty non-blocking pipe would livelock
+under DBI — so the contract is a query/flag round-trip that ptrace, DBI, and
+native all agree on (`ok=6`). KVM is a gap here: its `ElfExecutor` returns
+`ENOTTY` for `FIONREAD` on a pipe, so the two count checks fail (`ok=4`), though
+it does support `FIONBIO`.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
-process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+process-memory read/write refusal, the `FIONBIO` non-blocking-mode ioctl,
+io_uring refusal with epoll fallback, repeatable heap growth, and
+private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
 arguments before returning deterministic Linux-compatible errors, while its
 in-memory mapping model validates `msync` and translates range-advice file
 descriptors. Serialized child exits support both `wait4` and `waitid`, including
-canonical zero CPU accounting and complete reaping. The remaining process-wait
-lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
-exit but does not yet synthesize an x86-64 signal frame to run the handler.
+canonical zero CPU accounting and complete reaping. The process-wait lifecycle
+gap is guest SIGCHLD handler delivery: the KVM personality records the exit but
+does not yet synthesize an x86-64 signal frame to run the handler. The
+`ioctl_fionread` gap is the `FIONREAD` pipe ioctl: KVM's `ElfExecutor` returns
+`ENOTTY` for it even though it supports `FIONBIO`.
 
 ## Matrix
 
@@ -84,6 +98,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
+| `ioctl_fionread` | pass | pass | gap |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
