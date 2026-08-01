@@ -140,6 +140,10 @@ class Fixtures:
                 (),
             ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
+            "mincore_residency": (
+                local / "mincore_residency.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
                 ("-D_GNU_SOURCE",),
@@ -253,6 +257,11 @@ def case_catalog(
             [str(fixtures.binary("cpuid_probe"))],
             0,
             b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n",
+        ),
+        "mincore_residency": (
+            [str(fixtures.binary("mincore_residency"))],
+            0,
+            b"mincore ok=6\n",
         ),
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
