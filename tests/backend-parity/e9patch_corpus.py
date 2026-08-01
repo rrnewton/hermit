@@ -606,6 +606,28 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "prctl_thp_disable": (0, b"thpdisable=1\n"),
     "setfsuid_noop": (0, b"setfsuid=1\n"),
     "setfsgid_noop": (0, b"setfsgid=1\n"),
+    # round-30: process-config query, process-time accounting, and xattr error
+    # paths. prctl_timerslack queries the timer slack (a config value inert
+    # under hermit's virtual time), reduced to a boolean since the raw value is
+    # host-dependent. times_check reads process CPU-tick accounting whose return
+    # is host/timing dependent, so it is a PARITY-ONLY guest (None): golden and
+    # e9patch must agree byte-for-byte under one deterministic run, but the value
+    # is not asserted. The get/lget/fgetxattr guests read a nonexistent user
+    # xattr from /dev/null, which always fails negative (-ENODATA where user
+    # xattrs are supported, -EOPNOTSUPP otherwise); each prints the boolean
+    # "returned an error", a faithful Linux semantic that is host/filesystem
+    # independent. None changes CPU scheduling, virtual time, or randomness, so
+    # all are routine backend-parity coverage e9patch must leave byte-identical
+    # to golden ptrace. Three candidates were probed and DROPPED per
+    # no-false-parity #152: prctl PR_GET_FP_MODE(46) returns -ENOSYS (-38) under
+    # golden hermit ptrace, and name_to_handle_at(303) and seccomp(317) both
+    # return -EOPNOTSUPP (-95); keeping any would encode a hermit limitation
+    # rather than parity, so the batch kept five of eight.
+    "prctl_timerslack": (0, b"timerslack=1\n"),
+    "times_check": (0, None),
+    "getxattr_devnull": (0, b"getxattr=1\n"),
+    "lgetxattr_devnull": (0, b"lgetxattr=1\n"),
+    "fgetxattr_devnull": (0, b"fgetxattr=1\n"),
 }
 
 FREESTANDING_FLAGS = (
