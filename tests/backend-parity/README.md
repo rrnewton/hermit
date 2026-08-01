@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -52,6 +52,16 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+
+The vectored-file-io row drives scatter/gather I/O against one regular file:
+`writev` gathers ordered iovecs into a contiguous region and advances the file
+offset, `readv` scatters that region back across buffers, and `pwritev`/`preadv`
+apply at an explicit offset without disturbing the descriptor's current offset.
+It observes only byte counts, the reassembled contents, offsets, and the final
+size — no pid, timestamp, cpu-time, or address — and passes on ptrace and DBI.
+It is an explicit KVM gap: the KVM `ElfExecutor` supports plain `writev`/`readv`
+but returns deterministic `ENOSYS` for the positioned `pwritev`/`preadv`
+variants, so the positioned-write portion of the contract cannot yet hold there.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -92,6 +102,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `vectored_file_io` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
