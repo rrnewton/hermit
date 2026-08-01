@@ -43,6 +43,14 @@ thread and hang the run.
 | `mprotect_roundtrip` | memory protection: `mmap`/`mprotect` RW→RO→RW/`munmap` |
 | `getid_identity` | credentials: `getuid`/`geteuid`/`getgid`/`getegid` |
 | `getgroups_identity` | credentials: `getgroups` supplementary-group count |
+| `brk_grow` | heap/brk: query the break then grow it by a page |
+| `madvise_dontneed` | memory advice: `MADV_DONTNEED` zero-fills an anon page |
+| `file_mmap_zero` | file-backed mmap: `MAP_PRIVATE` of `/dev/zero` reads 0 |
+| `memfd_seek` | anon-file seek: `memfd_create`/`ftruncate`/`SEEK_END` = 4096 |
+| `ioctl_enotty` | ioctl error path: `TCGETS` on `/dev/null` fails `ENOTTY` |
+| `access_devnull` | fs access: `access(/dev/null, R_OK)` succeeds |
+| `sigaction_query` | signal disposition: `rt_sigaction` NULL-act query |
+| `getppid_check` | process hierarchy: virtualized `getppid` |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -63,6 +71,21 @@ byte-identical to golden ptrace. `getid_identity` and `getgroups_identity` emit
 host-specific absolute uid/gid/group-count values, so the driver asserts
 golden==e9patch parity only (`expected_stdout=None`); the other six pin exact
 deterministic stdout. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-4 new-family ratchet batch** (non-time,
+non-gated): heap/brk (`brk_grow`), memory advice (`madvise_dontneed`),
+file-backed mmap (`file_mmap_zero`), anonymous-file seek positioning
+(`memfd_seek`, via `memfd_create`/`ftruncate`/`SEEK_END`, since a device's
+`lseek` is a no-op), ioctl error paths (`ioctl_enotty` `TCGETS`→`ENOTTY`),
+filesystem access checks (`access_devnull`), signal-disposition queries
+(`sigaction_query`, a NULL-act `rt_sigaction` read with no delivery or
+scheduling), and process hierarchy (`getppid_check`). These establish that
+e9patch preprocessing leaves `brk`/`madvise`/file-backed `mmap`/`memfd_create`/
+`ftruncate`/`lseek`/`ioctl`/`access`/`rt_sigaction`/`getppid` byte-identical to
+golden ptrace. `getppid_check` emits a host-specific virtualized parent pid, so
+the driver asserts golden==e9patch parity only (`expected_stdout=None`); the
+other seven pin exact deterministic stdout. All remain freestanding
+(`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
