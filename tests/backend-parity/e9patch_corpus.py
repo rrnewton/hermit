@@ -174,6 +174,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "readlinkat_exe": (0, None),
     "getresuid_check": (0, None),
     "prlimit_nofile": (0, None),
+    # Round-9 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into positioned vector I/O (preadv/pwritev), fcntl F_SETFL and
+    # F_DUPFD_CLOEXEC, mremap growth, socketpair sendmsg/recvmsg, and the
+    # getsid/getpgrp process-group queries -- all families e9patch preprocessing
+    # must leave byte-identical to golden ptrace. getsid/getpgrp emit
+    # host-specific ids, so they assert golden==e9patch parity only.
+    "preadv_memfd": (0, b"preadv=cdef\n"),
+    "pwritev_memfd": (0, b"pwritev=hiyo\n"),
+    "fcntl_setfl_nonblock": (0, b"nonblock=1\n"),
+    "fcntl_dupfd_cloexec": (0, b"cloexec=1\n"),
+    "mremap_grow": (0, b"mremap=ok\n"),
+    "sendmsg_socketpair": (0, b"msg=hi\n"),
+    "getsid_check": (0, None),
+    "getpgrp_check": (0, None),
 }
 
 FREESTANDING_FLAGS = (

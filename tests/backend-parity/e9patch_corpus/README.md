@@ -82,6 +82,14 @@ thread and hang the run.
 | `readlinkat_exe` | `readlinkat` `/proc/self/exe` (parity-only, host path) |
 | `getresuid_check` | `getresuid` real uid (parity-only, host uid) |
 | `prlimit_nofile` | `prlimit64` `RLIMIT_NOFILE` (parity-only, host limit) |
+| `preadv_memfd` | `preadv` positioned vector read at offset 2 |
+| `pwritev_memfd` | `pwritev` positioned vector write then `pread` back |
+| `fcntl_setfl_nonblock` | `fcntl` `F_SETFL` sets `O_NONBLOCK` |
+| `fcntl_dupfd_cloexec` | `fcntl` `F_DUPFD_CLOEXEC` sets `FD_CLOEXEC` on the copy |
+| `mremap_grow` | `mremap` `MREMAP_MAYMOVE` grows an anon mapping |
+| `sendmsg_socketpair` | `sendmsg`/`recvmsg` over an `AF_UNIX` socketpair |
+| `getsid_check` | `getsid(0)` (parity-only, host-specific sid) |
+| `getpgrp_check` | `getpgrp` (parity-only, host-specific pgrp) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -167,6 +175,18 @@ byte-identical to golden ptrace. `readlinkat_exe`, `getresuid_check`, and
 `RLIMIT_NOFILE` soft limit), so the driver asserts golden==e9patch parity only
 (`expected_stdout=None`); the other five pin exact deterministic stdout. All
 remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-9 new-family ratchet batch** (non-time,
+non-gated): positioned vector I/O (`preadv_memfd`, `pwritev_memfd`), `fcntl`
+`F_SETFL` (`fcntl_setfl_nonblock`) and `F_DUPFD_CLOEXEC` (`fcntl_dupfd_cloexec`),
+`mremap` growth (`mremap_grow`), `sendmsg`/`recvmsg` over a socketpair
+(`sendmsg_socketpair`), and the `getsid`/`getpgrp` process-group queries
+(`getsid_check`, `getpgrp_check`). These establish that e9patch preprocessing
+leaves `preadv`/`pwritev`/`fcntl`/`mremap`/`sendmsg`/`recvmsg`/`getsid`/`getpgrp`
+byte-identical to golden ptrace. `getsid_check` and `getpgrp_check` emit
+host-specific session/process-group ids, so the driver asserts golden==e9patch
+parity only (`expected_stdout=None`); the other six pin exact deterministic
+stdout. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
