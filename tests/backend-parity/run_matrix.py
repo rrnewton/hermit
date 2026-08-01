@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "faccessat2_flags": (
+                local / "faccessat2_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -208,6 +212,11 @@ def case_catalog(
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "faccessat2_flags": (
+            [str(fixtures.binary("faccessat2_flags"))],
+            0,
+            b"faccessat2 ok=6\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
