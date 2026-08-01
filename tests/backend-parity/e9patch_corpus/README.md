@@ -196,6 +196,8 @@ thread and hang the run.
 | `mlockall_all` | `mlockall(MCL_CURRENT)` + `munlockall` (return 0) |
 | `faccessat2_devnull` | `faccessat2(AT_FDCWD,"/dev/null",R_OK,0)` (return 0) |
 | `pidfd_send_signal_self` | `pidfd_send_signal(self,0,...)` signal-0 permission check (return 0) |
+| `capset_noop` | `capget` then `capset` identical sets back (return 0) |
+| `epoll_wait_timeout_zero` | `epoll_wait(timeout=0)` on empty set (0 ready) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -566,6 +568,19 @@ time, or randomness. `openat2(437)` and the three System V IPC creation syscalls
 no-false-parity (#152): each returns failure under hermit (openat2 unsupported;
 no usable System V IPC namespace), so those families have no guest. The batch
 kept three of seven. All remain freestanding (`candidate_sites > 0`).
+
+The final two guests are the **round-25 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New families:
+capability writeback via `capset(126)`, reading this thread's capability sets
+with `capget` and writing the identical sets back — a no-op returning 0, distinct
+from the existing capget read guest (`capset_noop`); and non-blocking readiness
+polling via `epoll_wait(232)` with timeout 0 on an empty epoll interest set,
+which returns 0 ready events (`epoll_wait_timeout_zero`). Every printed value is
+host-independent — the syscall return on success (0) or a boolean. None changes
+CPU scheduling, time, or randomness. `keyctl(250)` `KEYCTL_GET_KEYRING_ID` was
+probed and **dropped** per no-false-parity (#152): it returns failure under
+hermit, so the kernel-keyring family has no guest. The batch kept two of three.
+All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

@@ -68,6 +68,12 @@
       "why": "tests/backend-parity/e9patch_corpus/capget_ok.c is owned by tests/backend-parity/e9patch_corpus.py: Queries the process capability sets with capget using a version three header and prints the syscall return value which is zero on success without emitting the host-specific capability bitmasks, proving e9patch preprocessing preserves capget parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/capset_noop.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/capset_noop.c is owned by tests/backend-parity/e9patch_corpus.py: exercises capset(126) by first reading this thread's capability sets with capget and then writing the identical effective, permitted, and inheritable sets back, a no-op that returns 0 and is distinct from the existing capget read guest, printing that return, under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/chdir_root.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -120,6 +126,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/epoll_ctl_add.c is owned by tests/backend-parity/e9patch_corpus.py: Creates an epoll instance with epoll_create1 and registers a pipe read end with epoll_ctl using EPOLL_CTL_ADD, printing the return value which is zero on success without ever calling epoll_wait, proving e9patch preprocessing preserves epoll_create1 and epoll_ctl parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/epoll_wait_timeout_zero.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/epoll_wait_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: exercises epoll_wait(232) with timeout 0 on a freshly created empty epoll interest set, a non-blocking poll that returns 0 ready events, printing that return, under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/eventfd_rw.c",

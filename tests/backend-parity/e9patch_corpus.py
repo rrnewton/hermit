@@ -504,6 +504,21 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mlockall_all": (0, b"mlockall=0\n"),
     "faccessat2_devnull": (0, b"faccessat2=0\n"),
     "pidfd_send_signal_self": (0, b"pidfdsignal=0\n"),
+    # Round-25 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: capability writeback via capset(126), reading this thread's
+    # capability sets with capget and writing the identical sets back (a no-op
+    # returning 0; distinct from the existing capget read guest); and non-blocking
+    # readiness polling via epoll_wait(232) with timeout 0 on an empty epoll
+    # interest set, which returns 0 ready events. Every printed value is
+    # host-independent: the syscall return on success (0) or a boolean. None
+    # changes CPU scheduling, virtual time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    # (keyctl(250) KEYCTL_GET_KEYRING_ID was probed and DROPPED per no-false-parity
+    # #152: it returns failure under hermit, so the kernel-keyring family has no
+    # guest.)
+    "capset_noop": (0, b"capset=0\n"),
+    "epoll_wait_timeout_zero": (0, b"epollwait=0\n"),
 }
 
 FREESTANDING_FLAGS = (
