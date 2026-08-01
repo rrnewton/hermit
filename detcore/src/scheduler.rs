@@ -416,6 +416,18 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
+    /// A cached copy of `Config::sched_sticky_futex_wakes`. When set, a
+    /// `FUTEX_WAKE` that finds no matching waiter records a pending wake in
+    /// `pending_futex_wakes`, and a later `FUTEX_WAIT` on that futex consumes it
+    /// instead of blocking (a spec-legal spurious wakeup). Off by default, in
+    /// which case `pending_futex_wakes` stays empty and behavior is unchanged.
+    sticky_futex_wakes: bool,
+    /// Pending "sticky" futex wakes, keyed by futex, holding the OR of the wake
+    /// bitsets of `FUTEX_WAKE`s that fizzled (no waiter present). Consumed at
+    /// most once per futex by the next matching `FUTEX_WAIT`. Only ever
+    /// populated when `sticky_futex_wakes` is set; keyed lookups only, never
+    /// iterated for logic, so it introduces no ordering nondeterminism.
+    pending_futex_wakes: HashMap<FutexID, u32>,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -983,6 +995,8 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
+            sticky_futex_wakes: cfg.sched_sticky_futex_wakes,
+            pending_futex_wakes: HashMap::new(),
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
         }
@@ -1492,6 +1506,7 @@ impl Scheduler {
                         "[detcore] Futex wake {} waiters FIZZLED -- none waiting",
                         max_to_wake
                     );
+                    self.record_sticky_futex_wake(futexid, wake_mask);
                     return 0;
                 }
                 Some(r) => std::mem::take(r),
@@ -1516,7 +1531,54 @@ impl Scheduler {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
             assert!(junk.unwrap().is_empty());
         }
+        if num_woken == 0 {
+            // A waiter list existed for this futex but nothing in it matched the
+            // wake mask; treat this like the no-waiter fizzle for sticky-wake
+            // purposes so a mask-matching waiter that arrives next is not lost.
+            self.record_sticky_futex_wake(futexid, wake_mask);
+        }
         num_woken as u64
+    }
+
+    /// Record a pending "sticky" wake for `futexid` so a `FUTEX_WAIT` that
+    /// arrives after this (waiter-less) `FUTEX_WAKE` is not lost under DetCore's
+    /// sequentialization. No-op unless `--sched-sticky-futex-wakes` is set. The
+    /// stored value ORs in `wake_mask` so a later bitset wait only consumes the
+    /// credit if their masks intersect. Deterministic: only reached on a
+    /// scheduler wake turn.
+    fn record_sticky_futex_wake(&mut self, futexid: FutexID, wake_mask: u32) {
+        if !self.sticky_futex_wakes {
+            return;
+        }
+        let entry = self.pending_futex_wakes.entry(futexid).or_insert(0);
+        *entry |= wake_mask;
+        trace!(
+            "[detcore] sticky-wake: recorded pending wake for futex {:?}, mask now {:#x}",
+            &futexid, *entry
+        );
+    }
+
+    /// Consume a pending sticky wake for `futexid` if one exists whose recorded
+    /// mask intersects `wait_mask`. Returns true iff a credit was consumed, in
+    /// which case the caller must return the wait immediately (a spec-legal
+    /// spurious wakeup) instead of parking the thread. Consumes the whole credit
+    /// for the futex (at most one spurious wakeup per fizzled-wake episode), so
+    /// it cannot livelock. No-op / always false unless the overlay is enabled.
+    pub fn consume_sticky_futex_wake(&mut self, futexid: FutexID, wait_mask: u32) -> bool {
+        if !self.sticky_futex_wakes {
+            return false;
+        }
+        if let Some(mask) = self.pending_futex_wakes.get(&futexid) {
+            if mask & wait_mask != 0 {
+                self.pending_futex_wakes.remove(&futexid);
+                trace!(
+                    "[detcore] sticky-wake: consuming pending wake for futex {:?} (wait mask {:#x})",
+                    &futexid, wait_mask
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
@@ -3060,6 +3122,71 @@ mod test {
             response: Ivar::new(),
             bitset,
         }
+    }
+
+    fn test_futex(addr: usize) -> FutexID {
+        FutexID::private(MmId::initial(DetTid::from_raw(1)), addr)
+    }
+
+    // The sticky-wake overlay is inert unless --sched-sticky-futex-wakes is set:
+    // a waiter-less FUTEX_WAKE records nothing and a later FUTEX_WAIT finds no
+    // credit, so behavior is byte-identical to legacy.
+    #[test]
+    fn sticky_futex_wake_is_off_by_default() {
+        let mut sched = Scheduler::new(&Config::default());
+        assert!(!sched.sticky_futex_wakes);
+        let fx = test_futex(0x1000);
+        sched.record_sticky_futex_wake(fx, u32::MAX);
+        assert!(
+            sched.pending_futex_wakes.is_empty(),
+            "off: recording must be a no-op"
+        );
+        assert!(
+            !sched.consume_sticky_futex_wake(fx, u32::MAX),
+            "off: nothing to consume"
+        );
+    }
+
+    // With the overlay on, a waiter-less wake leaves a pending credit that the
+    // next mask-matching wait consumes exactly once (spec-legal spurious
+    // wakeup), and a second wait on the same futex then blocks normally.
+    #[test]
+    fn sticky_futex_wake_records_and_consumes_once() {
+        let mut config = Config::default();
+        config.sched_sticky_futex_wakes = true;
+        let mut sched = Scheduler::new(&config);
+        let fx = test_futex(0x2000);
+
+        // A wake with no waiter present records a pending credit.
+        assert_eq!(
+            sched.wake_futex_waiters(DetTid::from_raw(9), fx, 1, u32::MAX),
+            0
+        );
+        assert_eq!(sched.pending_futex_wakes.get(&fx), Some(&u32::MAX));
+
+        // The next wait consumes it (returns true => caller does NOT park)...
+        assert!(sched.consume_sticky_futex_wake(fx, u32::MAX));
+        // ...and it is gone, so a subsequent wait blocks normally.
+        assert!(sched.pending_futex_wakes.get(&fx).is_none());
+        assert!(!sched.consume_sticky_futex_wake(fx, u32::MAX));
+    }
+
+    // A pending credit is only consumed by a wait whose bitset intersects the
+    // recorded wake mask; a disjoint-bitset wait leaves the credit intact.
+    #[test]
+    fn sticky_futex_wake_respects_bitset() {
+        let mut config = Config::default();
+        config.sched_sticky_futex_wakes = true;
+        let mut sched = Scheduler::new(&config);
+        let fx = test_futex(0x3000);
+
+        sched.record_sticky_futex_wake(fx, 0b0001);
+        // Disjoint mask: no intersection, credit preserved.
+        assert!(!sched.consume_sticky_futex_wake(fx, 0b0010));
+        assert_eq!(sched.pending_futex_wakes.get(&fx), Some(&0b0001));
+        // Intersecting mask: consumed.
+        assert!(sched.consume_sticky_futex_wake(fx, 0b0011));
+        assert!(sched.pending_futex_wakes.get(&fx).is_none());
     }
 
     #[test]

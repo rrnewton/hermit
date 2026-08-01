@@ -1515,6 +1515,17 @@ impl GlobalState {
                         );
                         return Some(SchedValue::Value(0));
                     }
+                    if sched.consume_sticky_futex_wake(futexid, mask) {
+                        // A prior FUTEX_WAKE on this futex found no waiter and was
+                        // recorded as a pending sticky wake (--sched-sticky-futex-wakes).
+                        // Return the wait immediately as a spec-legal spurious
+                        // wakeup rather than parking outside the run queue forever.
+                        trace!(
+                            "[detcore, dtid {}] futex wait consumes pending sticky wake on {:?}",
+                            dettid, futexid
+                        );
+                        return Some(SchedValue::Value(0));
+                    }
                     sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }

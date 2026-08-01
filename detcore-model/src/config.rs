@@ -216,6 +216,21 @@ pub struct Config {
     #[clap(long)]
     pub fuzz_futexes: bool,
 
+    /// **Research (default off):** record a bounded, spec-legal "sticky" wakeup
+    /// for a `FUTEX_WAKE` that finds no matching waiter, so that a later
+    /// `FUTEX_WAIT` on the same futex whose condition still holds does not block
+    /// forever. Under DetCore's sequentialization a wake can be committed just
+    /// before the matching waiter reaches `FUTEX_WAIT`; the emulated (precise)
+    /// futex model then loses that wakeup and the waiter blocks outside the run
+    /// queue permanently (the demo5 QEMU-boot wedge). A pending wake is
+    /// consumed at most once per futex and yields a spurious-but-legal wakeup
+    /// (POSIX permits spurious `FUTEX_WAIT` returns; the caller rechecks its
+    /// condition). Deterministic: the credit is set and consumed only on
+    /// scheduler turns, never from host timing. Inert when off (legacy
+    /// byte-identical behavior).
+    #[clap(long)]
+    pub sched_sticky_futex_wakes: bool,
+
     /// Targeted chaos: bias scheduling toward known concurrency race patterns
     /// instead of exploring interleavings uniformly. At the scheduler's existing
     /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
@@ -698,6 +713,9 @@ impl fmt::Display for Config {
 
         if self.fuzz_futexes {
             write!(f, " --fuzz-futexes")?;
+        }
+        if self.sched_sticky_futex_wakes {
+            write!(f, " --sched-sticky-futex-wakes")?;
         }
         if self.chaos_target_races {
             write!(f, " --chaos-target-races")?;

@@ -216,6 +216,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         memory: 1024 * 1024 * 1024,
         interrupt_at: vec![],
         fuzz_futexes: false,
+        sched_sticky_futex_wakes: false,
         chaos_target_races: false,
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
