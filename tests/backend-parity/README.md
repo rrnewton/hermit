@@ -9,9 +9,9 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 22/23 number above is deliberately
@@ -20,8 +20,9 @@ The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
-verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+verifies that epoll remains available as a fallback, refuses process-memory
+reads and writes with deterministic `EPERM`, and reproduces a faithful
+`PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` capability-inheritance round-trip. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,12 +53,21 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The keepcaps row toggles the per-process `PR_SET_KEEPCAPS` flag off, on, and
+off again, reading it back with `PR_GET_KEEPCAPS` after each write and requiring
+the observed boolean to match what was just set. The flag is pure per-process
+state — it grants no capability and does not consult host time, PID, UID, the
+filesystem, or the scheduler — so every backend must reproduce the same
+self-consistent round-trip. Unlike the refusal rows this is a faithful-behavior
+contract: the deterministic answer coincides with native Linux rather than
+overriding it.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
+the `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` round-trip,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
@@ -84,6 +94,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
+| `keepcaps_prctl` | pass | pass | pass |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
