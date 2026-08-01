@@ -651,6 +651,22 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "timerfd_create_check": (0, b"timerfd=1\n"),
     "clock_getres_monotonic": (0, b"clockres=0\n"),
     "rt_sigtimedwait_empty": (0, b"sigtimedwait=-11\n"),
+    # round-32: inert fd/timer/sleep probes. memfd_create_check allocates an
+    # anonymous memfd and prints a boolean valid-fd (the fd number itself is
+    # host-dependent). getitimer_real reads the unarmed ITIMER_REAL interval
+    # timer, returning 0. clock_nanosleep_relative sleeps a fixed 1ms relative
+    # interval on CLOCK_MONOTONIC, which hermit virtualizes deterministically,
+    # returning 0. Every printed value is host-independent; none changes CPU
+    # scheduling, virtual time, or randomness. Five candidates were DROPPED per
+    # no-false-parity #152: splice(275), tee(276), vmsplice(278), and
+    # copy_file_range(326) each return -ENOSYS under golden hermit ptrace though
+    # native Linux moves the bytes, and process_vm_readv(310) returns -EPERM on
+    # a self target under hermit's ptrace supervision though native succeeds;
+    # keeping any of them would encode a hermit limitation as expected Linux
+    # behavior. The batch kept three of eight.
+    "memfd_create_check": (0, b"memfd=1\n"),
+    "getitimer_real": (0, b"getitimer=0\n"),
+    "clock_nanosleep_relative": (0, b"clocknanosleep=0\n"),
 }
 
 FREESTANDING_FLAGS = (
