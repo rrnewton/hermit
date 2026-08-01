@@ -782,6 +782,23 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_rcvlowat": (0, b"rcvlowat=1\n"),
     "getitimer_virtual": (0, b"getitimervirt=0\n"),
     "getitimer_prof": (0, b"getitimerprof=0\n"),
+    # round-39: more madvise advice values, an mmap flag, and a fixed socket
+    # option. madvise_normal/sequential/random/dontfork exercise four more advice
+    # codes (MADV_NORMAL=0, MADV_SEQUENTIAL=2, MADV_RANDOM=1, MADV_DONTFORK=10)
+    # beyond the covered DONTNEED/WILLNEED/FREE, each an inert hint returning 0.
+    # mmap_populate maps anonymous memory with MAP_POPULATE (prefault), writes and
+    # reads back a sentinel (42), a distinct flag path from mmap_anon/mmap_noreserve.
+    # getsockopt_sndlowat reads SO_SNDLOWAT, fixed at 1 on Linux (the send-side
+    # counterpart of getsockopt_rcvlowat). Every printed value is host-independent
+    # (an inert advice return, a sentinel echo, or a fixed constant) with no time,
+    # randomness, PID, or host-variable input -- families e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    "madvise_normal": (0, b"madvnormal=0\n"),
+    "madvise_sequential": (0, b"madvseq=0\n"),
+    "madvise_random": (0, b"madvrandom=0\n"),
+    "madvise_dontfork": (0, b"madvdontfork=0\n"),
+    "mmap_populate": (0, b"mmappopulate=42\n"),
+    "getsockopt_sndlowat": (0, b"sndlowat=1\n"),
 }
 
 FREESTANDING_FLAGS = (

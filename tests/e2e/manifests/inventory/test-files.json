@@ -1238,6 +1238,42 @@
       "why": "tests/backend-parity/e9patch_corpus/getitimer_prof.c is owned by tests/backend-parity/e9patch_corpus.py: queries the ITIMER_PROF interval timer via getitimer(36) with no timer armed, so the itimerval reads all-zero and the printed sum of its four fields (0) is host-independent; a distinct timer from getitimer_real and getitimer_virtual that counts user plus system CPU time. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_normal.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_normal.c is owned by tests/backend-parity/e9patch_corpus.py: advises MADV_NORMAL over an anonymous mapping via madvise(28), the default no-op advice distinct from the MADV_DONTNEED/MADV_WILLNEED/MADV_FREE codes already covered; the printed syscall return (0) is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_sequential.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_sequential.c is owned by tests/backend-parity/e9patch_corpus.py: advises MADV_SEQUENTIAL over an anonymous mapping via madvise(28), a read-ahead hint distinct from MADV_NORMAL/MADV_RANDOM and from the DONTNEED/WILLNEED/FREE advice; the printed syscall return (0) is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_random.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_random.c is owned by tests/backend-parity/e9patch_corpus.py: advises MADV_RANDOM over an anonymous mapping via madvise(28), the read-ahead hint opposite to MADV_SEQUENTIAL and distinct from MADV_NORMAL and the DONTNEED/WILLNEED/FREE advice; the printed syscall return (0) is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_dontfork.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_dontfork.c is owned by tests/backend-parity/e9patch_corpus.py: advises MADV_DONTFORK over an anonymous mapping via madvise(28), a page-property hint excluding the range from a child after fork, distinct from the read-ahead and DONTNEED/WILLNEED/FREE advice; the printed syscall return (0) is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/mmap_populate.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/mmap_populate.c is owned by tests/backend-parity/e9patch_corpus.py: maps anonymous memory with MAP_POPULATE via mmap(9) to prefault the page table at mmap time, a distinct flag path from mmap_anon's plain MAP_PRIVATE|MAP_ANONYMOUS and mmap_noreserve's MAP_NORESERVE, then writes and reads back a sentinel byte (42) to confirm writability; the echoed sentinel is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_sndlowat.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_sndlowat.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_SNDLOWAT via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where the send low-water mark is fixed at 1 on Linux and cannot be changed, the send-side counterpart of getsockopt_rcvlowat; the returned value (1) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
