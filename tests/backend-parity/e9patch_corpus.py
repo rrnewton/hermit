@@ -395,6 +395,32 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "kill_self_sig0": (0, b"kill=0\n"),
     "tgkill_self_sig0": (0, b"tgkill=0\n"),
     "flistxattr_memfd": (0, b"flistxattr=0\n"),
+    # Round-20 new-family ratchet batch (non-time, non-gated). Yet more syscalls
+    # with no existing guest: fchown(93) as the fchown(fd,-1,-1) no-op that
+    # changes neither owner nor group (return 0); munlockall(152), which always
+    # succeeds even with nothing locked (return 0); setrlimit(160) writing the
+    # current RLIMIT_NOFILE back unchanged (a no-op, return 0; the host-specific
+    # limit values are read but never printed); and four pure scheduler/process
+    # QUERIES that read but never change scheduling -- sched_getaffinity(204)
+    # (boolean success only; the returned byte count is host CPU-count dependent
+    # and never printed), sched_rr_get_interval(148) (return 0; interval not
+    # printed), sched_getattr(275) (return 0; attributes not printed), and
+    # setpgid(0,0) (109) which sets the process group to the pid, a process-group
+    # change and not a thread-scheduling change (return 0). poll(7) with no fds
+    # and a zero timeout returns immediately with 0 and never blocks. Every
+    # printed value is host-independent: the syscall return on success (0) or a
+    # boolean. None changes scheduling, time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace. An eighth candidate, sched_getattr(275), was DROPPED: it
+    # returns -ENOSYS (-38) under golden hermit ptrace, so keeping it would be a
+    # false-parity claim (#152) -- the batch kept seven of eight.
+    "fchown_memfd": (0, b"fchown=0\n"),
+    "munlockall_ok": (0, b"munlockall=0\n"),
+    "setrlimit_nofile": (0, b"setrlimit=0\n"),
+    "sched_getaffinity_check": (0, b"affinity=1\n"),
+    "sched_rr_get_interval_check": (0, b"rrinterval=0\n"),
+    "setpgid_self": (0, b"setpgid=0\n"),
+    "poll_timeout_zero": (0, b"poll=0\n"),
 }
 
 FREESTANDING_FLAGS = (

@@ -167,6 +167,13 @@ thread and hang the run.
 | `kill_self_sig0` | `kill(self, 0)` liveness probe (return 0) |
 | `tgkill_self_sig0` | `tgkill(pid, tid, 0)` liveness probe (return 0) |
 | `flistxattr_memfd` | `flistxattr` size query on a memfd (return 0) |
+| `fchown_memfd` | `fchown(fd,-1,-1)` no-op on a memfd (return 0) |
+| `munlockall_ok` | `munlockall` unlock-all (return 0) |
+| `setrlimit_nofile` | `setrlimit(RLIMIT_NOFILE)` no-op rewrite (return 0) |
+| `sched_getaffinity_check` | `sched_getaffinity` query (success boolean 1) |
+| `sched_rr_get_interval_check` | `sched_rr_get_interval` query (return 0) |
+| `setpgid_self` | `setpgid(0,0)` self process-group (return 0) |
+| `poll_timeout_zero` | `poll(NULL,0,0)` immediate return (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -446,6 +453,26 @@ round-tripped text (`hi`); host-specific outputs (the GS base, the attribute
 list) are read but never printed. None changes scheduling, time, or randomness,
 and the signal-0 probes deliver no signal. All eight pass under golden hermit
 ptrace, so the batch kept eight of eight. All remain freestanding
+(`candidate_sites > 0`).
+
+The final seven guests are the **round-20 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New syscalls:
+`fchown(93)` in its `fchown(fd,-1,-1)` no-op form that changes neither owner nor
+group (`fchown_memfd`, return 0); `munlockall(152)`, which always succeeds even
+with nothing locked (`munlockall_ok`, return 0); `setrlimit(160)` writing the
+current `RLIMIT_NOFILE` value back unchanged (`setrlimit_nofile`, a no-op return
+0; the host-specific limit values are read but never printed); three pure
+scheduler/process **queries** that read but never change scheduling —
+`sched_getaffinity(204)` (`sched_getaffinity_check`, a success boolean only,
+since the returned byte count is host CPU-count dependent and is not printed),
+`sched_rr_get_interval(148)` (`sched_rr_get_interval_check`, return 0), and
+`setpgid(0,0)` (`setpgid_self`, return 0, a process-group change and not a
+thread-scheduling change); and `poll(7)` with no fds and a zero timeout, which
+returns immediately with 0 and never blocks (`poll_timeout_zero`). Every printed
+value is host-independent — the syscall return on success (0) or a boolean. An
+eighth candidate, `sched_getattr(275)`, was **dropped**: it returns `-ENOSYS`
+(-38) under golden hermit ptrace, so keeping it would be a false-parity claim
+(#152) — the batch kept seven of eight. All remain freestanding
 (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
