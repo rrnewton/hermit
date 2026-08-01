@@ -160,6 +160,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "flock_memfd": (0, b"flock=ok\n"),
     "pipe_nonblock_eagain": (0, b"eagain=-11\n"),
     "getpgid_check": (0, None),
+    # Round-8 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into dup fd allocation, fcntl F_DUPFD/F_GETFL, lseek SEEK_CUR composition,
+    # pread past EOF, readlinkat, getresuid, and prlimit64 -- all families
+    # e9patch preprocessing must leave byte-identical to golden ptrace. The
+    # readlinkat/getresuid/prlimit64 guests emit host-specific values (exe path,
+    # uid, and RLIMIT_NOFILE), so they assert golden==e9patch parity only.
+    "dup_lowest": (0, b"dup=4\n"),
+    "fcntl_dupfd": (0, b"dupfd=20\n"),
+    "fcntl_getfl": (0, b"getfl=0\n"),
+    "lseek_seekcur_memfd": (0, b"cur=5\n"),
+    "pread_past_eof": (0, b"eof=0\n"),
+    "readlinkat_exe": (0, None),
+    "getresuid_check": (0, None),
+    "prlimit_nofile": (0, None),
 }
 
 FREESTANDING_FLAGS = (
