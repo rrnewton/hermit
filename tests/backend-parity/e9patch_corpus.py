@@ -237,6 +237,25 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "msync_anon": (0, b"msync=0\n"),
     "inotify_watch_root": (0, b"inotify=1\n"),
     "readahead_memfd": (0, b"readahead=0\n"),
+    # Round-13 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into path-based statfs on "/", the legacy pipe(2) syscall, directory
+    # enumeration (getdents64, reduced to a non-empty boolean since contents are
+    # host-specific), signalfd registration (no signal delivered or read),
+    # close_range fd teardown, socket-option get/set on a socketpair
+    # (getsockopt SO_TYPE, setsockopt SO_REUSEADDR), and fcntl F_GETLK record-lock
+    # querying on a memfd -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. Every printed value is host-independent:
+    # constants (SOCK_STREAM=1, F_UNLCK=2, lowest pipe fd=3, non-empty getdents
+    # boolean, valid-fd boolean) or the syscall return (0 on success). All eight
+    # ran clean under golden ptrace (no -ENOSYS drop).
+    "statfs_root": (0, b"statfs=0\n"),
+    "pipe_legacy": (0, b"pipe=3\n"),
+    "getdents_root": (0, b"getdents=1\n"),
+    "signalfd_create": (0, b"signalfd=1\n"),
+    "close_range_high": (0, b"close_range=0\n"),
+    "getsockopt_socktype": (0, b"socktype=1\n"),
+    "setsockopt_reuseaddr": (0, b"setsockopt=0\n"),
+    "fcntl_getlk": (0, b"getlk=2\n"),
 }
 
 FREESTANDING_FLAGS = (

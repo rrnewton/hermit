@@ -114,6 +114,14 @@ thread and hang the run.
 | `msync_anon` | `msync` `MS_SYNC` on an anonymous mapping (return 0) |
 | `inotify_watch_root` | `inotify_init1`/`inotify_add_watch` on `/` (wd 1) |
 | `readahead_memfd` | `readahead` over a sized memfd (return 0) |
+| `statfs_root` | path-based `statfs` on `/` (return 0; fields not printed) |
+| `pipe_legacy` | legacy `pipe(2)` read-end fd number (3) |
+| `getdents_root` | `getdents64` on `/` returns bytes (non-empty => 1) |
+| `signalfd_create` | `signalfd4` for `SIGUSR1` (valid fd => 1; no delivery) |
+| `close_range_high` | `close_range(3, ~0, 0)` fd teardown (return 0) |
+| `getsockopt_socktype` | `getsockopt` `SO_TYPE` on a socketpair (`SOCK_STREAM`=1) |
+| `setsockopt_reuseaddr` | `setsockopt` `SO_REUSEADDR` on a socketpair (return 0) |
+| `fcntl_getlk` | `fcntl` `F_GETLK` on an unlocked memfd (`F_UNLCK`=2) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -255,6 +263,22 @@ value is host-independent — the `S_IFCHR` file-type test (1), the first inotif
 watch descriptor (1), or the syscall return (0 on success). All eight ran clean
 under golden ptrace with no `-ENOSYS` drop, so the batch stayed at eight. All
 remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-13 new-family ratchet batch** (non-time,
+non-gated): path-based `statfs` on `/` (`statfs_root`), the legacy `pipe(2)`
+syscall (`pipe_legacy`), directory enumeration (`getdents_root`, reduced to a
+non-empty boolean since directory contents are host-specific), `signalfd4`
+registration with no signal delivered or read (`signalfd_create`), `close_range`
+fd teardown (`close_range_high`), socket-option get/set on an `AF_UNIX`
+socketpair (`getsockopt_socktype` `SO_TYPE`, `setsockopt_reuseaddr`
+`SO_REUSEADDR`), and `fcntl` `F_GETLK` record-lock querying on a memfd
+(`fcntl_getlk`). These establish that e9patch preprocessing leaves
+`statfs`/`pipe`/`getdents64`/`signalfd4`/`close_range`/`getsockopt`/`setsockopt`/
+`fcntl`(`F_GETLK`) byte-identical to golden ptrace. Every printed value is
+host-independent — the `SOCK_STREAM` (1) and `F_UNLCK` (2) constants, the lowest
+free pipe descriptor (3), a non-empty/valid boolean, or the syscall return (0 on
+success). All eight ran clean under golden ptrace with no `-ENOSYS` drop, so the
+batch stayed at eight. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
