@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "socketpair_flags": (
+                local / "socketpair_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -208,6 +212,11 @@ def case_catalog(
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "socketpair_flags": (
+            [str(fixtures.binary("socketpair_flags"))],
+            0,
+            b"socketpair ok=7\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
