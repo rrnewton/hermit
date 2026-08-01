@@ -32,6 +32,12 @@
       "why": "tests/backend-parity/e9patch_corpus/accept4_abstract.c is owned by tests/backend-parity/e9patch_corpus.py: exercises accept4(288) accepting a pending connection on a listening abstract-namespace AF_UNIX stream socket with SOCK_NONBLOCK, emitting only a boolean valid-fd result since the accepted descriptor number is host-specific and not printed, under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/accept_abstract.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/accept_abstract.c is owned by tests/backend-parity/e9patch_corpus.py: accepts a pending abstract AF_UNIX connection via the legacy accept(43) syscall, printing whether a valid connected fd (>=0) was returned. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/access_devnull.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -126,6 +132,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/epoll_ctl_add.c is owned by tests/backend-parity/e9patch_corpus.py: Creates an epoll instance with epoll_create1 and registers a pipe read end with epoll_ctl using EPOLL_CTL_ADD, printing the return value which is zero on success without ever calling epoll_wait, proving e9patch preprocessing preserves epoll_create1 and epoll_ctl parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/epoll_pwait_timeout_zero.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/epoll_pwait_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: issues a non-blocking epoll_pwait(281) with timeout 0 and NULL sigmask on an empty interest set, printing the 0 ready-event return. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/epoll_wait_timeout_zero.c",
@@ -422,6 +434,12 @@
       "why": "tests/backend-parity/e9patch_corpus/getrlimit_nofile.c is owned by tests/backend-parity/e9patch_corpus.py: Queries RLIMIT_NOFILE with the legacy getrlimit(97) syscall (distinct from prlimit64) and asserts a 0 return without printing the host limit values, proving e9patch preprocessing preserves legacy resource-limit queries against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getrusage_self.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getrusage_self.c is owned by tests/backend-parity/e9patch_corpus.py: queries this process resource usage via getrusage(98) RUSAGE_SELF into a local buffer, printing only the syscall return (0) since the fields are host-specific. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/getsid_check.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -710,6 +728,12 @@
       "why": "tests/backend-parity/e9patch_corpus/poll_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: exercises poll(7) with a NULL descriptor array, zero descriptors, and a zero millisecond timeout, which returns immediately with zero ready descriptors and never blocks, emitting the syscall return to confirm determinism under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/ppoll_timeout_zero.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/ppoll_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: calls ppoll(271) with no descriptors, a zero timespec, and a NULL sigmask so it returns 0 immediately without blocking, printing the syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/prctl_cap_ambient.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -768,6 +792,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/proc_self_fd_count.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the /proc/self/fd entry count is byte-identical under e9patch preprocessing and golden ptrace, proving the e9loader closes its self-fd and leaves no extra loader descriptor visible to the guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/pselect6_timeout_zero.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/pselect6_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: calls pselect6(270) with no descriptors, a zero timespec, and a NULL sigmask so it returns 0 immediately without blocking, printing the syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/pwrite_pread_memfd.c",
@@ -900,6 +930,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/sched_rr_get_interval_check.c is owned by tests/backend-parity/e9patch_corpus.py: exercises sched_rr_get_interval(148) querying the round-robin scheduling quantum for the calling thread into a local timespec, emitting only the syscall return so the guest-visible output stays host-independent under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/select_timeout_zero.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/select_timeout_zero.c is owned by tests/backend-parity/e9patch_corpus.py: calls select(23) with no descriptors and a zero timeval so it returns 0 immediately without blocking, printing the syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/sendfile_memfd.c",
