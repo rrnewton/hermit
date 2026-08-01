@@ -47,6 +47,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Display;
 
@@ -145,6 +146,113 @@ struct QueueValue {
     poll_upgrade: Option<Priority>,
 }
 
+/// The service-lead budget cost charged to a thread for one completed
+/// scheduling opportunity. Phase-1 uses a flat unit cost with no escalation, so
+/// the liveness bound depends only on the budget and the population.
+const FAIR_BASE_COST: u64 = 1;
+
+/// Maximum stale credit a just-woken thread may keep relative to the runnable
+/// floor. A short sleep cannot erase over-service debt (the `max` never lowers a
+/// counter), and a long sleeper cannot bank unlimited credit (it is clamped to
+/// at most this far below the floor). One base slice, per the design.
+const FAIR_WAKE_CREDIT: u64 = FAIR_BASE_COST;
+
+/// Bounded service-lead fairness overlay (research-only; see
+/// `Config::sched_fairness_budget`).
+///
+/// Each thread carries a deterministic unsigned integer "fair service" counter
+/// `S`. For the current runnable set `R`, let `F = min(S[j] for j in R)`. A
+/// thread `i` is *eligible* iff `S[i] - F < budget`. Selection then applies the
+/// unchanged priority/FIFO (or chaos) policy, but only among eligible threads.
+/// A minimum-service thread always has lead `0 < budget`, so at least one thread
+/// is always eligible: the overlay is work-conserving. Every committed turn
+/// charges the selected thread `FAIR_BASE_COST`, so a cheap poll/yield loop
+/// burns its lead budget and self-deprioritizes *by behavior*, with no poller
+/// classification and without ever touching guest-visible virtual time.
+#[derive(Debug, Clone)]
+struct FairService {
+    /// Service-lead budget `B > 0`, in scheduling opportunities.
+    budget: u64,
+    /// Per-thread service counter. Retained while a thread is blocked (absent
+    /// from the queue) so its accounting survives a block/wake round trip.
+    service: BTreeMap<DetTid, u64>,
+    /// Threads that left the runnable set via `remove_tid` (a block), pending a
+    /// wake-credit clamp when they are next admitted. A thread that merely took
+    /// its turn (committed pop then requeue) is NOT in this set and keeps its
+    /// counter unchanged on requeue.
+    blocked: BTreeSet<DetTid>,
+    /// Monotonic remembered floor so a thread cannot reset its service simply by
+    /// draining the queue to empty and re-entering at zero.
+    remembered_floor: u64,
+}
+
+impl FairService {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            service: BTreeMap::new(),
+            blocked: BTreeSet::new(),
+            remembered_floor: 0,
+        }
+    }
+
+    /// The runnable floor: the least service among threads currently queued,
+    /// falling back to the monotonic remembered floor when the queue is empty.
+    fn floor(&self, queue: &BTreeMap<PrioritizedOrder, QueueValue>) -> u64 {
+        queue
+            .values()
+            .filter_map(|v| self.service.get(&v.tid).copied())
+            .min()
+            .unwrap_or(self.remembered_floor)
+            .max(self.remembered_floor)
+    }
+
+    /// Whether `tid` is within the eligibility band given a precomputed `floor`.
+    fn eligible(&self, tid: DetTid, floor: u64) -> bool {
+        let s = self.service.get(&tid).copied().unwrap_or(floor);
+        s.saturating_sub(floor) < self.budget
+    }
+
+    /// Admission: place a thread's counter as it (re)enters the runnable set.
+    /// A brand-new thread is placed neutrally at the floor; a waking thread
+    /// keeps its counter but has stale credit clamped; a thread requeued after
+    /// taking a turn is left exactly as charged.
+    fn on_admit(&mut self, tid: DetTid, queue: &BTreeMap<PrioritizedOrder, QueueValue>) {
+        let floor = self.floor(queue);
+        self.remembered_floor = self.remembered_floor.max(floor);
+        match self.service.entry(tid) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                // New thread: neutral placement, not minimum preference.
+                e.insert(floor);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                if self.blocked.remove(&tid) {
+                    // Wake: retain over-service debt, clamp stale sleeper credit
+                    // to at most one slice below the floor.
+                    let clamped = floor.saturating_sub(FAIR_WAKE_CREDIT);
+                    let s = e.get_mut();
+                    *s = (*s).max(clamped);
+                }
+                // else: ordinary requeue after a turn -> counter unchanged.
+            }
+        }
+    }
+
+    /// A thread left the runnable set to block. Retain its counter and mark it
+    /// for a wake clamp on readmission.
+    fn on_block(&mut self, tid: DetTid) {
+        if self.service.contains_key(&tid) {
+            self.blocked.insert(tid);
+        }
+    }
+
+    /// Charge one committed scheduling opportunity to the selected thread.
+    fn on_commit(&mut self, tid: DetTid) {
+        let s = self.service.entry(tid).or_insert(self.remembered_floor);
+        *s = s.saturating_add(FAIR_BASE_COST);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunQueue {
     /// We use a "flattened" queue (rather than a Priority -> Vec<DetTid> map)
@@ -181,6 +289,11 @@ pub struct RunQueue {
 
     sticky_random_param: f64,
     sticky_random_selection: Option<DetTid>,
+
+    /// Optional bounded service-lead fairness overlay. `None` (the default)
+    /// preserves the exact legacy priority/FIFO selection with zero behavior
+    /// change; `Some` enables deterministic service accounting and eligibility.
+    fair: Option<FairService>,
 }
 
 /// A multi-line print of the runqueue.
@@ -201,9 +314,16 @@ impl fmt::Display for RunQueue {
 }
 
 impl RunQueue {
-    /// Create a new RunQueue.
-    pub fn new(ss: SchedHeuristic, seed: u64, srp: f64) -> Self {
+    /// Create a new RunQueue. `fairness_budget` enables the bounded service-lead
+    /// fairness overlay when `Some`; `None` preserves exact legacy behavior.
+    pub fn new(ss: SchedHeuristic, seed: u64, srp: f64, fairness_budget: Option<u64>) -> Self {
         detlog!("SCHEDRAND: seeding scheduler runqueue with seed {}", seed);
+        if let Some(b) = fairness_budget {
+            detlog!(
+                "SCHEDFAIR: bounded service-lead fairness enabled, budget {}",
+                b
+            );
+        }
         Self {
             queue: BTreeMap::new(),
             // For clarity, 0 is unused so that positive/negative == back/front:
@@ -216,6 +336,7 @@ impl RunQueue {
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
             sticky_random_selection: None,
+            fair: fairness_budget.map(FairService::new),
         }
     }
 
@@ -350,6 +471,12 @@ impl RunQueue {
         prio: PrioritizedOrder,
         poll_upgrade: Option<Priority>,
     ) -> PrioritizedOrder {
+        // Admit into the fairness overlay before the insert so a brand-new
+        // thread is placed at the floor of the *other* runnable threads rather
+        // than counting itself.
+        if let Some(fair) = self.fair.as_mut() {
+            fair.on_admit(tid, &self.queue);
+        }
         let qval = QueueValue { tid, poll_upgrade };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
@@ -392,6 +519,11 @@ impl RunQueue {
         if self.yielded_skip == Some(tid) {
             self.yielded_skip = None;
         }
+        // A thread leaving the runnable set is treated as blocking: retain its
+        // service counter and mark it for a wake-credit clamp on readmission.
+        if !kept_all && let Some(fair) = self.fair.as_mut() {
+            fair.on_block(tid);
+        }
         !kept_all
     }
 
@@ -415,11 +547,20 @@ impl RunQueue {
         let skip = self
             .yielded_skip
             .filter(|tid| self.queue.len() > 1 && self.contains_tid(*tid));
+        // Precompute the runnable floor once so every eligibility check in this
+        // selection sees the same value. `None` when the overlay is disabled.
+        let floor = self.fair.as_ref().map(|f| f.floor(&self.queue));
         self.tentative_selection = match self.sched_strategy {
             SchedHeuristic::None | SchedHeuristic::ConnectBind => self
                 .queue
                 .values()
-                .find(|value| Some(value.tid) != skip)
+                .find(|value| {
+                    Some(value.tid) != skip && Self::fair_eligible(&self.fair, value.tid, floor)
+                })
+                // Work-conserving fallback: if the eligibility band excluded
+                // every non-skipped thread (only possible when the sole eligible
+                // thread is the yielded one), ignore eligibility this turn.
+                .or_else(|| self.queue.values().find(|value| Some(value.tid) != skip))
                 .map(|value| value.tid),
             SchedHeuristic::Random => {
                 if self.queue.is_empty() {
@@ -428,14 +569,9 @@ impl RunQueue {
 
                 // If there is not Tid picked from a previous operation, let's pick one now.
                 if self.tentative_selection.is_none() {
-                    let eligible = self.queue.len() - usize::from(skip.is_some());
-                    let random_idx = self.random_range(0, eligible);
-                    self.tentative_selection = self
-                        .queue
-                        .values()
-                        .filter(|value| Some(value.tid) != skip)
-                        .nth(random_idx)
-                        .map(|value| value.tid);
+                    let candidates = self.eligible_candidates(skip, floor);
+                    let random_idx = self.random_range(0, candidates.len());
+                    self.tentative_selection = candidates.get(random_idx).copied();
                 };
 
                 self.tentative_selection
@@ -448,17 +584,19 @@ impl RunQueue {
                 if self.sticky_random_selection == skip {
                     self.sticky_random_selection = None;
                 }
+                // Drop a sticky selection that has fallen out of the eligibility
+                // band so fairness can force a switch.
+                if let Some(sel) = self.sticky_random_selection
+                    && !Self::fair_eligible(&self.fair, sel, floor)
+                {
+                    self.sticky_random_selection = None;
+                }
                 if self.sticky_random_selection.is_none()
                     || !self.contains_tid(self.sticky_random_selection.unwrap())
                 {
-                    let eligible = self.queue.len() - usize::from(skip.is_some());
-                    let random_idx = self.random_range(0, eligible);
-                    self.sticky_random_selection = self
-                        .queue
-                        .values()
-                        .filter(|value| Some(value.tid) != skip)
-                        .nth(random_idx)
-                        .map(|value| value.tid);
+                    let candidates = self.eligible_candidates(skip, floor);
+                    let random_idx = self.random_range(0, candidates.len());
+                    self.sticky_random_selection = candidates.get(random_idx).copied();
                 }
 
                 self.sticky_random_selection
@@ -466,6 +604,37 @@ impl RunQueue {
         };
 
         self.tentative_selection
+    }
+
+    /// Whether the fairness overlay (if enabled) admits `tid` given a
+    /// precomputed `floor`. Always true when the overlay is disabled.
+    fn fair_eligible(fair: &Option<FairService>, tid: DetTid, floor: Option<u64>) -> bool {
+        match (fair, floor) {
+            (Some(f), Some(fl)) => f.eligible(tid, fl),
+            _ => true,
+        }
+    }
+
+    /// The randomly-selectable candidate tids for chaos heuristics: non-skipped
+    /// and (when the overlay is on) within the eligibility band, in deterministic
+    /// queue order. Falls back to all non-skipped tids if the band would leave
+    /// no candidate, preserving work-conservation.
+    fn eligible_candidates(&self, skip: Option<DetTid>, floor: Option<u64>) -> Vec<DetTid> {
+        let eligible: Vec<DetTid> = self
+            .queue
+            .values()
+            .filter(|v| Some(v.tid) != skip && Self::fair_eligible(&self.fair, v.tid, floor))
+            .map(|v| v.tid)
+            .collect();
+        if eligible.is_empty() {
+            self.queue
+                .values()
+                .filter(|v| Some(v.tid) != skip)
+                .map(|v| v.tid)
+                .collect()
+        } else {
+            eligible
+        }
     }
 
     // TODO-HUMAN-REVIEW(PR-868): Review exact run-queue selection for vfork barriers.
@@ -534,6 +703,13 @@ impl RunQueue {
         // If this invariant is violated, then it's a bug, or the queue is modified
         // between the peek and tentative_pop and commit_tentative_pop.
         debug_assert!(ret == tentative_selection);
+        // Charge the committed scheduling opportunity. This is the single choke
+        // point for every real turn (poller requeue, chaos reprioritization, and
+        // completed guest turns all route through here); `undo_tentative_pop`
+        // deliberately bypasses it so a rolled-back selection is never charged.
+        if let Some(fair) = self.fair.as_mut() {
+            fair.on_commit(ret);
+        }
         ret
     }
 
@@ -595,7 +771,7 @@ impl RunQueue {
 
 impl Default for RunQueue {
     fn default() -> Self {
-        Self::new(SchedHeuristic::None, 0, 0.0)
+        Self::new(SchedHeuristic::None, 0, 0.0, None)
     }
 }
 
@@ -613,7 +789,7 @@ mod tests {
         ] {
             let yielding = DetTid::from_raw(1);
             let peer = DetTid::from_raw(2);
-            let mut queue = RunQueue::new(strategy, 0, 1.0);
+            let mut queue = RunQueue::new(strategy, 0, 1.0, None);
 
             queue.push_back(yielding, DEFAULT_PRIORITY - 1);
             assert_eq!(queue.tentative_pop_next(), Some(yielding));
@@ -657,7 +833,7 @@ mod tests {
         ] {
             let higher_priority = DetTid::from_raw(1);
             let selected = DetTid::from_raw(2);
-            let mut queue = RunQueue::new(strategy, 0, 1.0);
+            let mut queue = RunQueue::new(strategy, 0, 1.0, None);
             queue.push_back(higher_priority, FIRST_PRIORITY);
             queue.push_back(selected, LAST_PRIORITY);
 
@@ -688,5 +864,150 @@ mod tests {
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
         assert_eq!(queue.yielded_skip, None);
+    }
+
+    /// The overlay must be entirely inert when disabled: no `fair` state exists
+    /// and selection is exactly the legacy priority/FIFO order.
+    #[test]
+    fn overlay_disabled_is_exact_legacy_behavior() {
+        let a = DetTid::from_raw(1);
+        let b = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, None);
+        assert!(queue.fair.is_none());
+        // A monopolist that always re-inserts at the front would run forever
+        // without the overlay; confirm that is exactly what happens with None.
+        queue.push_back(a, DEFAULT_PRIORITY);
+        queue.push_back(b, DEFAULT_PRIORITY);
+        for _ in 0..10 {
+            assert_eq!(queue.tentative_pop_next(), Some(a));
+            assert_eq!(queue.commit_tentative_pop(), a);
+            queue.push_front(a, DEFAULT_PRIORITY);
+        }
+        // b never ran.
+        assert!(queue.contains_tid(b));
+    }
+
+    /// A thread that keeps winning selection (here, by re-inserting at the front
+    /// every turn) burns its service lead and, once it is `budget` turns ahead of
+    /// the floor, becomes ineligible so the starved peer is forced to run. This
+    /// is the missing burn-out mechanism (H8) demonstrated in miniature.
+    #[test]
+    fn hot_thread_self_deprioritizes_within_budget() {
+        let budget = 3u64;
+        let hot = DetTid::from_raw(1);
+        let peer = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, Some(budget));
+
+        queue.push_back(hot, DEFAULT_PRIORITY);
+        queue.push_back(peer, DEFAULT_PRIORITY);
+
+        // The hot thread can win at most `budget` turns before its lead over the
+        // (never-charged) peer reaches the budget and it is excluded.
+        let mut hot_turns = 0;
+        for _ in 0..budget {
+            let sel = queue.tentative_pop_next().unwrap();
+            assert_eq!(sel, hot, "hot thread should keep winning while eligible");
+            assert_eq!(queue.commit_tentative_pop(), hot);
+            hot_turns += 1;
+            // Re-insert at the front: absent fairness this would monopolize.
+            queue.push_front(hot, DEFAULT_PRIORITY);
+        }
+        assert_eq!(hot_turns, budget);
+
+        // Now hot's lead == budget => ineligible. The peer must be selected even
+        // though hot sits at the front of the queue.
+        assert_eq!(
+            queue.tentative_pop_next(),
+            Some(peer),
+            "starved peer must run once the hot thread exhausts its budget"
+        );
+    }
+
+    /// A rolled-back tentative selection must not be charged: `undo_tentative_pop`
+    /// bypasses `on_commit`, so eligibility is unchanged afterward.
+    #[test]
+    fn undo_tentative_pop_does_not_charge() {
+        let budget = 2u64;
+        let a = DetTid::from_raw(1);
+        let b = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, Some(budget));
+        queue.push_back(a, DEFAULT_PRIORITY);
+        queue.push_back(b, DEFAULT_PRIORITY);
+
+        // Peek-and-undo many times: no charge accrues, so `a` stays eligible and
+        // keeps being the FIFO-first selection every time.
+        for _ in 0..10 {
+            assert_eq!(queue.tentative_pop_next(), Some(a));
+            queue.undo_tentative_pop();
+        }
+        let fair = queue.fair.as_ref().unwrap();
+        assert_eq!(fair.service.get(&a).copied(), Some(0));
+        assert_eq!(fair.service.get(&b).copied(), Some(0));
+    }
+
+    /// A blocked thread's service counter is retained across a block/wake round
+    /// trip, and a short sleeper cannot bank unbounded credit: on wake its
+    /// counter is clamped to at most one slice below the runnable floor.
+    #[test]
+    fn wake_clamp_bounds_sleeper_credit() {
+        let budget = 100u64;
+        let sleeper = DetTid::from_raw(1);
+        let worker = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, Some(budget));
+
+        queue.push_back(sleeper, DEFAULT_PRIORITY);
+        queue.push_back(worker, DEFAULT_PRIORITY);
+
+        // Sleeper takes one turn (charged to service 1), is requeued, then
+        // blocks (leaves the runnable set via remove_tid).
+        assert_eq!(queue.tentative_pop_next(), Some(sleeper));
+        assert_eq!(queue.commit_tentative_pop(), sleeper);
+        queue.push_back(sleeper, DEFAULT_PRIORITY);
+        assert!(queue.remove_tid(sleeper));
+
+        // Worker runs many turns, advancing the floor far ahead.
+        for _ in 0..20 {
+            assert_eq!(queue.tentative_pop_next(), Some(worker));
+            assert_eq!(queue.commit_tentative_pop(), worker);
+            queue.push_front(worker, DEFAULT_PRIORITY);
+        }
+
+        // Sleeper wakes: its stale counter (1) is clamped up to floor-credit so
+        // it cannot preempt the worker for more than a bounded burst.
+        queue.push_back(sleeper, DEFAULT_PRIORITY);
+        let fair = queue.fair.as_ref().unwrap();
+        let floor_before = *fair.service.get(&worker).unwrap();
+        let sleeper_service = *fair.service.get(&sleeper).unwrap();
+        assert!(
+            sleeper_service + FAIR_WAKE_CREDIT >= floor_before,
+            "woken sleeper credit must be clamped to <= one slice below floor \
+             (sleeper={sleeper_service}, floor={floor_before})"
+        );
+    }
+
+    /// A brand-new thread joins at the runnable floor (neutral), neither given
+    /// minimum-service preference nor penalized, so it competes fairly at once.
+    #[test]
+    fn new_thread_admitted_at_floor() {
+        let budget = 100u64;
+        let old = DetTid::from_raw(1);
+        let fresh = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 1.0, Some(budget));
+
+        queue.push_back(old, DEFAULT_PRIORITY);
+        for _ in 0..5 {
+            assert_eq!(queue.tentative_pop_next(), Some(old));
+            assert_eq!(queue.commit_tentative_pop(), old);
+            queue.push_front(old, DEFAULT_PRIORITY);
+        }
+        // Now `old` has service 5. A newcomer joins.
+        queue.push_back(fresh, DEFAULT_PRIORITY);
+        let fair = queue.fair.as_ref().unwrap();
+        let floor = fair.floor(&queue.queue);
+        assert_eq!(
+            fair.service.get(&fresh).copied(),
+            Some(floor),
+            "new thread must be admitted at the current floor"
+        );
     }
 }

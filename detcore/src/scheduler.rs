@@ -960,6 +960,7 @@ impl Scheduler {
                 cfg.sched_heuristic,
                 cfg.sched_seed(),
                 cfg.sched_sticky_random_param,
+                cfg.sched_fairness_budget.map(std::num::NonZeroU64::get),
             ),
             turn: 0,
             next_turns: Default::default(),

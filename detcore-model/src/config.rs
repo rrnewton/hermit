@@ -435,6 +435,22 @@ pub struct Config {
     #[clap(long, default_value = "0.0", value_name = "double")]
     pub sched_sticky_random_param: f64,
 
+    /// **Research:** enable the bounded service-lead fairness overlay in the run
+    /// queue with the given service-lead budget `B` (in scheduling
+    /// opportunities). Each runnable thread carries a deterministic integer
+    /// "fair service" counter that is charged one unit per committed scheduling
+    /// turn; a thread whose service leads the least-served runnable thread by at
+    /// least `B` becomes temporarily ineligible for selection. This provides a
+    /// burn-out mechanism so a busy poll/yield loop self-deprioritizes without
+    /// any poller classification, giving a CPU-bound guest thread a bounded wait
+    /// even when RCB-time preemption is disabled (`--no-rcb-time`). The counter
+    /// is scheduler-internal and NEVER guest-visible: it does not affect virtual
+    /// time, clocks, or timeouts. Omit (the default) to preserve the exact
+    /// legacy priority/FIFO selection with no overlay.
+    #[serde(default)]
+    #[clap(long, value_name = "budget")]
+    pub sched_fairness_budget: Option<NonZeroU64>,
+
     /// **Internal:** An internal flag for indicating to Detcore whether we are in `hermit record` or
     /// `hermit replay` mode.  This is necessary because there are DIFFERENT global
     /// invariants in record mode (e.g. files dont exist).  If we move to a chroot model
@@ -813,6 +829,9 @@ impl fmt::Display for Config {
                 " --sched-sticky-random-param={}",
                 self.sched_sticky_random_param
             )?;
+        }
+        if let Some(b) = self.sched_fairness_budget {
+            write!(f, " --sched-fairness-budget={}", b)?;
         }
         if let Some(t) = self.stop_after_turn {
             write!(f, " --stop-after-turn={}", t)?;
