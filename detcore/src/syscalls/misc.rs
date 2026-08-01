@@ -272,6 +272,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    fn arch_prctl_gs_shadow(requested: u64, observed: u64) -> Option<u64> {
+        (requested != observed).then_some(requested)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
     /// Preserve thread-local bases while hiding host CPU feature controls.
@@ -284,10 +288,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.cfg.virtualize_cpuid && self.cfg.cpuid_virtualized_by_backend;
         let cpuid_uses_faulting = self.cfg.virtualize_cpuid && guest.has_cpuid_interception();
         match call.cmd() {
-            ArchPrctlCmd::ARCH_SET_FS(_)
-            | ArchPrctlCmd::ARCH_SET_GS(_)
-            | ArchPrctlCmd::ARCH_GET_FS(_)
-            | ArchPrctlCmd::ARCH_GET_GS(_) => Ok(guest.inject(call).await?),
+            ArchPrctlCmd::ARCH_SET_FS(_) | ArchPrctlCmd::ARCH_GET_FS(_) => {
+                Ok(guest.inject(call).await?)
+            }
+            ArchPrctlCmd::ARCH_SET_GS(requested) => {
+                let result = guest.inject(call).await?;
+                let observed = guest.regs().await.gs_base;
+                guest.thread_state_mut().arch_prctl_gs_shadow =
+                    Self::arch_prctl_gs_shadow(requested, observed);
+                Ok(result)
+            }
+            ArchPrctlCmd::ARCH_GET_GS(addr) => {
+                if let Some(value) = guest.thread_state().arch_prctl_gs_shadow {
+                    let addr = addr.ok_or(Errno::EFAULT)?;
+                    self.write_arch_prctl_u64(guest, addr.as_raw(), value)
+                } else {
+                    Ok(guest.inject(call).await?)
+                }
+            }
 
             // KVM installs a deterministic CPUID table while leaving the instruction enabled.
             ArchPrctlCmd::ARCH_GET_CPUID(_) if cpuid_uses_backend_policy => Ok(1),
@@ -751,6 +769,22 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gs_shadow_is_only_needed_when_backend_cannot_observe_the_set() {
+        assert_eq!(
+            Detcore::<crate::record_or_replay::NoopTool>::arch_prctl_gs_shadow(0x1234, 0x1234),
+            None
+        );
+        assert_eq!(
+            Detcore::<crate::record_or_replay::NoopTool>::arch_prctl_gs_shadow(0x1234, 0),
+            Some(0x1234)
+        );
+        assert_eq!(
+            Detcore::<crate::record_or_replay::NoopTool>::arch_prctl_gs_shadow(0, 0),
+            None
+        );
+    }
 
     #[test]
     fn prctl_support_covers_deterministic_controls() {

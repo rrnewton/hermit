@@ -1198,6 +1198,15 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
+    /// Guest-visible GS base when a backend cannot preserve or expose a
+    /// successful `ARCH_SET_GS` through its register context.
+    ///
+    /// Ptrace and other complete backends leave this unset and continue to
+    /// read the kernel register state. LiteInst needs the shadow while its
+    /// in-process hook context omits segment bases.
+    #[serde(default)]
+    pub(crate) arch_prctl_gs_shadow: Option<u64>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -1602,6 +1611,7 @@ impl<T> ThreadState<T> {
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
+            arch_prctl_gs_shadow: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
