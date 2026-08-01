@@ -198,6 +198,8 @@ thread and hang the run.
 | `pidfd_send_signal_self` | `pidfd_send_signal(self,0,...)` signal-0 permission check (return 0) |
 | `capset_noop` | `capget` then `capset` identical sets back (return 0) |
 | `epoll_wait_timeout_zero` | `epoll_wait(timeout=0)` on empty set (0 ready) |
+| `tkill_self_sig0` | `tkill(tid, 0)` thread-directed signal-0 permission check (return 0) |
+| `rt_tgsigqueueinfo_self` | `rt_tgsigqueueinfo(pid, tid, 0, &si)` signal-0 permission check (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -581,6 +583,24 @@ CPU scheduling, time, or randomness. `keyctl(250)` `KEYCTL_GET_KEYRING_ID` was
 probed and **dropped** per no-false-parity (#152): it returns failure under
 hermit, so the kernel-keyring family has no guest. The batch kept two of three.
 All remain freestanding (`candidate_sites > 0`).
+
+The final two guests are the **round-26 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New families:
+thread-directed signalling via `tkill(200)` sending signal 0 to this thread — a
+pure permission check with no delivery, returning 0 (`tkill_self_sig0`, distinct
+from the process-directed `kill`/`tgkill` guests of round-19) — and
+`rt_tgsigqueueinfo(297)` queuing signal 0 to this thread with an `SI_QUEUE`
+siginfo, again only the permission check with no delivery, returning 0
+(`rt_tgsigqueueinfo_self`, the thread-group-targeted, siginfo-carrying
+counterpart to round-23's `rt_sigqueueinfo`). Every printed value is
+host-independent — the syscall return on success (0). Neither changes CPU
+scheduling, time, or randomness. Three candidates were probed and **dropped**
+per no-false-parity (#152): `prctl` `PR_GET_SECUREBITS(27)` and
+`PR_MCE_KILL_GET(34)` both return `-ENOSYS` under hermit, so those prctl-option
+families have no guest, and `userfaultfd(323)` fails even natively here
+(unprivileged userfaultfd is disabled), so it is an error path rather than a
+supported-success guest. The batch kept two of five. All remain freestanding
+(`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

@@ -860,6 +860,12 @@
       "why": "tests/backend-parity/e9patch_corpus/rt_sigqueueinfo_self.c is owned by tests/backend-parity/e9patch_corpus.py: exercises rt_sigqueueinfo(129) queuing signal 0 to this process with an SI_QUEUE siginfo, which performs only the permission check with no delivery and returns 0, printing that return, under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/rt_tgsigqueueinfo_self.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/rt_tgsigqueueinfo_self.c is owned by tests/backend-parity/e9patch_corpus.py: queues signal 0 to this thread via rt_tgsigqueueinfo(297) with an SI_QUEUE siginfo as a permission check with no delivery, printing the syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_get_priority_min_check.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -1086,6 +1092,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/tgkill_self_sig0.c is owned by tests/backend-parity/e9patch_corpus.py: exercises tgkill(234) sending the null signal 0 to the calling thread identified by its own pid and tid as a liveness probe that delivers no signal, emitting only the syscall return to confirm determinism under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/tkill_self_sig0.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/tkill_self_sig0.c is owned by tests/backend-parity/e9patch_corpus.py: sends signal 0 to this thread via tkill(200) as a pure thread-directed permission check with no delivery, printing the syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/umask_set.c",
