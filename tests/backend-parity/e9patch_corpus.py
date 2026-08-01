@@ -221,6 +221,22 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "prctl_dumpable": (0, b"dumpable=1\n"),
     "capget_ok": (0, b"capget=0\n"),
     "fstatfs_memfd": (0, b"fstatfs=0\n"),
+    # Round-12 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into path-based stat/lstat on /dev/null, openat(AT_FDCWD) read-to-EOF,
+    # memory locking (mlock/mlock2/munlock), msync(MS_SYNC) on an anonymous
+    # mapping, inotify watch registration (no event wait), and readahead over a
+    # memfd -- all families e9patch preprocessing must leave byte-identical to
+    # golden ptrace. Every printed value is host-independent: constants (S_IFCHR
+    # file-type test => 1, first inotify wd => 1) or the syscall return (0 on
+    # success). All eight ran clean under golden ptrace (no -ENOSYS drop).
+    "stat_devnull": (0, b"stat_chr=1\n"),
+    "lstat_devnull": (0, b"lstat_chr=1\n"),
+    "openat_devnull": (0, b"openat=0\n"),
+    "mlock_page": (0, b"mlock=0\n"),
+    "mlock2_page": (0, b"mlock2=0\n"),
+    "msync_anon": (0, b"msync=0\n"),
+    "inotify_watch_root": (0, b"inotify=1\n"),
+    "readahead_memfd": (0, b"readahead=0\n"),
 }
 
 FREESTANDING_FLAGS = (

@@ -106,6 +106,14 @@ thread and hang the run.
 | `prctl_dumpable` | `prctl` `PR_GET_DUMPABLE` (1) |
 | `capget_ok` | `capget` v3 header (return 0; masks not printed) |
 | `fstatfs_memfd` | `fstatfs` on a memfd (return 0; fields not printed) |
+| `stat_devnull` | path-based `stat` on `/dev/null` reports `S_IFCHR` (1) |
+| `lstat_devnull` | path-based `lstat` on `/dev/null` reports `S_IFCHR` (1) |
+| `openat_devnull` | `openat(AT_FDCWD)` `/dev/null` then `read` to EOF (0) |
+| `mlock_page` | `mlock`/`munlock` one anonymous page (return 0) |
+| `mlock2_page` | `mlock2`/`munlock` one anonymous page (return 0) |
+| `msync_anon` | `msync` `MS_SYNC` on an anonymous mapping (return 0) |
+| `inotify_watch_root` | `inotify_init1`/`inotify_add_watch` on `/` (wd 1) |
+| `readahead_memfd` | `readahead` over a sized memfd (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -233,6 +241,20 @@ success). `splice` was evaluated and **dropped**: hermit returns `-ENOSYS`
 limitation rather than a parity claim (no false-parity), exactly as round-6
 handled `copy_file_range`. All kept guests remain freestanding
 (`candidate_sites > 0`).
+
+The final eight guests are the **round-12 new-family ratchet batch** (non-time,
+non-gated): path-based `stat`/`lstat` on `/dev/null` (`stat_devnull`,
+`lstat_devnull`), `openat(AT_FDCWD)` with a read to EOF (`openat_devnull`),
+memory locking (`mlock_page`, `mlock2_page`, each with `munlock`), `msync`
+`MS_SYNC` on an anonymous mapping (`msync_anon`), inotify watch registration
+with no event wait (`inotify_watch_root`), and `readahead` over a sized memfd
+(`readahead_memfd`). These establish that e9patch preprocessing leaves
+`stat`/`lstat`/`openat`/`mlock`/`mlock2`/`munlock`/`msync`/`inotify_init1`/
+`inotify_add_watch`/`readahead` byte-identical to golden ptrace. Every printed
+value is host-independent — the `S_IFCHR` file-type test (1), the first inotify
+watch descriptor (1), or the syscall return (0 on success). All eight ran clean
+under golden ptrace with no `-ENOSYS` drop, so the batch stayed at eight. All
+remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
