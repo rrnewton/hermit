@@ -9,19 +9,20 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+reads and writes with deterministic `EPERM`. It also drives a non-blocking
+`epoll_pwait2` readiness cycle over an armed eventfd. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,6 +53,14 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The `epoll_pwait2` row is the syscall-441 sibling of the io_uring fallback's
+epoll check: it registers an eventfd, arms it, and polls with `epoll_pwait2`
+using a zero `struct timespec` so the wait never blocks. ptrace and DBI forward
+the newer wait entry point faithfully and report the armed descriptor ready,
+then empty after removal; the fixture asserts only the readiness count, the
+woken descriptor, and its event bits, never a timeout value. KVM's `ElfExecutor`
+does not implement syscall 441 and returns a deterministic `ENOSYS`, so the row
+is a KVM gap: KVM already drives the classic `epoll_wait`, but not `epoll_pwait2`.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -67,7 +76,9 @@ in-memory mapping model validates `msync` and translates range-advice file
 descriptors. Serialized child exits support both `wait4` and `waitid`, including
 canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
-exit but does not yet synthesize an x86-64 signal frame to run the handler.
+exit but does not yet synthesize an x86-64 signal frame to run the handler. Its
+other gap is `epoll_pwait2`: the personality drives the classic `epoll_wait` but
+returns a deterministic `ENOSYS` for the newer syscall-441 wait entry point.
 
 ## Matrix
 
@@ -92,6 +103,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `epoll_pwait2` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
