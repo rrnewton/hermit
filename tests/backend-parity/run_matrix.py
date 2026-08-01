@@ -139,6 +139,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "set_tid_address": (local / "set_tid_address.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -208,6 +209,11 @@ def case_catalog(
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "set_tid_address": (
+            [str(fixtures.binary("set_tid_address"))],
+            0,
+            b"set_tid_address ok=4\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
