@@ -137,6 +137,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "fd_duplication": (local / "fd_duplication.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -235,6 +236,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "fd_duplication": (
+            [str(fixtures.binary("fd_duplication"))],
+            0,
+            b"fd_dup offset=8 ok=11\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
