@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "file_backed_mmap": (
+                local / "file_backed_mmap.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "file_backed_mmap": (
+            [str(fixtures.binary("file_backed_mmap"))],
+            0,
+            b"file_backed_mmap size=16 checksum=1160 ok=5\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
