@@ -29,6 +29,7 @@ static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
 static LITEINST_ARCHIVE_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
+static LITEINST_CPIO_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
@@ -183,6 +184,48 @@ fn archive_fixtures() -> &'static [PathBuf; 3] {
             );
             path
         })
+    })
+}
+
+fn cpio_fixture() -> &'static Path {
+    LITEINST_CPIO_FIXTURE.get_or_init(|| {
+        let source = compatibility_fixture();
+        let build_root = source
+            .parent()
+            .expect("compatibility fixture should have a parent directory");
+        let filename = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("compatibility fixture filename should be UTF-8");
+        let path = build_root.join("compatibility-fixture.cpio");
+
+        let mut child = Command::new("/usr/bin/cpio")
+            .args(["-o", "-H", "newc"])
+            .current_dir(build_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run /usr/bin/cpio");
+        writeln!(
+            child
+                .stdin
+                .take()
+                .expect("cpio fixture stdin pipe should exist"),
+            "{filename}"
+        )
+        .expect("failed to write cpio fixture member name");
+        let output = child
+            .wait_with_output()
+            .expect("failed to collect cpio fixture output");
+        assert!(
+            output.status.success(),
+            "cpio failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::write(&path, output.stdout).expect("failed to write cpio fixture");
+        path
     })
 }
 
@@ -786,6 +829,74 @@ fn liteinst_strict_verify_round4_archive_utilities() {
         ],
         COMPAT_FIXTURE_CONTENT,
     );
+}
+
+#[test]
+fn liteinst_strict_verify_round5_language_utilities() {
+    let lua = [Path::new("/usr/bin/lua5.4"), Path::new("/usr/bin/lua")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .expect("portable CI should provide Lua 5.4");
+    assert_liteinst_strict_verify(
+        lua,
+        &["-e", "print(table.concat({1,4,9}, ','))"],
+        b"1,4,9\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/ruby"),
+        &["--disable-gems", "-e", "puts [1,4,9].join(',')"],
+        b"1,4,9\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/php"),
+        &["-r", "echo implode(',', [1,4,9]), PHP_EOL;"],
+        b"1,4,9\n",
+    );
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/tclsh"),
+        &[],
+        b"puts [join [list 1 4 9] \",\"]\n",
+    );
+    assert_eq!(output.stdout, b"1,4,9\n");
+}
+
+#[test]
+fn liteinst_strict_verify_round5_portable_data_utilities() {
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/xmllint"),
+        &["--xpath", "string(/root/item[@id=\"2\"])", "-"],
+        b"<root><item id=\"2\">beta</item></root>\n",
+    );
+    assert_eq!(output.stdout, b"beta\n");
+
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/file"),
+        &["-b", "--mime-type", fixture],
+        b"text/plain\n",
+    );
+
+    let cpio = fs::read(cpio_fixture()).expect("failed to read cpio fixture");
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/cpio"),
+        &["-i", "--to-stdout", "compatibility-fixture.txt"],
+        &cpio,
+    );
+    assert_eq!(output.stdout, COMPAT_FIXTURE_CONTENT);
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/xxd"),
+        &["-p", fixture],
+        b"6c697465696e737420636f6d7061746962696c6974792066697874757265\n0a\n",
+    );
+
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/column"),
+        &["-t"],
+        b"alpha 1\nbeta 22\n",
+    );
+    assert_eq!(output.stdout, b"alpha  1\nbeta   22\n");
 }
 
 #[test]
