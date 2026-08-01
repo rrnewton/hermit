@@ -702,6 +702,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "wait4_nochild": (0, b"wait4=-10\n"),
     "membarrier_query": (0, b"membarrierquery=1\n"),
     "getrusage_thread": (0, b"getrusagethread=0\n"),
+    # round-35: inert query/no-op probes on uncovered socket, fcntl, mmap, and
+    # dup2 boundaries. socket_stream creates a lone AF_UNIX SOCK_STREAM socket
+    # (a distinct socket TYPE from socket_dgram's SOCK_DGRAM), printing the
+    # lowest free fd (3). getsockopt_soerror and getsockopt_acceptconn read two
+    # more socket OPTIONS beyond round-13's SO_TYPE: SO_ERROR (no pending error
+    # on a fresh socketpair endpoint -> 0) and SO_ACCEPTCONN (a connected, non-
+    # listening endpoint -> 0). fcntl_getsig reads F_GETSIG on a fresh pipe read-
+    # end (no signal set -> 0), a distinct fcntl OP from the F_GETFL/F_GETFD/
+    # F_GETOWN guests. mmap_noreserve exercises the MAP_NORESERVE flag path
+    # (distinct from mmap_anon's plain MAP_PRIVATE|MAP_ANONYMOUS), writing and
+    # reading back a sentinel byte (42) to confirm the mapping is writable.
+    # dup2_same_fd covers the POSIX oldfd==newfd special case: dup2 on an already-
+    # open fd is a no-op that returns newfd (3) without closing it. Every printed
+    # value is host-independent (a fixed fd number, a queried 0, or the written-
+    # back sentinel byte); none blocks, perturbs scheduling, or touches
+    # randomness -- all families e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    "socket_stream": (0, b"socketstream=3\n"),
+    "getsockopt_soerror": (0, b"soerror=0\n"),
+    "getsockopt_acceptconn": (0, b"acceptconn=0\n"),
+    "fcntl_getsig": (0, b"getsig=0\n"),
+    "mmap_noreserve": (0, b"noreserve=42\n"),
+    "dup2_same_fd": (0, b"dup2same=3\n"),
 }
 
 FREESTANDING_FLAGS = (
