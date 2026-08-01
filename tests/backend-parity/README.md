@@ -9,9 +9,9 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 22/24 | 92% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 22/23 number above is deliberately
@@ -36,7 +36,10 @@ permit different backend-local layouts. Portable pthread startup still exits
 or stalls intermittently during DynamoRIO startup, so it remains an explicit
 gap rather than making the strict CI gate flaky. The random-source row continues
 to use root-only mode so it measures the cross-backend root stream independently
-of the pthread lifecycle gap.
+of the pthread lifecycle gap. The `uname` identity row is a second explicit DBI
+gap: DBI pins the kernel release but forwards the *host* `nodename` rather than
+the determinized hostname, so it deterministically leaks a host-specific value
+that ptrace and KVM both hide.
 
 The file-mutation row creates, writes, attempts allocation, truncates, renames,
 links, reads, and removes temporary files without exposing backend-specific metadata.
@@ -52,11 +55,23 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The `uname` identity row calls `uname(2)` and checks the fields Hermit is
+expected to pin identically for every guest: `sysname` (`Linux`), `machine`
+(`x86_64`), the determinized kernel `release` (`5.2.0`, versus the real running
+kernel outside Hermit), and the determinized `nodename` (`hermetic-container.local`).
+Native Linux matches only the two host-generic fields, proving the release and
+nodename values are Hermit determinization choices rather than host coincidences.
+ptrace and KVM pin all four. DBI pins the release but forwards the host
+`nodename`; that divergence is deterministic yet host-dependent, so it is
+recorded as a DBI gap rather than presented as parity — the same hostname value
+would change on a different host, which is precisely the nondeterminism the
+contract must not hide.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
-memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
-threaded random-source probes, plus file mutation, listmount refusal,
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
+memory, deterministic memory-advice policy, clock, PID, synthetic CPUID,
+determinized `uname` identity, and threaded random-source probes, plus file
+mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
@@ -92,6 +107,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `uname_identity` | pass | gap | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |

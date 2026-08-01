@@ -18,6 +18,7 @@ shared_anonymous_mmap	pass	pass	pass	-	-
 pthread_lifecycle	pass	gap	pass	Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness	-
 process_wait_accounting	pass	pass	pass	-	-
 process_wait_lifecycle	pass	pass	gap	-	KVM records serialized child exits and implements wait4/waitid, but does not synthesize guest SIGCHLD handler delivery
+uname_identity	pass	gap	pass	DBI forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBI leaks the real host name	-
 cpuid_policy	pass	pass	pass	-	-
 virtual_clock	pass	pass	pass	-	-
 random_sources	pass	pass	pass	-	-
