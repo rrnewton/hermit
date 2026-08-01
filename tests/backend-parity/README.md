@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -69,6 +69,20 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
+The poll-readiness row drives a single pipe through a fixed sequence of states
+and queries I/O readiness with a **zero timeout** at each step, so every result
+is a pure function of the pipe's buffered state rather than of elapsed time. It
+checks that a pipe holding buffered data reports the read end readable (POLLIN)
+and the write end writable (POLLOUT) under both `poll(2)` and `select(2)`, that
+`ppoll(2)` with a zero timespec agrees on the writable case, that a drained pipe
+with the write end still open reports the read end not ready, and that closing
+the write end makes the read end report EOF (POLLHUP/POLLIN). Only the aggregate
+`poll_readiness ok=8` is printed, never a timestamp or descriptor number. ptrace
+and DBI satisfy it, and DBI verifies byte-identical under strict verification. It
+is an explicit KVM gap: the KVM `ElfExecutor` personality implements the
+`poll`/`ppoll` readiness path but returns deterministic `ENOSYS` for
+`select(2)`/`pselect6`.
+
 ## Matrix
 
 | Test | ptrace | DBI | KVM |
@@ -92,6 +106,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `poll_readiness` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
