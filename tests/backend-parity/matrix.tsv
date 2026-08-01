@@ -18,6 +18,7 @@ shared_anonymous_mmap	pass	pass	pass	-	-
 pthread_lifecycle	pass	gap	pass	Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness	-
 process_wait_accounting	pass	pass	pass	-	-
 process_wait_lifecycle	pass	pass	gap	-	KVM records serialized child exits and implements wait4/waitid, but does not synthesize guest SIGCHLD handler delivery
+fchmodat2_flags	pass	pass	gap	-	KVM ElfExecutor returns ENOSYS for fchmodat2 (syscall 452); ptrace and DBI forward it to the host
 cpuid_policy	pass	pass	pass	-	-
 virtual_clock	pass	pass	pass	-	-
 random_sources	pass	pass	pass	-	-
