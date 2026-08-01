@@ -799,6 +799,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "madvise_dontfork": (0, b"madvdontfork=0\n"),
     "mmap_populate": (0, b"mmappopulate=42\n"),
     "getsockopt_sndlowat": (0, b"sndlowat=1\n"),
+    # round-40: four more boolean getsockopt options, one non-boolean option, and
+    # a memfd fcntl seal query. getsockopt_reuseport/passcred/timestamp/nocheck
+    # read SO_REUSEPORT/SO_PASSCRED/SO_TIMESTAMP/SO_NO_CHECK, each unset on a fresh
+    # endpoint (-> 0); getsockopt_priority reads SO_PRIORITY, which defaults to 0.
+    # fcntl_get_seals creates a memfd (born with F_SEAL_SEAL) and reads F_GET_SEALS
+    # -> 1, a new fcntl OP and a new memfd contract. Every printed value is a
+    # queried constant with no time, randomness, PID, or host-variable input, so
+    # e9patch preprocessing must leave all six byte-identical to golden ptrace.
+    "getsockopt_reuseport": (0, b"reuseport=0\n"),
+    "getsockopt_passcred": (0, b"passcred=0\n"),
+    "getsockopt_timestamp": (0, b"timestamp=0\n"),
+    "getsockopt_nocheck": (0, b"nocheck=0\n"),
+    "getsockopt_priority": (0, b"priority=0\n"),
+    "fcntl_get_seals": (0, b"seals=1\n"),
 }
 
 FREESTANDING_FLAGS = (
