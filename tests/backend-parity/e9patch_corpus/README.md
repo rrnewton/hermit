@@ -90,6 +90,14 @@ thread and hang the run.
 | `sendmsg_socketpair` | `sendmsg`/`recvmsg` over an `AF_UNIX` socketpair |
 | `getsid_check` | `getsid(0)` (parity-only, host-specific sid) |
 | `getpgrp_check` | `getpgrp` (parity-only, host-specific pgrp) |
+| `sendto_socketpair` | `sendto`/`recvfrom` over an `AF_UNIX` socketpair |
+| `getsockname_unix` | `getsockname` reports `AF_UNIX` on a socketpair endpoint |
+| `getpeername_unix` | `getpeername` reports `AF_UNIX` on the connected peer |
+| `fallocate_memfd` | `fallocate` extends a memfd; size read back via `fstat` |
+| `fdatasync_memfd` | `fdatasync` flushes a memfd (return 0) |
+| `mincore_resident` | `mincore` queries a written anon page (return 0) |
+| `fadvise_memfd` | `fadvise64` `POSIX_FADV_NORMAL` hint on a memfd (return 0) |
+| `sysinfo_ok` | `sysinfo` fills the struct (return 0; fields not printed) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -187,6 +195,19 @@ byte-identical to golden ptrace. `getsid_check` and `getpgrp_check` emit
 host-specific session/process-group ids, so the driver asserts golden==e9patch
 parity only (`expected_stdout=None`); the other six pin exact deterministic
 stdout. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-10 new-family ratchet batch** (non-time,
+non-gated): socketpair datagram-style transfer (`sendto_socketpair`), socket
+address copyout (`getsockname_unix`, `getpeername_unix`), memfd size-extension
+(`fallocate_memfd`), data flush (`fdatasync_memfd`), page-residency query
+(`mincore_resident`), access hints (`fadvise_memfd`), and system summary
+(`sysinfo_ok`). These establish that e9patch preprocessing leaves
+`sendto`/`recvfrom`/`getsockname`/`getpeername`/`fallocate`/`fdatasync`/
+`mincore`/`fadvise64`/`sysinfo` byte-identical to golden ptrace. Each value is
+host-independent by construction: `getsockname_unix`/`getpeername_unix` print
+the `AF_UNIX` family constant (1); `fdatasync_memfd`/`mincore_resident`/
+`fadvise_memfd`/`sysinfo_ok` print the syscall return (0 on success) rather than
+any host-specific field. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
