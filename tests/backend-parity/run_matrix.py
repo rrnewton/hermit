@@ -139,6 +139,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "msync_writeback": (local / "msync_writeback.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -208,6 +209,11 @@ def case_catalog(
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "msync_writeback": (
+            [str(fixtures.binary("msync_writeback"))],
+            0,
+            b"msync ok=5\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
