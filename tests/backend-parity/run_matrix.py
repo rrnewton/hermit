@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "name_to_handle": (
+                local / "name_to_handle.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "name_to_handle_refusal": (
+            [str(fixtures.binary("name_to_handle"))],
+            0,
+            b"name_to_handle ok=3\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
