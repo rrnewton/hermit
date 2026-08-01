@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -52,6 +52,13 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The prctl-identity row round-trips the per-task name through a 16-byte buffer
+(`PR_SET_NAME` then `PR_GET_NAME`) and toggles the dumpable flag
+(`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`), requiring all five checks under ptrace
+and DBI. KVM is an explicit gap here: its `ElfExecutor` returns deterministic
+`ENOSYS` for `PR_SET_NAME` and `PR_GET_NAME`, so only the three dumpable checks
+pass. The gap is a missing prctl subcommand, not nondeterminism, and the KVM
+result stays byte-identical across strict runs.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -92,6 +99,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `prctl_identity` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
