@@ -105,6 +105,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mprotect_roundtrip": (0, b"mprotect=ok\n"),
     "getid_identity": (0, None),
     "getgroups_identity": (0, None),
+    # Round-4 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into heap/brk, memory advice, file-backed mmap, anonymous-file seek
+    # positioning, ioctl error paths, filesystem access checks, signal-
+    # disposition queries, and process hierarchy -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. getppid emits a
+    # host-specific virtualized pid, so it asserts golden==e9patch parity only.
+    "brk_grow": (0, b"brk=ok\n"),
+    "madvise_dontneed": (0, b"madvise=ok\n"),
+    "file_mmap_zero": (0, b"mzero=1\n"),
+    "memfd_seek": (0, b"end=4096\n"),
+    "ioctl_enotty": (0, b"enotty=-25\n"),
+    "access_devnull": (0, b"access=0\n"),
+    "sigaction_query": (0, b"sigaction=ok\n"),
+    "getppid_check": (0, None),
 }
 
 FREESTANDING_FLAGS = (
