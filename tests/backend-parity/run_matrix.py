@@ -139,6 +139,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "fcntl_owner": (local / "fcntl_owner.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +249,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "fcntl_owner": (
+            [str(fixtures.binary("fcntl_owner"))],
+            0,
+            b"fowner ok=6\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
