@@ -628,6 +628,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getxattr_devnull": (0, b"getxattr=1\n"),
     "lgetxattr_devnull": (0, b"lgetxattr=1\n"),
     "fgetxattr_devnull": (0, b"fgetxattr=1\n"),
+    # round-31: xattr write-side error paths, inert fd/query probes, and a
+    # non-blocking signal poll. The remove/lremove/fremovexattr guests remove a
+    # nonexistent user xattr from /dev/null, which always fails negative
+    # (-ENODATA or -EOPNOTSUPP by filesystem); each prints the boolean "returned
+    # an error", the write-side counterpart to round-30's get/lget/fgetxattr.
+    # timerfd_create_check creates but never arms a monotonic timer fd (no
+    # settime, no expiration, no timed waiter), printing a boolean valid-fd.
+    # clock_getres_monotonic reads the fixed CLOCK_MONOTONIC resolution (a kernel
+    # constant, not the current time), returning 0. rt_sigtimedwait_empty polls
+    # an empty signal set with a {0,0} timeout, returning -EAGAIN immediately
+    # without blocking or registering a timed waiter (same class as the
+    # zero-timeout poll/select guests). Every printed value is host-independent;
+    # none changes CPU scheduling, virtual time, or randomness. One candidate was
+    # DROPPED per no-false-parity #152: kcmp(312) returns -1 under golden hermit
+    # ptrace (native returns 0) because pid virtualization breaks the kernel's
+    # pid-based comparison, so it would encode a hermit limitation; the batch
+    # kept six of seven.
+    "removexattr_devnull": (0, b"removexattr=1\n"),
+    "lremovexattr_devnull": (0, b"lremovexattr=1\n"),
+    "fremovexattr_devnull": (0, b"fremovexattr=1\n"),
+    "timerfd_create_check": (0, b"timerfd=1\n"),
+    "clock_getres_monotonic": (0, b"clockres=0\n"),
+    "rt_sigtimedwait_empty": (0, b"sigtimedwait=-11\n"),
 }
 
 FREESTANDING_FLAGS = (
