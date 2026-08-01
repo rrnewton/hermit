@@ -139,6 +139,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "sync_file_range": (local / "sync_file_range.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +249,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "sync_file_range": (
+            [str(fixtures.binary("sync_file_range"))],
+            0,
+            b"syncrange ok=4\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
