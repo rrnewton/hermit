@@ -138,6 +138,10 @@ class Fixtures:
                 (),
             ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
+            "madvise_reclaim_hints": (
+                local / "madvise_reclaim_hints.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
                 ("-D_GNU_SOURCE",),
@@ -240,6 +244,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("cpuid_probe"))],
             0,
             b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n",
+        ),
+        "madvise_reclaim_hints": (
+            [str(fixtures.binary("madvise_reclaim_hints"))],
+            0,
+            b"madvise_reclaim ok=6\n",
         ),
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
