@@ -556,6 +556,33 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "ppoll_timeout_zero": (0, b"ppoll=0\n"),
     "epoll_pwait_timeout_zero": (0, b"epollpwait=0\n"),
     "getrusage_self": (0, b"getrusage=0\n"),
+    # Round-28 new-family ratchet batch (non-time, non-gated). Legacy/variant
+    # syscall numbers with no existing guest, each distinct from a covered
+    # newer counterpart: the LEGACY size-hint epoll_create(213) (vs
+    # epoll_create1(291)), the LEGACY single-argument eventfd(284) (vs
+    # eventfd2(290)) round-tripping a counter of 5, the LEGACY no-argument
+    # inotify_init(253) (vs inotify_init1(294)), and the LEGACY 3-argument
+    # signalfd(282) over an empty mask (vs signalfd4(289); no signal delivered).
+    # Also mbind(237) setting an anonymous page to MPOL_DEFAULT (the
+    # range-scoped NUMA-policy call complementing get_mempolicy/set_mempolicy),
+    # ioprio_set(251) setting this process's best-effort I/O priority (an
+    # I/O-priority accounting change, not a CPU-schedule change, complementing
+    # ioprio_get(252)), and the timespec-based epoll_pwait2(441) with a zero
+    # timeout on an empty interest set (returns 0 immediately, no timed waiter;
+    # distinct from the millisecond epoll_pwait(281)). Every printed value is
+    # host-independent: a boolean valid-fd (1), a fixed round-tripped counter
+    # (5), or the syscall return on success (0). The fd creators register no
+    # events; none of the batch changes CPU scheduling, virtual time, or
+    # randomness, so all are routine backend-parity coverage e9patch
+    # preprocessing must leave byte-identical to golden ptrace. Zero drops: all
+    # seven ran clean under golden hermit ptrace on the first attempt.
+    "epoll_create_legacy": (0, b"epollcreate=1\n"),
+    "eventfd_legacy": (0, b"eventfdlegacy=5\n"),
+    "inotify_init_legacy": (0, b"inotifyinit=1\n"),
+    "signalfd_legacy": (0, b"signalfdlegacy=1\n"),
+    "mbind_default": (0, b"mbind=0\n"),
+    "ioprio_set_self": (0, b"ioprioset=0\n"),
+    "epoll_pwait2_timeout_zero": (0, b"epollpwait2=0\n"),
 }
 
 FREESTANDING_FLAGS = (
