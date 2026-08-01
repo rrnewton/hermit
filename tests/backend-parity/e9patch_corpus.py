@@ -725,6 +725,28 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "fcntl_getsig": (0, b"getsig=0\n"),
     "mmap_noreserve": (0, b"noreserve=42\n"),
     "dup2_same_fd": (0, b"dup2same=3\n"),
+    # round-36: inert query/no-op probes widening coverage of already-supported
+    # socket, madvise, mmap, open, and wait families along new axes.
+    # getsockopt_domain and getsockopt_protocol read two more socket OPTIONS
+    # beyond SO_TYPE/SO_ERROR/SO_ACCEPTCONN: SO_DOMAIN (AF_UNIX -> 1) and
+    # SO_PROTOCOL (default AF_UNIX protocol -> 0). madvise_free exercises the
+    # MADV_FREE advice (distinct from madvise_dontneed's MADV_DONTNEED),
+    # asserting only the host-independent syscall return (0). mmap_stack adds the
+    # MAP_STACK flag path (distinct from mmap_anon/mmap_noreserve), confirming a
+    # sentinel byte (42) round-trips through the mapping. open_directory opens "/"
+    # with O_DIRECTORY (a distinct open-flag path from open_enoent/openat_devnull)
+    # and prints the lowest free fd (3). waitid_nochild is the waitid (247)
+    # analogue of wait4_nochild's ECHILD boundary, printing the negated errno
+    # (10 = ECHILD). Every printed value is host-independent (a queried constant,
+    # a fixed fd, a written-back sentinel, or a fixed errno); none blocks,
+    # perturbs scheduling, or touches randomness -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace.
+    "getsockopt_domain": (0, b"domain=1\n"),
+    "getsockopt_protocol": (0, b"protocol=0\n"),
+    "madvise_free": (0, b"madvfree=0\n"),
+    "mmap_stack": (0, b"mmapstack=42\n"),
+    "open_directory": (0, b"opendir=3\n"),
+    "waitid_nochild": (0, b"waitid=10\n"),
 }
 
 FREESTANDING_FLAGS = (

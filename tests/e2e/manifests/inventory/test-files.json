@@ -1148,6 +1148,42 @@
       "why": "tests/backend-parity/e9patch_corpus/dup2_same_fd.c is owned by tests/backend-parity/e9patch_corpus.py: covers the POSIX oldfd==newfd special case of dup2(33) on an already-open fd, a no-op that returns newfd without closing it (distinct from dup2_high's redirection to a fresh number); it opens /dev/null (fd 3), calls dup2(3,3), and prints the returned fd (3), which is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_domain.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_domain.c is owned by tests/backend-parity/e9patch_corpus.py: queries the address family of an AF_UNIX socketpair endpoint via getsockopt(55) SO_DOMAIN, a distinct socket OPTION from SO_TYPE/SO_ERROR/SO_ACCEPTCONN; the returned domain (AF_UNIX = 1) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_protocol.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_protocol.c is owned by tests/backend-parity/e9patch_corpus.py: queries the protocol of an AF_UNIX socketpair endpoint via getsockopt(55) SO_PROTOCOL, a distinct socket OPTION from SO_TYPE/SO_DOMAIN/SO_ERROR/SO_ACCEPTCONN; the returned protocol (0, the AF_UNIX default) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_free.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_free.c is owned by tests/backend-parity/e9patch_corpus.py: mmaps an anonymous page, touches it, then applies MADV_FREE via madvise(28), a distinct memory-advice from madvise_dontneed's MADV_DONTNEED; because MADV_FREE reclaims lazily it asserts only the host-independent syscall return (0). This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/mmap_stack.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/mmap_stack.c is owned by tests/backend-parity/e9patch_corpus.py: mmaps an anonymous page with the MAP_STACK flag, a distinct flag path from mmap_anon and mmap_noreserve, and confirms a sentinel byte (42) round-trips through the writable mapping before munmap; the printed byte is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/open_directory.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/open_directory.c is owned by tests/backend-parity/e9patch_corpus.py: opens the root directory with open(2) O_RDONLY|O_DIRECTORY, a distinct open-flag path from open_enoent/openat_devnull; \"/\" is always a directory so the call returns the lowest free fd (3), which is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/waitid_nochild.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/waitid_nochild.c is owned by tests/backend-parity/e9patch_corpus.py: calls waitid(247) with P_ALL and WEXITED when the process has no children, the waitid analogue of wait4_nochild's wait4 ECHILD boundary; it prints the negated errno (10 = ECHILD), a host-independent constant. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
