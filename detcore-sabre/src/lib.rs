@@ -100,6 +100,10 @@ fn require_virtual_rdtsc(result: Result<u64, Errno>) -> u64 {
     result.expect("SaBRe RDTSC virtualization failed")
 }
 
+fn require_virtual_cpuid(result: Result<reverie::CpuIdResult, Errno>) -> reverie::CpuIdResult {
+    result.expect("SaBRe CPUID virtualization failed")
+}
+
 fn is_post_load_bootstrap_random(syscall: &Syscall) -> bool {
     matches!(
         syscall,
@@ -254,6 +258,10 @@ impl reverie_sabre::Tool for Plugin {
     // TODO-HUMAN-REVIEW(PR-755): Review SaBRe RDTSC virtualization.
     fn rdtsc(&self) -> u64 {
         require_virtual_rdtsc(self.adapter.handle_rdtsc())
+    }
+
+    fn cpuid(&self, eax: u32, ecx: u32) -> reverie::CpuIdResult {
+        require_virtual_cpuid(self.adapter.handle_cpuid(eax, ecx))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

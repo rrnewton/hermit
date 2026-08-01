@@ -65,28 +65,29 @@ Snapshot:
 - Log level: INFO for verification. Every cell was bounded by its manifest
   timeout. `race.sh` was not run.
 
-The ptrace strict-verify plan has 194 cells. Before this ratchet, SaBRe was
-enabled for 22 (11.3%). This ratchet evaluates 157 previously disabled C
-candidates:
+The baseline sweep's ptrace strict-verify plan had 194 cells. The current plan
+has 195 after `determinism-stress-c/producer-consumer` landed as a ptrace-only
+scheduling cell. Before this ratchet, SaBRe was enabled for 22 (11.3%). This
+ratchet evaluates 157 previously disabled C candidates:
 
 | Result | Cells | Meaning |
 | --- | ---: | --- |
-| SaBRe L2 and ptrace exit/stdout parity | 109 | Enabled by this ratchet |
+| SaBRe L2 and ptrace exit/stdout parity | 110 | Enabled by this ratchet |
 | SaBRe L2, but ptrace output differs | 18 | Remains disabled |
-| SaBRe L2 failed or timed out | 30 | Remains disabled |
+| SaBRe L2 failed or timed out | 29 | Remains disabled |
 
-The resulting plan enables SaBRe for 131/194 cells (67.5%): seven blocking CI
-cells and 124 manual cells. This meets the B3 corpus-count threshold (at least
+The resulting plan enables SaBRe for 132/195 cells (67.7%): seven blocking CI
+cells and 125 manual cells. This meets the B3 corpus-count threshold (at least
 50% of the ptrace strict-verify corpus). It does not establish B4, L3 memory
 determinism, L4 stress hardening, or support for every workload in a subsystem.
 
-The 109 newly enabled cells are grouped as follows:
+The 110 newly enabled cells are grouped as follows:
 
 | Manifest bucket | New cells |
 | --- | ---: |
 | `c-programs` | 99 |
 | `determinism-stress-c` | 7 |
-| `backend-parity-c` | 1 |
+| `backend-parity-c` | 2 |
 | `bin-c` | 1 |
 | `chaos-c` verify mode | 1 |
 
@@ -102,6 +103,13 @@ file and procfs metadata, memory mapping, timers, PIDFD, poll, netlink and UNIX
 socket autobind, TCP info, syscall-refusal semantics, pipes, fork trees, shared
 mappings, and signal ordering. These are probe-specific claims; for example,
 some fork and signal probes pass while other probes in those categories do not.
+
+The incremental `backend-parity-c/cpuid-probe` qualification routes SaBRe
+CPUID instructions through the existing shared Detcore fixed table. The loader
+preserves the architectural EAX/ECX inputs, EAX/EBX/ECX/EDX outputs, all other
+general-purpose registers, and RFLAGS across its plugin callback. The cell
+passes ptrace and SaBRe L2 with byte-identical guest output. This covers CPUID;
+it does not close the separate RDTSCP or cross-backend clock trajectories.
 
 ## Known gaps
 
@@ -133,7 +141,6 @@ The following 30 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
 
 ```text
-backend-parity-c/cpuid-probe
 bin-c/robust-futex-test
 c-programs/arch-prctl-determinism
 c-programs/clone
@@ -164,6 +171,11 @@ shared-futex-c/qemu-init
 shared-futex-c/qemu-net-init
 util-c/pmu-skid
 ```
+
+The post-sweep `determinism-stress-c/producer-consumer` cell is also disabled
+for SaBRe. Its multi-producer/consumer condvar and futex schedule belongs to the
+owner-gated scheduling lane, so this non-gated ratchet does not evaluate or
+claim it.
 
 Additional backend-wide limits:
 
