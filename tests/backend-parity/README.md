@@ -9,19 +9,19 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
-verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+memory-layout behavior. It also deterministically refuses io_uring, listmount,
+and `copy_file_range`, verifies that epoll remains available as a fallback, and
+refuses process-memory reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -48,17 +48,24 @@ The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
 recognizes the syscall and returns `EINVAL` for the same request.
+The copy_file_range row asks the kernel to copy a six-byte source file into an
+empty destination. Detcore implements the in-kernel copy on no backend, so every
+backend must fail the call deterministically with `ENOSYS` and leave the
+destination empty, even though the same call copies the bytes outside Hermit. It
+verifies the emptiness through the destination's `fstat` size and derives its
+content checksum by reading the source back, independent of the refused copy.
 The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
-process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+`copy_file_range` refusal, process-memory read/write refusal, io_uring refusal
+with epoll fallback, repeatable heap growth, and private/shared anonymous mapping
+layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
@@ -92,6 +99,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `copy_file_range_refusal` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |

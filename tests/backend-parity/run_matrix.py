@@ -137,6 +137,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "copy_file_range_refusal": (
+                local / "copy_file_range_refusal.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -235,6 +239,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "copy_file_range_refusal": (
+            [str(fixtures.binary("copy_file_range_refusal"))],
+            0,
+            b"copy_file_range_refusal src=6 dst=0 checksum=597 ok=3\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
