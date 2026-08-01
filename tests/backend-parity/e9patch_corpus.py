@@ -813,6 +813,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_nocheck": (0, b"nocheck=0\n"),
     "getsockopt_priority": (0, b"priority=0\n"),
     "fcntl_get_seals": (0, b"seals=1\n"),
+    # round-41: two new fcntl OPs, three more getsockopt options, and AF_INET
+    # socket creation. fcntl_getlease_memfd reads F_GETLEASE on a lease-free memfd
+    # (-> F_UNLCK=2); fcntl_getownex_pipe reads F_GETOWN_EX on an unowned pipe
+    # (owner type -> 0, a struct-copyout OP distinct from scalar F_GETOWN).
+    # getsockopt_linger reads struct linger (l_onoff -> 0); getsockopt_sndbuf and
+    # getsockopt_rcvbuf print only the host-independent invariant that a fresh
+    # socket has positive buffers (-> 1); getsockopt_peekoff reads SO_PEEK_OFF,
+    # disabled by default (-> -1, a negative-default option). socket_inet_stream
+    # and socket_inet_dgram create AF_INET TCP/UDP sockets that take the lowest
+    # free fd (-> 3) and never bind or connect, so nothing communicates. Every
+    # printed value is a queried constant with no time, randomness, PID, or
+    # host-variable input, so e9patch preprocessing must leave all eight
+    # byte-identical to golden ptrace.
+    "fcntl_getlease_memfd": (0, b"getlease=2\n"),
+    "fcntl_getownex_pipe": (0, b"getownex=0\n"),
+    "getsockopt_linger": (0, b"linger=0\n"),
+    "getsockopt_sndbuf": (0, b"sndbuf=1\n"),
+    "getsockopt_rcvbuf": (0, b"rcvbuf=1\n"),
+    "getsockopt_peekoff": (0, b"peekoff=-1\n"),
+    "socket_inet_stream": (0, b"inetstream=3\n"),
+    "socket_inet_dgram": (0, b"inetdgram=3\n"),
 }
 
 FREESTANDING_FLAGS = (
