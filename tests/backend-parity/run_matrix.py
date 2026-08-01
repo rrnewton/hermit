@@ -137,6 +137,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "bind_getsockname": (local / "bind_getsockname.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -195,6 +196,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "bind_getsockname": (
+            [str(fixtures.binary("bind_getsockname"))],
+            0,
+            b"bind_name ok=6\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],

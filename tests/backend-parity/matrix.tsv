@@ -10,6 +10,7 @@ io_uring_fallback	pass	pass	pass	-	-
 listmount_unavailable	pass	pass	pass	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-
 process_vm_writev_refusal	pass	pass	pass	-	-
+bind_getsockname	pass	pass	pass	-	-
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
