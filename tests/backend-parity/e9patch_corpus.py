@@ -747,6 +747,26 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mmap_stack": (0, b"mmapstack=42\n"),
     "open_directory": (0, b"opendir=3\n"),
     "waitid_nochild": (0, b"waitid=10\n"),
+    # round-37: inert query/no-op probes on more uncovered socket and lseek axes.
+    # getsockopt_reuseaddr and getsockopt_broadcast read two more socket OPTIONS
+    # (SO_REUSEADDR, SO_BROADCAST) that are unset on a fresh socketpair endpoint
+    # -> 0. lseek_devnull_end seeks /dev/null to SEEK_END: a character device whose
+    # seek is a no-op reporting offset 0 (distinct from lseek_pipe's ESPIPE and the
+    # memfd seekable-file guests). Every printed value is host-independent (a
+    # queried constant or a device no-op offset); none blocks, perturbs
+    # scheduling, or touches randomness -- all families e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    #
+    # DROPPED (no false parity, hermit #152): prctl_child_subreaper
+    # (PR_GET_CHILD_SUBREAPER=37), prctl_tsc (PR_GET_TSC=25), and prctl_mce_kill_get
+    # (PR_MCE_KILL_GET=34) each return a value natively (0/1/2) but golden hermit
+    # ptrace returns an ERROR for these prctl subcommands (Detcore does not support
+    # them), so golden diverges from native. The e9-vs-golden parity check passes
+    # (both error identically) but the golden-vs-native truth gate fails, so these
+    # are excluded rather than admitted as false parity.
+    "getsockopt_reuseaddr": (0, b"reuseaddr=0\n"),
+    "getsockopt_broadcast": (0, b"broadcast=0\n"),
+    "lseek_devnull_end": (0, b"devnullend=0\n"),
 }
 
 FREESTANDING_FLAGS = (
