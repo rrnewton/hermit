@@ -583,6 +583,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mbind_default": (0, b"mbind=0\n"),
     "ioprio_set_self": (0, b"ioprioset=0\n"),
     "epoll_pwait2_timeout_zero": (0, b"epollpwait2=0\n"),
+    # Round-29 new-family ratchet batch (non-time, non-gated). Syscalls and
+    # prctl/credential operations with no existing guest: sched_yield(24), which
+    # with a single runnable guest thread is a no-op that returns immediately and
+    # changes no scheduling decision (a voluntary-yield hint, not a DetCore
+    # scheduling change); three new prctl QUERY operations distinct from every
+    # existing prctl guest -- PR_CAPBSET_READ(23) for CAP_CHOWN, PR_GET_THP_DISABLE
+    # (42), each reduced to a boolean "query succeeded" (return >= 0) because the
+    # raw bit/flag is host/config dependent; and the setfsuid(122)/setfsgid(123)
+    # credential queries in their setfs*(-1) no-op forms, which change nothing and
+    # return the previous fs id, reduced to a boolean "call succeeded" since the
+    # previous id is host-dependent. Every printed value is host-independent: the
+    # syscall return on success (yield=0) or a boolean. None changes CPU
+    # scheduling, virtual time, or randomness, so all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace. Two candidates were probed and DROPPED per no-false-parity #152:
+    # prctl PR_GET_NO_NEW_PRIVS(39) and rseq(334) both return -ENOSYS (-38) under
+    # golden hermit ptrace, so keeping them would encode a hermit limitation
+    # rather than parity; the batch kept five of seven.
+    "sched_yield_noop": (0, b"yield=0\n"),
+    "prctl_capbset_read": (0, b"capbset=1\n"),
+    "prctl_thp_disable": (0, b"thpdisable=1\n"),
+    "setfsuid_noop": (0, b"setfsuid=1\n"),
+    "setfsgid_noop": (0, b"setfsgid=1\n"),
 }
 
 FREESTANDING_FLAGS = (
