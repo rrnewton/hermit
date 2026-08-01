@@ -139,6 +139,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "sysv_ipc_refusal": (local / "sysv_ipc_refusal.c", ()),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +249,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "sysv_ipc_refusal": (
+            [str(fixtures.binary("sysv_ipc_refusal"))],
+            0,
+            b"sysvipc ok=3\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
