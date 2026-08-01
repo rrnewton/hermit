@@ -1442,6 +1442,12 @@
       "why": "tests/e2e/language-runtimes/ruby.rb is owned by tests/e2e/lib/language-runtimes/run.sh: The `ruby.rb` source is the rb runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
     },
     {
+      "path": "tests/e2e/language-runtimes/tcl-rand-clock.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/language-runtimes/tcl-rand-clock.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "path": "tests/e2e/lib/applications/build_tools.sh",
       "disposition": "suite-helper",
       "runner": "tests/e2e/lib/applications/run_all.sh",
