@@ -38,6 +38,7 @@
     {"test":"language-runtimes/python-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/coreutils-shuf-pipeline","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"sabre"},
     {"test":"system-utils/random-device","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},

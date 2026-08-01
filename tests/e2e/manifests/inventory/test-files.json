@@ -1766,6 +1766,12 @@
       "why": "tests/e2e/system-utils/README.md is owned by maintainers of tests/e2e/system-utils: This README records the scope, invocation, and assumptions of `tests/e2e/system-utils`. It is retained as operator documentation and contains no executable guest contract."
     },
     {
+      "path": "tests/e2e/system-utils/coreutils-shuf-pipeline.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/coreutils-shuf-pipeline.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; a multi-stage coreutils pipeline whose shuf/sort -R entropy varies natively and is determinized under Hermit strict verification"
+    },
+    {
       "path": "tests/e2e/system-utils/date-nanoseconds.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
