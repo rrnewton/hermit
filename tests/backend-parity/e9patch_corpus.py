@@ -681,6 +681,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "gettimeofday_check": (0, b"gettimeofday=0\n"),
     "sched_getattr_self": (0, b"schedgetattr=0\n"),
     "sched_setaffinity_self": (0, b"setaffinity=0\n"),
+    # round-34: more inert query/no-op probes on uncovered boundaries.
+    # timer_create_gettime creates a POSIX per-process timer (222) and queries it
+    # unarmed via timer_gettime (224), returning 0 with a zeroed itimerspec that is
+    # not printed. timerfd_gettime_unarmed creates a timerfd and reads it unarmed
+    # via timerfd_gettime (287) — return 0, zeroed spec not printed — distinct from
+    # timerfd_create_check (creation only). futex_wait_mismatch issues
+    # futex(FUTEX_WAIT) with an expected value that does not match the word, so the
+    # kernel returns -EAGAIN (-11) immediately WITHOUT blocking or registering a
+    # timed waiter. wait4_nochild calls wait4(-1,...,WNOHANG) with no children,
+    # returning -ECHILD (-10) immediately. membarrier_query issues
+    # membarrier(CMD_QUERY) and prints only success as a boolean (1); the supported-
+    # command bitmask is host-dependent and not emitted. getrusage_thread reads
+    # RUSAGE_THREAD (a distinct who from getrusage_self's RUSAGE_SELF), returning 0
+    # with the timing-dependent rusage fields never printed. Every printed value is
+    # host-independent and none blocks, perturbs scheduling, or touches randomness.
+    "timer_create_gettime": (0, b"timergettime=0\n"),
+    "timerfd_gettime_unarmed": (0, b"timerfdgettime=0\n"),
+    "futex_wait_mismatch": (0, b"futexwait=-11\n"),
+    "wait4_nochild": (0, b"wait4=-10\n"),
+    "membarrier_query": (0, b"membarrierquery=1\n"),
+    "getrusage_thread": (0, b"getrusagethread=0\n"),
 }
 
 FREESTANDING_FLAGS = (
