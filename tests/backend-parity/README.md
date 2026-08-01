@@ -9,9 +9,9 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 22/23 number above is deliberately
@@ -20,8 +20,9 @@ The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
-verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+verifies that epoll remains available as a fallback, refuses process-memory
+reads and writes with deterministic `EPERM`, and refuses the `no_new_privs`
+prctl with deterministic `ENOSYS`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,12 +53,22 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The `no_new_privs` refusal row exercises `PR_GET_NO_NEW_PRIVS` and
+`PR_SET_NO_NEW_PRIVS`, the prctl operations that manage the sticky bit
+suppressing privilege gains across `execve`. Detcore does not model the execve
+privilege lattice, so all three backends refuse the query and the set uniformly
+with `ENOSYS` rather than accepting a privilege-semantics change they cannot
+honor. This is a uniform deterministic non-support refusal, not a
+determinization of a nondeterminism source: outside Hermit the full round-trip
+succeeds (query 0, set 0, next query 1), so the uniform `ENOSYS` is Hermit's
+deterministic disposition, not a host limitation.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
-process-memory read/write refusal, io_uring refusal with epoll fallback,
+process-memory read/write refusal, `no_new_privs` prctl refusal, io_uring
+refusal with epoll fallback,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
@@ -92,6 +103,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `no_new_privs_refusal` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
