@@ -322,6 +322,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "sched_priority_max": (0, b"priomax=0\n"),
     "sched_getscheduler_check": (0, b"sched=0\n"),
     "sync_all": (0, b"sync=0\n"),
+    # Round-17 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into fd-flag/ownership fcntl ops (F_SETFD+F_GETFD FD_CLOEXEC round-trip
+    # -> boolean, F_GETOWN on a pipe -> 0 no owner, F_GETPIPE_SZ -> boolean
+    # size>0), two working ioctls beyond round-4's TCGETS/ENOTTY (FIONREAD on a
+    # pipe holding 3 bytes -> 3, FIONBIO set-nonblocking -> 0), the semaphore
+    # eventfd flag path (EFD_SEMAPHORE read returns 1, distinct from round-6's
+    # plain eventfd), the AF_UNIX/SOCK_DGRAM socketpair round-trip (distinct
+    # from round-7's SOCK_STREAM pair), and an abstract-namespace bind (leading
+    # NUL, no filesystem entry) -> 0. Every printed value is host-independent:
+    # the syscall return on success (0), a boolean (cloexec bit / pipe size>0),
+    # a fixed readable-byte count (3), a fixed semaphore decrement (1), or fixed
+    # round-tripped text ("hi"). The exact pipe capacity, owner pid, and fd
+    # numbers are read/used but never printed. All are ordinary fd/socket/ioctl
+    # families e9patch preprocessing must leave byte-identical to golden ptrace;
+    # none changes scheduling, time, or randomness.
+    "fcntl_setfd_cloexec": (0, b"setfd=1\n"),
+    "fcntl_getown_pipe": (0, b"getown=0\n"),
+    "ioctl_fionread_pipe": (0, b"fionread=3\n"),
+    "ioctl_fionbio_pipe": (0, b"fionbio=0\n"),
+    "eventfd_semaphore": (0, b"efdsem=1\n"),
+    "socketpair_dgram": (0, b"sp=hi\n"),
+    "bind_abstract": (0, b"bind=0\n"),
+    "fcntl_getpipe_sz": (0, b"pipesz=1\n"),
 }
 
 FREESTANDING_FLAGS = (

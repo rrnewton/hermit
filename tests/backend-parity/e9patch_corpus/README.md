@@ -144,6 +144,14 @@ thread and hang the run.
 | `sched_priority_max` | `sched_get_priority_max(SCHED_OTHER)` (constant 0) |
 | `sched_getscheduler_check` | `sched_getscheduler(0)` (`SCHED_OTHER`=0) |
 | `sync_all` | no-argument `sync(2)` (return 0) |
+| `fcntl_setfd_cloexec` | `fcntl` `F_SETFD`+`F_GETFD` `FD_CLOEXEC` round-trip (bit set => 1) |
+| `fcntl_getown_pipe` | `fcntl` `F_GETOWN` on a pipe (no owner => 0) |
+| `ioctl_fionread_pipe` | `ioctl` `FIONREAD` on a pipe holding 3 bytes (count 3) |
+| `ioctl_fionbio_pipe` | `ioctl` `FIONBIO` set-nonblocking on a pipe (return 0) |
+| `eventfd_semaphore` | `eventfd2` `EFD_SEMAPHORE` read after write 5 (returns 1) |
+| `socketpair_dgram` | `AF_UNIX`/`SOCK_DGRAM` socketpair round-trip (`hi`) |
+| `bind_abstract` | `bind` `AF_UNIX` abstract-namespace address (return 0) |
+| `fcntl_getpipe_sz` | `fcntl` `F_GETPIPE_SZ` on a pipe (size > 0 => 1) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -361,6 +369,29 @@ change. An eighth candidate, `prctl` `PR_GET_CHILD_SUBREAPER`, was **dropped**:
 it returns `-ENOSYS` (-38) under golden hermit ptrace, so keeping it would be a
 false-parity claim (#152) — the batch kept seven of eight. All remain
 freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-17 new-family ratchet batch** (non-time,
+non-gated): three more `fcntl` operations beyond the F_GETFD/F_DUPFD_CLOEXEC/
+F_SETFL/F_GETLK/F_SETLK guests of earlier rounds — the `F_SETFD`+`F_GETFD`
+`FD_CLOEXEC` round-trip (`fcntl_setfd_cloexec`), `F_GETOWN` SIGIO-owner query on
+a pipe (`fcntl_getown_pipe`), and `F_GETPIPE_SZ` pipe-capacity query
+(`fcntl_getpipe_sz`); two working `ioctl`s beyond round-4's `TCGETS`/`ENOTTY`
+case — `FIONREAD` on a pipe holding three bytes (`ioctl_fionread_pipe`) and
+`FIONBIO` set-nonblocking (`ioctl_fionbio_pipe`); the semaphore eventfd flag
+path (`eventfd_semaphore`, `EFD_SEMAPHORE` reads decrement and return 1,
+distinct from round-6's plain `eventfd`); the `AF_UNIX`/`SOCK_DGRAM` socketpair
+round-trip (`socketpair_dgram`, distinct from round-7's `SOCK_STREAM` pair); and
+an abstract-namespace `bind` (`bind_abstract`, leading NUL, no filesystem
+entry). These establish that e9patch preprocessing leaves the
+`fcntl`/`ioctl`/`eventfd2`/`socketpair`/`bind` families byte-identical to golden
+ptrace. Every printed value is host-independent — the syscall return on success
+(0), a boolean (the `FD_CLOEXEC` bit / pipe size > 0), a fixed readable-byte
+count (3), a fixed semaphore decrement (1), or fixed round-tripped text
+(`hi`); the exact pipe capacity, owner pid, and fd numbers are read or used but
+never printed. None changes scheduling, time, or randomness, so all are routine
+backend-parity coverage. All eight passed golden ptrace on the first attempt,
+so the batch kept eight of eight. All remain freestanding
+(`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
