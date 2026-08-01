@@ -127,6 +127,12 @@ pub struct RunOpts {
     #[clap(long, value_name = "RCBS")]
     skid_margin: Option<u64>,
 
+    /// Continue after a PMU interrupt arrives past its precise RCB target. The
+    /// timer event is delivered late and execution remains valid, but that run
+    /// may not be deterministic.
+    #[clap(long)]
+    no_exit_on_overskid: bool,
+
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
@@ -443,6 +449,9 @@ impl fmt::Display for RunOpts {
         }
         if let Some(skid_margin) = self.skid_margin {
             write!(f, " --skid-margin={skid_margin}")?;
+        }
+        if self.no_exit_on_overskid {
+            write!(f, " --no-exit-on-overskid")?;
         }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
@@ -1025,7 +1034,7 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
         assert!(
             error
                 .to_string()
-                .contains("requires a ptrace-backed backend"),
+                .contains("require a ptrace-backed backend"),
             "unexpected {backend} error: {error}"
         );
     }
@@ -1045,6 +1054,34 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
         format!("{opts}"),
         " --backend=liteinst --skid-margin=500 -- fakeprog"
     );
+}
+
+#[test]
+fn no_exit_on_overskid_parses_and_round_trips() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--no-exit-on-overskid", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert!(opts.no_exit_on_overskid);
+    assert_eq!(format!("{opts}"), " --no-exit-on-overskid -- fakeprog");
+}
+
+#[test]
+fn no_exit_on_overskid_rejects_non_ptrace_backed_backends() {
+    for backend in ["dbi", "kvm", "sabre"] {
+        let mut opts = RunOpts::parse_from([
+            "fakehermit",
+            &format!("--backend={backend}"),
+            "--no-exit-on-overskid",
+            "fakeprog",
+        ]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("require a ptrace-backed backend"),
+            "unexpected {backend} error: {error}"
+        );
+    }
 }
 
 #[test]
@@ -1582,7 +1619,7 @@ impl RunOpts {
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let backend = self.selected_backend();
-        if self.skid_margin.is_some()
+        if (self.skid_margin.is_some() || self.no_exit_on_overskid)
             && (self.namespace_only
                 || !matches!(
                     backend,
@@ -1590,7 +1627,7 @@ impl RunOpts {
                 ))
         {
             anyhow::bail!(
-                "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
+                "--skid-margin and --no-exit-on-overskid configure the Reverie ptrace PMU timer and require a ptrace-backed backend"
             );
         }
         let config = &mut self.det_opts.det_config;
@@ -1746,13 +1783,19 @@ impl RunOpts {
     }
 
     fn install_pmu_config(&self) -> Result<(), Error> {
-        let Some(skid_margin) = self.skid_margin else {
+        if self.skid_margin.is_none() && !self.no_exit_on_overskid {
             return Ok(());
-        };
-        let config = reverie_ptrace::PmuConfig::new().with_skid_margin_override(skid_margin);
+        }
+        let mut config = reverie_ptrace::PmuConfig::new();
+        if let Some(skid_margin) = self.skid_margin {
+            config = config.with_skid_margin_override(skid_margin);
+        }
+        if self.no_exit_on_overskid {
+            config = config.with_exit_on_overskid(false);
+        }
         reverie_ptrace::set_pmu_config(config).map_err(|_| {
             anyhow::anyhow!(
-                "Reverie PMU configuration was initialized before --skid-margin could be applied"
+                "Reverie PMU configuration was initialized before command-line timer policy could be applied"
             )
         })
     }
