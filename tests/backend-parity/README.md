@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -44,6 +44,18 @@ The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
+The pipe-capacity row exercises the `F_GETPIPE_SZ`/`F_SETPIPE_SZ` fcntl command
+family — the pipe-buffer sizing namespace, distinct from the descriptor-flag and
+status-flag namespaces. It reads the default capacity, shrinks the buffer to one
+page (shrinking is always permitted for an unprivileged process, whereas growing
+a pipe can require `CAP_SYS_RESOURCE`), confirms the shrunk size does not exceed
+the default, and confirms a follow-up `F_GETPIPE_SZ` echoes the size the shrink
+returned. It asserts only these relational properties and never prints an
+absolute capacity, so the golden byte stream is portable across hosts regardless
+of their default pipe size or `pipe-max-size` limit. ptrace and DBI implement the
+command family; KVM's `ElfExecutor` does not model pipe-buffer resizing and
+returns a deterministic error for both `F_GETPIPE_SZ` and `F_SETPIPE_SZ`, so it
+remains an explicit gap.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -92,6 +104,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `pipe_capacity` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
