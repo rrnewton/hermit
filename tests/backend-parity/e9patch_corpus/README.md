@@ -66,6 +66,14 @@ thread and hang the run.
 | `eventfd_rw` | eventfd: counter written and read back |
 | `rt_sigpending_empty` | signal pending: `rt_sigpending` empty set |
 | `fchmod_memfd` | fchmod: memfd mode set to `0644` and read back |
+| `dup2_high` | `dup2` honors a caller-chosen high fd (20) |
+| `chdir_root` | `chdir("/")` then `getcwd` = `/` (host-independent) |
+| `fchdir_root` | `fchdir` into a root dir fd then `getcwd` = `/` |
+| `fsync_memfd` | `fsync` of a memfd returns 0 |
+| `socketpair_rw` | `AF_UNIX` `socketpair` two-byte round-trip |
+| `flock_memfd` | `flock` `LOCK_EX` then `LOCK_UN` both succeed |
+| `pipe_nonblock_eagain` | nonblocking read of an empty pipe fails `EAGAIN` (-11) |
+| `getpgid_check` | `getpgid(0)` (parity-only, host-specific pgid) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -125,6 +133,19 @@ and `fchmod` (`fchmod_memfd`). These establish that e9patch preprocessing leaves
 deterministic stdout. `copy_file_range` was intentionally *not* added: hermit
 returns `-ENOSYS` for it, so it exercises no working feature and would only
 encode a hermit limitation. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-7 new-family ratchet batch** (non-time,
+non-gated): `dup2` fd placement (`dup2_high`), working-directory syscalls tested
+against the host-independent root (`chdir_root`, `fchdir_root`, both reading
+back `getcwd` = `/` rather than a host-specific path), `fsync` (`fsync_memfd`),
+`AF_UNIX` `socketpair` data transfer (`socketpair_rw`), `flock` (`flock_memfd`),
+the nonblocking empty-pipe errno path (`pipe_nonblock_eagain` `EAGAIN`), and
+`getpgid` (`getpgid_check`). These establish that e9patch preprocessing leaves
+`dup2`/`chdir`/`fchdir`/`getcwd`/`fsync`/`socketpair`/`flock`/nonblocking
+`read`/`getpgid` byte-identical to golden ptrace. `getpgid_check` emits a
+host-specific process-group id, so the driver asserts golden==e9patch parity
+only (`expected_stdout=None`); the other seven pin exact deterministic stdout.
+All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

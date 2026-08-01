@@ -146,6 +146,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "eventfd_rw": (0, b"eventfd=5\n"),
     "rt_sigpending_empty": (0, b"pending=0\n"),
     "fchmod_memfd": (0, b"chmod=ok\n"),
+    # Round-7 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into dup2 fd placement, chdir/fchdir + getcwd against the host-independent
+    # root, fsync, AF_UNIX socketpair data transfer, flock, the nonblocking
+    # empty-pipe errno path, and getpgid -- all families e9patch preprocessing
+    # must leave byte-identical to golden ptrace. getpgid emits a host-specific
+    # process-group id, so it asserts golden==e9patch parity only.
+    "dup2_high": (0, b"dup2=20\n"),
+    "chdir_root": (0, b"cwd=/\n"),
+    "fchdir_root": (0, b"cwd=/\n"),
+    "fsync_memfd": (0, b"fsync=ok\n"),
+    "socketpair_rw": (0, b"sp=hi\n"),
+    "flock_memfd": (0, b"flock=ok\n"),
+    "pipe_nonblock_eagain": (0, b"eagain=-11\n"),
+    "getpgid_check": (0, None),
 }
 
 FREESTANDING_FLAGS = (
