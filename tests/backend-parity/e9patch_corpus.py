@@ -133,6 +133,19 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "readv_zero": (0, b"readv=16\n"),
     "umask_set": (0, b"umask=18\n"),
     "fstat_size_memfd": (0, b"size=5\n"),
+    # Round-6 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into *at-suffixed stat/access syscalls, the sendfile zero-copy transfer,
+    # positioned I/O (pwrite64/pread64), eventfd counters, signal-pending
+    # queries, and fchmod -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. (copy_file_range was intentionally not
+    # added: hermit returns -ENOSYS for it, so it exercises no working feature.)
+    "newfstatat_devnull": (0, b"fstatat_chr=1\n"),
+    "faccessat_devnull": (0, b"faccessat=0\n"),
+    "sendfile_memfd": (0, b"sent=5\n"),
+    "pwrite_pread_memfd": (0, b"pread=abc\n"),
+    "eventfd_rw": (0, b"eventfd=5\n"),
+    "rt_sigpending_empty": (0, b"pending=0\n"),
+    "fchmod_memfd": (0, b"chmod=ok\n"),
 }
 
 FREESTANDING_FLAGS = (

@@ -59,6 +59,13 @@ thread and hang the run.
 | `readv_zero` | scatter read: `readv` of `/dev/zero` into two iovecs |
 | `umask_set` | umask: `umask` round-trips the set value (022) |
 | `fstat_size_memfd` | stat size: `fstat` reports a memfd's `st_size` |
+| `newfstatat_devnull` | fstatat: `newfstatat(/dev/null)` reports `S_IFCHR` |
+| `faccessat_devnull` | faccessat: `faccessat(/dev/null, R_OK)` succeeds |
+| `sendfile_memfd` | sendfile: zero-copy five bytes between two memfds |
+| `pwrite_pread_memfd` | positioned I/O: `pwrite64`/`pread64` at offset 10 |
+| `eventfd_rw` | eventfd: counter written and read back |
+| `rt_sigpending_empty` | signal pending: `rt_sigpending` empty set |
+| `fchmod_memfd` | fchmod: memfd mode set to `0644` and read back |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -106,6 +113,18 @@ byte-identical to golden ptrace. `getcwd_check` emits a host-specific working
 directory, so the driver asserts golden==e9patch parity only
 (`expected_stdout=None`); the other seven pin exact deterministic stdout. All
 remain freestanding (`candidate_sites > 0`).
+
+The final seven guests are the **round-6 new-family ratchet batch** (non-time,
+non-gated): `*at`-suffixed stat/access syscalls (`newfstatat_devnull`,
+`faccessat_devnull`), the `sendfile` zero-copy transfer (`sendfile_memfd`),
+positioned I/O (`pwrite_pread_memfd`, `pwrite64`/`pread64` at a fixed offset),
+eventfd counters (`eventfd_rw`), signal-pending queries (`rt_sigpending_empty`),
+and `fchmod` (`fchmod_memfd`). These establish that e9patch preprocessing leaves
+`newfstatat`/`faccessat`/`sendfile`/`pwrite64`/`pread64`/`eventfd2`/
+`rt_sigpending`/`fchmod` byte-identical to golden ptrace, all pinning exact
+deterministic stdout. `copy_file_range` was intentionally *not* added: hermit
+returns `-ENOSYS` for it, so it exercises no working feature and would only
+encode a hermit limitation. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
