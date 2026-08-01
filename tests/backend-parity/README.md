@@ -9,19 +9,22 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+reads and writes with deterministic `EPERM`. It creates a `SOCK_CLOEXEC |
+SOCK_NONBLOCK` `AF_UNIX` socket pair and confirms the creation flags and the
+`SO_TYPE`, `SO_DOMAIN`, and `SO_ACCEPTCONN` socket options introspect
+identically to the ptrace reference. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,6 +55,16 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The socketpair-flags row creates an `AF_UNIX` socket pair with the combined
+`SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK` type, then checks that the
+`SOCK_CLOEXEC` flag surfaces as `FD_CLOEXEC` on both ends, that `SOCK_NONBLOCK`
+surfaces as `O_NONBLOCK`, and that `getsockopt` reports `SO_TYPE == SOCK_STREAM`,
+`SO_DOMAIN == AF_UNIX`, and `SO_ACCEPTCONN == 0`. Every value is a property of
+the guest's own creation arguments and no byte is transferred, so there is no
+blocking wait to schedule and the answer is host-independent. ptrace and DBI
+both report `socketpair ok=7`. KVM remains an explicit gap: its `ElfExecutor`
+implements `getsockopt` for `SO_TYPE` but returns `ENOPROTOOPT` for `SO_DOMAIN`
+and `SO_ACCEPTCONN`, so it observes `ok=5` instead of `ok=7`.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -84,6 +97,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
+| `socketpair_flags` | pass | pass | gap |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |

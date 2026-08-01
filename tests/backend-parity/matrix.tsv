@@ -10,6 +10,7 @@ io_uring_fallback	pass	pass	pass	-	-
 listmount_unavailable	pass	pass	pass	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-
 process_vm_writev_refusal	pass	pass	pass	-	-
+socketpair_flags	pass	pass	gap	-	KVM ElfExecutor getsockopt implements SO_TYPE but returns ENOPROTOOPT for SO_DOMAIN and SO_ACCEPTCONN, so the socket-introspection contract observes ok=5 instead of ok=7
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
