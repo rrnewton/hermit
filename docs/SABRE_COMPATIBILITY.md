@@ -65,8 +65,9 @@ Snapshot:
 - Log level: INFO for verification. Every cell was bounded by its manifest
   timeout. `race.sh` was not run.
 
-The ptrace strict-verify plan has 194 cells. Before this ratchet, SaBRe was
-enabled for 22 (11.3%). This ratchet evaluates 157 previously disabled C
+The baseline sweep's ptrace strict-verify plan had 194 cells. The current plan
+has 199 after later ptrace-only cells landed. Before the baseline sweep, SaBRe
+was enabled for 22 (11.3%). That sweep evaluated 157 previously disabled C
 candidates:
 
 | Result | Cells | Meaning |
@@ -103,6 +104,21 @@ socket autobind, TCP info, syscall-refusal semantics, pipes, fork trees, shared
 mappings, and signal ordering. These are probe-specific claims; for example,
 some fork and signal probes pass while other probes in those categories do not.
 
+The non-gated static-ELF increment was validated at Hermit
+`d09bd347df9986eab05d78572547bc382af57d6a`, Reverie
+`47544aecfcb3ec92fa6fb5d92bd5c75ac72c0a98`, and SaBRe
+`df1839a129d93b69f47a819a3769c8cbb0b4ec60` (loader SHA-256
+`f901b227eb9c1ff28cda292cbd8e9c8308fcfdaa57aa4bb7fadf610990b03812`).
+The exact `hello-nostdlib` and `pread64-nostdlib` manifest cells pass L2 with
+the SaBRe backend, INFO logging, and the portable
+`--no-virtualize-cpuid --max-timeslice=disabled` profile. The same cells pass
+ptrace L2. Separate direct strict runs produced byte-identical ptrace/SaBRe
+guest stdout: 14-byte `Hello, World!\n` for `hello-nostdlib` and empty stdout
+for `pread64-nostdlib`; both backends exited zero. The executable plan is now
+133/199 SaBRe verify cells (66.8%, B3), up from 131/199 (65.8%) on the same
+plan: seven blocking CI cells and 126 manual cells. This is not a full-corpus
+rerun or a B4/full-parity claim.
+
 ## Known gaps
 
 The following 18 cells are deterministic inside SaBRe but do not match ptrace
@@ -129,7 +145,7 @@ debugger-c/debuggee
 determinism-stress-c/pid-tid
 ```
 
-The following 30 candidates fail SaBRe strict verification or its timeout and
+The following 28 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
 
 ```text
@@ -140,11 +156,9 @@ c-programs/clone
 c-programs/dbi-unsupported-syscall
 c-programs/epoll-determinism
 c-programs/fp-reduction-nondeterminism
-c-programs/hello-nostdlib
 c-programs/ipc-determinism
 c-programs/liteinst-advanced
 c-programs/nanosleep-threads-simple
-c-programs/pread64-nostdlib
 c-programs/pselect6-simulation
 c-programs/racewrite-nostdlib
 c-programs/record-replay-file-state
@@ -186,8 +200,9 @@ Additional backend-wide limits:
   disabled because raw host TSC can leak through RDTSCP.
 - Continuous virtual time is deterministic within each backend, but the ptrace
   and SaBRe clock trajectories are not yet identical.
-- Static/no-libc binaries are outside the current rewrite envelope, as shown by
-  `hello-nostdlib`, `pread64-nostdlib`, and `racewrite-nostdlib`.
+- The two single-threaded, freestanding x86-64 static probes now pass, but
+  `racewrite-nostdlib` remains disabled. This does not qualify threaded static
+  guests, static glibc, or other architectures.
 - Process and thread support is selective: fork-tree and several lifecycle
   probes pass, while raw clone, vfork/exec, robust-futex, and some contention
   probes fail or time out.
