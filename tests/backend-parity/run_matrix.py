@@ -140,6 +140,7 @@ class Fixtures:
                 (),
             ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
+            "getrusage_self_accounting": (local / "getrusage_self_accounting.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
                 ("-D_GNU_SOURCE",),
@@ -253,6 +254,11 @@ def case_catalog(
             [str(fixtures.binary("cpuid_probe"))],
             0,
             b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n",
+        ),
+        "getrusage_self_accounting": (
+            [str(fixtures.binary("getrusage_self_accounting"))],
+            0,
+            b"getrusage ok=6\n",
         ),
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
