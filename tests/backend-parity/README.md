@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -54,11 +54,12 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
-memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
-threaded random-source probes, plus file mutation, listmount refusal,
+twenty-three pairs, including its bounded cooperative pthread lifecycle,
+executable memory, deterministic memory-advice policy, clock, PID, synthetic
+CPUID, and threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
-repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+repeatable heap growth, private/shared anonymous mapping layouts, and positional
+write and O_APPEND offset semantics. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
@@ -68,6 +69,17 @@ descriptors. Serialized child exits support both `wait4` and `waitid`, including
 canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
+
+The append-pwrite row exercises file offset semantics against one temporary
+file, checking the invariants Detcore must preserve identically on every
+backend: `pwrite`/`pread` operate at an explicit offset without moving the
+descriptor's own file offset, an ordinary `write` uses and advances that offset,
+and once `O_APPEND` is enabled with `fcntl(F_SETFL)` every write lands at the
+current end of file regardless of the descriptor's offset. The fixed sequence
+deterministically produces the contents `XY2345Z` (checksum 473, size 7), and
+only those invariants are printed (`append_pwrite size=7 checksum=473 ok=6`),
+never a descriptor number or address. All three backends satisfy it, and DBI
+verifies byte-identical under strict verification.
 
 ## Matrix
 
@@ -92,6 +104,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `append_pwrite` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
