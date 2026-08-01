@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "vectored_file_io": (
+                local / "vectored_file_io.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "vectored_file_io": (
+            [str(fixtures.binary("vectored_file_io"))],
+            0,
+            b"vectored_file_io size=10 checksum=959 ok=6\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
