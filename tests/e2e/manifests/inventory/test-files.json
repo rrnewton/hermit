@@ -38,6 +38,12 @@
       "why": "tests/backend-parity/e9patch_corpus/arch_prctl_getfs.c is owned by tests/backend-parity/e9patch_corpus.py: Reads the FS segment base with arch_prctl ARCH_GET_FS and prints the syscall return value which is zero on success without printing the host-specific base pointer, proving e9patch preprocessing preserves arch_prctl parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest exposes an in-ELF SYSCALL site so e9tool actually rewrites it, and is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/arch_prctl_getgs.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/arch_prctl_getgs.c is owned by tests/backend-parity/e9patch_corpus.py: exercises arch_prctl(158) with ARCH_GET_GS to read the current GS base register into a local without printing the host-specific value, emitting only the syscall return to confirm the query path is stable under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/bind_abstract.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -230,6 +236,12 @@
       "why": "tests/backend-parity/e9patch_corpus/file_mmap_zero.c is owned by tests/backend-parity/e9patch_corpus.py: MAP_PRIVATE-maps a page of /dev/zero PROT_READ and confirms the first byte reads back zero, proving e9patch preprocessing preserves file-backed mmap content parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/flistxattr_memfd.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/flistxattr_memfd.c is owned by tests/backend-parity/e9patch_corpus.py: exercises flistxattr(196) issuing a zero-length size query for the extended-attribute name list of an anonymous memfd, emitting only the syscall return so the guest-visible output stays host-independent under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/flock_memfd.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -414,6 +426,18 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/ioctl_fionread_pipe.c is owned by tests/backend-parity/e9patch_corpus.py: writes three bytes into a pipe and queries the readable byte count with ioctl FIONREAD, printing the fixed count 3 rather than any host-specific value. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/kill_self_sig0.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/kill_self_sig0.c is owned by tests/backend-parity/e9patch_corpus.py: exercises kill(62) sending the null signal 0 to the calling process as a pure liveness/permission probe that delivers no actual signal, emitting only the syscall return to confirm the path is deterministic under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/listen_abstract.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/listen_abstract.c is owned by tests/backend-parity/e9patch_corpus.py: exercises listen(50) on an AF_UNIX stream socket that has been bound to an abstract-namespace address, verifying the socket transitions to the passive listening state and returns zero under e9patch preprocessing with the ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/loop_write.c",
@@ -608,6 +632,12 @@
       "why": "tests/backend-parity/e9patch_corpus/prctl_name.c is owned by tests/backend-parity/e9patch_corpus.py: Round-trips the thread name through prctl PR_SET_NAME then PR_GET_NAME and confirms the value is returned unchanged, proving e9patch preprocessing preserves prctl thread-name parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/prctl_pdeathsig.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/prctl_pdeathsig.c is owned by tests/backend-parity/e9patch_corpus.py: exercises prctl(157) with PR_GET_PDEATHSIG to query the parent-death signal disposition, emitting only the syscall return so the guest-visible output stays host-independent under e9patch preprocessing with the ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/pread_past_eof.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -678,6 +708,18 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/readv_zero.c is owned by tests/backend-parity/e9patch_corpus.py: Performs a scatter readv from /dev/zero into two eight-byte iovecs and asserts sixteen bytes were transferred, proving e9patch preprocessing preserves readv scatter-read parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/recvfrom_socketpair.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/recvfrom_socketpair.c is owned by tests/backend-parity/e9patch_corpus.py: exercises recvfrom(45) with a NULL source-address argument over one end of a connected AF_UNIX socketpair, round-tripping the fixed two-byte payload to confirm datagram receipt is unperturbed by e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/recvmsg_socketpair.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/recvmsg_socketpair.c is owned by tests/backend-parity/e9patch_corpus.py: exercises recvmsg(47) performing a scatter read through a struct msghdr/iovec over one end of a connected AF_UNIX socketpair, round-tripping the fixed two-byte payload to confirm message delivery is unperturbed by e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/rt_sigpending_empty.c",
@@ -852,6 +894,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/sysinfo_ok.c is owned by tests/backend-parity/e9patch_corpus.py: Fills a struct sysinfo buffer with the sysinfo syscall and prints the syscall return value which is zero on success without emitting the host-specific uptime, load, and memory fields, proving e9patch preprocessing preserves sysinfo parity against the golden ptrace backend. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/tgkill_self_sig0.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/tgkill_self_sig0.c is owned by tests/backend-parity/e9patch_corpus.py: exercises tgkill(234) sending the null signal 0 to the calling thread identified by its own pid and tid as a liveness probe that delivers no signal, emitting only the syscall return to confirm determinism under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/umask_set.c",

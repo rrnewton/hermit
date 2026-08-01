@@ -372,6 +372,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "socketpair_seqpacket": (0, b"sp=hi\n"),
     "pidfd_open_self": (0, b"pidfd=1\n"),
     "sendmmsg_socketpair": (0, b"sendmmsg=1\n"),
+    # Round-19 new-family ratchet batch (non-time, non-gated). More syscalls with
+    # no existing guest: listen(50) on a bound abstract AF_UNIX socket (return 0,
+    # complements bind_abstract), recvmsg(47) and recvfrom(45) round-trips on a
+    # socketpair (distinct receive-side counterparts to the sendmsg/sendto
+    # guests), arch_prctl ARCH_GET_GS (return 0 only; the GS base is host-specific
+    # and never printed, distinct from the ARCH_GET_FS guest), prctl
+    # PR_GET_PDEATHSIG (return 0; no parent-death signal set), kill(62) and
+    # tgkill(234) with signal 0 (existence/permission checks that deliver no
+    # signal, return 0), and flistxattr(196) on a memfd (0-length attribute list).
+    # Every printed value is host-independent: the syscall return on success (0)
+    # or fixed round-tripped text ("hi"). The signal-0 guests deliver nothing, so
+    # they do not exercise signal handling or scheduling; none of the batch
+    # changes scheduling, time, or randomness, so all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace.
+    "listen_abstract": (0, b"listen=0\n"),
+    "recvmsg_socketpair": (0, b"recvmsg=hi\n"),
+    "recvfrom_socketpair": (0, b"recvfrom=hi\n"),
+    "arch_prctl_getgs": (0, b"getgs=0\n"),
+    "prctl_pdeathsig": (0, b"pdeathsig=0\n"),
+    "kill_self_sig0": (0, b"kill=0\n"),
+    "tgkill_self_sig0": (0, b"tgkill=0\n"),
+    "flistxattr_memfd": (0, b"flistxattr=0\n"),
 }
 
 FREESTANDING_FLAGS = (

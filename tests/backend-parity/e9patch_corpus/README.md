@@ -159,6 +159,14 @@ thread and hang the run.
 | `socketpair_seqpacket` | `AF_UNIX`/`SOCK_SEQPACKET` socketpair round-trip (`hi`) |
 | `pidfd_open_self` | `pidfd_open` on self (valid fd => 1) |
 | `sendmmsg_socketpair` | `sendmmsg` one datagram on a socketpair (count 1) |
+| `listen_abstract` | `listen` on a bound abstract `AF_UNIX` stream socket (return 0) |
+| `recvmsg_socketpair` | `recvmsg` scatter read on a socketpair (`hi`) |
+| `recvfrom_socketpair` | `recvfrom` on a connected socketpair (`hi`) |
+| `arch_prctl_getgs` | `arch_prctl(ARCH_GET_GS)` query (return 0) |
+| `prctl_pdeathsig` | `prctl(PR_GET_PDEATHSIG)` query (return 0) |
+| `kill_self_sig0` | `kill(self, 0)` liveness probe (return 0) |
+| `tgkill_self_sig0` | `tgkill(pid, tid, 0)` liveness probe (return 0) |
+| `flistxattr_memfd` | `flistxattr` size query on a memfd (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -421,6 +429,24 @@ None changes scheduling, time, or randomness. An eighth candidate, `prctl`
 `PR_SET_NO_NEW_PRIVS` operation returns `-ENOSYS` (-38) under golden hermit
 ptrace, so keeping it would be a false-parity claim (#152) — the batch kept
 seven of eight. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-19 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New syscalls:
+`listen(50)` on a bound abstract `AF_UNIX` stream socket (`listen_abstract`,
+return 0); `recvmsg(47)` scatter read and `recvfrom(45)` on a connected
+socketpair (`recvmsg_socketpair`, `recvfrom_socketpair`, both round-tripping the
+fixed text `hi`); `arch_prctl(158)` `ARCH_GET_GS` (`arch_prctl_getgs`, the GS
+base is read into a local but never printed — only the return 0 is emitted);
+`prctl(157)` `PR_GET_PDEATHSIG` (`prctl_pdeathsig`, return 0); `kill(62)` and
+`tgkill(234)` sending signal 0 to self as pure liveness probes
+(`kill_self_sig0`, `tgkill_self_sig0`, return 0, no signal delivered); and
+`flistxattr(196)` size query on a memfd (`flistxattr_memfd`, return 0). Every
+printed value is host-independent — the syscall return on success (0) or fixed
+round-tripped text (`hi`); host-specific outputs (the GS base, the attribute
+list) are read but never printed. None changes scheduling, time, or randomness,
+and the signal-0 probes deliver no signal. All eight pass under golden hermit
+ptrace, so the batch kept eight of eight. All remain freestanding
+(`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
