@@ -119,6 +119,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "access_devnull": (0, b"access=0\n"),
     "sigaction_query": (0, b"sigaction=ok\n"),
     "getppid_check": (0, None),
+    # Round-5 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into filesystem errno paths, prctl thread-name round-trips, cwd queries,
+    # pipe data I/O, statx mode bits, scatter reads, umask round-trips, and
+    # fstat size reporting -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. getcwd emits a host-specific path, so it
+    # asserts golden==e9patch parity only.
+    "open_enoent": (0, b"enoent=-2\n"),
+    "prctl_name": (0, b"name=cg\n"),
+    "getcwd_check": (0, None),
+    "pipe_rw": (0, b"pipe=hi\n"),
+    "statx_devnull": (0, b"statx_chr=1\n"),
+    "readv_zero": (0, b"readv=16\n"),
+    "umask_set": (0, b"umask=18\n"),
+    "fstat_size_memfd": (0, b"size=5\n"),
 }
 
 FREESTANDING_FLAGS = (
