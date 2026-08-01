@@ -487,6 +487,23 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "set_mempolicy_default": (0, b"setmempolicy=0\n"),
     "modify_ldt_read": (0, b"modifyldt=0\n"),
     "rt_sigqueueinfo_self": (0, b"sigqueueinfo=0\n"),
+    # Round-24 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: whole-address-space memory locking via mlockall(151)
+    # MCL_CURRENT (paired with munlockall) returning 0; faccessat2(439) checking
+    # read access to /dev/null returning 0; and pidfd-based signalling via
+    # pidfd_send_signal(424) delivering signal 0 through a self pidfd (permission
+    # check only, no delivery) returning 0. Every printed value is
+    # host-independent: the syscall return on success (0) or a boolean. None
+    # changes CPU scheduling, virtual time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    # (openat2(437) and the three System V IPC creation syscalls shmget(29),
+    # semget(64), msgget(68) were probed and DROPPED per no-false-parity #152:
+    # each returns failure under hermit -- openat2 is not supported, and there is
+    # no usable System V IPC namespace -- so those families have no guest.)
+    "mlockall_all": (0, b"mlockall=0\n"),
+    "faccessat2_devnull": (0, b"faccessat2=0\n"),
+    "pidfd_send_signal_self": (0, b"pidfdsignal=0\n"),
 }
 
 FREESTANDING_FLAGS = (

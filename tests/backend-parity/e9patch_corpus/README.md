@@ -193,6 +193,9 @@ thread and hang the run.
 | `set_mempolicy_default` | `set_mempolicy(MPOL_DEFAULT,...)` no-op (return 0) |
 | `modify_ldt_read` | `modify_ldt(0,buf,size)` LDT read, no entries (return 0) |
 | `rt_sigqueueinfo_self` | `rt_sigqueueinfo(self,0,&si)` signal-0 permission check (return 0) |
+| `mlockall_all` | `mlockall(MCL_CURRENT)` + `munlockall` (return 0) |
+| `faccessat2_devnull` | `faccessat2(AT_FDCWD,"/dev/null",R_OK,0)` (return 0) |
+| `pidfd_send_signal_self` | `pidfd_send_signal(self,0,...)` signal-0 permission check (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -548,6 +551,21 @@ accounting, not the deterministic thread schedule. `io_setup(206)`/`io_destroy`
 were probed and **dropped** per no-false-parity (#152): `io_setup` returns
 `-ENOSYS` under hermit, so the asynchronous-IO family has no guest. The batch
 kept six of seven. All remain freestanding (`candidate_sites > 0`).
+
+The final three guests are the **round-24 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New families:
+whole-address-space memory locking via `mlockall(151)` MCL_CURRENT paired with
+`munlockall`, returning 0 (`mlockall_all`); the modern access check
+`faccessat2(439)` on `/dev/null` with `R_OK`, returning 0
+(`faccessat2_devnull`); and pidfd-based signalling via `pidfd_send_signal(424)`
+delivering signal 0 through a self pidfd — a permission check with no delivery —
+returning 0 (`pidfd_send_signal_self`). Every printed value is host-independent —
+the syscall return on success (0) or a boolean. None changes CPU scheduling,
+time, or randomness. `openat2(437)` and the three System V IPC creation syscalls
+`shmget(29)`, `semget(64)`, `msgget(68)` were probed and **dropped** per
+no-false-parity (#152): each returns failure under hermit (openat2 unsupported;
+no usable System V IPC namespace), so those families have no guest. The batch
+kept three of seven. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
