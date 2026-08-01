@@ -9,19 +9,22 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+reads and writes with deterministic `EPERM`. It also round-trips the
+memory-residency locking family (`mlock`, `munlock`, and `mlock2` with and
+without `MLOCK_ONFAULT`) over a private anonymous mapping. The wait contract
+covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,6 +55,16 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The memory-locking row pins a fixed two-page private anonymous mapping into RAM
+with `mlock`, `mlock2` (whole-region prefault), and `mlock2` with
+`MLOCK_ONFAULT`, releasing it with `munlock` after each, and asserts only the
+return values — never an address or a residency count. It is a distinct memory
+family from the mapping-layout rows (which compare address sequences) and the
+memory-advice row (which drives madvise hints); `mlockall`/`munlockall` are
+omitted because locking every current mapping perturbs a backend's own runtime
+pages. ptrace and DBI round-trip all six checks; KVM's `ElfExecutor` returns a
+deterministic `ENOSYS` for `mlock` and `mlock2` (its `munlock` succeeds as a
+no-op), so it remains an explicit gap rather than a false pass.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -92,6 +105,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `mlock_family` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
