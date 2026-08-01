@@ -519,6 +519,21 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     # guest.)
     "capset_noop": (0, b"capset=0\n"),
     "epoll_wait_timeout_zero": (0, b"epollwait=0\n"),
+    # Round-26 new-family ratchet batch (non-time, non-gated). Thread-directed
+    # signalling syscalls with no existing guest: tkill(200) sending signal 0 to
+    # this thread and rt_tgsigqueueinfo(297) queuing signal 0 to this thread with
+    # an SI_QUEUE siginfo, both performing only the permission check (no delivery)
+    # and returning 0. Every printed value is host-independent: the syscall return
+    # on success (0). Neither changes CPU scheduling, virtual time, or randomness,
+    # so both are routine backend-parity coverage that e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    # (Two prctl query options were probed and DROPPED per no-false-parity #152:
+    # PR_GET_SECUREBITS(27) and PR_MCE_KILL_GET(34) both return -ENOSYS under
+    # hermit. userfaultfd(323) was dropped before shipping: it fails even natively
+    # here -- unprivileged userfaultfd is disabled -- so it is an error path, not
+    # a supported-success guest.)
+    "tkill_self_sig0": (0, b"tkill=0\n"),
+    "rt_tgsigqueueinfo_self": (0, b"tgsigqueueinfo=0\n"),
 }
 
 FREESTANDING_FLAGS = (
