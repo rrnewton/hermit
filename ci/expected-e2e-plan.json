@@ -337,6 +337,13 @@
       "test": "language-runtimes/rust-hashmap-iteration"
     },
     {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/tcl-rand-clock"
+    },
+    {
       "backend": "liteinst",
       "category": "system-utils",
       "lane": "portable",
