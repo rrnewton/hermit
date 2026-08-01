@@ -9,9 +9,9 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 22/23 number above is deliberately
@@ -20,8 +20,9 @@ The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
-verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+verifies that epoll remains available as a fallback, refuses process-memory
+reads and writes with deterministic `EPERM`, and drives flagged positioned
+vectored I/O (`preadv2`/`pwritev2`, including `RWF_APPEND`). The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -52,6 +53,15 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The `preadv2_flags` row exercises the flagged positioned vectored I/O syscalls
+`preadv2`/`pwritev2` (numbers 327/328, distinct from the classic
+`preadv`/`pwritev`): two positioned `pwritev2` writes, two positioned `preadv2`
+read-backs, and an `RWF_APPEND` write that lands at end-of-file regardless of
+the supplied offset. Because every call targets a caller-supplied offset rather
+than a shared file position, the result is deterministic on any backend that
+implements the syscalls. ptrace and DBI pass; KVM's `ElfExecutor` does not
+implement `preadv2`/`pwritev2` (it returns `ENOSYS`, exactly as it lacks the
+classic `pwritev`/`preadv`), so KVM is an explicit gap here.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
@@ -84,6 +94,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
+| `preadv2_flags` | pass | pass | gap |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
