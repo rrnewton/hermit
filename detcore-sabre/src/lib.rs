@@ -11,7 +11,6 @@
 use std::cell::Cell;
 use std::ffi::CString;
 use std::ffi::OsStr;
-use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -76,9 +75,8 @@ fn remember_coordinator_socket(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-845): Review SaBRe guest comm-name restoration.
-fn guest_comm_from_args(args: impl IntoIterator<Item = OsString>) -> Option<CString> {
-    let program = args.into_iter().next()?;
-    let name = Path::new(&program).file_name()?.as_bytes();
+fn guest_comm_from_path(program: &OsStr) -> Option<CString> {
+    let name = Path::new(program).file_name()?.as_bytes();
     CString::new(&name[..name.len().min(15)]).ok()
 }
 
@@ -86,7 +84,8 @@ fn restore_guest_comm_name(thread_id: u32) {
     if thread_id != unsafe { libc::getpid() as u32 } {
         return;
     }
-    let Some(name) = guest_comm_from_args(std::env::args_os()) else {
+    let program = OsStr::from_bytes(sabre::client_path().to_bytes());
+    let Some(name) = guest_comm_from_path(program) else {
         return;
     };
     unsafe {
@@ -314,17 +313,13 @@ mod tests {
     #[test]
     fn guest_comm_uses_target_basename_and_linux_limit() {
         assert_eq!(
-            guest_comm_from_args(
-                ["/usr/bin/bash", "-c", "exit 0"]
-                    .into_iter()
-                    .map(OsString::from)
-            )
-            .unwrap()
-            .to_bytes(),
+            guest_comm_from_path(OsStr::new("/usr/bin/bash"))
+                .unwrap()
+                .to_bytes(),
             b"bash"
         );
         assert_eq!(
-            guest_comm_from_args(["abcdefghijklmnop"].into_iter().map(OsString::from))
+            guest_comm_from_path(OsStr::new("abcdefghijklmnop"))
                 .unwrap()
                 .to_bytes(),
             b"abcdefghijklmno"
