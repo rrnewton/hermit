@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 28/28 | 100% |
-| DBI | 27/28 | 96% |
-| KVM | 23/28 | 82% |
+| ptrace | 29/29 | 100% |
+| DBI | 28/29 | 96% |
+| KVM | 24/29 | 82% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBI | 26/28 | DETLOG-bitwise | 93% |
-| KVM | 22/28 | guest-visible only | 79% |
+| ptrace | 29/29 | DETLOG-bitwise | 100% |
+| DBI | 27/29 | DETLOG-bitwise | 93% |
+| KVM | 23/29 | guest-visible only | 79% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -45,7 +45,9 @@ random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
 memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
-reads and writes with deterministic `EPERM`. The wait contract covers deterministic
+reads and writes with deterministic `EPERM`. It also opens `pidfd_open`
+descriptors for the virtualized self PID and rejects an invalid flags argument
+with `EINVAL`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -76,13 +78,21 @@ The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
+The pidfd row issues the wrapperless `pidfd_open` syscall against the caller's
+own PID. Because Hermit virtualizes PIDs, the contract confirms that every
+backend accepts the virtualized self PID and returns a usable descriptor,
+opens two distinct self pidfds, rejects an invalid flags argument with `EINVAL`,
+and closes both descriptors. It is purely relational — no absolute PID or fd
+number is baked into the golden output — and performs no data transfer or
+blocking wait, so it holds at L2 (`pass / detlog` on ptrace and DBI,
+`pass / guest` on KVM) and is safe for the DBI cooperative scheduler.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-four pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, inert scheduler-policy
 queries, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
-process-memory read/write refusal, io_uring refusal with epoll fallback,
+process-memory read/write refusal, self pidfd_open, io_uring refusal with epoll fallback,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
 thread syscalls bypass per-child Detcore callbacks, but the shared personality
 still provides distinct worker samples and byte-identical output across strict
@@ -113,6 +123,7 @@ is not reached.
 | `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
 | `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
 | `process_vm_writev_refusal` | pass / detlog | pass / detlog | pass / guest |
+| `pidfd_open_self` | pass / detlog | pass / detlog | pass / guest |
 | `executable_mmap` | pass / detlog | pass / detlog | pass / guest |
 | `memory_advice` | pass / detlog | pass / detlog | pass / guest |
 | `heap_growth` | pass / detlog | pass / detlog | pass / guest |

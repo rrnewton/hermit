@@ -169,6 +169,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/process_vm_writev_refusal_probe.c",
                 (),
             ),
+            "pidfd_open_self": (
+                local / "pidfd_open_self.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "madvise_determinism": (
                 REPOSITORY / "tests/c/madvise_determinism.c",
                 (),
@@ -255,6 +259,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_vm_writev_refusal"))],
             0,
             b"process-vm-writev-refused-ok\n",
+        ),
+        "pidfd_open_self": (
+            [str(fixtures.binary("pidfd_open_self"))],
+            0,
+            b"pidfd ok=6\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],

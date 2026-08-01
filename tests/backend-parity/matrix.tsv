@@ -10,6 +10,7 @@ io_uring_fallback	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 listmount_unavailable	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 process_vm_writev_refusal	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+pidfd_open_self	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 executable_mmap	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 memory_advice	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 heap_growth	pass	pass	pass	-	-	detlog	detlog	guest	-	-
