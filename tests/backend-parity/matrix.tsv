@@ -10,6 +10,7 @@ io_uring_fallback	pass	pass	pass	-	-
 listmount_unavailable	pass	pass	pass	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-
 process_vm_writev_refusal	pass	pass	pass	-	-
+msync_writeback	pass	pass	gap	-	KVM msync returns 0 but its in-memory mapping model does not flush MAP_SHARED writes to the backing file, so the pread write-through checks fail and it observes ok=3 instead of ok=5
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
