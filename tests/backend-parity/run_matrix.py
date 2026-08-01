@@ -147,6 +147,7 @@ class Fixtures:
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
+            "pipe_ipc": (local / "pipe_ipc.c", ()),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -235,6 +236,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "pipe_ipc": (
+            [str(fixtures.binary("pipe_ipc"))],
+            0,
+            b"pipe_ipc bytes=256 checksum=32640 reaped=1\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],

@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 22/24 | 92% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -69,6 +69,19 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
+The pipe IPC row exercises the cross-process producer/consumer contract: a parent
+creates a pipe and forks, the child writes a fixed byte stream (every value
+0..255 once) and closes its write end, and the parent drains the pipe to EOF and
+reaps the child. The only observable is an aggregate over the stream
+(`pipe_ipc bytes=256 checksum=32640 reaped=1`), so the result never depends on the
+parent/child scheduling interleave, and no pid, timing, or address is seen. It is
+distinct from the single-process `pipe_basics` guest, which pipes between threads
+and prints interleaved lines. ptrace and DBI both satisfy it and DBI verifies
+byte-identical under strict verification. KVM is a documented gap: its child
+process runs in the deterministic `ElfExecutor` personality that does not
+synchronize cross-process pipe I/O with the coordinator, so the parent's blocking
+read returns `EAGAIN` rather than the child's bytes.
+
 ## Matrix
 
 | Test | ptrace | DBI | KVM |
@@ -92,6 +105,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `pipe_ipc` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
