@@ -767,6 +767,21 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_reuseaddr": (0, b"reuseaddr=0\n"),
     "getsockopt_broadcast": (0, b"broadcast=0\n"),
     "lseek_devnull_end": (0, b"devnullend=0\n"),
+    # round-38: four more inert getsockopt OPTIONS and two more getitimer timers.
+    # getsockopt_keepalive/oobinline/dontroute read boolean SO_* flags that are
+    # unset on a fresh AF_UNIX socketpair endpoint (-> 0); getsockopt_rcvlowat
+    # reads the non-boolean SO_RCVLOWAT receive low-water mark, which defaults to 1
+    # byte. getitimer_virtual and getitimer_prof query the ITIMER_VIRTUAL and
+    # ITIMER_PROF interval timers with none armed, so each itimerval reads all-zero
+    # (field sum 0) -- distinct timers from getitimer_real. Every printed value is a
+    # queried constant with no time, randomness, PID, or host-variable input, so
+    # e9patch preprocessing must leave all six byte-identical to golden ptrace.
+    "getsockopt_keepalive": (0, b"keepalive=0\n"),
+    "getsockopt_oobinline": (0, b"oobinline=0\n"),
+    "getsockopt_dontroute": (0, b"dontroute=0\n"),
+    "getsockopt_rcvlowat": (0, b"rcvlowat=1\n"),
+    "getitimer_virtual": (0, b"getitimervirt=0\n"),
+    "getitimer_prof": (0, b"getitimerprof=0\n"),
 }
 
 FREESTANDING_FLAGS = (
