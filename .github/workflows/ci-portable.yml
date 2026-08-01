@@ -59,7 +59,7 @@ jobs:
     - name: Build DAG runner (rust, zero runtime deps)
       run: (cd agent-utils && ./setup rs)
     - name: Portable test DAG (no PMU or CPUID interception)
-      run: env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner ci/run-dag.sh portable --allow-cgroup-failure --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v
+      run: env SAFE_CI_DAG_RUNNER=agent-utils/rs/bin/safe-ci-dag-runner ci/run-dag.sh portable --allow-cgroup-failure -j 2 --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v
     - name: Upload DAG performance report
       if: always()
       uses: actions/upload-artifact@v4
