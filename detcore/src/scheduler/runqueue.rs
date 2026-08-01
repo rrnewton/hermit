@@ -728,10 +728,8 @@ impl RunQueue {
         // and the internal I/O poll-retry requeue routes through
         // `commit_tentative_pop_uncharged` (`charge = false`) so a
         // host-nondeterministic retry count never gates fairness (#140).
-        if charge {
-            if let Some(fair) = self.fair.as_mut() {
-                fair.on_commit(ret);
-            }
+        if charge && let Some(fair) = self.fair.as_mut() {
+            fair.on_commit(ret);
         }
         ret
     }
