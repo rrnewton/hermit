@@ -137,6 +137,13 @@ thread and hang the run.
 | `personality_query` | `personality(0xffffffff)` query (success => 1) |
 | `fcntl_setlk_memfd` | `fcntl` `F_SETLK` write-lock/unlock on a memfd (return 0) |
 | `inotify_rm_watch` | `inotify_rm_watch` after add on `/` (return 0) |
+| `getrandom_bytes` | `getrandom` fills 16 bytes (count 16; bytes not printed) |
+| `gettid_check` | `gettid` query (tid > 0 => 1; tid not printed) |
+| `getrlimit_nofile` | legacy `getrlimit(97)` `RLIMIT_NOFILE` (return 0) |
+| `set_tid_address_ok` | `set_tid_address` registration (tid > 0 => 1) |
+| `sched_priority_max` | `sched_get_priority_max(SCHED_OTHER)` (constant 0) |
+| `sched_getscheduler_check` | `sched_getscheduler(0)` (`SCHED_OTHER`=0) |
+| `sync_all` | no-argument `sync(2)` (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -331,6 +338,29 @@ printed. An eighth candidate, `process_vm_readv` from self, was **dropped**: it
 returns `-1` under golden hermit ptrace (a hermit limitation, not parity), so
 keeping it would be a false-parity claim (#152) — the batch kept seven of eight.
 All remain freestanding (`candidate_sites > 0`).
+
+The final seven guests are the **round-16 new-family ratchet batch** (non-time,
+non-gated): randomness (`getrandom_bytes`, which prints the byte count filled,
+not the random bytes), the `gettid` thread-id query (`gettid_check`), the
+**legacy** `getrlimit(97)` resource-limit query (`getrlimit_nofile`, distinct
+from round-8's `prlimit64`), clear-child-tid registration (`set_tid_address_ok`),
+two scheduler **queries** that read but never change scheduling
+(`sched_priority_max` = `sched_get_priority_max(SCHED_OTHER)` and
+`sched_getscheduler_check` = `sched_getscheduler(0)`, both the fixed constant 0
+for the default policy), and the no-argument `sync(2)` (`sync_all`, distinct from
+round-15's fd-scoped `syncfs`). These establish that e9patch preprocessing leaves
+`getrandom`/`gettid`/legacy `getrlimit`/`set_tid_address`/
+`sched_get_priority_max`/`sched_getscheduler`/`sync` byte-identical to golden
+ptrace. Every printed value is host-independent — the syscall return on success
+(0), a boolean (`gettid`/`set_tid_address` returned a positive tid => 1), a
+fixed byte count (`getrandom` fills 16), or a fixed scheduler constant
+(`SCHED_OTHER` = 0); the random bytes, tid values, and rlimit fields are read or
+used but never printed. The two scheduler guests only query policy and range, so
+they are routine backend-parity coverage rather than a DetCore scheduling
+change. An eighth candidate, `prctl` `PR_GET_CHILD_SUBREAPER`, was **dropped**:
+it returns `-ENOSYS` (-38) under golden hermit ptrace, so keeping it would be a
+false-parity claim (#152) — the batch kept seven of eight. All remain
+freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

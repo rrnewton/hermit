@@ -297,6 +297,31 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "personality_query": (0, b"persona=1\n"),
     "fcntl_setlk_memfd": (0, b"setlk=0\n"),
     "inotify_rm_watch": (0, b"inotify_rm=0\n"),
+    # Round-16 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into randomness (getrandom -- prints the byte count filled, not the random
+    # bytes), the gettid thread-id query, the LEGACY getrlimit(97) (distinct from
+    # round-8's prlimit64), clear-child-tid registration (set_tid_address), two
+    # scheduler QUERIES that read but never change scheduling (sched_get_priority_max
+    # SCHED_OTHER and sched_getscheduler, both fixed constant 0 for the default
+    # policy), and the no-argument sync (distinct from round-15's fd-scoped
+    # syncfs) -- all families e9patch preprocessing must leave byte-identical to
+    # golden ptrace. Every printed value is host-independent: the syscall return
+    # on success (0), a boolean (gettid/set_tid_address returned a positive
+    # tid -> 1), a fixed byte count (getrandom fills 16), or a fixed scheduler
+    # constant (SCHED_OTHER = 0). The random bytes, tid values, and rlimit fields
+    # are read/used but never printed. The scheduler guests only QUERY policy/
+    # range; they do not alter scheduling, so they are routine backend-parity
+    # coverage, not a DetCore scheduling change. prctl PR_GET_CHILD_SUBREAPER was
+    # DROPPED: it returns -ENOSYS (-38) under golden hermit ptrace, so it would
+    # encode a hermit limitation, not parity (no false parity, #152); the batch
+    # kept 7 of 8.
+    "getrandom_bytes": (0, b"getrandom=16\n"),
+    "gettid_check": (0, b"gettid=1\n"),
+    "getrlimit_nofile": (0, b"getrlimit=0\n"),
+    "set_tid_address_ok": (0, b"settid=1\n"),
+    "sched_priority_max": (0, b"priomax=0\n"),
+    "sched_getscheduler_check": (0, b"sched=0\n"),
+    "sync_all": (0, b"sync=0\n"),
 }
 
 FREESTANDING_FLAGS = (
