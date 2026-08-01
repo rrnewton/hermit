@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "fd_cloexec_flags": (
+                local / "fd_cloexec_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "fd_cloexec_flags": (
+            [str(fixtures.binary("fd_cloexec_flags"))],
+            0,
+            b"fdflags ok=5\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
