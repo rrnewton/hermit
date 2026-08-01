@@ -464,6 +464,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "setregid_noop": (0, b"setregid=0\n"),
     "accept4_abstract": (0, b"accept4=1\n"),
     "ioprio_get_check": (0, b"ioprio=1\n"),
+    # Round-23 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: scheduling *priority* (not CPU scheduling) via
+    # setpriority(141) as a PRIO_PROCESS no-op returning 0 and getpriority(140)
+    # reporting only a boolean (the 20-nice value is host-configuration
+    # dependent and not printed); NUMA
+    # memory policy via get_mempolicy(239) and set_mempolicy(238) in their
+    # default forms returning 0; the x86 local descriptor table via
+    # modify_ldt(154) func=0 read, which yields 0 bytes for a process with no
+    # custom LDT entries; and rt_sigqueueinfo(129) queuing signal 0 to self,
+    # which performs only the permission check (no delivery) and returns 0.
+    # Every printed value is host-independent: the syscall return on success (0)
+    # or a boolean. None of these change CPU scheduling, virtual time, or
+    # randomness -- setpriority/getpriority adjust nice-level accounting, not the
+    # deterministic thread schedule -- so all are routine backend-parity coverage
+    # that e9patch preprocessing must leave byte-identical to golden ptrace.
+    # (io_setup(206)/io_destroy(207) were probed and DROPPED per no-false-parity
+    # #152: io_setup returns -ENOSYS under hermit, so the AIO family has no guest.)
+    "setpriority_self": (0, b"setpriority=0\n"),
+    "getpriority_self": (0, b"getpriority=1\n"),
+    "get_mempolicy_default": (0, b"getmempolicy=0\n"),
+    "set_mempolicy_default": (0, b"setmempolicy=0\n"),
+    "modify_ldt_read": (0, b"modifyldt=0\n"),
+    "rt_sigqueueinfo_self": (0, b"sigqueueinfo=0\n"),
 }
 
 FREESTANDING_FLAGS = (

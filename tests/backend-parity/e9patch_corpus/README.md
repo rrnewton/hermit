@@ -187,6 +187,12 @@ thread and hang the run.
 | `setregid_noop` | `setregid(-1,-1)` no-op (return 0) |
 | `accept4_abstract` | `accept4` a pending abstract `AF_UNIX` connection (valid fd => 1) |
 | `ioprio_get_check` | `ioprio_get(IOPRIO_WHO_PROCESS)` query (success boolean 1) |
+| `setpriority_self` | `setpriority(PRIO_PROCESS,0,0)` no-op (return 0) |
+| `getpriority_self` | `getpriority(PRIO_PROCESS,0)` query (success boolean 1) |
+| `get_mempolicy_default` | `get_mempolicy(&mode,...)` NUMA policy query (return 0) |
+| `set_mempolicy_default` | `set_mempolicy(MPOL_DEFAULT,...)` no-op (return 0) |
+| `modify_ldt_read` | `modify_ldt(0,buf,size)` LDT read, no entries (return 0) |
+| `rt_sigqueueinfo_self` | `rt_sigqueueinfo(self,0,&si)` signal-0 permission check (return 0) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -524,6 +530,24 @@ printed value is host-independent — the syscall return on success (0) or a
 boolean. None changes CPU scheduling, time, or randomness. All six pass under
 golden hermit ptrace, so the batch kept six of six. All remain freestanding
 (`candidate_sites > 0`).
+
+The final six guests are the **round-23 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New families:
+scheduling *priority* (distinct from CPU scheduling) via `setpriority(141)` as a
+`PRIO_PROCESS` no-op returning 0 (`setpriority_self`) and `getpriority(140)`
+reporting only a boolean since the `20 - nice` value is host-configuration
+dependent (`getpriority_self`); NUMA memory policy via `get_mempolicy(239)` and
+`set_mempolicy(238)` in their default forms returning 0 (`get_mempolicy_default`,
+`set_mempolicy_default`); the x86 local descriptor table via `modify_ldt(154)`
+func=0 read, which yields 0 bytes for a process with no custom LDT entries
+(`modify_ldt_read`); and `rt_sigqueueinfo(129)` queuing signal 0 to self, which
+performs only the permission check with no delivery and returns 0
+(`rt_sigqueueinfo_self`). Every printed value is host-independent — the syscall
+return on success (0) or a boolean; `setpriority`/`getpriority` adjust nice-level
+accounting, not the deterministic thread schedule. `io_setup(206)`/`io_destroy`
+were probed and **dropped** per no-false-parity (#152): `io_setup` returns
+`-ENOSYS` under hermit, so the asynchronous-IO family has no guest. The batch
+kept six of seven. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
