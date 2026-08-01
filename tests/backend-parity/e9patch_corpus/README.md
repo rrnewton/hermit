@@ -152,6 +152,13 @@ thread and hang the run.
 | `socketpair_dgram` | `AF_UNIX`/`SOCK_DGRAM` socketpair round-trip (`hi`) |
 | `bind_abstract` | `bind` `AF_UNIX` abstract-namespace address (return 0) |
 | `fcntl_getpipe_sz` | `fcntl` `F_GETPIPE_SZ` on a pipe (size > 0 => 1) |
+| `sched_getparam_check` | `sched_getparam(0)` query (return 0) |
+| `sched_get_priority_min_check` | `sched_get_priority_min(SCHED_OTHER)` (constant 0) |
+| `ftruncate_memfd` | dedicated `ftruncate` memfd resize (return 0) |
+| `sync_file_range_memfd` | `sync_file_range` on a memfd (return 0) |
+| `socketpair_seqpacket` | `AF_UNIX`/`SOCK_SEQPACKET` socketpair round-trip (`hi`) |
+| `pidfd_open_self` | `pidfd_open` on self (valid fd => 1) |
+| `sendmmsg_socketpair` | `sendmmsg` one datagram on a socketpair (count 1) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -392,6 +399,28 @@ never printed. None changes scheduling, time, or randomness, so all are routine
 backend-parity coverage. All eight passed golden ptrace on the first attempt,
 so the batch kept eight of eight. All remain freestanding
 (`candidate_sites > 0`).
+
+The final seven guests are the **round-18 new-family ratchet batch** (non-time,
+non-gated). Unlike earlier rounds this one targets syscalls with **no existing
+guest at all** — the corpus already covers `umask`, `access`, `chdir`, `msync`,
+`fstat`, `statx`, `prctl`-name, and `uname`, so those families were deliberately
+not duplicated. New syscalls: `sched_getparam(143)` and
+`sched_get_priority_min(147)` (`sched_getparam_check`,
+`sched_get_priority_min_check`), two pure scheduler **queries** that read but
+never change scheduling; a dedicated `ftruncate(77)` memfd resize
+(`ftruncate_memfd`, previously only a helper); `sync_file_range(277)` on a memfd
+(`sync_file_range_memfd`); the `AF_UNIX`/`SOCK_SEQPACKET` socketpair
+(`socketpair_seqpacket`, distinct from the `SOCK_STREAM` and `SOCK_DGRAM`
+pairs); `pidfd_open(434)` on self (`pidfd_open_self`, a boolean valid-fd, the fd
+number not printed); and `sendmmsg(307)` of one datagram on a socketpair
+(`sendmmsg_socketpair`, message count 1). Every printed value is
+host-independent — the syscall return on success (0), a fixed scheduler constant
+(0), a boolean, a fixed message count (1), or fixed round-tripped text (`hi`).
+None changes scheduling, time, or randomness. An eighth candidate, `prctl`
+`PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`, was **dropped**: the
+`PR_SET_NO_NEW_PRIVS` operation returns `-ENOSYS` (-38) under golden hermit
+ptrace, so keeping it would be a false-parity claim (#152) — the batch kept
+seven of eight. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

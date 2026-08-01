@@ -345,6 +345,33 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "socketpair_dgram": (0, b"sp=hi\n"),
     "bind_abstract": (0, b"bind=0\n"),
     "fcntl_getpipe_sz": (0, b"pipesz=1\n"),
+    # Round-18 new-family ratchet batch (non-time, non-gated). This round targets
+    # syscalls with NO existing guest at all (the corpus already covers umask,
+    # access, chdir, msync, fstat, statx, prctl-name, and uname, so those were
+    # deliberately not duplicated). New syscalls: sched_getparam(143) and
+    # sched_get_priority_min(147) -- two pure scheduler QUERIES that read but
+    # never change scheduling (return 0 / SCHED_OTHER constants), a dedicated
+    # ftruncate(77) memfd resize (return 0; previously only a helper),
+    # sync_file_range(277) on a memfd (return 0), the AF_UNIX/SOCK_SEQPACKET
+    # socketpair (distinct from the SOCK_STREAM and SOCK_DGRAM pairs),
+    # pidfd_open(434) on self (boolean valid-fd, the fd number not printed), and
+    # sendmmsg(307) of one datagram on a socketpair (message count 1). Every
+    # printed value is host-independent: the syscall return on success (0), a
+    # fixed scheduler constant (0), a boolean, a fixed message count (1), or
+    # fixed round-tripped text ("hi"). None changes scheduling, time, or
+    # randomness, so all are routine backend-parity coverage that e9patch
+    # preprocessing must leave byte-identical to golden ptrace. An eighth
+    # candidate, prctl PR_SET_NO_NEW_PRIVS/PR_GET_NO_NEW_PRIVS, was DROPPED: the
+    # PR_SET_NO_NEW_PRIVS operation returns -ENOSYS (-38) under golden hermit
+    # ptrace, so keeping it would encode a hermit limitation, not parity (no
+    # false parity, #152); the batch kept seven of eight.
+    "sched_getparam_check": (0, b"getparam=0\n"),
+    "sched_get_priority_min_check": (0, b"priomin=0\n"),
+    "ftruncate_memfd": (0, b"ftruncate=0\n"),
+    "sync_file_range_memfd": (0, b"syncrange=0\n"),
+    "socketpair_seqpacket": (0, b"sp=hi\n"),
+    "pidfd_open_self": (0, b"pidfd=1\n"),
+    "sendmmsg_socketpair": (0, b"sendmmsg=1\n"),
 }
 
 FREESTANDING_FLAGS = (
