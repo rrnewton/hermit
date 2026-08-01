@@ -139,6 +139,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "child_subreaper_refusal": (
+                local / "child_subreaper_refusal.c",
+                (),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "child_subreaper_refusal": (
+            [str(fixtures.binary("child_subreaper_refusal"))],
+            0,
+            b"subreaper ok=2\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
