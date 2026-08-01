@@ -534,6 +534,28 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     # a supported-success guest.)
     "tkill_self_sig0": (0, b"tkill=0\n"),
     "rt_tgsigqueueinfo_self": (0, b"tgsigqueueinfo=0\n"),
+    # Round-27 new-family ratchet batch (non-time, non-gated). Non-blocking
+    # readiness / connection / usage syscalls with no existing guest: the legacy
+    # accept(43) accepting a pending abstract AF_UNIX connection (distinct from
+    # round-22's accept4); the select(23), pselect6(270), and ppoll(271) readiness
+    # multiplexers each called with no descriptors and a zero timeout so they
+    # return 0 immediately without blocking or registering a timed waiter (the
+    # non-blocking-poll family already established by poll_timeout_zero); the
+    # epoll_pwait(281) sigmask-carrying variant of epoll_wait, timeout 0 on an
+    # empty interest set returning 0; and getrusage(98) filling a rusage struct
+    # for RUSAGE_SELF, printing only the syscall return (0) since the usage fields
+    # are host-specific. Every printed value is host-independent: the syscall
+    # return on success (0) or a boolean valid-fd. A zero-timeout readiness poll
+    # returns immediately and registers no timed waiter, so none changes CPU
+    # scheduling, virtual time, or randomness; all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace.
+    "accept_abstract": (0, b"accept=1\n"),
+    "select_timeout_zero": (0, b"select=0\n"),
+    "pselect6_timeout_zero": (0, b"pselect=0\n"),
+    "ppoll_timeout_zero": (0, b"ppoll=0\n"),
+    "epoll_pwait_timeout_zero": (0, b"epollpwait=0\n"),
+    "getrusage_self": (0, b"getrusage=0\n"),
 }
 
 FREESTANDING_FLAGS = (

@@ -200,6 +200,12 @@ thread and hang the run.
 | `epoll_wait_timeout_zero` | `epoll_wait(timeout=0)` on empty set (0 ready) |
 | `tkill_self_sig0` | `tkill(tid, 0)` thread-directed signal-0 permission check (return 0) |
 | `rt_tgsigqueueinfo_self` | `rt_tgsigqueueinfo(pid, tid, 0, &si)` signal-0 permission check (return 0) |
+| `accept_abstract` | legacy `accept(43)` a pending abstract `AF_UNIX` connection (valid fd => 1) |
+| `select_timeout_zero` | `select(0,NULL,NULL,NULL,&{0,0})` immediate return (return 0) |
+| `pselect6_timeout_zero` | `pselect6(0,...,&{0,0},NULL)` immediate return (return 0) |
+| `ppoll_timeout_zero` | `ppoll(NULL,0,&{0,0},NULL,8)` immediate return (return 0) |
+| `epoll_pwait_timeout_zero` | `epoll_pwait(timeout=0,NULL)` on empty set (0 ready) |
+| `getrusage_self` | `getrusage(RUSAGE_SELF,&ru)` (return 0; fields not printed) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -601,6 +607,25 @@ families have no guest, and `userfaultfd(323)` fails even natively here
 (unprivileged userfaultfd is disabled), so it is an error path rather than a
 supported-success guest. The batch kept two of five. All remain freestanding
 (`candidate_sites > 0`).
+
+The final six guests are the **round-27 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New families:
+the legacy `accept(43)` accepting a pending connection on a listening abstract
+`AF_UNIX` socket (`accept_abstract`, a boolean valid-fd, distinct from
+round-22's `accept4`); the `select(23)`, `pselect6(270)`, and `ppoll(271)`
+readiness multiplexers, each called with no descriptors and a **zero timeout**
+so they return 0 immediately without blocking or registering a timed waiter
+(`select_timeout_zero`, `pselect6_timeout_zero`, `ppoll_timeout_zero`, the same
+non-blocking class already established by `poll_timeout_zero`);
+`epoll_pwait(281)`, the sigmask-carrying variant of `epoll_wait`, with timeout 0
+on an empty interest set returning 0 ready events (`epoll_pwait_timeout_zero`);
+and `getrusage(98)` filling a rusage struct for `RUSAGE_SELF`, printing only the
+syscall return since the usage fields are host-specific (`getrusage_self`).
+Every printed value is host-independent — the syscall return on success (0) or a
+boolean valid-fd. A zero-timeout readiness poll returns immediately and
+registers no timed waiter, so none changes CPU scheduling, virtual time, or
+randomness. All six pass under golden hermit ptrace, so the batch kept six of
+six. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
