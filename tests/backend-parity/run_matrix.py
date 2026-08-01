@@ -137,6 +137,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "renameat2_flags": (local / "renameat2_flags.c", ("-D_GNU_SOURCE",)),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -235,6 +236,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "renameat2_flags": (
+            [str(fixtures.binary("renameat2_flags"))],
+            0,
+            b"renameat2 ok=4\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
