@@ -137,6 +137,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "symlink_ops": (
+                local / "symlink_ops.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -235,6 +239,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "symlink_ops": (
+            [str(fixtures.binary("symlink_ops"))],
+            0,
+            b"symlink_ops size=6 checksum=597 ok=6\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
