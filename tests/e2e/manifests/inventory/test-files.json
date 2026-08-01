@@ -1274,6 +1274,42 @@
       "why": "tests/backend-parity/e9patch_corpus/getsockopt_sndlowat.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_SNDLOWAT via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where the send low-water mark is fixed at 1 on Linux and cannot be changed, the send-side counterpart of getsockopt_rcvlowat; the returned value (1) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_reuseport.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_reuseport.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_REUSEPORT via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where the option is unset, a distinct boolean OPTION from SO_REUSEADDR/SO_BROADCAST/SO_KEEPALIVE/SO_OOBINLINE/SO_DONTROUTE already covered; the returned flag (0) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_passcred.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_passcred.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_PASSCRED via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where SCM credential passing is disabled by default, a distinct boolean OPTION from the other SO_* flag reads already covered; the returned flag (0) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_timestamp.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_timestamp.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_TIMESTAMP via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where receive timestamping is disabled by default, a distinct boolean OPTION from the other SO_* flag reads already covered; the returned flag (0) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_nocheck.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_nocheck.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_NO_CHECK via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where the disable-checksum option is off by default, a distinct boolean OPTION from the other SO_* flag reads already covered; the returned flag (0) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_priority.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_priority.c is owned by tests/backend-parity/e9patch_corpus.py: queries SO_PRIORITY via getsockopt(55) on a fresh AF_UNIX socketpair endpoint where the packet priority defaults to 0, a non-boolean OPTION reading 0 that is distinct from SO_RCVLOWAT/SO_SNDLOWAT and from the boolean flag reads; the returned value (0) is printed and is host-independent. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/fcntl_get_seals.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/fcntl_get_seals.c is owned by tests/backend-parity/e9patch_corpus.py: creates a memfd via memfd_create(319) then reads its file seals with fcntl(72) F_GET_SEALS; a memfd born without MFD_ALLOW_SEALING already carries F_SEAL_SEAL, so the returned mask (1) is host-independent, a distinct fcntl OP from F_GETFL/F_GETFD/F_GETOWN/F_GETSIG and a distinct memfd contract from the memfd seek/positioning guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
