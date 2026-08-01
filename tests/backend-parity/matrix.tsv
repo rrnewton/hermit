@@ -10,6 +10,7 @@ io_uring_fallback	pass	pass	pass	-	-
 listmount_unavailable	pass	pass	pass	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-
 process_vm_writev_refusal	pass	pass	pass	-	-
+socket_options	pass	pass	gap	-	KVM ElfExecutor accepts setsockopt but getsockopt returns ENOPROTOOPT for SO_REUSEADDR/SO_KEEPALIVE/SO_BROADCAST, so the option round-trip observes ok=0 instead of ok=6
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
