@@ -140,6 +140,10 @@ class Fixtures:
                 (),
             ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
+            "epoll_pwait2_readiness": (
+                local / "epoll_pwait2_readiness.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
                 ("-D_GNU_SOURCE",),
@@ -248,6 +252,11 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "epoll_pwait2": (
+            [str(fixtures.binary("epoll_pwait2_readiness"))],
+            0,
+            b"epoll_pwait2 ok=7\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
