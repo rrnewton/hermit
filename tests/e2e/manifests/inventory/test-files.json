@@ -212,6 +212,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/mincore_residency.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/mincore_residency.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/mkdir_rmdir.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/mkdir_rmdir.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1610,6 +1616,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/bash-random.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/bash-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It proves Bash $RANDOM varies natively yet repeats bitwise under strict verification via Hermit's PID and time virtualization"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/cpp-stl-determinism.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
       "why": "tests/e2e/language-runtimes/cpp-stl-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It compiles a small C++17 STL program in --prepare and execs it under Hermit, exercising std::random_device entropy through std::set/std::map/std::unordered_map/std::sort/std::string plus a file-I/O roundtrip and std::chrono timestamp under strict verification"
@@ -2609,12 +2621,6 @@
       "path": "tests/util/ssl_server.py",
       "runner": "validate.sh or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by validate.sh or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
-    },
-    {
-      "path": "tests/backend-parity/fixtures/mincore_residency.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/mincore_residency.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     }
   ],
   "schema": 2
