@@ -91,6 +91,20 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "fcntl_cloexec": (0, b"stdout_fd_flags=0\nopened_fd=3\nopened_flags=0\n"),
     "proc_self_fd_count": (0, None),
     "readlink_exe": (0, None),
+    # Round-3 new-family ratchet batch (non-time, non-gated). Widens coverage
+    # beyond fd/output hygiene into content I/O, stat mode bits, memory
+    # protection, errno paths, and credential syscalls -- families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. The identity
+    # guests emit host-specific absolute values, so they assert golden==e9patch
+    # parity only (None); the rest pin exact deterministic stdout.
+    "read_devzero": (0, b"zeros=16\n"),
+    "read_devnull_eof": (0, b"eof=0\n"),
+    "fstat_devnull": (0, b"chardev=1\n"),
+    "lseek_pipe": (0, b"espipe=-29\n"),
+    "write_badfd": (0, b"ebadf=-9\n"),
+    "mprotect_roundtrip": (0, b"mprotect=ok\n"),
+    "getid_identity": (0, None),
+    "getgroups_identity": (0, None),
 }
 
 FREESTANDING_FLAGS = (

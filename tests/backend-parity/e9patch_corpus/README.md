@@ -35,6 +35,14 @@ thread and hang the run.
 | `fcntl_cloexec` | `F_GETFD` reports no stray `FD_CLOEXEC` |
 | `proc_self_fd_count` | `/proc/self/fd` count parity (no leaked loader fd) |
 | `readlink_exe` | `/proc/self/exe` resolves to the original guest, not the e9 temp |
+| `read_devzero` | content I/O: `read(/dev/zero, 16)` yields 16 zero bytes |
+| `read_devnull_eof` | content I/O: `read(/dev/null)` returns 0 (EOF) |
+| `fstat_devnull` | stat mode bits: `fstat(/dev/null)` reports `S_IFCHR` |
+| `lseek_pipe` | seek error path: `lseek` on a pipe fails `ESPIPE` (-29) |
+| `write_badfd` | fd error path: `write` to a bad fd fails `EBADF` (-9) |
+| `mprotect_roundtrip` | memory protection: `mmap`/`mprotect` RW→RO→RW/`munmap` |
+| `getid_identity` | credentials: `getuid`/`geteuid`/`getgid`/`getegid` |
+| `getgroups_identity` | credentials: `getgroups` supplementary-group count |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -43,6 +51,18 @@ descriptor allocation or process-metadata output. `proc_self_fd_count` and
 golden==e9patch parity for them (`expected_stdout=None`) rather than a fixed
 string; the other six pin exact stdout. All remain freestanding
 (`candidate_sites > 0`) so e9patch actually rewrites them.
+
+The final eight guests are the **round-3 new-family ratchet batch** (non-time,
+non-gated): they widen coverage beyond fd/output hygiene into content I/O
+(`read_devzero`, `read_devnull_eof`), stat mode bits (`fstat_devnull`), memory
+protection (`mprotect_roundtrip`), errno paths (`lseek_pipe` `ESPIPE`,
+`write_badfd` `EBADF`), and credential syscalls (`getid_identity`,
+`getgroups_identity`). These establish that e9patch preprocessing leaves
+`read`/`fstat`/`mmap`/`mprotect`/`lseek`/`write` and the credential syscalls
+byte-identical to golden ptrace. `getid_identity` and `getgroups_identity` emit
+host-specific absolute uid/gid/group-count values, so the driver asserts
+golden==e9patch parity only (`expected_stdout=None`); the other six pin exact
+deterministic stdout. All remain freestanding (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
