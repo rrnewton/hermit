@@ -174,6 +174,13 @@ thread and hang the run.
 | `sched_rr_get_interval_check` | `sched_rr_get_interval` query (return 0) |
 | `setpgid_self` | `setpgid(0,0)` self process-group (return 0) |
 | `poll_timeout_zero` | `poll(NULL,0,0)` immediate return (return 0) |
+| `munlock_page` | `munlock` one page after `mlock` (return 0) |
+| `connect_abstract` | `connect` to a listening abstract `AF_UNIX` socket (return 0) |
+| `recvmmsg_socketpair` | `recvmmsg` one datagram on a socketpair (`hi`) |
+| `preadv2_memfd` | `preadv2` positional scatter read on a memfd (`hi`) |
+| `pwritev2_memfd` | `pwritev2` positional gather write on a memfd (`hi`) |
+| `prctl_cap_ambient` | `prctl(PR_CAP_AMBIENT, IS_SET)` query (boolean 0) |
+| `pidfd_getfd_self` | `pidfd_getfd` on a self pidfd (valid fd => 1) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -473,6 +480,26 @@ value is host-independent — the syscall return on success (0) or a boolean. An
 eighth candidate, `sched_getattr(275)`, was **dropped**: it returns `-ENOSYS`
 (-38) under golden hermit ptrace, so keeping it would be a false-parity claim
 (#152) — the batch kept seven of eight. All remain freestanding
+(`candidate_sites > 0`).
+
+The final seven guests are the **round-21 new-family ratchet batch** (non-time,
+non-gated), again targeting syscalls with **no existing guest**. New syscalls:
+`munlock(11)` unlocking one page after an `mlock` (`munlock_page`, return 0);
+`connect(42)` of a second `AF_UNIX` stream socket to a listening
+abstract-namespace address (`connect_abstract`, return 0, the connect path
+complementing `bind_abstract`/`listen_abstract`); `recvmmsg(299)` reading back
+one datagram previously sent over a socketpair (`recvmmsg_socketpair`,
+round-tripping `hi`, the receive-side counterpart to `sendmmsg_socketpair`);
+`preadv2(327)` and `pwritev2(328)` positional scatter/gather I/O on a memfd
+(`preadv2_memfd`, `pwritev2_memfd`, round-tripping `hi`, the flagged v2
+counterparts to `preadv`/`pwritev`); `prctl` `PR_CAP_AMBIENT`
+`PR_CAP_AMBIENT_IS_SET` querying `CAP_CHOWN` (`prctl_cap_ambient`, boolean 0,
+not in the ambient set); and `pidfd_getfd(438)` duplicating one of the process's
+own descriptors through a self `pidfd` (`pidfd_getfd_self`, a boolean valid-fd,
+the fd number not printed). Every printed value is host-independent — the
+syscall return on success (0), a boolean, or fixed round-tripped text (`hi`).
+None changes scheduling, time, or randomness. All seven pass under golden hermit
+ptrace, so the batch kept seven of seven. All remain freestanding
 (`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at

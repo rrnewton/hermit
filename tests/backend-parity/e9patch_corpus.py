@@ -421,6 +421,29 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "sched_rr_get_interval_check": (0, b"rrinterval=0\n"),
     "setpgid_self": (0, b"setpgid=0\n"),
     "poll_timeout_zero": (0, b"poll=0\n"),
+    # Round-21 new-family ratchet batch (non-time, non-gated). Yet more syscalls
+    # with no existing guest: munlock(11) after an mlock, unlocking one page
+    # (return 0); connect(42) of a second AF_UNIX stream socket to a listening
+    # abstract-namespace address (return 0, exercising the connect path that
+    # complements bind_abstract/listen_abstract); recvmmsg(299) reading back one
+    # datagram previously sent with sendmmsg over a socketpair (round-trips "hi",
+    # the receive-side counterpart to sendmmsg_socketpair); preadv2(327) and
+    # pwritev2(328) positional scatter/gather I/O on a memfd (round-trip "hi",
+    # the flagged v2 counterparts to preadv/pwritev); prctl PR_CAP_AMBIENT(47)
+    # PR_CAP_AMBIENT_IS_SET query for CAP_CHOWN (boolean 0, not in the ambient
+    # set); and pidfd_getfd(438) duplicating one of the process's own descriptors
+    # through a self pidfd (boolean valid-fd; the fd number is host-specific and
+    # not printed). Every printed value is host-independent: the syscall return on
+    # success (0), a boolean, or fixed round-tripped text ("hi"). None changes
+    # scheduling, time, or randomness, so all are routine backend-parity coverage
+    # that e9patch preprocessing must leave byte-identical to golden ptrace.
+    "munlock_page": (0, b"munlock=0\n"),
+    "connect_abstract": (0, b"connect=0\n"),
+    "recvmmsg_socketpair": (0, b"recvmmsg=hi\n"),
+    "preadv2_memfd": (0, b"preadv2=hi\n"),
+    "pwritev2_memfd": (0, b"pwritev2=hi\n"),
+    "prctl_cap_ambient": (0, b"capambient=0\n"),
+    "pidfd_getfd_self": (0, b"pidfdgetfd=1\n"),
 }
 
 FREESTANDING_FLAGS = (
