@@ -9,17 +9,18 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+memory-layout behavior, plus sorted directory enumeration via
+`readdir`/`getdents`. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -44,6 +45,13 @@ The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
+The readdir row creates a temporary directory holding three known regular files
+in a non-sorted creation order, enumerates it with `opendir`/`readdir` (backed
+by `getdents64`), sorts the returned names in the fixture, and verifies the
+entry count, the sorted names, and that each entry resolves to a regular file.
+Sorting in the fixture makes the contract independent of backend-specific
+directory ordering; all three backends produce the same enumeration, and the
+temporary tree is removed before exit so repeated runs are idempotent.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -54,7 +62,7 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
@@ -64,7 +72,8 @@ still provides distinct worker samples and byte-identical output across strict
 verification runs. Its no-xattr filesystem model validates xattr targets and
 arguments before returning deterministic Linux-compatible errors, while its
 in-memory mapping model validates `msync` and translates range-advice file
-descriptors. Serialized child exits support both `wait4` and `waitid`, including
+descriptors. It also enumerates directories through `getdents64`, returning the
+same entry set that ptrace and DBI observe. Serialized child exits support both `wait4` and `waitid`, including
 canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
@@ -92,6 +101,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_accounting` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
+| `readdir_entries` | pass | pass | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | pass |
