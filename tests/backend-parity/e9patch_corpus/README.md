@@ -98,6 +98,14 @@ thread and hang the run.
 | `mincore_resident` | `mincore` queries a written anon page (return 0) |
 | `fadvise_memfd` | `fadvise64` `POSIX_FADV_NORMAL` hint on a memfd (return 0) |
 | `sysinfo_ok` | `sysinfo` fills the struct (return 0; fields not printed) |
+| `rt_sigprocmask_query` | `rt_sigprocmask` `SIG_BLOCK` (return 0; no delivery) |
+| `sigaltstack_query` | `sigaltstack` query reports `SS_DISABLE` (2) |
+| `epoll_ctl_add` | `epoll_create1`/`epoll_ctl` `ADD` a pipe (return 0; no wait) |
+| `memfd_seal` | `fcntl` `F_ADD_SEALS`/`F_GET_SEALS` on a sealable memfd (1) |
+| `uname_sysname` | `uname` sysname field (`Linux`) |
+| `prctl_dumpable` | `prctl` `PR_GET_DUMPABLE` (1) |
+| `capget_ok` | `capget` v3 header (return 0; masks not printed) |
+| `fstatfs_memfd` | `fstatfs` on a memfd (return 0; fields not printed) |
 
 The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
 (non-time, non-gated): they establish that e9patch preprocessing perturbs no
@@ -208,6 +216,23 @@ host-independent by construction: `getsockname_unix`/`getpeername_unix` print
 the `AF_UNIX` family constant (1); `fdatasync_memfd`/`mincore_resident`/
 `fadvise_memfd`/`sysinfo_ok` print the syscall return (0 on success) rather than
 any host-specific field. All remain freestanding (`candidate_sites > 0`).
+
+The final eight guests are the **round-11 new-family ratchet batch** (non-time,
+non-gated): signal-mask and alternate-stack queries with no delivery or
+scheduling (`rt_sigprocmask_query`, `sigaltstack_query`), epoll descriptor
+registration with no wait (`epoll_ctl_add`), memfd `fcntl` sealing
+(`memfd_seal`), `uname` (`uname_sysname`), `prctl` `PR_GET_DUMPABLE`
+(`prctl_dumpable`), `capget` (`capget_ok`), and `fstatfs` (`fstatfs_memfd`).
+These establish that e9patch preprocessing leaves
+`rt_sigprocmask`/`sigaltstack`/`epoll_create1`/`epoll_ctl`/`fcntl`(sealing)/
+`uname`/`prctl`/`capget`/`fstatfs` byte-identical to golden ptrace. Every printed
+value is host-independent — the `uname` sysname `Linux`, the `SS_DISABLE`,
+`F_SEAL_SEAL`, and `PR_GET_DUMPABLE` constants, or the syscall return (0 on
+success). `splice` was evaluated and **dropped**: hermit returns `-ENOSYS`
+(golden itself prints `splice=-38`), so including it would encode a hermit
+limitation rather than a parity claim (no false-parity), exactly as round-6
+handled `copy_file_range`. All kept guests remain freestanding
+(`candidate_sites > 0`).
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

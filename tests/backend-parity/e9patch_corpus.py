@@ -203,6 +203,24 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mincore_resident": (0, b"mincore=0\n"),
     "fadvise_memfd": (0, b"fadvise=0\n"),
     "sysinfo_ok": (0, b"sysinfo=0\n"),
+    # Round-11 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into signal-mask/altstack queries (no delivery, no scheduling), epoll fd
+    # registration (no wait), memfd fcntl sealing, uname, prctl PR_GET_DUMPABLE,
+    # capget, and fstatfs -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. Every printed value is host-independent:
+    # constants (uname sysname "Linux", SS_DISABLE=2, F_SEAL_SEAL=1,
+    # PR_GET_DUMPABLE=1) or the syscall return (0 on success). splice was
+    # evaluated and DROPPED: hermit returns -ENOSYS (golden itself prints
+    # "splice=-38"), so it would encode a hermit limitation, not a parity claim
+    # (no false-parity), exactly like round-6's copy_file_range.
+    "rt_sigprocmask_query": (0, b"sigprocmask=0\n"),
+    "sigaltstack_query": (0, b"altstack=2\n"),
+    "epoll_ctl_add": (0, b"epoll=0\n"),
+    "memfd_seal": (0, b"seals=1\n"),
+    "uname_sysname": (0, b"uname=Linux\n"),
+    "prctl_dumpable": (0, b"dumpable=1\n"),
+    "capget_ok": (0, b"capget=0\n"),
+    "fstatfs_memfd": (0, b"fstatfs=0\n"),
 }
 
 FREESTANDING_FLAGS = (
