@@ -153,6 +153,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "getpriority_identity": (
+                REPOSITORY / "tests/c/getpriority_identity.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -261,6 +265,11 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "getpriority_identity": (
+            [str(fixtures.binary("getpriority_identity"))],
+            0,
+            b"getpriority-identity-ok\n",
         ),
     }
 
