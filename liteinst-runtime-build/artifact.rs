@@ -9,7 +9,7 @@ pub(crate) fn liteinst_cdylibs_from_cargo_messages(messages: &str) -> Result<Vec
             .map_err(|error| format!("invalid Cargo JSON on line {}: {error}", index + 1))?;
         let target = &message["target"];
         let is_liteinst_cdylib = message["reason"] == "compiler-artifact"
-            && target["name"] == "reverie_liteinst"
+            && target["name"] == "hermit_liteinst_runtime_artifact"
             && target["kind"]
                 .as_array()
                 .is_some_and(|kinds| kinds.iter().any(|kind| kind == "cdylib"));
@@ -44,7 +44,7 @@ mod tests {
         let messages = concat!(
             r#"{"reason":"compiler-artifact","target":{"name":"unrelated","kind":["cdylib"]},"filenames":["/warm/deps/libreverie_liteinst-stale.so"]}"#,
             "\n",
-            r#"{"reason":"compiler-artifact","target":{"name":"reverie_liteinst","kind":["rlib","cdylib"]},"filenames":["/isolated/deps/libreverie_liteinst-current.rlib","/isolated/deps/libreverie_liteinst-current.so"],"fresh":true}"#,
+            r#"{"reason":"compiler-artifact","target":{"name":"hermit_liteinst_runtime_artifact","kind":["rlib","cdylib"]},"filenames":["/isolated/deps/libreverie_liteinst-current.rlib","/isolated/deps/libreverie_liteinst-current.so"],"fresh":true}"#,
             "\n",
             r#"{"reason":"build-finished","success":true}"#,
         );

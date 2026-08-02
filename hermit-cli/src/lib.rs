@@ -598,7 +598,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
+    /// Use the in-guest LiteInst Tool with coordinator GlobalTool RPC.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -1477,6 +1477,12 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
     // the parent kernel-blocked until the child registers, so this stays false there.
     config.backend_defers_vfork_child_registration = backend == Backend::Kvm;
+    if backend == Backend::Liteinst {
+        // LiteInst has no RCB timer delivery yet. Do not let Detcore believe a
+        // max or target timeslice was armed by the backend's coarse boundary.
+        config.max_timeslice = None;
+        config.target_timeslice = None;
+    }
     config
 }
 
@@ -1550,7 +1556,7 @@ async fn run_with_backend_inner(
         }
 
         let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1684,11 +1690,11 @@ async fn run_with_output_backend_inner(
         }
 
         let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
-        let status = output.status;
+        let status: ExitStatus = output.status.into();
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
@@ -2015,14 +2021,12 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
+    fn liteinst_backend_disables_unsupported_rcb_timeslices() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
-        assert!(
-            prepare_backend_config(config.clone(), Backend::Liteinst)
-                .max_timeslice
-                .is_some()
-        );
+        let liteinst = prepare_backend_config(config.clone(), Backend::Liteinst);
+        assert!(liteinst.max_timeslice.is_none());
+        assert!(liteinst.target_timeslice.is_none());
         assert!(
             prepare_backend_config(config, Backend::Ptrace)
                 .max_timeslice
