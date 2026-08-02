@@ -891,6 +891,31 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "pipe2_direct": (0, b"pd=hi\n"),
     "fcntl_setsig": (0, b"setsig=10\n"),
     "arch_prctl_getcpuid": (0, b"getcpuid=0\n"),
+    # round-45: a memory-protection-key application, an xattr-list query, a
+    # session op, four setsockopt set-and-confirm ops, an executable mprotect, a
+    # core-dump madvise, and an IPv6 socket. pkey_mprotect_page applies a pkey to
+    # an anon page with pkey_mprotect (-> 0); llistxattr_devnull reads the empty
+    # xattr list size of /dev/null (-> 0); setsid_check starts a new session
+    # (host-variable sid, success boolean -> 1); setsockopt_keepalive /
+    # setsockopt_rcvbuf / setsockopt_reuseport / setsockopt_sndbuf set an option
+    # then confirm it (readback boolean -> 1); getrandom_nonblock fills 16 bytes
+    # via GRND_NONBLOCK (count -> 16, not the bytes); mprotect_exec makes a page
+    # read+execute (-> 0); madvise_dontdump excludes a page from core dumps
+    # (-> 0); socket_inet6 opens an AF_INET6 stream socket (lowest fd -> 3).
+    # Every printed value is a queried constant, a success boolean, or the lowest
+    # free fd with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all eleven byte-identical to golden ptrace.
+    "pkey_mprotect_page": (0, b"pkeymprotect=0\n"),
+    "llistxattr_devnull": (0, b"llistxattr=0\n"),
+    "setsid_check": (0, b"setsid=1\n"),
+    "setsockopt_keepalive": (0, b"setkeepalive=1\n"),
+    "getrandom_nonblock": (0, b"grndnb=16\n"),
+    "setsockopt_rcvbuf": (0, b"setrcvbuf=1\n"),
+    "setsockopt_reuseport": (0, b"setreuseport=1\n"),
+    "mprotect_exec": (0, b"protexec=0\n"),
+    "madvise_dontdump": (0, b"dontdump=0\n"),
+    "socket_inet6": (0, b"inet6=3\n"),
+    "setsockopt_sndbuf": (0, b"setsndbuf=1\n"),
 }
 
 FREESTANDING_FLAGS = (
