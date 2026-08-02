@@ -1258,12 +1258,9 @@ fn image_conflicts_with_no_namespace_with_explanatory_error() {
 
 #[test]
 fn image_rejects_unqualified_backend_and_namespace_paths() {
-    let mut backend = RunOpts::parse_from([
-        "fakehermit",
-        "--image=busybox@sha256:deadbeef",
-        "--backend=dbi",
-        "/bin/sh",
-    ]);
+    let mut backend =
+        RunOpts::parse_from(["fakehermit", "--image=busybox@sha256:deadbeef", "/bin/sh"]);
+    backend.backend = Backend::Dbi;
     let message = backend
         .validate_args_with_perf_support(true)
         .unwrap_err()
