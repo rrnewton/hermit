@@ -42,6 +42,7 @@ use super::container::IdentityGuard;
 use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
+use super::container::image_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
@@ -163,6 +164,11 @@ pub struct RunOpts {
     /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
     /// guests. Host process, filesystem, and network state are shared, reducing determinism.
     /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    ///
+    /// Incompatible with `--image`, which chroots the guest into a materialized
+    /// OCI rootfs and therefore requires namespaces; that conflict is reported
+    /// at runtime with an explanatory message rather than as a generic clap
+    /// argument conflict.
     #[clap(
         long,
         visible_alias = "core-only",
@@ -203,6 +209,22 @@ pub struct RunOpts {
     /// mounted over `/tmp`, and deleted when the guest has exited.
     #[clap(long, value_name = "dirpath")]
     tmp: Option<PathBuf>,
+
+    /// PROTOTYPE: run the guest against the root filesystem of a pinned OCI image
+    /// instead of the host filesystem. The reference is materialized (pulled and
+    /// unpacked, rootless) via `buildah` and the guest is `chroot`ed into a
+    /// read-only cached root with an isolated writable `/tmp`, so its FILE INPUTS
+    /// come deterministically from the image. Pin by digest for
+    /// reproducibility, e.g.
+    /// `--image docker.io/library/busybox@sha256:...`. The guest program path
+    /// must resolve inside the image: give an absolute path (e.g. `/bin/sh`) or
+    /// a relative path containing a `/` (e.g. `./bin/sh`), which is resolved
+    /// against the image working directory; a bare command name (PATH search
+    /// inside the image) is not yet supported. Requires namespaces (incompatible
+    /// with `--no-namespace`). The prototype currently supports only the ptrace
+    /// backend and does not yet compose with custom `--mount`/`--bind` options.
+    #[clap(long, value_name = "OCI-REFERENCE")]
+    image: Option<String>,
 
     /// Exactly like "seed" but we generate a seed for you. This is useful if multiple
     /// hermit runs execute in parallel and rand based collisions exist.  "Args" generates
@@ -481,6 +503,9 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --tmp={}", shell_words::quote(s))?;
+        }
+        if let Some(image) = &self.image {
+            write!(f, " --image={}", shell_words::quote(image))?;
         }
         match &self.verify_allow {
             VerifyAllow::Success => {} // default
@@ -1232,6 +1257,104 @@ fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
 }
 
 #[test]
+fn image_conflicts_with_no_namespace_with_explanatory_error() {
+    // The clap layer no longer lists `image` in `--no-namespace`'s
+    // conflicts_with set, so parsing succeeds; the conflict is reported at
+    // validation time with a message that explains *why* they are incompatible.
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--image=docker.io/library/busybox@sha256:deadbeef",
+        "--no-namespace",
+        "/bin/sh",
+    ]);
+    let message = opts
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("--image"), "message: {message}");
+    assert!(message.contains("--no-namespace"), "message: {message}");
+    assert!(message.contains("chroot"), "message: {message}");
+}
+
+#[test]
+fn image_rejects_unqualified_backend_and_namespace_paths() {
+    let mut backend = RunOpts::parse_from([
+        "fakehermit",
+        "--image=busybox@sha256:deadbeef",
+        "--backend=dbi",
+        "/bin/sh",
+    ]);
+    let message = backend
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("only the ptrace backend"),
+        "message: {message}"
+    );
+
+    let mut namespace_only = RunOpts::parse_from([
+        "fakehermit",
+        "--image=busybox@sha256:deadbeef",
+        "--namespace-only",
+        "/bin/sh",
+    ]);
+    let message = namespace_only
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("--namespace-only"), "message: {message}");
+}
+
+#[test]
+fn image_script_validation_resolves_interpreter_inside_rootfs() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootfs = tmp.path();
+    let script = rootfs.join("bin/image-script");
+    let interpreter = rootfs.join("image-only-interpreter");
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::write(&script, b"#!/image-only-interpreter\nexit 0\n").unwrap();
+    std::fs::write(&interpreter, b"image interpreter fixture\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    validate_executable(&script, Path::new("/bin/image-script"), Some(rootfs)).unwrap();
+}
+
+#[test]
+fn image_guest_program_resolution_matches_execve_pathname_rules() {
+    // Absolute paths pass through unchanged.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("/bin/sh"), Path::new("/")).unwrap(),
+        PathBuf::from("/bin/sh")
+    );
+    // A relative path containing a '/' resolves against the guest working
+    // directory (the image WorkingDir) and is normalized.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("bin/busybox"), Path::new("/opt/app")).unwrap(),
+        PathBuf::from("/opt/app/bin/busybox")
+    );
+    assert_eq!(
+        resolve_image_guest_program(Path::new("./run.sh"), Path::new("/srv")).unwrap(),
+        PathBuf::from("/srv/run.sh")
+    );
+    // Default working directory of `/` resolves relative paths at the root.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("./bin/sh"), Path::new("/")).unwrap(),
+        PathBuf::from("/bin/sh")
+    );
+    // A bare command name (no '/') would need an unsupported in-image PATH
+    // search and is rejected with an actionable message.
+    let bare = resolve_image_guest_program(Path::new("sh"), Path::new("/"))
+        .unwrap_err()
+        .to_string();
+    assert!(bare.contains("PATH search"), "message: {bare}");
+    assert!(bare.contains("bin/sh"), "message: {bare}");
+    // Parent components cannot escape the guest root during validation.
+    assert!(resolve_image_guest_program(Path::new("../etc/x"), Path::new("/app")).is_err());
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -1308,7 +1431,11 @@ pub(super) fn is_elf_file(path: &Path) -> Result<bool, Error> {
     }
 }
 
-fn validate_executable(path: &Path, requested: &Path) -> Result<(), Error> {
+fn validate_executable(
+    path: &Path,
+    requested: &Path,
+    guest_root: Option<&Path>,
+) -> Result<(), Error> {
     let metadata = fs::metadata(path).with_context(|| {
         format!(
             "Program {} does not exist or is not accessible. Check the path and any --mount or \
@@ -1344,10 +1471,13 @@ fn validate_executable(path: &Path, requested: &Path) -> Result<(), Error> {
                 requested.display()
             );
         }
-        let interpreter_metadata = fs::metadata(&interpreter).with_context(|| {
+        let interpreter_host = guest_root
+            .map(|root| crate::image::resolve_in_rootfs(root, &interpreter))
+            .unwrap_or_else(|| interpreter.clone());
+        let interpreter_metadata = fs::metadata(&interpreter_host).with_context(|| {
             format!(
-                "Program {} uses shebang interpreter {}, but that interpreter does not exist. \
-                 Install it or update the script's #! line.",
+                "Program {} uses shebang interpreter {}, but that interpreter does not exist in \
+                 the selected guest filesystem. Install it or update the script's #! line.",
                 requested.display(),
                 interpreter.display()
             )
@@ -1390,6 +1520,30 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
         }
     }
     Ok(normalized)
+}
+
+/// Resolve a guest program path to an absolute path *inside the image rootfs*,
+/// mirroring execve(2) pathname resolution for the `--image` prototype:
+///
+///   * an absolute path is used as-is;
+///   * a relative path that contains a `/` (e.g. `./bin/sh`, `bin/busybox`) is
+///     resolved against `guest_cwd` (the image WorkingDir, or `/`), so the path
+///     validated here is the same one the chrooted guest will execve;
+///   * a bare command name (no `/`) would require a PATH search inside the
+///     image, which the prototype does not implement, so it is rejected.
+fn resolve_image_guest_program(requested: &Path, guest_cwd: &Path) -> Result<PathBuf, Error> {
+    if requested.is_absolute() {
+        Ok(requested.to_path_buf())
+    } else if requested.to_string_lossy().contains('/') {
+        normalize_guest_path(&guest_cwd.join(requested))
+    } else {
+        anyhow::bail!(
+            "With --image, a bare program name ({:?}) would require a PATH search inside the \
+             image, which is not yet supported; use a path containing '/' (absolute like \
+             `/bin/sh`, or relative to the working directory like `./bin/sh`).",
+            requested
+        )
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1652,6 +1806,28 @@ impl RunOpts {
                 "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
             );
         }
+        if self.image.is_some() && self.no_namespace {
+            anyhow::bail!(
+                "--image chroots the guest into a materialized OCI rootfs, which requires mount \
+                 and PID namespaces; it is incompatible with --no-namespace"
+            );
+        }
+        if self.image.is_some() && backend != Backend::Ptrace {
+            anyhow::bail!(
+                "--image currently supports only the ptrace backend; backend `{}` has separate \
+                 launcher/runtime-file requirements that have not been qualified inside the OCI rootfs",
+                backend.as_str()
+            );
+        }
+        if self.image.is_some() && self.namespace_only {
+            anyhow::bail!("--image cannot be combined with --namespace-only");
+        }
+        if self.image.is_some() && (!self.mount.is_empty() || !self.bind.is_empty()) {
+            anyhow::bail!(
+                "--image does not yet compose with custom --mount/--bind targets inside the OCI rootfs"
+            );
+        }
+
         let config = &mut self.det_opts.det_config;
 
         // Only the ptrace-family backends launch the guest through Reverie's
@@ -2041,16 +2217,45 @@ impl RunOpts {
     }
 
     fn validate_program(&self) -> Result<(), Error> {
+        // PROTOTYPE (--image): the guest program is interpreted inside the
+        // materialized OCI rootfs, not on the host filesystem. Resolve and
+        // validate it against the rootfs so that image-only binaries (e.g.
+        // busybox's `/bin/busybox`, absent from the host) are accepted, and so
+        // host binaries that merely happen to share a path are never used.
+        // materialize_rootfs is idempotent/cached, so this does not re-pull the
+        // image later in `container()`.
+        if let Some(image) = &self.image {
+            // Materialize before building the command: on a cold cache this is
+            // what makes the image's Env/WorkingDir available for relative-path
+            // resolution during first-run validation.
+            let rootfs = crate::image::materialize_rootfs(image)?;
+            let command = self.guest_command()?;
+            let requested = Path::new(command.get_program());
+            // `guest_command()` sets the image working directory (WorkingDir, or
+            // `/`) as the guest cwd; resolve a relative program path against it.
+            let guest_cwd = command
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
+            // Resolve chroot-aware: images (nixos/nix especially) expose
+            // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
+            // only resolves under the image root, so a naive host `stat` would
+            // follow it against the host `/` and fail.
+            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, &guest_abs);
+            return validate_executable(&in_rootfs, &guest_abs, Some(&rootfs));
+        }
+
         if self.selected_backend() == Backend::E9patch {
             let (_, host) = self.resolve_guest_and_host_program()?;
-            return validate_executable(&host, &self.program);
+            return validate_executable(&host, &self.program, None);
         }
 
         let command = self.guest_command()?;
         let requested = Path::new(command.get_program());
         if requested.is_absolute() {
             if let GuestPathMapping::Mapped(host) = self.mapped_host_program(requested) {
-                return validate_executable(&host, requested);
+                return validate_executable(&host, requested, None);
             }
             if requested.starts_with(TMP_DIR) && self.tmp.is_none() && requested.exists() {
                 anyhow::bail!(
@@ -2060,7 +2265,7 @@ impl RunOpts {
                     requested.display()
                 );
             }
-            return validate_executable(requested, requested);
+            return validate_executable(requested, requested, None);
         }
 
         let resolved = command.find_program().with_context(|| {
@@ -2070,7 +2275,7 @@ impl RunOpts {
                 requested
             )
         })?;
-        validate_executable(&resolved, requested)
+        validate_executable(&resolved, requested, None)
     }
 
     fn validate_e9patch_source_visibility(&self, source: &Path) -> Result<(), Error> {
@@ -2338,6 +2543,26 @@ impl RunOpts {
 
     /// Returns a configured container to run a function in.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
+        // PROTOTYPE: when an OCI image is requested, the guest runs against the
+        // image's materialized rootfs (deterministic file inputs) rather than
+        // the host filesystem. This replaces the default namespace+mounts setup
+        // with a chroot into the pinned image root.
+        if let Some(image) = &self.image {
+            let rootfs = crate::image::materialize_rootfs(image)?;
+            let (mut container, identity_sources) =
+                image_container(&rootfs, tmpfs, self.pin_threads)?;
+            match &self.network {
+                NetworkingMode::Local => {
+                    container.local_networking_only();
+                }
+                NetworkingMode::Host if self.analyze_networking => {
+                    container.local_networking_only();
+                }
+                NetworkingMode::Host => {}
+            }
+            return Ok((container, identity_sources));
+        }
+
         let mut container = default_container(self.pin_threads);
 
         match &self.network {
@@ -2406,9 +2631,47 @@ impl RunOpts {
         if self.e9patch_program.is_some() {
             command.arg0(&self.program);
         }
+        // PROTOTYPE (--image): the guest lives inside the OCI rootfs, so the
+        // guest working directory must be one that exists under the image root.
+        // Default it to the image's declared `WorkingDir`, else `/` (a bare
+        // chroot leaves cwd pointing at the — now unreachable — host cwd, which
+        // makes `getcwd` fail inside the guest). An explicit `--workdir` wins.
         if let Some(current_dir) = &self.workdir {
             command.current_dir(current_dir);
+        } else if let Some(image) = &self.image {
+            let cfg = crate::image::read_image_config(image)?;
+            command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
         }
+
+        // PROTOTYPE (--image): an OCI rootfs is a self-contained filesystem, so
+        // leaking the host environment (a host `PATH` full of paths absent from
+        // the image) both breaks usability and undermines determinism. Instead
+        // apply the image's *own* declared `Env` — pinned by the image digest,
+        // hence deterministic — over an otherwise empty base, then merge user
+        // `--env` on top. If the image declares no `PATH`/`HOME` we fall back to
+        // the same hermetic defaults `--base-env=minimal` uses.
+        if let Some(image) = &self.image {
+            command.env_clear();
+            let cfg = crate::image::read_image_config(image)?;
+            let declares_path = cfg.env.iter().any(|(k, _)| k == "PATH");
+            let declares_home = cfg.env.iter().any(|(k, _)| k == "HOME");
+            command.env("HOSTNAME", "hermetic-container.local");
+            if !declares_path {
+                command.env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
+            }
+            if !declares_home {
+                command.env("HOME", "/root");
+            }
+            for (key, value) in &cfg.env {
+                command.env(key, value);
+            }
+            self.merge_from_env_settings(&mut command)?;
+            return Ok(command);
+        }
+
         match self.base_env {
             BaseEnv::Empty => {
                 command.env_clear();
