@@ -153,6 +153,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "cpu_virtualization": (
+                local / "cpu_virtualization.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -261,6 +265,11 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "cpu_virtualization": (
+            [str(fixtures.binary("cpu_virtualization"))],
+            0,
+            b"cpu-virtualization-ok\n",
         ),
     }
 
