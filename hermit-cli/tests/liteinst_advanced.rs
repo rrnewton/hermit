@@ -215,6 +215,41 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
+fn assert_liteinst_stats(
+    output: &Output,
+    expected_run_reports: usize,
+    expected_process_reports: usize,
+) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("backend run complete backend=liteinst")
+            .count(),
+        expected_run_reports,
+        "{stderr}"
+    );
+    let process_field = format!(
+        "LiteInst instrumentation stats: process_reports={expected_process_reports} distinct_rips_patched="
+    );
+    assert!(
+        stderr.contains(&process_field),
+        "missing {process_field:?}: {stderr}"
+    );
+    for field in [
+        "patch_candidates=",
+        "decisions[direct_pun=",
+        "paths[first_site_seccomp=0,ptrace_installation=0,in_guest_sigsys=",
+        "in_guest_nested_sigsys=",
+        "cacheline_straddler=",
+        "unpatchable_or_other=",
+        "direct_hook=",
+        "instruction_lengths[1=",
+        "straddle_prefix[1=",
+    ] {
+        assert!(stderr.contains(field), "missing {field:?}: {stderr}");
+    }
+}
+
 fn assert_liteinst_virtual_time_is_continuous() {
     const EPOCH_SECONDS: u64 = 1_767_225_600;
     const MAX_STARTUP_SECONDS: u64 = 60;
@@ -871,7 +906,39 @@ fn liteinst_thread_clone_fails_closed_without_sigsys() {
 
 #[test]
 fn liteinst_fork_process_tree_strict_verify() {
-    assert_liteinst_strict_verify(advanced_guest(), &["fork"], b"fork-ok\n");
+    let output = run_liteinst_strict_verify(advanced_guest(), &["fork"]);
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert_liteinst_stats(&output, 2, 9);
+}
+
+#[test]
+fn liteinst_fork_process_tree_reports_stats_on_normal_path() {
+    let output = run_liteinst(advanced_guest(), &["fork"], false);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert_liteinst_stats(&output, 1, 9);
+}
+
+#[test]
+fn liteinst_disabled_stats_ignore_an_inherited_stats_socket() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let output = Command::new(liteinst_runtime::hermit_binary())
+        .args(["run", "--backend", "liteinst", "--strict", "--"])
+        .arg(advanced_guest())
+        .arg("fork")
+        .env(
+            reverie_liteinst::STATS_COORDINATOR_ENV,
+            "/definitely/missing/liteinst-stats.sock",
+        )
+        .output()
+        .expect("failed to run Hermit LiteInst with statistics disabled");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("backend run complete backend=liteinst"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

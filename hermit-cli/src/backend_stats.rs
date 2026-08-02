@@ -34,11 +34,9 @@ where
         S::Snapshot::BACKEND_NAME,
         "backend statistics source does not match selected backend"
     );
-    tracing::info!(
-        target: TARGET,
-        backend = %selected_backend.as_str(),
-        stats = %snapshot,
-        "backend run complete",
+    eprintln!(
+        "backend run complete backend={} stats={snapshot}",
+        selected_backend.as_str()
     );
 }
 

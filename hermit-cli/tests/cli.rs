@@ -697,6 +697,8 @@ fn run_dbi_strict_returns_with_blocked_stdin_source() {
 fn run_liteinst_verifies_detcore_backend() {
     liteinst_runtime::ensure_liteinst_runtime();
     let args = [
+        "--log",
+        "info",
         "run",
         "--backend",
         "liteinst",
@@ -719,11 +721,13 @@ fn run_liteinst_verifies_detcore_backend() {
     );
     for field in [
         "backend run complete backend=liteinst",
-        "LiteInst instrumentation stats: distinct_rips_patched=",
+        "LiteInst instrumentation stats: process_reports=1 distinct_rips_patched=",
         "cacheline_straddlers=",
         "non_straddling=",
-        "paths[first_site_sigsys=",
+        "paths[first_site_seccomp=0",
         "ptrace_installation=",
+        "in_guest_sigsys=",
+        "in_guest_nested_sigsys=",
         "unpatchable_or_other=",
         "direct_hook=",
         "instruction_lengths[1=",
