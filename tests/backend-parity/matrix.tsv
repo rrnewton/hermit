@@ -23,3 +23,4 @@ virtual_clock	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 random_sources	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 virtual_pid	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 scheduler_policy_queries	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+prctl_identity	pass	pass	gap	-	KVM returns ENOSYS for prctl(PR_SET_NAME/PR_GET_NAME) thread-name round-trips; PR_GET_DUMPABLE and the other task-control subcommands succeed under KVM, but the name set/get pair is unimplemented in the KVM guest personality	detlog	detlog	gap	-	inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify
