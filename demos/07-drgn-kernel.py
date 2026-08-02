@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 
-from drgn.helpers.linux.pid import for_each_task
+from drgn.helpers.linux.list import list_for_each_entry
 
 DEMO_DIR = Path(__file__).resolve().parent
 ROOT = DEMO_DIR.parent
@@ -62,7 +62,9 @@ def _task_list(program):
     ]
     rows.extend(
         (task.pid.value_(), task.comm.string_().decode("utf-8", "replace"))
-        for task in for_each_task(program)
+        for task in list_for_each_entry(
+            "struct task_struct", init_task.tasks.address_of_(), "tasks"
+        )
     )
     return rows
 
