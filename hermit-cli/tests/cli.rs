@@ -702,6 +702,7 @@ fn run_liteinst_verifies_detcore_backend() {
         "liteinst",
         "--strict",
         "--verify",
+        "--verify-logs",
         "--",
         "/bin/echo",
         "liteinst-cli-ok",
@@ -717,6 +718,7 @@ fn run_liteinst_verifies_detcore_backend() {
         "{stderr}"
     );
     for field in [
+        "backend run complete backend=liteinst",
         "LiteInst instrumentation stats: distinct_rips_patched=",
         "cacheline_straddlers=",
         "non_straddling=",
@@ -737,6 +739,23 @@ fn run_liteinst_verifies_detcore_backend() {
             "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
         ),
         "{stderr}"
+    );
+}
+
+#[test]
+fn backend_stats_are_info_gated_for_ptrace() {
+    let default_args = ["run", "--strict", "--", "/bin/true"];
+    let default_output = hermit(&default_args);
+    assert_success(&default_output, &default_args);
+    assert!(!stderr(&default_output).contains("backend run complete"));
+
+    let info_args = ["--log", "info", "run", "--strict", "--", "/bin/true"];
+    let info_output = hermit(&info_args);
+    assert_success(&info_output, &info_args);
+    assert!(
+        stderr(&info_output).contains("backend run complete backend=ptrace stats=metrics=none"),
+        "{}",
+        stderr(&info_output)
     );
 }
 
