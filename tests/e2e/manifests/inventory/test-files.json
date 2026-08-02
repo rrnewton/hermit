@@ -362,6 +362,12 @@
       "why": "tests/c/get_robust_list_thread.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/getcpu_identity.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/getcpu_identity.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall getcpu(2) backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins Detcore's single-virtual-CPU and single-node determinization so the raw syscall always reports CPU 0 and node 0 across the optional-output-pointer combinations, keeping results byte-identical across ptrace, DBI, and KVM."
+    },
+    {
       "path": "tests/c/getitimer_determinism_probe.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
