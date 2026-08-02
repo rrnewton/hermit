@@ -994,6 +994,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_bindtoifindex": (0, b"sobindtoifidx=0\n"),
     "getsockopt_incoming_napi_id": (0, b"sonapiid=0\n"),
     "getsockopt_wifi_status": (0, b"sowifistatus=0\n"),
+    # Round 50: NEW syscall families beyond the now-exhausted getsockopt lane.
+    # Two credential no-ops (setuid/setgid to the current identity, return 0,
+    # distinct from the setres*, setre*, setfs* guests) plus nine more madvise
+    # advice codes on a private anon page and a private-expedited membarrier.
+    # Every value is a host-independent constant: madvise advice succeeds (0)
+    # except MADV_COLLAPSE, which returns -EINVAL(-22) on a 4 KiB anon range
+    # both natively and under golden ptrace (faithful Linux parity, not a hermit
+    # limitation). No time/randomness/PID/host-variable input, so e9patch
+    # preprocessing stays byte-identical to golden ptrace.
+    "setuid_noop": (0, b"setuid=0\n"),
+    "setgid_noop": (0, b"setgid=0\n"),
+    "madvise_hugepage": (0, b"madvhugepage=0\n"),
+    "madvise_nohugepage": (0, b"madvnohugepage=0\n"),
+    "madvise_wipeonfork": (0, b"madvwipeonfork=0\n"),
+    "madvise_keeponfork": (0, b"madvkeeponfork=0\n"),
+    "madvise_mergeable": (0, b"madvmergeable=0\n"),
+    "madvise_unmergeable": (0, b"madvunmergeable=0\n"),
+    "madvise_dodump": (0, b"madvdodump=0\n"),
+    "madvise_pageout": (0, b"madvpageout=0\n"),
+    "madvise_collapse": (0, b"madvcollapse=-22\n"),
+    "membarrier_private": (0, b"membarpriv=0\n"),
 }
 
 FREESTANDING_FLAGS = (

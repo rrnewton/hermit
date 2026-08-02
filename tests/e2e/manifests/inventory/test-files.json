@@ -1808,6 +1808,78 @@
       "why": "tests/backend-parity/e9patch_corpus/getsockopt_wifi_status.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_WIFI_STATUS at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; wifi-status ancillary reporting is disabled by default so the queried flag is 0, a host-independent per-socket default completing the round-49 batch of remaining SOL_SOCKET option flags. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/setuid_noop.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setuid_noop.c is owned by tests/backend-parity/e9patch_corpus.py: reads the current uid with getuid(102) and sets it back with setuid(105); setting the same identity is a no-op returning 0 both natively and under golden ptrace, a distinct credential syscall from the setresuid/setreuid/setfsuid guests, opening the round-50 new-family batch beyond the exhausted getsockopt lane. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setgid_noop.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setgid_noop.c is owned by tests/backend-parity/e9patch_corpus.py: reads the current gid with getgid(104) and sets it back with setgid(106); setting the same identity is a no-op returning 0 both natively and under golden ptrace, a distinct credential syscall from the setresgid/setregid/setfsgid guests already covered in the corpus, part of the round-50 new-family batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_hugepage.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_hugepage.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_HUGEPAGE=14 to a private anonymous 4 KiB mapping with madvise(28); the transparent-hugepage hint succeeds and returns 0, a host-independent constant and a distinct advice code from the NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED/FREE/DONTFORK/COLD/DONTDUMP madvise guests already covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_nohugepage.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_nohugepage.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_NOHUGEPAGE=15 to a private anonymous 4 KiB mapping with madvise(28); the disable-transparent-hugepage hint succeeds and returns 0, a host-independent constant and a distinct advice code from the other madvise guests already covered in the corpus, part of the round-50 batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_wipeonfork.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_wipeonfork.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_WIPEONFORK=18 to a private anonymous 4 KiB mapping with madvise(28); the wipe-on-fork hint succeeds and returns 0, a host-independent constant and a distinct advice code from the other madvise guests already covered in the corpus, part of the round-50 madvise expansion batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_keeponfork.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_keeponfork.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_KEEPONFORK=19 to a private anonymous 4 KiB mapping with madvise(28); the keep-on-fork hint (undoing wipe-on-fork) succeeds and returns 0, a host-independent constant and a distinct advice code from the other madvise guests already covered, part of the round-50 madvise expansion batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_mergeable.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_mergeable.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_MERGEABLE=12 to a private anonymous 4 KiB mapping with madvise(28); the KSM merge-eligible hint succeeds and returns 0 both natively and under golden ptrace, a host-independent constant and a distinct advice code from the other madvise guests already covered, part of the round-50 batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_unmergeable.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_unmergeable.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_UNMERGEABLE=13 to a private anonymous 4 KiB mapping with madvise(28); the KSM unmerge hint succeeds and returns 0 both natively and under golden ptrace, a host-independent constant and a distinct advice code from the other madvise guests already covered, part of the round-50 batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_dodump.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_dodump.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_DODUMP=17 to a private anonymous 4 KiB mapping with madvise(28); the include-in-core-dump hint (inverse of the covered MADV_DONTDUMP guest) succeeds and returns 0, a host-independent constant and a distinct advice code from the other madvise guests, part of the round-50 batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_pageout.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_pageout.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_PAGEOUT=21 to a private anonymous 4 KiB mapping with madvise(28); the reclaim-now hint succeeds and returns 0 both natively and under golden ptrace, a host-independent constant and a distinct advice code from the other madvise guests already covered, part of the round-50 madvise expansion batch. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/madvise_collapse.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/madvise_collapse.c is owned by tests/backend-parity/e9patch_corpus.py: applies MADV_COLLAPSE=25 to a private anonymous 4 KiB mapping with madvise(28); a single small anon range is not transparent-hugepage collapsible so the kernel returns -EINVAL(-22) both natively and under golden ptrace, a host-independent constant exercising the madvise error path as faithful Linux parity, not a hermit limitation. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/membarrier_private.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/membarrier_private.c is owned by tests/backend-parity/e9patch_corpus.py: registers then issues a private-expedited memory barrier via membarrier(324) MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED=8 then MEMBARRIER_CMD_PRIVATE_EXPEDITED=4, printing the final return 0, a host-independent constant and a distinct command from the CMD_GLOBAL and CMD_QUERY membarrier guests already covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
