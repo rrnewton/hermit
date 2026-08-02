@@ -17,17 +17,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 24/24 | 100% |
-| DBI | 23/24 | 96% |
-| KVM | 23/24 | 96% |
+| ptrace | 25/25 | 100% |
+| DBI | 24/25 | 96% |
+| KVM | 23/25 | 92% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 24/24 | DETLOG-bitwise | 100% |
-| DBI | 22/24 | DETLOG-bitwise | 92% |
-| KVM | 22/24 | guest-visible only | 92% |
+| ptrace | 25/25 | DETLOG-bitwise | 100% |
+| DBI | 23/25 | DETLOG-bitwise | 92% |
+| KVM | 22/25 | guest-visible only | 88% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -39,7 +39,7 @@ column is therefore capped at `guest`, never `detlog`. See the L2 subsection
 below for the two contracts that hold at L1 but not L2.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 24/25 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -127,6 +127,22 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `prctl_identity` | pass / detlog | pass / detlog | **gap** / gap |
+
+The `prctl_identity` contract pins deterministic `prctl(2)` task-control
+round-trips. The guest sets its thread name (`PR_SET_NAME`) and reads it back
+(`PR_GET_NAME`), toggles and re-reads the dumpable flag (`PR_SET_DUMPABLE` /
+`PR_GET_DUMPABLE`) and the keepcaps bit (`PR_SET_KEEPCAPS` /
+`PR_GET_KEEPCAPS`), and confirms a freshly exec'd task has no parent-death
+signal (`PR_GET_PDEATHSIG` reads `0`). Every checked value is one the guest
+itself just set or a fixed post-exec default, so the result depends only on the
+program, never on the host task's inherited name, dumpable flag, keepcaps bit,
+or parent-death signal. It uses no threads, blocking I/O, or signal delivery, so
+it is safe under the DBI no-preemption scheduler. ptrace and DBI hold this at L2
+DETLOG-bitwise. KVM is an explicit `gap`: the KVM guest personality returns
+`ENOSYS` for the `PR_SET_NAME`/`PR_GET_NAME` thread-name round-trip (while
+`PR_GET_DUMPABLE` and the other task-control subcommands succeed), so the guest
+exits non-zero and there is no L2 run to verify.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
