@@ -92,9 +92,10 @@ def main() -> int:
     run_dir = make_temp_result_dir(ASSETS, "boot")
     qmp_socket = run_dir / "qmp.sock"
     # Boot backs the serial console with a `-serial file:` transcript, not a unix
-    # socket: a socket chardev adds a host-timing-driven pollable fd that starves
-    # the -icount vCPU under `hermit --no-rcb-time` (the 600s boot timeout). QEMU
-    # writes this file directly and the controller tails it for boot markers.
+    # socket: a socket chardev adds a host-timing-driven pollable fd that can
+    # starve the -icount vCPU under the deterministic scheduler (the 600s boot
+    # timeout). QEMU writes this file directly and the controller tails it for
+    # boot markers.
     serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
     snapshot_disk = (
@@ -129,11 +130,18 @@ def main() -> int:
             str(HERMIT),
             "run",
             "--strict",
-            "--no-rcb-time",
+            # Keep RCB/PMU branch-count preemption ARMED with a large-but-finite
+            # --max-timeslice so the deterministic scheduler makes fine-grained
+            # virtual-time progress. Setting --max-timeslice disabled together
+            # with --no-rcb-time (parent commit 0591104) removed all timer
+            # preemption, so unproductive SleepUntil(0) poll-yields kept the run
+            # queue non-empty, the step-2d vtime jump never fired, and the vCPU
+            # was starved -> boot wedge at HPET calibration. See
+            # debug/demo5-regression (H11) and tag demo5-lastgood.
             "--target-timeslice",
             "100000",
             "--max-timeslice",
-            "disabled",
+            "2000000000",
             "--",
             sys.executable,
             str(DEMO_DIR / "lib/qemu_controller.py"),
