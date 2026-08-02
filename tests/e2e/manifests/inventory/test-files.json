@@ -860,6 +860,12 @@
       "why": "tests/c/resource_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/rlimit_identity.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/rlimit_identity.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall resource-limit backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins Detcore's deterministic getrlimit/setrlimit/prlimit64 RLIMIT_NOFILE soft and hard round-trips so limit queries and updates read back identically across ptrace, DBI, and KVM instead of leaking host process state."
+    },
+    {
       "path": "tests/c/sabre_exit_group_parked.c",
       "disposition": "guest-fixture",
       "runner": "hermit-cli/tests/hermit_modes.rs",
