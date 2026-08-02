@@ -148,6 +148,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/random_sources.c",
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
+            "signal_disposition": (
+                REPOSITORY / "tests/c/signal_disposition.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "pid_probe": (local / "pid_probe.c", ()),
             "scheduler_policy_queries": (
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
@@ -261,6 +265,11 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "signal_disposition": (
+            [str(fixtures.binary("signal_disposition"))],
+            0,
+            b"signal-disposition-ok\n",
         ),
     }
 
