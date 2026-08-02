@@ -1608,6 +1608,7 @@ impl RunOpts {
                     &self.program,
                     &self.args,
                     self.verify,
+                    self.summary,
                     global.log,
                     &self.effective_det_config(),
                     environment,
