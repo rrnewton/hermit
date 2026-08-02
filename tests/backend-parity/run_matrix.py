@@ -187,6 +187,10 @@ class Fixtures:
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
+            "cpu_virtualization": (
+                local / "cpu_virtualization.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -284,6 +288,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
         "virtual_pid": ([str(fixtures.binary("pid_probe"))], 0, None),
+        "cpu_virtualization": (
+            [str(fixtures.binary("cpu_virtualization"))],
+            0,
+            b"cpu-virtualization-ok\n",
+        ),
     }
     try:
         return cases[name]

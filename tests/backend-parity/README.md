@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 23/23 | 100% |
-| DBI | 22/23 | 96% |
-| KVM | 22/23 | 96% |
+| ptrace | 24/24 | 100% |
+| DBI | 23/24 | 96% |
+| KVM | 23/24 | 96% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 23/23 | DETLOG-bitwise | 100% |
-| DBI | 21/23 | DETLOG-bitwise | 91% |
-| KVM | 21/23 | guest-visible only | 91% |
+| ptrace | 24/24 | DETLOG-bitwise | 100% |
+| DBI | 22/24 | DETLOG-bitwise | 92% |
+| KVM | 22/24 | guest-visible only | 92% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -38,7 +38,7 @@ column is therefore capped at `guest`, never `detlog`. See the L2 subsection
 below for the two contracts that hold at L1 but not L2.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/23 number above is deliberately
+measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -78,8 +78,9 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-two pairs, including its bounded cooperative pthread lifecycle, executable
-memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
+twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
+memory, deterministic memory-advice policy, clock, PID, single-CPU affinity,
+synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
@@ -124,6 +125,16 @@ is not reached.
 | `virtual_clock` | pass / detlog | pass / detlog | pass / guest |
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
+| `cpu_virtualization` | pass / detlog | pass / detlog | pass / guest |
+
+The `cpu_virtualization` contract pins Detcore's single-virtual-CPU topology:
+it issues raw `getcpu` and `sched_getaffinity` syscalls (never the glibc/vDSO
+fast path, so each is guaranteed to cross the backend) and asserts the guest
+always observes CPU 0 / NUMA node 0 and a single-CPU affinity mask, regardless
+of the host's real core count or the scheduler's physical placement. A
+passthrough would leak the host CPU count and run-to-run placement, so this row
+holds identically across ptrace, DBI, and KVM and across the `--verify`
+double run.
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
