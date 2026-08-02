@@ -4698,7 +4698,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "Finite timeouts plus nanosleep-delayed pthread and asynchronous signal delivery are outside the non-gated SaBRe frontier"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6063,7 +6063,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "Timer-driven, scheduler-yielding asynchronous signal delivery is owner-gated; no non-gated SaBRe parity claim"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8584,7 +8584,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "Virtual PID topology and parent/child output ordering are owner-gated; no non-gated SaBRe parity claim"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
