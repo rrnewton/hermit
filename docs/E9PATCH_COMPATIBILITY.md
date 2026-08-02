@@ -15,7 +15,7 @@ HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
 ```
 
 The mode runs the 155 semantic installed-program probes in the compatibility
-matrix. Every available probe uses `hermit run --backend e9patch --strict
+matrix. Every available probe uses `hermit --backend e9patch run --strict
 --verify`, so a pass is L2. A program that fails or lacks a backend diagnostic
 fails the gate. Missing e9patch artifacts fail before the matrix starts. The
 former 56-row optional banner matrix was retired because `--help`, `--version`,

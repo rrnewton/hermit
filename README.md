@@ -100,9 +100,6 @@ existing behavior:
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-For backwards compatibility, `run` still accepts `--backend` after the
-subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
-
 Backend selection fails closed. Hermit never substitutes ptrace after an
 explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
 dynamically linked Linux x86-64 guests:
@@ -112,7 +109,7 @@ dynamically linked Linux x86-64 guests:
   "$PWD/target/debug/libreverie_liteinst.so" \
   "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --bin hermit
-./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
+./target/debug/hermit --backend=liteinst run --strict --verify -- /bin/echo hello
 ```
 
 The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.

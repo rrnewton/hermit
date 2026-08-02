@@ -365,6 +365,97 @@ mod tests {
     }
 
     #[test]
+    fn backend_short_flag_parses_in_global_position() {
+        use hermit::Backend;
+
+        for (prefix, expected) in [
+            ("ptr", Backend::Ptrace),
+            ("d", Backend::Dbi),
+            ("lite", Backend::Liteinst),
+            ("sab", Backend::Sabre),
+            ("kv", Backend::Kvm),
+            ("e9", Backend::E9patch),
+        ] {
+            let args = Args::try_parse_from(["hermit", "-b", prefix, "run", "prog"])
+                .expect("unique backend prefix should parse");
+            assert_eq!(args.global.backend, Some(expected), "prefix {prefix}");
+            assert!(matches!(args.command, Subcommand::Run(_)));
+        }
+
+        let ambiguous = Args::try_parse_from(["hermit", "-b", "", "run", "prog"])
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(ambiguous.contains("ptrace"), "{ambiguous}");
+        assert!(ambiguous.contains("e9patch"), "{ambiguous}");
+
+        let unknown = Args::try_parse_from(["hermit", "-b", "unknown", "run", "prog"])
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unknown backend prefix"), "{unknown}");
+        for backend in ["ptrace", "dbi", "liteinst", "sabre", "kvm", "e9patch"] {
+            assert!(unknown.contains(backend), "missing {backend} in {unknown}");
+        }
+
+        let subcommand_position =
+            Args::try_parse_from(["hermit", "run", "--backend", "kvm", "prog"])
+                .unwrap_err()
+                .to_string();
+        assert!(subcommand_position.contains("unexpected argument '--backend'"));
+    }
+
+    #[test]
+    fn log_diff_uses_explicitly_unsafe_strip_lines_name() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "log-diff",
+            "--unsafe-strip-lines",
+            "first.log",
+            "second.log",
+        ])
+        .expect("--unsafe-strip-lines should parse");
+        let Subcommand::LogDiff(options) = args.command else {
+            panic!("expected log-diff subcommand");
+        };
+        assert!(options.more.strip_lines);
+
+        let mut command = Args::command();
+        let root_help = command.render_long_help().to_string();
+        assert!(root_help.contains("-b, --backend <BACKEND>"));
+        for backend in ["ptrace", "dbi", "liteinst", "sabre", "kvm", "e9patch"] {
+            assert!(
+                root_help.contains(backend),
+                "missing {backend} in {root_help}"
+            );
+        }
+        assert!(!root_help.contains("backwards compatibility"));
+        let log_diff_help = command
+            .find_subcommand_mut("log-diff")
+            .expect("log-diff command")
+            .render_long_help()
+            .to_string();
+        assert!(log_diff_help.contains("--unsafe-strip-lines"));
+        assert!(log_diff_help.contains("You PROBABLY DO NOT WANT THIS"));
+        assert!(log_diff_help.contains("genuine"));
+        assert!(log_diff_help.contains("determinism"));
+        assert!(log_diff_help.contains("look equal"));
+
+        let legacy = Args::try_parse_from([
+            "hermit",
+            "log-diff",
+            "--strip-lines",
+            "first.log",
+            "second.log",
+        ])
+        .expect("hidden legacy alias should remain parseable");
+        let Subcommand::LogDiff(options) = legacy.command else {
+            panic!("expected log-diff subcommand");
+        };
+        assert!(options.more.strip_lines);
+        assert!(!log_diff_help.contains("--strip-lines"));
+    }
+
+    #[test]
     fn e9patch_is_allowed_for_recording_but_rejected_for_management_and_replay() {
         use hermit::Backend;
 

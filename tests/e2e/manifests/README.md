@@ -14,7 +14,7 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `ci/test_harness.sh` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-The 13 manifests separate calibrated blocking cells from discoverable migration
+The 14 manifests separate calibrated blocking cells from discoverable migration
 inventory. CI creates one independently schedulable run node for every bucket.
 Six buckets currently contain calibrated blocking workloads:
 
@@ -26,7 +26,10 @@ Six buckets currently contain calibrated blocking workloads:
 - `c-programs.toml` (eight calibrated Buck-derived C probes)
 
 Eight additional `*-c.toml`/`c-programs.toml` buckets make 180 more C guests
-centrally discoverable. Eight `c-programs.toml` entries have calibrated
+centrally discoverable. The ninth manual bucket contains ten steady-state
+performance profiles; those deliberately stay outside blocking CI because each
+takes more than five seconds under ptrace verification. Eight `c-programs.toml`
+entries have calibrated
 standalone build and output contracts and run in blocking CI; the remaining
 172 C guests keep `ci = false` until they are calibrated. Buckets without a
 calibrated cell still have a CI node that intentionally reports zero cells,
@@ -102,7 +105,7 @@ known-green envelope, use all three exact cell filters:
 
 ```bash
 ./ci/test_harness.sh run --probe-disabled --test c-programs/example \
-  --mode verify --backend sabre --results target/e2e/probe/results.jsonl
+  --mode verify --backend sabre --results ignored/e2e/probe/results.jsonl
 ```
 
 `--probe-disabled` selects from `backends_disabled`, is accepted only by

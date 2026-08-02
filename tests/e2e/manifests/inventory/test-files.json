@@ -1760,6 +1760,12 @@
       "why": "tests/e2e/manifests/language-runtimes.toml is owned by ci/test_harness.sh via ci/manifest-plan: The `language-runtimes` TOML file is policy for the `language-runtimes` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
     },
     {
+      "path": "tests/e2e/manifests/performance.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "tests/e2e/manifests/performance.toml is owned by ci/test_harness.sh via ci/manifest-plan: The `performance` TOML file declares the manual long-running backend timing cells and their complete mode and backend partitions. It configures the common harness and is not itself executable test input."
+    },
+    {
       "path": "tests/e2e/manifests/shared-futex-c.toml",
       "disposition": "manifest-policy",
       "runner": "ci/test_harness.sh via ci/manifest-plan",
@@ -1776,6 +1782,72 @@
       "disposition": "manifest-policy",
       "runner": "ci/test_harness.sh via ci/manifest-plan",
       "why": "tests/e2e/manifests/util-c.toml is owned by ci/test_harness.sh via ci/manifest-plan: The `util-c` TOML file is policy for the `util-c` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
+    },
+    {
+      "path": "tests/e2e/performance/barrier-rounds.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/barrier-rounds.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/condvar-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/condvar-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/mmap-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/mmap-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/mutex-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/mutex-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/pipe-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/pipe-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/rwlock-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/rwlock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/sigmask-toggle.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/sigmask-toggle.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/socketpair-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/socketpair-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/steady_state_common.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e/performance profile wrappers",
+      "why": "tests/e2e/performance/steady_state_common.c is owned by tests/e2e/performance profile wrappers: It holds the shared synchronization, IPC, memory, and syscall workload implementation selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
+    },
+    {
+      "path": "tests/e2e/performance/syscall-mix.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/syscall-mix.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/yield-storm.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/yield-storm.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
       "path": "tests/e2e/system-utils/README.md",

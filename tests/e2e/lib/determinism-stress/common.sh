@@ -30,7 +30,8 @@ fi
   "DETERMINISM_STRESS_TIMEOUT must be a positive integer"
 
 mkdir -p "$repo_root/target"
-stress_workdir=$(mktemp -d "$repo_root/target/determinism-stress.XXXXXX")
+mkdir -p "$repo_root/ignored"
+stress_workdir=$(mktemp -d "$repo_root/ignored/determinism-stress.XXXXXX")
 
 cleanup_stress_workdir() {
   if [[ ${KEEP_DETERMINISM_STRESS_ARTIFACTS:-0} == 1 ]]; then

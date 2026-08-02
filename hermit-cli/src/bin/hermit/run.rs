@@ -83,9 +83,8 @@ pub(crate) struct DetOptions {
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
-    /// Select the process instrumentation backend.
-    #[clap(long, value_enum)]
-    backend: Option<Backend>,
+    #[clap(skip)]
+    backend: Backend,
 
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
@@ -155,8 +154,7 @@ pub struct RunOpts {
         long,
         alias = "lite",
         conflicts_with = "chaos",
-        conflicts_with = "verify",
-        conflicts_with = "backend"
+        conflicts_with = "verify"
     )]
     namespace_only: bool,
 
@@ -460,9 +458,6 @@ impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let dop = &self.det_opts.det_config;
 
-        if let Some(backend) = self.backend {
-            write!(f, " --backend={}", backend.as_str())?;
-        }
         if let Some(skid_margin) = self.skid_margin {
             write!(f, " --skid-margin={skid_margin}")?;
         }
@@ -665,13 +660,13 @@ fn display_runopts1() {
 fn backend_defaults_to_ptrace() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(ro.backend, None);
+    assert_eq!(ro.backend, Backend::Ptrace);
     assert_eq!(ro.selected_backend(), Backend::Ptrace);
     assert_eq!(format!("{}", ro), " -- fakeprog");
 }
 
 #[test]
-fn backend_values_parse_and_round_trip() {
+fn backend_values_select_and_render_as_global_only() {
     for (value, expected) in [
         ("ptrace", Backend::Ptrace),
         ("dbi", Backend::Dbi),
@@ -680,18 +675,19 @@ fn backend_values_parse_and_round_trip() {
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
     ] {
-        let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
+        let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+        ro.backend = expected;
         ro.validate_args_with_perf_support(true).unwrap();
-        assert_eq!(ro.backend, Some(expected));
+        assert_eq!(ro.backend, expected);
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = format!(" --backend={value} -- fakeprog");
-        assert_eq!(format!("{}", ro), normalized);
+        assert_eq!(format!("{}", ro), " -- fakeprog", "backend {value}");
     }
 }
 
 #[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
+    let mut ro = RunOpts::parse_from(["fakehermit", "/bin/echo", "hello"]);
+    ro.backend = Backend::E9patch;
     ro.e9patch_overlay = Some(E9patchOverlay {
         source: PathBuf::from("/cache/patched-echo"),
         target: PathBuf::from("/bin/echo"),
@@ -721,15 +717,8 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
     fs::set_permissions(&tool, permissions).unwrap();
 
     let tmp_arg = format!("--tmp={}", tmp.path().display());
-    let mut ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        &tmp_arg,
-        "-e",
-        "PATH=/tmp",
-        "tool",
-    ]);
+    let mut ro = RunOpts::parse_from(["fakehermit", &tmp_arg, "-e", "PATH=/tmp", "tool"]);
+    ro.backend = Backend::E9patch;
     assert_eq!(ro.tmp.as_deref(), Some(tmp.path()));
     assert_eq!(
         ro.guest_command()
@@ -753,7 +742,7 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
 
 #[test]
 fn non_e9patch_validation_preserves_parent_component_paths() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "ptrace", "/usr/bin/../bin/echo"]);
+    let ro = RunOpts::parse_from(["fakehermit", "/usr/bin/../bin/echo"]);
     ro.validate_program().unwrap();
 }
 
@@ -795,13 +784,12 @@ fn guest_path_normalization_rejects_parent_components() {
 
 #[test]
 fn e9patch_mount_target_rejects_parent_components() {
-    let ro = RunOpts::parse_from([
+    let mut ro = RunOpts::parse_from([
         "fakehermit",
-        "--backend",
-        "e9patch",
         "--mount=type=tmpfs,target=/tmp/../bin",
         "/bin/echo",
     ]);
+    ro.backend = Backend::E9patch;
     let error = ro.validate_e9patch_mount_targets().unwrap_err().to_string();
     assert!(error.contains("mount target cannot contain parent components"));
 }
@@ -815,7 +803,8 @@ fn e9patch_mount_target_rejects_symlink_components() {
         "--mount=type=tmpfs,target={}",
         link.join("target").display()
     );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
+    let mut ro = RunOpts::parse_from(["fakehermit", &mount, "/bin/echo"]);
+    ro.backend = Backend::E9patch;
     let error = ro.validate_e9patch_mount_targets().unwrap_err();
     assert!(error.to_string().contains("mount target traverses symlink"));
 }
@@ -849,21 +838,16 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
         mount_link.join("target").display()
     );
     let tmp = format!("--tmp={}", directory.path().display());
-    let mut ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        &unrelated_mount,
-        &tmp,
-        "/tmp/script",
-    ]);
+    let mut ro = RunOpts::parse_from(["fakehermit", &unrelated_mount, &tmp, "/tmp/script"]);
+    ro.backend = Backend::E9patch;
     ro.prepare_e9patch_program().unwrap();
     assert!(ro.e9patch_overlay.is_none());
 }
 
 #[test]
 fn e9patch_overlay_uses_canonical_target_without_custom_mounts() {
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo"]);
+    let mut ro = RunOpts::parse_from(["fakehermit", "/bin/echo"]);
+    ro.backend = Backend::E9patch;
     assert_eq!(
         ro.resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
             .unwrap(),
@@ -882,13 +866,8 @@ fn e9patch_rejects_symlinked_executables_through_custom_mounts() {
         "--mount=type=bind,source={},target=/e9patch-test",
         directory.path().display()
     );
-    let ro = RunOpts::parse_from([
-        "fakehermit",
-        "--backend",
-        "e9patch",
-        &mount,
-        "/e9patch-test/link",
-    ]);
+    let mut ro = RunOpts::parse_from(["fakehermit", &mount, "/e9patch-test/link"]);
+    ro.backend = Backend::E9patch;
     let error = ro
         .resolve_e9patch_overlay_target(Path::new("/e9patch-test/link"), &link)
         .unwrap_err();
@@ -902,7 +881,8 @@ fn e9patch_rejects_mounts_that_change_a_symlink_target() {
         "--mount=type=bind,source={},target=/usr",
         directory.path().display()
     );
-    let ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", &mount, "/bin/echo"]);
+    let mut ro = RunOpts::parse_from(["fakehermit", &mount, "/bin/echo"]);
+    ro.backend = Backend::E9patch;
     let error = ro
         .resolve_e9patch_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
         .unwrap_err();
@@ -1069,37 +1049,30 @@ fn skid_margin_override_parses_and_round_trips() {
 
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    for backend in ["dbi", "kvm", "sabre"] {
-        let mut opts = RunOpts::parse_from([
-            "fakehermit",
-            &format!("--backend={backend}"),
-            "--skid-margin=500",
-            "fakeprog",
-        ]);
+    for (backend_name, backend) in [
+        ("dbi", Backend::Dbi),
+        ("kvm", Backend::Kvm),
+        ("sabre", Backend::Sabre),
+    ] {
+        let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=500", "fakeprog"]);
+        opts.backend = backend;
         let error = opts.validate_args_with_perf_support(true).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("requires a ptrace-backed backend"),
-            "unexpected {backend} error: {error}"
+            "unexpected {backend_name} error: {error}"
         );
     }
 }
 
 #[test]
 fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
-    let mut opts = RunOpts::parse_from([
-        "fakehermit",
-        "--backend=liteinst",
-        "--skid-margin=500",
-        "fakeprog",
-    ]);
+    let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=500", "fakeprog"]);
+    opts.backend = Backend::Liteinst;
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(
-        format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
-    );
+    assert_eq!(format!("{opts}"), " --skid-margin=500 -- fakeprog");
 }
 
 #[test]
@@ -1236,7 +1209,8 @@ fn dbi_backend_disables_uts_assumption() {
     // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
     // the nodename to `hermetic-container.local` instead of leaking the host
     // FQDN. Regression guard for DBI uname parity with the ptrace backend.
-    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbi", "fakeprog"]);
+    let mut opts = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    opts.backend = Backend::Dbi;
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.selected_backend(), Backend::Dbi);
     assert!(!opts.no_namespace);
@@ -1374,11 +1348,6 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--preemption-timeout",
         "--target-timeslice",
         "syscall boundaries",
-        "--backend <BACKEND>",
-        "Select the process instrumentation backend",
-        "ptrace",
-        "dbi",
-        "kvm",
     ] {
         assert!(
             help.contains(expected),
@@ -1638,7 +1607,7 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
 /// status if there was a difference in any component of the output.
 impl RunOpts {
     fn selected_backend(&self) -> Backend {
-        self.backend.unwrap_or_default()
+        self.backend
     }
 
     fn runtime_backend(&self) -> Backend {
@@ -1677,11 +1646,7 @@ impl RunOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
-        // The backend may be given in the preferred global position
-        // (`hermit --backend X run ...`) or, for backwards compatibility, after the
-        // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
-        // value wins; otherwise fall back to the global one.
-        self.backend = self.backend.or(global.backend);
+        self.backend = global.backend.unwrap_or_default();
         if self.verify {
             validate_log_level(global)?;
         }
@@ -1708,7 +1673,7 @@ impl RunOpts {
             );
         }
         if self.namespace_only {
-            if let Some(explicit_backend) = self.backend {
+            if let Some(explicit_backend) = global.backend {
                 anyhow::bail!(
                     "--backend={} cannot be used with --namespace-only because namespace-only mode \
                      bypasses instrumentation",

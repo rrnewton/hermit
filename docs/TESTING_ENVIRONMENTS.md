@@ -76,7 +76,7 @@ metadata, CPUID, and randomness: 189 bounded cases in total.
 Run the matrix directly with:
 
 ```sh
-HERMIT_FLAG_MATRIX_REPORT=target/relaxed-flag-matrix/results.tsv \
+HERMIT_FLAG_MATRIX_REPORT=ignored/relaxed-flag-matrix/results.tsv \
   cargo test -p hermit --test relaxed_flag_matrix \
   meaningful_flag_combinations_run_without_crashing -- \
   --exact --ignored --test-threads=1 --nocapture

@@ -29,7 +29,7 @@ HERMIT_BIN                           release Hermit path
 CC                                  host C compiler
 NATIVE_STRESS_REPETITIONS           native demonstrations (default 3)
 DETERMINISM_STRESS_TIMEOUT          seconds per native/verify run (default 180)
-KEEP_DETERMINISM_STRESS_ARTIFACTS=1 retain logs under target/
+KEEP_DETERMINISM_STRESS_ARTIFACTS=1 retain logs under ignored/
 ```
 
 ## Coverage

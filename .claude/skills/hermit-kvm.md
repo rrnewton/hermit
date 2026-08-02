@@ -8,7 +8,7 @@ description: "Purpose-fixed role for the hermit-kvm agent: ratchet the Reverie K
 ## Purpose
 
 Advance the **Reverie KVM backend** so that more of the strict-compatibility
-corpus passes under `hermit run --backend kvm`, at parity with the ptrace
+corpus passes under `hermit --backend kvm run`, at parity with the ptrace
 baseline where the semantics allow it. "Ratchet" means: each task moves the
 KVM pass count up (or root-causes a specific residual failure) with evidence,
 never down. Secondary charter: keep the KVM-vs-gVisor and KVM-vs-ptrace

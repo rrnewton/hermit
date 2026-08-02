@@ -36,9 +36,11 @@ pub enum LogComparisonMode {
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser)]
 pub struct LogDiffOpts {
-    /// Strip numerical information and tmp paths from log lines. This allows comparison even in the
-    /// presence of (limited) nondeterminism.
-    #[clap(long)]
+    /// You PROBABLY DO NOT WANT THIS.
+    ///
+    /// Strip numerical information and tmp paths from log lines. This can mask
+    /// genuine determinism divergences and make unequal executions look equal.
+    #[clap(long = "unsafe-strip-lines", alias = "strip-lines")]
     pub strip_lines: bool,
 
     /// The internal message set to compare.

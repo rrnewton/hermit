@@ -222,7 +222,7 @@ fi
 
 kvm_probe="not-run"
 if [[ $kvm_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend kvm -- /bin/true </dev/null >/dev/null 2>&1; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" --backend kvm run -- /bin/true </dev/null >/dev/null 2>&1; then
         kvm_probe="pass"
     else
         kvm_probe="fail"
@@ -231,7 +231,7 @@ fi
 
 dbi_probe="not-run"
 if [[ $dbi_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbi -- /bin/true </dev/null >/dev/null 2>&1; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" --backend dbi run -- /bin/true </dev/null >/dev/null 2>&1; then
         dbi_probe="pass"
     else
         dbi_probe="fail"

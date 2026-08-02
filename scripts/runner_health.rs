@@ -36,7 +36,7 @@ use std::time::UNIX_EPOCH;
 const DEFAULT_REPOSITORY: &str = "rrnewton/hermit";
 const DEFAULT_OFFLINE_THRESHOLD_SECONDS: u64 = 60 * 60;
 const DEFAULT_RUN_SCAN_LIMIT: usize = 20;
-const DEFAULT_STATE_FILE: &str = "target/runner-health/state.tsv";
+const DEFAULT_STATE_FILE: &str = "ignored/runner-health/state.tsv";
 const DEFAULT_WORKFLOWS: &[&str] = &["ci-privileged.yml", "validation-levels.yml", "ci-dag.yml"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +95,7 @@ Options:\n\
   --offline-threshold-seconds N     Alert threshold (default: 3600)\n\
   --run-scan-limit N                Completed runs scanned per workflow (default: 20)\n\
   --state-file PATH                 Persistent state file\n\
-                                      (default: target/runner-health/state.tsv)\n\
+                                      (default: ignored/runner-health/state.tsv)\n\
   --workflow FILE_OR_ID             Privileged workflow to scan; repeatable\n\
                                       (defaults: ci-privileged.yml, validation-levels.yml, ci-dag.yml)\n\
   -h, --help                        Show this help\n\

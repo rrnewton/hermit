@@ -47,7 +47,8 @@ check_repository() {
     local found=0
     local hit_file
     local path
-    hit_file=$(mktemp "$ROOT_DIR/target/portable-path-hit.XXXXXX")
+    mkdir -p "$ROOT_DIR/ignored"
+    hit_file=$(mktemp "$ROOT_DIR/ignored/portable-path-hit.XXXXXX")
     while IFS= read -r -d '' path; do
         is_excluded "$path" && continue
         [[ -f $ROOT_DIR/$path ]] || continue

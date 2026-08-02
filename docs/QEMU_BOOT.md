@@ -52,7 +52,7 @@ initramfs, starts QEMU under Hermit, and requires the kernel marker before the
 ./tests/qemu-boot/smoke_test.sh
 ```
 
-It writes the initramfs and console log under `target/qemu-boot-smoke/`. Set
+It writes the initramfs and console log under `ignored/qemu-boot-smoke/`. Set
 these environment variables when the defaults do not match the host:
 
 ```bash
@@ -86,7 +86,7 @@ timeout --kill-after=10s --signal=TERM 180s \
   -icount shift=0,sleep=off \
   -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
-  -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
+  -initrd ignored/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
   -serial stdio \
   -monitor none \
@@ -144,7 +144,7 @@ timeout --signal=KILL 90s target/release/hermit --log error run \
   -icount shift=0,sleep=off \
   -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
-  -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
+  -initrd ignored/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
   -serial stdio \
   -monitor none \
@@ -289,7 +289,7 @@ The smoke-test initramfs contains one freestanding static executable. Build it
 manually from the repository root with:
 
 ```bash
-out=target/qemu-boot-smoke
+out=ignored/qemu-boot-smoke
 mkdir -p "$out/initramfs-root"
 gcc -Os -nostdlib -static -fno-stack-protector -fno-pie -no-pie \
   tests/shared-futex-verify/qemu_init.c \

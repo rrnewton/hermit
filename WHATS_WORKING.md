@@ -469,8 +469,8 @@ threaded Python remains a separate gap. Ruby and PHP are excluded for host/runti
 
 ```bash
 $HERMIT run --strict --verify -- /bin/echo hi   # ptrace: works
-$HERMIT run --backend dbi -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
-$HERMIT run --backend kvm -- /bin/echo hi        # fail-closed
+$HERMIT --backend dbi run -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
+$HERMIT --backend kvm run -- /bin/echo hi        # fail-closed
 ```
 
 ---

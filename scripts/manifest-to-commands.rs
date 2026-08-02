@@ -205,7 +205,7 @@ fn hermit_command(
     };
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --strict --verify{profile} -- {guest}",
             shell_quote(backend)
         ),
         "replay" => format!(
@@ -213,7 +213,7 @@ fn hermit_command(
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=off run --backend {} --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=off --backend {} run --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0)
         ),
@@ -225,7 +225,7 @@ fn hermit_command(
                 .join(" ");
             let separator = if extra.is_empty() { "" } else { " " };
             format!(
-                "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict{separator}{extra} -- {guest}",
+                "{RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --strict{separator}{extra} -- {guest}",
                 shell_quote(backend)
             )
         }

@@ -58,7 +58,7 @@ Portable Hermit cells add `--no-virtualize-cpuid` and
 `--max-timeslice=disabled`. Every result records the source SHA and dirty bit,
 test and binary hashes, effective arguments, relaxations, lane, mode, backend,
 duration, and outcome. JSONL, JUnit XML, and a denominator-aware summary are
-stored below `target/e2e/` and uploaded by both workflows.
+stored below `ignored/e2e/` and uploaded by both workflows.
 
 Each cell receives repo-local `HOME`, `XDG_CONFIG_HOME`, fixtures, captures,
 and recording directories. Hermit guests use the isolated `/tmp/hermit-e2e`

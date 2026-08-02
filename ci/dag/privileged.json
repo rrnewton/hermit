@@ -26,7 +26,7 @@
     {
       "group": "pmu", "job": "preemption",
       "desc": "PMU smoke: retired-conditional-branch overflow delivery and skid measurement",
-      "cmd": "cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
+      "cmd": "mkdir -p ignored && cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o ignored/ci-pmu-skid && timeout 20 ignored/ci-pmu-skid --iterations 16 --period 100000",
       "deps": ["build.privileged_tests"],
       "timeout": 30,
       "hint": {"resources": {"pmu": 1}, "est_duration_s": 5,
@@ -73,6 +73,17 @@
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_performance",
+      "desc": "Privileged manifest bucket: performance (manual cells only)",
+      "manifest": {"lane": "privileged", "category": "performance"},
+      "cmd": "./ci/test_harness.sh run --lane privileged --category performance --ci-only --allow-empty --prebuilt --results ignored/e2e/privileged/performance/results.jsonl --junit ignored/e2e/privileged/performance/junit.xml",
+      "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 120,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 1,
+               "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
+               "classification": "light"}
     }
   ]
 }

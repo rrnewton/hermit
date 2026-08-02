@@ -53,13 +53,12 @@ $ ./target/debug/hermit --backend kvm run -- /bin/echo hello
 Error: backend `kvm` is unavailable: the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI
 exit=1
 
-$ ./target/debug/hermit run --backend kvm -- /bin/echo hello
+$ ./target/debug/hermit --backend kvm run -- /bin/echo hello
 Error: backend `kvm` is unavailable: the bare KVM prototype cannot execute Linux programs without a guest-kernel ABI
 exit=1
 ```
 
-Both the global (`hermit --backend kvm run …`) and subcommand
-(`hermit run --backend kvm …`) positions behave identically.
+Backend selection uses the global position (`hermit --backend kvm run …`).
 
 Root cause is an ordering/consistency issue between two pieces of code:
 
@@ -89,12 +88,12 @@ uncommitted** one-line edit skipped the availability gate for KVM
 run.rs). After `cargo build -p hermit`:
 
 ```
-$ ./target/debug/hermit run --backend kvm -- /bin/echo hello
+$ ./target/debug/hermit --backend kvm run -- /bin/echo hello
 hermit: [kvm backend] "/bin/echo" is not executed as an ELF; the reverie-kvm prototype runs a built-in hello-world guest that issues write(2) via vmcall.
 hello world
 exit=0
 
-$ ./target/debug/hermit run --backend kvm -- /usr/bin/python3 -c 'print(1)'
+$ ./target/debug/hermit --backend kvm run -- /usr/bin/python3 -c 'print(1)'
 hermit: [kvm backend] "/usr/bin/python3" is not executed as an ELF; the reverie-kvm prototype runs a built-in hello-world guest that issues write(2) via vmcall.
 hello world
 exit=0
@@ -112,7 +111,7 @@ Observations:
 - The only way the program argument matters is Hermit's generic existence check
   (`validate_program`), which still runs first:
   ```
-  $ ./target/debug/hermit run --backend kvm -- /no/such/prog
+  $ ./target/debug/hermit --backend kvm run -- /no/such/prog
   Error: Program /no/such/prog does not exist or is not accessible. ...
   exit=1
   ```
@@ -124,10 +123,10 @@ tree is clean and this branch contains **no source changes** to the backend.
 
 | App | Command | Result under `--backend kvm` |
 | --- | --- | --- |
-| echo | `run --backend kvm -- /bin/echo hello` | frontier: fails closed (unavailable). Gate-bypassed: prints `hello world` (demo), ELF not run. |
+| echo | `--backend kvm run -- /bin/echo hello` | frontier: fails closed (unavailable). Gate-bypassed: prints `hello world` (demo), ELF not run. |
 | hello binary | any ELF path | Same as echo — program arg ignored; demo only. |
-| Redis | `run --backend kvm -- redis-server …` | **Not runnable.** KVM backend never execs an ELF; a long-lived multi-threaded server is far beyond a single-`write` real-mode demo. Not attempted as it cannot succeed by construction. |
-| Python | `run --backend kvm -- /usr/bin/python3 -c 'print(1)'` | frontier: fails closed. Gate-bypassed: prints `hello world` (demo), interpreter not run. |
+| Redis | `--backend kvm run -- redis-server …` | **Not runnable.** KVM backend never execs an ELF; a long-lived multi-threaded server is far beyond a single-`write` real-mode demo. Not attempted as it cannot succeed by construction. |
+| Python | `--backend kvm run -- /usr/bin/python3 -c 'print(1)'` | frontier: fails closed. Gate-bypassed: prints `hello world` (demo), interpreter not run. |
 
 For reference, the ptrace backend runs these normally, e.g.:
 

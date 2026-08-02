@@ -8,7 +8,7 @@ description: "Purpose-fixed role for the hermit-dbi agent: ratchet the DBI/Dynam
 ## Purpose
 
 Advance the **DBI (DynamoRIO) backend** so more of the corpus runs under
-`hermit run --backend dbi` with a real Detcore Tool driving the guest. Ratchet
+`hermit --backend dbi run` with a real Detcore Tool driving the guest. Ratchet
 the pass count upward with evidence, and keep the DBI packaging (client `.so`,
 runtime footprint, RPATH) working.
 

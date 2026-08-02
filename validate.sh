@@ -246,8 +246,8 @@ declare -a background_names=()
 declare -a background_logs=()
 declare -a background_duration_files=()
 
-mkdir -p "$ROOT_DIR/target/validation"
-VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
+mkdir -p "$ROOT_DIR/ignored/validation"
+VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/ignored/validation/hermit-validate.XXXXXX")
 if [[ -z $VALIDATION_TMP_DIR ]]; then
     echo "Unable to create validation workspace." >&2
     exit 1
@@ -299,9 +299,9 @@ readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
 readonly COMPAT_SUMMARY_RESULTS="$VALIDATION_TMP_DIR/compat-summary-results.tsv"
-VALIDATE_RESULTS_FILE=${VALIDATE_RESULTS_FILE:-"$ROOT_DIR/target/validate-results.txt"}
+VALIDATE_RESULTS_FILE=${VALIDATE_RESULTS_FILE:-"$ROOT_DIR/ignored/validate-results.txt"}
 readonly VALIDATE_RESULTS_FILE
-readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
+readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/ignored/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
 readonly COMPLEX_SHELL_WORKLOAD="$ROOT_DIR/tests/compat/complex_shell_workload.sh"
@@ -830,7 +830,7 @@ function kvm_backend_available {
 
 function dbi_backend_available {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" --log=info run --backend dbi --strict --verify -- \
+        "$HERMIT_BIN" --log=info --backend dbi run --strict --verify -- \
         /bin/echo hermit-dbi-probe \
         </dev/null >/dev/null 2>&1
 }
@@ -1167,11 +1167,11 @@ function super_probe_command {
             return "$status" ;;
         kvm-verify)
             timeout "$STRICT_COMPAT_TIMEOUT" \
-                "$HERMIT_BIN" run --backend kvm --verify -- \
+                "$HERMIT_BIN" --backend kvm run --verify -- \
                 /bin/echo "hermit-super-kvm-$iteration" ;;
         dbi-verify)
             timeout "$STRICT_COMPAT_TIMEOUT" \
-                "$HERMIT_BIN" run --backend dbi --verify -- \
+                "$HERMIT_BIN" --backend dbi run --verify -- \
                 /bin/echo "hermit-super-dbi-$iteration" ;;
         *)
             echo "validate.sh: unknown super probe: $probe" >&2
@@ -1477,10 +1477,10 @@ function strict_compatibility_probe {
     fi
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
-        run_args=(run --backend sabre --strict --verify --)
+        run_args=(--backend sabre run --strict --verify --)
     elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
         assurance="e9patch L2"
-        run_args=(run --backend e9patch)
+        run_args=(--backend e9patch run)
         # These workloads query owner names that the host may delegate to an
         # asynchronous identity daemon. Pin just those rows to the fixture;
         # custom mounts intentionally reject unrelated symlinked executables.
@@ -2996,7 +2996,7 @@ function run_calibrated_analyze_tests {
     local analyze_period=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}
     local analyze_minimum_margin=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}
     local analyze_calibration_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}
-    local calibration_binary="$ROOT_DIR/target/ci-pmu-skid"
+    local calibration_binary="$ROOT_DIR/ignored/ci-pmu-skid"
     local output
     local recommended
     local margin
@@ -3095,7 +3095,7 @@ function run_portable_slow_strict_diagnostics {
 # TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
 function run_super_diagnostic_suite {
     run_check_with_timeout 1800 "Relaxed Hermit flag matrix" \
-        env HERMIT_FLAG_MATRIX_REPORT="$ROOT_DIR/target/relaxed-flag-matrix/results.tsv" \
+        env HERMIT_FLAG_MATRIX_REPORT="$ROOT_DIR/ignored/relaxed-flag-matrix/results.tsv" \
         cargo test -p hermit --features third-party-backends --test relaxed_flag_matrix \
         meaningful_flag_combinations_run_without_crashing -- --exact --ignored --test-threads=1 --nocapture
     # These probes are useful for trend detection but do not gate PRs. On the
@@ -3165,8 +3165,8 @@ function run_super_diagnostic_suite {
 }
 
 function run_super_suite {
-    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
-    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
+    local leveldb_install="$ROOT_DIR/ignored/hermit-leveldb-super"
+    local leveldb_build="$ROOT_DIR/ignored/hermit-leveldb-build-super"
 
     run_check "Build workspace" cargo build --workspace --features third-party-backends
     run_check "Build release Hermit" cargo build --release -p hermit --features third-party-backends

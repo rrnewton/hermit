@@ -16,5 +16,5 @@ envelope.json
 **/__pycache__/
 **/.mypy_cache/
 
-# Regenerated human-readable commands from tests/e2e/manifests/*.toml.
-/ignored/e2e-commands/
+# Hermit-generated evidence, reports, fixtures, and other non-Cargo artifacts.
+/ignored/

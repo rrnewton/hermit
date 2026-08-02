@@ -76,7 +76,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
 kernel_image=${KERNEL_IMAGE:-/boot/vmlinuz}
-output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-strict-l2-userspace}
+output_dir=${OUTPUT_DIR:-$repo_root/ignored/qemu-strict-l2-userspace}
 phase_timeout_seconds=${QEMU_L2_PHASE_TIMEOUT_SECONDS:-360}
 qemu_bin=${QEMU_BIN:-}
 # The host glibc is built for the x86-64-v2 baseline and its IFUNC resolvers

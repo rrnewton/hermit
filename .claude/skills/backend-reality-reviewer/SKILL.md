@@ -58,7 +58,7 @@ time-virtualization change) must pass **dual independent adversarial review — 
 
 - Building on a feature branch = in progress.
 - PR opened = in review.
-- Merged to main + `hermit run --backend X` works = DONE.
+- Merged to main + `hermit --backend X run` works = DONE.
 - Never close a backend milestone task for work on an unlanded branch.
 
 ## Deep Code-Path Audit
@@ -78,7 +78,7 @@ Record exact `file:line -> symbol -> symbol` paths, commands, and literal output
 
 A backend is REAL if and only if:
 
-1. **`hermit run --backend X --strict --verify -- echo hello` exits 0 on main branch**
+1. **`hermit --backend X run --strict --verify -- echo hello` exits 0 on main branch**
    - If --backend flag doesn't exist on main: NOT a real backend yet
    - If it exists but ignores the program (canned output): FAKE
 
@@ -134,13 +134,13 @@ rg -n 'run_kvm|run_dbi|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
 rg -n 'syscall|intercept|passthrough|forward' hermit-cli/src/ detcore/src/ reverie-*/src/
 
 # 7. Try running real programs (if --backend exists)
-target/release/hermit run --backend X --strict --verify -- echo hello 2>&1
-target/release/hermit run --backend X --strict --verify -- /bin/true 2>&1
-target/release/hermit run --backend X --strict --verify -- cat /dev/null 2>&1
+target/release/hermit --backend X run --strict --verify -- echo hello 2>&1
+target/release/hermit --backend X run --strict --verify -- /bin/true 2>&1
+target/release/hermit --backend X run --strict --verify -- cat /dev/null 2>&1
 
 # 8. Capture and compare INFO-level syscall handling with ptrace
 target/release/hermit --log info run --strict --verify -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
-target/release/hermit --log info run --backend X --strict --verify -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
+target/release/hermit --log info --backend X run --strict --verify -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
 diff -u /tmp/hermit-ptrace.info /tmp/hermit-backend-X.info
 ```
 

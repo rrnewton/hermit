@@ -100,7 +100,7 @@ diff is the authoritative power-to-weight comparison.
 ## Report format
 
 Reports are ignored build artifacts under
-`target/hermit-code-coverage/<name>/`:
+`ignored/hermit-code-coverage/<name>/`:
 
 | Path | Contents |
 | --- | --- |
@@ -114,7 +114,7 @@ Reports are ignored build artifacts under
 | `run.stderr.log` | Guest/wrapper standard error. |
 
 Diffs are written to
-`target/hermit-code-coverage/diffs/<baseline>-vs-<candidate>.{md,json}`. The
+`ignored/hermit-code-coverage/diffs/<baseline>-vs-<candidate>.{md,json}`. The
 JSON contains the complete lost/gained sets; the Markdown report bounds long
 region listings and points to the JSON.
 

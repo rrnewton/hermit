@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-const DEFAULT_OUTPUT_ROOT: &str = "target/hermit-code-coverage";
+const DEFAULT_OUTPUT_ROOT: &str = "ignored/hermit-code-coverage";
 const SCHEMA: &str = "hermit-code-coverage/v1";
 const PRODUCT_ROOTS: &[&str] = &[
     "common",

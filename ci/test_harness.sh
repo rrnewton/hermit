@@ -776,7 +776,7 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
-            command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
+            command=("$HERMIT_BIN" --log=info --backend "$backend" run --strict --verify
                 "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
@@ -784,12 +784,12 @@ function execute_attempt {
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
-            command=("$HERMIT_BIN" --log=off run --backend "$backend" --strict --chaos
+            command=("$HERMIT_BIN" --log=off --backend "$backend" run --strict --chaos
                 --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         custom)
             mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
-            command=("$HERMIT_BIN" --log=info run --backend "$backend"
+            command=("$HERMIT_BIN" --log=info --backend "$backend" run
                 "${custom_args[@]}" -- "${guest_command[@]}")
             ;;
         *) die "internal error: unsupported mode $mode" ;;

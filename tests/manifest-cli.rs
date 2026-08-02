@@ -241,13 +241,13 @@ fn hermit_command(
     };
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{extra_joined} -- {guest}"
+            "{RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run --strict --verify{extra_joined} -- {guest}"
         ),
         "replay" => format!(
             "{RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify{extra_joined} -- {guest}"
         ),
         "chaos" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --chaos --sched-heuristic=random --seed={}{extra_joined} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run --strict --chaos --sched-heuristic=random --seed={}{extra_joined} -- {guest}",
             seed.unwrap_or(0)
         ),
         "custom" => {
@@ -258,7 +258,7 @@ fn hermit_command(
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
             format!(
-                "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict{sep}{margs}{extra_joined} -- {guest}"
+                "{RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} run --strict{sep}{margs}{extra_joined} -- {guest}"
             )
         }
         other => fail(format!("unsupported mode `{other}`")),

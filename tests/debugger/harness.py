@@ -30,9 +30,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GUEST_SRC = Path(__file__).resolve().parent / "guests" / "debuggee.c"
 
-# Build guests and recordings under target/ (git-ignored) and, crucially, *not*
+# Build guests and recordings under ignored/ and, crucially, *not*
 # under host /tmp: Hermit refuses to run a guest whose path is under host /tmp.
-BUILD_DIR = REPO_ROOT / "target" / "debugger-tests"
+BUILD_DIR = REPO_ROOT / "ignored" / "debugger-tests"
 
 # Known-deterministic values produced by guests/debuggee.c with x=7, y=6.
 EXPECT_A = 7

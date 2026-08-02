@@ -155,9 +155,6 @@ command-specific. LiteInst and e9patch support only `run`, while SaBRe supports
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-For backwards compatibility, `run` also accepts `--backend` after the
-subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
-
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
 LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That

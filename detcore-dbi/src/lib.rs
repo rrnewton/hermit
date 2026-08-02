@@ -213,7 +213,7 @@ fn init_dbi_tracing(emit: Emitter) -> bool {
     true
 }
 
-/// Environment variable through which `hermit run --backend dbi` hands the
+/// Environment variable through which `hermit --backend dbi run` hands the
 /// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
 ///
 /// The guest process inherits it from `drrun` (see the DBI launcher), so it is

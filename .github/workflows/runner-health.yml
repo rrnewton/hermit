@@ -35,7 +35,7 @@ jobs:
         if: env.GH_TOKEN != ''
         uses: actions/cache/restore@v4
         with:
-          path: target/runner-health/state.tsv
+          path: ignored/runner-health/state.tsv
           key: runner-health-state-${{ github.run_id }}
           restore-keys: |
             runner-health-state-
@@ -48,10 +48,10 @@ jobs:
           "$RUNNER_TEMP/runner-health"
           --repo "$GITHUB_REPOSITORY"
           --offline-threshold-seconds 3600
-          --state-file target/runner-health/state.tsv
+          --state-file ignored/runner-health/state.tsv
       - name: Save offline-state observations
         if: always() && env.GH_TOKEN != ''
         uses: actions/cache/save@v4
         with:
-          path: target/runner-health/state.tsv
+          path: ignored/runner-health/state.tsv
           key: runner-health-state-${{ github.run_id }}
