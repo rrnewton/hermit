@@ -42,6 +42,10 @@ qemu-prereqs: process-prereqs
 drgn-prereqs: qemu-prereqs
 	@command -v drgn >/dev/null 2>&1 || { \
 		echo "ERROR: drgn is required for demo 7." >&2; exit 1; }
+	@command -v bpftool >/dev/null 2>&1 || { \
+		echo "ERROR: bpftool is required for demo 7." >&2; exit 1; }
+	@command -v gcc >/dev/null 2>&1 || { \
+		echo "ERROR: gcc is required for demo 7." >&2; exit 1; }
 	@command -v readelf >/dev/null 2>&1 || { \
 		echo "ERROR: readelf is required for demo 7." >&2; exit 1; }
 
