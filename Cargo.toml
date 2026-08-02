@@ -42,3 +42,17 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# LOCAL-ONLY integration patch (DO NOT COMMIT): redirect reverie git deps to the
+# kvm-slot reverie worktree carrying codex/kvm-root-getppid-parity so the
+# getppid parity fix can be validated end-to-end against the ptrace golden.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "../reverie/reverie" }
+reverie-ptrace = { path = "../reverie/reverie-ptrace" }
+reverie-kvm = { path = "../reverie/reverie-kvm" }
+reverie-rpc-transport = { path = "../reverie/reverie-rpc-transport" }
+reverie-syscalls = { path = "../reverie/reverie-syscalls" }
+reverie-process = { path = "../reverie/reverie-process" }
+reverie-memory = { path = "../reverie/reverie-memory" }
+reverie-util = { path = "../reverie/reverie-util" }
+safeptrace = { path = "../reverie/safeptrace" }
