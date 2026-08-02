@@ -934,6 +934,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_ip_mtudiscover": (0, b"ipmtudisc=1\n"),
     "getsockopt_ipv6_v6only": (0, b"v6only=0\n"),
     "getsockopt_ipv6_hops": (0, b"v6hops=64\n"),
+    # round-47: ten more protocol-level getsockopt reads extending the round-46
+    # option-level dimension with new IPPROTO_TCP / IPPROTO_IP / IPPROTO_IPV6
+    # members, including the multicast sub-family on datagram sockets. Each reads
+    # a fixed per-socket default: TCP_QUICKACK (-> 1), TCP_DEFER_ACCEPT /
+    # TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_FASTOPEN (-> 0), IP_TOS (-> 0),
+    # IP_MULTICAST_TTL (-> 1), IP_MULTICAST_LOOP (-> 1), IPV6_MULTICAST_HOPS
+    # (-> 1), IPV6_TCLASS (-> 0). These are per-socket option defaults (not
+    # host-tuned sysctls), so no time, randomness, PID, or host-variable input
+    # feeds the output and e9patch preprocessing stays byte-identical to golden
+    # ptrace. TCP_KEEPIDLE and TCP_LINGER2 were dropped: they mirror host sysctls
+    # (tcp_keepalive_time, tcp_fin_timeout) and diverge from golden.
+    "getsockopt_tcp_quickack": (0, b"tcpquickack=1\n"),
+    "getsockopt_tcp_defer_accept": (0, b"tcpdeferaccept=0\n"),
+    "getsockopt_tcp_window_clamp": (0, b"tcpwinclamp=0\n"),
+    "getsockopt_tcp_user_timeout": (0, b"tcpusertimeo=0\n"),
+    "getsockopt_tcp_fastopen": (0, b"tcpfastopen=0\n"),
+    "getsockopt_ip_tos": (0, b"iptos=0\n"),
+    "getsockopt_ip_multicast_ttl": (0, b"ipmcttl=1\n"),
+    "getsockopt_ip_multicast_loop": (0, b"ipmcloop=1\n"),
+    "getsockopt_ipv6_multicast_hops": (0, b"v6mchops=1\n"),
+    "getsockopt_ipv6_tclass": (0, b"v6tclass=0\n"),
 }
 
 FREESTANDING_FLAGS = (
