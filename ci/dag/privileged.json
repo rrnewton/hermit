@@ -3,22 +3,22 @@
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
-  "default_step_timeout": 120,
+  "default_step_timeout": 300,
   "steps": [
     {
       "group": "build", "job": "privileged_tests",
       "desc": "Build Hermit and the focused test binaries used by the privileged lane",
       "cmd": "cargo build -p hermit --features third-party-backends --bin hermit && cargo test -p detcore --test tests_misc --no-run",
-      "timeout": 120,
+      "timeout": 300,
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
       "group": "cpuid", "job": "faulting",
       "desc": "CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits",
-      "cmd": "timeout 30 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
+      "cmd": "timeout 90 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
       "deps": ["build.privileged_tests"],
-      "timeout": 40,
+      "timeout": 120,
       "hint": {"est_duration_s": 15,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
@@ -47,7 +47,7 @@
       "desc": "Prepare every CI-enabled privileged manifest guest",
       "cmd": "./ci/test_harness.sh build --lane privileged --ci-only",
       "deps": ["e2e.metadata"],
-      "timeout": 90,
+      "timeout": 300,
       "hint": {"est_duration_s": 75,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "cpu-bound"}
@@ -58,7 +58,7 @@
       "manifest": {"lane": "privileged", "category": "applications"},
       "cmd": "./ci/test_harness.sh run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
-      "timeout": 120,
+      "timeout": 360,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}

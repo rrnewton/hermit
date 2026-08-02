@@ -21,6 +21,17 @@ MATRIX_PATH = SCRIPT_DIR / "matrix.tsv"
 BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
 
+# Wall-clock ceiling for a single guest invocation. This is a load-flake
+# backstop, not a performance budget: a debug-hermit guest that normally
+# finishes in a couple of seconds must still survive a heavily contended CI
+# host, where the same CPU work stretches over far more wall time. 30s was tight
+# enough to turn contention into spurious status-124 failures. Override with
+# HERMIT_MATRIX_CASE_TIMEOUT_SECONDS when a host or batch needs a different
+# ceiling.
+PER_CASE_TIMEOUT_SECONDS = int(
+    os.environ.get("HERMIT_MATRIX_CASE_TIMEOUT_SECONDS", "90")
+)
+
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
 # contract cannot currently be verified at L2 on that backend. "guest" is
 # guest-visible L2: the two --verify runs produced identical stdout+exit but the
@@ -357,7 +368,7 @@ def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] |
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=30)
+        stdout, stderr = process.communicate(timeout=PER_CASE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         print(f"timed-out command: {command!r}", file=sys.stderr)
         for proc in sorted(
