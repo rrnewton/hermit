@@ -11,8 +11,7 @@ pr-dag-health.json
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
 
-# Local backup and Python cache files.
-*.orig
+# Local Python cache files.
 **/__pycache__/
 **/.mypy_cache/
 
