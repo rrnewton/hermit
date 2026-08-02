@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure targeted native, ptrace, DBI, and KVM backend workloads."""
+"""Measure targeted native, ptrace, DBI, LiteInst, and KVM workloads."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
-BACKEND_NAMES = ("native", "ptrace", "dbi", "kvm")
+BACKEND_NAMES = ("native", "ptrace", "dbi", "liteinst", "kvm")
 
 
 class BenchmarkError(RuntimeError):
@@ -78,8 +78,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backends",
-        default="native,ptrace,dbi,kvm",
-        help="comma-separated backend set (default: native,ptrace,dbi,kvm)",
+        default="native,ptrace,dbi,liteinst,kvm",
+        help="comma-separated backend set (default: native,ptrace,dbi,liteinst,kvm)",
     )
     parser.add_argument(
         "--benchmarks",

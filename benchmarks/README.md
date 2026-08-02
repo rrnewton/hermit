@@ -92,7 +92,7 @@ with-proxy ./benchmarks/targeted.py
 ```
 
 The default is five measured samples plus one warmup for native, ptrace, DBI,
-and KVM. Every Hermit command uses explicit `--strict`, `--log=error`, and
+LiteInst, and KVM. Every Hermit command uses explicit `--strict`, `--log=error`, and
 no determinism relaxations. Before timing, the runner requires each backend to
 exit zero and produce byte-identical stdout to native. A backend or workload
 that fails this precheck is recorded as unavailable rather than misreported as
