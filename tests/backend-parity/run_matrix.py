@@ -139,6 +139,15 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
+            "fd_duplication": (local / "fd_duplication.c", ("-D_GNU_SOURCE",)),
+            "dup_shared_offset": (
+                local / "dup_shared_offset.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "lseek_positioning": (
+                local / "lseek_positioning.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -248,6 +257,21 @@ def case_catalog(
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
             b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        ),
+        "fd_duplication": (
+            [str(fixtures.binary("fd_duplication"))],
+            0,
+            b"fd_dup offset=8 ok=11\n",
+        ),
+        "dup_shared_offset": (
+            [str(fixtures.binary("dup_shared_offset"))],
+            0,
+            b"dup_shared_offset size=8 checksum=748 ok=6\n",
+        ),
+        "lseek_positioning": (
+            [str(fixtures.binary("lseek_positioning"))],
+            0,
+            b"lseek_positioning size=16 checksum=702 ok=11\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],

@@ -152,10 +152,28 @@
       "why": "tests/backend-parity/fixtures/cpuid_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/dup_shared_offset.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/dup_shared_offset.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall shared-file-description backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins that descriptors created with dup share a single kernel open file description so a write or seek through either descriptor advances the one shared offset seen by the other, and reports only a size/checksum/ok aggregate so ptrace, DBI, and KVM stay byte-identical across repeated deterministic runs."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/fd_duplication.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/fd_duplication.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall descriptor-duplication backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins the fd-table invariants Detcore must preserve identically on ptrace, DBI, and KVM: dup shares one open file description and its byte offset, dup/dup2 clear close-on-exec while dup3(O_CLOEXEC) and F_DUPFD_CLOEXEC set it, F_SETFD/F_GETFD round-trips FD_CLOEXEC, and F_DUPFD returns the lowest free descriptor at or above the request, observing only aggregated invariants never a raw descriptor number."
+    },
+    {
       "path": "tests/backend-parity/fixtures/input.txt",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/run_matrix.py",
       "why": "tests/backend-parity/fixtures/input.txt is owned by tests/backend-parity/run_matrix.py: This fixed text payload is input data for backend-parity guest cases; run_matrix.py supplies it to compiled guests and compares backend results, so the data file is not executable."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/lseek_positioning.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/lseek_positioning.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall file-positioning backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins deterministic lseek behaviour across SEEK_SET/SEEK_CUR/SEEK_END plus sparse-hole seeking past end-of-file and short reads at boundaries, reporting only a size/checksum/ok aggregate so ptrace, DBI, and KVM produce identical file-offset semantics under strict verification."
     },
     {
       "path": "tests/backend-parity/fixtures/pid_probe.c",
