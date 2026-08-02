@@ -134,10 +134,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -192,10 +191,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -247,10 +245,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -302,10 +299,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -357,10 +353,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -412,10 +407,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -467,10 +461,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "kvm"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
