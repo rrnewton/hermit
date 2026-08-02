@@ -7,8 +7,8 @@ raised `SIGTRAP` for every syscall, then the ptrace host validated the marker,
 read `/proc/<pid>/maps`, and ran the Tool. At 100,000 calls it did not complete
 within 45 seconds (and a separate run was interrupted after 194 seconds).
 
-Hermit `c89eaddb0aa39a44ef7daeb2959af085ea418351` instead uses Reverie
-`7401ed949d61a2f30614f332fad7d185a499fcfc`: the Tool runs in the guest, only
+Hermit `8e930f87f04bd55208d7bab77dfaa7919f6ac971` instead uses Reverie
+`d3ed343eaff599b7cd390ee89bf1bf3902877786`: the Tool runs in the guest, only
 `GlobalTool` operations use the coordinator socket, and Hermit's currently
 single-threaded constructor explicitly selects quiescent patch publication.
 The generic Reverie entry point remains concurrent-safe.
@@ -17,13 +17,13 @@ Five measured strict-mode samples after one warmup gave these medians:
 
 | Mode | 100,000 calls | Relative to ptrace |
 | --- | ---: | ---: |
-| Native | 16.302 ms | 257.22x faster |
-| Ptrace | 4,193.171 ms | 1.00x |
-| LiteInst in-guest/quiescent | 1,416.672 ms | 2.96x faster |
-| LiteInst host hybrid | >45,000 ms (timeout) | >10.73x slower |
+| Native | 16.289 ms | 247.21x faster |
+| Ptrace | 4,026.665 ms | 1.00x |
+| LiteInst in-guest/quiescent | 1,416.972 ms | 2.84x faster |
+| LiteInst host hybrid | >45,000 ms (timeout) | >11.18x slower |
 
-The in-guest path reduces wall time by 66.2% versus ptrace and is more than
-31.8x faster than the timed-out host hybrid. Quiescent publication itself is a
+The in-guest path reduces wall time by 64.8% versus ptrace and is more than
+31.7x faster than the timed-out host hybrid. Quiescent publication itself is a
 first-hit optimization: on matched 100,000-call `perf stat -r 5` runs,
 concurrent and quiescent in-guest task-clock were 1,975.48 ms and 1,974.26 ms.
 The large speedup comes from removing the per-syscall ptrace round trip.
@@ -90,7 +90,7 @@ microbenchmarks. Ratios use alternating backend order in the same run.
 with-proxy cargo build --release --locked -p hermit --bin hermit
 with-proxy scripts/stage-liteinst-runtime.sh release \
   target/release/libreverie_liteinst.so \
-  target/liteinst-runtime-build-7401ed94
+  target/liteinst-runtime-build-d3ed343e
 with-proxy ./benchmarks/targeted.py --skip-build \
   --hermit target/release/hermit \
   --backends native,ptrace,liteinst \
