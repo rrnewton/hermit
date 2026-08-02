@@ -182,6 +182,40 @@ def _elf_build_id(path: Path) -> str:
     return match.group(1).lower()
 
 
+def _register_vmcoreinfo_symbols(program, vmcoreinfo: bytes, drgn) -> None:
+    """Expose runtime kernel symbols recorded in the guest's VMCOREINFO."""
+    symbols = tuple(
+        drgn.Symbol(
+            match.group(1).decode("ascii"),
+            int(match.group(2), 16),
+            1,
+            drgn.SymbolBinding.GLOBAL,
+            drgn.SymbolKind.UNKNOWN,
+        )
+        for match in re.finditer(
+            rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo
+        )
+    )
+    if not symbols:
+        raise RuntimeError("guest VMCOREINFO contains no SYMBOL entries")
+
+    def find_symbols(_program, name, address, one):
+        matches = [
+            symbol
+            for symbol in symbols
+            if (name is None or symbol.name == name)
+            and (
+                address is None
+                or symbol.address <= address < symbol.address + symbol.size
+            )
+        ]
+        return matches[:1] if one else matches
+
+    program.register_symbol_finder(
+        "guest-vmcoreinfo", find_symbols, enable_index=0
+    )
+
+
 def _proc_status_value(pid: int, key: str) -> str:
     with open("/proc/{}/status".format(pid)) as status:
         for line in status:
@@ -497,6 +531,7 @@ class HermitGuestProgram:
         program = drgn.Program(drgn.Platform(drgn.Architecture.X86_64))
         program.add_memory_segment(0, self._ram_size, read_physical, physical=True)
         program.set_linux_kernel_custom(self._vmcoreinfo, True)
+        _register_vmcoreinfo_symbols(program, self._vmcoreinfo, drgn)
         program.load_debug_info([str(self._vmlinux)], main=True)
         return program
 

@@ -51,7 +51,9 @@ with-proxy ./demos/07-drgn-kernel.sh
 
 The fixed public `bzImage` contains BTF. On first use Demo 07 extracts its
 XZ-compressed ELF payload to `ignored/qemu-linux/vmlinux` and verifies that its
-GNU BuildID matches the live guest's VMCOREINFO before loading symbols.
+GNU BuildID matches the live guest's VMCOREINFO. The compressed boot ELF does
+not retain an ELF symbol table, so Demo 07 registers the runtime `SYMBOL(...)`
+entries from that same VMCOREINFO note with drgn before loading BTF types.
 
 `DEMO07_SNAPSHOT_DISK` and `DEMO07_SNAPSHOT_NAME` select the phase-5 artifact.
 `DEMO07_KERNEL`, `DEMO07_INITRD`, and `DEMO07_VMLINUX` may select another
