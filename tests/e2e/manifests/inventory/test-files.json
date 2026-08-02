@@ -374,6 +374,12 @@
       "why": "tests/c/getpid.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/c/getpriority_identity.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/getpriority_identity.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall getpriority(2) and setpriority(2) backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins Detcore's inert-nice determinization so the raw priority is the constant 20 and setpriority is a virtualized no-op, keeping the value byte-identical across ptrace, DBI, and KVM."
+    },
+    {
       "path": "tests/c/getsockopt_null.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
