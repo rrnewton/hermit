@@ -686,6 +686,12 @@
       "why": "tests/c/prctl_dumpable.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/prctl_identity.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/prctl_identity.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall prctl(2) backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins the deterministic PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_KEEPCAPS, and post-execve PR_GET_PDEATHSIG round-trips so ptrace, DBI, and KVM stay byte-identical across repeated runs."
+    },
+    {
       "path": "tests/c/print_memaddrs.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
