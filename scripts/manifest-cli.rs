@@ -341,6 +341,20 @@ fn mode_backends(spec: &Value, mode: &str, id: &str) -> Vec<String> {
     )
 }
 
+/// Guest arguments for one enabled backend in a mode.
+fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+    let Some(by_backend) = spec.get("guest_args") else {
+        return Vec::new();
+    };
+    let by_backend = by_backend
+        .as_table()
+        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
+    string_array(
+        by_backend.get(backend),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    )
+}
+
 /// Union of backends enabled across all of a test's modes.
 fn test_backends(test: &Value, id: &str) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
@@ -584,6 +598,20 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
 fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
     let (setup, guest) = setup_prefix(test, id);
+    let modes = modes_table(test, id);
+    let guest_args = mode_guest_args(&modes[&mode], &mode, &backend, id);
+    let guest = if guest_args.is_empty() {
+        guest
+    } else {
+        format!(
+            "{guest} {}",
+            guest_args
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
     let log = args
         .flag("log")
         .map(str::to_owned)
@@ -739,5 +767,42 @@ fn main() -> ExitCode {
             eprintln!("manifest-cli: unknown subcommand `{other}`\n");
             usage();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_command_keeps_backend_specific_guest_args() {
+        let test: Value = r#"
+id = "c-programs/example"
+program = "tests/c/example.c"
+lane = "portable"
+timeout_seconds = 90
+
+[modes.verify]
+backends_enabled = ["ptrace", "liteinst"]
+guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
+"#
+        .parse()
+        .unwrap();
+        let args = parse_args(&[
+            "c-programs/example".to_owned(),
+            "--mode".to_owned(),
+            "verify".to_owned(),
+            "--backend".to_owned(),
+            "ptrace".to_owned(),
+        ]);
+
+        let (command, mode, backend) = build_full_command(&test, "c-programs/example", &args);
+
+        assert_eq!(mode, "verify");
+        assert_eq!(backend, "ptrace");
+        assert!(
+            command.contains("-- \"$cell/guest\" multi 'value with spaces'"),
+            "{command}"
+        );
     }
 }
