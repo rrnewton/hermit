@@ -916,6 +916,24 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "madvise_dontdump": (0, b"dontdump=0\n"),
     "socket_inet6": (0, b"inet6=3\n"),
     "setsockopt_sndbuf": (0, b"setsndbuf=1\n"),
+    # round-46: nine getsockopt reads at the IPPROTO_TCP / IPPROTO_IP /
+    # IPPROTO_IPV6 protocol levels, a new option-level dimension distinct from
+    # every prior SOL_SOCKET socket-option guest. On a fresh socket each reads a
+    # fixed kernel default: TCP_NODELAY / TCP_CORK off (-> 0), TCP_KEEPCNT (-> 9),
+    # TCP_KEEPINTVL (-> 75s), TCP_SYNCNT (-> 6), TCP_MAXSEG advertised MSS
+    # (-> 536), IP_MTU_DISCOVER = IP_PMTUDISC_WANT (-> 1), IPV6_V6ONLY dual-stack
+    # (-> 0), IPV6_UNICAST_HOPS (-> 64). Every printed value is a queried default
+    # constant with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all nine byte-identical to golden ptrace.
+    "getsockopt_tcp_nodelay": (0, b"tcpnodelay=0\n"),
+    "getsockopt_tcp_cork": (0, b"tcpcork=0\n"),
+    "getsockopt_tcp_keepcnt": (0, b"tcpkeepcnt=9\n"),
+    "getsockopt_tcp_keepintvl": (0, b"tcpkeepintvl=75\n"),
+    "getsockopt_tcp_syncnt": (0, b"tcpsyncnt=6\n"),
+    "getsockopt_tcp_maxseg": (0, b"tcpmaxseg=536\n"),
+    "getsockopt_ip_mtudiscover": (0, b"ipmtudisc=1\n"),
+    "getsockopt_ipv6_v6only": (0, b"v6only=0\n"),
+    "getsockopt_ipv6_hops": (0, b"v6hops=64\n"),
 }
 
 FREESTANDING_FLAGS = (
