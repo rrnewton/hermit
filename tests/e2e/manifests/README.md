@@ -26,7 +26,7 @@ Six buckets currently contain calibrated blocking workloads:
 - `c-programs.toml` (eight calibrated Buck-derived C probes)
 
 Eight additional `*-c.toml`/`c-programs.toml` buckets make 180 more C guests
-centrally discoverable. The ninth manual bucket contains ten steady-state
+centrally discoverable. The ninth manual bucket contains twenty steady-state
 performance profiles; those deliberately stay outside blocking CI because each
 takes more than five seconds under ptrace verification. Eight `c-programs.toml`
 entries have calibrated

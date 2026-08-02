@@ -1796,6 +1796,30 @@
       "why": "tests/e2e/performance/condvar-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
+      "path": "tests/e2e/performance/epoll-eventfd-ring.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/epoll-eventfd-ring.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/eventfd-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/eventfd-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/fork-wait-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/fork-wait-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/futex-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/futex-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
       "path": "tests/e2e/performance/mmap-churn.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
@@ -1808,16 +1832,40 @@
       "why": "tests/e2e/performance/mutex-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
+      "path": "tests/e2e/performance/nanosleep-yield.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/nanosleep-yield.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/pipe-fd-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/pipe-fd-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
       "path": "tests/e2e/performance/pipe-roundtrip.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
       "why": "tests/e2e/performance/pipe-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
+      "path": "tests/e2e/performance/poll-pipe-ring.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/poll-pipe-ring.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
       "path": "tests/e2e/performance/rwlock-contention.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
       "why": "tests/e2e/performance/rwlock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/semaphore-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/semaphore-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
       "path": "tests/e2e/performance/sigmask-toggle.c",
@@ -1838,10 +1886,28 @@
       "why": "tests/e2e/performance/steady_state_common.c is owned by tests/e2e/performance profile wrappers: It holds the shared synchronization, IPC, memory, and syscall workload implementation selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
     },
     {
+      "path": "tests/e2e/performance/steady_state_extra.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e/performance profile wrappers",
+      "why": "tests/e2e/performance/steady_state_extra.c is owned by tests/e2e/performance profile wrappers: It holds the second batch of synchronization, descriptor, and process-lifecycle workloads selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
+    },
+    {
       "path": "tests/e2e/performance/syscall-mix.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
       "why": "tests/e2e/performance/syscall-mix.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/thread-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/thread-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
+    },
+    {
+      "path": "tests/e2e/performance/trylock-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml",
+      "why": "tests/e2e/performance/trylock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml: Long-running schema-v2 steady-state guest with explicit multi-backend verification policy"
     },
     {
       "path": "tests/e2e/performance/yield-storm.c",
