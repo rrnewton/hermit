@@ -955,6 +955,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_ip_multicast_loop": (0, b"ipmcloop=1\n"),
     "getsockopt_ipv6_multicast_hops": (0, b"v6mchops=1\n"),
     "getsockopt_ipv6_tclass": (0, b"v6tclass=0\n"),
+    # round-48: twelve getsockopt reads of the receive/ancillary-control option
+    # sub-family at the IPPROTO_IP / IPPROTO_IPV6 / IPPROTO_TCP levels. These
+    # booleans gate delivery of ancillary control messages or per-socket
+    # behaviors and are all disabled by default on a fresh socket, so each reads
+    # the fixed constant 0: IP_RECVTOS / IP_RECVTTL / IP_PKTINFO / IP_RECVOPTS /
+    # IP_FREEBIND / IP_NODEFRAG, IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT /
+    # IPV6_RECVTCLASS / IPV6_DONTFRAG, and TCP_INQ / TCP_SAVE_SYN. Every value is
+    # a per-socket default with no time, randomness, PID, or host-variable input,
+    # so e9patch preprocessing stays byte-identical to golden ptrace.
+    "getsockopt_ip_recvtos": (0, b"iprecvtos=0\n"),
+    "getsockopt_ip_recvttl": (0, b"iprecvttl=0\n"),
+    "getsockopt_ip_pktinfo": (0, b"ippktinfo=0\n"),
+    "getsockopt_ip_recvopts": (0, b"iprecvopts=0\n"),
+    "getsockopt_ip_freebind": (0, b"ipfreebind=0\n"),
+    "getsockopt_ip_nodefrag": (0, b"ipnodefrag=0\n"),
+    "getsockopt_ipv6_recvpktinfo": (0, b"v6recvpktinfo=0\n"),
+    "getsockopt_ipv6_recvhoplimit": (0, b"v6recvhoplim=0\n"),
+    "getsockopt_ipv6_recvtclass": (0, b"v6recvtclass=0\n"),
+    "getsockopt_ipv6_dontfrag": (0, b"v6dontfrag=0\n"),
+    "getsockopt_tcp_inq": (0, b"tcpinq=0\n"),
+    "getsockopt_tcp_save_syn": (0, b"tcpsavesyn=0\n"),
 }
 
 FREESTANDING_FLAGS = (
