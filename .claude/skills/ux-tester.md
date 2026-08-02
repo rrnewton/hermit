@@ -1,93 +1,85 @@
 ---
 name: ux-tester
-description: "Test a frontend as a real user with browser-driven workflows, desktop and mobile visual inspection, accessibility checks, and reproducible defect evidence. Use whenever reviewing, validating, or finishing a web UI, app, dashboard, game, or interactive tool."
+description: "Tire-kick a tool, command, UI, report, demo, or workflow as a first-time user and judge output quality, not only exit status. Use whenever validating that something works, especially help text, CLI output, generated artifacts, or user-facing behavior."
 ---
 
 # UX Tester
 
-Test the running product, not only its source. Exercise the workflows a target
-user came to complete, inspect what the browser actually rendered, and bind
-every conclusion to reproducible evidence.
+Act like an intelligent first-time user. Actually use the thing through its
+public entrypoint, read what it produces, and decide both whether it functions
+and whether the experience makes sense.
 
-## Establish The Test Contract
+## Run It For Real
 
-- Identify the audience, primary workflows, supported browsers, and expected
-  responsive range from the task and product context.
-- Record the exact build SHA, URL, fixture or account, browser, viewport, and
-  relevant feature flags. Use deterministic local fixtures where possible.
-- Start the repository's normal development or preview server. Confirm the page
-  is the intended product screen rather than a landing page, error page, stale
-  build, or blank canvas.
-- Prefer the project's existing browser framework. Use Playwright when one is
-  available; do not replace an established test harness with ad hoc automation.
+1. Start from the documented entrypoint and a realistic clean state.
+2. Perform the primary user action. Also try the obvious discovery path such as
+   `-h`, `--help`, an empty state, or the first screen.
+3. Capture the exit status and the user-visible stdout, stderr, files, or UI.
+4. Read the complete result. Do not treat output as an opaque string whose only
+   requirement is that the process exited zero.
 
-## Exercise Real Workflows
+Use first-time-user knowledge, not implementation trivia. If the workflow only
+works after guessing an undocumented flag, internal path, or hidden setup step,
+that is a UX problem even when the underlying code works.
 
-For each primary workflow:
+## Read Critically
 
-1. begin from a clean, documented state;
-2. perform the actions through visible controls as a user would;
-3. verify intermediate, success, empty, loading, validation, and failure states;
-4. reload or revisit when persistence and navigation are part of the contract;
-5. check browser console errors and failed network requests;
-6. repeat the critical path using keyboard navigation.
+Flag anything a reasonable user would find:
 
-Interact with every control introduced or changed by the work. Verify that
-buttons, menus, tabs, dialogs, forms, drag interactions, and back navigation do
-what their labels and placement imply. Do not count DOM presence as usability.
+- broken, incomplete, contradictory, or misleading;
+- random, nonsensical, irrelevant, or unexpectedly verbose;
+- ugly, confusing, poorly ordered, clipped, or misformatted;
+- contaminated with debug logs, source comments, audit markers, stack traces,
+  internal paths, hostnames, implementation jargon, or other leaked internals;
+- inconsistent with the command, label, documentation, examples, or surrounding
+  product conventions.
 
-## Inspect Every Viewport
+Check spelling, alignment, headings, units, defaults, examples, error recovery,
+and whether the next action is clear. A technically accurate result can still
+be unusable.
 
-Test at least one desktop viewport and one narrow mobile viewport. Use stable
-dimensions such as `1440x900` and `390x844`, plus any product-specific boundary
-where layout changes.
+## Report Two Verdicts
 
-- Capture a screenshot after initial load and after important state changes.
-- Inspect screenshots directly, including below-the-fold content. For canvas or
-  WebGL experiences, also check canvas pixels so a nonempty DOM cannot mask a
-  blank render.
-- Look for overlap, clipping, horizontal scrolling, unreadable text, unstable
-  control sizes, hidden actions, broken stacking, and content obscured by fixed
-  headers, keyboards, dialogs, or toasts.
-- Exercise long labels, long values, empty collections, errors, and the largest
-  realistic repeated-data set. Dynamic content must not shift fixed controls or
-  escape its container.
-- Confirm the first viewport communicates the actual product, object, place, or
-  gameplay state and leaves navigation and primary actions usable.
+Always report these separately:
 
-## Check Accessibility And Interaction Quality
+```text
+Works? YES | NO | PARTIAL - <what actually ran and whether it completed>
+UX sensible? YES | NO | PARTIAL - <whether a first-time user gets a clear,
+                                   coherent, appropriately formatted result>
+```
 
-- Tab through the interface in visual order. Focus must remain visible and must
-  enter, stay within, and leave dialogs predictably.
-- Verify interactive elements have accessible names, correct roles, useful
-  labels, and adequate hit targets. Familiar icon-only controls need tooltips or
-  equivalent accessible names.
-- Check heading order, form labels, validation association, selected/expanded
-  state, reduced-motion behavior, and contrast for text and controls.
-- Confirm hover-only information has a keyboard and touch path. Ensure loading
-  and disabled states explain themselves without blocking unrelated work.
+Then list the exact command or action, observed output, and every problem. Keep
+observed facts separate from hypotheses about the cause.
 
-## Report Evidence, Not Impressions
+## File Every Problem
 
-Report each defect with:
+Create one TaskGraph task per independent problem; do not bury defects only in
+chat or combine unrelated symptoms into one task. Search first and reuse an
+existing task for the same defect. Use a symptom-focused title and include
+reproduction steps, expected behavior, actual behavior, user impact, evidence,
+and a concrete acceptance check. Choose honest impact, effort, priority, tags,
+and parent/project relationships, for example:
 
-- severity and affected workflow;
-- exact reproduction steps;
-- expected and observed behavior;
-- build SHA, browser, viewport, and fixture;
-- screenshot, trace, console message, or failed request when relevant.
+```bash
+tg add "Help output leaks internal source comments" \
+  --impact 50 --effort 0.5 --tags ux,bug \
+  --blocks <owning-task-or-goal> \
+  --description "Repro: ... Expected: ... Actual: ... Acceptance: ..."
+```
 
-Separate observed facts from hypotheses about the cause. When reporting counts,
-rates, or timings, also apply
-[presenting-quantitative-data](presenting-quantitative-data.md). Scrub internal
-FQDNs, credentials, tokens, and personal data from durable artifacts.
+Report the created task IDs beside the corresponding findings. If no problem is
+found, say so explicitly; do not invent work to satisfy the checklist.
 
-## Completion Gate
+## Canonical Catch
 
-- Re-run every affected workflow after a fix, then run the surrounding smoke
-  paths to catch regressions.
-- Confirm desktop and mobile screenshots are coherent and no console or network
-  errors were introduced.
-- State exactly what passed, what failed, and what could not be exercised. Never
-  call a UI polished or complete based only on code review or a single happy-path
-  screenshot.
+`validate.sh -h` once exited successfully but printed every comment from the
+script, including `TODO-HUMAN-REVIEW` and `AUTONOMOUS-BOT-IMPLEMENTED` markers.
+A pass/fail test saw exit 0. A UX test read the output and correctly reported:
+
+```text
+Works? YES - the help path runs and exits zero.
+UX sensible? NO - the output is a source-comment dump with leaked internals,
+                  not a concise help page.
+```
+
+That distinction is the purpose of this skill.
