@@ -400,7 +400,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "CLONE_VM completion is observed through SIGCHLD and wait; that process-lifecycle family is owner-gated for SaBRe"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -1944,7 +1944,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "The oracle prints concurrent pthread pipe, socketpair, eventfd, and epoll ordering; core scheduling parity is owner-gated"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -5023,7 +5023,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "The default oracle includes per-thread getrandom and urandom assignment; multithreaded-random parity is owner-gated"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6955,7 +6955,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "SIOCGSTAMP and SIOCGSTAMPNS output plus delayed receive advancement are part of the owner-gated virtual-time family"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8090,11 +8090,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm"]
-guest_args = { ptrace = ["cancellation"], kvm = ["cancellation"] }
+backends_enabled = ["ptrace", "kvm", "sabre"]
+guest_args = { ptrace = ["cancellation"], kvm = ["cancellation"], sabre = ["cancellation"] }
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8475,7 +8474,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "vfork completion and wait depend on the owner-gated SIGCHLD/process-lifecycle path; current SaBRe probes time out"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
