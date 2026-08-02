@@ -1035,6 +1035,25 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "setsockopt_tcp_cork": (0, b"settcpcork=1\n"),
     "setsockopt_ipv6_hops": (0, b"setipv6hops=5\n"),
     "mlockall_onfault": (0, b"mlockonfault=0\n"),
+    # Round 52 (more setsockopt write-path round-trips, TCP timer/segment/MTU +
+    # multicast-loop options). Each sets a NON-default value with setsockopt(54)
+    # then reads it back with getsockopt(55) and prints the round-tripped
+    # constant. TCP_KEEPIDLE and TCP_LINGER2 read-only defaults mirrored host
+    # sysctls (tcp_keepalive_time / tcp_fin_timeout) and were dropped in round 47;
+    # writing a fixed value pins them deterministically, recovering that coverage.
+    # No time/randomness/PID/host-variable input, so e9patch preprocessing stays
+    # byte-identical to golden ptrace.
+    "setsockopt_keepidle": (0, b"setkeepidle=120\n"),
+    "setsockopt_keepcnt": (0, b"setkeepcnt=5\n"),
+    "setsockopt_keepintvl": (0, b"setkeepintvl=30\n"),
+    "setsockopt_linger2": (0, b"setlinger2=15\n"),
+    "setsockopt_maxseg": (0, b"setmaxseg=1000\n"),
+    "setsockopt_syncnt": (0, b"setsyncnt=3\n"),
+    "setsockopt_ip_mtu_discover": (0, b"setipmtudisc=2\n"),
+    "setsockopt_v6only": (0, b"setv6only=1\n"),
+    "setsockopt_ip_multicast_loop": (0, b"setipmcloop=0\n"),
+    "setsockopt_ipv6_multicast_loop": (0, b"setv6mcloop=0\n"),
+    "setsockopt_ipv6_multicast_hops": (0, b"setv6mchops=7\n"),
 }
 
 FREESTANDING_FLAGS = (

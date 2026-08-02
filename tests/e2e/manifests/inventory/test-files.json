@@ -1934,6 +1934,72 @@
       "why": "tests/backend-parity/e9patch_corpus/mlockall_onfault.c is owned by tests/backend-parity/e9patch_corpus.py: locks all current pages with mlockall(151) using MCL_CURRENT(1)|MCL_ONFAULT(4) then releases them with munlockall(152), printing the mlockall return 0, a host-independent constant and a distinct flag combination from the mlockall_all guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_keepidle.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_keepidle.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_KEEPIDLE(4) at IPPROTO_TCP(6) to 120 with setsockopt(54), reads it back with getsockopt(55) and prints 120; the read-only default mirrored host sysctl tcp_keepalive_time and was dropped in round 47, but a written value round-trips deterministically. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_keepcnt.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_keepcnt.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_KEEPCNT(6) at IPPROTO_TCP(6) to 5 with setsockopt(54), reads it back with getsockopt(55) and prints 5, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_keepintvl.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_keepintvl.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_KEEPINTVL(5) at IPPROTO_TCP(6) to 30 with setsockopt(54), reads it back with getsockopt(55) and prints 30, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_linger2.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_linger2.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_LINGER2(8) at IPPROTO_TCP(6) to 15 with setsockopt(54), reads it back with getsockopt(55) and prints 15; the read-only default mirrored host sysctl tcp_fin_timeout and was dropped in round 47, but a written value round-trips deterministically. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_maxseg.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_maxseg.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_MAXSEG(2) at IPPROTO_TCP(6) to 1000 with setsockopt(54), reads it back with getsockopt(55) and prints 1000, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_syncnt.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_syncnt.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets TCP_SYNCNT(7) at IPPROTO_TCP(6) to 3 with setsockopt(54), reads it back with getsockopt(55) and prints 3, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_ip_mtu_discover.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_ip_mtu_discover.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket, sets IP_MTU_DISCOVER(10) at IPPROTO_IP(0) to IP_PMTUDISC_DO(2) with setsockopt(54), reads it back with getsockopt(55) and prints 2, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_v6only.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_v6only.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET6/SOCK_STREAM socket, sets IPV6_V6ONLY(26) at IPPROTO_IPV6(41) to 1 with setsockopt(54), reads it back with getsockopt(55) and prints 1, a host-independent constant exercising the setsockopt write path on an IPv6 socket. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_ip_multicast_loop.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_ip_multicast_loop.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_DGRAM socket, sets IP_MULTICAST_LOOP(34) at IPPROTO_IP(0) to 0 with setsockopt(54), reads it back with getsockopt(55) and prints 0, a host-independent constant exercising the setsockopt write path distinct from the read-only getsockopt_ip_multicast_loop guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_ipv6_multicast_loop.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_ipv6_multicast_loop.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET6/SOCK_DGRAM socket, sets IPV6_MULTICAST_LOOP(19) at IPPROTO_IPV6(41) to 0 with setsockopt(54), reads it back with getsockopt(55) and prints 0, a host-independent constant exercising the setsockopt write path. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/setsockopt_ipv6_multicast_hops.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/setsockopt_ipv6_multicast_hops.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET6/SOCK_DGRAM socket, sets IPV6_MULTICAST_HOPS(18) at IPPROTO_IPV6(41) to 7 with setsockopt(54), reads it back with getsockopt(55) and prints 7, a host-independent constant exercising the setsockopt write path distinct from the read-only getsockopt_ipv6_multicast_hops guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
