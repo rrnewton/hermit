@@ -760,18 +760,24 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
 
     // The two variables are present with identical values regardless of the
     // selected backend, so no backend-specific spawn hook is required for parity.
-    for backend in ["ptrace", "kvm", "sabre", "dbi"] {
-        let ro = RunOpts::parse_from(["fakehermit", "--backend", backend, "/bin/echo", "hi"]);
+    for (backend_name, backend) in [
+        ("ptrace", Backend::Ptrace),
+        ("kvm", Backend::Kvm),
+        ("sabre", Backend::Sabre),
+        ("dbi", Backend::Dbi),
+    ] {
+        let mut ro = RunOpts::parse_from(["fakehermit", "/bin/echo", "hi"]);
+        ro.backend = backend;
         let envs = ro.guest_command().unwrap().get_captured_envs();
         assert_eq!(
             envs.get(asan),
             Some(&expected),
-            "ASAN_OPTIONS not set for backend {backend}"
+            "ASAN_OPTIONS not set for backend {backend_name}"
         );
         assert_eq!(
             envs.get(lsan),
             Some(&expected),
-            "LSAN_OPTIONS not set for backend {backend}"
+            "LSAN_OPTIONS not set for backend {backend_name}"
         );
     }
 }
