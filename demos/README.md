@@ -17,7 +17,7 @@ cargo build --release -p hermit --bin hermit
 
 With no `KERNEL_IMAGE` set, the demo auto-fetches a pinned x86-64 `bzImage`
 (SHA-256 `e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2`)
-into the gitignored cache at `target/qemu-busybox/bzImage`, verifies its
+into the gitignored cache at `ignored/qemu-busybox/bzImage`, verifies its
 SHA-256, and reuses it on later runs. The download tries a direct connection
 first and falls back to a `with-proxy` helper when one is on `PATH`. Set
 `KERNEL_IMAGE=/path/to/bzImage` to use a local kernel instead, or
@@ -26,7 +26,7 @@ first and falls back to a `with-proxy` helper when one is on `PATH`. Set
 The default backend is ptrace. This command uses `--log info --strict` with no
 determinism relaxations, so a successful run is L1 evidence for the exact
 kernel, BusyBox, QEMU, and host recorded in the output. Logs and generated
-artifacts are written under `target/qemu-busybox/`. The Linux serial console is
+artifacts are written under `ignored/qemu-busybox/`. The Linux serial console is
 streamed live and saved as `console.log`; Hermit's full INFO trace is saved as
 `hermit-info.log` without flooding the serial output.
 
@@ -37,7 +37,7 @@ once on the host and supply both fixed images:
 BUSYBOX=/path/to/static/busybox \
   ./demos/qemu-busybox/build-initramfs.sh
 KERNEL_IMAGE=/path/to/bzImage \
-  INITRAMFS_IMAGE=target/qemu-busybox/initramfs-busybox.cpio.gz \
+  INITRAMFS_IMAGE=ignored/qemu-busybox/initramfs-busybox.cpio.gz \
   cargo run --release -p hermit -- run --strict -- demos/boot_qemu.sh
 ```
 

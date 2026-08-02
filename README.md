@@ -208,13 +208,13 @@ deterministic schedule twice:
 
 ```bash
 cargo build --release -p hermit --bin hermit
-mkdir -p target/chaos-demo
+mkdir -p ignored/chaos-demo
 cc -std=c11 -O2 -pthread tests/chaos/order_violation.c \
-  -o target/chaos-demo/order-violation
+  -o ignored/chaos-demo/order-violation
 
 for run in 1 2; do
   target/release/hermit run --max-timeslice=disabled -- \
-    ./target/chaos-demo/order-violation
+    ./ignored/chaos-demo/order-violation
 done
 ```
 
@@ -225,7 +225,7 @@ schedules; this bounded search reports the guest status for each seed:
 for seed in {0..15}; do
   target/release/hermit run --chaos --sched-heuristic=random \
     --max-timeslice=disabled --seed="$seed" -- \
-    ./target/chaos-demo/order-violation
+    ./ignored/chaos-demo/order-violation
   printf 'seed=%s status=%s\n' "$seed" "$?"
 done
 ```
@@ -237,7 +237,7 @@ reproduces the same failure:
 ```bash
 target/release/hermit run --chaos --sched-heuristic=random \
   --max-timeslice=disabled --seed=9 -- \
-  ./target/chaos-demo/order-violation
+  ./ignored/chaos-demo/order-violation
 ```
 
 The seed identifies a schedule for a particular Hermit build, guest binary,

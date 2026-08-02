@@ -5,7 +5,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 fixture="$script_dir/build-time-0.1.3"
 hermit_bin=${HERMIT_BIN:-"$repo_root/target/release/hermit"}
-artifact_dir="$fixture/target/reproducible-builds"
+artifact_dir="$repo_root/ignored/reproducible-builds"
 
 if [[ ! -x "$hermit_bin" ]]; then
     printf 'Hermit binary not found: %s\n' "$hermit_bin" >&2

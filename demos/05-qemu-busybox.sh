@@ -34,12 +34,12 @@ hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
 kernel_image=${KERNEL_IMAGE:-}
 # Pinned QEMU kernel provisioning (mirrors dev-hermit demos/lib/qemu-assets.sh).
 # When KERNEL_IMAGE is unset the demo auto-fetches this exact bzImage into the
-# gitignored cache under target/, so it runs out of the box with no manual step.
+# gitignored cache under ignored/, so it runs out of the box with no manual step.
 # Override with QEMU_KERNEL_URL / QEMU_KERNEL_SHA256 to pin a different kernel.
 kernel_sha256=${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}
 kernel_url=${QEMU_KERNEL_URL:-https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-$kernel_sha256/bzImage}
 qemu_bin=${QEMU_BIN:-}
-output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-busybox}
+output_dir=${OUTPUT_DIR:-$repo_root/ignored/qemu-busybox}
 timeout_seconds=${DEMO_TIMEOUT_SECONDS:-300}
 verify=${VERIFY:-0}
 skid_margin=${SKID_MARGIN:-}
@@ -65,7 +65,7 @@ done
 mkdir -p "$output_dir"
 
 # Resolve the kernel image: honor an explicit KERNEL_IMAGE, otherwise fetch the
-# pinned bzImage into the gitignored cache under target/ and verify its sha256
+# pinned bzImage into the gitignored cache under ignored/ and verify its sha256
 # so the demo works out of the box with no manual provisioning step.
 if [[ -z $kernel_image ]]; then
   [[ $kernel_sha256 =~ ^[0-9a-f]{64}$ ]] || fail \

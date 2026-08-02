@@ -8,7 +8,7 @@ redis_url=https://github.com/redis/redis/archive/refs/tags/${redis_version}.tar.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
-artifact_root=${ARTIFACT_ROOT:-$repo_root/target/redis-strict}
+artifact_root=${ARTIFACT_ROOT:-$repo_root/ignored/redis-strict}
 archive=$artifact_root/downloads/redis-${redis_version}.tar.gz
 source_root=$artifact_root/source/redis-${redis_version}
 hermit_bin=${HERMIT_BIN:-$repo_root/target/debug/hermit}

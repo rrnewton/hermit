@@ -10,7 +10,7 @@ fail() {
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 busybox=${BUSYBOX:-}
-output=${1:-$repo_root/target/qemu-busybox/initramfs-busybox.cpio.gz}
+output=${1:-$repo_root/ignored/qemu-busybox/initramfs-busybox.cpio.gz}
 
 if [[ -z $busybox ]]; then
   busybox=$(command -v busybox || true)
@@ -28,8 +28,8 @@ for applet in bc ls mknod mount poweroff sha256sum sh uname; do
     "BusyBox does not provide required applet: $applet"
 done
 
-mkdir -p "$repo_root/target/qemu-busybox" "$(dirname -- "$output")"
-root=$(mktemp -d "$repo_root/target/qemu-busybox/root.XXXXXX")
+mkdir -p "$repo_root/ignored/qemu-busybox" "$(dirname -- "$output")"
+root=$(mktemp -d "$repo_root/ignored/qemu-busybox/root.XXXXXX")
 cleanup() {
   rm -rf -- "$root"
 }

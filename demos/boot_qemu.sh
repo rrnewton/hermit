@@ -10,7 +10,7 @@ fail() {
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 kernel_image=${1:-${KERNEL_IMAGE:-}}
-initramfs_image=${2:-${INITRAMFS_IMAGE:-$repo_root/target/qemu-busybox/initramfs-busybox.cpio.gz}}
+initramfs_image=${2:-${INITRAMFS_IMAGE:-$repo_root/ignored/qemu-busybox/initramfs-busybox.cpio.gz}}
 qemu_bin=${3:-${QEMU_BIN:-}}
 
 if [[ -z $qemu_bin ]]; then

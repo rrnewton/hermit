@@ -17,7 +17,7 @@ with-proxy ./tests/reproducible-builds/run.sh
 ```
 
 Set `HERMIT_BIN` to test another Hermit binary. Generated objects remain under
-the fixture's ignored `target/reproducible-builds/` directory for inspection.
+the repository's `ignored/reproducible-builds/` directory for inspection.
 
 ## Scope
 

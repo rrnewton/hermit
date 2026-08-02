@@ -90,7 +90,7 @@ case $hermit_bin in
   /*) ;;
   *) hermit_bin=$PWD/$hermit_bin ;;
 esac
-artifact_root=${SQLITE_VERYQUICK_ARTIFACT_ROOT:-$repo_root/target/sqlite-veryquick}
+artifact_root=${SQLITE_VERYQUICK_ARTIFACT_ROOT:-$repo_root/ignored/sqlite-veryquick}
 case $artifact_root in
   /*) ;;
   *) artifact_root=$PWD/$artifact_root ;;

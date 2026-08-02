@@ -41,7 +41,7 @@ run_strict() {
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
-artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
+artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/ignored/compression}
 runs=${COMPRESSION_RUNS:-3}
 input_lines=${COMPRESSION_INPUT_LINES:-24000}
 
