@@ -1082,6 +1082,23 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "accept_nonlisten": (0, b"acceptnolis=-22\n"),
     "listen_dgram": (0, b"listendgram=-95\n"),
     "getsockname_family": (0, b"gsnfamily=2\n"),
+    # Round 55 (removed kernel-module / sysctl-management syscalls -> faithful
+    # ENOSYS). Each drives a syscall number that once existed in older Linux and
+    # was later removed: _sysctl(156) removed in 5.5; create_module(174),
+    # query_module(178), get_kernel_syms(177) all stubbed to -ENOSYS since 2.6
+    # and removed in 5.18; nfsservctl(180) removed in 3.1. The kernel returns
+    # -ENOSYS(-38) for these numbers both natively and under golden ptrace, so
+    # this is faithful native==golden parity (not a hermit limitation), and the
+    # value is a host-independent constant. These exercise e9patch's
+    # rewritten-SYSCALL dispatch of a removed/unknown number, which must classify
+    # to the same ENOSYS as golden ptrace, keeping e9patch preprocessing
+    # byte-identical. Distinct from the not-implemented-here restart_syscall and
+    # from every success/error-path guest above.
+    "sysctl_enosys": (0, b"sysctl=-38\n"),
+    "create_module_enosys": (0, b"createmod=-38\n"),
+    "query_module_enosys": (0, b"querymod=-38\n"),
+    "get_kernel_syms_enosys": (0, b"getkernelsyms=-38\n"),
+    "nfsservctl_enosys": (0, b"nfsservctl=-38\n"),
 }
 
 FREESTANDING_FLAGS = (

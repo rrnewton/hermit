@@ -2060,6 +2060,36 @@
       "why": "tests/backend-parity/e9patch_corpus/getsockname_family.c is owned by tests/backend-parity/e9patch_corpus.py: calls getsockname(51) on a fresh unbound AF_INET/SOCK_STREAM socket and reads the returned sockaddr address family AF_INET(2), a host-independent constant distinct from the AF_UNIX success-path getsockname_unix guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/sysctl_enosys.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/sysctl_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the long-removed _sysctl(156) syscall, removed from Linux in 5.5, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/create_module_enosys.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/create_module_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the removed create_module(174) syscall, stubbed to -ENOSYS since Linux 2.6 and removed in 5.18, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/query_module_enosys.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/query_module_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the removed query_module(178) syscall, stubbed to -ENOSYS since Linux 2.6 and removed in 5.18, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/get_kernel_syms_enosys.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/get_kernel_syms_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the removed get_kernel_syms(177) syscall, stubbed to -ENOSYS since Linux 2.6 and removed in 5.18, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/nfsservctl_enosys.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/nfsservctl_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the removed nfsservctl(180) syscall, removed from Linux in 3.1, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
