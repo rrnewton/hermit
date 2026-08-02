@@ -976,6 +976,24 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_ipv6_dontfrag": (0, b"v6dontfrag=0\n"),
     "getsockopt_tcp_inq": (0, b"tcpinq=0\n"),
     "getsockopt_tcp_save_syn": (0, b"tcpsavesyn=0\n"),
+    # round-49: ten remaining SOL_SOCKET(1) option flags not previously covered,
+    # completing the generic socket-level option coverage. Each is a per-socket
+    # boolean/flag disabled by default on a fresh socket, so each reads the fixed
+    # constant 0: SO_BSDCOMPAT, SO_RXQ_OVFL, SO_NOFCS, SO_LOCK_FILTER,
+    # SO_SELECT_ERR_QUEUE, SO_TIMESTAMPING, SO_TXTIME, SO_BINDTOIFINDEX,
+    # SO_INCOMING_NAPI_ID, SO_WIFI_STATUS. Every value is a per-socket default
+    # with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing stays byte-identical to golden ptrace.
+    "getsockopt_bsdcompat": (0, b"sobsdcompat=0\n"),
+    "getsockopt_rxq_ovfl": (0, b"sorxqovfl=0\n"),
+    "getsockopt_nofcs": (0, b"sonofcs=0\n"),
+    "getsockopt_lock_filter": (0, b"solockfilter=0\n"),
+    "getsockopt_select_err_queue": (0, b"soselecterrq=0\n"),
+    "getsockopt_timestamping": (0, b"sotimestamping=0\n"),
+    "getsockopt_txtime": (0, b"sotxtime=0\n"),
+    "getsockopt_bindtoifindex": (0, b"sobindtoifidx=0\n"),
+    "getsockopt_incoming_napi_id": (0, b"sonapiid=0\n"),
+    "getsockopt_wifi_status": (0, b"sowifistatus=0\n"),
 }
 
 FREESTANDING_FLAGS = (

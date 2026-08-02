@@ -1748,6 +1748,66 @@
       "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_save_syn.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_SAVE_SYN at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; saving of the received SYN header for later retrieval is off by default so the queried flag is 0, a host-independent per-socket default distinct from the TCP_INQ ancillary control and from all prior TCP option guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_bsdcompat.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_bsdcompat.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_BSDCOMPAT with getsockopt(55) at the SOL_SOCKET(1) level on a fresh AF_INET/SOCK_STREAM socket; this deprecated BSD-compatibility flag is always off so the queried value is 0, a fixed per-socket default that fills a remaining gap in the SOL_SOCKET option coverage alongside the other round-49 socket-level flags. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_rxq_ovfl.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_rxq_ovfl.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_RXQ_OVFL at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; delivery of a receive-queue overflow counter as ancillary data is disabled by default so the queried flag is 0, a host-independent per-socket default distinct from the other SOL_SOCKET option guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_nofcs.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_nofcs.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_NOFCS at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; the disable-frame-check-sequence flag is off by default so the queried value is 0, a fixed per-socket default completing more of the SOL_SOCKET option coverage. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_lock_filter.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_lock_filter.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_LOCK_FILTER at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; no attached BPF filter is locked by default so the queried flag is 0, a host-independent per-socket default distinct from the other round-49 SOL_SOCKET flags. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_select_err_queue.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_select_err_queue.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_SELECT_ERR_QUEUE at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; reporting error-queue readability through select is disabled by default so the queried flag is 0, a fixed per-socket default distinct from the other SOL_SOCKET option guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_timestamping.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_timestamping.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_TIMESTAMPING at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; no hardware or software timestamping generation flags are set by default so the queried bitmask is 0, a host-independent per-socket default distinct from the SO_TIMESTAMP/SO_TIMESTAMPNS guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_txtime.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_txtime.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_TXTIME at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; the transmit-time scheduling feature is off by default so the queried value is 0, a fixed per-socket default completing more of the SOL_SOCKET option coverage. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_bindtoifindex.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_bindtoifindex.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_BINDTOIFINDEX at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; no interface is bound by index by default so the queried ifindex is 0, a host-independent per-socket default distinct from the other round-49 SOL_SOCKET flags. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_incoming_napi_id.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_incoming_napi_id.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_INCOMING_NAPI_ID at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; no NAPI receive context is associated on an unconnected socket so the queried id is 0, a fixed per-socket default distinct from the other SOL_SOCKET option guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_wifi_status.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_wifi_status.c is owned by tests/backend-parity/e9patch_corpus.py: reads SO_WIFI_STATUS at the SOL_SOCKET(1) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; wifi-status ancillary reporting is disabled by default so the queried flag is 0, a host-independent per-socket default completing the round-49 batch of remaining SOL_SOCKET option flags. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
