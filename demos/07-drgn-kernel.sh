@@ -41,6 +41,12 @@ if [ -z "$DRGN_BIN" ]; then
   echo "error: drgn is required (https://github.com/osandov/drgn)" >&2
   exit 1
 fi
+for tool in bpftool gcc; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: $tool is required to bridge public kernel BTF into drgn" >&2
+    exit 1
+  fi
+done
 
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
 if [ ! -x "$HERMIT_RELEASE" ]; then

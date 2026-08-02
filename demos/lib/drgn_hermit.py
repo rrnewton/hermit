@@ -17,6 +17,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -216,6 +217,185 @@ def _register_vmcoreinfo_symbols(program, vmcoreinfo: bytes, drgn) -> None:
     )
 
 
+def _btf_dwarf_cache(vmlinux: Path, artifact_dir: Path) -> Path:
+    """Convert the public kernel BTF to DWARF for drgn builds without BTF."""
+    build_id = _elf_build_id(vmlinux)
+    cache_dir = artifact_dir / "type-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output = cache_dir / "vmlinux-types-{}.o".format(build_id)
+    if output.is_file():
+        with output.open("rb") as cached:
+            if cached.read(4) == ELF_MAGIC:
+                return output
+        raise RuntimeError("cached drgn type object is not ELF: {}".format(output))
+
+    bpftool = shutil.which("bpftool")
+    compiler = shutil.which("gcc")
+    if bpftool is None or compiler is None:
+        raise RuntimeError(
+            "bpftool and gcc are required to bridge kernel BTF into public drgn"
+        )
+
+    descriptor, source_name = tempfile.mkstemp(
+        prefix=".vmlinux-types.", suffix=".c", dir=str(cache_dir)
+    )
+    os.close(descriptor)
+    source = Path(source_name)
+    temporary_output = source.with_suffix(".o")
+    try:
+        with source.open("wb") as generated:
+            dumped = subprocess.run(
+                [bpftool, "btf", "dump", "file", str(vmlinux), "format", "c"],
+                stdout=generated,
+                stderr=subprocess.PIPE,
+            )
+        if dumped.returncode != 0:
+            raise RuntimeError(
+                "bpftool could not decode kernel BTF: {}".format(
+                    dumped.stderr.decode("utf-8", "replace").strip()
+                )
+            )
+        with source.open("ab") as generated:
+            generated.write(b"\nstruct task_struct demo07_init_task_type;\n")
+        compiled = subprocess.run(
+            [
+                compiler,
+                "-w",
+                "-g",
+                "-gdwarf-4",
+                "-fno-eliminate-unused-debug-types",
+                "-c",
+                str(source),
+                "-o",
+                str(temporary_output),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if compiled.returncode != 0:
+            raise RuntimeError(
+                "gcc could not compile BTF-derived types: {}".format(
+                    compiled.stderr.decode("utf-8", "replace").strip()
+                )
+            )
+        os.chmod(temporary_output, 0o644)
+        os.replace(temporary_output, output)
+        return output
+    finally:
+        for temporary in (source, temporary_output):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _load_btf_dwarf(program, vmlinux: Path, artifact_dir: Path) -> None:
+    debug_object = _btf_dwarf_cache(vmlinux, artifact_dir)
+    module = program.extra_module(str(debug_object), create=True)
+    # An extra module needs a nonempty range even though only its types are used.
+    module.address_range = (0, 1)
+    module.try_file(str(debug_object), force=True)
+    program.load_module_debug_info(module)
+
+
+def _vmcoreinfo_symbol_addresses(vmcoreinfo: bytes) -> dict[str, int]:
+    return {
+        match.group(1).decode("ascii"): int(match.group(2), 16)
+        for match in re.finditer(
+            rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo
+        )
+    }
+
+
+def _kallsyms_address(program, vmcoreinfo: bytes, wanted: str) -> int:
+    """Resolve one symbol from the stopped guest's compressed kallsyms table."""
+    addresses = _vmcoreinfo_symbol_addresses(vmcoreinfo)
+    required = (
+        "kallsyms_names",
+        "kallsyms_num_syms",
+        "kallsyms_token_table",
+        "kallsyms_token_index",
+        "kallsyms_offsets",
+        "kallsyms_relative_base",
+    )
+    missing = [name for name in required if name not in addresses]
+    if missing:
+        raise RuntimeError(
+            "guest VMCOREINFO lacks kallsyms metadata: {}".format(", ".join(missing))
+        )
+
+    number = struct.unpack(
+        "<I", program.read(addresses["kallsyms_num_syms"], 4)
+    )[0]
+    if not 0 < number <= 4_000_000:
+        raise RuntimeError("invalid guest kallsyms count: {}".format(number))
+
+    names_size = addresses["kallsyms_token_table"] - addresses["kallsyms_names"]
+    token_table_size = (
+        addresses["kallsyms_token_index"] - addresses["kallsyms_token_table"]
+    )
+    if not 0 < names_size <= 64 << 20 or not 0 < token_table_size <= 1 << 20:
+        raise RuntimeError("invalid guest kallsyms table layout")
+
+    names = program.read(addresses["kallsyms_names"], names_size)
+    token_table = program.read(addresses["kallsyms_token_table"], token_table_size)
+    token_index = struct.unpack(
+        "<256H", program.read(addresses["kallsyms_token_index"], 512)
+    )
+    offsets = struct.unpack(
+        "<{}i".format(number),
+        program.read(addresses["kallsyms_offsets"], number * 4),
+    )
+    relative_base = struct.unpack(
+        "<Q", program.read(addresses["kallsyms_relative_base"], 8)
+    )[0]
+
+    position = 0
+    for index in range(number):
+        if position >= len(names):
+            raise RuntimeError("guest kallsyms names table ended early")
+        length = names[position]
+        position += 1
+        if length & 0x80:
+            if position >= len(names):
+                raise RuntimeError("guest kallsyms name length is truncated")
+            length = (length & 0x7F) | (names[position] << 7)
+            position += 1
+        if position + length > len(names):
+            raise RuntimeError("guest kallsyms name is truncated")
+
+        expanded = bytearray()
+        for token in names[position : position + length]:
+            start = token_index[token]
+            end = token_table.find(b"\0", start)
+            if end < 0:
+                raise RuntimeError("guest kallsyms token table is truncated")
+            expanded.extend(token_table[start:end])
+        position += length
+        # The first expanded character is the kallsyms type code.
+        if expanded[1:].decode("ascii", "replace") == wanted:
+            offset = offsets[index]
+            return (
+                relative_base + offset
+                if offset >= 0
+                else relative_base - 1 - offset
+            )
+    raise RuntimeError("guest kallsyms has no {} symbol".format(wanted))
+
+
+def _register_init_task_object(program, address: int, drgn) -> None:
+    task_type = program.type("struct task_struct")
+
+    def find_object(_program, name, _flags, _filename):
+        if name == "init_task":
+            return drgn.Object(program, task_type, address=address)
+        return None
+
+    program.register_object_finder(
+        "guest-init-task", find_object, enable_index=0
+    )
+
+
 def _proc_status_value(pid: int, key: str) -> str:
     with open("/proc/{}/status".format(pid)) as status:
         for line in status:
@@ -391,6 +571,7 @@ class HermitGuestProgram:
         self._serial_bytes = 0
         self._reads = 0
         self._bytes = 0
+        self._init_task_address = None  # type: Optional[int]
         self.metrics = []  # type: list[ObservationMetrics]
         self.run_dir = None  # type: Optional[Path]
         self.serial_log = None  # type: Optional[Path]
@@ -532,7 +713,20 @@ class HermitGuestProgram:
         program.add_memory_segment(0, self._ram_size, read_physical, physical=True)
         program.set_linux_kernel_custom(self._vmcoreinfo, True)
         _register_vmcoreinfo_symbols(program, self._vmcoreinfo, drgn)
-        program.load_debug_info([str(self._vmlinux)], main=True)
+        if "btf" not in program.registered_type_finders():
+            # Public drgn 0.2.0 does not read BTF, while Meta's build does.
+            # Convert the pinned public BTF to cached DWARF types on that path.
+            _load_btf_dwarf(program, self._vmlinux, self.config.artifact_dir)
+        else:
+            try:
+                program.load_debug_info([str(self._vmlinux)], main=True)
+            except drgn.MissingDebugInfoError:
+                _load_btf_dwarf(program, self._vmlinux, self.config.artifact_dir)
+        if self._init_task_address is None:
+            self._init_task_address = _kallsyms_address(
+                program, self._vmcoreinfo, "init_task"
+            )
+        _register_init_task_object(program, self._init_task_address, drgn)
         return program
 
     @contextmanager
