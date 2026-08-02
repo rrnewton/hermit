@@ -1015,6 +1015,26 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "madvise_pageout": (0, b"madvpageout=0\n"),
     "madvise_collapse": (0, b"madvcollapse=-22\n"),
     "membarrier_private": (0, b"membarpriv=0\n"),
+    # Round 51 (setsockopt write-path round-trips + mlockall on-fault). Each
+    # setsockopt_* guest sets a NON-default option value with setsockopt(54) then
+    # reads it back with getsockopt(55) and prints the round-tripped constant;
+    # the kernel echoes exactly what was written, identical native and golden, so
+    # these exercise the setsockopt WRITE path distinct from the read-only
+    # getsockopt guests (IP_TTL/IP_TOS/IP_MULTICAST_TTL/TCP_CORK/IPV6_UNICAST_HOPS
+    # were host-variable or default-only on the read side but round-trip
+    # deterministically once written). mlockall_onfault locks with
+    # MCL_CURRENT|MCL_ONFAULT (a distinct flag combo from mlockall_all) and
+    # releases, returning 0. No time/randomness/PID/host-variable input, so
+    # e9patch preprocessing stays byte-identical to golden ptrace.
+    "setsockopt_priority": (0, b"sopriority=6\n"),
+    "setsockopt_nodelay": (0, b"setnodelay=1\n"),
+    "setsockopt_ipttl": (0, b"setipttl=33\n"),
+    "setsockopt_rcvlowat": (0, b"setrcvlowat=2\n"),
+    "setsockopt_iptos": (0, b"setiptos=8\n"),
+    "setsockopt_ip_multicast_ttl": (0, b"setipmcttl=5\n"),
+    "setsockopt_tcp_cork": (0, b"settcpcork=1\n"),
+    "setsockopt_ipv6_hops": (0, b"setipv6hops=5\n"),
+    "mlockall_onfault": (0, b"mlockonfault=0\n"),
 }
 
 FREESTANDING_FLAGS = (
