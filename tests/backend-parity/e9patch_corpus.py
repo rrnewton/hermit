@@ -1099,6 +1099,22 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "query_module_enosys": (0, b"querymod=-38\n"),
     "get_kernel_syms_enosys": (0, b"getkernelsyms=-38\n"),
     "nfsservctl_enosys": (0, b"nfsservctl=-38\n"),
+    # Round 56 (wrong-arg errno constants, non-socket, distinct errno classes).
+    # Each drives an already-covered syscall into a faithful negative errno via a
+    # bad argument or wrong-type target, on a distinct errno class not otherwise
+    # represented as an error constant: getcwd(79) 1-byte buffer -> -ERANGE(-34);
+    # pread64(17) on a pipe -> -ESPIPE(-29); openat(257) /dev/null O_DIRECTORY ->
+    # -ENOTDIR(-20); memfd_create(319) invalid flags -> -EINVAL(-22); read(0) on a
+    # directory fd -> -EISDIR(-21). Every errno comes from kernel argument
+    # validation, so native==golden (faithful, not a hermit limitation) and the
+    # value is host-independent (independent of the actual cwd/fs layout). These
+    # are ERROR paths distinct from the success-path getcwd_check/pread_past_eof/
+    # open_directory/memfd_create_check guests and from lseek_pipe (lseek ESPIPE).
+    "getcwd_erange": (0, b"getcwderange=-34\n"),
+    "pread_pipe_espipe": (0, b"preadespipe=-29\n"),
+    "open_notdir": (0, b"opennotdir=-20\n"),
+    "memfd_einval": (0, b"memfdeinval=-22\n"),
+    "read_dir_eisdir": (0, b"readeisdir=-21\n"),
 }
 
 FREESTANDING_FLAGS = (

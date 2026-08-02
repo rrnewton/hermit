@@ -2090,6 +2090,36 @@
       "why": "tests/backend-parity/e9patch_corpus/nfsservctl_enosys.c is owned by tests/backend-parity/e9patch_corpus.py: calls the removed nfsservctl(180) syscall, removed from Linux in 3.1, which the kernel returns -ENOSYS(-38) for both natively and under golden ptrace -- a faithful, host-independent constant exercising e9patch's rewritten-SYSCALL dispatch of a removed number to the same ENOSYS as golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getcwd_erange.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getcwd_erange.c is owned by tests/backend-parity/e9patch_corpus.py: calls getcwd(79) with a 1-byte buffer, which the kernel rejects with -ERANGE(-34) because the buffer is too small for the current directory path; the errno is faithful (native==golden) and host-independent, a distinct errno class from the success-path getcwd_check guest, exercising getcwd's ERANGE path under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/pread_pipe_espipe.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/pread_pipe_espipe.c is owned by tests/backend-parity/e9patch_corpus.py: calls pread64(17) on the read end of a pipe, which the kernel rejects with -ESPIPE(-29) because pipes are not seekable; the errno is faithful (native==golden) and host-independent, distinct from pread_past_eof (EOF->0 on a regular file) and lseek_pipe (lseek ESPIPE), exercising pread's ESPIPE path under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/open_notdir.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/open_notdir.c is owned by tests/backend-parity/e9patch_corpus.py: calls openat(257) of /dev/null with O_DIRECTORY, which the kernel rejects with -ENOTDIR(-20) because the path is not a directory; the errno is faithful (native==golden) and host-independent, distinct from open_directory (O_DIRECTORY success) and open_enoent (ENOENT), exercising openat's ENOTDIR path under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/memfd_einval.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/memfd_einval.c is owned by tests/backend-parity/e9patch_corpus.py: calls memfd_create(319) with an all-ones invalid flags word, which the kernel rejects with -EINVAL(-22) because unknown flag bits are set; the errno is faithful (native==golden) and host-independent, distinct from the success-path memfd_create_check guest, exercising memfd_create's EINVAL bad-flags path under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/read_dir_eisdir.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/read_dir_eisdir.c is owned by tests/backend-parity/e9patch_corpus.py: calls read(0) on a directory fd (\"/\" opened O_DIRECTORY), which the kernel rejects with -EISDIR(-21) because directories cannot be read with read(2); the errno is faithful (native==golden) and host-independent, a distinct errno class from every other corpus error guest, exercising read's EISDIR path under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
