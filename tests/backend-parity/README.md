@@ -126,6 +126,19 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `getpriority_identity` | pass / detlog | pass / detlog | pass / guest |
+
+The `getpriority_identity` contract pins Detcore's inert-nice model: the nice
+value is meaningless under the virtualized single-CPU scheduler, so raw
+`getpriority(2)` returns the fixed kernel value `20` (nice 0) for any valid
+`which` regardless of the host, `setpriority(2)` is accepted as an inert no-op
+returning `0`, and a re-read after that write still reports `20` — proving the
+change was virtualized away rather than applied. An invalid `which` still faults
+with `EINVAL`, preserving the Linux boundary. Because a real host would reflect
+the changed nice on the re-read, a native run diverges, and every backend routes
+these determinized syscalls through the same shared Detcore handler, so the guest
+observes an identical, host-independent result across ptrace, DBI, and KVM and
+across the `--verify` double run.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
