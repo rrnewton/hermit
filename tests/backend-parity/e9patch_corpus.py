@@ -870,6 +870,27 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "mmap_32bit": (0, b"map32=1\n"),
     "mprotect_none": (0, b"protnone=0\n"),
     "pkey_alloc_free": (0, b"pkeyalloc=1\n"),
+    # round-44: a path-based *at credential no-op, two more socket options, two more
+    # mmap flags, a netlink socket, a packet-mode pipe, a fcntl I/O-signal op, and
+    # a CPUID-fault query. fchownat_devnull issues a no-op chown(-1,-1) on /dev/null
+    # (-> 0); getsockopt_zerocopy / getsockopt_mark read SO_ZEROCOPY / SO_MARK
+    # defaults (-> 0); mmap_locked / mmap_growsdown map a page with MAP_LOCKED /
+    # MAP_GROWSDOWN (success boolean -> 1, address not printed); socket_netlink
+    # opens an AF_NETLINK/SOCK_RAW socket (success boolean -> 1); pipe2_direct
+    # round-trips two bytes through an O_DIRECT packet pipe (-> hi); fcntl_setsig
+    # sets and reads back the I/O signal SIGUSR1 (-> 10); arch_prctl_getcpuid reads
+    # the CPUID-fault flag (disabled -> 0). Every printed value is a queried
+    # constant with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all nine byte-identical to golden ptrace.
+    "fchownat_devnull": (0, b"fchownat=0\n"),
+    "getsockopt_zerocopy": (0, b"zerocopy=0\n"),
+    "getsockopt_mark": (0, b"mark=0\n"),
+    "mmap_locked": (0, b"maplocked=1\n"),
+    "mmap_growsdown": (0, b"growsdown=1\n"),
+    "socket_netlink": (0, b"netlink=1\n"),
+    "pipe2_direct": (0, b"pd=hi\n"),
+    "fcntl_setsig": (0, b"setsig=10\n"),
+    "arch_prctl_getcpuid": (0, b"getcpuid=0\n"),
 }
 
 FREESTANDING_FLAGS = (
