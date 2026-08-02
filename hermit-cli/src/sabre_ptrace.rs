@@ -32,6 +32,9 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
+use reverie_sabre_stats::SabrePatchRoute;
+use reverie_sabre_stats::SabreSlowPath;
+use reverie_sabre_stats::SabreStats;
 
 const SYSCALL_INSN: [u8; 2] = [0x0f, 0x05];
 // SaBRe's SIGILL handler recognizes this reserved two-byte instruction as a
@@ -117,7 +120,8 @@ struct Supervisor {
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     ready_observed: bool,
-    patched_sites: HashSet<(Pid, usize)>,
+    patched_sites: usize,
+    stats: Option<SabreStats>,
     signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
 }
@@ -129,6 +133,7 @@ impl Supervisor {
         plugin: PathBuf,
         readiness: Arc<AtomicBool>,
         physical_exit_observer: Arc<detcore::GlobalState>,
+        stats: Option<SabreStats>,
     ) -> Self {
         Self {
             root,
@@ -139,7 +144,8 @@ impl Supervisor {
             readiness,
             plugin,
             ready_observed: false,
-            patched_sites: HashSet::new(),
+            patched_sites: 0,
+            stats,
             signal_diagnostics: HashMap::new(),
             physical_exit_observer,
         }
@@ -331,7 +337,7 @@ impl Supervisor {
         }
 
         let status = root_status.ok_or_else(|| anyhow!("SaBRe root tracee disappeared"))?;
-        Ok((status, self.patched_sites.len()))
+        Ok((status, self.patched_sites))
     }
 
     fn set_options(&self, pid: Pid) -> Result<(), Error> {
@@ -358,6 +364,9 @@ impl Supervisor {
         );
         match syscall_info.op {
             libc::PTRACE_SYSCALL_INFO_ENTRY => {
+                if let Some(stats) = &self.stats {
+                    stats.increment_slow_path(SabreSlowPath::PtraceSyscallEntry);
+                }
                 let mut regs = ptrace::getregs(pid)?;
                 let site = regs
                     .rip
@@ -383,7 +392,15 @@ impl Supervisor {
                     ptrace::setregs(pid, regs)?;
                     self.states.entry(pid).or_default().pending_patch =
                         Some(PendingPatch { site, syscall });
-                    self.patched_sites.insert((pid, site));
+                    self.patched_sites += 1;
+                    if let Some(stats) = &self.stats {
+                        stats.record_patch(
+                            site as u64,
+                            SYSCALL_INSN.len() as u8,
+                            SabrePatchRoute::PtraceInstalledMarker,
+                        );
+                        stats.increment_slow_path(SabreSlowPath::PtraceRawSyscallRedirect);
+                    }
                     tracing::debug!(
                         target: "hermit::sabre::fallback",
                         tid = pid.as_raw(),
@@ -393,6 +410,9 @@ impl Supervisor {
                 }
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
+                if let Some(stats) = &self.stats {
+                    stats.increment_slow_path(SabreSlowPath::PtraceSyscallExit);
+                }
                 if let Some(pending) = self.states.entry(pid).or_default().pending_patch.take() {
                     let mut regs = ptrace::getregs(pid)?;
                     regs.rax = pending.syscall;
@@ -604,6 +624,7 @@ pub async fn run(
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
     capture_output: bool,
+    stats: Option<SabreStats>,
 ) -> Result<Output, Error> {
     if capture_output {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -623,7 +644,14 @@ pub async fn run(
     ptrace::detach(root, Some(Signal::SIGSTOP))
         .context("failed to hand SaBRe tracee to supervisor worker")?;
     tokio::task::spawn_blocking(move || {
-        run_blocking(child, sabre, plugin, readiness, physical_exit_observer)
+        run_blocking(
+            child,
+            sabre,
+            plugin,
+            readiness,
+            physical_exit_observer,
+            stats,
+        )
     })
     .await
     .context("SaBRe ptrace supervisor task panicked")?
@@ -659,6 +687,7 @@ fn run_blocking(
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    stats: Option<SabreStats>,
 ) -> Result<Output, Error> {
     let root = Pid::from_raw(child.id() as i32);
     let stdout = child.stdout.take();
@@ -667,7 +696,15 @@ fn run_blocking(
 
     let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
     let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
-    let supervised = Supervisor::new(root, sabre, plugin, readiness, physical_exit_observer).run();
+    let supervised = Supervisor::new(
+        root,
+        sabre,
+        plugin,
+        readiness,
+        physical_exit_observer,
+        stats,
+    )
+    .run();
     if supervised.is_err() {
         let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
     }

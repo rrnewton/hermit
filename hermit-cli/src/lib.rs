@@ -28,9 +28,11 @@ mod record;
 mod recorder;
 mod replay;
 mod replayer;
+#[cfg(feature = "sabre")]
 mod sabre_ptrace;
 mod script;
 
+#[cfg(any(feature = "sabre", test))]
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -39,14 +41,20 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", test))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(any(feature = "sabre", test))]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(feature = "sabre", test))]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(feature = "sabre", test))]
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "sabre")]
 use std::sync::atomic::AtomicBool;
+#[cfg(any(feature = "sabre", test))]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -87,7 +95,10 @@ pub use id::Id;
 use metadata::Metadata;
 use record::Record;
 use replay::Replay;
+#[cfg(feature = "sabre")]
+use reverie::BackendStatsRequest;
 pub use reverie::ExitStatus;
+#[cfg(feature = "sabre")]
 use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
@@ -719,14 +730,17 @@ fn dbi_unavailable_reason() -> Option<String> {
     Some("DBI support was not included in this build".to_owned())
 }
 
+#[cfg(any(feature = "sabre", test))]
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
 
+#[cfg(any(feature = "sabre", test))]
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+#[cfg(any(feature = "sabre", test))]
 fn resolve_sabre_binary_from(
     override_path: Option<&OsStr>,
     packaged_path: Option<&Path>,
@@ -783,6 +797,7 @@ fn resolve_sabre_binary_from(
     ))
 }
 
+#[cfg(feature = "sabre")]
 fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     let executable =
         std::env::current_exe().context("failed to locate running Hermit executable")?;
@@ -797,19 +812,24 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     )
 }
 
+#[cfg(any(feature = "sabre", test))]
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+#[cfg(feature = "sabre")]
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
+#[cfg(any(feature = "sabre", test))]
 struct StagedSabreProgram {
     path: PathBuf,
 }
 
+#[cfg(any(feature = "sabre", test))]
 impl Drop for StagedSabreProgram {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(any(feature = "sabre", test))]
 fn sabre_program_needs_neutral_name(program: &Path) -> bool {
     program
         .file_name()
@@ -818,6 +838,7 @@ fn sabre_program_needs_neutral_name(program: &Path) -> bool {
 
 // TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
 // dynamic-loader prefix collision.
+#[cfg(any(feature = "sabre", test))]
 fn stage_sabre_program_in(
     program: &Path,
     staging_directory: &Path,
@@ -859,6 +880,7 @@ fn stage_sabre_program_in(
 }
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+#[cfg(feature = "sabre")]
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
         && path.is_file()
@@ -904,8 +926,10 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
+#[cfg(feature = "sabre")]
 const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[cfg(any(feature = "sabre", test))]
 async fn wait_for_sabre_rpc_disconnects<T>(
     global: &Arc<T>,
     timeout: Duration,
@@ -931,6 +955,7 @@ async fn wait_for_sabre_rpc_disconnects<T>(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
+#[cfg(any(feature = "sabre", test))]
 async fn stop_sabre_rpc_server<E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
 ) -> Result<(), Error>
@@ -948,6 +973,7 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
+#[cfg(any(feature = "sabre", test))]
 async fn shutdown_sabre_rpc<T, E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
     global: &Arc<T>,
@@ -990,6 +1016,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// the single GlobalState held by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
+#[cfg(feature = "sabre")]
 async fn run_sabre(
     mut command: Command,
     config: DetConfig,
@@ -997,6 +1024,12 @@ async fn run_sabre(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    let stats_request = BackendStatsRequest::new(tracing::enabled!(
+        target: "hermit::backend_stats",
+        tracing::Level::INFO
+    ));
+    let stats = reverie_sabre_stats::SabreStats::create(stats_request)
+        .context("failed to create SaBRe backend statistics channel")?;
     let sabre = resolve_sabre_binary()?;
     let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
@@ -1033,6 +1066,13 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove(reverie_sabre_stats::BACKEND_STATS_ENV);
+    if let Some(stats) = &stats {
+        command.env(
+            reverie_sabre_stats::BACKEND_STATS_ENV,
+            stats.raw_fd().to_string(),
+        );
+    }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
 
@@ -1051,6 +1091,7 @@ async fn run_sabre(
         fallback_ready,
         global.clone(),
         capture_output,
+        stats.clone(),
     )
     .await
     {
@@ -1082,6 +1123,16 @@ async fn run_sabre(
     };
 
     shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await?;
+    if let Some(stats) = stats.as_ref()
+        && let Some(snapshot) = stats_request.collect(stats)
+    {
+        tracing::info!(
+            target: "hermit::backend_stats",
+            backend = "sabre",
+            stats = %snapshot,
+            "backend run complete",
+        );
+    }
     let mut global = Arc::try_unwrap(global).map_err(|global| {
         anyhow!(
             "SaBRe coordinator stopped with {} live RPC reference(s)",
@@ -1513,15 +1564,23 @@ async fn run_with_backend_inner(
         }
     }
     if backend == Backend::Sabre {
-        return Ok(run_sabre(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            false,
-        )
-        .await?
-        .status);
+        #[cfg(feature = "sabre")]
+        {
+            return Ok(run_sabre(
+                command,
+                config,
+                print_summary,
+                print_summary_to_json_file,
+                false,
+            )
+            .await?
+            .status);
+        }
+        #[cfg(not(feature = "sabre"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("SaBRe availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
@@ -1619,17 +1678,25 @@ async fn run_with_output_backend_inner(
         }
     }
     if backend == Backend::Sabre {
-        command.stdin(output_backend_stdin()?);
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        return run_sabre(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            true,
-        )
-        .await;
+        #[cfg(feature = "sabre")]
+        {
+            command.stdin(output_backend_stdin()?);
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+            return run_sabre(
+                command,
+                config,
+                print_summary,
+                print_summary_to_json_file,
+                true,
+            )
+            .await;
+        }
+        #[cfg(not(feature = "sabre"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("SaBRe availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Liteinst {
         command.stdin(output_backend_stdin()?);

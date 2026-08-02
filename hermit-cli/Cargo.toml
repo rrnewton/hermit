@@ -20,7 +20,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 dbi = ["dep:detcore-dbi", "dep:reverie-dbi"]
-sabre = []
+sabre = ["dep:reverie-sabre-stats"]
 e9patch = []
 third-party-backends = ["dbi", "sabre", "e9patch"]
 
@@ -57,6 +57,7 @@ reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.gi
 reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90" }
 reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90", default-features = false }
 reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90" }
+reverie-sabre-stats = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
