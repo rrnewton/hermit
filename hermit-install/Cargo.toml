@@ -10,4 +10,4 @@ publish = false
 path = "src/lib.rs"
 
 [build-dependencies]
-reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d3ed343eaff599b7cd390ee89bf1bf3902877786", default-features = false }
+reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "456b628bc361c16faa6393942714ec6ca40af846", default-features = false }
