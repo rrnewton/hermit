@@ -17,43 +17,53 @@ readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
 # --- Argument parsing -------------------------------------------------------
-# Usage: ./validate.sh [quick|portable-only|full|super] [options]
-# Default (no level): run the full validation suite, which also prints the
-# working-envelope vector at the end. VALIDATE_LEVEL may select the same level.
-#   quick        Core ptrace run/verify/record smoke tests; no alternate backends.
-#   portable-only  Portable build, test, lint, format, and documentation gates
-#                matching GitHub-managed portable CI; no PMU or namespace requirements.
-#   full         Everything in quick plus the complete suite and DBI/KVM gates.
-#   super        Repeat stress probes (20x by default) under moderate
-#                oversubscription and report a pass rate for every probe.
-#   --quick      Alias for the quick level.
-#   --portable     Alias for the portable-only level.
-#
-# The envelope path is factored out so CI
-# can call the *identical* measurement code and produce matching numbers:
-#   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
-#   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
-#                                            # regressed below FILE's baseline
-#   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix;
-#                                            # STRICT_COMPAT_HERMIT_BIN reuses
-#                                            # an existing executable
-#   ./validate.sh --portable-strict-compat-only # portable L2 matrix with bounded diagnostics
-#   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
-#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix;
-#                                            # needs executable HERMIT_SABRE_BINARY
-#   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
-#   ./validate.sh --liteinst-compat-only      # run the portable CI liteinst_strict test
-#   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
-#   ./validate.sh --portable-only               # no PMU/CPUID hardware required
-#   ./validate.sh --privileged-only             # PMU/CPUID-dependent tests only
-#   ./validate.sh --verbose                  # stream each gate's command, PID,
-#                                            # elapsed time, and subprocess output
-# Every foreground/background gate has a process-tree timeout. Override the
-# profile default with VALIDATE_GATE_TIMEOUT_SECONDS; tune TERM-to-KILL grace
-# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS.
-# A fully-green full run labels the current PR `locally-validated` by default.
-# PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
-# VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
+function usage {
+    cat <<'EOF'
+Usage: ./validate.sh [PROFILE] [OPTIONS]
+
+Run Hermit's validation suite. The default profile is --full.
+
+Profiles (choose one):
+  --quick, quick
+      Core ptrace run, verify, record, and replay smoke tests.
+  --portable, --portable-only, portable-only
+      GitHub-managed portable CI gates; no PMU or namespaces required.
+  --full, full
+      Portable and privileged CI gates, including available alternate backends.
+  --super, super
+      Full stress and diagnostic probes with repeated determinism checks.
+
+Focused profiles (choose one, without a profile above):
+  --strict-compat-only           Blocking L2 application matrix
+  --portable-strict-compat-only  Portable L2 matrix with bounded diagnostics
+  --rr-compat-only               Known-passing record/replay matrix
+  --sabre-compat-only            SaBRe compatibility matrix
+  --e9patch-compat-only          e9patch compatibility matrix
+  --liteinst-compat-only         LiteInst strict compatibility test
+  --qemu-l2-only                 Heavyweight QEMU L2 boot test
+  --privileged-only              PMU, CPUID, and KVM-dependent gates
+  --envelope-only                Measure and print the working envelope
+  --envelope-compare FILE        Measure and compare with a baseline JSON file
+
+Options:
+  --verbose                      Stream commands, timing, and subprocess output
+  --label-pr                     Label a fully green full-profile PR (default)
+  --no-label-pr                  Do not label the current PR
+  -h, --help                     Show this help and exit
+
+Backend availability is detected automatically. Unavailable KVM and DBI gates
+are reported as skipped.
+
+Examples:
+  ./validate.sh --full
+  ./validate.sh --portable --no-label-pr
+  ./validate.sh --liteinst-compat-only --verbose
+  STRICT_COMPAT_HERMIT_BIN=./target/release/hermit \
+    ./validate.sh --strict-compat-only
+  ./validate.sh --envelope-compare target/envelope-baseline.json
+EOF
+}
+
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | super
@@ -102,6 +112,12 @@ while [[ $# -gt 0 ]]; do
         --portable|--portable-only)
             select_validation_level portable-only
             shift ;;
+        --full)
+            select_validation_level full
+            shift ;;
+        --super)
+            select_validation_level super
+            shift ;;
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
         --envelope-compare)
             ENVELOPE_MODE="only"; ENVELOPE_BASELINE=${2:-}
@@ -124,7 +140,7 @@ while [[ $# -gt 0 ]]; do
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
         -h|--help)
-            grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            usage; exit 0 ;;
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
