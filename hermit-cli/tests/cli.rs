@@ -716,6 +716,18 @@ fn run_liteinst_verifies_detcore_backend() {
         ),
         "{stderr}"
     );
+    for field in [
+        "LiteInst instrumentation stats: distinct_rips_patched=",
+        "cacheline_straddlers=",
+        "non_straddling=",
+        "instruction_lengths[5+=",
+        "straddle_prefix[1=",
+    ] {
+        assert!(
+            stderr.contains(field),
+            "missing instrumentation field {field:?}: {stderr}"
+        );
+    }
     assert!(
         stderr.contains("Success: deterministic. Determinism verified."),
         "{stderr}"
