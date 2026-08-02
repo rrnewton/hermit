@@ -153,6 +153,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "sched_getaffinity_identity": (
+                REPOSITORY / "tests/c/sched_getaffinity_identity.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -261,6 +265,11 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "sched_getaffinity_identity": (
+            [str(fixtures.binary("sched_getaffinity_identity"))],
+            0,
+            b"sched-getaffinity-identity-ok\n",
         ),
     }
 

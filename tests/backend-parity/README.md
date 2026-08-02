@@ -127,6 +127,21 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `sched_getaffinity_identity` | pass / detlog | pass / detlog | pass / guest |
+
+The `sched_getaffinity_identity` contract pins Detcore's `sched_getaffinity(2)`
+determinization. Detcore virtualizes a single logical CPU, so it suppresses the
+host affinity mask and reports a fixed cpuset containing only CPU 0, returning a
+constant 16-byte (`VIRTUAL_CPUSET_BYTES`) cpumask size regardless of the host's
+real CPU count. The guest poisons its mask buffer with a sentinel and issues the
+raw `SYS_sched_getaffinity` syscall (never glibc's wrapper, which post-processes
+the kernel result) repeatedly, asserting on every call that the return value is
+the virtualized `16`, that CPU 0 is the only bit set, and that no other mask byte
+is nonzero. A native run returns the kernel's real cpumask size and a mask
+reflecting the host's many CPUs, so it diverges — proving the fixture pins a
+genuine determinization. Because the constant is produced by the shared Detcore
+handler, the answer is identical across ptrace, DBI, and KVM and across the
+`--verify` double run.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
