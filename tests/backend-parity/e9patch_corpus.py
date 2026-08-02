@@ -1067,6 +1067,21 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "getsockopt_so_protocol_tcp": (0, b"soprotocol_tcp=6\n"),
     "getsockopt_so_protocol_udp": (0, b"soprotocol_udp=17\n"),
     "getsockopt_so_type_dgram": (0, b"sotype_dgram=2\n"),
+    # Round 54 (socket-syscall ERROR-path constants). Each drives a socket
+    # operation into a faithful Linux errno on a socket in the wrong state:
+    # getpeername/shutdown on an unconnected socket -> -ENOTCONN(-107), accept on
+    # a non-listening socket -> -EINVAL(-22), listen on a dgram socket ->
+    # -EOPNOTSUPP(-95). getsockname_family reads AF_INET(2) from an unbound socket.
+    # Every value is host-independent and native==golden (faithful error parity,
+    # not a hermit limitation), so e9patch preprocessing stays byte-identical to
+    # golden ptrace. These are ERROR paths distinct from the success-path AF_UNIX
+    # getpeername_unix/getsockname_unix/shutdown_socketpair/accept_abstract/
+    # listen_abstract guests.
+    "getpeername_unconnected": (0, b"getpeername=-107\n"),
+    "shutdown_unconnected": (0, b"shutdownunc=-107\n"),
+    "accept_nonlisten": (0, b"acceptnolis=-22\n"),
+    "listen_dgram": (0, b"listendgram=-95\n"),
+    "getsockname_family": (0, b"gsnfamily=2\n"),
 }
 
 FREESTANDING_FLAGS = (

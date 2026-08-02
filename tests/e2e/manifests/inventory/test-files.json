@@ -2030,6 +2030,36 @@
       "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_type_dgram.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_DGRAM socket and reads its socket type with getsockopt(55) SO_TYPE(3) at SOL_SOCKET(1), printing SOCK_DGRAM(2), a distinct socket type and return value from the existing AF_UNIX/SOCK_STREAM getsockopt_socktype guest which returns 1. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getpeername_unconnected.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getpeername_unconnected.c is owned by tests/backend-parity/e9patch_corpus.py: calls getpeername(52) on a fresh unconnected AF_INET/SOCK_STREAM socket which has no peer, so the kernel returns -ENOTCONN(-107) both natively and under golden ptrace; the ERROR path distinct from the success-path getpeername_unix guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/shutdown_unconnected.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/shutdown_unconnected.c is owned by tests/backend-parity/e9patch_corpus.py: calls shutdown(48) SHUT_RDWR on a fresh unconnected AF_INET/SOCK_STREAM socket which is not connected, so the kernel returns -ENOTCONN(-107) both natively and under golden ptrace; the ERROR path distinct from the success-path shutdown_socketpair guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/accept_nonlisten.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/accept_nonlisten.c is owned by tests/backend-parity/e9patch_corpus.py: calls accept(43) on a fresh AF_INET/SOCK_STREAM socket that is not listening, so the kernel returns -EINVAL(-22) both natively and under golden ptrace; the ERROR path distinct from the success-path accept_abstract and accept4_abstract guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/listen_dgram.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/listen_dgram.c is owned by tests/backend-parity/e9patch_corpus.py: calls listen(50) on an AF_INET/SOCK_DGRAM socket which does not support listening, so the kernel returns -EOPNOTSUPP(-95) both natively and under golden ptrace; the ERROR path distinct from the success-path listen_abstract guest on a stream socket. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockname_family.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockname_family.c is owned by tests/backend-parity/e9patch_corpus.py: calls getsockname(51) on a fresh unbound AF_INET/SOCK_STREAM socket and reads the returned sockaddr address family AF_INET(2), a host-independent constant distinct from the AF_UNIX success-path getsockname_unix guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
