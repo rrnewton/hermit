@@ -712,7 +712,7 @@ fn run_liteinst_verifies_detcore_backend() {
     let stderr = stderr(&output);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
         ),
         "{stderr}"
     );
@@ -722,8 +722,12 @@ fn run_liteinst_verifies_detcore_backend() {
     );
     assert!(
         stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+            "LiteInst in-guest Tool (reverie-liteinst runtime + coordinator GlobalTool RPC)"
         ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Detcore Tool active in ptrace host"),
         "{stderr}"
     );
 }

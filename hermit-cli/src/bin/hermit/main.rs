@@ -124,7 +124,7 @@ fn liteinst_activation_probe() -> Option<ExitStatus> {
         "hermit-liteinst-activation calls={LITEINST_ACTIVATION_CALLS} traps={traps} hooks={hooks}"
     );
     Some(ExitStatus::Exited(i32::from(
-        traps != 1 || hooks != LITEINST_ACTIVATION_CALLS - 1,
+        traps != 1 || hooks != LITEINST_ACTIVATION_CALLS,
     )))
 }
 

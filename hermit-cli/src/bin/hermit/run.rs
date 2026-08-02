@@ -1478,7 +1478,7 @@ impl RunOpts {
             &None,
             Backend::Liteinst,
         )?;
-        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
+        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=32\n";
         if output.status != ExitStatus::Exited(0) || output.stdout != expected {
             anyhow::bail!(
                 "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
@@ -1573,7 +1573,7 @@ impl RunOpts {
         if backend == Backend::Liteinst {
             self.verify_liteinst_activation()?;
             eprintln!(
-                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+                "hermit: [liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
             );
         }
 
@@ -2234,9 +2234,9 @@ impl RunOpts {
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
-            Backend::Liteinst => {
-                Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
-            }
+            Backend::Liteinst => Some(
+                "LiteInst in-guest Tool (reverie-liteinst runtime + coordinator GlobalTool RPC)",
+            ),
             _ => None,
         };
         if let Some(backend_banner) = backend_banner {
