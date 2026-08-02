@@ -851,6 +851,25 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "setsockopt_broadcast": (0, b"setbroadcast=0\n"),
     "madvise_cold": (0, b"madvcold=0\n"),
     "listxattr_devnull": (0, b"listxattr=0\n"),
+    # round-43: a file-time call, an OFD-lock SET path, two more socket options, an
+    # mmap flag, a protection transition, and a memory-protection-key pair.
+    # utimensat_memfd sets a memfd's timestamps to now (return 0, times not read
+    # back); fcntl_ofd_setlk_memfd clears a whole-file OFD lock (F_OFD_SETLK with
+    # F_UNLCK -> 0); getsockopt_timestampns reads SO_TIMESTAMPNS (off -> 0);
+    # getsockopt_busy_poll reads SO_BUSY_POLL (0 -> 0); mmap_32bit maps a page with
+    # MAP_32BIT (success boolean -> 1, address not printed); mprotect_none drops a
+    # page to PROT_NONE then restores PROT_READ (-> 0); pkey_alloc_free allocates
+    # and frees a protection key (success boolean -> 1, key index not printed).
+    # Every printed value is a constant with no time, randomness, PID, or
+    # host-variable input, so e9patch preprocessing must leave all seven
+    # byte-identical to golden ptrace.
+    "utimensat_memfd": (0, b"utimens=0\n"),
+    "fcntl_ofd_setlk_memfd": (0, b"ofdsetlk=0\n"),
+    "getsockopt_timestampns": (0, b"timestampns=0\n"),
+    "getsockopt_busy_poll": (0, b"busypoll=0\n"),
+    "mmap_32bit": (0, b"map32=1\n"),
+    "mprotect_none": (0, b"protnone=0\n"),
+    "pkey_alloc_free": (0, b"pkeyalloc=1\n"),
 }
 
 FREESTANDING_FLAGS = (
