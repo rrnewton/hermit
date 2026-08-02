@@ -722,7 +722,11 @@ fn run_liteinst_verifies_detcore_backend() {
         "LiteInst instrumentation stats: distinct_rips_patched=",
         "cacheline_straddlers=",
         "non_straddling=",
-        "instruction_lengths[5+=",
+        "paths[first_site_sigsys=",
+        "ptrace_installation=",
+        "unpatchable_or_other=",
+        "direct_hook=",
+        "instruction_lengths[1=",
         "straddle_prefix[1=",
     ] {
         assert!(

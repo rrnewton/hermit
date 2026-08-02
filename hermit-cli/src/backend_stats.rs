@@ -65,37 +65,6 @@ impl BackendStatsSource for PtraceStatsSource {
     }
 }
 
-pub(crate) struct LiteinstStatsSource<'a> {
-    stats: &'a reverie_liteinst::LiteinstInstrumentationStats,
-}
-
-impl<'a> LiteinstStatsSource<'a> {
-    pub(crate) const fn new(stats: &'a reverie_liteinst::LiteinstInstrumentationStats) -> Self {
-        Self { stats }
-    }
-}
-
-pub(crate) struct LiteinstStatsSnapshot<'a> {
-    stats: &'a reverie_liteinst::LiteinstInstrumentationStats,
-}
-
-impl fmt::Display for LiteinstStatsSnapshot<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.stats.fmt(formatter)
-    }
-}
-
-impl BackendStatsSnapshot for LiteinstStatsSnapshot<'_> {
-    const BACKEND_NAME: &'static str = "liteinst";
-}
-
-impl<'a> BackendStatsSource for LiteinstStatsSource<'a> {
-    type Snapshot = LiteinstStatsSnapshot<'a>;
-
-    fn backend_stats(&self) -> Self::Snapshot {
-        LiteinstStatsSnapshot { stats: self.stats }
-    }
-}
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
