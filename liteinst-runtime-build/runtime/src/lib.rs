@@ -10,7 +10,7 @@
 
 #![deny(missing_docs)]
 
-// TODO-HUMAN-REVIEW(PR-liteinst-multiproc-inguest): Trigger 2 — this constructor
+// TODO-HUMAN-REVIEW(PR-1429): Trigger 2 - this constructor
 // moves the Detcore Tool from the ptrace host into the instrumented guest.
 /// Installs one process-local `Detcore` Tool when the LiteInst coordinator is active.
 ///
