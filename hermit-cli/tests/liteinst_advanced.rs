@@ -274,7 +274,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
         ),
         "{stderr}"
     );
@@ -290,7 +290,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     );
     assert!(
         stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+            "LiteInst in-guest Tool (reverie-liteinst runtime + coordinator GlobalTool RPC)"
         ),
         "{stderr}"
     );
@@ -311,6 +311,16 @@ fn liteinst_detcore_strict_verify_micro_suite() {
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_hides_coordinator_selector() {
+    let output = run_liteinst_strict_verify(Path::new("/usr/bin/env"), &[]);
+    let stdout = String::from_utf8(output.stdout).expect("env output should be UTF-8");
+    assert!(
+        !stdout.contains("REVERIE_LITEINST_COORDINATOR="),
+        "private coordinator selector leaked into the guest: {stdout}"
     );
 }
 
@@ -810,10 +820,7 @@ fn assert_clone_boundary(mode: &str) {
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ENOTSUPP (Operation is not supported)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Operation not supported"), "{stderr}");
     assert!(!stderr.contains("Bad system call"), "{stderr}");
 }
 
@@ -826,13 +833,9 @@ fn liteinst_runtime_library() -> PathBuf {
     liteinst_runtime::liteinst_runtime_library()
 }
 
-/// A bare preload must not create a second in-guest Detcore Tool.
-///
-/// Host mode is selected only by `run_host_with_preload`. Without that private
-/// selector, even a stale legacy coordinator variable must leave the patch DSO
-/// inert and let the program run normally.
+/// A bare preload without a coordinator selector must not create a Detcore Tool.
 #[test]
-fn liteinst_preload_is_inert_without_host_runtime_selector() {
+fn liteinst_preload_is_inert_without_coordinator_selector() {
     let runtime = liteinst_runtime_library();
     assert!(
         runtime.is_file(),
@@ -841,10 +844,7 @@ fn liteinst_preload_is_inert_without_host_runtime_selector() {
     );
 
     let output = Command::new("/bin/true")
-        .env(
-            reverie_liteinst::COORDINATOR_ENV,
-            "/definitely/not/a/coordinator.sock",
-        )
+        .env_remove(reverie_liteinst::COORDINATOR_ENV)
         .env("LD_PRELOAD", &runtime)
         .output()
         .expect("failed to launch /bin/true under the LiteInst preload");
@@ -870,8 +870,8 @@ fn liteinst_thread_clone_fails_closed_without_sigsys() {
 }
 
 #[test]
-fn liteinst_fork_fails_closed_without_hanging() {
-    assert_clone_boundary("fork");
+fn liteinst_fork_process_tree_strict_verify() {
+    assert_liteinst_strict_verify(advanced_guest(), &["fork"], b"fork-ok\n");
 }
 
 #[test]
