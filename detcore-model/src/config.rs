@@ -498,6 +498,23 @@ pub struct Config {
     /// interrupt points specified
     #[clap(long, value_name = "tid:rcbs", value_parser = try_parse_numbers_with_colon)]
     pub interrupt_at: Vec<(DetTid, u64)>,
+
+    /// **Experimental (default off):** Make the schedule depend only on virtual time by charging each
+    /// asynchronous PMU max-timeslice preemption exactly its deterministic armed RCB budget, absorbing
+    /// host-load-dependent counter skid. A retired-conditional-branch counter overflow is *delivered*
+    /// some branches after it fires (delivery skid), so the guest is stopped at `armed + skid` retired
+    /// branches, where `skid` depends on host load. `update_logical_time_rcbs` charges that raw overshoot
+    /// into logical time and records it as a `SchedEvent::branches(delta)`, coupling the
+    /// scheduling-decision sequence to host load: `--strict --verify` of a timer/wall-clock-driven guest
+    /// can diverge under heavy load even though its output is byte-identical. When this option is set, a
+    /// max-timeslice overshoot (`delta_rcbs > armed && last_rcb_timer_is_max`) is clamped to `armed` for
+    /// both logical-time accounting and the recorded schedule, while the committed clock still advances to
+    /// the real position so the skid is absorbed rather than deferred. The timeslice is then exactly
+    /// `armed` RCBs regardless of load. Voluntary boundaries (`delta_rcbs <= armed`) and scheduled
+    /// `interrupt_at` preemptions are deterministic and are charged unchanged. This is a core scheduling
+    /// change gated behind adversarial dual review and owner discussion of the virtual-time model.
+    #[clap(long)]
+    pub deterministic_timeslice: bool,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {

@@ -373,6 +373,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             let dettid = thread_state.dettid;
             assert!(thread_state.committed_clock_value <= clock_value);
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
+
+            // Deterministic-timeslice clamp (default off; --deterministic-timeslice).
+            //
+            // A PMU retired-branch counter overflow is *delivered* some branches after it
+            // fires (delivery skid), so on a max-timeslice preemption the guest is stopped
+            // at `armed + skid` retired branches, where `skid` is host-load-dependent.
+            // Charging that raw overshoot into logical time and recording it as a
+            // `SchedEvent` couples the scheduling-decision sequence to host load, so
+            // `--strict --verify` of a timer/wall-clock-driven guest can diverge under load
+            // even though its output is byte-identical. Clamp a max-timeslice overshoot to
+            // its deterministic armed budget for logical-time accounting and the recorded
+            // schedule; the committed clock still advances to the real position below, so
+            // the skid is absorbed (dropped from vtime) rather than deferred to the next
+            // interval. Only genuine overshoot of the max deadline is clamped: a voluntary
+            // boundary reached early (`delta_rcbs <= armed`) and scheduled `interrupt_at`
+            // preemptions (`last_rcb_timer_is_max == false`) stay exact.
+            let charged_rcbs: u64 = if self.cfg.deterministic_timeslice
+                && self.cfg.use_rcb_time()
+                && precise_timers
+                && thread_state.last_rcb_timer_is_max
+                && let Some(armed) = thread_state.last_rcb_timer
+                && delta_rcbs > armed
+            {
+                armed
+            } else {
+                delta_rcbs
+            };
             if self.cfg.use_rcb_time() {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-1151)
@@ -380,9 +407,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let factor = thread_state.rcb_time_multiplier();
                     thread_state
                         .thread_logical_time
-                        .add_rcbs_with_multiplier(delta_rcbs, factor);
+                        .add_rcbs_with_multiplier(charged_rcbs, factor);
                 } else {
-                    thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+                    thread_state.thread_logical_time.add_rcbs(charged_rcbs);
                 }
             }
             thread_state.account_process_cpu_time();
@@ -426,7 +453,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest,
                     SchedEvent::branches(
                         dettid,
-                        delta_rcbs
+                        charged_rcbs
                             .try_into()
                             .expect("should not have more than 2^32 branches at once"),
                     ),
@@ -437,7 +464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     ev
                 };
 
-                if delta_rcbs > 0 {
+                if charged_rcbs > 0 {
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
                     // since the last branch.
