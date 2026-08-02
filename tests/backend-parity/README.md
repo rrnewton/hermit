@@ -17,17 +17,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 24/24 | 100% |
-| DBI | 23/24 | 96% |
-| KVM | 23/24 | 96% |
+| ptrace | 25/25 | 100% |
+| DBI | 24/25 | 96% |
+| KVM | 24/25 | 96% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 24/24 | DETLOG-bitwise | 100% |
-| DBI | 22/24 | DETLOG-bitwise | 92% |
-| KVM | 22/24 | guest-visible only | 92% |
+| ptrace | 25/25 | DETLOG-bitwise | 100% |
+| DBI | 23/25 | DETLOG-bitwise | 92% |
+| KVM | 23/25 | guest-visible only | 92% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -39,7 +39,7 @@ column is therefore capped at `guest`, never `detlog`. See the L2 subsection
 below for the two contracts that hold at L1 but not L2.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 24/25 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -79,7 +79,7 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
+twenty-four pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, inert scheduler-policy
 queries, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
@@ -127,6 +127,24 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `rlimit_identity` | pass / detlog | pass / detlog | pass / guest |
+
+The `rlimit_identity` contract pins Detcore's virtualized resource-limit model
+over `getrlimit`/`setrlimit`/`prlimit64`. The guest observes its own
+`RLIMIT_NOFILE` hard limit, lowers the soft limit to a value clamped to that
+observed hard limit, reads it straight back, confirms a query-only
+`prlimit64(pid=0)` agrees with what it installed, performs an atomic
+`prlimit64` set+get whose reported old value matches the prior soft limit, and
+raises the soft limit back up to the hard limit. It then confirms the two
+faithful Linux refusals that do not depend on host state: a request with
+soft > hard returns `EINVAL`, and an unprivileged attempt to raise the hard
+limit returns `EPERM`. Every checked value is one the guest just installed or is
+derived from the hard limit it just observed, and no raw host-dependent number
+is printed, so the observable result depends only on the program. Detcore
+virtualizes `RLIMIT_NOFILE` to a fixed per-process value and permits exactly the
+soft-limit lowering, soft-limit raising up to the hard limit, and the two
+refusals this contract exercises, so ptrace, DBI, and KVM all hold it: ptrace
+and DBI at L2 DETLOG-bitwise and KVM at L2 guest-visible.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual

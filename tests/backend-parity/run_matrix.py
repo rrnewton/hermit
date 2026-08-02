@@ -153,6 +153,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "rlimit_identity": (
+                REPOSITORY / "tests/c/rlimit_identity.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -261,6 +265,11 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "rlimit_identity": (
+            [str(fixtures.binary("rlimit_identity"))],
+            0,
+            b"rlimit-identity-ok\n",
         ),
     }
 
