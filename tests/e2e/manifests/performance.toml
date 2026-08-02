@@ -40,6 +40,326 @@ backends_enabled = []
 backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
 
 [[test]]
+id = "performance/dup-close-churn"
+description = "Long-running concurrent descriptor duplication, flag, and close pressure"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/dup-close-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/open-read-close-churn"
+description = "Long-running concurrent device open, read, and close pressure"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/open-read-close-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "sabre"]
+backends_disabled = { kvm = "KVM timed out during concurrent device open, read, and close pressure", liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/socketpair-dgram-churn"
+description = "Long-running concurrent datagram socketpair creation and I/O pressure"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/socketpair-dgram-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/pipe-nonblock-churn"
+description = "Long-running concurrent nonblocking pipe creation and I/O pressure"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/pipe-nonblock-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/getrandom-churn"
+description = "Long-running deterministic getrandom pressure across four threads"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/getrandom-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/clock-query-churn"
+description = "Long-running monotonic and realtime clock query pressure"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/clock-query-churn.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/spin-trylock-contention"
+description = "Long-running spin trylock contention with scheduler yields"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/spin-trylock-contention.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/condvar-signal-baton"
+description = "Long-running condition-variable signal baton between two threads"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/condvar-signal-baton.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/rwlock-mixed-contention"
+description = "Long-running mixed read and write lock contention with yields"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/rwlock-mixed-contention.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
+id = "performance/barrier-yield-rounds"
+description = "Long-running paired barriers with scheduler yields across four threads"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 300
+occasional = false
+program = "tests/e2e/performance/barrier-yield-rounds.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+build = { cflags = ["-pthread"] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+backends_disabled = { liteinst = "LiteInst rejected the threaded profile during initial strict verification" }
+[test.modes.naked]
+ci = false
+backends_enabled = []
+backends_disabled = { native = "Native timing is not a deterministic performance baseline" }
+[test.modes.replay]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Strict verification owns this performance cell", dbi = "Record/replay is unsupported by DBI", kvm = "Record/replay is unsupported by KVM", sabre = "Record/replay is unsupported by SaBRe", liteinst = "Record/replay is unsupported by LiteInst" }
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "Steady-state verification uses the default deterministic scheduler", dbi = "Chaos scheduling is unsupported by DBI", kvm = "Chaos scheduling is unsupported by KVM", sabre = "Chaos scheduling is unsupported by SaBRe", liteinst = "Chaos scheduling is unsupported by LiteInst" }
+[test.modes.custom]
+ci = false
+backends_enabled = []
+backends_disabled = { ptrace = "No custom edge-case arguments are required", dbi = "No custom edge-case arguments are required", kvm = "No custom edge-case arguments are required", sabre = "No custom edge-case arguments are required", liteinst = "No custom edge-case arguments are required" }
+
+[[test]]
 id = "performance/semaphore-baton"
 description = "Long-running semaphore baton with deterministic thread handoffs"
 lane = "privileged"
