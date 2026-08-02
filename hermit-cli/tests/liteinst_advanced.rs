@@ -235,14 +235,64 @@ fn assert_liteinst_stats(
         stderr.contains(&process_field),
         "missing {process_field:?}: {stderr}"
     );
+    let path_reports = stderr
+        .lines()
+        .filter(|line| line.contains("backend run complete backend=liteinst"))
+        .map(|line| {
+            let fields = line
+                .split_once(" paths[")
+                .and_then(|(_, suffix)| suffix.split_once(']'))
+                .map(|(fields, _)| fields)
+                .unwrap_or_else(|| panic!("missing LiteInst path totals: {line}"));
+            let fields = fields.split(',').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 7, "unexpected LiteInst path count: {line}");
+            let mut paths = [0_u64; 7];
+            for (index, (expected_name, field)) in [
+                "first_site_seccomp",
+                "ptrace_installation",
+                "in_guest_sigsys",
+                "in_guest_nested_sigsys",
+                "cacheline_straddler",
+                "unpatchable_or_other",
+                "direct_hook",
+            ]
+            .into_iter()
+            .zip(fields)
+            .enumerate()
+            {
+                let (name, value) = field
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("malformed LiteInst path total {field:?}: {line}"));
+                assert_eq!(
+                    name, expected_name,
+                    "unexpected LiteInst path order: {line}"
+                );
+                paths[index] = value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid LiteInst path total {field:?}: {line}"));
+            }
+            paths
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        path_reports.len(),
+        expected_run_reports,
+        "missing per-run path totals: {stderr}"
+    );
+    for paths in path_reports {
+        // Nested SIGSYS includes Tool-internal RPC/polling syscalls. Its exact
+        // diagnostic count follows scheduler polling, while all other paths
+        // are fixed for this plain-fork fixture.
+        assert!(paths[3] > 0, "missing nested SIGSYS hits: {stderr}");
+        assert_eq!(
+            [paths[0], paths[1], paths[2], paths[4], paths[5], paths[6]],
+            [0, 0, 29, 0, 0, 51],
+            "unexpected LiteInst path totals: {stderr}"
+        );
+    }
     for field in [
         "patch_candidates=",
         "decisions[direct_pun=",
-        "paths[first_site_seccomp=0,ptrace_installation=0,in_guest_sigsys=",
-        "in_guest_nested_sigsys=",
-        "cacheline_straddler=",
-        "unpatchable_or_other=",
-        "direct_hook=",
         "instruction_lengths[1=",
         "straddle_prefix[1=",
     ] {
