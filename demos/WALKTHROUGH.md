@@ -64,8 +64,10 @@ make
 ```
 
 Demos 5-7 require Python 3, QEMU, `qemu-img`, static BusyBox, and the QEMU asset
-tools. Demo 7 additionally requires `drgn` and `readelf`. Check the QEMU side
-without building or downloading anything:
+tools. Demo 7 additionally requires `drgn`, `bpftool`, `gcc`, and `readelf`.
+`bpftool` and `gcc` convert the pinned public kernel's BTF to a cached DWARF
+type object when the installed drgn does not support BTF directly. Check the
+QEMU side without building or downloading anything:
 
 ```bash
 ./demos/lib/qemu-assets.sh --check
