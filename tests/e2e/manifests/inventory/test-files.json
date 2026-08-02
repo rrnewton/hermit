@@ -2000,6 +2000,36 @@
       "why": "tests/backend-parity/e9patch_corpus/setsockopt_ipv6_multicast_hops.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET6/SOCK_DGRAM socket, sets IPV6_MULTICAST_HOPS(18) at IPPROTO_IPV6(41) to 7 with setsockopt(54), reads it back with getsockopt(55) and prints 7, a host-independent constant exercising the setsockopt write path distinct from the read-only getsockopt_ipv6_multicast_hops guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_so_domain_inet.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_domain_inet.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM socket and reads its address family with getsockopt(55) SO_DOMAIN(39) at SOL_SOCKET(1), printing AF_INET(2), a host-independent socket-identity constant not previously covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_so_domain_inet6.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_domain_inet6.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET6/SOCK_STREAM socket and reads its address family with getsockopt(55) SO_DOMAIN(39) at SOL_SOCKET(1), printing AF_INET6(10), a host-independent socket-identity constant not previously covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_so_protocol_tcp.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_protocol_tcp.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_STREAM/IPPROTO_TCP socket and reads its protocol with getsockopt(55) SO_PROTOCOL(38) at SOL_SOCKET(1), printing IPPROTO_TCP(6), a host-independent socket-identity constant not previously covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_so_protocol_udp.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_protocol_udp.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_DGRAM/IPPROTO_UDP socket and reads its protocol with getsockopt(55) SO_PROTOCOL(38) at SOL_SOCKET(1), printing IPPROTO_UDP(17), a host-independent socket-identity constant not previously covered. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_so_type_dgram.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_so_type_dgram.c is owned by tests/backend-parity/e9patch_corpus.py: opens an AF_INET/SOCK_DGRAM socket and reads its socket type with getsockopt(55) SO_TYPE(3) at SOL_SOCKET(1), printing SOCK_DGRAM(2), a distinct socket type and return value from the existing AF_UNIX/SOCK_STREAM getsockopt_socktype guest which returns 1. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
