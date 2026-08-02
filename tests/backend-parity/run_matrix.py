@@ -186,6 +186,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/random_sources.c",
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
+            "signal_disposition": (
+                REPOSITORY / "tests/c/signal_disposition.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "pid_probe": (local / "pid_probe.c", ()),
         }
         source, flags = sources[name]
@@ -284,6 +288,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
         "virtual_pid": ([str(fixtures.binary("pid_probe"))], 0, None),
+        "signal_disposition": (
+            [str(fixtures.binary("signal_disposition"))],
+            0,
+            b"signal-disposition-ok\n",
+        ),
     }
     try:
         return cases[name]
