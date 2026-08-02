@@ -702,6 +702,7 @@ fn run_liteinst_verifies_detcore_backend() {
         "liteinst",
         "--strict",
         "--verify",
+        "--verify-logs",
         "--",
         "/bin/echo",
         "liteinst-cli-ok",
@@ -717,6 +718,7 @@ fn run_liteinst_verifies_detcore_backend() {
         "{stderr}"
     );
     for field in [
+        "backend run complete backend=liteinst",
         "LiteInst instrumentation stats: distinct_rips_patched=",
         "cacheline_straddlers=",
         "non_straddling=",
