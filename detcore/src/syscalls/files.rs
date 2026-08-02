@@ -1470,6 +1470,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Fixed terminal window size reported to the guest for `TIOCGWINSZ` on a
+    /// real terminal. 80x24 is the classic VT100 default. The pixel dimensions
+    /// are reported as zero, which is what a character terminal reports.
+    const DETERMINISTIC_WINSIZE: syscalls::ioctl::Winsize = syscalls::ioctl::Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    /// Canonical cooked-mode terminal attributes reported to the guest for
+    /// `TCGETS` on a real terminal. These are the Linux kernel's standard
+    /// `tty_std_termios` defaults (N_TTY line discipline), so they are exactly
+    /// what a freshly opened terminal reports — faithful, but fixed, so the
+    /// guest's view does not depend on whatever mode a previous host program
+    /// left the terminal in.
+    fn deterministic_termios() -> syscalls::ioctl::Termios {
+        let mut c_cc = [0u8; 19];
+        c_cc[libc::VINTR] = 3; // ^C
+        c_cc[libc::VQUIT] = 28; // ^\
+        c_cc[libc::VERASE] = 127; // DEL
+        c_cc[libc::VKILL] = 21; // ^U
+        c_cc[libc::VEOF] = 4; // ^D
+        c_cc[libc::VMIN] = 1;
+        c_cc[libc::VSTART] = 17; // ^Q
+        c_cc[libc::VSTOP] = 19; // ^S
+        c_cc[libc::VSUSP] = 26; // ^Z
+        c_cc[libc::VREPRINT] = 18; // ^R
+        c_cc[libc::VDISCARD] = 15; // ^O
+        c_cc[libc::VWERASE] = 23; // ^W
+        c_cc[libc::VLNEXT] = 22; // ^V
+        syscalls::ioctl::Termios {
+            c_iflag: libc::ICRNL | libc::IXON,
+            c_oflag: libc::OPOST | libc::ONLCR,
+            c_cflag: libc::B38400 | libc::CS8 | libc::CREAD | libc::HUPCL,
+            c_lflag: libc::ISIG
+                | libc::ICANON
+                | libc::ECHO
+                | libc::ECHOE
+                | libc::ECHOK
+                | libc::ECHOCTL
+                | libc::ECHOKE
+                | libc::IEXTEN,
+            c_line: 0,
+            c_cc,
+        }
+    }
+
     /// ioctl system call
     pub async fn handle_ioctl<G: Guest<Self>>(
         &self,
@@ -1511,6 +1559,40 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
                 return Ok(0);
             }
+        }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1445): Review deterministic terminal geometry.
+        // `TCGETS`/`TIOCGWINSZ` on a real terminal leak host-controlled state into
+        // the guest: `isatty()` succeeds only when the fd is a tty, and `ls`-style
+        // column layout is driven by the terminal's row/column count, so identical
+        // guest input produces different output on an 80- vs 200-column terminal.
+        // We still run the real ioctl (so a non-tty fd correctly fails with ENOTTY
+        // and `isatty()` stays false — `?` propagates that error before any
+        // overwrite), then, on success, replace the returned struct with a fixed
+        // canonical terminal so the guest's view is bitwise-identical across host
+        // terminals and across backends. Non-terminal ioctls fall through to the
+        // ordinary record/replay path below.
+        match call.request() {
+            syscalls::ioctl::Request::TIOCGWINSZ(buf) => {
+                let result = self.record_or_replay(guest, call).await?;
+                if let Some(buf) = buf {
+                    guest
+                        .memory()
+                        .write_value(buf, &Self::DETERMINISTIC_WINSIZE)?;
+                }
+                return Ok(result);
+            }
+            syscalls::ioctl::Request::TCGETS(buf) => {
+                let result = self.record_or_replay(guest, call).await?;
+                if let Some(buf) = buf {
+                    guest
+                        .memory()
+                        .write_value(buf, &Self::deterministic_termios())?;
+                }
+                return Ok(result);
+            }
+            _ => {}
         }
 
         let result = self.record_or_replay(guest, call).await?;
