@@ -29,7 +29,11 @@ unsafe extern "C" fn initialize() {
     // Keep the selector available to fork children. Exec remains fail-closed
     // until a lifecycle supervisor can rebootstrap the replacement image.
     if let Err(error) = unsafe {
-        reverie_liteinst::install_tool::<detcore::Detcore>(socket)
+        // This runtime currently rejects application-created threads, and
+        // Hermit schedules at most one guest thread at a time. Preserve that
+        // invariant when thread lifecycle support is added: otherwise this
+        // constructor must select the concurrent publication entry point.
+        reverie_liteinst::install_tool_quiescent::<detcore::Detcore>(socket)
     } {
         eprintln!("hermit-liteinst-runtime: initialization failed: {error}");
         unsafe { libc::_exit(127) };
