@@ -191,6 +191,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "numa_node_identity": (
+                REPOSITORY / "tests/c/numa_node_identity.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -292,6 +296,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "numa_node_identity": (
+            [str(fixtures.binary("numa_node_identity"))],
+            0,
+            b"numa-node-identity-ok\n",
         ),
     }
     try:
