@@ -1562,6 +1562,60 @@
       "why": "tests/backend-parity/e9patch_corpus/setsockopt_sndbuf.c is owned by tests/backend-parity/e9patch_corpus.py: sets SO_SNDBUF on a fresh AF_INET/SOCK_STREAM socket with setsockopt(54) then reads it back with getsockopt(55); the kernel-adjusted buffer size is host-variable so only the boolean readback-greater-than-zero (1) is printed, a host-independent constant, distinct from the query-only getsockopt_sndbuf guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_nodelay.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_nodelay.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_NODELAY with getsockopt(55) at the IPPROTO_TCP(6) protocol level on a fresh AF_INET/SOCK_STREAM socket; Nagle batching is enabled by default so the queried flag is 0, a fixed kernel default with no time, randomness, PID, or host input, exercising a new option-level dimension distinct from every prior SOL_SOCKET getsockopt guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_cork.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_cork.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_CORK at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh stream socket; output corking is off by default so the queried flag is 0, a host-independent constant distinct from the TCP_NODELAY guest and from all SOL_SOCKET socket-option guests, probing the corking control at the transport protocol level. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_keepcnt.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_keepcnt.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_KEEPCNT at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh stream socket; the default number of unacknowledged keepalive probes before a dead peer is declared is the fixed kernel constant 9, a host-independent value distinct from the boolean TCP flags and from every SOL_SOCKET guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_keepintvl.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_keepintvl.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_KEEPINTVL at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh stream socket; the default interval in seconds between keepalive probes is the fixed kernel constant 75, a host-independent value probing keepalive timing distinct from the TCP_KEEPCNT count guest and from SOL_SOCKET guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_syncnt.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_syncnt.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_SYNCNT at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh stream socket; the default number of SYN retransmits for an active connect is the fixed kernel constant 6, a host-independent value probing connection-establishment retries distinct from the keepalive-family guests and from SOL_SOCKET guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_maxseg.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_tcp_maxseg.c is owned by tests/backend-parity/e9patch_corpus.py: reads TCP_MAXSEG at the IPPROTO_TCP(6) level with getsockopt(55) on a fresh unconnected stream socket; before a route is bound the advertised maximum segment size is the fixed default 536 (IPv4 minimum-MTU MSS), a host-independent constant probing the MSS control distinct from the timing and boolean TCP guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_ip_mtudiscover.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_ip_mtudiscover.c is owned by tests/backend-parity/e9patch_corpus.py: reads IP_MTU_DISCOVER at the IPPROTO_IP(0) level with getsockopt(55) on a fresh AF_INET/SOCK_STREAM socket; the default path-MTU-discovery mode is IP_PMTUDISC_WANT(1), a fixed kernel constant exercising the IPv4 network-layer option level, a dimension distinct from the transport IPPROTO_TCP guests and the SOL_SOCKET guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_ipv6_v6only.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_ipv6_v6only.c is owned by tests/backend-parity/e9patch_corpus.py: reads IPV6_V6ONLY at the IPPROTO_IPV6(41) level with getsockopt(55) on a fresh AF_INET6/SOCK_STREAM socket; dual-stack operation is the default so the flag is 0, a host-independent constant exercising the IPv6 network-layer option level distinct from the IPv4 IP_MTU_DISCOVER guest and all IPPROTO_TCP/SOL_SOCKET guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getsockopt_ipv6_hops.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getsockopt_ipv6_hops.c is owned by tests/backend-parity/e9patch_corpus.py: reads IPV6_UNICAST_HOPS at the IPPROTO_IPV6(41) level with getsockopt(55) on a fresh AF_INET6/SOCK_STREAM socket; the default unicast hop limit is the fixed kernel constant 64, a host-independent value probing the IPv6 hop-limit control distinct from the IPV6_V6ONLY boolean guest and from all IPv4/transport option guests. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/sched_yield_noop.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
