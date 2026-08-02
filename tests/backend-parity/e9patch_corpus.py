@@ -1054,6 +1054,19 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "setsockopt_ip_multicast_loop": (0, b"setipmcloop=0\n"),
     "setsockopt_ipv6_multicast_loop": (0, b"setv6mcloop=0\n"),
     "setsockopt_ipv6_multicast_hops": (0, b"setv6mchops=7\n"),
+    # Round 53 (socket-identity getsockopt constants). Each reads a fixed property
+    # of the socket itself (address family, protocol, or type) with getsockopt(55)
+    # at SOL_SOCKET(1). SO_DOMAIN and SO_PROTOCOL are options not previously
+    # covered; getsockopt_so_type_dgram exercises SO_TYPE on an AF_INET dgram
+    # socket returning SOCK_DGRAM(2), a distinct socket type and return value from
+    # the existing AF_UNIX/SOCK_STREAM getsockopt_socktype guest. Every value is a
+    # host-independent constant, so e9patch preprocessing stays byte-identical to
+    # golden ptrace.
+    "getsockopt_so_domain_inet": (0, b"sodomain_inet=2\n"),
+    "getsockopt_so_domain_inet6": (0, b"sodomain_inet6=10\n"),
+    "getsockopt_so_protocol_tcp": (0, b"soprotocol_tcp=6\n"),
+    "getsockopt_so_protocol_udp": (0, b"soprotocol_udp=17\n"),
+    "getsockopt_so_type_dgram": (0, b"sotype_dgram=2\n"),
 }
 
 FREESTANDING_FLAGS = (
