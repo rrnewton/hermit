@@ -182,8 +182,12 @@ jobs:
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
+          test -f target/debug/libdetcore_dbi.so
+          test -d target/install_pkg
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
+            target/debug/libdetcore_dbi.so \
+            target/install_pkg \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
