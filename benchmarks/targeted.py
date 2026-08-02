@@ -23,6 +23,13 @@ BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
 BACKEND_NAMES = ("native", "ptrace", "dbi", "liteinst", "kvm")
+BACKEND_LABELS = {
+    "native": "Native",
+    "ptrace": "Ptrace",
+    "dbi": "DBI",
+    "liteinst": "LiteInst",
+    "kvm": "KVM",
+}
 
 
 class BenchmarkError(RuntimeError):
@@ -411,6 +418,10 @@ def format_mode(mode: dict[str, object], native: bool) -> str:
 def render_summary(results: dict[str, object]) -> str:
     configuration = results["configuration"]
     assert isinstance(configuration, dict)
+    header = [
+        "Benchmark",
+        *(f"{BACKEND_LABELS[name]} median" for name in BACKEND_NAMES),
+    ]
     rows = [
         "# Targeted Hermit backend benchmark results",
         "",
@@ -420,8 +431,8 @@ def render_summary(results: dict[str, object]) -> str:
         f"(+ {configuration['warmups']} warmup per available backend)",
         "Hermit modes: strict, log=error, relaxations=none",
         "",
-        "| Benchmark | Native median | Ptrace median | DBI median | KVM median |",
-        "| --- | ---: | ---: | ---: | ---: |",
+        "| " + " | ".join(header) + " |",
+        "| --- |" + " ---: |" * len(BACKEND_NAMES),
     ]
     benchmarks = results["benchmarks"]
     assert isinstance(benchmarks, list)
@@ -441,10 +452,7 @@ def render_summary(results: dict[str, object]) -> str:
                 failures.append(
                     f"- {benchmark['name']} / {backend}: {mode['reason']}"
                 )
-        rows.append(
-            f"| {benchmark['name']} | {cells[0]} | {cells[1]} | "
-            f"{cells[2]} | {cells[3]} |"
-        )
+        rows.append("| " + " | ".join([str(benchmark["name"]), *cells]) + " |")
 
     rows.extend(
         [
