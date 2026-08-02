@@ -10,6 +10,7 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+mod backend_stats;
 mod chroot;
 mod consts;
 mod desync;
@@ -1519,8 +1520,30 @@ async fn run_with_backend_inner(
     }
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
-        let (exit_status, mut global_state, instrumentation_stats) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+        let stats_request = backend_stats::request();
+        if stats_request.is_enabled() {
+            let (exit_status, mut global_state, instrumentation_stats) =
+                reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+                    command, config, preload,
+                )
+                .await?;
+            if liteinst_requires_forced_shutdown(exit_status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            backend_stats::report(
+                backend,
+                stats_request,
+                &backend_stats::LiteinstStatsSource::new(&instrumentation_stats),
+            );
+            return Ok(exit_status);
+        }
+
+        let (exit_status, mut global_state) =
+            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1531,11 +1554,11 @@ async fn run_with_backend_inner(
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
-        instrumentation_stats.print();
         return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1544,6 +1567,7 @@ async fn run_with_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await; // Before it's dropped by this function.
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
 
@@ -1629,8 +1653,35 @@ async fn run_with_output_backend_inner(
     if backend == Backend::Liteinst {
         command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
-        let (output, mut global_state, instrumentation_stats) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<Detcore>(
+        let stats_request = backend_stats::request();
+        if stats_request.is_enabled() {
+            let (output, mut global_state, instrumentation_stats) =
+                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                    Detcore,
+                >(command, config, preload)
+                .await?;
+            let status = output.status;
+            if liteinst_requires_forced_shutdown(status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            backend_stats::report(
+                backend,
+                stats_request,
+                &backend_stats::LiteinstStatsSource::new(&instrumentation_stats),
+            );
+            return Ok(Output {
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+
+        let (output, mut global_state) =
+            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1642,7 +1693,6 @@ async fn run_with_output_backend_inner(
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
-        instrumentation_stats.print();
         return Ok(Output {
             status,
             stdout: output.stdout,
@@ -1651,6 +1701,7 @@ async fn run_with_output_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1662,6 +1713,7 @@ async fn run_with_output_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
 
