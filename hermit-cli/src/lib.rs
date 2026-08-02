@@ -1540,11 +1540,7 @@ async fn run_with_backend_inner(
             global_state
                 .clean_up(print_summary, print_summary_to_json_file)
                 .await;
-            backend_stats::report(
-                backend,
-                stats_request,
-                &backend_stats::LiteinstStatsSource::new(&instrumentation_stats),
-            );
+            backend_stats::report(backend, stats_request, &instrumentation_stats);
             return Ok(exit_status);
         }
 
@@ -1674,11 +1670,7 @@ async fn run_with_output_backend_inner(
             global_state
                 .clean_up(print_summary, print_summary_to_json_file)
                 .await;
-            backend_stats::report(
-                backend,
-                stats_request,
-                &backend_stats::LiteinstStatsSource::new(&instrumentation_stats),
-            );
+            backend_stats::report(backend, stats_request, &instrumentation_stats);
             return Ok(Output {
                 status,
                 stdout: output.stdout,

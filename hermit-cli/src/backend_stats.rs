@@ -29,7 +29,11 @@ where
     let Some(snapshot) = request.collect(source) else {
         return;
     };
-    debug_assert_eq!(selected_backend.as_str(), S::Snapshot::BACKEND_NAME);
+    assert_eq!(
+        selected_backend.as_str(),
+        S::Snapshot::BACKEND_NAME,
+        "backend statistics source does not match selected backend"
+    );
     tracing::info!(
         target: TARGET,
         backend = %selected_backend.as_str(),
@@ -58,38 +62,6 @@ impl BackendStatsSource for PtraceStatsSource {
 
     fn backend_stats(&self) -> Self::Snapshot {
         PtraceStatsSnapshot
-    }
-}
-
-pub(crate) struct LiteinstStatsSource<'a> {
-    stats: &'a reverie_liteinst::LiteinstInstrumentationStats,
-}
-
-impl<'a> LiteinstStatsSource<'a> {
-    pub(crate) const fn new(stats: &'a reverie_liteinst::LiteinstInstrumentationStats) -> Self {
-        Self { stats }
-    }
-}
-
-pub(crate) struct LiteinstStatsSnapshot<'a> {
-    stats: &'a reverie_liteinst::LiteinstInstrumentationStats,
-}
-
-impl fmt::Display for LiteinstStatsSnapshot<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.stats.fmt(formatter)
-    }
-}
-
-impl BackendStatsSnapshot for LiteinstStatsSnapshot<'_> {
-    const BACKEND_NAME: &'static str = "liteinst";
-}
-
-impl<'a> BackendStatsSource for LiteinstStatsSource<'a> {
-    type Snapshot = LiteinstStatsSnapshot<'a>;
-
-    fn backend_stats(&self) -> Self::Snapshot {
-        LiteinstStatsSnapshot { stats: self.stats }
     }
 }
 
@@ -142,5 +114,15 @@ mod tests {
             PtraceStatsSource.backend_stats().to_string(),
             "metrics=none"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "backend statistics source does not match selected backend")]
+    fn report_rejects_a_mismatched_backend_source_in_release_builds() {
+        let source = CountingSource {
+            snapshots: Cell::new(0),
+        };
+
+        report(Backend::Liteinst, BackendStatsRequest::ENABLED, &source);
     }
 }
