@@ -24,6 +24,7 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
+use crate::time::RcbTimeMultiplier;
 
 const fn default_true() -> bool {
     true
@@ -88,6 +89,12 @@ pub struct Config {
     #[clap(skip)]
     pub cancel_killed_thread_rpcs: bool,
 
+    /// The execution backend reports final physical process exits after logical tool cleanup, so
+    /// Detcore can prevent virtual timers from overtaking kernel child-exit publication.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_reports_physical_process_exits: bool,
+
     // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
     /// The execution backend completes forked process children before returning to the parent.
     #[serde(default)]
@@ -114,6 +121,19 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub backend_virtualizes_capability_prctls: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+    /// The execution backend does not keep a `CLONE_VFORK` parent blocked inside the injected
+    /// `clone(2)` until the child registers. The ptrace backend relies on the kernel to suspend a
+    /// vfork parent until the child execs or exits, so the child always registers its vfork barrier
+    /// before the parent asks to continue. Out-of-process backends such as KVM service the clone by
+    /// deferring the child spawn, so the child registers only *after* the parent posts its
+    /// continuation. When this is set the scheduler keeps an unfulfilled vfork barrier in place at
+    /// parent continuation (waiting for the late child) instead of treating it as a failed clone.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_defers_vfork_child_registration: bool,
 
     /// Epoch of the logical time.
     ///
@@ -205,6 +225,40 @@ pub struct Config {
     /// like the rest of chaos mode it remains reproducible under a fixed seed.
     #[clap(long)]
     pub chaos_target_races: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Reproducible per-thread slowdown factors for chaos mode. A factor greater
+    /// than one makes each RCB consume proportionally more virtual time, while a
+    /// factor below one makes it consume less. Thus scheduling deadlines and the
+    /// guest-visible virtual clock describe the same slowed execution rather than
+    /// applying an out-of-band scheduling bias. The factor is a pure function of
+    /// scheduler seed, stable deterministic thread id, and chaos epoch. A fixed
+    /// seed therefore reproduces both timing and interleavings.
+    #[clap(long)]
+    pub chaos_per_thread_slowdown: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Maximum ratio between the slowest and fastest per-thread slowdown factor
+    /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
+    /// log-uniformly from `[1/R, R]` where `R` is this value. Must fit the Q32
+    /// virtual-time representation and be `>= 1.0`; `1.0` disables the spread.
+    #[clap(long, default_value = "10.0", value_name = "double")]
+    pub chaos_slowdown_max_factor: f64,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Length of a deterministic slowdown epoch in elapsed per-thread logical
+    /// nanoseconds. At the first scheduler commit at or after each boundary the
+    /// factor is redrawn as `factor(seed, stable_dettid, epoch)`. This is never
+    /// wall time. `0` means one epoch for the entire run, making constant slowdown
+    /// the single-epoch special case. Recorded preemption artifacts carry exact
+    /// epoch transitions and factors for replay. Inert without chaos slowdown.
+    #[clap(long, default_value = "0", value_name = "nanos")]
+    pub chaos_epoch_length_ns: u64,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -471,7 +525,12 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 impl Config {
     /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
     pub fn minimum_max_timeslice_nanos(&self) -> u64 {
-        let multiplier = self.clock_multiplier.unwrap_or(1.0);
+        let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
+            self.chaos_slowdown_max_factor
+        } else {
+            1.0
+        };
+        let multiplier = self.clock_multiplier.unwrap_or(1.0) * slowdown;
         ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
     }
 
@@ -479,6 +538,16 @@ impl Config {
     pub fn validate_invariants(&self) {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1149)
+        assert!(
+            self.chaos_slowdown_max_factor.is_finite()
+                && self.chaos_slowdown_max_factor >= 1.0
+                && self.chaos_slowdown_max_factor <= RcbTimeMultiplier::MAX,
+            "chaos_slowdown_max_factor must be finite and in [1.0, {}], got {}",
+            RcbTimeMultiplier::MAX,
+            self.chaos_slowdown_max_factor
+        );
         if let Some(multiplier) = self.clock_multiplier {
             assert!(
                 multiplier.is_finite() && multiplier > 0.0,
@@ -632,6 +701,21 @@ impl fmt::Display for Config {
         }
         if self.chaos_target_races {
             write!(f, " --chaos-target-races")?;
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1149)
+        if self.chaos_per_thread_slowdown {
+            write!(f, " --chaos-per-thread-slowdown")?;
+            write!(
+                f,
+                " --chaos-slowdown-max-factor={}",
+                self.chaos_slowdown_max_factor
+            )?;
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            if self.chaos_epoch_length_ns > 0 {
+                write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
+            }
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -1017,10 +1101,12 @@ mod tests {
     #[test]
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
+        assert!(!config.backend_reports_physical_process_exits);
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_virtualizes_capability_prctls);
+        assert!(!config.backend_defers_vfork_child_registration);
     }
 
     #[test]
@@ -1061,6 +1147,82 @@ mod tests {
         assert!(config.to_string().contains(" --runs-post-fork=random"));
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    #[test]
+    fn chaos_per_thread_slowdown_is_opt_in_and_round_trips() {
+        // Off by default; the factor default is present but inert.
+        let dflt = Config::default();
+        assert!(!dflt.chaos_per_thread_slowdown);
+        assert_eq!(dflt.chaos_slowdown_max_factor, 10.0);
+        // Default (disabled) config does not emit the flags.
+        assert!(!dflt.to_string().contains("--chaos-per-thread-slowdown"));
+
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-slowdown-max-factor=4.5",
+        ]);
+        assert!(config.chaos_per_thread_slowdown);
+        assert_eq!(config.chaos_slowdown_max_factor, 4.5);
+
+        // The Display round-trips both flags into the recorded schedule artifact.
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-per-thread-slowdown"));
+        assert!(rendered.contains(" --chaos-slowdown-max-factor=4.5"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert!(reparsed.chaos_per_thread_slowdown);
+        assert_eq!(reparsed.chaos_slowdown_max_factor, 4.5);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn chaos_epoch_length_is_opt_in_and_round_trips() {
+        // Off by default (single stable factor == plain per-thread-slowdown).
+        let dflt = Config::default();
+        assert_eq!(dflt.chaos_epoch_length_ns, 0);
+        assert!(!dflt.to_string().contains("--chaos-epoch-length-ns"));
+
+        // Epochs are only emitted alongside per-thread-slowdown.
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-epoch-length-ns=100000",
+        ]);
+        assert_eq!(config.chaos_epoch_length_ns, 100000);
+
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-epoch-length-ns=100000"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert_eq!(reparsed.chaos_epoch_length_ns, 100000);
+
+        // Without per-thread-slowdown the epoch flag is inert and not rendered.
+        let no_slowdown = Config::parse_from(["detcore", "--chaos", "--chaos-epoch-length-ns=100"]);
+        assert_eq!(no_slowdown.chaos_epoch_length_ns, 100);
+        assert!(!no_slowdown.to_string().contains("--chaos-epoch-length-ns"));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1149)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
+    fn validate_rejects_chaos_slowdown_max_factor_below_one() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: 0.5,
+            ..Default::default()
+        };
+        config.validate();
+    }
+
     #[test]
     #[should_panic(expected = "max_timeslice must be at least one RCB")]
     fn validate_rejects_max_timeslice_below_one_rcb() {
@@ -1098,6 +1260,33 @@ mod tests {
         let mut config = Config {
             max_timeslice: NonZeroU64::new(10),
             clock_multiplier: Some(2.0),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_scales_one_rcb_minimum_with_chaos_slowdown() {
+        let mut config = Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_slowdown_max_factor: 4.0,
+            max_timeslice: NonZeroU64::new(39),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
+    fn validate_rejects_unrepresentable_chaos_slowdown_factor() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: RcbTimeMultiplier::MAX * 2.0,
             ..Default::default()
         };
         config.validate();

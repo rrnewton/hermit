@@ -44,6 +44,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
@@ -57,6 +58,18 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+fn should_tag_sabre_internal_pipe_io(
+    discovers_live_metadata: bool,
+    fd_type: FdType,
+    physically_nonblocking: bool,
+    logically_nonblocking: bool,
+) -> bool {
+    discovers_live_metadata
+        && fd_type == FdType::Pipe
+        && physically_nonblocking
+        && !logically_nonblocking
+}
 
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
@@ -147,10 +160,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         open_file_id: OpenFileId,
     ) -> Option<u16> {
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let response = guest
-            .send_rpc((mytime, GlobalRequest::ReleasePort(open_file_id)))
-            .await;
+        let response = send_and_update_time(guest, GlobalRequest::ReleasePort(open_file_id)).await;
         match response.1 {
             GlobalResponse::ReleasePort(port) => port,
             other => panic!("unexpected release-port response: {other:?}"),
@@ -163,10 +173,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         open_file_id: OpenFileId,
         port: u16,
     ) {
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let response = guest
-            .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-            .await;
+        let response =
+            send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id)).await;
         match response.1 {
             GlobalResponse::AddUsedPort => {}
             other => panic!("unexpected restore-port response: {other:?}"),
@@ -447,13 +455,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (fd_type, resource, random_device_offset) =
-            guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.resource(), detfd.random_device_offset())
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            resource,
+            random_device_offset,
+        ) = guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.resource(),
+                detfd.random_device_offset(),
+            )
+        })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -797,11 +824,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, resource, raw_ino) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
                     detfd.resource(),
                     detfd.stat().map(|x| x.inode),
                 )
@@ -814,7 +842,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -975,7 +1011,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -1020,13 +1064,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let (fd_type, physically_nonblocking, resource) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.physically_nonblocking(), detfd.resource())
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.resource(),
+                )
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -1984,6 +2041,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let resource = ResourceID::PriorityChangePoint(
                 LAST_PRIORITY,
                 guest.thread_state().thread_logical_time.as_nanos(),
+                guest.thread_state().committed_clock_value,
+                Vec::new(),
             );
             let req = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, req).await;
@@ -2000,10 +2059,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if sockaddr_family == libc::AF_UNIX as u16
             && call.addrlen() == std::mem::offset_of!(libc::sockaddr_un, sun_path) as i32
         {
-            let mytime = guest.thread_state().thread_logical_time.clone();
-            let resp = guest
-                .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                .await;
+            let resp = send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
             let port = match resp.1 {
                 GlobalResponse::RequestPort(port) => port,
                 GlobalResponse::PortFull => {
@@ -2031,10 +2087,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .memory()
                 .read_value(addr.cast::<libc::sockaddr_nl>())?;
             if sockaddr_nl.nl_pid == 0 {
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port) => {
                         sockaddr_nl.nl_pid = DETERMINISTIC_NETLINK_PORT_ID_BASE | u32::from(port);
@@ -2068,11 +2122,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ipaddr, port
                     );
                 }
-                let mytime = guest.thread_state().thread_logical_time.clone();
                 // Send RPC to make sure already used ports are not used.
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id))
+                        .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
                         trace!("Added to used port {}", port);
@@ -2080,11 +2133,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     _ => unreachable!(),
                 }
             } else {
-                let mytime = guest.thread_state().thread_logical_time.clone();
                 // Request a determinzed port
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
                         sockaddr_in.sin_port = port_assigned.to_be();
@@ -2112,10 +2163,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ipaddr, port
                     );
                 }
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id))
+                        .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
                         trace!("Added to used port {}", port);
@@ -2123,10 +2173,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     _ => unreachable!(),
                 }
             } else {
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
                         sockfaddr_in.sin6_port = port_assigned.to_be();
@@ -2322,6 +2370,87 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal(2) determinization.
+    /// Deliver a signal to the process referred to by a pidfd.
+    ///
+    /// `pidfd_send_signal(pidfd, sig, info, flags)` names its target by an open
+    /// kernel descriptor rather than a numeric PID. Unlike `kill(2)`, there is
+    /// therefore no host-PID/virtual-PID ambiguity for Detcore to resolve: the
+    /// pidfd was bound to one specific process at `pidfd_open` time. Signal
+    /// generation runs inside this thread's serialized scheduler turn, exactly
+    /// like `tgkill`/`tkill`/`rt_tgsigqueueinfo` (which also just forward through
+    /// record/replay), so forwarding the kernel call is deterministic by
+    /// construction. This handler adds deterministic argument validation ahead of
+    /// the forward: a descriptor that Detcore does not model as a pidfd fails
+    /// closed with `EBADF`, and the flags field the current kernel reserves is
+    /// required to be zero (`EINVAL` otherwise), so the guest-visible errno is
+    /// fixed and host-independent.
+    ///
+    /// `call` is the raw `Syscall::Other`; `pidfd`/`flags` are pre-extracted from
+    /// its arguments by the dispatcher.
+    pub async fn handle_pidfd_send_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        pidfd: RawFd,
+        flags: u32,
+    ) -> Result<i64, Error> {
+        // The kernel currently reserves `flags`; a nonzero value is EINVAL.
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        // Fail closed unless Detcore models this descriptor as a pidfd. This also
+        // yields a deterministic EBADF for an unknown/closed descriptor.
+        let is_pidfd = guest
+            .thread_state()
+            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        if !is_pidfd {
+            return Err(Errno::EBADF.into());
+        }
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd(2) determinization and the
+    // FdType of the duplicated descriptor.
+    /// Duplicate a descriptor from the process referred to by a pidfd.
+    ///
+    /// `pidfd_getfd(pidfd, targetfd, flags)` returns a fresh descriptor in the
+    /// caller that aliases `targetfd` in the target process. The source pidfd
+    /// names one specific process fixed at `pidfd_open` time, the returned
+    /// descriptor number is chosen through record/replay (so it is stable across
+    /// runs), and the operation executes inside this thread's serialized turn, so
+    /// the result is deterministic. Detcore fails closed with `EBADF` unless it
+    /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
+    /// to be zero (`EINVAL` otherwise). The duplicated descriptor is registered so
+    /// later `close`/`fcntl`/`dup` see it; Detcore cannot cheaply learn the source
+    /// descriptor's kind, so it is modeled as a regular, close-on-exec fd. This is
+    /// sufficient for descriptor lifecycle tracking; see the review tag above for
+    /// the type-inference limitation.
+    pub async fn handle_pidfd_getfd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        pidfd: RawFd,
+        flags: u32,
+    ) -> Result<i64, Error> {
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let is_pidfd = guest
+            .thread_state()
+            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        if !is_pidfd {
+            return Err(Errno::EBADF.into());
+        }
+        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
+        self.add_fd(guest, fd, OFlag::O_CLOEXEC, FdType::Regular)
+            .await?;
+        Ok(fd as i64)
+    }
+
     /// userfaultfd system call.
     pub async fn handle_userfaultfd<G: Guest<Self>>(
         &self,
@@ -2464,8 +2593,10 @@ mod test {
 
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
+    use crate::fd::FdType;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2473,6 +2604,40 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn sabre_pipe_marker_requires_nonblockize_retry_semantics() {
+        assert!(should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            true,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            true,
+            true
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            false,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            false,
+            FdType::Pipe,
+            true,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Regular,
+            true,
+            false
+        ));
     }
 
     #[test]

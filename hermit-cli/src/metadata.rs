@@ -169,10 +169,12 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detect_host_clock_futex_timeouts: false,
         syscall_clobbers_virtualized_by_backend: false,
         cancel_killed_thread_rpcs: false,
+        backend_reports_physical_process_exits: false,
         backend_serializes_fork_children: false,
         backend_dispatches_thread_tools: true,
         backend_requires_thread_directed_process_signals: false,
         backend_virtualizes_capability_prctls: false,
+        backend_defers_vfork_child_registration: false,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
@@ -215,6 +217,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         interrupt_at: vec![],
         fuzz_futexes: false,
         chaos_target_races: false,
+        chaos_per_thread_slowdown: false,
+        chaos_slowdown_max_factor: 10.0,
+        chaos_epoch_length_ns: 0,
         fuzz_seed: None,
     };
     if config.max_timeslice.is_some() && !reverie_ptrace::is_perf_supported() {

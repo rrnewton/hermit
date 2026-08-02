@@ -66,6 +66,7 @@ pub mod preemptions;
 pub mod types;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -109,6 +110,7 @@ pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
+use tool_global::ThreadDeregistration;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
@@ -375,7 +377,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             assert!(thread_state.committed_clock_value <= clock_value);
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
             if self.cfg.use_rcb_time() {
-                thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-1151)
+                if thread_state.chaos_slowdown_active {
+                    let factor = thread_state.rcb_time_multiplier();
+                    thread_state
+                        .thread_logical_time
+                        .add_rcbs_with_multiplier(delta_rcbs, factor);
+                } else {
+                    thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+                }
             }
             thread_state.account_process_cpu_time();
             thread_state.committed_clock_value = clock_value;
@@ -526,11 +537,15 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(mut max_timeslice_end) = guest.thread_state().max_timeslice_end {
             assert!(guest.config().max_timeslice.is_some());
+            let mut replay_rcb_end = guest.thread_state().replay_rcb_end;
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
-            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
+                * guest.thread_state().rcb_time_multiplier().as_f64();
             let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
 
-            if current_time + epsilon > max_timeslice_end {
+            if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 trace!(
                     "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
                     dettid, max_timeslice_end
@@ -541,17 +556,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .max_timeslice_end
                     .expect("ending a PMU-backed timeslice must install a new maximum");
                 current_time = guest.thread_state().thread_logical_time.as_nanos();
+                replay_rcb_end = guest.thread_state().replay_rcb_end;
             }
-            if current_time + epsilon > max_timeslice_end {
+            if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 panic!(
                     "Ended time slice, but current time {} is still beyond PMU maximum {}",
                     current_time, max_timeslice_end
                 );
             }
 
-            let ns_remaining = max_timeslice_end - current_time;
-            let max_rcbs_remaining = ns_remaining.into_rcbs_with_multiplier(clock_multiplier);
             let current_rcbs = guest.thread_state().thread_logical_time.rcbs();
+            let current_pmu_rcbs = guest.thread_state().committed_clock_value;
+            let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
+                assert!(
+                    replay_rcb_end > current_pmu_rcbs,
+                    "recorded PMU RCB deadline {} is not ahead of current {}",
+                    replay_rcb_end,
+                    current_pmu_rcbs
+                );
+                let logical_remaining = if max_timeslice_end > current_time {
+                    max_timeslice_end - current_time
+                } else {
+                    LogicalTime::ZERO
+                };
+                (logical_remaining, replay_rcb_end - current_pmu_rcbs)
+            } else {
+                let logical_remaining = max_timeslice_end - current_time;
+                (
+                    logical_remaining,
+                    logical_remaining.into_rcbs_with_multiplier(clock_multiplier),
+                )
+            };
             let next_interrupt = self
                 .cfg
                 .use_rcb_time()
@@ -578,7 +613,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid, ns_remaining, rcbs_remaining,
             );
 
-            if ns_remaining.is_zero() {
+            if replay_rcb_end.is_none() && ns_remaining.is_zero() {
                 panic!(
                     "Timer invariant broken: we should not exit a handler with 0 timeslice remaining."
                 );
@@ -637,32 +672,45 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        explicit_sched_yield: bool,
+        mut explicit_sched_yield: bool,
     ) {
-        let thread_state = guest.thread_state();
-        let dettid = thread_state.dettid;
         let chaos = guest.config().chaos;
-        let end_time = thread_state.thread_logical_time.as_nanos();
-        info!(
-            "[detcore, dtid {}] ending timeslice T{}. {} syscalls and {} signals this timeslice.",
-            dettid,
-            thread_state.stats.timeslice_count,
-            thread_state.stats.timeslice_syscall_count,
-            thread_state.stats.timeslice_signal_count,
-        );
-        let maybe_prio = guest.thread_state_mut().next_timeslice(&self.cfg); // Reset end_of_timeslice
+        loop {
+            let thread_state = guest.thread_state();
+            let dettid = thread_state.dettid;
+            let end_time = thread_state.thread_logical_time.as_nanos();
+            info!(
+                "[detcore, dtid {}] ending timeslice T{}. {} syscalls and {} signals this timeslice.",
+                dettid,
+                thread_state.stats.timeslice_count,
+                thread_state.stats.timeslice_syscall_count,
+                thread_state.stats.timeslice_signal_count,
+            );
+            let maybe_prio = guest.thread_state_mut().next_timeslice(&self.cfg);
 
-        // Depending on chaos mode, a received timer event is either a preemption or a changepoint
-        let req = if let Some(prio) = maybe_prio {
-            Self::priority_changepoint_request(guest, end_time, prio)
-        } else if chaos {
-            Self::random_priority_changepoint_request(guest, end_time)
-        } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
-            Self::sched_yield_request(guest)
-        } else {
-            Self::yield_request(guest)
-        };
-        resource_request(guest, req).await;
+            // Depending on chaos mode, a received timer event is either a preemption or a changepoint
+            let req = if let Some(prio) = maybe_prio {
+                Self::priority_changepoint_request(guest, end_time, prio)
+            } else if chaos {
+                Self::random_priority_changepoint_request(guest, end_time)
+            } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
+                Self::sched_yield_request(guest)
+            } else {
+                Self::yield_request(guest)
+            };
+            resource_request(guest, req).await;
+
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1151)
+            // Multiple scheduler commits can occur without an intervening
+            // conditional branch. Exact-RCB replay represents those as
+            // adjacent zero-RCB slices, which must be consumed before the
+            // guest resumes.
+            if !guest.thread_state().timeslice_expired() {
+                break;
+            }
+            explicit_sched_yield = false;
+        }
     }
 
     fn detlog_memory_maps<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
@@ -791,6 +839,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-862): Keep modeled pidfd creation intercepted.
                 Sysno::pidfd_open,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-1175): Keep pidfd signal/get-fd
+                // determinization from being bypassed under the passthru opt-in.
+                Sysno::pidfd_send_signal,
+                Sysno::pidfd_getfd,
                 Sysno::userfaultfd,
                 Sysno::io_uring_setup,
                 Sysno::io_uring_enter,
@@ -1081,6 +1134,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if !clone_flags.contains(CloneFlags::CLONE_THREAD) {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
+                let guest_clock = Arc::clone(&pts.1.guest_clock);
 
                 ThreadState {
                     dettid,
@@ -1145,17 +1199,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Arc::new(Mutex::new(ProcessCpuTime::default()))
                     },
-                    guest_clock: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-                        Arc::clone(&pts.1.guest_clock)
-                    } else {
-                        Arc::new(Mutex::new(
-                            pts.1
-                                .guest_clock
-                                .lock()
-                                .expect("guest clock mutex poisoned")
-                                .clone(),
-                        ))
-                    },
+                    // Wall time belongs to the traced process tree, not to an
+                    // individual process. Forked processes and cloned threads
+                    // therefore retain one monotonic view of raw logical time.
+                    guest_clock,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -1178,6 +1225,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     committed_clock_value: 0,
 
                     end_of_timeslice: None,
+                    replay_rcb_end: None,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-1151)
+                    chaos_epoch: tool_local::chaos_epoch_sentinel(),
+                    chaos_slowdown_factor: RcbTimeMultiplier::ONE,
+                    chaos_slowdown_active: false,
+                    pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
@@ -1223,7 +1277,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            create_child_thread(guest, new_dettid, 0, None).await;
+            if let Some(post_exec_mm) = create_child_thread(guest, new_dettid, 0, None).await {
+                guest.thread_state_mut().mm_id = post_exec_mm;
+            }
         }
 
         // Except for the root task, let's block until it's our turn to go:
@@ -1252,7 +1308,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
-        guest.thread_state().reset_guest_clock();
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
@@ -1422,6 +1477,36 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 match call {
                     Syscall::Other(_, args) => Self::handle_process_madvise(args.arg0, args.arg4),
                     _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
+                }
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1175): The pinned Reverie revision exposes
+            // pidfd_send_signal/pidfd_getfd only as raw calls, so dispatch on the
+            // Sysno. See the handlers in syscalls/files.rs for the determinism
+            // argument.
+            SyscallClassification::Determinized if call.number() == Sysno::pidfd_send_signal => {
+                match call {
+                    Syscall::Other(_, args) => {
+                        self.handle_pidfd_send_signal(
+                            guest,
+                            call,
+                            args.arg0 as RawFd,
+                            args.arg3 as u32,
+                        )
+                        .await
+                    }
+                    _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
+                }
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd, likewise untyped.
+            SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
+                match call {
+                    Syscall::Other(_, args) => {
+                        self.handle_pidfd_getfd(guest, call, args.arg0 as RawFd, args.arg2 as u32)
+                            .await
+                    }
+                    _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2166,14 +2251,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
+        let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
         deregister_thread(
-            dettid,
             thread_state.thread_logical_time.clone(),
             &self.cfg,
             global_state,
-            detpid,
-            mm_id,
-            thread_state.stats.timeslice_stats,
+            ThreadDeregistration {
+                dettid,
+                detpid,
+                mm: mm_id,
+                timeslice_stats: thread_state.stats.timeslice_stats,
+                chaos_epochs: pending_chaos_epochs,
+            },
         )
         .await;
 
@@ -2378,5 +2467,26 @@ mod timeslice_timer_tests {
         };
 
         let _ = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+    }
+}
+
+#[cfg(test)]
+mod process_tree_guest_clock_tests {
+    use super::*;
+
+    #[test]
+    fn forked_process_shares_guest_clock_domain() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        parent.clone_flags = Some(CloneFlags::empty());
+
+        let child = <Detcore as Tool>::init_thread_state(
+            &tool,
+            Tid::from_raw(2),
+            Some((Tid::from_raw(1), &parent)),
+        );
+
+        assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
     }
 }

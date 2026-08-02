@@ -14,6 +14,90 @@
       "why": "tests/backend-parity/README.md is owned by tests/backend-parity/run_matrix.py maintainers: This README specifies backend-parity matrix semantics and reproduction commands. It documents the driver but contains no executable workload."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus.py",
+      "disposition": "special-driver",
+      "runner": "e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI)",
+      "why": "tests/backend-parity/e9patch_corpus.py is owned by e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI): Standalone driver that compiles each freestanding corpus guest, rewrites it with e9tool, and enforces exit-status and stdout parity, golden and e9patch L2, full direct-AOT coverage with mapped==candidate, no SIGILL fallback with b0==0, and a guest-syscall DETLOG tail-match against golden ptrace. It needs e9tool and a hermit built --features e9patch, both absent in CI, so it is BLOCKED there like the KVM /dev/kvm gate rather than a manifest-plan program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/README.md",
+      "disposition": "support-data",
+      "runner": "tests/backend-parity/e9patch_corpus.py maintainers",
+      "why": "tests/backend-parity/e9patch_corpus/README.md is owned by tests/backend-parity/e9patch_corpus.py maintainers: Documents why the e9patch preprocessing parity corpus must be freestanding, statically linked, raw-syscall guests, since a dynamically linked libc program exposes zero in-ELF SYSCALL sites, and tabulates what each guest exercises. It is reference documentation for the driver and contains no executable workload."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/clock_gettime.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/clock_gettime.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a guest clock_gettime(CLOCK_MONOTONIC) read stays byte-identical between golden plain-ptrace and e9patch preprocessing plus ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/compute.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/compute.c is owned by tests/backend-parity/e9patch_corpus.py: Probes an RCB-preempted CPU-bound loop so branch-count preemption behaves identically under e9patch rewriting and plain ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getpid_check.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getpid_check.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the virtualized getpid result is identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/getrandom.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getrandom.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the determinized getrandom byte stream is identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/loop_write.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/loop_write.c is owned by tests/backend-parity/e9patch_corpus.py: Probes a single write site invoked repeatedly in a loop so the rewritten trampoline is reused deterministically across iterations. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/minimal_exit.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/minimal_exit.c is owned by tests/backend-parity/e9patch_corpus.py: Probes the smallest possible rewrite, a lone exit_group site, establishing the e9loader-prologue baseline used by the DETLOG tail-match check. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/mmap_anon.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/mmap_anon.c is owned by tests/backend-parity/e9patch_corpus.py: Probes an anonymous mmap, touch, and munmap sequence so memory-mapping syscalls are rewritten and replayed identically to plain ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/multi_site.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/multi_site.c is owned by tests/backend-parity/e9patch_corpus.py: Probes three distinct noinline syscall sites so multi-site rewriting maps every candidate and adds the expected additional trampoline mmaps. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/nanosleep.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/nanosleep.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a nanosleep request is virtualized identically under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/sigmask.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/sigmask.c is owned by tests/backend-parity/e9patch_corpus.py: Probes gettid plus rt_sigprocmask so signal-mask syscalls survive rewriting without introducing a SIGILL signal-fallback site. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/uname.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/uname.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the deterministic uname buffer is byte-identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/write_stdout.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/write_stdout.c is owned by tests/backend-parity/e9patch_corpus.py: Probes a single write(1,...) site so basic guest-visible stdout is byte-identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/fixtures/cpuid_probe.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -332,6 +416,18 @@
       "why": "tests/c/liteinst_advanced.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/liteinst_host_activation.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/liteinst_host_activation.rs",
+      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
+    },
+    {
+      "path": "tests/c/liteinst_inert_runtime.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
+    },
+    {
       "path": "tests/c/lsm_get_self_attr_enosys.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
@@ -646,8 +742,8 @@
     {
       "path": "tests/c/random_sources.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/random_sources.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml",
+      "why": "tests/c/random_sources.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml: Direct C guest asserting that getrandom(2), /dev/urandom, and /dev/random entropy plus GRND flag/fault semantics reproduce bitwise under strict ptrace verification; its standalone build and stdout+status contract are calibrated, so the verify/ptrace cell gates CI (ci=true)"
     },
     {
       "path": "tests/c/rcx_canonicalization.c",
@@ -686,6 +782,12 @@
       "why": "tests/c/recvmsg_scm_rights_mmap.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/relaxed_flag_matrix.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/relaxed_flag_matrix.rs",
+      "why": "tests/c/relaxed_flag_matrix.c is owned by hermit-cli/tests/relaxed_flag_matrix.rs: The Rust integration test compiles this observation guest and runs it across the exhaustive strict/relaxed flag matrix with bounded execution and exact result classification; a generic manifest cell cannot express the matrix-wide flag cross-product or ratcheted expected-failure contract."
+    },
+    {
       "path": "tests/c/remap_file_pages_anonymous_enosys.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
@@ -714,6 +816,12 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/resource_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/c/sabre_exit_group_parked.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/hermit_modes.rs",
+      "why": "tests/c/sabre_exit_group_parked.c is owned by hermit-cli/tests/hermit_modes.rs: The Rust integration test compiles this SaBRe-only lifecycle guest, supplies the reviewed loader, enforces strict verification, and owns bounded process-group cleanup; a generic manifest cell cannot express that backend-specific setup and timeout contract."
     },
     {
       "path": "tests/c/sched_setattr_batch.c",
@@ -1202,6 +1310,12 @@
       "why": "tests/e2e/data-handling/archive-roundtrip.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/data-handling/shell-pipeline.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/data-handling/shell-pipeline.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "path": "tests/e2e/determinism-stress/README.md",
       "disposition": "support-data",
       "runner": "maintainers of tests/e2e/determinism-stress",
@@ -1216,20 +1330,20 @@
     {
       "path": "tests/e2e/determinism-stress/guests/lock_free.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/lock_free.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/lock_free.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its lock-free atomic/CAS interleaving resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/pid_tid.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/pid_tid.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/pid_tid.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its per-thread pid/tid observation is deterministically virtualized under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/signal_order.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/signal_order.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/signal_order.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its signal delivery ordering resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/mmap_fork_shared.c",
@@ -1246,14 +1360,20 @@
     {
       "path": "tests/e2e/determinism-stress/pipe_prefill.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/pipe_prefill.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/pipe_prefill.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its prefilled-pipe read/write ordering resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/process-chains.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/determinism-stress/process-chains.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/producer_consumer.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/producer_consumer.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its multi-producer/multi-consumer bounded-queue condvar/futex schedule is a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/thread-contention.sh",
@@ -1292,6 +1412,12 @@
       "why": "tests/e2e/language-runtimes/bash-loop-pipe-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Bash file I/O, loops, pipelines, hashing, and virtual time under strict verification"
     },
     {
+      "path": "tests/e2e/language-runtimes/gawk-random.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/gawk-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: GNU awk's pid-seeded rand() output varies natively and repeats under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/javascript.js",
       "disposition": "guest-fixture",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
@@ -1302,6 +1428,12 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
       "why": "tests/e2e/language-runtimes/perl-io-subprocess-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Perl file I/O, subprocess pipes, hashing, and virtual time under strict verification"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/python-hash-determinism.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/python-hash-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It proves CPython hash-seed order varies natively yet repeats bitwise under strict verification"
     },
     {
       "path": "tests/e2e/language-runtimes/python-io-subprocess-time.sh",
@@ -1342,14 +1474,14 @@
     {
       "path": "tests/e2e/lib/applications/http_server.sh",
       "disposition": "suite-helper",
-      "runner": "tests/e2e/lib/applications/run_all.sh",
-      "why": "tests/e2e/lib/applications/http_server.sh is owned by tests/e2e/lib/applications/run_all.sh: The `http_server` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/http_server.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit: The long-lived Python server plus curl client remains an explicit occasional L2 check, preserving its process-lifecycle coverage without allowing a server-child starvation defect to consume every-commit CI's full application timeout."
     },
     {
       "path": "tests/e2e/lib/applications/redis_deep.sh",
       "disposition": "suite-helper",
-      "runner": "tests/e2e/lib/applications/run_all.sh",
-      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by tests/e2e/lib/applications/run_all.sh: The `redis_deep` scenario is one named case inside the applications aggregate suite, driven by run_all.sh with suite-owned lifecycle. It runs a full redis-server plus redis-cli session over a private unix socket and folds its determinism assertions into the suite's combined pass/fail contract, so scheduling the helper on its own would duplicate that setup and fracture the contract."
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit: The full redis-server plus redis-cli session takes about one minute even when healthy, so the ignored Rust wrapper keeps it available as explicit occasional L2 validation without adding a long-lived server workload to every-commit portable CI."
     },
     {
       "path": "tests/e2e/lib/applications/run_all.sh",
@@ -1656,6 +1788,24 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/date-nanoseconds.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/system-utils/openssl-passwd.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/openssl-passwd.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/system-utils/openssl-x509.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/openssl-x509.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/system-utils/proc-uptime.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/proc-uptime.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/system-utils/random-device.sh",

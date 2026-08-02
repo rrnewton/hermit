@@ -78,10 +78,12 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
@@ -135,6 +137,9 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
+    chaos_epoch_length_ns: 0,
 });
 
 /// Standardized test config: common options on.
@@ -148,10 +153,12 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
@@ -205,6 +212,9 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
+    chaos_epoch_length_ns: 0,
 });
 
 /// Standardized test config: all options on.
@@ -218,10 +228,12 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     cancel_killed_thread_rpcs: false,
+    backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,
     backend_dispatches_thread_tools: true,
     backend_requires_thread_directed_process_signals: false,
     backend_virtualizes_capability_prctls: false,
+    backend_defers_vfork_child_registration: false,
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,
@@ -275,6 +287,9 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
+    chaos_epoch_length_ns: 0,
 });
 
 /// A basic oracle, which expects a success exit code.

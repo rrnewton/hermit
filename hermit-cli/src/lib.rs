@@ -56,22 +56,32 @@ pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_background_init;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_name;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_pre_syscall;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_ready;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_thread_exit;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_thread_init;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_totals;
 pub use error::Context;
 pub use error::Error;
 pub use error::SerializableError;
+use goblin::elf::Elf;
+use goblin::elf::header;
+use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
 use record::Record;
@@ -358,12 +368,14 @@ fn validate_tracing_environment() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(feature = "dbi")]
 fn is_dynamorio_sdk(path: &Path) -> bool {
     path.join("include/dr_api.h").is_file()
         || path.join("DynamoRIOConfig.cmake").is_file()
         || path.join("cmake/DynamoRIOConfig.cmake").is_file()
 }
 
+#[cfg(feature = "dbi")]
 fn dynamorio_sdk_available() -> bool {
     if hermit_resources::resource("dynamorio/bin64/drrun")
         .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
@@ -387,6 +399,7 @@ fn dynamorio_sdk_available() -> bool {
         .any(|path| is_dynamorio_sdk(&path))
 }
 
+#[cfg(feature = "dbi")]
 fn dbi_runtime_unavailable_reason() -> Option<String> {
     detcore_dbi::runtime_library_path().err().map(|error| {
         format!(
@@ -398,23 +411,128 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    let bytes = fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read LiteInst runtime {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let elf = Elf::parse(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} is not an ELF DSO: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} is not an x86-64 shared object",
+                path.display()
+            ),
+        ));
+    }
+
+    let required = [
+        "reverie_liteinst_initialize",
+        "reverie_liteinst_site_trap_count",
+        "reverie_liteinst_site_hook_count",
+    ];
+    for name in required {
+        if !elf
+            .dynsyms
+            .iter()
+            .any(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LiteInst runtime {} is missing required export {name}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let (initializer_index, initializer) = elf
+        .dynsyms
+        .iter()
+        .enumerate()
+        .find(|(_, symbol)| {
+            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
+        })
+        .ok_or_else(|| io::Error::other("checked LiteInst initializer disappeared"))?;
+    let init_array = elf
+        .section_headers
+        .iter()
+        .find(|section| section.sh_type == section_header::SHT_INIT_ARRAY)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LiteInst runtime {} has no constructor array",
+                    path.display()
+                ),
+            )
+        })?;
+    let init_start = init_array.sh_addr;
+    let init_end = init_start.saturating_add(init_array.sh_size);
+    let relocated_initializer = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .any(|relocation| {
+            (init_start..init_end).contains(&relocation.r_offset)
+                && relocation.r_sym == initializer_index
+        });
+    let init_bytes = usize::try_from(init_array.sh_offset)
+        .ok()
+        .and_then(|start| {
+            usize::try_from(init_array.sh_size)
+                .ok()
+                .and_then(|size| bytes.get(start..start.checked_add(size)?))
+        })
+        .unwrap_or_default();
+    let direct_initializer = init_bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
+    if !relocated_initializer && !direct_initializer {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LiteInst runtime {} does not register reverie_liteinst_initialize as a preload constructor",
+                path.display()
+            ),
+        ));
+    }
+    path.canonicalize()
+}
+
 /// Returns the LiteInst preload cdylib produced beside the Hermit binary.
 #[doc(hidden)]
 pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("HERMIT_LITEINST_RUNTIME") {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path).ok_or_else(|| {
-            io::Error::new(
+        if !path.is_file() {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "HERMIT_LITEINST_RUNTIME does not name a regular file",
+            ));
+        }
+        return validate_liteinst_runtime_library(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("HERMIT_LITEINST_RUNTIME is invalid: {error}"),
             )
         });
-    }
-
-    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")?
-        && path.is_file()
-    {
-        return Ok(path);
     }
 
     let executable = std::env::current_exe()?;
@@ -424,27 +542,33 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
             "Hermit executable has no parent directory",
         )
     })?;
-    [
-        directory.join("libdetcore_liteinst.so"),
-        directory.join("deps/libdetcore_liteinst.so"),
+    if let Some(path) = [
+        directory.join("libreverie_liteinst.so"),
+        directory.join("deps/libreverie_liteinst.so"),
     ]
     .into_iter()
     .find(|path| path.is_file())
-    .ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "libdetcore_liteinst.so was not built beside {}",
-                executable.display()
-            ),
-        )
-    })
+    {
+        return validate_liteinst_runtime_library(&path);
+    }
+    if let Some(path) = hermit_resources::resource("libreverie_liteinst.so")?
+        && path.is_file()
+    {
+        return validate_liteinst_runtime_library(&path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "libreverie_liteinst.so was not built beside {} or staged as an installed resource",
+            executable.display()
+        ),
+    ))
 }
 
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_runtime_library_path().err().map(|error| {
         format!(
-            "the LiteInst preload runtime is unavailable: {error}; build detcore-liteinst and hermit in the same target directory"
+            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
         )
     })
 }
@@ -472,7 +596,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the LiteInst in-process backend with the Detcore Tool.
+    /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -537,21 +661,61 @@ impl Backend {
             Self::Ptrace => validate_tracing_environment()
                 .err()
                 .map(|error| error.to_string()),
-            Self::Dbi if !dynamorio_sdk_available() => Some(
-                "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
-                    .to_owned(),
-            ),
-            Self::Dbi => dbi_runtime_unavailable_reason(),
+            Self::Dbi => dbi_unavailable_reason(),
             Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
-            Self::Sabre => sabre_runtime_unavailable_reason(),
+            Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
-            Self::E9patch => validate_tracing_environment()
-                .err()
-                .map(|error| error.to_string())
-                .or_else(e9patch::unavailable_reason),
+            Self::E9patch => e9patch_unavailable_reason(),
         }
     }
+}
+
+// SaBRe and e9patch add no third-party Rust dependencies to `hermit-cli` (SaBRe
+// shells out to an external loader plus `libdetcore_sabre.so`, and e9patch shells
+// out to `e9tool`/`e9patch`). They are still gated behind the `sabre` and
+// `e9patch` cargo features so the default `hermit` binary reports them as absent
+// and only the `third-party-backends` build offers them. The reverie-sabre Rust
+// dependency lives in the `detcore-sabre` crate, which is excluded from the
+// workspace's `default-members`.
+#[cfg(feature = "sabre")]
+fn sabre_unavailable_reason() -> Option<String> {
+    sabre_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "sabre"))]
+fn sabre_unavailable_reason() -> Option<String> {
+    Some("SaBRe support was not included in this build".to_owned())
+}
+
+#[cfg(feature = "e9patch")]
+fn e9patch_unavailable_reason() -> Option<String> {
+    validate_tracing_environment()
+        .err()
+        .map(|error| error.to_string())
+        .or_else(e9patch::unavailable_reason)
+}
+
+#[cfg(not(feature = "e9patch"))]
+fn e9patch_unavailable_reason() -> Option<String> {
+    Some("e9patch support was not included in this build".to_owned())
+}
+
+#[cfg(feature = "dbi")]
+fn dbi_unavailable_reason() -> Option<String> {
+    if !dynamorio_sdk_available() {
+        return Some(
+            "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
+                .to_owned(),
+        );
+    }
+    dbi_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "dbi"))]
+// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBI compile-time feature boundary.
+fn dbi_unavailable_reason() -> Option<String> {
+    Some("DBI support was not included in this build".to_owned())
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
@@ -725,6 +889,7 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_runtime_unavailable_reason() -> Option<String> {
     if let Err(error) = resolve_sabre_binary() {
         return Some(error.to_string());
@@ -883,17 +1048,23 @@ async fn run_sabre(
         PathBuf::from(&sabre),
         plugin.clone(),
         fallback_ready,
+        global.clone(),
         capture_output,
     )
     .await
     {
         Ok(supervised) => supervised,
         Err(error) => {
+            global.release_all_physical_process_exits();
             global.force_shutdown_with_error();
             let _ = shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await;
             return Err(error);
         }
     };
+    // The supervisor returns only after every tracee reached a final kernel wait status. Release
+    // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
+    // shutdown; no guest thread remains that could race timer fast-forward here.
+    global.release_all_physical_process_exits();
     let requires_forced_shutdown = !supervised.status.success();
     if requires_forced_shutdown {
         global.force_shutdown_with_error();
@@ -1091,6 +1262,19 @@ async fn run_kvm(
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
+    // The KVM backend now defaults to Tool-owned guest threads: CLONE_THREAD
+    // workers are driven through the Detcore tool loop and their futex/CLEARTID
+    // synchronization routes to Detcore, matching the golden ptrace model
+    // ("follow children"). Detcore's own clone logic treats a CLONE_THREAD as
+    // backend-uninstrumented iff `backend_dispatches_thread_tools` is false (see
+    // detcore/src/syscalls/threads.rs), so in exactly that case opt the backend
+    // out to host-owned threads to keep worker execution and futex ownership in
+    // one synchronization domain (mixing them deadlocks pthread_join). In the
+    // default (true) case the backend already follows children, so no call is
+    // needed.
+    if !config.backend_dispatches_thread_tools {
+        backend.unmonitored_threads();
+    }
 
     let execution_started = Instant::now();
     let (global_state, code, stdout, stderr) = backend
@@ -1130,6 +1314,7 @@ async fn run_kvm(
 }
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBI guest execution.
+#[cfg(feature = "dbi")]
 fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
     status.code() == Some(reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
 }
@@ -1137,6 +1322,7 @@ fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
+#[cfg(feature = "dbi")]
 async fn run_dbi(
     command: Command,
     config: DetConfig,
@@ -1268,22 +1454,22 @@ pub fn run_with_backend(
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
-    if backend == Backend::Liteinst && config.max_timeslice.is_some() {
-        eprintln!(
-            "WARNING: --backend=liteinst does not implement PMU/RCB timer delivery; continuing with --max-timeslice=disabled."
-        );
-        config.max_timeslice = None;
-    }
     config.discover_live_file_metadata = backend == Backend::Sabre;
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
-    config.backend_dispatches_thread_tools = backend != Backend::Kvm;
+    config.backend_dispatches_thread_tools = true;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
+    // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
+    // the parent kernel-blocked until the child registers, so this stays false there.
+    config.backend_defers_vfork_child_registration = backend == Backend::Kvm;
     config
 }
 
@@ -1315,7 +1501,15 @@ async fn run_with_backend_inner(
         .status);
     }
     if backend == Backend::Dbi {
-        return Ok(run_dbi(command, config, print_summary, false).await?.status);
+        #[cfg(feature = "dbi")]
+        {
+            return Ok(run_dbi(command, config, print_summary, false).await?.status);
+        }
+        #[cfg(not(feature = "dbi"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBI availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Sabre {
         return Ok(run_sabre(
@@ -1331,7 +1525,7 @@ async fn run_with_backend_inner(
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
         let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1413,7 +1607,15 @@ async fn run_with_output_backend_inner(
         .await;
     }
     if backend == Backend::Dbi {
-        return run_dbi(command, config, print_summary, true).await;
+        #[cfg(feature = "dbi")]
+        {
+            return run_dbi(command, config, print_summary, true).await;
+        }
+        #[cfg(not(feature = "dbi"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBI availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Sabre {
         command.stdin(output_backend_stdin()?);
@@ -1432,11 +1634,11 @@ async fn run_with_output_backend_inner(
         command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
         let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
-        let status = output.status.into();
+        let status = output.status;
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
@@ -1687,12 +1889,16 @@ mod tests {
     use super::Backend;
     use super::ExitStatus;
     use super::SABRE_RPC_SOCKET_ENV;
+    #[cfg(feature = "dbi")]
     use super::dbi_runtime_unavailable_reason;
+    #[cfg(feature = "dbi")]
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
+    #[cfg(feature = "dbi")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     use super::liteinst_requires_forced_shutdown;
+    #[cfg(feature = "dbi")]
     use super::liteinst_runtime_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
@@ -1700,7 +1906,6 @@ mod tests {
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_program_needs_neutral_name;
-    use super::sabre_runtime_unavailable_reason;
     use super::shutdown_sabre_rpc;
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
@@ -1758,13 +1963,13 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_backend_config_disables_unsupported_rcb_timeslices() {
+    fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         assert!(
             prepare_backend_config(config.clone(), Backend::Liteinst)
                 .max_timeslice
-                .is_none()
+                .is_some()
         );
         assert!(
             prepare_backend_config(config, Backend::Ptrace)
@@ -1782,20 +1987,24 @@ mod tests {
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
+        assert!(sabre.backend_reports_physical_process_exits);
         assert!(!sabre.backend_serializes_fork_children);
         assert!(sabre.backend_dispatches_thread_tools);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
+        assert!(!sabre.backend_defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
         assert!(!ptrace.cancel_killed_thread_rpcs);
+        assert!(!ptrace.backend_reports_physical_process_exits);
         assert!(!ptrace.backend_serializes_fork_children);
         assert!(ptrace.backend_dispatches_thread_tools);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
+        assert!(!ptrace.backend_defers_vfork_child_registration);
     }
 
     #[test]
@@ -1803,19 +2012,21 @@ mod tests {
         let config = super::DetConfig::default();
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(!kvm.backend_serializes_fork_children);
-        assert!(!kvm.backend_dispatches_thread_tools);
+        assert!(kvm.backend_dispatches_thread_tools);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
+        assert!(kvm.backend_defers_vfork_child_registration);
     }
 
     #[test]
     fn dbi_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
         assert!(config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_defers_vfork_child_registration);
     }
 
     #[test]
-    fn liteinst_public_dispatch_runs_default_config_without_rcb_timers() {
+    fn liteinst_public_dispatch_runs_ptrace_host_hybrid() {
         if Backend::Liteinst.ensure_available().is_err() {
             return;
         }
@@ -1829,7 +2040,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/echo through LiteinstGuest<Detcore>");
+        .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
 
@@ -1840,11 +2051,12 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/true through LiteinstGuest<Detcore>");
+        .expect("run /bin/true through the ptrace-hosted LiteInst hybrid");
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn default_and_available_backends_reflect_host_probes() {
         assert_eq!(Backend::default(), Backend::Ptrace);
         let available = Backend::available().collect::<Vec<_>>();
@@ -1862,7 +2074,7 @@ mod tests {
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
-            sabre_runtime_unavailable_reason().is_none()
+            Backend::Sabre.is_available()
         );
         assert_eq!(
             available.contains(&Backend::Kvm),
@@ -1875,6 +2087,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dependency_probes_require_usable_paths() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!is_dynamorio_sdk(temp.path()));
@@ -2060,6 +2273,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn optional_backends_report_accurate_availability() {
         match Backend::Dbi.ensure_available() {
             Ok(()) => assert!(
@@ -2106,6 +2320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_retries_only_the_pre_guest_bootstrap_failure() {
         use std::os::unix::process::ExitStatusExt as _;
 
@@ -2119,6 +2334,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_dispatch_requires_sequentialized_threads() {
         let command = super::Command::new("/bin/true");
         let config = super::DetConfig {
@@ -2137,6 +2353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_dispatch_runs_echo_through_detcore() {
         use clap::Parser;
 
@@ -2164,6 +2381,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_status_dispatch_runs_true_through_detcore() {
         use clap::Parser;
 

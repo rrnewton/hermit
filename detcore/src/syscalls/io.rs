@@ -10,6 +10,8 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
@@ -34,6 +36,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
@@ -41,6 +44,7 @@ use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
+use crate::types::DetTid;
 use crate::types::LogicalTime;
 
 // Printing helper
@@ -57,6 +61,32 @@ fn print_poll(call: &syscalls::Poll) {
                 call.fds().unwrap().offset(i as isize)
             );
         }
+    }
+}
+
+/// Build the scheduler request for a zero-timeout poll.
+///
+/// An empty request only rotates the caller within its current priority band. That is not a
+/// yield when a busy poller has a higher priority than the producer whose readiness it is
+/// probing. `SchedYield` excludes the caller from the next selection, allowing exactly one
+/// other runnable guest to make progress before the nonblocking poll executes. Limit that strong
+/// yield to SaBRe tasks with a loopback peer: libcurl alternates its loopback socket with an
+/// internal wakeup fd, and either zero-timeout probe can otherwise starve the peer. General
+/// build-tool polling retains the existing empty-turn behavior.
+fn zero_timeout_poll_request(dettid: DetTid, yield_to_peer: bool) -> Resources {
+    let mut request = Resources::new(dettid);
+    if yield_to_peer {
+        request.insert(ResourceID::SchedYield, Permission::W);
+        request.fyi(SABRE_LOOPBACK_POLL_YIELD_FYI);
+    }
+    request
+}
+
+fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(Error::Errno(errno)) => *errno == Errno::EINPROGRESS,
+        Err(_) => false,
     }
 }
 
@@ -348,17 +378,28 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
+    // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     pub async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+        if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
-            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
-            Ok(self.record_or_replay(guest, call).await?)
+            let yield_to_peer =
+                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            resource_request(
+                guest,
+                zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+            )
+            .await;
+            if self.cfg.recordreplay_modes {
+                Ok(self.record_or_replay(guest, call).await?)
+            } else {
+                Ok(guest.inject(call).await?)
+            }
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.
@@ -390,7 +431,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let raw_timeout = match call.timeout() {
             Some(timeout) => {
-                let timeout: Timespec = guest.memory().read_value(timeout.cast())?;
+                let timeout: Timespec = guest.memory().read_value(timeout)?;
                 Some(timeout)
             }
             None => None,
@@ -410,22 +451,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
-        // the wrapper even when the inner pointer is null. A real mask needs atomic
-        // kernel ownership across the wait, so keep it on the external-blocking path.
-        if let Some(argument) = call.sigmask() {
+        // the wrapper even when the inner pointer is null. A real mask must stay in
+        // effect for the whole wait so an unblocked signal (make's jobserver unblocks
+        // SIGCHLD) can interrupt it. Previously that forced the external-blocking path,
+        // whose completion timing is host-decided and is a source of `make -jN`
+        // execution-log divergence. With SIGCHLD admission now deterministic (scheduler
+        // `sigchld_deferred`/`sigchld_ready`), honor the mask on each deterministic poll
+        // probe instead: a pending unblocked signal is observed at a scheduler-decided
+        // probe point rather than at host signal-arrival time.
+        let sigmask = if let Some(argument) = call.sigmask() {
             let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
             if argument.sigmask != 0 {
-                return self
-                    .record_or_replay_blocking(guest, Syscall::Pselect6(call))
-                    .await;
+                if argument.sigsetsize != KERNEL_SIGSET_SIZE {
+                    return Err(Errno::EINVAL.into());
+                }
+                let mask_addr = AddrMut::<u64>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
+                let mask: u64 = guest.memory().read_value(mask_addr.cast())?;
+                Some(sanitize_ppoll_signal_mask(mask))
+            } else {
+                None
             }
-        }
-        // The null inner mask was snapshotted above. Do not let later guest mutations of
-        // the outer wrapper change the meaning of a retry probe.
+        } else {
+            None
+        };
+        // The inner mask was snapshotted above. Do not let later guest mutations of the
+        // outer wrapper change the meaning of a retry probe.
         let call = call.with_sigmask(None);
         let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
 
-        self.handle_internal_pselect6(guest, call, timeout).await
+        self.handle_internal_pselect6(guest, call, timeout, sigmask)
+            .await
     }
 
     async fn handle_internal_pselect6<G: Guest<Self>>(
@@ -433,6 +488,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pselect6,
         timeout: Option<Duration>,
+        sigmask: Option<u64>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
         let deadline = match timeout {
@@ -465,18 +521,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
         let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
         let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
-        let probe_timeout = stack
-            .push(Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            })
-            .cast::<libc::timeval>();
+        // pselect6's timeout is a writable in-out kernel timespec, so the probe
+        // needs a mutable scratch cell (re-zeroed each iteration below to keep
+        // every probe a non-blocking poll).
+        let probe_timeout = stack.reserve::<Timespec>();
+        // Carry the temporary signal mask on every zero-timeout probe so the kernel
+        // applies it atomically: a pending, mask-unblocked signal makes the probe return
+        // EINTR at a deterministic scheduler point. The probe's wrapper points at scratch
+        // memory the guard keeps alive across each injection.
+        let probe_sigmask = sigmask.map(|mask| {
+            let sigset = stack.push(mask);
+            stack
+                .push(Pselect6SigmaskArg {
+                    sigmask: sigset.as_raw(),
+                    sigsetsize: KERNEL_SIGSET_SIZE,
+                })
+                .cast()
+        });
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
             .with_writefds(writefds)
             .with_exceptfds(exceptfds)
-            .with_timeout(Some(probe_timeout));
+            .with_timeout(Some(probe_timeout))
+            .with_sigmask(probe_sigmask);
 
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
@@ -487,6 +555,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.write_pselect6_remaining(guest, call, deadline).await?;
                 return Err(Errno::EINTR.into());
             }
+            guest.memory().write_value(
+                probe_timeout,
+                &Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            )?;
             write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
             write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
             write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
@@ -547,9 +622,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 tv_sec: (remaining / 1_000_000_000) as libc::time_t,
                 tv_nsec: (remaining % 1_000_000_000) as libc::c_long,
             };
-            // SAFETY: pselect6's timeout is a writable in-out kernel timespec even though
-            // reverie-syscalls exposes the ABI-compatible pointer as shared.
-            let timeout = unsafe { timeout.cast::<Timespec>().into_mut() };
+            // pselect6's timeout is a writable in-out kernel timespec; reverie-syscalls
+            // now types it as `AddrMut<Timespec>`, so the remaining time can be written
+            // back directly without an unsafe pointer cast.
             if let Err(error) = guest.memory().write_value(timeout, &remaining) {
                 // Linux preserves the pselect6 result when remaining-time copyout faults.
                 trace!(?error, "ignoring pselect6 timeout writeback failure");
@@ -904,7 +979,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A nonblocking poll can still be the synchronization point in a
             // userspace polling loop. Yield once before probing so backends
             // without PMU preemption cannot let that loop starve its producer.
-            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            let yield_to_peer =
+                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            resource_request(
+                guest,
+                zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+            )
+            .await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -1059,17 +1140,71 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Connect,
     ) -> Result<i64, Error> {
+        let fd = call.fd();
+        let uservaddr = call.uservaddr();
+        let addrlen = call.addrlen();
+
         if guest.config().sched_heuristic == SchedHeuristic::ConnectBind {
             trace!("Scheduling heuristic: reprioritizing connect");
             let resource = ResourceID::PriorityChangePoint(
                 FIRST_PRIORITY,
                 guest.thread_state().thread_logical_time.as_nanos(),
+                guest.thread_state().committed_clock_value,
+                Vec::new(),
             );
             let req = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, req).await;
         }
 
-        self.execute_nonblockable_fd_syscall(guest, call).await
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        if self.cfg.discover_live_file_metadata
+            && connect_result_allows_peer_classification(&result)
+        {
+            // This metadata is a SaBRe-only scheduling hint, not part of connect's semantics.
+            // Let the kernel establish the authoritative result first, then classify the peer
+            // best-effort so an invalid guest pointer or an untracked fd can never replace the
+            // kernel's errno.
+            let loopback_peer = (|| -> Result<Option<bool>, Error> {
+                let Some(address) = uservaddr else {
+                    return Ok(None);
+                };
+                let addrlen = usize::try_from(addrlen).unwrap_or(0);
+                if addrlen < std::mem::size_of::<u16>() {
+                    return Ok(None);
+                }
+                let family: u16 = guest.memory().read_value(address.cast())?;
+                if family == libc::AF_INET as u16 {
+                    if addrlen < std::mem::size_of::<libc::sockaddr_in>() {
+                        return Ok(None);
+                    }
+                    let address: libc::sockaddr_in = guest.memory().read_value(address.cast())?;
+                    Ok(Some(
+                        Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).is_loopback(),
+                    ))
+                } else if family == libc::AF_INET6 as u16 {
+                    if addrlen < std::mem::size_of::<libc::sockaddr_in6>() {
+                        return Ok(None);
+                    }
+                    let address: libc::sockaddr_in6 = guest.memory().read_value(address.cast())?;
+                    Ok(Some(
+                        Ipv6Addr::from(address.sin6_addr.s6_addr).is_loopback(),
+                    ))
+                } else {
+                    // This includes a successful AF_UNSPEC disconnect and successful connects
+                    // to non-IP families, neither of which has a loopback IP peer.
+                    Ok(Some(false))
+                }
+            })()
+            .ok()
+            .flatten();
+            if let Some(loopback_peer) = loopback_peer {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_loopback_peer(loopback_peer));
+            }
+        }
+
+        result
     }
 
     /// Handles sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
@@ -1326,6 +1461,43 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_timeout_socket_poll_requests_a_strong_one_turn_yield() {
+        let request = zero_timeout_poll_request(DetTid::from_raw(17), true);
+
+        assert_eq!(request.resources.len(), 1);
+        assert_eq!(
+            request.resources.get(&ResourceID::SchedYield),
+            Some(&Permission::W)
+        );
+        assert_eq!(request.fyi, SABRE_LOOPBACK_POLL_YIELD_FYI);
+    }
+
+    #[test]
+    fn zero_timeout_non_socket_poll_keeps_the_existing_empty_turn() {
+        let request = zero_timeout_poll_request(DetTid::from_raw(17), false);
+
+        assert!(request.resources.is_empty());
+        assert!(request.fyi.is_empty());
+    }
+
+    #[test]
+    fn connect_peer_classification_never_overrides_kernel_errors() {
+        assert!(connect_result_allows_peer_classification(&Ok(0)));
+        assert!(connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EINPROGRESS)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EALREADY)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EBADF)
+        )));
+        assert!(!connect_result_allows_peer_classification(&Err(
+            Error::Errno(Errno::EFAULT)
+        )));
+    }
 
     #[test]
     fn ppoll_timeout_uses_timespec_units() {

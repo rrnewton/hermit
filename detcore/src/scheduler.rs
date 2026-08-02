@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -63,6 +64,8 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
+use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
@@ -138,6 +141,17 @@ pub struct ThreadNextTurn {
     pub resp: Ivar<SchedResponse>,
 }
 
+/// State needed to replace a process's scheduler identity after successful exec.
+pub(crate) struct ExecReconnect {
+    pub caller: DetTid,
+    pub new_leader: DetTid,
+    pub detpid: DetPid,
+    pub pre_exec_mm: MmId,
+    pub post_exec_mm: MmId,
+    pub child_tid_addr: usize,
+    pub reconnect_priority: Option<Priority>,
+}
+
 /// Request for resources when the thread next parks.
 /// OR the thread might "park" because it's really exited.
 pub type SchedRequest = Result<Resources, ThreadExited>;
@@ -202,9 +216,32 @@ pub struct BlockedPool {
     /// The protocol here is that the `(request,response)` pair (in `next_turns`) for
     /// threads in `external_io_blockers` will have the request filled in with an
     /// `BlockedExternalContinue` request when the thread is past its blocking action and
-    /// waiting for permission to resume.  The request will stay empty while the thread is
-    /// doing the blocking action.  This is different than the normal relationship
+    /// waiting for permission to resume. A failed operation governed by `BlockingVfork` instead
+    /// reports `VforkFailed`, which follows the same re-admission path after cancelling its
+    /// barrier. The request will stay empty while the thread is doing the blocking action. This is
+    /// different than the normal relationship
     pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
+
+    /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
+    ///
+    /// When a guest child process exits, the kernel raises `SIGCHLD` on the
+    /// parent at a moment decided purely by host timing. If the resulting
+    /// `InboundSignal` turn is committed as soon as it arrives, its position
+    /// races whatever guest work was already runnable -- classically a `make -jN`
+    /// jobserver `pselect6` continuation -- and `--strict --verify` diverges.
+    ///
+    /// Instead the parent is parked here, out of the run queue, and re-admitted
+    /// by `step2e_process_signal_deferred` only once no ordinary (non-poller)
+    /// guest work remains: the same deterministic-work-first policy that governs
+    /// `external_io_blockers`. The physical signal has already been delivered by
+    /// the kernel, so the handler's `wait4`/`waitpid` still reaps a real host
+    /// zombie and no synthetic signal is ever generated.
+    pub sigchld_deferred: BTreeSet<DetTid>,
+
+    /// Deferred `SIGCHLD` parents that `step2e_process_signal_deferred` has
+    /// re-admitted to the run queue. Their `InboundSignal` turn must now be
+    /// granted rather than deferred again on the turn the scheduler selects them.
+    pub sigchld_ready: BTreeSet<DetTid>,
 }
 
 impl BlockedPool {
@@ -213,6 +250,7 @@ impl BlockedPool {
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
             && self.external_io_blockers.is_empty()
+            && self.sigchld_deferred.is_empty()
     }
 
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
@@ -233,7 +271,7 @@ fn external_continue_id(req: &Resources) -> ExternalOpId {
     assert_eq!(req.resources.len(), 1);
     let rsrc = req.resources.iter().next().unwrap().0;
     match rsrc {
-        ResourceID::BlockedExternalContinue(op_id) => *op_id,
+        ResourceID::BlockedExternalContinue(op_id) | ResourceID::VforkFailed(op_id) => *op_id,
         other => panic!("expected external continue request, got {other:?}"),
     }
 }
@@ -279,6 +317,31 @@ pub struct Scheduler {
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
+
+    /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
+    /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
+    logically_killed_threads: BTreeSet<DetTid>,
+
+    /// Accepted address-space incarnation for raw TIDs explicitly reused by exec.
+    exec_incarnations: BTreeMap<DetTid, MmId>,
+
+    /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
+    /// Logical exit-group teardown and physical exit cleanup are distinct events.
+    deregistration_accounted: BTreeSet<DetTid>,
+
+    /// Whether the backend will report final physical process exits after logical cleanup.
+    backend_reports_physical_process_exits: bool,
+
+    /// SaBRe process leaders whose tool exit hook ran before the ptrace supervisor observed the
+    /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
+    /// overtaking a child exit that is not physically waitable yet.
+    pending_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Whether the backend defers spawning a vfork child until after the parent posts its
+    /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
+    /// still on its way rather than that the clone failed. See
+    /// [`Config::backend_defers_vfork_child_registration`].
+    backend_defers_vfork_child_registration: bool,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -661,7 +724,10 @@ async fn sched_loop_inner(
         // If there are NO threads left in the system, then we're truly done:
         {
             let sched = sched.lock().unwrap();
-            if sched.run_queue.is_empty() && sched.blocked.is_empty() {
+            if sched.run_queue.is_empty()
+                && sched.blocked.is_empty()
+                && sched.pending_physical_process_exits.is_empty()
+            {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
@@ -903,6 +969,12 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            logically_killed_threads: Default::default(),
+            exec_incarnations: Default::default(),
+            deregistration_accounted: Default::default(),
+            backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
+            pending_physical_process_exits: Default::default(),
+            backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1086,6 +1158,9 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        if self.cancel_killed_thread_rpcs {
+            self.logically_killed_threads.insert(*dtid);
+        }
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1131,8 +1206,160 @@ impl Scheduler {
             .into_iter()
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
+            let _ = self.begin_physical_process_exit(*detpid);
             self.blocked.timed_waiters.remove_process_timers(*detpid);
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation reconciliation.
+    /// Apply Linux's successful-exec rule when a backend reloads its tool.
+    ///
+    /// Every sibling disappears. If a non-leader called exec, Linux also changes
+    /// that surviving task's TID to the process leader's TID. In that case the old
+    /// caller registration is retired and a fresh leader registration is installed
+    /// before it is removed, so process-exit barriers cannot observe a transiently
+    /// empty thread group.
+    pub fn reconnect_after_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
+        let ExecReconnect {
+            caller,
+            new_leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm,
+            child_tid_addr,
+            reconnect_priority,
+        } = reconnect;
+        let group = self.thread_tree.my_thread_group(&detpid);
+        assert!(group.contains(&caller));
+        assert!(group.contains(&new_leader));
+        self.exec_incarnations.insert(new_leader, post_exec_mm);
+
+        if caller == new_leader {
+            let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
+            for sibling in &siblings {
+                self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
+                self.timeslices.remove(sibling);
+            }
+            self.remove_exec_vfork_barriers(&siblings);
+            return siblings;
+        }
+
+        let survivor_priority = self
+            .priorities
+            .get(&caller)
+            .copied()
+            .or(reconnect_priority)
+            .expect("exec caller must have a scheduler priority");
+        let mut retired = Vec::new();
+        for old_tid in group.into_iter().filter(|tid| *tid != caller) {
+            self.logically_kill_thread(&old_tid, &detpid, pre_exec_mm);
+            self.timeslices.remove(&old_tid);
+            retired.push(old_tid);
+        }
+
+        // The leader identity was occupied by a thread the kernel destroyed as
+        // part of this exec. This is the one intentional exception to permanent
+        // raw-TID tombstones: the pending exec record proves why Linux reused it.
+        self.logically_killed_threads.remove(&new_leader);
+        self.deregistration_accounted.remove(&new_leader);
+        self.pending_physical_process_exits.remove(&detpid);
+        assert!(
+            self.next_turns
+                .insert(
+                    new_leader,
+                    ThreadNextTurn {
+                        dettid: new_leader,
+                        child_tid_addr,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                    },
+                )
+                .is_none(),
+            "retired exec leader still had a scheduler registration"
+        );
+        self.priorities.insert(new_leader, survivor_priority);
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.set_current(new_leader, survivor_priority);
+        }
+        self.runqueue_push_back(new_leader);
+        self.started_up.try_put(());
+
+        self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
+        self.timeslices.remove(&caller);
+        retired.push(caller);
+        self.remove_exec_vfork_barriers(&retired);
+        retired
+    }
+
+    fn remove_exec_vfork_barriers(&mut self, retired: &[DetTid]) {
+        self.vfork_barriers.retain(|parent, child| {
+            !retired.contains(parent) && !child.is_some_and(|tid| retired.contains(&tid))
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vfork_barrier_mentions(&self, dettid: DetTid) -> bool {
+        self.vfork_barriers
+            .iter()
+            .any(|(parent, child)| *parent == dettid || child == &Some(dettid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_vfork_barrier(&mut self, parent: DetTid, child: DetTid) {
+        self.vfork_barriers.insert(parent, Some(child));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_exec_incarnation(&mut self, dettid: DetTid, mm: MmId) {
+        self.exec_incarnations.insert(dettid, mm);
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
+    pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
+        self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+    }
+
+    pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
+        self.exec_incarnations
+            .get(&dettid)
+            .is_none_or(|expected| *expected == mm)
+    }
+
+    /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
+    /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
+    pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
+        !self.cancel_killed_thread_rpcs || self.deregistration_accounted.insert(dettid)
+    }
+
+    /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
+    /// wait status. Other backends retain their existing lifecycle behavior.
+    pub(crate) fn begin_physical_process_exit(&mut self, detpid: DetPid) -> bool {
+        if self.backend_reports_physical_process_exits {
+            let inserted = self.pending_physical_process_exits.insert(detpid);
+            if inserted {
+                trace!(
+                    "[detcore, dpid {}] waiting for final physical process exit",
+                    detpid
+                );
+            }
+            inserted
+        } else {
+            false
+        }
+    }
+
+    /// Release the exact process barrier when the ptrace supervisor receives its final `Exited`
+    /// or `Signaled` wait status. At that lifecycle point the process is physically waitable.
+    pub(crate) fn complete_physical_process_exit(&mut self, detpid: DetPid) -> bool {
+        self.pending_physical_process_exits.remove(&detpid)
+    }
+
+    /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
+    pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
+        let released = self.pending_physical_process_exits.len();
+        self.pending_physical_process_exits.clear();
+        released
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.
@@ -1140,6 +1367,8 @@ impl Scheduler {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
+        self.blocked.sigchld_deferred.remove(dtid);
+        self.blocked.sigchld_ready.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
     }
 
@@ -1321,28 +1550,86 @@ impl Scheduler {
         self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
+        self.step2e_process_signal_deferred(); // May populate run_queue.
         self.step2d_handle_empty_queue(global_time)?;
         Ok(())
+    }
+
+    /// Re-admit parents whose host-async `SIGCHLD` was parked in
+    /// `blocked.sigchld_deferred` (see `block_for_one_resource`). Uses the same
+    /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
+    /// signal is delivered only once the run queue holds no ordinary (non-poller)
+    /// guest work, so its commit order is fixed by the scheduler rather than by
+    /// host signal-arrival timing. Runs after external-IO harvesting so a ready
+    /// IO continuation is always ordered ahead of a deferred signal.
+    fn step2e_process_signal_deferred(&mut self) {
+        if self.blocked.sigchld_deferred.is_empty() {
+            return;
+        }
+        let only_pollers = match self.run_queue.first_priority() {
+            Some(fp) => fp >= LAST_PRIORITY,
+            None => true,
+        };
+        if !self.run_queue.is_empty() && !only_pollers {
+            return;
+        }
+        // BTreeSet drains in sorted DetTid order, giving a canonical admission
+        // order when several parents are owed a signal at the same quiescence.
+        let ready = std::mem::take(&mut self.blocked.sigchld_deferred);
+        for dtid in ready {
+            info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
+            self.blocked.sigchld_ready.insert(dtid);
+            self.run_queue.push_eager_io_repoll(dtid);
+        }
     }
 
     /// Keep scheduling inside an active vfork until the parent can continue.
     /// Before child registration no guest may run; afterward step 3 admits only
     /// the child. A failed clone reaches the parent continuation without a child.
+    ///
+    /// On the ptrace backend the kernel keeps the vfork parent blocked inside the injected
+    /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
+    /// present by the time the parent posts its continuation; an unfulfilled barrier (`None`) at
+    /// that point therefore means the clone failed and the barrier must be dropped. On a backend
+    /// that defers the child spawn (see `backend_defers_vfork_child_registration`, e.g. KVM) the
+    /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
+    /// parent continuation means the child is still on its way and the barrier must be kept.
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+        let defers_registration = self.backend_defers_vfork_child_registration;
         let completed_parents: Vec<_> = self
             .vfork_barriers
-            .keys()
-            .copied()
-            .filter(|parent| {
-                self.next_turns
+            .iter()
+            .filter_map(|(parent, registered_child)| {
+                let child_registered = registered_child.is_some();
+                let remove = match self
+                    .next_turns
                     .get(parent)
                     .and_then(|turn| turn.req.try_read())
-                    .is_some_and(|request| match request {
-                        Ok(resources) => resources.resources.keys().any(|resource| {
+                {
+                    // The parent exited: there will be no child; drop the barrier.
+                    Some(Err(ThreadExited)) => true,
+                    Some(Ok(resources)) => {
+                        let vfork_failed = resources
+                            .resources
+                            .keys()
+                            .any(|resource| matches!(resource, ResourceID::VforkFailed(_)));
+                        let at_continue = resources.resources.keys().any(|resource| {
                             matches!(resource, ResourceID::BlockedExternalContinue(_))
-                        }),
-                        Err(ThreadExited) => true,
-                    })
+                        });
+                        // A failed injected clone is an explicit deterministic outcome: no child
+                        // can ever register, so cancel the barrier on every backend. Successful
+                        // deferred spawns retain the ordinary continuation and keep waiting.
+                        // At parent continuation, drop a fulfilled barrier as normal cleanup. An
+                        // unfulfilled barrier is a failed clone only when the backend kept the
+                        // parent blocked until the child registered; when the backend defers child
+                        // registration the child is still coming, so keep waiting.
+                        vfork_failed || (at_continue && (child_registered || !defers_registration))
+                    }
+                    _ => false,
+                };
+                remove.then_some(*parent)
             })
             .collect();
         for parent in completed_parents {
@@ -1478,14 +1765,18 @@ impl Scheduler {
         self.runqueue_push_front(dettid);
     }
 
-    /// Send a signal to the guest, which should be blocked on the scheduler when this is sent.
-    /// (I.e. the signal is physically delivered when the scheduler resumes the thread's execution.)
+    /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately. SaBRe
+    /// external syscalls remain blocked until the signal interrupts them and their real
+    /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        if cfg!(debug_assertions) {
+        let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid);
+        let await_external_continuation =
+            self.backend_reports_physical_process_exits && has_external_blocker;
+        if cfg!(debug_assertions) && !await_external_continuation {
             let nxtturn = self
                 .next_turns
                 .get(&dettid)
@@ -1497,6 +1788,9 @@ impl Scheduler {
         }
         let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
         signal::kill(pid, signal).expect("signal::kill to go through");
+        if await_external_continuation {
+            return;
+        }
 
         // Now that the thread is signaled, it needs to be runnable for the scheduler to continue it.
         match self.thread_status(dettid) {
@@ -1701,6 +1995,17 @@ impl Scheduler {
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
+            if !self.pending_physical_process_exits.is_empty() {
+                // The SaBRe plugin has run the child process's logical exit hook, but the ptrace
+                // supervisor has not received its final wait status. Fast-forwarding the next
+                // timer here can fire a parent's timeout before the child becomes waitable.
+                trace!(
+                    "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
+                    self.pending_physical_process_exits
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
@@ -1956,15 +2261,15 @@ impl Scheduler {
             }
 
             // Thread CONTINUES after completing [potentially] blocking IO.
-            ResourceID::BlockedExternalContinue(_) => {
+            ResourceID::BlockedExternalContinue(_) | ResourceID::VforkFailed(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
                 // in, this resource request is immediately granted.
                 Ok(())
             }
 
             // Thread requests change in priority
-            ResourceID::PriorityChangePoint(prio, change_time) => {
-                self.perform_priority_changepoint(dettid, *prio, *change_time)
+            ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs) => {
+                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs)
             }
 
             // For now, all other resource types are immediately granted.
@@ -1982,7 +2287,33 @@ impl Scheduler {
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
             ResourceID::SchedYield => Ok(()),
-            ResourceID::InboundSignal(_) => Ok(()),
+
+            // A host-async SIGCHLD (a guest child process exited) is delivered to
+            // the parent at a moment decided by host timing. Committing that turn
+            // immediately makes the signal race whatever guest work was already
+            // runnable (e.g. a `make -jN` jobserver `pselect6` continuation),
+            // which diverges under `--strict --verify`. Defer it deterministic-
+            // work-first: park the parent out of the run queue and let
+            // `step2e_process_signal_deferred` re-admit it once no ordinary guest
+            // work remains, mirroring the `external_io_blockers` policy. Signals
+            // that the scheduler itself synthesizes deterministically (timers via
+            // `fire_alarm`) are never SIGCHLD and are unaffected.
+            ResourceID::InboundSignal(SigWrapper(sig)) => {
+                // `sigchld_ready` marks a parent step2e has already re-admitted;
+                // grant it now rather than deferring it a second time.
+                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
+                if *sig == Signal::SIGCHLD
+                    && !already_readmitted
+                    && self.run_queue.has_runnable_besides(dettid)
+                {
+                    self.run_queue.undo_tentative_pop(); // Begun in step3.
+                    assert!(self.run_queue.remove_tid(dettid));
+                    self.blocked.sigchld_deferred.insert(dettid);
+                    Err(SkipTurn)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -2025,6 +2356,10 @@ impl Scheduler {
 
         new_priority: Priority,
         guest_time: LogicalTime,
+        guest_rcbs: u64,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        chaos_epochs: &[crate::resources::ChaosEpochTransition],
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
         // Alter the threads priority and requeue.
@@ -2039,7 +2374,10 @@ impl Scheduler {
                 "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
                 dettid, guest_time, old_prio, new_priority
             );
-            pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
+            for transition in chaos_epochs {
+                pw.insert_chaos_epoch(dettid, *transition);
+            }
+            pw.insert_reprioritization(dettid, guest_time, guest_rcbs, old_prio, new_priority);
             pw.set_current(dettid, new_priority);
         }
 
@@ -2102,6 +2440,19 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
     }
 
+    /// SaBRe discovers an inherited stdio pipe as a device resource before the inner
+    /// `InternalIOPolling` request. Both turns belong to one host-timing-sensitive pipe
+    /// operation, so their logical-time logging must use the same retry normalization.
+    fn is_sabre_internal_pipe_io_turn(&self, rsrcs: &Resources) -> bool {
+        rsrcs.fyi == SABRE_INTERNAL_PIPE_IO_FYI
+    }
+
+    /// A strong yield issued by a SaBRe task before a zero-timeout poll while it owns a
+    /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
+    fn is_sabre_loopback_poll_yield_turn(&self, rsrcs: &Resources) -> bool {
+        rsrcs.fyi == SABRE_LOOPBACK_POLL_YIELD_FYI
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -2135,7 +2486,11 @@ impl Scheduler {
         // between runs, but those are numerically normalized before comparison.
         let last_turn_was_polling = last_turn
             .as_ref()
-            .map(Self::is_polling_turn)
+            .map(|resources| {
+                Self::is_polling_turn(resources)
+                    || self.is_sabre_internal_pipe_io_turn(resources)
+                    || self.is_sabre_loopback_poll_yield_turn(resources)
+            })
             .unwrap_or(false);
 
         // At this moment, when threads are parked, we know that the global_time is
@@ -2226,9 +2581,20 @@ impl Scheduler {
                 assert_eq!(resp, &nxt.resp);
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
+                let normalization_marker = if self.is_sabre_internal_pipe_io_turn(rsrcs) {
+                    " [sabre-internal-pipe-io]"
+                } else if self.is_sabre_loopback_poll_yield_turn(rsrcs) {
+                    " [sabre-loopback-poll-zero-timeout]"
+                } else {
+                    ""
+                };
                 info!(
-                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}",
-                    self.turn, next_dtid, rsrcs.resources, self.committed_time
+                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
+                    self.turn,
+                    next_dtid,
+                    rsrcs.resources,
+                    self.committed_time,
+                    normalization_marker,
                 );
                 self.unblock_guest(next_dtid, resp);
                 Ok(())
@@ -2793,6 +3159,81 @@ mod test {
         assert!(scheduler.vfork_barriers.is_empty());
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+    #[test]
+    fn vfork_registration_barrier_waits_for_deferred_child_at_continuation() {
+        // On a backend that defers the child spawn (e.g. KVM), the parent posts its continuation
+        // BEFORE the child registers. An unfulfilled barrier at continuation must be kept, not
+        // torn down as a failed clone; otherwise the late child panics on registration.
+        let config = Config {
+            backend_defers_vfork_child_registration: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+            },
+        );
+
+        // Parent is at its continuation but the child has not registered: keep waiting, keep the
+        // barrier (the failed-clone teardown must NOT fire on a deferring backend).
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+
+        // The deferred child registers; now the barrier is fulfilled and released.
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+    #[test]
+    fn vfork_registration_barrier_releases_deferred_failed_clone() {
+        let config = Config {
+            backend_defers_vfork_child_registration: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
+
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.blocked.external_io_blockers.insert(parent, op_id);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(failure)),
+                resp: Ivar::new(),
+            },
+        );
+
+        // The explicit failure proves that no deferred child is coming, so step2a cancels the
+        // barrier instead of waiting forever. The ordinary external-continuation path can then
+        // requeue the parent, whose syscall handler still owns and returns the original errno.
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(parent));
+    }
+
     #[test]
     fn external_io_continuation_does_not_overtake_runnable_peer() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -3056,5 +3497,181 @@ mod test {
             scheduler.select_signal_target(leader, Some(leader)),
             Some(worker)
         );
+    }
+
+    #[test]
+    fn physical_exit_barrier_precedes_empty_queue_timer_fast_forward() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let exit_deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let first_process = DetPid::from_raw(100);
+        let second_process = DetPid::from_raw(200);
+        let unrelated_process = DetPid::from_raw(300);
+
+        assert!(scheduler.begin_physical_process_exit(first_process));
+        assert!(!scheduler.begin_physical_process_exit(first_process));
+        assert!(scheduler.begin_physical_process_exit(second_process));
+        scheduler.register_alarm(
+            first_process,
+            first_process,
+            initial_time,
+            LogicalTime::from_nanos(1_000),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(
+            scheduler
+                .blocked
+                .timed_waiters
+                .iter()
+                .map(|(time, _)| time)
+                .collect::<Vec<_>>(),
+            vec![exit_deadline]
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+
+        assert!(!scheduler.complete_physical_process_exit(unrelated_process));
+        assert!(scheduler.complete_physical_process_exit(first_process));
+        assert!(!scheduler.complete_physical_process_exit(first_process));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(!scheduler.blocked.timed_waiters.is_empty());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+
+        assert!(scheduler.complete_physical_process_exit(second_process));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), exit_deadline);
+    }
+
+    #[test]
+    fn physical_exit_barrier_is_disabled_for_other_backends() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let process = DetPid::from_raw(100);
+
+        assert!(!scheduler.begin_physical_process_exit(process));
+
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+        assert!(!scheduler.complete_physical_process_exit(process));
+        assert_eq!(scheduler.release_all_physical_process_exits(), 0);
+    }
+
+    #[test]
+    fn physical_exit_barrier_begins_when_last_process_thread_is_logically_dead() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        for dettid in [leader, worker] {
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+
+        scheduler.logically_kill_thread(&leader, &leader, MmId::initial(leader));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+
+        scheduler.logically_kill_thread(&worker, &leader, MmId::initial(leader));
+        assert_eq!(
+            scheduler.pending_physical_process_exits,
+            BTreeSet::from([leader])
+        );
+    }
+
+    #[test]
+    fn final_root_and_orphan_exits_release_exact_pid_barriers() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let root = DetPid::from_raw(100);
+        let child = DetPid::from_raw(200);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, child, true);
+        for dettid in [root, child] {
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+
+        scheduler.logically_kill_thread(&root, &root, MmId::initial(root));
+        assert_eq!(
+            scheduler.pending_physical_process_exits,
+            BTreeSet::from([root])
+        );
+        assert!(!scheduler.complete_physical_process_exit(child));
+        assert!(scheduler.complete_physical_process_exit(root));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+
+        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+        assert_eq!(
+            scheduler.pending_physical_process_exits,
+            BTreeSet::from([child])
+        );
+        assert!(scheduler.complete_physical_process_exit(child));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+    }
+
+    #[test]
+    fn final_child_exit_does_not_block_parent_timer() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let parent = DetPid::from_raw(100);
+        let child = DetPid::from_raw(200);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        scheduler.priorities.insert(parent, DEFAULT_PRIORITY);
+        scheduler.blocked.timed_waiters.insert(deadline, parent);
+
+        assert!(scheduler.begin_physical_process_exit(child));
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+        assert!(scheduler.complete_physical_process_exit(child));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
     }
 }

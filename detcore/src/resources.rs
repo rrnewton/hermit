@@ -21,7 +21,32 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
+
+/// Identifies the outer resource turn for a physically nonblocking, guest-internal pipe
+/// operation. SaBRe reports these inherited stdio pipes as device resources before Detcore's
+/// `InternalIOPolling` turn, so the scheduler tags the outer turn for the same retry-count
+/// normalization as the polling turn itself.
+pub(crate) const SABRE_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
+
+/// Identifies the strong one-turn yield issued before a SaBRe task with a loopback peer performs
+/// a zero-timeout poll. The number of these guest polling-loop iterations depends on when the
+/// peer's kernel readiness becomes visible, so the verifier normalizes their scheduler-only turns.
+pub(crate) const SABRE_LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1151)
+/// An exact slowdown-factor transition recorded at a scheduler commit boundary.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct ChaosEpochTransition {
+    /// Per-thread absolute logical time at which the new epoch begins.
+    pub logical_time: LogicalTime,
+    /// Deterministic epoch number.
+    pub epoch: u64,
+    /// Exact fixed-point factor used for virtual-time progression.
+    pub factor: RcbTimeMultiplier,
+}
 
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
@@ -232,6 +257,13 @@ pub enum ResourceID {
     /// another guest turn until the child has registered or the clone has failed.
     BlockingVfork(ExternalOpId),
 
+    // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+    /// A clone operation governed by [`ResourceID::BlockingVfork`] failed before a child could
+    /// register. This is a continuation outcome rather than a new blocking operation: it lets the
+    /// scheduler cancel the pending vfork barrier, re-admit the parent, and preserve the original
+    /// injected syscall error.
+    VforkFailed(ExternalOpId),
+
     /// Permission to CONTINUE execution after returning from a potentially-blocking
     /// operation that reaches outside the container.
     BlockedExternalContinue(ExternalOpId),
@@ -243,7 +275,9 @@ pub enum ResourceID {
     /// No guarantees are made about how it will be used.
     ///
     /// Also includes the local time at which the guest observed the preemption point.
-    PriorityChangePoint(u64, LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    PriorityChangePoint(u64, LogicalTime, u64, Vec<ChaosEpochTransition>),
 
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.

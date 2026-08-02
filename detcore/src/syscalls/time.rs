@@ -37,7 +37,6 @@ use crate::tool_global::register_posix_timer;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
-use crate::types::DetTime;
 use crate::types::LogicalTime;
 
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
@@ -104,8 +103,7 @@ where
     } else {
         thread_observe_time(guest).await
     };
-    let epoch = DetTime::from(&guest.config().epoch).as_nanos();
-    guest.thread_state().observe_guest_clock(raw, epoch)
+    guest.thread_state().observe_guest_clock(raw)
 }
 
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
@@ -162,7 +160,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         change_time: LogicalTime,
         new_priority: Priority,
     ) -> Resources {
-        let resource = ResourceID::PriorityChangePoint(new_priority, change_time);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        let epochs = guest.thread_state_mut().take_pending_chaos_epochs();
+        let rcbs = guest.thread_state().committed_clock_value;
+        let resource = ResourceID::PriorityChangePoint(new_priority, change_time, rcbs, epochs);
         guest.thread_state().mk_request(resource, Permission::W)
     }
 
@@ -228,17 +230,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGetres,
     ) -> Result<i64, Error> {
-        let res = call.res().ok_or(Errno::EFAULT)?;
+        // A NULL `res` pointer is valid for clock_getres: the kernel validates
+        // the clockid and returns 0 without storing the resolution. GHC's RTS
+        // probes the per-thread CPU clock exactly this way
+        // (clock_getres(clockid, NULL)) in getCurrentThreadCPUTime, so
+        // returning EFAULT here spuriously aborts the guest. Only write the
+        // resolution when the caller supplied a destination.
+        if let Some(res) = call.res() {
+            // For now we report a constant clock res of 10ms:
+            let clock_res = 10;
 
-        // For now we report a constant clock res of 10ms:
-        let clock_res = 10;
+            let t = Timespec {
+                tv_sec: 0,
+                tv_nsec: 1000 * clock_res as i64,
+            };
 
-        let t = Timespec {
-            tv_sec: 0,
-            tv_nsec: 1000 * clock_res as i64,
-        };
-
-        guest.memory().write_value(res, &t)?;
+            guest.memory().write_value(res, &t)?;
+        }
 
         Ok(0)
     }

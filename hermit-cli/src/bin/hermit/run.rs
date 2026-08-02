@@ -659,11 +659,7 @@ fn backend_values_parse_and_round_trip() {
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = if expected == Backend::Liteinst {
-            format!(" --backend={value} --max-timeslice=disabled -- fakeprog")
-        } else {
-            format!(" --backend={value} -- fakeprog")
-        };
+        let normalized = format!(" --backend={value} -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
 }
@@ -1017,8 +1013,8 @@ fn skid_margin_override_parses_and_round_trips() {
 }
 
 #[test]
-fn skid_margin_override_rejects_non_ptrace_backends() {
-    for backend in ["dbi", "kvm", "liteinst", "sabre"] {
+fn skid_margin_override_rejects_non_ptrace_backed_backends() {
+    for backend in ["dbi", "kvm", "sabre"] {
         let mut opts = RunOpts::parse_from([
             "fakehermit",
             &format!("--backend={backend}"),
@@ -1027,10 +1023,28 @@ fn skid_margin_override_rejects_non_ptrace_backends() {
         ]);
         let error = opts.validate_args_with_perf_support(true).unwrap_err();
         assert!(
-            error.to_string().contains("requires the ptrace backend"),
+            error
+                .to_string()
+                .contains("requires a ptrace-backed backend"),
             "unexpected {backend} error: {error}"
         );
     }
+}
+
+#[test]
+fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--backend=liteinst",
+        "--skid-margin=500",
+        "fakeprog",
+    ]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.skid_margin, Some(500));
+    assert_eq!(
+        format!("{opts}"),
+        " --backend=liteinst --skid-margin=500 -- fakeprog"
+    );
 }
 
 #[test]
@@ -1157,6 +1171,34 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
         format!("{}", opts),
         " --network=host --no-namespace --tmp=/tmp -- fakeprog"
     );
+}
+
+#[test]
+fn dbi_backend_disables_uts_assumption() {
+    // The DBI backend runs the guest under DynamoRIO without Reverie's
+    // `Container`, so it never enters a UTS namespace or applies the
+    // deterministic hostname. `has_uts_namespace` must therefore be false even
+    // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
+    // the nodename to `hermetic-container.local` instead of leaking the host
+    // FQDN. Regression guard for DBI uname parity with the ptrace backend.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbi", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Dbi);
+    assert!(!opts.no_namespace);
+    assert!(!opts.det_opts.det_config.has_uts_namespace);
+}
+
+#[test]
+fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
+    // The default (ptrace) backend does launch through Reverie's `Container`,
+    // which unshares CLONE_NEWUTS and sets the deterministic hostname, so the
+    // UTS assumption must stay enabled when namespaces are on. Pins the fix to
+    // DBI so it does not regress the ptrace trust-the-namespace path.
+    let mut opts = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Ptrace);
+    assert!(!opts.no_namespace);
+    assert!(opts.det_opts.det_config.has_uts_namespace);
 }
 
 #[test]
@@ -1423,6 +1465,31 @@ impl RunOpts {
         }
     }
 
+    fn verify_liteinst_activation(&self) -> Result<(), Error> {
+        let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .env(super::LITEINST_ACTIVATION_PROBE_ENV, "1");
+        let output = hermit::run_with_output_backend(
+            command,
+            self.effective_det_config(),
+            false,
+            &None,
+            Backend::Liteinst,
+        )?;
+        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
+        if output.status != ExitStatus::Exited(0) || output.stdout != expected {
+            anyhow::bail!(
+                "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        Ok(())
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -1464,9 +1531,10 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else if backend == Backend::E9patch {
-            Backend::Ptrace.ensure_available()?;
         } else if backend != Backend::Kvm {
+            // E9patch's own availability check covers both its ptrace runtime and
+            // the `e9patch` cargo feature (it reports "not included in this build"
+            // when the feature is disabled), so it no longer needs a special case.
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;
@@ -1503,7 +1571,10 @@ impl RunOpts {
         }
 
         if backend == Backend::Liteinst {
-            eprintln!("hermit: [liteinst backend] Detcore Tool active");
+            self.verify_liteinst_activation()?;
+            eprintln!(
+                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            );
         }
 
         if self.no_namespace {
@@ -1529,26 +1600,42 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         let perf_supported = match self.selected_backend() {
-            Backend::Ptrace | Backend::E9patch => reverie_ptrace::is_perf_supported(),
+            Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
+                reverie_ptrace::is_perf_supported()
+            }
             Backend::Dbi | Backend::Sabre | Backend::Kvm => true,
-            Backend::Liteinst => false,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let backend = self.selected_backend();
-        let liteinst_backend = backend == Backend::Liteinst;
         if self.skid_margin.is_some()
-            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
+            && (self.namespace_only
+                || !matches!(
+                    backend,
+                    Backend::Ptrace | Backend::Liteinst | Backend::E9patch
+                ))
         {
             anyhow::bail!(
-                "--skid-margin configures the Reverie ptrace PMU timer and requires the ptrace backend"
+                "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
             );
         }
         let config = &mut self.det_opts.det_config;
 
-        config.has_uts_namespace = !self.no_namespace;
+        // Only the ptrace-family backends launch the guest through Reverie's
+        // `Container` (see `container::default_container`), which unshares
+        // `CLONE_NEWUTS` and applies the deterministic hostname
+        // `hermetic-container.local`. The DBI backend returns early from
+        // dispatch and runs the guest under DynamoRIO with no UTS namespace, so
+        // its `uname()` nodename would otherwise leak the real host FQDN.
+        // Reflect that reality here so Detcore's `handle_uname` deterministic
+        // nodename/domainname rewrite fires for DBI (it is gated on
+        // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
+        // with a deterministic `EPERM` on every backend, so this never masks a
+        // hostname the guest legitimately set.
+        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbi);
+        config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
 
         if self.no_namespace {
             self.network = NetworkingMode::Host;
@@ -1611,12 +1698,7 @@ impl RunOpts {
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.max_timeslice.is_some() && liteinst_backend {
-            eprintln!(
-                "WARNING: --backend=liteinst does not implement PMU/RCB timer delivery; continuing with --max-timeslice=disabled."
-            );
-            config.max_timeslice = None;
-        } else if config.max_timeslice.is_some() && !perf_supported {
+        if config.max_timeslice.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(
                 "WARNING: --max-timeslice requires user-space perf counters, but \
@@ -2152,7 +2234,9 @@ impl RunOpts {
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
-            Backend::Liteinst => Some("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+            Backend::Liteinst => {
+                Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
+            }
             _ => None,
         };
         if let Some(backend_banner) = backend_banner {
