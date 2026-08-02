@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 24/24 | 100% |
-| DBI | 23/24 | 96% |
-| KVM | 23/24 | 96% |
+| ptrace | 27/27 | 100% |
+| DBI | 26/27 | 96% |
+| KVM | 26/27 | 96% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 24/24 | DETLOG-bitwise | 100% |
-| DBI | 22/24 | DETLOG-bitwise | 92% |
-| KVM | 22/24 | guest-visible only | 92% |
+| ptrace | 27/27 | DETLOG-bitwise | 100% |
+| DBI | 25/27 | DETLOG-bitwise | 93% |
+| KVM | 25/27 | guest-visible only | 93% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -94,6 +94,21 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
+The file-descriptor and file-positioning family (`fd_duplication`,
+`dup_shared_offset`, `lseek_positioning`) pins the open-file-description and
+offset invariants Detcore must preserve identically on every backend. The
+`fd_duplication` row checks that `dup`/`dup2` yield a target without
+close-on-exec while `dup3(O_CLOEXEC)` and `fcntl F_DUPFD_CLOEXEC` set it, that
+`fcntl F_SETFD/F_GETFD` round-trips `FD_CLOEXEC`, and that `F_DUPFD` returns the
+lowest free descriptor at or above the request. The `dup_shared_offset` row
+verifies that descriptors sharing one open file description advance a single
+byte offset, so a write or seek through either descriptor is visible through the
+other. The `lseek_positioning` row exercises `SEEK_SET`/`SEEK_CUR`/`SEEK_END`
+plus sparse-hole seeking past end-of-file and short reads at boundaries. Each
+row observes only aggregated invariants (a byte offset, checksum, and boolean
+counts), never a raw descriptor number, and all three pass on ptrace, DBI, and
+KVM with DBI verifying byte-identical DETLOG under strict verification.
+
 ## Matrix
 
 Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
@@ -121,6 +136,9 @@ is not reached.
 | `pthread_lifecycle` | pass / detlog | gap / gap | pass / guest |
 | `process_wait_accounting` | pass / detlog | pass / detlog | pass / **gap** |
 | `process_wait_lifecycle` | pass / detlog | pass / detlog | gap / gap |
+| `fd_duplication` | pass / detlog | pass / detlog | pass / guest |
+| `dup_shared_offset` | pass / detlog | pass / detlog | pass / guest |
+| `lseek_positioning` | pass / detlog | pass / detlog | pass / guest |
 | `cpuid_policy` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_clock` | pass / detlog | pass / detlog | pass / guest |
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |

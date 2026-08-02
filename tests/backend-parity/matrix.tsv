@@ -18,6 +18,9 @@ shared_anonymous_mmap	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 pthread_lifecycle	pass	gap	pass	Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness	-	detlog	gap	guest	inherited from the L1 DBI pthread_lifecycle gap: DynamoRIO startup stall prevents any L2 verify run	-
 process_wait_accounting	pass	pass	pass	-	-	detlog	detlog	gap	-	under --verify the concurrent double-run races child reaping: waitid on the already-reaped child returns ECHILD, so the second run exits non-zero; reverie-kvm synchronizes wait4 child state but not waitid
 process_wait_lifecycle	pass	pass	gap	-	KVM records serialized child exits and implements wait4/waitid, but does not synthesize guest SIGCHLD handler delivery	detlog	detlog	gap	-	inherited from the L1 KVM process_wait_lifecycle gap: no guest SIGCHLD frame synthesis, so there is no L2 run to verify
+fd_duplication	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+dup_shared_offset	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+lseek_positioning	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 cpuid_policy	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 virtual_clock	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 random_sources	pass	pass	pass	-	-	detlog	detlog	guest	-	-
