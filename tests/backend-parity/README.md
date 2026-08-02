@@ -127,6 +127,17 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `numa_node_identity` | pass / detlog | pass / detlog | pass / guest |
+
+The `numa_node_identity` contract pins Detcore's single-virtual-node NUMA model:
+`get_mempolicy(2)` reports `MPOL_DEFAULT`, and `move_pages(2)` in location-query
+mode reports node `0` for every page — including a deliberately not-present page
+that a real kernel reports as `-ENOENT`. The fixture maps two anonymous pages,
+faults in only the first, and asserts node `0` for both across repeated queries.
+Because a native run reports `-ENOENT` for the not-present page, it diverges,
+while every backend routes these determinized syscalls through the same shared
+Detcore handler, so the guest observes an identical, host-independent result
+across ptrace, DBI, and KVM and across the `--verify` double run.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
