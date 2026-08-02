@@ -109,33 +109,61 @@ matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
 qualifies `backend-parity-c/pid-probe` and `debugger-c/debuggee` at SaBRe L2
 with byte-identical ptrace output under the portable profile. It does not claim
 parity for child/thread identities, whose backend task topologies still differ.
-At this increment's source tree, the executable plan enables SaBRe for 133/199
-ptrace verify cells (66.8%, B3), up by two cells from 131/199 (65.8%) on the
-same plan.
+The socket-cookie increment gives sockets their own per-task open sequence.
+Linux specifies a nonzero identity that is unique among live sockets and shared
+by descriptor aliases, but does not specify its numeric value. Keeping the
+socket sequence separate from regular-file opens preserves those properties and
+prevents ptrace-only dynamic-linker file operations from shifting SaBRe-visible
+cookies. This qualifies `c-programs/socket-cookie-tcp`,
+`c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` at SaBRe L2
+with byte-identical ptrace output under the portable profile.
+
+At this increment's source tree, the executable plan enables SaBRe for 133/200
+ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
+That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
+the denominator and enabled set have changed since the historical 133/199
+root-process-identity snapshot above.
 
 ## Known gaps
 
-The following 16 cells are deterministic inside SaBRe but do not match ptrace
-guest output, so they remain disabled:
+The historical output-differ audit contained 18 cells. Five now have
+byte-identical ptrace/SaBRe output and are enabled. Ten remain under the owners
+of clock, multithreaded-random, SIGCHLD, or multithreaded-identity semantics.
+The three remaining non-gated cells pass SaBRe L2 but stay disabled because
+their guest output is still backend-specific:
 
-```text
-c-programs/dbi-pid-virtualization
-c-programs/print-memaddrs
-c-programs/proc-fdinfo
-c-programs/random-sources
-c-programs/setitimer-determinism
-c-programs/sigtimedwait-timeout-1s
-c-programs/socket-cookie-tcp
-c-programs/socket-cookie-udp
-c-programs/socket-cookie-unix
-c-programs/socket-timestamp-edge-cases
-c-programs/socket-timestamp-timespec
-c-programs/socket-timestamp-timeval
-c-programs/sysinfo
-c-programs/sysinfo-uptime
-c-programs/wait-on-child
-determinism-stress-c/pid-tid
-```
+| Cell | Disposition | Evidence |
+| --- | --- | --- |
+| `backend-parity-c/pid-probe` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
+| `c-programs/dbi-pid-virtualization` | Blocked | Child allocation and vfork/exec behavior still expose different backend task topologies. |
+| `c-programs/print-memaddrs` | Blocked | SaBRe relocation changes the stack, brk heap, and large-allocation addresses. |
+| `c-programs/proc-fdinfo` | Blocked | Loader-visible regular-file opens shift the virtual inode: ptrace reports 3 and SaBRe reports 1. |
+| `c-programs/random-sources` | Owner-gated | Multithreaded random ordering belongs to the MT-random owner. |
+| `c-programs/setitimer-determinism` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/sigtimedwait-timeout-1s` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-cookie-tcp` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-cookie-udp` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-cookie-unix` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-timestamp-edge-cases` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-timestamp-timespec` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-timestamp-timeval` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/sysinfo` | Owner-gated | Uptime and memory observations are owned with guest-clock/vtime semantics. |
+| `c-programs/sysinfo-uptime` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/wait-on-child` | Owner-gated | Child completion ordering belongs to the SIGCHLD owner. |
+| `debugger-c/debuggee` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
+| `determinism-stress-c/pid-tid` | Owner-gated | Thread identity allocation belongs to MT identity and scheduling. |
+
+The three non-gated probes were rerun at Hermit
+`cc026964cf8b992ecd95883418991571783799c0` with Reverie
+`aa6f1283aeee3efd174c57f6dd8198310bd307e1`. All three passed SaBRe INFO-level
+L2 under the portable profile, but direct strict ptrace/SaBRe stdout comparison
+failed for all three. This audit therefore makes no manifest promotion: the
+plan remains 133/200 before and after it.
+
+Separately, the same full scorecard found the already-enabled
+`c-programs/mmap-determinism` at L2 on both backends but with
+`stdout_parity=false`. That regression is outside the historical 18-cell set
+and requires independent requalification; it is not counted as progress here.
 
 The following 30 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
@@ -177,11 +205,14 @@ Additional backend-wide limits:
 
 - GNU `patch` reaches `getrandom` through glibc at a libc site that the SaBRe
   syscall rewriter can miss. The plugin detours that libc function through
-  Detcore; the canonical `patch` workload then passed five consecutive strict
-  verification probes with matching DETLOG/COMMIT streams. This does not close
-  the broader random-source gap: the multithreaded `random-sources` probe still
-  produces different ptrace and SaBRe stdout and DETLOG streams and remains
-  disabled.
+  Detcore. The canonical `patch` workload passed five consecutive strict
+  verification probes on the measured Fedora host, but a GitHub Ubuntu package
+  still reached a different libc-internal random path and varied its temporary
+  suffix. Portable CI therefore covers a compiled public-`getrandom` caller;
+  it does not claim every host `patch` build is deterministic. This also does
+  not close the broader random-source gap: the multithreaded `random-sources`
+  probe still produces different ptrace and SaBRe stdout and DETLOG streams
+  and remains disabled.
 - The exhaustive `relaxed_flag_matrix` integration test is currently a
   ptrace-only cross-product. It exercises getrandom in its observation guest,
   but provides no SaBRe flag-matrix coverage; adding a bounded SaBRe slice is a
