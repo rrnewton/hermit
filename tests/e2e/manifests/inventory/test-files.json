@@ -866,6 +866,12 @@
       "why": "tests/c/sabre_exit_group_parked.c is owned by hermit-cli/tests/hermit_modes.rs: The Rust integration test compiles this SaBRe-only lifecycle guest, supplies the reviewed loader, enforces strict verification, and owns bounded process-group cleanup; a generic manifest cell cannot express that backend-specific setup and timeout contract."
     },
     {
+      "path": "tests/c/sched_getaffinity_identity.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/sched_getaffinity_identity.c is owned by tests/backend-parity/run_matrix.py: Raw-syscall sched_getaffinity(2) backend-parity contract guest run by the backend-parity matrix driver rather than the e2e manifest harness; it pins Detcore's single-virtual-CPU determinization so the syscall returns the fixed 16-byte cpumask with only CPU 0 set, keeping results byte-identical across ptrace, DBI, and KVM."
+    },
+    {
       "path": "tests/c/sched_setattr_batch.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
