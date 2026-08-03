@@ -78,6 +78,15 @@ jobs:
           ref: main
           path: trusted
           persist-credentials: false
+      - name: Prove required checks fail closed
+        run: |
+          set -euo pipefail
+          test_script="$GITHUB_WORKSPACE/trusted/scripts/test-require-check-success.sh"
+          if [ ! -x "$test_script" ]; then
+            test_script="$GITHUB_WORKSPACE/candidate/scripts/test-require-check-success.sh"
+          fi
+          test -x "$test_script"
+          "$test_script"
       - name: Require a complete test inventory on the merge result
         run: |
           set -euo pipefail
@@ -89,15 +98,6 @@ jobs:
           fi
           test -x "$checker"
           "$checker" "$GITHUB_WORKSPACE/candidate"
-      - name: Prove required checks fail closed
-        run: |
-          set -euo pipefail
-          test_script="$GITHUB_WORKSPACE/trusted/scripts/test-require-check-success.sh"
-          if [ ! -x "$test_script" ]; then
-            test_script="$GITHUB_WORKSPACE/candidate/scripts/test-require-check-success.sh"
-          fi
-          test -x "$test_script"
-          "$test_script"
 
   refire-on-ci-completion:
     name: refire-on-ci-completion
