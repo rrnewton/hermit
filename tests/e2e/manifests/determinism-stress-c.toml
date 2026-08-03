@@ -354,10 +354,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "Forwarded-DETLOG SaBRe verification exits during the first run before producing guest output; the historical stdout-only qualification is insufficient"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
 
 [test.modes.naked]
