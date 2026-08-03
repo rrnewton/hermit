@@ -20,10 +20,12 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head after the repository
-# GitHub-managed portable CI job succeeds or after a fully green local validate.sh
-# run applies the locally-validated label. The independent Reverie-pin lint does
-# not taint this product-test result. Demo-relevant changes
+# This lightweight required check accepts an exact PR head only after the
+# repository GitHub-managed portable CI job succeeds. A locally-validated label
+# is supporting evidence, never a substitute for a required GitHub check.
+# Inventory completeness is checked unconditionally on the synthesized PR +
+# current-main tree. The independent Reverie-pin lint does not taint this
+# product-test result. Demo-relevant changes
 # additionally require the exact-SHA P0 demo gate; local validation never bypasses
 # that owner-mandated gate. Privileged CI is an independent bonus signal.
 # Merge-group checks inspect their constituent PR heads instead of trusting the
@@ -33,24 +35,21 @@ on:
 # fork privileged runners and fork pull requests receive a read-only token in
 # that repository. Upstream relies on the GitHub-managed portable Rust job instead.
 
-# Deduplicate superseded runs. Every push/label to a PR re-fires this workflow;
-# without cancellation those runs stack in the shared hosted-runner queue (they
-# ran ~40 deep on 2026-08-03), so even this ~5s stamp-check waits behind 40-min
-# builds and landing stalls. The check is idempotent (it re-reads the current PR
-# head state), so cancelling an in-flight PR run is always safe. Cancel ONLY
-# pull_request runs; merge_group, workflow_run, and workflow_dispatch runs each
-# get a unique group and are never cancelled. Mirrors demo-hot-path.yml.
+# Never cancel a required gate run. GitHub can retain an older successful check
+# with the same context when a newer run is cancelled, which masks NOT-PASSED as
+# mergeable. These control-plane runs are short and use the dedicated gate pool;
+# queued duplicates are cheaper than ambiguous required-check state.
 concurrency:
   group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   actions: read
   contents: read
   pull-requests: read
 
-# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
-# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
+# Control-plane merge-gate jobs run on the dedicated `gate` self-hosted runner
+# pool rather than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
 # a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
 # ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
 # ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
@@ -61,6 +60,45 @@ permissions:
 # outage cannot block landing. Because the required-check context is the job name
 # (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
 jobs:
+  merge-safety-guards:
+    name: Merge safety guards
+    if: github.repository == 'rrnewton/hermit' && github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the synthesized candidate tree
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr_number) || '' }}
+          persist-credentials: false
+      - name: Check out the trusted inventory checker
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+      - name: Require a complete test inventory on the merge result
+        run: |
+          set -euo pipefail
+          checker="$GITHUB_WORKSPACE/trusted/scripts/check-test-inventory.sh"
+          # Bootstrap this guard's own PR. Once it lands, every later PR uses
+          # main's checker and cannot weaken the audit in its candidate tree.
+          if [ ! -x "$checker" ]; then
+            checker="$GITHUB_WORKSPACE/candidate/scripts/check-test-inventory.sh"
+          fi
+          test -x "$checker"
+          "$checker" "$GITHUB_WORKSPACE/candidate"
+      - name: Prove required checks fail closed
+        run: |
+          set -euo pipefail
+          test_script="$GITHUB_WORKSPACE/trusted/scripts/test-require-check-success.sh"
+          if [ ! -x "$test_script" ]; then
+            test_script="$GITHUB_WORKSPACE/candidate/scripts/test-require-check-success.sh"
+          fi
+          test -x "$test_script"
+          "$test_script"
+
   refire-on-ci-completion:
     name: refire-on-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
@@ -247,7 +285,7 @@ jobs:
 
   merge-gate:
     name: merge-gate
-    needs: [invalidate-local-validation, core-review-protocol]
+    needs: [merge-safety-guards, invalidate-local-validation, core-review-protocol]
     if: >-
       always() &&
       github.repository == 'rrnewton/hermit' &&
@@ -255,24 +293,32 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
+      - name: Check out trusted gate policy
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
       - name: Require the core-change review protocol
         env:
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
         run: |
           set -euo pipefail
-          # core-review-protocol shares merge-gate's activation conditions, so it
-          # runs whenever this job does; treat anything other than a clean pass
-          # (or a defensive skip) as a landing block.
-          case "$PROTOCOL_RESULT" in
-            success | skipped)
-              echo "core-review-protocol result: $PROTOCOL_RESULT"
-              ;;
-            *)
-              echo "::error::Core-change review protocol did not pass (result=$PROTOCOL_RESULT); blocking landing."
-              exit 1
-              ;;
-          esac
-      - name: Require successful CI or local validation
+          if [ "$PROTOCOL_RESULT" != success ]; then
+            echo "::error::Core-change review protocol did not pass (result=$PROTOCOL_RESULT); blocking landing."
+            exit 1
+          fi
+          echo "core-review-protocol result: success"
+      - name: Require merge safety guards
+        env:
+          SAFETY_RESULT: ${{ needs.merge-safety-guards.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SAFETY_RESULT" != success ]; then
+            echo "::error::Merge safety guards did not pass (result=$SAFETY_RESULT)."
+            exit 1
+          fi
+          echo "Merge safety guards passed."
+      - name: Require successful CI
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
@@ -284,6 +330,23 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+
+          require_check_success() {
+            if [ -x scripts/require-check-success.sh ]; then
+              scripts/require-check-success.sh "$@"
+              return
+            fi
+            # Bootstrap this guard's own PR. The trusted main checkout does not
+            # contain the helper until this change lands; keep the same exact
+            # one-pass-state policy inline for that first run.
+            local label=$1 status=${2,,} conclusion=${3,,}
+            if [ "$status" = completed ] && [ "$conclusion" = success ]; then
+              echo "$label passed (completed/success)."
+              return 0
+            fi
+            echo "$label is NOT PASSED ($status/${conclusion:-none}); re-run is required." >&2
+            return 1
+          }
 
           if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
              [ "$INVALIDATION_RESULT" != success ]; then
@@ -347,50 +410,48 @@ jobs:
           fi
 
           failed=0
-          while IFS=$'\t' read -r pr_number head_sha locally_validated; do
+          while IFS=$'\t' read -r pr_number head_sha; do
             if [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
               echo "::error::PR #${pr_number} has no head SHA."
               failed=1
               continue
             fi
-            if [ "$locally_validated" = true ]; then
-              echo "PR #${pr_number} is locally validated at $head_sha."
+            runs="$(
+              gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
+            )"
+            run="$(jq --arg sha "$head_sha" '
+              [.workflow_runs[] | select(.head_sha == $sha)]
+              | sort_by(.created_at)
+              | last // {}
+            ' <<< "$runs")"
+            run_id="$(jq -r '.id // ""' <<< "$run")"
+            url="$(jq -r '.html_url // ""' <<< "$run")"
+
+            # Gate on the authoritative product-test job, not the whole run.
+            # The same workflow contains the independent `reverie-pin` lint;
+            # a stale pin can fail that job while Regular tests are green.
+            if [ -z "$run_id" ]; then
+              echo "::error::No ci-portable.yml run for PR #${pr_number} at $head_sha."
+              failed=1
             else
-              runs="$(
-                gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
+              jobs="$(
+                gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
               )"
-              run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[] | select(.head_sha == $sha)]
-                | sort_by(.created_at)
+              regular_job="$(jq '
+                [.jobs[] | select(.name == "Regular tests (GitHub-managed portable)")]
                 | last // {}
-              ' <<< "$runs")"
-              run_id="$(jq -r '.id // ""' <<< "$run")"
-              url="$(jq -r '.html_url // ""' <<< "$run")"
+              ' <<< "$jobs")"
+              job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
+              job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
+              job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
 
-              # Gate on the authoritative product-test job, not the whole run.
-              # The same workflow contains the independent `reverie-pin` lint;
-              # a stale pin can fail that job while Regular tests are green.
-              if [ -z "$run_id" ]; then
-                echo "::error::No ci-portable.yml run for PR #${pr_number} at $head_sha."
-                failed=1
+              if require_check_success \
+                   "Regular tests for PR #${pr_number} at $head_sha" \
+                   "$job_status" "$job_conclusion"; then
+                echo "Authoritative portable job: ${job_url:-$url}"
               else
-                jobs="$(
-                  gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
-                )"
-                regular_job="$(jq '
-                  [.jobs[] | select(.name == "Regular tests (GitHub-managed portable)")]
-                  | last // {}
-                ' <<< "$jobs")"
-                job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
-                job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
-                job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
-
-                if [ "$job_status:$job_conclusion" = completed:success ]; then
-                  echo "Authoritative portable job passed for PR #${pr_number} at $head_sha: ${job_url:-$url}"
-                else
-                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_status/${job_conclusion:-none}: ${job_url:-${url:-no run URL}}."
-                  failed=1
-                fi
+                echo "::error::Required portable job is not passed: ${job_url:-${url:-no run URL}}."
+                failed=1
               fi
             fi
 
@@ -416,7 +477,9 @@ jobs:
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
 
-              if [ "$demo_status:$demo_conclusion" = completed:success ]; then
+              if require_check_success \
+                   "P0 demo gate for hot-path PR #${pr_number} at $head_sha" \
+                   "$demo_status" "$demo_conclusion"; then
                 echo "P0 demo gate passed for hot-path PR #${pr_number} at $head_sha: $demo_url"
               else
                 echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_status/${demo_conclusion:-none}: ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
@@ -427,7 +490,7 @@ jobs:
             fi
           done < <(jq -r '
             .[]
-            | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
+            | [.number, .head.sha]
             | @tsv
           ' <<< "$pull_requests")
 

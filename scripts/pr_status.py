@@ -38,24 +38,13 @@ DEFAULT_MAIN_LIMIT = 10
 HUMAN_REVIEW_LABEL = "human-review"
 REGULAR_PORTABLE_CHECK = "Regular tests (GitHub-managed portable)"
 REQUIRED_CHECKS = {
-    "rrnewton/hermit": (REGULAR_PORTABLE_CHECK,),
+    "rrnewton/hermit": (REGULAR_PORTABLE_CHECK, "merge-gate"),
     "rrnewton/reverie": (
         REGULAR_PORTABLE_CHECK,
         "Host-dependent tests (privileged)",
     ),
 }
 
-RED_CONCLUSIONS = frozenset(
-    (
-        "FAILURE",
-        "TIMED_OUT",
-        "CANCELLED",
-        "ERROR",
-        "ACTION_REQUIRED",
-        "STARTUP_FAILURE",
-        "STALE",
-    )
-)
 PENDING_STATES = frozenset(
     ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
 )
@@ -98,8 +87,8 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
 
     GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
     In particular, Hermit's merge gate intentionally starts red and refires
-    after portable CI completes. Those historical placeholders must not turn a
-    portable-green pull request red in this operational report.
+    after portable CI completes. The latest exact-head result wins, but both
+    authoritative portable CI and the ruleset-required merge gate must pass.
     """
     if not isinstance(checks, list) or not checks:
         return "none"
@@ -125,14 +114,17 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
         conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         status = str(check.get("status") or "").upper()
 
-        if conclusion in RED_CONCLUSIONS:
-            return "red"
         if (
             conclusion in PENDING_STATES
             or not conclusion
             or (status and status != "COMPLETED")
         ):
             saw_pending = True
+        elif conclusion != "SUCCESS":
+            # Fail closed on every completed non-success conclusion, including
+            # cancelled, skipped, neutral, stale, and future values GitHub may
+            # add. Only completed/success is mergeable evidence.
+            return "red"
 
     return "pending" if saw_pending else "green"
 
@@ -306,7 +298,15 @@ def classify_run_conclusion(conclusion: object, status: object) -> str:
     stat = str(status or "").upper()
     if concl == "SUCCESS":
         return "pass"
-    if concl in RED_CONCLUSIONS:
+    if concl in (
+        "FAILURE",
+        "TIMED_OUT",
+        "CANCELLED",
+        "ERROR",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+        "STALE",
+    ):
         return "fail"
     if concl in ("SKIPPED", "NEUTRAL"):
         return "skipped"

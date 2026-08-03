@@ -12,6 +12,14 @@ import pr_status
 
 
 class ClassifyCiRollupTest(unittest.TestCase):
+    @staticmethod
+    def merge_gate(conclusion: str = "SUCCESS", status: str = "COMPLETED") -> dict[str, str]:
+        return {
+            "name": "merge-gate",
+            "conclusion": conclusion,
+            "status": status,
+        }
+
     def test_empty_or_missing_is_none(self) -> None:
         self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", []), "none")
         self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", None), "none")
@@ -27,6 +35,31 @@ class ClassifyCiRollupTest(unittest.TestCase):
         self.assertEqual(
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
         )
+
+    def test_every_completed_non_success_required_check_is_red(self) -> None:
+        for conclusion in (
+            "FAILURE",
+            "TIMED_OUT",
+            "CANCELLED",
+            "SKIPPED",
+            "NEUTRAL",
+            "STALE",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "SOME_FUTURE_CONCLUSION",
+        ):
+            checks = [
+                {
+                    "name": pr_status.REGULAR_PORTABLE_CHECK,
+                    "conclusion": conclusion,
+                    "status": "COMPLETED",
+                }
+            ]
+            self.assertEqual(
+                pr_status.classify_ci_rollup("rrnewton/hermit", checks),
+                "red",
+                msg=conclusion,
+            )
 
     def test_incomplete_status_is_pending(self) -> None:
         checks = [
@@ -46,13 +79,14 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
-            }
+            },
+            self.merge_gate(),
         ]
         self.assertEqual(
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
         )
 
-    def test_merge_gate_failure_is_ignored(self) -> None:
+    def test_merge_gate_failure_blocks(self) -> None:
         checks = [
             {
                 "name": "merge-gate",
@@ -68,7 +102,20 @@ class ClassifyCiRollupTest(unittest.TestCase):
             },
         ]
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
+        )
+
+    def test_cancelled_required_merge_gate_blocks(self) -> None:
+        checks = [
+            {
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+            },
+            self.merge_gate("CANCELLED"),
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
         )
 
     def test_latest_authoritative_rerun_wins(self) -> None:
@@ -85,6 +132,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:05:00Z",
             },
+            self.merge_gate(),
         ]
         self.assertEqual(
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
@@ -123,6 +171,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
+            self.merge_gate(),
         ]
         self.assertEqual(
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"

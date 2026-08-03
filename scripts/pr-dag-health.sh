@@ -86,18 +86,26 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
 ENRICH_JQ='
 def result: (.conclusion // .state // .status // "PENDING");
 def red: ["FAILURE","TIMED_OUT","CANCELLED","ERROR","ACTION_REQUIRED","STARTUP_FAILURE","STALE"];
+def run_id:
+  (try ((.detailsUrl // "") | capture("/runs/(?<id>[0-9]+)") | .id | tonumber) catch -1);
+def latest($rollup; $name):
+  ($rollup | map(select((.name // .context)==$name))
+   | sort_by(run_id, (.startedAt // .createdAt // .completedAt // ""))
+   | last);
 def ci_of($rollup):
   ($rollup // []) as $r
   | { checks: ($r|length),
-      regular: (($r | map(select((.name // .context)=="Regular tests (GitHub-managed portable)")) | .[0]) as $x
+      regular: (latest($r; "Regular tests (GitHub-managed portable)") as $x
                 | if $x==null then "NONE" else ($x|result) end),
+      gate: (latest($r; "merge-gate") as $x
+             | if $x==null then "NONE" else ($x|result) end),
       hostdep: (($r | map(select((.name // .context)=="Privileged capability and E2E tests")) | .[0]) as $x
                 | if $x==null then "NONE" else ($x|result) end) }
   | . as $o
   | $o + { overall:
-      (if $o.regular=="SUCCESS" then "PASS"
-       elif (red | index($o.regular)) then "FAIL"
-       elif $o.regular=="NONE" then (if $o.checks==0 then "NONE" else "OTHER" end)
+      (if $o.regular=="SUCCESS" and $o.gate=="SUCCESS" then "PASS"
+       elif (red | index($o.regular)) or (red | index($o.gate)) then "FAIL"
+       elif $o.regular=="NONE" and $o.gate=="NONE" then (if $o.checks==0 then "NONE" else "OTHER" end)
        else "PENDING" end) };
 
 . as $prs

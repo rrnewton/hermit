@@ -152,41 +152,10 @@ function load_tests {
 }
 
 function audit_inventory {
-    [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
-    jq -e '
-        .schema == 2
-        and (.files | type == "array" and length > 0)
-        and (.files | all(
-            type == "object"
-            and ((keys | sort) == ["disposition", "path", "runner", "why"])
-            and (.path | type == "string" and startswith("tests/") and (contains("..") | not))
-            and (.disposition | type == "string" and length > 0)
-            and (.runner | type == "string" and length > 0)
-            and (.why | type == "string" and length > 0)
-            and (. as $entry | ($entry.why | startswith($entry.path + " is owned by " + $entry.runner + ": ")))))
-        and ((.files | map(.path) | unique | length) == (.files | length))
-        and ([.files[] | select(.disposition != "manifest-test")
-              | . as $entry
-              | ($entry.why | ltrimstr($entry.path + " is owned by " + $entry.runner + ": "))]
-             | length == (unique | length))
-        and all(.files[] | select(.disposition != "manifest-test");
-            (. as $entry
-             | ($entry.why
-                | ltrimstr($entry.path + " is owned by " + $entry.runner + ": ")
-                | length >= 120)))
-    ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
+    "$ROOT_DIR/scripts/check-test-inventory.sh" "$ROOT_DIR"
 
-    local scratch expected actual
+    local scratch
     scratch=$(mktemp -d)
-    expected="$scratch/expected"
-    actual="$scratch/actual"
-    find "$ROOT_DIR/tests" \( -type f -o -type l \) -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
-    jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
-    if ! diff -u "$expected" "$actual"; then
-        rm -rf "$scratch"
-        die "test inventory is stale; every file in tests/ must have an explicit disposition"
-    fi
-
     local manifest_programs="$scratch/manifest-programs"
     local inventory_manifest_tests="$scratch/inventory-manifest-tests"
     local test
