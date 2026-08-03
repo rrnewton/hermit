@@ -88,6 +88,11 @@ to the jobs a workflow would launch.
   A shard runs iff **any** of its nodes was selected. A release shard also
   declares `needs` (`dbi` / `aux`), which is how the selector decides whether the
   `build-dbi` / `build-aux` release builds are needed.
+- **Preflight** (`ci/portable-shards.json`, `preflight_nodes`). GitHub's
+  preflight job runs every entry. `add_to_selection: true` marks the original
+  three cheap gates that are also inserted into local and GitHub selective node
+  sets. This records the existing difference without naming the same node in a
+  second policy file.
 - **E2E cells** (`ci/expected-e2e-plan.json`, the 52 portable cells). Cells are
   filtered by **per-change backend affinity**, not by node membership — see next
   section.

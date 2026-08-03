@@ -235,7 +235,7 @@ jobs:
       - name: Rust components
         run: rustup component add rustfmt
       - name: Run preflight nodes
-        run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '[.preflight_nodes[].node]|join(",")' ci/portable-shards.json)"
 
   # ------------------------------------------------------------ build (debug)
   build-debug:
