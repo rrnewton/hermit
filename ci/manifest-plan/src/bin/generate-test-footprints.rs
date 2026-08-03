@@ -404,6 +404,34 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
     }
 }
 
+fn validate_preflight(policy: &Value, nodes: &BTreeSet<String>) {
+    for node in strings(policy, "preflight", &format!("{POLICY}: preflight")) {
+        if !nodes.contains(&node) {
+            die(format!(
+                "{POLICY}: preflight names unknown portable DAG node `{node}`"
+            ));
+        }
+    }
+}
+
+fn validate_backend_builds(policy: &Value) {
+    let raw = policy["backend_builds"]
+        .as_object()
+        .unwrap_or_else(|| die(format!("{POLICY}: `backend_builds` must be an object")));
+    for (backend, artifact) in raw {
+        let artifact = artifact.as_str().unwrap_or_else(|| {
+            die(format!(
+                "{POLICY}: backend_builds.{backend} must be a string"
+            ))
+        });
+        if !matches!(artifact, "dbi" | "aux") {
+            die(format!(
+                "{POLICY}: backend_builds.{backend} = `{artifact}` must be \"dbi\" or \"aux\""
+            ));
+        }
+    }
+}
+
 fn load_package_paths(
     policy: &Value,
     packages: &BTreeMap<String, Package>,
@@ -456,6 +484,8 @@ fn generated_footprints(root: &Path) -> Value {
     let rules = load_rules(&policy, &packages, &all_nodes);
     let package_paths = load_package_paths(&policy, &packages);
     validate_path_footprints(&policy, &all_nodes);
+    validate_preflight(&policy, &all_nodes);
+    validate_backend_builds(&policy);
 
     let mut package_footprints = Vec::new();
     let mut by_root: Vec<&Package> = packages.values().collect();
@@ -534,12 +564,16 @@ fn generated_footprints(root: &Path) -> Value {
             "harness edges and fail-safe path policy come from ci/test-footprints-policy.json.",
             "",
             "Safety is unchanged: force_full and unknown paths run everything. CI is skipped",
-            "only when every changed path is explicitly ci_irrelevant and no footprint matches."
+            "only when every changed path is explicitly ci_irrelevant and no footprint matches.",
+            "preflight (always-on selective gates) and backend_builds (cell backend -> release",
+            "artifact) are passed through verbatim from the policy file for the selection engine."
         ],
         "version": 2,
         "groups": {},
         "force_full": policy["force_full"].clone(),
         "ci_irrelevant": policy["ci_irrelevant"].clone(),
+        "preflight": policy["preflight"].clone(),
+        "backend_builds": policy["backend_builds"].clone(),
         "footprints": package_footprints
     })
 }
