@@ -1463,12 +1463,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // syscall (previously flagged inline as an unnecessary copy). guest.config()
         // borrows guest immutably; bind the flags in a tight scope so the borrow ends
         // before the later thread_state_mut()/&mut guest borrows below.
-        let (sequentialize_threads, virtualize_time, panic_on_unsupported_syscalls) = {
+        let (
+            sequentialize_threads,
+            virtualize_time,
+            panic_on_unsupported_syscalls,
+            has_syscall_count_anchors,
+        ) = {
             let config = guest.config();
             (
                 config.sequentialize_threads,
                 config.virtualize_time,
                 config.panic_on_unsupported_syscalls,
+                config
+                    .happens_before
+                    .as_ref()
+                    .is_some_and(|program| program.has_syscall_count_anchors()),
             )
         };
 
@@ -1509,11 +1518,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // makes an authored partial order reproduce a known race deterministically
         // (see detcore-model `happens_before`). It requires sequentialized
         // threads (enforced by the CLI) so the scheduler owns ordering.
-        if config
-            .happens_before
-            .as_ref()
-            .is_some_and(|p| p.has_syscall_count_anchors())
-        {
+        if has_syscall_count_anchors {
             let request = guest.thread_state().mk_request(
                 ResourceID::HappensBeforeCheckpoint(new_count),
                 Permission::R,
