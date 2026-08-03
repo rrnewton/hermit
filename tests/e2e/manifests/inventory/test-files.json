@@ -339,8 +339,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/pid_probe.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/pid_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking verify selection; ci=true)",
+      "why": "tests/backend-parity/fixtures/pid_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace, SaBRe, and LiteInst"
     },
     {
       "disposition": "manifest-test",
@@ -987,8 +987,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/pidfd_open_self.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
+      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
     },
     {
       "disposition": "manifest-test",
@@ -1233,8 +1233,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/scheduler_policy_queries.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/scheduler_policy_queries.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
+      "why": "tests/c/scheduler_policy_queries.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
     },
     {
       "disposition": "manifest-test",
@@ -1401,8 +1401,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/syscall_file_metadata.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/syscall_file_metadata.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
+      "why": "tests/c/syscall_file_metadata.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
     },
     {
       "disposition": "manifest-test",
