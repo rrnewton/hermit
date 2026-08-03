@@ -48,8 +48,8 @@
     },
     {
       "group": "e2e", "job": "system_utils",
-      "desc": "Portable system-utility controls, verification, and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --results target/e2e/portable/system-utils/results.jsonl --junit target/e2e/portable/system-utils/junit.xml",
+      "desc": "Portable system-utility controls plus the comprehensive utility suite",
+      "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --results target/e2e/portable/system-utils/results.jsonl --junit target/e2e/portable/system-utils/junit.xml && ./ci/run-component-e2e.sh portable system-utils",
       "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
@@ -58,8 +58,8 @@
     },
     {
       "group": "e2e", "job": "data_handling",
-      "desc": "Portable data-handling verification and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --results target/e2e/portable/data-handling/results.jsonl --junit target/e2e/portable/data-handling/junit.xml",
+      "desc": "Portable structured and comprehensive data-handling verification",
+      "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --results target/e2e/portable/data-handling/results.jsonl --junit target/e2e/portable/data-handling/junit.xml && ./ci/run-component-e2e.sh portable data-handling",
       "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
@@ -68,8 +68,8 @@
     },
     {
       "group": "e2e", "job": "determinism_stress",
-      "desc": "Portable deterministic and seeded-chaos stress tests",
-      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress --results target/e2e/portable/determinism-stress/results.jsonl --junit target/e2e/portable/determinism-stress/junit.xml",
+      "desc": "Portable structured and comprehensive deterministic stress tests",
+      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress --results target/e2e/portable/determinism-stress/results.jsonl --junit target/e2e/portable/determinism-stress/junit.xml && ./ci/run-component-e2e.sh portable determinism-stress",
       "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
@@ -78,8 +78,8 @@
     },
     {
       "group": "e2e", "job": "language_runtimes",
-      "desc": "Portable language-runtime controls, verification, and replay",
-      "cmd": "./ci/test_harness.sh run --lane portable --category language-runtimes --results target/e2e/portable/language-runtimes/results.jsonl --junit target/e2e/portable/language-runtimes/junit.xml",
+      "desc": "Portable structured and four-runtime language verification",
+      "cmd": "./ci/test_harness.sh run --lane portable --category language-runtimes --results target/e2e/portable/language-runtimes/results.jsonl --junit target/e2e/portable/language-runtimes/junit.xml && ./ci/run-component-e2e.sh portable language-runtimes",
       "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
@@ -88,21 +88,11 @@
     },
     {
       "group": "e2e", "job": "applications",
-      "desc": "Portable application verification",
-      "cmd": "./ci/test_harness.sh run --lane portable --category applications --results target/e2e/portable/applications/results.jsonl --junit target/e2e/portable/applications/junit.xml",
+      "desc": "Portable structured and comprehensive application verification",
+      "cmd": "./ci/test_harness.sh run --lane portable --category applications --results target/e2e/portable/applications/results.jsonl --junit target/e2e/portable/applications/junit.xml && ./ci/run-component-e2e.sh portable applications",
       "deps": ["build.workspace", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "latency-bound"}
-    },
-    {
-      "group": "test", "job": "applications_e2e",
-      "desc": "Run application end-to-end strict verification",
-      "cmd": "./tests/e2e/lib/applications/run_all.sh",
-      "deps": ["build.workspace"],
-      "timeout": 300,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },

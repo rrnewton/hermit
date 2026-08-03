@@ -12,7 +12,8 @@ HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 DATA_HANDLING_TIMEOUT=${DATA_HANDLING_TIMEOUT:-120s}
 NATIVE_ATTEMPTS=${NATIVE_ATTEMPTS:-12}
 NATIVE_RETRY_DELAY=${NATIVE_RETRY_DELAY:-0}
-readonly DATA_HANDLING_DIR ROOT_DIR HERMIT_BIN DATA_HANDLING_TIMEOUT
+DATA_HANDLING_BACKEND=ptrace
+readonly DATA_HANDLING_DIR ROOT_DIR HERMIT_BIN DATA_HANDLING_TIMEOUT DATA_HANDLING_BACKEND
 
 function require_tools {
     local tool
@@ -114,7 +115,7 @@ function assert_deterministic_with_hermit {
     stderr=$evidence/stderr
 
     if ! run_captured "$stdout" "$stderr" \
-        "$HERMIT_BIN" --log=info run \
+        "$HERMIT_BIN" --log=info run --backend "$DATA_HANDLING_BACKEND" \
         --strict --verify \
         --no-virtualize-cpuid --max-timeslice=disabled \
         -- "$@"; then

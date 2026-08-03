@@ -51,6 +51,16 @@
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 15,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "system_utils",
+      "desc": "KVM-allowlisted system utilities preserve strict output and exit status",
+      "cmd": "./ci/run-component-e2e.sh privileged system-utils",
+      "deps": ["build.privileged_tests", "e2e.metadata"],
+      "timeout": 150,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
     }
   ]
 }

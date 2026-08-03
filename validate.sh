@@ -2799,8 +2799,8 @@ function run_portable_only_suite {
     run_check "Build workspace" cargo build --workspace
     run_check "Multi-mode portable E2E categories" \
         ./ci/test_harness.sh run --lane portable
-    run_check "Application end-to-end strict verification" \
-        ./tests/e2e/lib/applications/run_all.sh
+    run_check "Comprehensive portable E2E categories" \
+        ./ci/run-component-e2e.sh portable
 
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
@@ -2905,6 +2905,8 @@ function run_privileged_validation {
 
     run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
     run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
+    run_check "Privileged component E2E categories" \
+        env HERMIT_BIN=target/debug/hermit ./ci/run-component-e2e.sh privileged
     run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness thread_sync_determinism writev_determinism
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
@@ -2953,6 +2955,8 @@ function run_full_suite {
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_quick_suite
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
+    run_check "Comprehensive portable E2E categories" \
+        env HERMIT_BIN=target/release/hermit ./ci/run-component-e2e.sh portable
 
     # Cargo supports concurrent commands in one target directory. Run checks that
     # do not execute Hermit guests alongside the ordered runtime and PMU gates.
@@ -2972,7 +2976,7 @@ function run_full_suite {
     # Detcore's PMU tests depend on same-binary coordination; nextest would launch
     # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
     run_check "Test workspace and integrations" \
-        "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
+        "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude detcore-liteinst \
         --exclude hermetic_infra_hermit_flaky-tests
     run_check "Test detcore package" cargo test -p detcore
     run_check "Fast concurrency stress suite" \
@@ -3099,6 +3103,8 @@ function run_super_suite {
 
     run_check "Build workspace" cargo build --workspace
     run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Occasional component E2E categories" \
+        env HERMIT_BIN=target/release/hermit ./ci/run-component-e2e.sh occasional
     run_super_diagnostic_suite
     run_check "Super repeated determinism probes" run_super_stress_suite
     if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then

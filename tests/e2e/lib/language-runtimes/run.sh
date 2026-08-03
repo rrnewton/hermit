@@ -13,9 +13,22 @@ cd "$ROOT_DIR"
 HERMIT_BIN=${HERMIT_BIN:-target/debug/hermit}
 RUNTIME_TIMEOUT=${HERMIT_LANGUAGE_RUNTIME_TIMEOUT:-180s}
 BACKEND=${HERMIT_LANGUAGE_RUNTIME_BACKEND:-ptrace}
+readonly -a BACKEND_ALLOWLIST=(ptrace)
 BUILD_DIR=target/language-runtime-e2e
 SENTINEL=language-runtime-e2e
 readonly ROOT_DIR HERMIT_BIN RUNTIME_TIMEOUT BACKEND BUILD_DIR SENTINEL
+
+backend_allowed=false
+for allowed_backend in "${BACKEND_ALLOWLIST[@]}"; do
+  if [[ $BACKEND == "$allowed_backend" ]]; then
+    backend_allowed=true
+    break
+  fi
+done
+if [[ $backend_allowed != true ]]; then
+  echo "backend is outside language-runtime allowlist: $BACKEND (allowed: ${BACKEND_ALLOWLIST[*]})" >&2
+  exit 2
+fi
 
 if [[ ! -x $HERMIT_BIN ]]; then
   echo "Hermit binary is not executable: $HERMIT_BIN" >&2
@@ -54,7 +67,7 @@ function run_l2 {
     return 1
   fi
 
-  cat "$strict_output"
+  grep -E '^(RANDOM|TIME|THREAD|SYSTEM) ' "$strict_output"
   local category
   for category in RANDOM TIME THREAD SYSTEM; do
     if ! grep -q "^$category " "$strict_output"; then
@@ -65,7 +78,7 @@ function run_l2 {
 
   printf '==> %s: %s L2 (--strict --verify)\n' "$label" "$BACKEND"
   if ! timeout --foreground --kill-after=10s "$RUNTIME_TIMEOUT" \
-      "$HERMIT_BIN" --log=off --backend "$BACKEND" run \
+      "$HERMIT_BIN" --log=info --backend "$BACKEND" run \
       --strict --verify --no-virtualize-cpuid --max-timeslice=disabled \
       --base-env=minimal --env="HERMIT_RUNTIME_SENTINEL=$SENTINEL" -- \
       "$program" "$@" >"$verify_output" 2>&1; then
@@ -74,7 +87,8 @@ function run_l2 {
     return 1
   fi
 
-  cat "$verify_output"
+  grep -E '(:: |Logs contain|Normalizing|Comparing DETLOG|Done processing|Determinism verified)' \
+    "$verify_output" || true
   if ! grep -q "Determinism verified" "$verify_output"; then
     echo "FAIL: $label exited zero without Hermit's verification marker" >&2
     return 1

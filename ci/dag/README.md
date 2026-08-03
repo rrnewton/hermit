@@ -32,6 +32,14 @@ the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
 internal scheduler changes. `validate.sh` remains the source of truth for
 individual gate commands.
 
+During the metadata migration, each category node runs both its structured
+sentinel cells and the comprehensive component suite retained under
+`tests/e2e/lib/`. `ci/run-component-e2e.sh` owns that compatibility path:
+portable CI runs all five categories, privileged CI runs the reviewed KVM
+system-utility allowlist, and scheduled `validate.sh super` runs the expensive
+reproducible-build and known-gap signal/syscall probes. Known gaps are printed
+as named XFAILs; unexpected failures remain blocking.
+
 Closed pull requests trigger a skipped workflow in the same concurrency group,
 which cancels their queued or in-progress PMU run. The `mem_race` family and
 three nonblocking post-DAG diagnostics run in the scheduled `super` tier so a

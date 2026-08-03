@@ -173,6 +173,51 @@ function load_tests {
     ((${#TESTS[@]} > 0)) || die "no tests discovered below $TEST_ROOT"
 }
 
+function validate_component_contract {
+    local script low_log_output trivial_output
+    local -a component_scripts=()
+    mapfile -t component_scripts < <(
+        find "$TEST_ROOT/lib" -type f -name '*.sh' -print | LC_ALL=C sort
+    )
+    ((${#component_scripts[@]} > 0)) || die "no component E2E scripts found below tests/e2e/lib"
+
+    for script in "${component_scripts[@]}"; do
+        [[ -x $script ]] || die "component E2E script is not executable: ${script#"$ROOT_DIR/"}"
+        bash -n "$script" || die "component E2E syntax check failed: ${script#"$ROOT_DIR/"}"
+    done
+
+    if ! low_log_output=$(perl -0ne '
+        if (/--log(?:=|\s+)off(?:(?!--log).){0,240}--verify/s) {
+            print "$ARGV: low-log verification contradiction\n";
+            $bad = 1;
+        }
+        END { exit($bad ? 1 : 0) }
+    ' "${component_scripts[@]}"); then
+        printf '%s\n' "$low_log_output" >&2
+        die "component verification requires INFO logging"
+    fi
+
+    if trivial_output=$(grep -R -n -E --include='*.sh' -- \
+        '--help|--version|/usr/bin/\[|/bin/true' \
+        "$TEST_ROOT/applications" "$TEST_ROOT/data-handling" \
+        "$TEST_ROOT/determinism-stress" "$TEST_ROOT/language-runtimes" \
+        "$TEST_ROOT/system-utils"); then
+        printf '%s\n' "$trivial_output" >&2
+        die "trivial help/version/no-op command found in a discovered E2E test"
+    fi
+
+    grep -Fq 'APPLICATION_BACKEND=ptrace' "$TEST_ROOT/lib/applications/common.sh" \
+        || die "application component backend allowlist is missing"
+    grep -Fq 'DATA_HANDLING_BACKEND=ptrace' "$TEST_ROOT/lib/data-handling/common.bash" \
+        || die "data-handling component backend allowlist is missing"
+    grep -Fq 'determinism_stress_backend=ptrace' "$TEST_ROOT/lib/determinism-stress/common.sh" \
+        || die "determinism-stress component backend allowlist is missing"
+    grep -Fq 'BACKEND_ALLOWLIST=(ptrace)' "$TEST_ROOT/lib/language-runtimes/run.sh" \
+        || die "language-runtime component backend allowlist is missing"
+    grep -R -Fq 'BACKEND_ALLOWLIST=' "$TEST_ROOT/lib/system-utils" \
+        || die "system-utility component backend allowlists are missing"
+}
+
 LANE_FILTER=
 MODE_FILTER=
 BACKEND_FILTER=
@@ -626,6 +671,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        validate_component_contract
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and metadata"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         ;;
