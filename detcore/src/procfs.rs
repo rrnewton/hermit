@@ -17,6 +17,9 @@ use serde::Serialize;
 enum ProcfsKind {
     Stat,
     Status,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review Btrfs generation normalization.
+    BtrfsGeneration,
     Cpuinfo,
     Loadavg,
     Uptime,
@@ -38,6 +41,9 @@ impl ProcfsFile {
         let kind = match path.to_str()? {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-TBD): Review Btrfs generation path matching.
+            other if is_btrfs_generation_path(Path::new(other)) => ProcfsKind::BtrfsGeneration,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
@@ -82,6 +88,7 @@ impl ProcfsFile {
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
             ProcfsKind::Status => sanitize_status(&contents, virtual_pid, virtual_ppid),
+            ProcfsKind::BtrfsGeneration => sanitize_btrfs_generation(&contents),
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
@@ -99,6 +106,33 @@ impl ProcfsFile {
         self.offset = end;
         Some(bytes)
     }
+}
+
+fn is_btrfs_generation_path(path: &Path) -> bool {
+    if path.file_name().and_then(|leaf| leaf.to_str()) != Some("generation") {
+        return false;
+    }
+    let Some(filesystem) = path.parent() else {
+        return false;
+    };
+    if filesystem.parent() != Some(Path::new("/sys/fs/btrfs")) {
+        return false;
+    }
+    filesystem
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_lowercase_uuid)
+}
+
+fn is_lowercase_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
@@ -249,6 +283,18 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the synthetic Btrfs generation value.
+fn sanitize_btrfs_generation(contents: &[u8]) -> Vec<u8> {
+    let Some(generation) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if generation.is_empty() || !generation.iter().all(u8::is_ascii_digit) {
+        return contents.to_vec();
+    }
+    b"0\n".to_vec()
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -317,6 +363,14 @@ mod tests {
             ProcfsKind::Status
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/generation"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::BtrfsGeneration
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
                 .unwrap()
                 .kind,
@@ -341,6 +395,17 @@ mod tests {
             ProcfsKind::Sockstat
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        for path in [
+            "/sys/fs/btrfs/004B7924-9DF8-4EC2-AEA0-D9775554E1BA/generation",
+            "/sys/fs/btrfs/not-a-uuid/generation",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/label",
+            "/sys/fs/btrfs/004b7924-9df8-4ec2-aea0-d9775554e1ba/nested/generation",
+        ] {
+            assert!(
+                ProcfsFile::from_path(Path::new(path)).is_none(),
+                "unexpectedly recognized {path}"
+            );
+        }
     }
 
     #[test]
@@ -415,6 +480,14 @@ mod tests {
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
         );
+    }
+
+    #[test]
+    fn btrfs_generation_is_fixed_after_strict_validation() {
+        assert_eq!(sanitize_btrfs_generation(b"184455\n"), b"0\n");
+        for malformed in [b"184455".as_slice(), b"-1\n", b"12\n13\n", b"\n"] {
+            assert_eq!(sanitize_btrfs_generation(malformed), malformed);
+        }
     }
 
     #[test]
