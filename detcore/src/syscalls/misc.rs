@@ -713,7 +713,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// uid, and the fully emulated result is bitwise-identical across --verify and
     /// record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-dbi-getuid-identity)
+    // TODO-HUMAN-REVIEW(#1549)
     pub async fn handle_getresuid<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -736,7 +736,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// constant 0, matching the ptrace CLONE_NEWUSER identity and deterministic
     /// across --verify and record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-dbi-getuid-identity)
+    // TODO-HUMAN-REVIEW(#1549)
     pub async fn handle_getresgid<G: Guest<Self>>(
         &self,
         guest: &mut G,
