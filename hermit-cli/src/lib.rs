@@ -1535,7 +1535,7 @@ async fn run_with_backend_inner(
         let stats_request = backend_stats::request();
         if stats_request.is_enabled() {
             let (exit_status, mut global_state, instrumentation_stats) =
-                reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<Detcore>(
+                reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
                     command, config, preload,
                 )
                 .await?;
@@ -1664,7 +1664,7 @@ async fn run_with_output_backend_inner(
         let stats_request = backend_stats::request();
         if stats_request.is_enabled() {
             let (output, mut global_state, instrumentation_stats) =
-                reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
+                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
                     Detcore,
                 >(command, config, preload)
                 .await?;
