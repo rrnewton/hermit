@@ -36,3 +36,5 @@ for command-line compatibility and does not make the default any stricter. See
 * See demos in [this tech talk](https://fb.workplace.com/groups/591973351138875/permalink/1132872253715646/).
 * [This talk](https://fb.workplace.com/groups/591973351138875/posts/1533285603674307) shows concurrency testing with hermit "chaos" mode.
 * [This talk](https://fb.workplace.com/groups/hermit.fyi/post
+
+<!-- selection-probe: docs-only footprint, no product change; PR will be closed -->
