@@ -38,6 +38,12 @@
       "why": "tests/backend-parity/e9patch_corpus/compute.c is owned by tests/backend-parity/e9patch_corpus.py: Probes an RCB-preempted CPU-bound loop so branch-count preemption behaves identically under e9patch rewriting and plain ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "path": "tests/backend-parity/e9patch_corpus/dense_syscalls.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/dense_syscalls.c is owned by tests/backend-parity/e9patch_corpus.py: Probes the e9tool relocation engine on two 2-byte SYSCALL instructions encoded back-to-back, so the 5-byte control transfer planted for the first site overlaps the immediately following second site (the adjacent-short-instruction straddler case), yet both sites must still map with mapped==candidate and no SIGILL fallback. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "path": "tests/backend-parity/e9patch_corpus/dup3_high.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
@@ -72,6 +78,12 @@
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/e9patch_corpus.py",
       "why": "tests/backend-parity/e9patch_corpus/getrandom.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the determinized getrandom byte stream is identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "path": "tests/backend-parity/e9patch_corpus/indirect_syscall.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/indirect_syscall.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that e9tool's ahead-of-time site rewrite is honored when the SYSCALL site is reached through an indirect call via a volatile function pointer rather than a compiler-visible direct call, so control transfer into the rewritten trampoline works for an opaque computed target. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "path": "tests/backend-parity/e9patch_corpus/loop_write.c",

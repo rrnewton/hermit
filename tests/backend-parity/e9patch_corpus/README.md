@@ -35,14 +35,30 @@ thread and hang the run.
 | `fcntl_cloexec` | `F_GETFD` reports no stray `FD_CLOEXEC` |
 | `proc_self_fd_count` | `/proc/self/fd` count parity (no leaked loader fd) |
 | `readlink_exe` | `/proc/self/exe` resolves to the original guest, not the e9 temp |
+| `dense_syscalls` | two back-to-back 2-byte `SYSCALL`s: trampoline window overlaps the next site (straddler) |
+| `indirect_syscall` | rewritten site reached via an indirect call through a `volatile` function pointer |
 
-The last eight guests are the **round-2 fd/output-hygiene ratchet batch**
-(non-time, non-gated): they establish that e9patch preprocessing perturbs no
-descriptor allocation or process-metadata output. `proc_self_fd_count` and
-`readlink_exe` emit environment-dependent values, so the driver asserts
-golden==e9patch parity for them (`expected_stdout=None`) rather than a fixed
-string; the other six pin exact stdout. All remain freestanding
-(`candidate_sites > 0`) so e9patch actually rewrites them.
+Guests 13–20 are the **round-2 fd/output-hygiene ratchet batch** (non-time,
+non-gated): they establish that e9patch preprocessing perturbs no descriptor
+allocation or process-metadata output. `proc_self_fd_count` and `readlink_exe`
+emit environment-dependent values, so the driver asserts golden==e9patch parity
+for them (`expected_stdout=None`) rather than a fixed string; the other six pin
+exact stdout.
+
+Guests 21–22 are the **rewrite-engine relocation-stress batch**. Every earlier
+guest wraps each `SYSCALL` in its own `noinline` helper reached by a
+compiler-visible direct call; these instead probe the e9tool AOT
+rewrite/relocation engine directly. `dense_syscalls` places two 2-byte `SYSCALL`
+instructions back-to-back (encoded `0f 05 0f 05`), so the 5-byte control-transfer
+e9tool plants for the first site overlaps the immediately following second site —
+the adjacent-short-instruction / "straddler" case. `indirect_syscall` reaches its
+rewritten site through an indirect call via a `volatile` function pointer, so the
+call target is opaque at compile time. Both still enforce full direct-AOT
+coverage (`mapped_sites == candidate_sites`, `b0_sites == 0`) and L2 on both
+backends.
+
+All guests remain freestanding (`candidate_sites > 0`) so e9patch actually
+rewrites them.
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.

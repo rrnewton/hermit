@@ -91,6 +91,17 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "fcntl_cloexec": (0, b"stdout_fd_flags=0\nopened_fd=3\nopened_flags=0\n"),
     "proc_self_fd_count": (0, None),
     "readlink_exe": (0, None),
+    # Rewrite-engine relocation-stress batch. Prior guests each wrap one SYSCALL
+    # in its own noinline helper reached by a direct call; these instead attack
+    # the e9tool AOT rewrite/relocation engine itself. dense_syscalls places two
+    # 2-byte SYSCALLs back-to-back (4 bytes) so the first site's 5-byte trampoline
+    # jump window overlaps the very next site (adjacent-short-instruction /
+    # "straddler" case); indirect_syscall reaches the rewritten site through an
+    # indirect call via a volatile function pointer rather than a compiler-visible
+    # direct call. Both must still achieve full direct-AOT coverage
+    # (mapped==candidate, b0==0) and L2 on both backends.
+    "dense_syscalls": (0, b"zz\n"),
+    "indirect_syscall": (0, b"indirect\n"),
 }
 
 FREESTANDING_FLAGS = (
