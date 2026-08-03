@@ -72,7 +72,7 @@ jobs:
           exit 1
 
   demos:
-    name: P0 demo gate (demos 1-8)
+    name: P0 demo gate (fast demos on PRs, full 1-8 on main)
     if: >-
       github.repository == 'rrnewton/hermit' &&
       (
@@ -227,15 +227,41 @@ jobs:
             dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
           key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Run demos 1-8 at the exact Hermit SHA
+      - name: Run the demo sweep at the exact Hermit SHA
         working-directory: dev-hermit-demo-suite
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          # Demo-set split to raise demo-gate throughput on the single serial
+          # PMU lane (see demo-gate-runner-relabel-owner). Pull requests — the
+          # blocking landing gate for the hot-path bulk — run only the FAST
+          # process-level demos (1-4: deterministic run, record/replay, chaos,
+          # schedule bisection), which exercise the core determinism features in
+          # a few minutes. The HEAVY QEMU/kernel/btrfs demos (5-8), whose boots
+          # dominate the ~14-20min cycle, run in full on every main push and on
+          # the weekly schedule, where a regression still reddens main and fires
+          # the P0 escalation below. DEMO_SWEEP_TARGETS overrides run-all.sh's
+          # --all selection, so this needs no change in the demo suite itself.
+          case "$EVENT_NAME" in
+            pull_request)
+              export DEMO_SWEEP_TARGETS="demo1 demo2 demo3 demo4"
+              demo_timeout=3600
+              echo "PR gate: fast demos ($DEMO_SWEEP_TARGETS)."
+              ;;
+            *)
+              # push (main), workflow_dispatch, schedule: full demos 1-8.
+              demo_timeout=21000
+              echo "Full demo sweep: demos 1-8."
+              ;;
+          esac
+
           command=(scripts/super-validate.sh --demos-only)
           if command -v with-proxy >/dev/null 2>&1; then
             command=(with-proxy "${command[@]}")
           fi
-          timeout --foreground --kill-after=60s 21000s \
+          timeout --foreground --kill-after=60s "$demo_timeout" \
             "${command[@]}" 2>&1 | tee demo-sweep-validation.log
 
       - name: Upload per-demo diagnostics
@@ -257,7 +283,7 @@ jobs:
       - name: Escalate every demo red as P0
         if: failure()
         run: |
-          echo "::error title=P0 Hermit demo regression::Demos 1-8 failed at exact Hermit SHA $TARGET_SHA. Treat this red as P0 and inspect the per-demo summary and artifacts."
+          echo "::error title=P0 Hermit demo regression::The demo sweep failed at exact Hermit SHA $TARGET_SHA. Treat this red as P0 and inspect the per-demo summary and artifacts."
           {
             echo
             echo "## P0 demo-regression escalation"
