@@ -623,7 +623,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setfsuid
         | Sysno::setfsgid
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-dbi-getuid-identity): Determinize the credential
+        // TODO-HUMAN-REVIEW(#1549): Determinize the credential
         // *query* family so it actually implements the fixed virtual-root
         // identity the setuid no-ops above already assume. Previously
         // getuid/geteuid/getgid/getegid/getresuid/getresgid were pass-through
