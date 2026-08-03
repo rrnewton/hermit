@@ -49,17 +49,13 @@ permissions:
   contents: read
   pull-requests: read
 
-# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
-# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
-# a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
-# ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
-# ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
-# stamp-check queued behind 40-min builds and NOTHING landed. Routing to
-# `[self-hosted, gate]` targets an always-idle lightweight runner
-# (selected by the `gate` label only) that picks these jobs up in seconds;
-# the three PMU runners also carry the `gate` label as fallback, so a single-node
-# outage cannot block landing. Because the required-check context is the job name
-# (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
+# Both control-plane jobs run on the dedicated `gate` self-hosted runner pool
+# rather than `ubuntu-latest`. They need no Rust build, PMU, or ptrace support.
+# `merge-gate` deliberately combines invalidation, review-protocol enforcement,
+# and validation into one runner lease: a synchronization burst must not fan one
+# PR out into three separately queued jobs. The three PMU runners also carry the
+# `gate` label as fallback, so a single-node outage cannot block landing. The
+# ruleset-required context remains the `merge-gate` job name.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
@@ -104,31 +100,58 @@ jobs:
               -f pr_number="$pr_number"
           done < <(jq -r '.[] | [.number, .current] | @tsv' <<< "$matches")
 
-  invalidate-local-validation:
-    name: invalidate-local-validation
+  merge-gate:
+    name: merge-gate
     if: >-
+      always() &&
       github.repository == 'rrnewton/hermit' &&
-      github.event_name == 'pull_request' &&
-      github.event.action == 'synchronize'
+      github.event_name != 'workflow_run'
     runs-on: [self-hosted, gate]
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
     steps:
-      - name: Remove validation and stale approvals inherited from an older PR head
+      - name: Plan gate sub-checks
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ]; then
+            run_invalidation=true
+            invalidation_reason="the pull request head changed"
+          else
+            run_invalidation=false
+            invalidation_reason="event ${EVENT_NAME}/${PR_ACTION:-none} does not replace a pull request head"
+          fi
+          echo "run_invalidation=$run_invalidation" >> "$GITHUB_OUTPUT"
+          echo "invalidation_reason=$invalidation_reason" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Merge gate sub-check plan"
+            echo
+            echo "| Sub-check | Decision | Reason |"
+            echo "| --- | --- | --- |"
+            echo "| Invalidate stale validation and reviews | \`$run_invalidation\` | $invalidation_reason |"
+            echo "| Core-change review protocol | \`run\` | required for every gate evaluation |"
+            echo "| Local-or-hosted validation | \`run\` | required for every gate evaluation |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Invalidate validation and reviews from the previous head
+        id: invalidate
+        if: steps.plan.outputs.run_invalidation == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # A new push invalidates prior sign-off on the previous revision:
-          #   - locally-validated: the local test evidence no longer matches HEAD.
-          #   - passed-review-{codex,claude}: the reviewers approved an older diff,
-          #     so their approval must be re-earned before the core-review-protocol
-          #     job (below) will let a post-facto-human-review PR land again.
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
           for stale in locally-validated passed-review-codex passed-review-claude; do
             if grep -Fxq "$stale" <<< "$labels"; then
@@ -139,30 +162,29 @@ jobs:
             fi
           done
 
-  core-review-protocol:
-    name: core-review-protocol
-    if: >-
-      github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
-    runs-on: [self-hosted, gate]
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Check out the review-protocol linter
+      - name: Explain skipped validation invalidation
+        if: steps.plan.outputs.run_invalidation != 'true'
+        env:
+          REASON: ${{ steps.plan.outputs.invalidation_reason }}
+        run: echo "Invalidation skipped — ${REASON}."
+
+      - name: Check out the trusted review-protocol linter
+        id: checkout_core_linter
+        if: always()
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           # Pin to the trusted base branch, NOT the PR head. This job runs on a
           # self-hosted runner, so checking out PR-controlled code and executing
           # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
-          # code on our infrastructure. The linter reads only environment inputs
-          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER), so main's copy is the correct
-          # and safe version to run — and a PR cannot weaken its own gate by
-          # editing the lint script.
+          # code on our infrastructure. The linter reads only environment inputs.
           ref: main
           persist-credentials: false
+
       - name: Enforce the core-change review protocol
+        id: core_review
+        if: always() && steps.checkout_core_linter.outcome == 'success'
+        continue-on-error: true
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
@@ -173,8 +195,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resolve the pull request number(s) this event covers, mirroring the
-          # merge-gate job so the same PRs are gated at PR time and in the queue.
+          # Resolve the pull request number(s) this event covers so PR and merge
+          # queue evaluations enforce the same review protocol.
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
               echo "::error::workflow_dispatch requires a pr_number input."
@@ -245,51 +267,19 @@ jobs:
 
           exit "$failed"
 
-  merge-gate:
-    name: merge-gate
-    needs: [invalidate-local-validation, core-review-protocol]
-    if: >-
-      always() &&
-      github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
-    runs-on: [self-hosted, gate]
-    timeout-minutes: 10
-    steps:
-      - name: Require the core-change review protocol
-        env:
-          PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
-        run: |
-          set -euo pipefail
-          # core-review-protocol shares merge-gate's activation conditions, so it
-          # runs whenever this job does; treat anything other than a clean pass
-          # (or a defensive skip) as a landing block.
-          case "$PROTOCOL_RESULT" in
-            success | skipped)
-              echo "core-review-protocol result: $PROTOCOL_RESULT"
-              ;;
-            *)
-              echo "::error::Core-change review protocol did not pass (result=$PROTOCOL_RESULT); blocking landing."
-              exit 1
-              ;;
-          esac
       - name: Require successful CI or local validation
+        id: validation
+        if: always()
+        continue-on-error: true
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
-          INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
-          PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-
-          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
-             [ "$INVALIDATION_RESULT" != success ]; then
-            echo "::error::Could not invalidate local validation from the previous PR head."
-            exit 1
-          fi
 
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
@@ -445,5 +435,58 @@ jobs:
             | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
             | @tsv
           ' <<< "$pull_requests")
+
+          exit "$failed"
+
+      - name: Require every planned gate sub-check
+        if: always()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout_core_linter.outcome }}
+          CORE_REVIEW_OUTCOME: ${{ steps.core_review.outcome }}
+          EXPECT_INVALIDATION: ${{ steps.plan.outputs.run_invalidation }}
+          INVALIDATION_OUTCOME: ${{ steps.invalidate.outcome }}
+          INVALIDATION_REASON: ${{ steps.plan.outputs.invalidation_reason }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          require_outcome() {
+            local check="$1"
+            local actual="$2"
+            local expected="$3"
+            local reason="$4"
+            if [ "$actual" = "$expected" ]; then
+              echo "::notice title=${check}::${actual} — ${reason}"
+            else
+              echo "::error title=${check}::expected ${expected}, got ${actual:-missing} — ${reason}"
+              failed=1
+            fi
+            printf '| %s | `%s` | %s |\n' "$check" "${actual:-missing}" "$reason" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          {
+            echo
+            echo "### Merge gate sub-check results"
+            echo
+            echo "| Sub-check | Outcome | Reason |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          require_outcome "Gate plan" "$PLAN_OUTCOME" success "the execution plan must be explicit"
+          if [ "$EXPECT_INVALIDATION" = true ]; then
+            require_outcome "Invalidate stale validation and reviews" \
+              "$INVALIDATION_OUTCOME" success "$INVALIDATION_REASON"
+          else
+            require_outcome "Invalidate stale validation and reviews" \
+              "$INVALIDATION_OUTCOME" skipped "$INVALIDATION_REASON"
+          fi
+          require_outcome "Trusted linter checkout" "$CHECKOUT_OUTCOME" success \
+            "core-review enforcement executes trusted main"
+          require_outcome "Core-change review protocol" "$CORE_REVIEW_OUTCOME" success \
+            "required for every gate evaluation"
+          require_outcome "Local-or-hosted validation" "$VALIDATION_OUTCOME" success \
+            "requires locally-validated or a successful authoritative GitHub Actions job"
 
           exit "$failed"
