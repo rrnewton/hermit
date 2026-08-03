@@ -188,6 +188,36 @@
       "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
     },
     {
+      "path": "tests/backend-parity/fixtures/madvise_reclaim_hints.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/madvise_reclaim_hints.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic madvise(2) reclaim/lazy-free hint round-tripping (MADV_DONTNEED/MADV_FREE/MADV_COLD/MADV_PAGEOUT) as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/mlock_family.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/mlock_family.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic mlock(2)/mlock2(2)/munlock(2)/mlockall memory-residency locking round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/mprotect_transitions.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/mprotect_transitions.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic mprotect(2) protection-flag transition round-tripping (PROT_READ/WRITE/EXEC/NONE across page runs) as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/mremap_resize.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/mremap_resize.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic mremap(2) grow/shrink/MREMAP_MAYMOVE resize round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/thp_disable.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/thp_disable.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic prctl(2) PR_SET_THP_DISABLE/PR_GET_THP_DISABLE transparent-hugepage flag round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
       "path": "tests/backend-parity/matrix.tsv",
       "disposition": "support-data",
       "runner": "tests/backend-parity/run_matrix.py",

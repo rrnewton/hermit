@@ -207,6 +207,20 @@ class Fixtures:
                 local / "sigaltstack_state.c",
                 ("-D_GNU_SOURCE",),
             ),
+            "madvise_reclaim_hints": (
+                local / "madvise_reclaim_hints.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "thp_disable": (local / "thp_disable.c", ()),
+            "mprotect_transitions": (
+                local / "mprotect_transitions.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "mlock_family": (local / "mlock_family.c", ("-D_GNU_SOURCE",)),
+            "mremap_resize": (
+                local / "mremap_resize.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -328,6 +342,31 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("sigaltstack_state"))],
             0,
             b"sigaltstack ok=4\n",
+        ),
+        "madvise_reclaim_hints": (
+            [str(fixtures.binary("madvise_reclaim_hints"))],
+            0,
+            b"madvise_reclaim ok=6\n",
+        ),
+        "thp_disable": (
+            [str(fixtures.binary("thp_disable"))],
+            0,
+            b"thp ok=4\n",
+        ),
+        "mprotect_transitions": (
+            [str(fixtures.binary("mprotect_transitions"))],
+            0,
+            b"mprot ok=7\n",
+        ),
+        "mlock_family": (
+            [str(fixtures.binary("mlock_family"))],
+            0,
+            b"mlock ok=6\n",
+        ),
+        "mremap_resize": (
+            [str(fixtures.binary("mremap_resize"))],
+            0,
+            b"mremap ok=6\n",
         ),
     }
     try:
