@@ -340,6 +340,17 @@ readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COM
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
+# ERE matching the safe-ci-dag-runner's OWN per-node status lines, which look like
+# "[group.job] ▶ START  <desc>", "[group.job] ✓ PASS   <desc> (Ns)", "✗ FAIL", and
+# "⊘ ABORT" — each carrying the node name and, on completion, its elapsed time. When
+# a gate exports GATE_PROGRESS_FILTER=$DAG_PROGRESS_LINE_REGEX, run_timed_command
+# streams only these lines to the console (see there) so a multi-minute DAG gate shows
+# live per-node progress instead of silence. Anchored on the ASCII status KEYWORD
+# (the leading glyphs are UTF-8 and locale-fragile; the keywords are stable) plus the
+# "] <glyph-token> KEYWORD  " shape, so ordinary child output such as
+# "[e2e.metadata] PASS: 278 tests ..." (a colon, no glyph token) never matches.
+readonly DAG_PROGRESS_LINE_REGEX='\] [^ ]+ (START|PASS|FAIL|ABORT)  '
+
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
@@ -1181,6 +1192,20 @@ function run_timed_command {
             "$@" 2>&1 |
                 tee -a "$log_file" |
                 sed -u "s|^|[$name] |"
+        elif [[ -n ${GATE_PROGRESS_FILTER:-} ]]; then
+            # Never-blind: stream the gate's OWN per-node status lines to the
+            # console as nodes complete, while the full output still lands in the
+            # log. The long portable/privileged DAG gate is ~90% of a validate;
+            # without this it prints nothing until it finishes, so a wedged node
+            # and a working node produce byte-identical output (silence) and the
+            # only way to tell them apart is to wait the whole budget. Filtering
+            # (not full --verbose streaming) keeps the console to one line per
+            # node start/finish instead of the child-stdout flood. sed keeps the
+            # filter's own status 0; `set -o pipefail` (as in the VERBOSE branch
+            # above) then makes the pipeline report the gate's real exit code.
+            "$@" 2>&1 |
+                tee -a "$log_file" |
+                LC_ALL=C sed -u -n -E "/${GATE_PROGRESS_FILTER}/p"
         else
             "$@" >>"$log_file" 2>&1
         fi
@@ -3682,8 +3707,12 @@ function run_ci_manifest_lane {
     local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+    # Stream the DAG runner's per-node status lines to the console so this
+    # multi-minute gate is never blind (see DAG_PROGRESS_LINE_REGEX).
+    GATE_PROGRESS_FILTER=$DAG_PROGRESS_LINE_REGEX
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
         ./ci/run-dag.sh "$lane" -j "$jobs" -v
+    GATE_PROGRESS_FILTER=
 }
 
 function run_portable_only_suite {
@@ -3791,10 +3820,12 @@ function run_selective_suite {
                 "${nodes//,/ }"
             run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
+            GATE_PROGRESS_FILTER=$DAG_PROGRESS_LINE_REGEX
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
                 "portable CI DAG (selective subset)" \
                 ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
             rc=$?
+            GATE_PROGRESS_FILTER=
             unset RUN_DAG_FILE_OVERRIDE
             print_summary
             ((failures == 0))
