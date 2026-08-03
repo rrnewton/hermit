@@ -22,7 +22,19 @@
     "",
     "Because a mismapped footprint can only cause MORE nodes to run (via the fail-safe",
     "unknown/force_full defaults), the worst case of a footprint error is wasted time, not a",
-    "missed regression -- except ci_irrelevant, which is deliberately conservative."
+    "missed regression -- except ci_irrelevant, which is deliberately conservative.",
+    "",
+    "E2E BACKEND AFFINITY (per-backend selection): a footprint entry may add e2e affinity",
+    "used by ci/select-tests.rs to filter the (category x mode x backend) e2e cell matrix:",
+    "  * e2e_backends: [..] -- this change only affects those backends' e2e cells (e.g. a",
+    "                  detcore-dbi change -> ['dbi'] runs only DBI e2e cells). This is how a",
+    "                  KVM/DBI/SaBRe/LiteInst-local change runs ONLY that backend's tests.",
+    "  * e2e_all: true -- this change can affect any backend (core Detcore, the hermit CLI,",
+    "                  or a guest fixture), so run every e2e cell.",
+    "An entry with neither key contributes no e2e cells (e.g. a pure lint/doc/script change).",
+    "force_full and unknown paths still run the full cell matrix. NOTE: the portable lane has",
+    "no KVM cells (no /dev/kvm); KVM e2e runs in the privileged lane, so a KVM-only affinity",
+    "correctly yields zero PORTABLE cells."
   ],
 
   "version": 1,
@@ -88,32 +100,34 @@
       "nodes": ["@LINT", "@DOC"]
     },
     {
-      "_why": "Core determinism engine + shared model types: linked into the hermit binary and every backend, so maximum blast radius.",
+      "_why": "Core determinism engine + shared model types: linked into the hermit binary and EVERY backend (all backends run this one Detcore path, incl. the KVM guest code under detcore/), so maximum blast radius and all e2e backends.",
       "paths": ["detcore/**/*.rs", "detcore/build.rs", "detcore-model/**/*.rs", "common/**/*.rs"],
-      "nodes": ["@CORE_ALL"]
+      "nodes": ["@CORE_ALL"],
+      "e2e_all": true
     },
     {
       "_why": "The hermit CLI/library builds the binary that every e2e, backend, and mode test drives.",
       "paths": ["hermit-cli/**/*.rs", "hermit-resources/**/*.rs", "hermit-install/**/*.rs", "hermit-install/**/*.sh"],
-      "nodes": ["@HERMIT_TESTS", "@E2E", "@BACKENDS", "test.regular_crates", "test.strict_compat"]
+      "nodes": ["@HERMIT_TESTS", "@E2E", "@BACKENDS", "test.regular_crates", "test.strict_compat"],
+      "e2e_all": true
     },
     {
-      "_why": "DBI backend plugin + its parity corpus: only the DBI build/parity path and the workspace crate suite.",
+      "_why": "DBI backend plugin + its parity corpus: only the DBI build/parity path, DBI e2e cells, and the workspace crate suite.",
       "paths": ["detcore-dbi/**", "tests/backend-parity/**"],
-      "nodes": ["test.dbi_parity", "e2e.manifest_backend_parity_c", "test.regular_crates"]
+      "nodes": ["test.dbi_parity", "e2e.manifest_backend_parity_c", "test.regular_crates"],
+      "e2e_backends": ["dbi"]
     },
     {
-      "_why": "SaBRe backend plugin: sabre examples plus the sabre-dependent e2e buckets.",
+      "_why": "SaBRe backend plugin: sabre examples, SaBRe e2e cells, and the workspace crate suite.",
       "paths": ["detcore-sabre/**"],
-      "nodes": [
-        "test.sabre_examples", "e2e.manifest_applications", "e2e.manifest_c_programs",
-        "e2e.manifest_data_handling", "e2e.manifest_system_utils", "test.regular_crates"
-      ]
+      "nodes": ["test.sabre_examples", "test.regular_crates"],
+      "e2e_backends": ["sabre"]
     },
     {
-      "_why": "LiteInst runtime staging + strict lane.",
+      "_why": "LiteInst runtime staging + strict lane + LiteInst e2e cells.",
       "paths": ["scripts/stage-liteinst-runtime.sh"],
-      "nodes": ["test.liteinst_strict"]
+      "nodes": ["test.liteinst_strict"],
+      "e2e_backends": ["liteinst"]
     },
     {
       "_why": "hermit-verify is a standalone binary exercised via the workspace crate suite only.",
@@ -121,9 +135,10 @@
       "nodes": ["test.regular_crates"]
     },
     {
-      "_why": "Guest programs and e2e fixtures: run by the e2e manifest buckets and hermit integration/mode tests.",
+      "_why": "Guest programs and e2e fixtures: run by the e2e manifest buckets and hermit integration/mode tests. A guest fixture can be exercised by any backend, so all e2e backends.",
       "paths": ["tests/**", "examples/**"],
-      "nodes": ["@E2E", "@HERMIT_TESTS"]
+      "nodes": ["@E2E", "@HERMIT_TESTS"],
+      "e2e_all": true
     },
     {
       "_why": "Racy guest programs used by chaos and determinism-stress buckets.",
@@ -131,7 +146,8 @@
       "nodes": [
         "build.flaky_harnesses", "e2e.manifest_chaos_c", "e2e.manifest_determinism_stress",
         "e2e.manifest_determinism_stress_c", "test.regular_crates"
-      ]
+      ],
+      "e2e_all": true
     },
     {
       "_why": "Standalone check scripts map to their own DAG node.",
