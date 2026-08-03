@@ -30,10 +30,13 @@
 //!
 //! CONFIG vs MACHINERY. All selection POLICY is external declarative DATA, not
 //! code: `ci/test-footprints-policy.json` (hand-authored: force_full,
-//! ci_irrelevant, package/path→node edges, the `preflight` gate list, and the
-//! `backend_builds` cell-backend→release-artifact map) is compiled by
+//! ci_irrelevant, package/path→node edges, and the `backend_builds`
+//! cell-backend→release-artifact map) is compiled by
 //! `ci/manifest-plan/src/bin/generate-test-footprints.rs` into the generated
-//! `ci/test-footprints.json` this file reads. THIS FILE is the MACHINERY: the
+//! `ci/test-footprints.json` this file reads. The always-on selective preflight
+//! gates live with the execution topology in `ci/portable-shards.json`; each
+//! preflight node says whether selection adds it or only the GitHub preflight
+//! job runs it. THIS FILE is the MACHINERY: the
 //! glob engine, DAG dependency closure, shard/cell projection, git plumbing,
 //! and — critically — the fail-safe PRECEDENCE in `select()`
 //! (force_full → footprint → ci_irrelevant → unknown ⇒ full). That precedence
@@ -152,8 +155,6 @@ struct Footprints {
     force_full: Vec<String>,
     ci_irrelevant: Vec<String>,
     footprints: Vec<Fp>,
-    /// Always-on cheap safety gates added to any selective run (policy data).
-    preflight: Vec<String>,
     /// Cell backend → release build artifact ("dbi" or "aux") (policy data).
     backend_builds: BTreeMap<String, String>,
 }
@@ -191,7 +192,6 @@ impl Footprints {
             })
             .unwrap_or_default();
 
-        let preflight = str_vec(&v["preflight"]);
         let backend_builds = v["backend_builds"]
             .as_object()
             .map(|o| {
@@ -201,7 +201,7 @@ impl Footprints {
             })
             .unwrap_or_default();
 
-        Footprints { groups, force_full, ci_irrelevant, footprints, preflight, backend_builds }
+        Footprints { groups, force_full, ci_irrelevant, footprints, backend_builds }
     }
 
     /// Expand a node-reference list, resolving `@GROUP` aliases recursively.
@@ -287,6 +287,8 @@ struct Shard {
 }
 
 struct Shards {
+    /// GitHub runs every preflight node; selection adds only those marked true.
+    selection_preflight: Vec<String>,
     debug: Vec<Shard>,
     release: Vec<Shard>,
 }
@@ -311,7 +313,36 @@ impl Shards {
                 })
                 .unwrap_or_default()
         };
-        Shards { debug: parse("debug_shards"), release: parse("release_shards") }
+        let preflight = v["preflight_nodes"].as_array().unwrap_or_else(|| {
+            fail("portable-shards: preflight_nodes must be a non-empty array")
+        });
+        if preflight.is_empty() {
+            fail("portable-shards: preflight_nodes must be a non-empty array");
+        }
+        let selection_preflight = preflight
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let node = entry["node"].as_str().filter(|node| !node.is_empty()).unwrap_or_else(
+                    || {
+                        fail(&format!(
+                            "portable-shards: preflight_nodes[{index}].node must be a non-empty string"
+                        ))
+                    },
+                );
+                let add = entry["add_to_selection"].as_bool().unwrap_or_else(|| {
+                    fail(&format!(
+                        "portable-shards: preflight_nodes[{index}].add_to_selection must be boolean"
+                    ))
+                });
+                add.then(|| node.to_string())
+            })
+            .collect();
+        Shards {
+            selection_preflight,
+            debug: parse("debug_shards"),
+            release: parse("release_shards"),
+        }
     }
 }
 
@@ -378,7 +409,12 @@ fn matches_any(globs: &[String], file: &str) -> bool {
     globs.iter().any(|g| glob_match(g, file))
 }
 
-fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
+fn select(
+    fp: &Footprints,
+    dag: &Dag,
+    selection_preflight: &[String],
+    files: &[String],
+) -> Selection {
     let mut reasons = Vec::new();
 
     // Full-suite result: every node, and every e2e cell (e2e_all).
@@ -465,7 +501,7 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
     }
 
     // Selective: add preflight (policy data), then close over build deps.
-    for pf in &fp.preflight {
+    for pf in selection_preflight {
         if dag.all_nodes.contains(pf) {
             matched.insert(pf.clone());
         }
@@ -778,7 +814,7 @@ fn main() {
         match resolve_baseline(&baseline) {
             Some(b) => {
                 let files = local_changed_files(&b);
-                let mut sel = select(&fp, &dag, &files);
+                let mut sel = select(&fp, &dag, &shards.selection_preflight, &files);
                 sel.reasons.insert(0, format!("LOCAL delta vs known-green baseline {b}"));
                 let rp = derive_run_plan(&sel, &shards, &plan, &fp.backend_builds);
                 emit(&sel, &rp, &format, files.len());
@@ -809,7 +845,7 @@ fn main() {
         (None, None) => fail("need --base <ref>, --files <paths…>, --files -, or --since-green"),
     };
 
-    let sel = select(&fp, &dag, &files);
+    let sel = select(&fp, &dag, &shards.selection_preflight, &files);
     let rp = derive_run_plan(&sel, &shards, &plan, &fp.backend_builds);
     emit(&sel, &rp, &format, files.len());
 }
@@ -1017,20 +1053,23 @@ fn self_test() {
     let dag = Dag::load(&root.join("ci/dag/portable.json"));
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    let select_files = |files: Vec<String>| {
+        select(&fp, &dag, &shards.selection_preflight, &files)
+    };
 
-    let docs = select(&fp, &dag, &vec!["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
+    let docs = select_files(vec!["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
     check("docs-only ⇒ skip", docs.decision == Decision::Skip && docs.nodes.is_empty());
 
-    let lock = select(&fp, &dag, &vec!["Cargo.lock".into()]);
+    let lock = select_files(vec!["Cargo.lock".into()]);
     check("Cargo.lock ⇒ full", lock.decision == Decision::Full && lock.nodes.len() == dag.all_nodes.len());
 
-    let toolchain = select(&fp, &dag, &vec!["rust-toolchain.toml".into()]);
+    let toolchain = select_files(vec!["rust-toolchain.toml".into()]);
     check("toolchain ⇒ full", toolchain.decision == Decision::Full);
 
-    let ci = select(&fp, &dag, &vec!["ci/dag/portable.json".into()]);
+    let ci = select_files(vec!["ci/dag/portable.json".into()]);
     check("ci/** ⇒ full", ci.decision == Decision::Full);
 
-    let dbi = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into()]);
+    let dbi = select_files(vec!["detcore-dbi/src/lib.rs".into()]);
     check("dbi-only ⇒ selective", dbi.decision == Decision::Selective);
     check("dbi-only runs dbi_parity", dbi.nodes.contains("test.dbi_parity"));
     check("dbi-only pulls build.dbi_release", dbi.nodes.contains("build.dbi_release"));
@@ -1040,21 +1079,21 @@ fn self_test() {
     check("dbi-only is a strict subset", dbi.nodes.len() < dag.all_nodes.len());
     check("dbi-only includes preflight", dbi.nodes.contains("lint.rustfmt"));
 
-    let core = select(&fp, &dag, &vec!["detcore/src/scheduler.rs".into()]);
+    let core = select_files(vec!["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
     check("detcore core runs strict_compat", core.nodes.contains("test.strict_compat"));
     check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit"));
 
-    let unknown = select(&fp, &dag, &vec!["some/brand/new/area/file.py".into()]);
+    let unknown = select_files(vec!["some/brand/new/area/file.py".into()]);
     check("unknown path ⇒ full", unknown.decision == Decision::Full);
 
-    let mixed = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into(), "README.md".into()]);
+    let mixed = select_files(vec!["detcore-dbi/src/lib.rs".into(), "README.md".into()]);
     check("dbi + docs ⇒ selective (docs inert)", mixed.decision == Decision::Selective);
 
-    let mixed2 = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into(), "Cargo.lock".into()]);
+    let mixed2 = select_files(vec!["detcore-dbi/src/lib.rs".into(), "Cargo.lock".into()]);
     check("dbi + Cargo.lock ⇒ full (force wins)", mixed2.decision == Decision::Full);
 
-    let rs_lint = select(&fp, &dag, &vec!["hermit-verify/src/main.rs".into()]);
+    let rs_lint = select_files(vec!["hermit-verify/src/main.rs".into()]);
     check("rs change pulls clippy", rs_lint.nodes.contains("lint.clippy"));
 
     // --- shard + e2e cell derivation (footprint → shard-selection layer) ---
@@ -1082,14 +1121,14 @@ fn self_test() {
     check("dbi ⇒ cells are a strict subset", rp_dbi.cells.len() < total_cells);
 
     // SaBRe backend change: only sabre cells + sabre shard.
-    let sabre = select(&fp, &dag, &vec!["detcore-sabre/src/lib.rs".into()]);
+    let sabre = select_files(vec!["detcore-sabre/src/lib.rs".into()]);
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan, &fp.backend_builds);
     check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
     check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
     check("sabre ⇒ build_aux, not dbi", rp_sabre.build_aux && !rp_sabre.build_dbi);
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
-    let liteinst = select(&fp, &dag, &vec!["scripts/stage-liteinst-runtime.sh".into()]);
+    let liteinst = select_files(vec!["scripts/stage-liteinst-runtime.sh".into()]);
     let rp_lite = derive_run_plan(&liteinst, &shards, &plan, &fp.backend_builds);
     check("liteinst ⇒ liteinst shard", rp_lite.shards.contains(&"liteinst".to_string()));
     check("liteinst ⇒ only liteinst cells", !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"));
@@ -1128,7 +1167,7 @@ fn self_test() {
 
     // A resolved baseline feeds the SAME select() path as a PR diff, so the
     // local delta of a docs-only change must still skip.
-    let local_docs = select(&fp, &dag, &vec!["docs/z.md".into()]);
+    let local_docs = select_files(vec!["docs/z.md".into()]);
     check("local docs-only ⇒ skip", local_docs.decision == Decision::Skip);
 
     drop(check);
