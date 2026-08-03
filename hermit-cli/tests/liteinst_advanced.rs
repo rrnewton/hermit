@@ -29,6 +29,8 @@ static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
+static LITEINST_ARCHIVE_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
+static LITEINST_CPIO_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
@@ -159,6 +161,97 @@ fn compressed_fixtures() -> &'static [PathBuf; 3] {
             fs::write(&path, output.stdout).expect("failed to write compressed fixture");
             path
         })
+    })
+}
+
+fn archive_fixtures() -> &'static [PathBuf; 3] {
+    LITEINST_ARCHIVE_FIXTURES.get_or_init(|| {
+        let source = compatibility_fixture();
+        let build_root = source
+            .parent()
+            .expect("compatibility fixture should have a parent directory");
+        let filename = source
+            .file_name()
+            .expect("compatibility fixture should have a filename");
+        let tar_path = build_root.join("compatibility-fixture.tar");
+        let ar_path = build_root.join("compatibility-fixture.a");
+        let zip_path = build_root.join("compatibility-fixture.zip");
+
+        let mut tar = Command::new("/usr/bin/tar");
+        tar.arg("-cf")
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(build_root)
+            .arg(filename);
+        let mut ar = Command::new("/usr/bin/ar");
+        ar.arg("rcs").arg(&ar_path).arg(source);
+        let mut zip = Command::new("/usr/bin/zip");
+        zip.args(["-q", "-j"]).arg(&zip_path).arg(source);
+
+        [
+            ("/usr/bin/tar", tar_path, tar),
+            ("/usr/bin/ar", ar_path, ar),
+            ("/usr/bin/zip", zip_path, zip),
+        ]
+        .map(|(program, path, mut command)| {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to replace {}: {error}", path.display()),
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to run {program}: {error}"));
+            assert!(
+                output.status.success(),
+                "{program} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            path
+        })
+    })
+}
+
+fn cpio_fixture() -> &'static Path {
+    LITEINST_CPIO_FIXTURE.get_or_init(|| {
+        let source = compatibility_fixture();
+        let build_root = source
+            .parent()
+            .expect("compatibility fixture should have a parent directory");
+        let filename = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("compatibility fixture filename should be UTF-8");
+        let path = build_root.join("compatibility-fixture.cpio");
+
+        let mut child = Command::new("/usr/bin/cpio")
+            .args(["-o", "-H", "newc"])
+            .current_dir(build_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run /usr/bin/cpio");
+        writeln!(
+            child
+                .stdin
+                .take()
+                .expect("cpio fixture stdin pipe should exist"),
+            "{filename}"
+        )
+        .expect("failed to write cpio fixture member name");
+        let output = child
+            .wait_with_output()
+            .expect("failed to collect cpio fixture output");
+        assert!(
+            output.status.success(),
+            "cpio failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::write(&path, output.stdout).expect("failed to write cpio fixture");
+        path
     })
 }
 
@@ -679,6 +772,167 @@ fn liteinst_strict_verify_round3_stdin_filter_utilities() {
     let output =
         run_liteinst_strict_verify_with_stdin(Path::new("/usr/bin/tsort"), &[], b"a b\nb c\n");
     assert_eq!(output.stdout, b"a\nb\nc\n");
+}
+
+#[test]
+fn liteinst_strict_verify_round4_stdin_transform_utilities() {
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/expand"),
+        &["-t", "4"],
+        b"a\tb\n",
+    );
+    assert_eq!(output.stdout, b"a   b\n");
+
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/unexpand"),
+        &["-a", "-t", "4"],
+        b"a   b\n",
+    );
+    assert_eq!(output.stdout, b"a\tb\n");
+
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/m4"),
+        &["-DNAME=liteinst"],
+        b"NAME-round4\n",
+    );
+    assert_eq!(output.stdout, b"liteinst-round4\n");
+
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/openssl"),
+        &["enc", "-base64", "-A"],
+        b"liteinst-openssl\n",
+    );
+    assert_eq!(output.stdout, b"bGl0ZWluc3Qtb3BlbnNzbAo=");
+
+    let output =
+        run_liteinst_strict_verify_with_stdin(Path::new("/usr/bin/bc"), &[], b"scale=3; 1/8\n");
+    assert_eq!(output.stdout, b".125\n");
+
+    let output = run_liteinst_strict_verify_with_stdin(Path::new("/usr/bin/dc"), &[], b"5 7 + p\n");
+    assert_eq!(output.stdout, b"12\n");
+}
+
+#[test]
+fn liteinst_strict_verify_round4_encoding_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/basenc"),
+        &["--base16", fixture],
+        b"6C697465696E737420636F6D7061746962696C69747920666978747572650A\n",
+    );
+    assert_liteinst_strict_verify(Path::new("/usr/bin/c++filt"), &["_Z3foov"], b"foo()\n");
+}
+
+#[test]
+fn liteinst_strict_verify_round4_archive_utilities() {
+    let filename = compatibility_fixture()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("compatibility fixture filename should be UTF-8");
+    let [tar_fixture, ar_fixture, zip_fixture] = archive_fixtures();
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/tar"),
+        &[
+            "-xOf",
+            tar_fixture
+                .to_str()
+                .expect("tar fixture path should be UTF-8"),
+            filename,
+        ],
+        COMPAT_FIXTURE_CONTENT,
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/ar"),
+        &[
+            "p",
+            ar_fixture
+                .to_str()
+                .expect("ar fixture path should be UTF-8"),
+            filename,
+        ],
+        COMPAT_FIXTURE_CONTENT,
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/unzip"),
+        &[
+            "-p",
+            zip_fixture
+                .to_str()
+                .expect("zip fixture path should be UTF-8"),
+            filename,
+        ],
+        COMPAT_FIXTURE_CONTENT,
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_round5_language_utilities() {
+    let lua = [Path::new("/usr/bin/lua5.4"), Path::new("/usr/bin/lua")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .expect("portable CI should provide Lua 5.4");
+    assert_liteinst_strict_verify(
+        lua,
+        &["-e", "print(table.concat({1,4,9}, ','))"],
+        b"1,4,9\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/ruby"),
+        &["--disable-gems", "-e", "puts [1,4,9].join(',')"],
+        b"1,4,9\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/php"),
+        &["-r", "echo implode(',', [1,4,9]), PHP_EOL;"],
+        b"1,4,9\n",
+    );
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/tclsh"),
+        &[],
+        b"puts [join [list 1 4 9] \",\"]\n",
+    );
+    assert_eq!(output.stdout, b"1,4,9\n");
+}
+
+#[test]
+fn liteinst_strict_verify_round5_portable_data_utilities() {
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/xmllint"),
+        &["--xpath", "string(/root/item[@id=\"2\"])", "-"],
+        b"<root><item id=\"2\">beta</item></root>\n",
+    );
+    assert_eq!(output.stdout, b"beta\n");
+
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/file"),
+        &["-b", "--mime-type", fixture],
+        b"text/plain\n",
+    );
+
+    let cpio = fs::read(cpio_fixture()).expect("failed to read cpio fixture");
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/cpio"),
+        &["-i", "--to-stdout", "compatibility-fixture.txt"],
+        &cpio,
+    );
+    assert_eq!(output.stdout, COMPAT_FIXTURE_CONTENT);
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/xxd"),
+        &["-p", fixture],
+        b"6c697465696e737420636f6d7061746962696c6974792066697874757265\n0a\n",
+    );
+
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/column"),
+        &["-t"],
+        b"alpha 1\nbeta 22\n",
+    );
+    assert_eq!(output.stdout, b"alpha  1\nbeta   22\n");
 }
 
 #[test]
