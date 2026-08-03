@@ -376,6 +376,13 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
+      "test": "system-utils/openssl-genpkey"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
       "test": "system-utils/openssl-passwd"
     },
     {
@@ -433,6 +440,27 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/shuf-permutation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/sort-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/ssh-keygen-ed25519"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/uuidgen-random"
     }
   ],
   "schema": 1
