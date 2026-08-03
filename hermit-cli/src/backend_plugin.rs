@@ -144,12 +144,19 @@ pub(crate) fn ensure_payload(spec: PluginSpec) -> Result<PayloadManifest, Plugin
         message: format!("error: failed waiting for {}: {error}", helper.display()),
     })?;
     if !output.status.success() {
-        return Err(PluginFailure {
-            code: output.status.code().unwrap_or(EX_CONFIG),
-            message: String::from_utf8_lossy(&output.stderr)
-                .trim_end()
-                .to_owned(),
-        });
+        let code = output.status.code().unwrap_or(EX_CONFIG);
+        let mut message = String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .to_owned();
+        if code == EX_CONFIG {
+            let repair = cargo_install_repair(&helper, spec.helper, &host.package_version)
+                .unwrap_or_else(|error| error);
+            message.push_str(&format!(
+                "\nHermit selected {}; repair that exact plugin in place with:\n  {repair}",
+                helper.display()
+            ));
+        }
+        return Err(PluginFailure { code, message });
     }
     let payload: PayloadManifest =
         serde_json::from_slice(&output.stdout).map_err(|error| PluginFailure {
