@@ -2061,3 +2061,5 @@ mod tests {
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
     }
 }
+
+// selection-probe: single-backend DBI footprint; PR will be closed
