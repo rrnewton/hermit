@@ -32,18 +32,25 @@ int main(void) {
   }
   free(groups);
 
+  pid_t self = getpid();
   pid_t process_group = getpgid(0);
+  pid_t process_group_repeat = getpgid(0);
   pid_t process_group_alias = getpgrp();
-  if (process_group < 0 || process_group != process_group_alias) {
-    fprintf(stderr, "getpgid/getpgrp mismatch: %ld/%ld\n", (long)process_group,
-            (long)process_group_alias);
+  pid_t process_group_alias_repeat = getpgrp();
+  if (process_group < 0 || process_group_repeat != process_group ||
+      process_group_alias < 0 ||
+      process_group_alias_repeat != process_group_alias ||
+      (process_group != process_group_alias && process_group != self)) {
+    fprintf(stderr, "unstable process-group identity: %ld/%ld self=%ld\n",
+            (long)process_group, (long)process_group_alias, (long)self);
     return 1;
   }
-  if (getsid(0) < 0) {
+  pid_t session = getsid(0);
+  if (session < 0 || getsid(0) != session) {
     perror("getsid");
     return 1;
   }
 
-  printf("pid=%ld\n", (long)getpid());
+  printf("pid=%ld\n", (long)self);
   return 0;
 }
