@@ -28,6 +28,18 @@ command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required
 [[ -f $dag ]] || { echo "check-shard-coverage.sh: missing $dag" >&2; exit 2; }
 [[ -f $shards ]] || { echo "check-shard-coverage.sh: missing $shards" >&2; exit 2; }
 
+if ! jq -e '
+    (.preflight_nodes | type) == "array"
+    and (.preflight_nodes | length) > 0
+    and ([.preflight_nodes[] |
+          ((.node | type) == "string" and (.node | length) > 0)
+          and ((.add_to_selection | type) == "boolean")]
+         | all)
+' "$shards" >/dev/null; then
+    echo "check-shard-coverage.sh: FAIL — preflight_nodes entries require a non-empty node and boolean add_to_selection" >&2
+    exit 1
+fi
+
 # All portable nodes except the e2e.manifest_* cells (covered by the e2e matrix).
 mapfile -t expected < <(
     jq -r '.steps[] | "\(.group).\(.job)"
@@ -37,7 +49,7 @@ mapfile -t expected < <(
 # Every node assigned by the shard map, across all job buckets.
 mapfile -t assigned < <(
     jq -r '
-        (.preflight_nodes // [])
+        ([.preflight_nodes[]?.node] // [])
       + (.build_debug_nodes // [])
       + (.build_dbi_nodes // [])
       + (.build_aux_nodes // [])
@@ -51,7 +63,7 @@ mapfile -t assigned < <(
 dupes=$(printf '%s\n' "${assigned[@]}" | uniq -d || true)
 if [[ -n $dupes ]]; then
     echo "check-shard-coverage.sh: FAIL — node(s) assigned to more than one job:" >&2
-    printf '  %s\n' $dupes >&2
+    printf '%s\n' "$dupes" | sed 's/^/  /' >&2
     exit 1
 fi
 
@@ -64,12 +76,12 @@ extra=$(comm -13 <(printf '%s\n' "$expected_list") <(printf '%s\n' "$assigned_un
 status=0
 if [[ -n $missing ]]; then
     echo "check-shard-coverage.sh: FAIL — portable nodes NOT assigned to any job:" >&2
-    printf '  %s\n' $missing >&2
+    printf '%s\n' "$missing" | sed 's/^/  /' >&2
     status=1
 fi
 if [[ -n $extra ]]; then
     echo "check-shard-coverage.sh: FAIL — shard map names nodes absent from portable.json (or e2e.manifest_*):" >&2
-    printf '  %s\n' $extra >&2
+    printf '%s\n' "$extra" | sed 's/^/  /' >&2
     status=1
 fi
 

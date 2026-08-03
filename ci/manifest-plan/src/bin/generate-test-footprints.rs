@@ -404,16 +404,6 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
     }
 }
 
-fn validate_preflight(policy: &Value, nodes: &BTreeSet<String>) {
-    for node in strings(policy, "preflight", &format!("{POLICY}: preflight")) {
-        if !nodes.contains(&node) {
-            die(format!(
-                "{POLICY}: preflight names unknown portable DAG node `{node}`"
-            ));
-        }
-    }
-}
-
 fn validate_backend_builds(policy: &Value) {
     let raw = policy["backend_builds"]
         .as_object()
@@ -484,7 +474,6 @@ fn generated_footprints(root: &Path) -> Value {
     let rules = load_rules(&policy, &packages, &all_nodes);
     let package_paths = load_package_paths(&policy, &packages);
     validate_path_footprints(&policy, &all_nodes);
-    validate_preflight(&policy, &all_nodes);
     validate_backend_builds(&policy);
 
     let mut package_footprints = Vec::new();
@@ -565,14 +554,13 @@ fn generated_footprints(root: &Path) -> Value {
             "",
             "Safety is unchanged: force_full and unknown paths run everything. CI is skipped",
             "only when every changed path is explicitly ci_irrelevant and no footprint matches.",
-            "preflight (always-on selective gates) and backend_builds (cell backend -> release",
-            "artifact) are passed through verbatim from the policy file for the selection engine."
+            "backend_builds (cell backend -> release artifact) is passed through verbatim",
+            "from the policy file for the selection engine."
         ],
         "version": 2,
         "groups": {},
         "force_full": policy["force_full"].clone(),
         "ci_irrelevant": policy["ci_irrelevant"].clone(),
-        "preflight": policy["preflight"].clone(),
         "backend_builds": policy["backend_builds"].clone(),
         "footprints": package_footprints
     })
