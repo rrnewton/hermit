@@ -1,0 +1,79 @@
+name: Debug-build timing probe
+
+# TEMPORARY measurement job (ci-debug-build-for-ci prototype). Times a cold
+# release-backend build vs a cold debug-backend build of the SAME packages on the
+# SAME 4-core ubuntu-latest runner, so the debug-for-CI build-time delta is free
+# of cross-runner variance. Not a gate; not referenced by merge-gate. Delete this
+# file once the delta is recorded. Runs only on its own probe branch.
+on:
+  push:
+    branches: [ci/debug-build-timing-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: Cold release vs debug backend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings -C link-arg=-llzma
+      # Match the production build nodes: cores-aware DynamoRIO/cargo -j.
+      THIRD_PARTY_BUILD_JOBS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      # Intentionally NO rust-cache: both builds must be cold to be comparable and
+      # to represent a first-run CI cost.
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+      - name: Show runner cores
+        run: |
+          echo "nproc=$(nproc)"; grep -c ^processor /proc/cpuinfo || true
+
+      - name: Cold RELEASE backend build (mirrors build.dbi_release + sabre + liteinst)
+        run: |
+          set -euo pipefail
+          J=${THIRD_PARTY_BUILD_JOBS:-$(nproc)}
+          t0=$SECONDS
+          CARGO_BUILD_JOBS=$J HERMIT_INSTALL_FORCE_RESTAGE=probe-rel \
+            cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install
+          CARGO_BUILD_JOBS=$J cargo build --release --locked -p detcore-sabre
+          CARGO_BUILD_JOBS=$J HERMIT_INSTALL_FORCE_RESTAGE=probe-rel-sabre \
+            cargo build --release --locked -p hermit-install
+          ./scripts/stage-liteinst-runtime.sh release "$PWD/target/release/libreverie_liteinst.so" "$PWD/target/liteinst-runtime-build-probe-rel" || true
+          echo "RELEASE_BUILD_SECONDS=$((SECONDS - t0))" | tee -a "$GITHUB_ENV"
+
+      - name: Cold DEBUG backend build (same packages, no --release)
+        run: |
+          set -euo pipefail
+          J=${THIRD_PARTY_BUILD_JOBS:-$(nproc)}
+          t0=$SECONDS
+          CARGO_BUILD_JOBS=$J HERMIT_INSTALL_FORCE_RESTAGE=probe-dbg \
+            cargo build --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install
+          CARGO_BUILD_JOBS=$J cargo build --locked -p detcore-sabre
+          CARGO_BUILD_JOBS=$J HERMIT_INSTALL_FORCE_RESTAGE=probe-dbg-sabre \
+            cargo build --locked -p hermit-install
+          ./scripts/stage-liteinst-runtime.sh debug "$PWD/target/debug/libreverie_liteinst.so" "$PWD/target/liteinst-runtime-build-probe-dbg" || true
+          echo "DEBUG_BUILD_SECONDS=$((SECONDS - t0))" | tee -a "$GITHUB_ENV"
+
+      - name: Report delta
+        run: |
+          set -euo pipefail
+          R=${RELEASE_BUILD_SECONDS:-0}
+          D=${DEBUG_BUILD_SECONDS:-0}
+          echo "::notice title=Backend build delta::release=${R}s ($((R/60))m$((R%60))s) vs debug=${D}s ($((D/60))m$((D%60))s), saving=$((R-D))s"
+          {
+            echo "## Debug-build-for-CI timing probe"
+            echo "| profile | seconds | m:s |"
+            echo "|---------|---------|-----|"
+            echo "| release backends | $R | $((R/60))m$((R%60))s |"
+            echo "| debug backends   | $D | $((D/60))m$((D%60))s |"
+            echo "| **delta (saved)** | $((R-D)) | $(( (R-D)/60 ))m$(( (R-D)%60 ))s |"
+          } >> "$GITHUB_STEP_SUMMARY"
