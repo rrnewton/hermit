@@ -34,6 +34,28 @@ function find_dev_hermit_parent {
     return 1
 }
 
+# Walk UP from the checkout root at most 3 levels looking for the CI hub — a
+# directory that contains the `ci-hub/ci-hub` entrypoint (requiring the
+# entrypoint, not a bare `ci-hub` name, avoids matching an unrelated directory).
+# Prints the hub directory on the first match and returns 0; prints nothing and
+# returns 1 when none is found within the bound. A worktree slot
+# (worktrees/<slot>/hermit) reaches the parent hub in 3 hops; the primary
+# checkout reaches it in 1. This probe NEVER fails its caller — a validate run
+# must proceed normally and silently when no hub is present.
+function find_ci_hub {
+    local dir=$ROOT_DIR
+    local i
+    for ((i = 0; i <= 3; i++)); do
+        if [[ -d $dir/ci-hub && -e $dir/ci-hub/ci-hub ]]; then
+            printf '%s\n' "$dir/ci-hub"
+            return 0
+        fi
+        [[ $dir == / ]] && break
+        dir=$(dirname -- "$dir")
+    done
+    return 1
+}
+
 function validation_slot_name {
     local parent=$1
     local relative
@@ -944,18 +966,17 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
-# Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
-# are computed once by the caller (cleanup) in the top-level shell so they match
-# the human summary exactly and so the `times` builtin sees the accumulated child
-# CPU (a subshell would report only its own times). See print_wall_cpu_summary.
-function append_validation_ledger {
+# Build one standard-format validate-run record (the schema_version 3 JSONL line)
+# and print it. Factored out so the parent ledger and the CI hub report record the
+# byte-identical line — the caller (cleanup) builds it ONCE with the wall/CPU it
+# already computed in the top-level shell, then feeds the same string to both
+# sinks so their timestamps and numbers never diverge.
+function build_validation_record {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
     local commit_anchored_json tree_dirty_json
     local i
-
-    [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
 
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -1000,6 +1021,15 @@ function append_validation_ledger {
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
+    printf '%s\n' "$line"
+}
+
+# Append a prebuilt standard-format record to the shared validate-run ledger.
+function append_validation_ledger {
+    local line=$1
+
+    [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
+    [[ -n $line ]] || return 0
 
     if ! mkdir -p "$(dirname -- "$VALIDATION_LEDGER_FILE")"; then
         printf "⚠️  unable to create validation ledger directory for %s\n" \
@@ -1018,6 +1048,76 @@ function append_validation_ledger {
         printf "⚠️  unable to append validation ledger %s\n" \
             "$VALIDATION_LEDGER_FILE" >&2
     fi
+}
+
+# Report this run to the CI hub (if one is reachable above this checkout) and
+# idempotently register the worktree there. BEST-EFFORT AND SILENT: a missing
+# hub, an unwritable data dir, or a missing jq all return without error and
+# without noise — a validate run must NEVER fail because the hub is absent or the
+# report could not be written. Hub runtime data lives under ci-hub/ignored/
+# (gitignored). Two artifacts:
+#   * validate-runs.jsonl — append the exact standard-format run record (same line
+#     the parent ledger got), so the hub sees worktree/standalone runs the parent
+#     ledger might miss.
+#   * worktree-registry.json — an object keyed by absolute worktree path, upserted
+#     so there is exactly ONE entry per worktree (no duplicates); records path,
+#     repo, branch, slot, first_seen (preserved), last_seen, and the last run's
+#     commit/result/profile/selection_mode.
+function report_run_to_hub {
+    local exit_status=$1 record=$2
+    local hub data_dir runs reg now now_epoch repo branch result
+
+    hub=$(find_ci_hub) || return 0
+    data_dir="$hub/ignored"
+    mkdir -p "$data_dir" 2>/dev/null || return 0
+
+    # Standard-format run report (append-only; runs are events, not deduplicated).
+    if [[ -n $record ]]; then
+        runs="$data_dir/validate-runs.jsonl"
+        if command -v flock >/dev/null 2>&1; then
+            ( flock -x 9; printf '%s\n' "$record" >&9 ) 9>>"$runs" 2>/dev/null || true
+        else
+            printf '%s\n' "$record" >>"$runs" 2>/dev/null || true
+        fi
+    fi
+
+    # Idempotent worktree registry (upsert keyed by absolute path). Requires jq
+    # for a safe read-modify-write; without it we still recorded the run above.
+    command -v jq >/dev/null 2>&1 || return 0
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    now_epoch=$(date +%s)
+    repo=$(basename -- "$ROOT_DIR")
+    branch=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || printf unknown)
+    if ((exit_status == 0 && failures == 0)); then result=pass; else result=fail; fi
+    reg="$data_dir/worktree-registry.json"
+    (
+        if command -v flock >/dev/null 2>&1; then flock -x 8; fi
+        local existing tmp
+        existing='{}'
+        if [[ -f $reg ]]; then
+            existing=$(cat "$reg" 2>/dev/null || printf '{}')
+            [[ -n $existing ]] || existing='{}'
+        fi
+        tmp="$reg.tmp.$$"
+        if printf '%s' "$existing" | jq \
+            --arg path "$ROOT_DIR" --arg repo "$repo" --arg branch "$branch" \
+            --arg slot "$VALIDATION_SLOT" --arg commit "$VALIDATION_COMMIT" \
+            --arg now "$now" --argjson now_epoch "$now_epoch" \
+            --arg result "$result" --arg profile "$VALIDATION_PROFILE" \
+            --arg selection "$VALIDATION_SELECTION_MODE" '
+            (.[$path].first_seen) as $first
+            | .[$path] = {
+                path: $path, repo: $repo, branch: $branch, slot: $slot,
+                first_seen: ($first // $now),
+                last_seen: $now, last_seen_epoch: $now_epoch,
+                last_commit: $commit, last_result: $result,
+                last_profile: $profile, last_selection_mode: $selection
+              }' >"$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$reg" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+        else
+            rm -f "$tmp" 2>/dev/null
+        fi
+    ) 8>>"$reg.lock" 2>/dev/null || true
 }
 
 function human_duration {
@@ -1103,8 +1203,14 @@ function cleanup {
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
-    append_validation_ledger "$exit_status" \
-        "$validation_wall" "$validation_user" "$validation_sys"
+    # Build the standard-format record once so the parent ledger and the CI hub
+    # report the byte-identical line. Reporting to the hub is best-effort and
+    # never fails the run (see report_run_to_hub).
+    local validation_record
+    validation_record=$(build_validation_record "$exit_status" \
+        "$validation_wall" "$validation_user" "$validation_sys")
+    append_validation_ledger "$validation_record"
+    report_run_to_hub "$exit_status" "$validation_record"
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
