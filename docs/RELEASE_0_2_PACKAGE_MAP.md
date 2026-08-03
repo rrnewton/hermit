@@ -68,21 +68,23 @@ before the dependent Hermit package can pass a faithful publish dry-run.
 | `reverie-sabre` | `reverie-sabre` | Registry currently has an `rrnewton` 0.0.1 placeholder |
 | `reverie-dbi` | `reverie-dbt` (`PENDING-OWNER-DECISION`) | DBI-to-DBT rename is deliberately not applied |
 
-## Known accepted release risk
+## Current release flake gate
 
-Hermit 0.2 is not a zero-flake release. After Reverie PR #355 removed the hot
-`PTRACE_GETEVENTMSG`/`ESRCH` spin and associated CPU burn, a 60-round stress
-campaign under elevated concurrent load observed one residual passive-block
-`detcore_misc` hang in approximately 2,760 executions. By the project's
-trinary classification, a result strictly between zero and all failures is
-still **flaky**, not green.
+The current Hermit release head pins Reverie
+`d973a85b328610c14c41c39fa57495b9f77c3c90`, which does not contain the
+`PTRACE_GETEVENTMSG`/`ESRCH` spin fix from Reverie PR #355 (`820b2b64`). A
+matched-load multisect measured 52 hangs in 320 executions (16.3%) at this
+exact Reverie pin; affected neighboring pins measured 18.4-23.4%. The probe
+used concurrent, interleaved waves under elevated host load and classified any
+mixed result as **flaky**. Its method and raw data are recorded in the parent
+workspace under `experiments/multisect_detcore_misc_20260803/`.
 
-The owner accepted this measured rare failure as a post-release backlog item,
-`detcore-misc-residual-passive-block-1-in-2760`, rather than a 0.2 release
-blocker. The residual is the passive reap/notifier path, not the spin fixed by
-#355. The recorded evidence does not include an exact tested SHA or confidence
-interval, so `~1/2760` must remain an approximate observed rate, not a claim of
-a bound or of zero failures.
+The post-#355 residual observation of approximately one passive-block hang in
+2,760 executions is not evidence for this release head. It must not be quoted
+as the current rate until Hermit pins a Reverie revision containing #355 and a
+calibrated matched-load probe verifies that exact Hermit head. Until then, the
+honest current status is a measured 16-23% `detcore_misc` flake, and the pin
+bump plus exact-head verification remain release gates.
 
 ## Generated-manifest synchronization
 
