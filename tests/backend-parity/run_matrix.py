@@ -153,6 +153,277 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "multiprocess_fork_exec": (
+                local / "multiprocess_fork_exec.c",
+                (),
+            ),
+            "pipe_ipc": (local / "pipe_ipc.c", ()),
+            "vectored_io": (local / "vectored_io.c", ()),
+            "eventfd_probe": (local / "eventfd_probe.c", ("-D_GNU_SOURCE",)),
+            "fd_duplication": (local / "fd_duplication.c", ("-D_GNU_SOURCE",)),
+            "sendfile_copy": (local / "sendfile_copy.c", ("-D_GNU_SOURCE",)),
+            "poll_readiness": (local / "poll_readiness.c", ("-D_GNU_SOURCE",)),
+            "append_pwrite": (local / "append_pwrite.c", ("-D_GNU_SOURCE",)),
+            "ftruncate_sparse": (local / "ftruncate_sparse.c", ("-D_GNU_SOURCE",)),
+            "lseek_positioning": (
+                local / "lseek_positioning.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "dup_shared_offset": (
+                local / "dup_shared_offset.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "vectored_file_io": (
+                local / "vectored_file_io.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "openat_flags": (
+                local / "openat_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "fcntl_status_flags": (
+                local / "fcntl_status_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "file_backed_mmap": (
+                local / "file_backed_mmap.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "path_file_ops": (
+                local / "path_file_ops.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "statx_metadata": (
+                local / "statx_metadata.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "copy_file_range_refusal": (
+                local / "copy_file_range_refusal.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "close_range_fds": (
+                local / "close_range_fds.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "mkdir_rmdir": (
+                local / "mkdir_rmdir.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "symlink_ops": (
+                local / "symlink_ops.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "fchmod_bits": (local / "fchmod_bits.c", ("-D_GNU_SOURCE",)),
+            "pipe2_flags": (local / "pipe2_flags.c", ("-D_GNU_SOURCE",)),
+            "rename_ops": (local / "rename_ops.c", ("-D_GNU_SOURCE",)),
+            "memfd_create": (local / "memfd_create.c", ("-D_GNU_SOURCE",)),
+            "fallocate_extents": (
+                local / "fallocate_extents.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "readdir_entries": (
+                local / "readdir_entries.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "flock_lifecycle": (
+                local / "flock_lifecycle.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "mknod_special": (local / "mknod_special.c", ("-D_GNU_SOURCE",)),
+            "umask_mode": (local / "umask_mode.c", ("-D_GNU_SOURCE",)),
+            "fsync_durability": (local / "fsync_durability.c", ("-D_GNU_SOURCE",)),
+            "epoll_readiness": (local / "epoll_readiness.c", ("-D_GNU_SOURCE",)),
+            "prctl_identity": (local / "prctl_identity.c", ("-D_GNU_SOURCE",)),
+            "linkat_flags": (local / "linkat_flags.c", ("-D_GNU_SOURCE",)),
+            "renameat2_flags": (local / "renameat2_flags.c", ("-D_GNU_SOURCE",)),
+            "sigaltstack_state": (
+                local / "sigaltstack_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sigprocmask_state": (
+                local / "sigprocmask_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sigaction_state": (
+                local / "sigaction_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "fadvise_hints": (
+                local / "fadvise_hints.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "fd_cloexec_flags": (
+                local / "fd_cloexec_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "eventfd_semaphore": (
+                local / "eventfd_semaphore.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "pipe_capacity": (
+                local / "pipe_capacity.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "record_lock": (
+                local / "record_lock.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "prlimit_roundtrip": (
+                local / "prlimit_roundtrip.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "mremap_resize": (
+                local / "mremap_resize.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "cwd_roundtrip": (local / "cwd_roundtrip.c", ("-D_GNU_SOURCE",)),
+            "personality_domain": (
+                local / "personality_domain.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "o_tmpfile_anon": (local / "o_tmpfile_anon.c", ("-D_GNU_SOURCE",)),
+            "fcntl_owner": (local / "fcntl_owner.c", ("-D_GNU_SOURCE",)),
+            "mlock_family": (local / "mlock_family.c", ("-D_GNU_SOURCE",)),
+            "mprotect_transitions": (
+                local / "mprotect_transitions.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "membarrier_query": (
+                local / "membarrier_query.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "getcpu_probe": (
+                local / "getcpu_probe.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "inotify_watch": (
+                local / "inotify_watch.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "signalfd_create": (
+                local / "signalfd_create.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "name_to_handle": (
+                local / "name_to_handle.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "aio_refusal": (
+                local / "aio_refusal.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "robust_list": (
+                local / "robust_list.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sysv_ipc_refusal": (local / "sysv_ipc_refusal.c", ()),
+            "child_subreaper_refusal": (
+                local / "child_subreaper_refusal.c",
+                (),
+            ),
+            "prctl_pdeathsig": (local / "prctl_pdeathsig.c", ()),
+            "seccomp_refusal": (local / "seccomp_refusal.c", ("-D_GNU_SOURCE",)),
+            "thp_disable": (local / "thp_disable.c", ()),
+            "sync_file_range": (local / "sync_file_range.c", ("-D_GNU_SOURCE",)),
+            "mce_kill_refusal": (local / "mce_kill_policy.c", ()),
+            "openat2_refusal": (
+                local / "openat2_refusal.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "mempolicy_default": (
+                local / "mempolicy_default.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sched_identity": (local / "sched_identity.c", ("-D_GNU_SOURCE",)),
+            "ioprio_identity": (local / "ioprio_identity.c", ("-D_GNU_SOURCE",)),
+            "kcmp_refusal": (local / "kcmp_refusal.c", ("-D_GNU_SOURCE",)),
+            "sched_attr_identity": (
+                local / "sched_attr_identity.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "no_new_privs_refusal": (
+                local / "no_new_privs_refusal.c",
+                (),
+            ),
+            "statfs_free_determinism": (
+                local / "statfs_free_determinism.c",
+                (),
+            ),
+            "uname_identity": (local / "uname_identity.c", ()),
+            "cachestat_refusal": (local / "cachestat_refusal.c", ("-D_GNU_SOURCE",)),
+            "keepcaps_prctl": (local / "keepcaps_prctl.c", ()),
+            "preadv2_flags": (local / "preadv2_flags.c", ("-D_GNU_SOURCE",)),
+            "mincore_residency": (
+                local / "mincore_residency.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "fchmodat2_flags": (
+                local / "fchmodat2_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "getrusage_self_accounting": (local / "getrusage_self_accounting.c", ()),
+            "madvise_reclaim_hints": (
+                local / "madvise_reclaim_hints.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "epoll_pwait2_readiness": (
+                local / "epoll_pwait2_readiness.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "faccessat2_flags": (
+                local / "faccessat2_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "ioctl_fionread": (
+                local / "ioctl_fionread.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "socketpair_flags": (
+                local / "socketpair_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "socket_options": (
+                local / "socket_options.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "shutdown_socketpair": (local / "shutdown_socketpair.c", ("-D_GNU_SOURCE",)),
+            "sockname_unnamed": (local / "sockname_unnamed.c", ("-D_GNU_SOURCE",)),
+            "bind_getsockname": (local / "bind_getsockname.c", ("-D_GNU_SOURCE",)),
+            "msync_writeback": (local / "msync_writeback.c", ("-D_GNU_SOURCE",)),
+            "set_tid_address": (local / "set_tid_address.c", ("-D_GNU_SOURCE",)),
+            "pidfd_open_self": (
+                local / "pidfd_open_self.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "signal_disposition": (
+                REPOSITORY / "tests/c/signal_disposition.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "cpu_virtualization": (
+                local / "cpu_virtualization.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "prctl_identity": (
+                REPOSITORY / "tests/c/prctl_identity.c",
+                (),
+            ),
+            "rlimit_identity": (
+                REPOSITORY / "tests/c/rlimit_identity.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "numa_node_identity": (
+                REPOSITORY / "tests/c/numa_node_identity.c",
+                (),
+            ),
+            "fd_duplication": (local / "fd_duplication.c", ("-D_GNU_SOURCE",)),
+            "dup_shared_offset": (
+                local / "dup_shared_offset.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "lseek_positioning": (
+                local / "lseek_positioning.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -261,6 +532,506 @@ def case_catalog(
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "multiprocess_fork_exec": (
+            [str(fixtures.binary("multiprocess_fork_exec"))],
+            0,
+            b"forked=4 exec=ok reaped=4 status_sum=10\n",
+        ),
+        "pipe_ipc": (
+            [str(fixtures.binary("pipe_ipc"))],
+            0,
+            b"pipe_ipc bytes=256 checksum=32640 reaped=1\n",
+        ),
+        "vectored_io": (
+            [str(fixtures.binary("vectored_io"))],
+            0,
+            b"vectored_io bytes=256 checksum=32640\n",
+        ),
+        "eventfd_semantics": (
+            [str(fixtures.binary("eventfd_probe"))],
+            0,
+            b"eventfd counter=36 sem=5\n",
+        ),
+        "fd_duplication": (
+            [str(fixtures.binary("fd_duplication"))],
+            0,
+            b"fd_dup offset=8 ok=11\n",
+        ),
+        "sendfile_copy": (
+            [str(fixtures.binary("sendfile_copy"))],
+            0,
+            b"sendfile copied=256 checksum=32640 pos=50 own_offset_kept=1\n",
+        ),
+        "poll_readiness": (
+            [str(fixtures.binary("poll_readiness"))],
+            0,
+            b"poll_readiness ok=8\n",
+        ),
+        "append_pwrite": (
+            [str(fixtures.binary("append_pwrite"))],
+            0,
+            b"append_pwrite size=7 checksum=473 ok=6\n",
+        ),
+        "ftruncate_sparse": (
+            [str(fixtures.binary("ftruncate_sparse"))],
+            0,
+            b"ftruncate_sparse size=6 checksum=131 ok=6\n",
+        ),
+        "lseek_positioning": (
+            [str(fixtures.binary("lseek_positioning"))],
+            0,
+            b"lseek_positioning size=16 checksum=702 ok=11\n",
+        ),
+        "dup_shared_offset": (
+            [str(fixtures.binary("dup_shared_offset"))],
+            0,
+            b"dup_shared_offset size=8 checksum=748 ok=6\n",
+        ),
+        "vectored_file_io": (
+            [str(fixtures.binary("vectored_file_io"))],
+            0,
+            b"vectored_file_io size=10 checksum=959 ok=6\n",
+        ),
+        "openat_flags": (
+            [str(fixtures.binary("openat_flags"))],
+            0,
+            b"openat_flags size=2 checksum=209 ok=6\n",
+        ),
+        "fcntl_status_flags": (
+            [str(fixtures.binary("fcntl_status_flags"))],
+            0,
+            b"fcntl_status_flags size=4 checksum=394 ok=6\n",
+        ),
+        "file_backed_mmap": (
+            [str(fixtures.binary("file_backed_mmap"))],
+            0,
+            b"file_backed_mmap size=16 checksum=1160 ok=5\n",
+        ),
+        "path_file_ops": (
+            [str(fixtures.binary("path_file_ops"))],
+            0,
+            b"path_file_ops size=8 checksum=293 ok=6\n",
+        ),
+        "statx_metadata": (
+            [str(fixtures.binary("statx_metadata"))],
+            0,
+            b"statx_metadata size=6 checksum=597 ok=5\n",
+        ),
+        "copy_file_range_refusal": (
+            [str(fixtures.binary("copy_file_range_refusal"))],
+            0,
+            b"copy_file_range_refusal src=6 dst=0 checksum=597 ok=3\n",
+        ),
+        "close_range_fds": (
+            [str(fixtures.binary("close_range_fds"))],
+            0,
+            b"close_range_fds size=6 checksum=597 ok=6\n",
+        ),
+        "mkdir_rmdir": (
+            [str(fixtures.binary("mkdir_rmdir"))],
+            0,
+            b"mkdir_rmdir ok=6\n",
+        ),
+        "symlink_ops": (
+            [str(fixtures.binary("symlink_ops"))],
+            0,
+            b"symlink_ops size=6 checksum=597 ok=6\n",
+        ),
+        "fchmod_bits": (
+            [str(fixtures.binary("fchmod_bits"))],
+            0,
+            b"fchmod_bits mode=416 ok=5\n",
+        ),
+        "pipe2_flags": (
+            [str(fixtures.binary("pipe2_flags"))],
+            0,
+            b"pipe2_flags ok=4\n",
+        ),
+        "rename_ops": (
+            [str(fixtures.binary("rename_ops"))],
+            0,
+            b"rename_ops ok=4\n",
+        ),
+        "memfd_create": (
+            [str(fixtures.binary("memfd_create"))],
+            0,
+            b"memfd_create ok=5\n",
+        ),
+        "fallocate_extents": (
+            [str(fixtures.binary("fallocate_extents"))],
+            0,
+            b"fallocate ok=5\n",
+        ),
+        "readdir_entries": (
+            [str(fixtures.binary("readdir_entries"))],
+            0,
+            b"readdir ok=3 names=alpha,beta,gamma\n",
+        ),
+        "flock_lifecycle": (
+            [str(fixtures.binary("flock_lifecycle"))],
+            0,
+            b"flock ok=5\n",
+        ),
+        "mknod_special": (
+            [str(fixtures.binary("mknod_special"))],
+            0,
+            b"mknod ok=4\n",
+        ),
+        "umask_mode": (
+            [str(fixtures.binary("umask_mode"))],
+            0,
+            b"umask ok=5\n",
+        ),
+        "fsync_durability": (
+            [str(fixtures.binary("fsync_durability"))],
+            0,
+            b"sync ok=6\n",
+        ),
+        "epoll_readiness": (
+            [str(fixtures.binary("epoll_readiness"))],
+            0,
+            b"epoll ok=6\n",
+        ),
+        "prctl_identity": (
+            [str(fixtures.binary("prctl_identity"))],
+            0,
+            b"prctl ok=5\n",
+        ),
+        "linkat_flags": (
+            [str(fixtures.binary("linkat_flags"))],
+            0,
+            b"linkat ok=5\n",
+        ),
+        "renameat2_flags": (
+            [str(fixtures.binary("renameat2_flags"))],
+            0,
+            b"renameat2 ok=4\n",
+        ),
+        "sigaltstack_state": (
+            [str(fixtures.binary("sigaltstack_state"))],
+            0,
+            b"sigaltstack ok=4\n",
+        ),
+        "sigprocmask_state": (
+            [str(fixtures.binary("sigprocmask_state"))],
+            0,
+            b"sigprocmask ok=5\n",
+        ),
+        "sigaction_state": (
+            [str(fixtures.binary("sigaction_state"))],
+            0,
+            b"sigaction ok=5\n",
+        ),
+        "fadvise_hints": (
+            [str(fixtures.binary("fadvise_hints"))],
+            0,
+            b"fadvise ok=5\n",
+        ),
+        "fd_cloexec_flags": (
+            [str(fixtures.binary("fd_cloexec_flags"))],
+            0,
+            b"fdflags ok=5\n",
+        ),
+        "eventfd_semaphore": (
+            [str(fixtures.binary("eventfd_semaphore"))],
+            0,
+            b"eventfd_sem ok=6\n",
+        ),
+        "pipe_capacity": (
+            [str(fixtures.binary("pipe_capacity"))],
+            0,
+            b"pipecap ok=5\n",
+        ),
+        "record_lock": (
+            [str(fixtures.binary("record_lock"))],
+            0,
+            b"reclock ok=6\n",
+        ),
+        "prlimit_roundtrip": (
+            [str(fixtures.binary("prlimit_roundtrip"))],
+            0,
+            b"prlimit ok=6\n",
+        ),
+        "mremap_resize": (
+            [str(fixtures.binary("mremap_resize"))],
+            0,
+            b"mremap ok=6\n",
+        ),
+        "cwd_roundtrip": (
+            [str(fixtures.binary("cwd_roundtrip"))],
+            0,
+            b"cwd ok=6\n",
+        ),
+        "personality_domain": (
+            [str(fixtures.binary("personality_domain"))],
+            0,
+            b"pers ok=5\n",
+        ),
+        "o_tmpfile_anon": (
+            [str(fixtures.binary("o_tmpfile_anon"))],
+            0,
+            b"otmpfile ok=6\n",
+        ),
+        "fcntl_owner": (
+            [str(fixtures.binary("fcntl_owner"))],
+            0,
+            b"fowner ok=6\n",
+        ),
+        "mlock_family": (
+            [str(fixtures.binary("mlock_family"))],
+            0,
+            b"mlock ok=6\n",
+        ),
+        "mprotect_transitions": (
+            [str(fixtures.binary("mprotect_transitions"))],
+            0,
+            b"mprot ok=7\n",
+        ),
+        "membarrier_query": (
+            [str(fixtures.binary("membarrier_query"))],
+            0,
+            b"memb ok=2 q=31\n",
+        ),
+        "getcpu_probe": (
+            [str(fixtures.binary("getcpu_probe"))],
+            0,
+            b"getcpu ok=2\n",
+        ),
+        "inotify_watch": (
+            [str(fixtures.binary("inotify_watch"))],
+            0,
+            b"ino ok=4\n",
+        ),
+        "signalfd_create": (
+            [str(fixtures.binary("signalfd_create"))],
+            0,
+            b"sfd ok=6\n",
+        ),
+        "name_to_handle_refusal": (
+            [str(fixtures.binary("name_to_handle"))],
+            0,
+            b"name_to_handle ok=3\n",
+        ),
+        "aio_refusal": (
+            [str(fixtures.binary("aio_refusal"))],
+            0,
+            b"aio ok=5\n",
+        ),
+        "robust_list": (
+            [str(fixtures.binary("robust_list"))],
+            0,
+            b"robustlist ok=5\n",
+        ),
+        "sysv_ipc_refusal": (
+            [str(fixtures.binary("sysv_ipc_refusal"))],
+            0,
+            b"sysvipc ok=3\n",
+        ),
+        "child_subreaper_refusal": (
+            [str(fixtures.binary("child_subreaper_refusal"))],
+            0,
+            b"subreaper ok=2\n",
+        ),
+        "prctl_pdeathsig": (
+            [str(fixtures.binary("prctl_pdeathsig"))],
+            0,
+            b"pdeathsig ok=6\n",
+        ),
+        "seccomp_refusal": (
+            [str(fixtures.binary("seccomp_refusal"))],
+            0,
+            b"seccomp ok=2\n",
+        ),
+        "thp_disable": (
+            [str(fixtures.binary("thp_disable"))],
+            0,
+            b"thp ok=4\n",
+        ),
+        "sync_file_range": (
+            [str(fixtures.binary("sync_file_range"))],
+            0,
+            b"syncrange ok=4\n",
+        ),
+        "mce_kill_refusal": (
+            [str(fixtures.binary("mce_kill_refusal"))],
+            0,
+            b"mcekill ok=2\n",
+        ),
+        "openat2_refusal": (
+            [str(fixtures.binary("openat2_refusal"))],
+            0,
+            b"openat2 ok=3\n",
+        ),
+        "mempolicy_default": (
+            [str(fixtures.binary("mempolicy_default"))],
+            0,
+            b"mempolicy ok=4\n",
+        ),
+        "sched_identity": (
+            [str(fixtures.binary("sched_identity"))],
+            0,
+            b"sched ok=6\n",
+        ),
+        "ioprio_identity": (
+            [str(fixtures.binary("ioprio_identity"))],
+            0,
+            b"ioprio ok=5\n",
+        ),
+        "kcmp_refusal": (
+            [str(fixtures.binary("kcmp_refusal"))],
+            0,
+            b"kcmp ok=3\n",
+        ),
+        "sched_attr_identity": (
+            [str(fixtures.binary("sched_attr_identity"))],
+            0,
+            b"sched_attr ok=5\n",
+        ),
+        "no_new_privs_refusal": (
+            [str(fixtures.binary("no_new_privs_refusal"))],
+            0,
+            b"nnp ok=3\n",
+        ),
+        "statfs_free_determinism": (
+            [str(fixtures.binary("statfs_free_determinism"))],
+            0,
+            b"statfs ok=6\n",
+        ),
+        "uname_identity": (
+            [str(fixtures.binary("uname_identity"))],
+            0,
+            b"uname ok=4\n",
+        ),
+        "cachestat_refusal": (
+            [str(fixtures.binary("cachestat_refusal"))],
+            0,
+            b"cachestat ok=2\n",
+        ),
+        "keepcaps_prctl": (
+            [str(fixtures.binary("keepcaps_prctl"))],
+            0,
+            b"keepcaps ok=5\n",
+        ),
+        "preadv2_flags": (
+            [str(fixtures.binary("preadv2_flags"))],
+            0,
+            b"preadv2 ok=6\n",
+        ),
+        "mincore_residency": (
+            [str(fixtures.binary("mincore_residency"))],
+            0,
+            b"mincore ok=6\n",
+        ),
+        "fchmodat2_flags": (
+            [str(fixtures.binary("fchmodat2_flags"))],
+            0,
+            b"fchmodat2 ok=5\n",
+        ),
+        "getrusage_self_accounting": (
+            [str(fixtures.binary("getrusage_self_accounting"))],
+            0,
+            b"getrusage ok=6\n",
+        ),
+        "madvise_reclaim_hints": (
+            [str(fixtures.binary("madvise_reclaim_hints"))],
+            0,
+            b"madvise_reclaim ok=6\n",
+        ),
+        "epoll_pwait2": (
+            [str(fixtures.binary("epoll_pwait2_readiness"))],
+            0,
+            b"epoll_pwait2 ok=7\n",
+        ),
+        "faccessat2_flags": (
+            [str(fixtures.binary("faccessat2_flags"))],
+            0,
+            b"faccessat2 ok=6\n",
+        ),
+        "ioctl_fionread": (
+            [str(fixtures.binary("ioctl_fionread"))],
+            0,
+            b"fionread ok=6\n",
+        ),
+        "socketpair_flags": (
+            [str(fixtures.binary("socketpair_flags"))],
+            0,
+            b"socketpair ok=7\n",
+        ),
+        "socket_options": (
+            [str(fixtures.binary("socket_options"))],
+            0,
+            b"sockopt ok=6\n",
+        ),
+        "shutdown_socketpair": (
+            [str(fixtures.binary("shutdown_socketpair"))],
+            0,
+            b"shutdown ok=5\n",
+        ),
+        "sockname_unnamed": (
+            [str(fixtures.binary("sockname_unnamed"))],
+            0,
+            b"sockname ok=6\n",
+        ),
+        "bind_getsockname": (
+            [str(fixtures.binary("bind_getsockname"))],
+            0,
+            b"bind_name ok=6\n",
+        ),
+        "msync_writeback": (
+            [str(fixtures.binary("msync_writeback"))],
+            0,
+            b"msync ok=5\n",
+        ),
+        "set_tid_address": (
+            [str(fixtures.binary("set_tid_address"))],
+            0,
+            b"set_tid_address ok=4\n",
+        ),
+        "pidfd_open_self": (
+            [str(fixtures.binary("pidfd_open_self"))],
+            0,
+            b"pidfd ok=6\n",
+        ),
+        "signal_disposition": (
+            [str(fixtures.binary("signal_disposition"))],
+            0,
+            b"signal-disposition-ok\n",
+        ),
+        "cpu_virtualization": (
+            [str(fixtures.binary("cpu_virtualization"))],
+            0,
+            b"cpu-virtualization-ok\n",
+        ),
+        "prctl_identity": (
+            [str(fixtures.binary("prctl_identity"))],
+            0,
+            b"prctl-identity-ok\n",
+        ),
+        "rlimit_identity": (
+            [str(fixtures.binary("rlimit_identity"))],
+            0,
+            b"rlimit-identity-ok\n",
+        ),
+        "numa_node_identity": (
+            [str(fixtures.binary("numa_node_identity"))],
+            0,
+            b"numa-node-identity-ok\n",
+        ),
+        "fd_duplication": (
+            [str(fixtures.binary("fd_duplication"))],
+            0,
+            b"fd_dup offset=8 ok=11\n",
+        ),
+        "dup_shared_offset": (
+            [str(fixtures.binary("dup_shared_offset"))],
+            0,
+            b"dup_shared_offset size=8 checksum=748 ok=6\n",
+        ),
+        "lseek_positioning": (
+            [str(fixtures.binary("lseek_positioning"))],
+            0,
+            b"lseek_positioning size=16 checksum=702 ok=11\n",
         ),
     }
 
@@ -911,9 +1682,12 @@ def main() -> int:
                     )
                     continue
 
-                status, detail, duration = run_case(
-                    hermit, backend, name, fixtures, strict, args.verify, expected
-                )
+                try:
+                    status, detail, duration = run_case(
+                        hermit, backend, name, fixtures, strict, args.verify, expected
+                    )
+                except MatrixError as _err:
+                    status, detail, duration = "FAIL", f"build/matrix-error: {str(_err)[:200]}", 0.0
                 if is_gap and status == "PASS":
                     status = "XPASS"
                     detail = f"candidate for promotion from gap: {detail}"
