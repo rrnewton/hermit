@@ -1212,13 +1212,15 @@ function human_duration {
 # and interruption alike.
 function print_wall_cpu_summary {
     local exit_status=$1 wall=$2 user=$3 sys=$4
-    local cpu ratio marker hint=""
+    local cpu ratio ratio_display marker hint=""
 
     cpu=$(awk -v u="$user" -v s="$sys" 'BEGIN { printf "%.1f", u + s }')
     if ((wall > 0)); then
         ratio=$(awk -v c="$cpu" -v w="$wall" 'BEGIN { printf "%.1f", c / w }')
+        ratio_display="${ratio}x"
     else
         ratio="n/a"
+        ratio_display="n/a"
     fi
     if ((exit_status == 0 && failures == 0)); then
         marker="✅"
@@ -1233,10 +1235,10 @@ function print_wall_cpu_summary {
             hint="  (~1 core busy — single-threaded or possibly spinning)"
         fi
     fi
-    printf "%s Elapsed: wall %s | CPU %s (user %s, sys %s) | CPU/wall %sx across %s cores%s\n" \
+    printf "%s Elapsed: wall %s | CPU %s (user %s, sys %s) | CPU/wall %s across %s cores%s\n" \
         "$marker" "$(human_duration "$wall")" "$(human_duration "$cpu")" \
         "$(human_duration "$user")" "$(human_duration "$sys")" \
-        "$ratio" "$host_cpus" "$hint"
+        "$ratio_display" "$host_cpus" "$hint"
 }
 
 function cleanup {
