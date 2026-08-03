@@ -295,7 +295,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbi = "DBI virtualizes getpgid but getpgrp still exposes the host process group; cross-call equality is not established"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
@@ -2623,7 +2623,6 @@ dbi = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
 [[test]]
 id = "backend-parity-c/socket-options"
 description = "Strict verification for tests/backend-parity/fixtures/socket_options.c"
