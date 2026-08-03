@@ -22,6 +22,8 @@ permissions:
   contents: read
 
 env:
+  # GitHub checks out Hermit standalone, outside the dev-hermit ci-hub.
+  VALIDATE_ALLOW_NO_CI_HUB: "1"
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
   RUSTFLAGS: -D warnings -C link-arg=-llzma

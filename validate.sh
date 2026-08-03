@@ -40,8 +40,8 @@ function find_dev_hermit_parent {
 # Prints the hub directory on the first match and returns 0; prints nothing and
 # returns 1 when none is found within the bound. A worktree slot
 # (worktrees/<slot>/hermit) reaches the parent hub in 3 hops; the primary
-# checkout reaches it in 1. This probe NEVER fails its caller — a validate run
-# must proceed normally and silently when no hub is present.
+# checkout reaches it in 1. Callers fail closed unless the standalone-only
+# VALIDATE_ALLOW_NO_CI_HUB escape hatch was set explicitly.
 function find_ci_hub {
     local dir=$ROOT_DIR
     local i
@@ -170,6 +170,8 @@ SHALLOW_SELECT=0
 SELECTION_OUTCOME=""
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
+ALLOW_NO_CI_HUB=0
+[[ ${VALIDATE_ALLOW_NO_CI_HUB:-0} == 1 ]] && ALLOW_NO_CI_HUB=1
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -220,6 +222,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ONLY_MODE=1; shift 3 ;;
         --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
+        --allow-no-ci-hub) ALLOW_NO_CI_HUB=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -285,6 +288,10 @@ Other options:
                    or compared. A run forced with this flag is recorded as
                    NOT-commit-anchored (commit_anchored=false) and never applies
                    the `locally-validated` label.
+  --allow-no-ci-hub  Standalone-only escape hatch: run without durable ci-hub
+                   registration. Emits a loud warning. Dev-hermit agents must
+                   not use this; GitHub workflows set it explicitly because a
+                   standalone product checkout has no parent hub.
   --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
   --no-label-pr    Disable the non-fatal GitHub label update.
   -h, --help       Show this help and exit.
@@ -296,6 +303,7 @@ Environment:
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
+  VALIDATE_ALLOW_NO_CI_HUB=1                     Same as --allow-no-ci-hub.
   VALIDATE_FORCE_FULL=1                          Same as --all (no selection pruning).
   VALIDATE_FULL_RUN_EVERY=N                      Force a full run after N consecutive
                                                  selective/skip runs in this slot's
@@ -414,6 +422,36 @@ readonly VALIDATION_LEVEL VALIDATION_PROFILE
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
+VALIDATION_CI_HUB=$(find_ci_hub || true)
+VALIDATION_CI_HUB_DATA_DIR=""
+if [[ -z $VALIDATION_CI_HUB ]]; then
+    if ((ALLOW_NO_CI_HUB == 0)); then
+        {
+            printf "validate.sh: ci-hub not found within 3 parent directories of %s.\n" "$ROOT_DIR"
+            printf "  Refusing an unregistered validation run: its result would be lost\n"
+            printf "  when this process or agent exits. Run inside dev-hermit, or for a\n"
+            printf "  standalone checkout explicitly pass --allow-no-ci-hub\n"
+            printf "  (VALIDATE_ALLOW_NO_CI_HUB=1). Dev-hermit agents must not opt out.\n"
+        } >&2
+        exit 2
+    fi
+    printf "WARNING: ci-hub unavailable; explicit standalone opt-out active. This run will NOT be registered.\n" >&2
+else
+    VALIDATION_CI_HUB_DATA_DIR="$(dirname -- "$VALIDATION_CI_HUB")/ignored/ci-hub"
+    for required in jq flock; do
+        if ! command -v "$required" >/dev/null 2>&1; then
+            printf "validate.sh: ci-hub registration requires '%s'; refusing an unregistered run.\n" \
+                "$required" >&2
+            exit 2
+        fi
+    done
+    if ! mkdir -p "$VALIDATION_CI_HUB_DATA_DIR" \
+        || [[ ! -w $VALIDATION_CI_HUB_DATA_DIR ]]; then
+        printf "validate.sh: ci-hub store is not writable: %s\n" \
+            "$VALIDATION_CI_HUB_DATA_DIR" >&2
+        exit 2
+    fi
+fi
 DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
 VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
 VALIDATION_LEDGER_FILE=${HERMIT_VALIDATE_LEDGER:-}
@@ -487,6 +525,7 @@ else
     VALIDATION_SELECTION_MODE=full
 fi
 readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
+readonly VALIDATION_CI_HUB VALIDATION_CI_HUB_DATA_DIR ALLOW_NO_CI_HUB
 readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
 readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
@@ -974,32 +1013,45 @@ function json_quote {
 function build_validation_record {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
-    local finished_at result gates_json gate_result line
+    local finished_at result gates_json gate_result gate_kind line
     local commit_anchored_json tree_dirty_json
-    local i
+    local i product_failures=0 killed_by_bound=0 incomplete_gates=0 killed_by_signal=0
 
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    if ((exit_status == 0 && failures == 0)); then
-        result=pass
-    else
-        result=fail
-    fi
 
     gates_json='['
     for i in "${!ledger_gate_names[@]}"; do
         ((i == 0)) || gates_json+=','
-        if ((ledger_gate_statuses[i] == 0)); then
-            gate_result=pass
-        else
-            gate_result=fail
-        fi
+        case ${ledger_gate_statuses[i]} in
+            0) gate_result=pass; gate_kind=pass ;;
+            124) gate_result=fail; gate_kind=timeout; ((killed_by_bound += 1)) ;;
+            *) gate_result=fail; gate_kind=fail; ((product_failures += 1)) ;;
+        esac
         gates_json+="{\"name\":$(json_quote "${ledger_gate_names[i]}"),"
         gates_json+="\"result\":\"$gate_result\","
+        gates_json+="\"kind\":\"$gate_kind\","
         gates_json+="\"exit_code\":${ledger_gate_statuses[i]},"
         gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
     done
     gates_json+=']'
+
+    # Match ci-hub/validate/aggregate.py's canonical attribution. Product
+    # failure wins over a resource timeout; a timeout (killed by a configured
+    # bound), signal kill, and incomplete/crashed harness are distinct terminal
+    # states. This prevents every non-pass from collapsing into `partial`.
+    if ((product_failures > 0 || (failures > 0 && killed_by_bound == 0))); then
+        result=fail
+    elif ((killed_by_bound > 0)); then
+        result=timeout
+    elif ((exit_status == 130)); then
+        result=killed
+        killed_by_signal=1
+    elif ((exit_status != 0)); then
+        result=incomplete
+        incomplete_gates=1
+    else
+        result=pass
+    fi
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
@@ -1019,6 +1071,8 @@ function build_validation_record {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"product_failures\":$product_failures,\"killed_by_bound\":$killed_by_bound,"
+    line+="\"killed_by_signal\":$killed_by_signal,\"incomplete_gates\":$incomplete_gates,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
     printf '%s\n' "$line"
@@ -1050,12 +1104,67 @@ function append_validation_ledger {
     fi
 }
 
-# Report this run to the CI hub (if one is reachable above this checkout) and
-# idempotently register the worktree there. BEST-EFFORT AND SILENT: a missing
-# hub, an unwritable data dir, or a missing jq all return without error and
-# without noise — a validate run must NEVER fail because the hub is absent or the
-# report could not be written. Hub runtime data lives under ci-hub/ignored/
-# (gitignored). Two artifacts:
+# Idempotently register this worktree at start and completion. The start record
+# makes a detached run discoverable while its launching agent is gone; the EXIT
+# trap replaces `running` with the terminal result. Runtime data lives under the
+# parent convention `ignored/ci-hub/` (gitignored), never under versioned
+# `ci-hub/` itself.
+function update_hub_worktree_registry {
+    local state=$1 result=${2:-running} exit_code=${3:--1}
+    local reg now now_epoch repo branch tmp existing
+    local commit_anchored_json tree_dirty_json active_pid
+
+    [[ -n $VALIDATION_CI_HUB_DATA_DIR ]] || return 0
+    reg="$VALIDATION_CI_HUB_DATA_DIR/worktree-registry.json"
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    now_epoch=$(date +%s)
+    repo=$(basename -- "$ROOT_DIR")
+    branch=$(git -C "$ROOT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || printf detached)
+    if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
+    if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+    if [[ $state == running ]]; then active_pid=$$; else active_pid=null; fi
+
+    (
+        flock -x 8 || exit 1
+        existing='{}'
+        if [[ -f $reg ]]; then
+            existing=$(cat "$reg") || exit 1
+            [[ -n $existing ]] || existing='{}'
+        fi
+        tmp="$reg.tmp.$$"
+        if ! printf '%s' "$existing" | jq \
+            --arg path "$ROOT_DIR" --arg repo "$repo" --arg branch "$branch" \
+            --arg slot "$VALIDATION_SLOT" --arg commit "$VALIDATION_COMMIT" \
+            --arg now "$now" --arg started "$VALIDATION_STARTED_AT" \
+            --argjson now_epoch "$now_epoch" --arg state "$state" \
+            --arg result "$result" --arg profile "$VALIDATION_PROFILE" \
+            --arg selection "$VALIDATION_SELECTION_MODE" \
+            --argjson exit_code "$exit_code" --argjson active_pid "$active_pid" \
+            --argjson anchored "$commit_anchored_json" \
+            --argjson dirty "$tree_dirty_json" '
+            (.[$path] // {}) as $old
+            | .[$path] = {
+                path: $path, repo: $repo, branch: $branch, slot: $slot,
+                first_seen: ($old.first_seen // $now),
+                last_seen: $now, last_seen_epoch: $now_epoch,
+                state: $state, active_pid: $active_pid,
+                current_started_at: $started,
+                last_commit: $commit, last_result: $result,
+                last_exit_code: $exit_code,
+                last_profile: $profile, last_selection_mode: $selection,
+                commit_anchored: $anchored, tree_dirty: $dirty
+              }' >"$tmp"; then
+            rm -f "$tmp"
+            exit 1
+        fi
+        mv -f "$tmp" "$reg" || { rm -f "$tmp"; exit 1; }
+    ) 8>>"$reg.lock"
+}
+
+# Report the standard record and finalize the worktree registration. Failures
+# are loud and affect an otherwise-green validate: silently losing the result is
+# worse than refusing to certify a run that cannot be aggregated.
+# Two artifacts:
 #   * validate-runs.jsonl — append the exact standard-format run record (same line
 #     the parent ledger got), so the hub sees worktree/standalone runs the parent
 #     ledger might miss.
@@ -1065,60 +1174,25 @@ function append_validation_ledger {
 #     commit/result/profile/selection_mode.
 function report_run_to_hub {
     local exit_status=$1 record=$2
-    local hub data_dir runs reg now now_epoch repo branch result
+    local runs result
 
-    hub=$(find_ci_hub) || return 0
-    data_dir="$hub/ignored"
-    mkdir -p "$data_dir" 2>/dev/null || return 0
+    [[ -n $VALIDATION_CI_HUB_DATA_DIR ]] || return 0
+    [[ -n $record ]] || return 1
+    runs="$VALIDATION_CI_HUB_DATA_DIR/validate-runs.jsonl"
+    result=$(printf '%s' "$record" | jq -er '.result') || return 1
 
     # Standard-format run report (append-only; runs are events, not deduplicated).
-    if [[ -n $record ]]; then
-        runs="$data_dir/validate-runs.jsonl"
-        if command -v flock >/dev/null 2>&1; then
-            ( flock -x 9; printf '%s\n' "$record" >&9 ) 9>>"$runs" 2>/dev/null || true
-        else
-            printf '%s\n' "$record" >>"$runs" 2>/dev/null || true
-        fi
-    fi
-
-    # Idempotent worktree registry (upsert keyed by absolute path). Requires jq
-    # for a safe read-modify-write; without it we still recorded the run above.
-    command -v jq >/dev/null 2>&1 || return 0
-    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    now_epoch=$(date +%s)
-    repo=$(basename -- "$ROOT_DIR")
-    branch=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || printf unknown)
-    if ((exit_status == 0 && failures == 0)); then result=pass; else result=fail; fi
-    reg="$data_dir/worktree-registry.json"
-    (
-        if command -v flock >/dev/null 2>&1; then flock -x 8; fi
-        local existing tmp
-        existing='{}'
-        if [[ -f $reg ]]; then
-            existing=$(cat "$reg" 2>/dev/null || printf '{}')
-            [[ -n $existing ]] || existing='{}'
-        fi
-        tmp="$reg.tmp.$$"
-        if printf '%s' "$existing" | jq \
-            --arg path "$ROOT_DIR" --arg repo "$repo" --arg branch "$branch" \
-            --arg slot "$VALIDATION_SLOT" --arg commit "$VALIDATION_COMMIT" \
-            --arg now "$now" --argjson now_epoch "$now_epoch" \
-            --arg result "$result" --arg profile "$VALIDATION_PROFILE" \
-            --arg selection "$VALIDATION_SELECTION_MODE" '
-            (.[$path].first_seen) as $first
-            | .[$path] = {
-                path: $path, repo: $repo, branch: $branch, slot: $slot,
-                first_seen: ($first // $now),
-                last_seen: $now, last_seen_epoch: $now_epoch,
-                last_commit: $commit, last_result: $result,
-                last_profile: $profile, last_selection_mode: $selection
-              }' >"$tmp" 2>/dev/null; then
-            mv -f "$tmp" "$reg" 2>/dev/null || rm -f "$tmp" 2>/dev/null
-        else
-            rm -f "$tmp" 2>/dev/null
-        fi
-    ) 8>>"$reg.lock" 2>/dev/null || true
+    ( flock -x 9 && printf '%s\n' "$record" >&9 ) 9>>"$runs" \
+        || return 1
+    update_hub_worktree_registry "$result" "$result" "$exit_status"
 }
+
+if [[ -n $VALIDATION_CI_HUB_DATA_DIR ]] \
+    && ! update_hub_worktree_registry running running -1; then
+    printf "validate.sh: failed to register running validation in %s\n" \
+        "$VALIDATION_CI_HUB_DATA_DIR" >&2
+    exit 2
+fi
 
 function human_duration {
     awk -v t="$1" 'BEGIN {
@@ -1204,13 +1278,19 @@ function cleanup {
         print_compatibility_summary
     fi
     # Build the standard-format record once so the parent ledger and the CI hub
-    # report the byte-identical line. Reporting to the hub is best-effort and
-    # never fails the run (see report_run_to_hub).
+    # report the byte-identical line. A hub write failure invalidates an otherwise
+    # green run: an unregistered result cannot be treated as durable evidence.
     local validation_record
     validation_record=$(build_validation_record "$exit_status" \
         "$validation_wall" "$validation_user" "$validation_sys")
     append_validation_ledger "$validation_record"
-    report_run_to_hub "$exit_status" "$validation_record"
+    if ! report_run_to_hub "$exit_status" "$validation_record"; then
+        printf "validate.sh: FAILED to persist the ci-hub result in %s\n" \
+            "${VALIDATION_CI_HUB_DATA_DIR:-<standalone opt-out>}" >&2
+        if ((exit_status == 0)); then
+            exit_status=2
+        fi
+    fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
