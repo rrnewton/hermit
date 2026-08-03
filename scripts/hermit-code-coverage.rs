@@ -40,7 +40,6 @@ const PRODUCT_ROOTS: &[&str] = &[
     "common",
     "detcore",
     "detcore-dbi",
-    "detcore-liteinst",
     "detcore-model",
     "detcore-sabre",
     "hermit-cli",
