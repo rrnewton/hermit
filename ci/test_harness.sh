@@ -314,6 +314,21 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$jobs" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
+    grep -Fq 'CI_DAG_JOBS:-$(./scripts/effective-dag-jobs.sh)' <<<"$runner_body" ||
+        die "validate.sh must derive its default DAG fan-out from effective resources"
+
+    [[ -x $ROOT_DIR/scripts/effective-cpu-count.sh ]] ||
+        die "missing executable effective CPU-count probe"
+    [[ -x $ROOT_DIR/scripts/effective-memory-budget.sh ]] ||
+        die "missing executable effective memory-budget probe"
+    [[ -x $ROOT_DIR/scripts/effective-dag-jobs.sh ]] ||
+        die "missing executable effective DAG-jobs probe"
+    "$ROOT_DIR/scripts/test-effective-resource-limits.sh" >/dev/null ||
+        die "effective host/cgroup resource probes failed"
+    [[ $(jq '[.steps[].cmd | select(contains("CARGO_BUILD_JOBS=")) | select(contains("effective-cpu-count.sh"))] | length' "$DAG_ROOT/portable.json") == 3 ]] ||
+        die "all portable Cargo build nodes must use the effective CPU-count probe"
+    ! grep -Fq 'THIRD_PARTY_BUILD_JOBS:-8' "$DAG_ROOT/portable.json" ||
+        die "portable Cargo build nodes retain the fixed eight-core throttle"
 
     local privileged_critical_path
     privileged_critical_path=$(dag_critical_path_seconds "$DAG_ROOT/privileged.json")

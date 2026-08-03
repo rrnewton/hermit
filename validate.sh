@@ -2953,7 +2953,7 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-2}
+    local jobs=${CI_DAG_JOBS:-$(./scripts/effective-dag-jobs.sh)}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
