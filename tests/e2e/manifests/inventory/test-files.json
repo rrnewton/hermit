@@ -500,6 +500,12 @@
     },
     {
       "disposition": "special-driver",
+      "path": "tests/backend-parity/split_asymmetric_pr.py",
+      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
+      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+    },
+    {
+      "disposition": "special-driver",
       "path": "tests/backend-parity/run_matrix.py",
       "runner": "portable and privileged backend-parity partitions",
       "why": "tests/backend-parity/run_matrix.py is owned by portable and privileged backend-parity partitions: run_matrix.py expands one fixture matrix across backend-specific capability checks, build flags, and expected results. It stays a driver because those cross-backend comparisons cannot be represented as one program observation."
