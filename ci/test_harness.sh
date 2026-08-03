@@ -339,6 +339,7 @@ function emit_manifest_buckets {
 
 function audit_ci_correspondence {
     local lane dag
+    "$ROOT_DIR/ci/test-validate-smart-selection.sh"
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
         jq -e '
