@@ -42,3 +42,16 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# LOCAL-ONLY integration patch for kvm-tty testing — DO NOT COMMIT.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie" }
+reverie-dbi = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-dbi" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-kvm" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-ptrace" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-liteinst" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-rpc-transport" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-syscalls" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-process" }
+reverie-util = { path = "/home/newton/work/dev-hermit/worktrees/kvm-envhash/reverie/reverie-util" }
