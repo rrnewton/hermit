@@ -2188,7 +2188,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-dbi-getuid-identity): Credential-query
+                // TODO-HUMAN-REVIEW(#1549): Credential-query
                 // family emulated to the fixed virtual-root identity (0). See
                 // syscall_classification.rs for the determinism rationale.
                 // getuid/geteuid/getgid/getegid return the constant directly;
