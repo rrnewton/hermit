@@ -5,6 +5,16 @@ name: P0 Demo Gate (Hermit hot paths)
 # check out the current parent demo harness, then overlay the exact Hermit
 # commit that triggered this workflow. Keep this paths list synchronized with
 # the hot-path test in merge-gate.yml.
+#
+# `tests/**` is armed broadly because guest programs and fixtures under it can
+# feed the demo suite, but pure test-SELECTION metadata cannot: the demo job
+# builds the hermit binary and runs the parent demo programs, and never reads
+# `tests/e2e/manifests/**` (manifest/inventory selection metadata) or the
+# standalone `tests/backend-parity/**` parity fixtures. A PR that touches only
+# those trees provably cannot change a demo outcome, so it is excluded below to
+# keep the single serial PMU lane free. merge-gate.yml already exempts the same
+# two trees from its required-check classifier (landed in 4a97ec36); this stops
+# the now-unnecessary demo runs from even being triggered.
 on:
   push:
     branches: [main]
@@ -21,6 +31,8 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/manifests/**"
+      - "!tests/backend-parity/**"
   pull_request:
     branches: [main]
     paths:
@@ -36,6 +48,8 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/manifests/**"
+      - "!tests/backend-parity/**"
   workflow_dispatch:
 
 concurrency:
