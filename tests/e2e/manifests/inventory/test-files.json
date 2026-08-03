@@ -2484,6 +2484,12 @@
       "disposition": "integration-helper",
       "runner": "validate.sh or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by validate.sh or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "path": "tests/backend-parity/retarget_to_manifest.py",
+      "disposition": "special-driver",
+      "runner": "backend-parity matrix-to-manifest retarget tool (manual; migrates legacy matrix.tsv rows into schema-v2 manifests)",
+      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix-to-manifest retarget tool (manual; migrates legacy matrix.tsv rows into schema-v2 manifests): One-shot migration driver that reads a source PR's added matrix.tsv rows and fixture .c files, writes each fixture into the working tree, appends a symmetric [[test]] block to backend-parity-c.toml with DBI/KVM enabled only where the source L2 --verify witness passed, and reclassifies the fixture from guest-fixture to manifest-test. It is standalone tooling run by hand, not a manifest-plan program observation."
     }
   ]
 }
