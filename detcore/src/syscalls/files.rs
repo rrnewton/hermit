@@ -11,7 +11,6 @@
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use nix::fcntl::OFlag;
 use rand::RngExt as _;
@@ -92,11 +91,30 @@ fn ns_to_timerfd_timespec(ns: u64) -> libc::timespec {
     }
 }
 
-/// Virtual-time nanoseconds remaining until `deadline`, or zero when the timer
-/// is disarmed or its next expiration is already due.
-fn timerfd_remaining_ns(deadline: Option<LogicalTime>, now: LogicalTime) -> u64 {
+/// Virtual-time nanoseconds until the timer's *next* expiration, matching the
+/// `it_value` that Linux's `timerfd_gettime` reports.
+///
+/// For a still-pending timer this is `deadline - now`. For a **periodic** timer
+/// that is already overdue (one or more expirations have accrued but have not
+/// yet been drained by `read()`), Linux reports the time until the *upcoming*
+/// tick, not zero: the stored `deadline` only advances on `read()`, so we must
+/// project it forward across the periods already crossed. Returns zero for a
+/// disarmed timer or an expired one-shot (whose single pending expiration is
+/// reported by `read()`, while `gettime` shows it as disarmed).
+fn timerfd_remaining_ns(deadline: Option<LogicalTime>, interval_ns: u64, now: LogicalTime) -> u64 {
     match deadline {
         Some(d) if d > now => d.as_nanos().saturating_sub(now.as_nanos()),
+        // Overdue periodic timer: advance to the first expiration strictly after
+        // `now`. `elapsed / interval + 1` is the number of whole periods to the
+        // next boundary (also correct at `d == now`, giving a full interval).
+        Some(d) if interval_ns > 0 => {
+            let elapsed = now.as_nanos().saturating_sub(d.as_nanos());
+            let periods = (elapsed / interval_ns).saturating_add(1);
+            let next = d
+                .as_nanos()
+                .saturating_add(periods.saturating_mul(interval_ns));
+            next.saturating_sub(now.as_nanos())
+        }
         _ => 0,
     }
 }
@@ -2384,6 +2402,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // host-timed behavior, letting the kernel own arming and old_value.
             return self.notification_fd_control(guest, call.into()).await;
         }
+
+        // Only a *modeled* timerfd is virtualized. A `timerfd_settime` targeting
+        // any other descriptor (a regular fd, socket, ...) is not: defer to the
+        // host, which rejects it (`EINVAL`) or handles it, without ever
+        // installing spurious virtual `TimerfdState`. `with_detfd` propagates
+        // `EBADF` for an unknown fd, matching Linux.
+        let prior = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?;
+        let Some(prior) = prior else {
+            return self.notification_fd_control(guest, call.into()).await;
+        };
+
         let new_ptr = call.new_value().ok_or(Errno::EFAULT)?;
         let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
         let interval_ns = timerfd_timespec_to_ns(new.it_interval);
@@ -2392,15 +2423,22 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let now = thread_observe_time(guest).await;
 
-        // Capture the prior virtual arming for old_value and to preserve clockid.
-        let prior = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?;
-        let old_remaining_ns = prior
-            .map(|st| timerfd_remaining_ns(st.deadline, now))
-            .unwrap_or(0);
-        let old_interval_ns = prior.map(|st| st.interval_ns).unwrap_or(0);
-        let clockid = prior.map(|st| st.clockid).unwrap_or(libc::CLOCK_MONOTONIC);
+        // Validate the arming against the kernel BEFORE committing any virtual
+        // state: mirror it to the host timer (for poll/epoll readiness) and let
+        // the host reject invalid `tv_nsec`/`tv_sec`/flags with `EINVAL`. Do not
+        // let the host write the guest's old_value buffer. On host error we
+        // return here, leaving the prior virtual arming untouched — so an invalid
+        // `settime` neither installs nor clobbers a `TimerfdState`, and a later
+        // `gettime` still reflects reality.
+        let host_call = call.with_old_value(None);
+        self.notification_fd_control(guest, host_call.into())
+            .await?;
+
+        // Host accepted the arming: capture old_value from the prior virtual
+        // arming, then compute and commit the new one.
+        let old_remaining_ns = timerfd_remaining_ns(prior.deadline, prior.interval_ns, now);
+        let old_interval_ns = prior.interval_ns;
+        let clockid = prior.clockid;
 
         let deadline = if value_ns == 0 {
             // Disarm.
@@ -2409,7 +2447,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Absolute expiration is interpreted against the same virtual clock.
             Some(LogicalTime::from_nanos(value_ns))
         } else {
-            Some(now + Duration::from_nanos(value_ns))
+            // Saturate rather than overflow on an extreme (but host-accepted)
+            // relative value such as `tv_sec == i64::MAX`.
+            Some(LogicalTime::from_nanos(
+                now.as_nanos().saturating_add(value_ns),
+            ))
         };
 
         guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -2419,12 +2461,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 interval_ns,
             });
         })?;
-
-        // Mirror the arming to the host timer for poll/epoll readiness, but do
-        // not let the host write the guest's old_value buffer.
-        let host_call = call.with_old_value(None);
-        self.notification_fd_control(guest, host_call.into())
-            .await?;
 
         if let Some(old_ptr) = call.old_value() {
             let old_spec = libc::itimerspec {
@@ -2467,7 +2503,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let now = thread_observe_time(guest).await;
                 let spec = libc::itimerspec {
                     it_interval: ns_to_timerfd_timespec(st.interval_ns),
-                    it_value: ns_to_timerfd_timespec(timerfd_remaining_ns(st.deadline, now)),
+                    it_value: ns_to_timerfd_timespec(timerfd_remaining_ns(
+                        st.deadline,
+                        st.interval_ns,
+                        now,
+                    )),
                 };
                 guest.memory().write_value(value_ptr, &spec)?;
                 Ok(0)
@@ -2506,7 +2546,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The kernel requires a buffer large enough for the u64 count.
             return Err(Errno::EINVAL.into());
         }
-        let buf = call.buf().ok_or(Errno::EFAULT)?;
+        // NB: the buffer pointer is validated only once we are about to copy out
+        // an expiration count, mirroring the kernel's order of checks
+        // (EINVAL on short length, then EAGAIN when nonblocking-and-unexpired,
+        // and only EFAULT on the final copy-to-user). Validating it up front
+        // would wrongly return EFAULT instead of EAGAIN for an unexpired
+        // `TFD_NONBLOCK` read with a bad buffer.
 
         loop {
             let state = guest
@@ -2526,18 +2571,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             if now >= deadline {
                 let deadline_ns = deadline.as_nanos();
                 let now_ns = now.as_nanos();
-                let (count, next_deadline) =
-                    match (now_ns - deadline_ns).checked_div(state.interval_ns) {
-                        // Periodic (interval_ns > 0): coalesce every period boundary
-                        // crossed, matching the kernel's expiration-count semantics.
-                        Some(extra) => {
-                            let count = 1 + extra;
-                            let advanced = deadline_ns + count * state.interval_ns;
-                            (count, Some(LogicalTime::from_nanos(advanced)))
-                        }
-                        // One-shot (interval_ns == 0): a single expiration, then disarmed.
-                        None => (1u64, None),
-                    };
+                let (count, next_deadline) = match now_ns
+                    .saturating_sub(deadline_ns)
+                    .checked_div(state.interval_ns)
+                {
+                    // Periodic (interval_ns > 0): coalesce every period boundary
+                    // crossed, matching the kernel's expiration-count semantics.
+                    // Saturating arithmetic keeps a far-future/extreme virtual
+                    // time from overflowing the count or the next deadline.
+                    Some(extra) => {
+                        let count = 1u64.saturating_add(extra);
+                        let advanced =
+                            deadline_ns.saturating_add(count.saturating_mul(state.interval_ns));
+                        (count, Some(LogicalTime::from_nanos(advanced)))
+                    }
+                    // One-shot (interval_ns == 0): a single expiration, then disarmed.
+                    None => (1u64, None),
+                };
+                // Validate the destination buffer only now that we have an
+                // expiration to deliver (kernel EFAULT-on-copy ordering).
+                let buf = call.buf().ok_or(Errno::EFAULT)?;
                 guest.thread_state().with_detfd(call.fd(), |detfd| {
                     detfd.set_timerfd_state(TimerfdState {
                         deadline: next_deadline,
