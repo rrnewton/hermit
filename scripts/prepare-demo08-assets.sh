@@ -3,6 +3,27 @@
 
 set -euo pipefail
 
+# Safe probes must be pure: show usage and exit 0 BEFORE the required-tool checks
+# and the (heavy, network-touching) asset build below.
+for arg in "$@"; do
+    case "$arg" in
+        -h | --help)
+            cat <<'EOF'
+prepare-demo08-assets.sh — build the pinned Demo 8 ASAN btrfs-progs fixtures
+
+USAGE:
+  scripts/prepare-demo08-assets.sh              build/refresh the fixtures (clones + compiles; cached)
+  scripts/prepare-demo08-assets.sh -h|--help    show this help and exit (no side effects)
+
+Bare invocation is the CI/nightly prep step and DOES real work (git clone + build);
+it is idempotent and no-ops when the cached assets are already current.
+Env: DEMO08_DIR, DEMO08_BUILD_ROOT, DEMO08_BTRFS_REPO, DEMO08_BUILD_JOBS, HERMIT_RELEASE.
+EOF
+            exit 0
+            ;;
+    esac
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${DEMO08_DIR:-$ROOT/ignored/demo08-btrfs}"
 BUILD_ROOT="${DEMO08_BUILD_ROOT:-$ROOT/ignored/demo08-build}"
