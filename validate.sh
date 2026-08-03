@@ -134,6 +134,18 @@ ONLY_LANE=""
 ONLY_NODES=""
 SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
+# Smart selection is the DEFAULT for a plain `./validate.sh` (full level, no
+# focused mode): the portable lane is pruned to the nodes the change can affect
+# (fail-open: any doubt runs the full portable lane), while the privileged lane
+# ALWAYS runs because select-tests cannot prove its PMU/CPUID/KVM nodes inert.
+# FORCE_FULL=1 (from --all/--full-run/VALIDATE_FORCE_FULL, or the chain-depth
+# safety trigger) runs the complete suite with no pruning. SHALLOW_SELECT=1
+# anchors selection to HEAD~1 (last-commit footprint) instead of the last green
+# base. SELECTION_OUTCOME records what selection actually did this run.
+FORCE_FULL=0
+[[ ${VALIDATE_FORCE_FULL:-0} == 1 ]] && FORCE_FULL=1
+SHALLOW_SELECT=0
+SELECTION_OUTCOME=""
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 LABEL_PR=1
@@ -171,6 +183,8 @@ while [[ $# -gt 0 ]]; do
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --all|--full-run) FORCE_FULL=1; shift ;;
+        --shallow-select) SHALLOW_SELECT=1; shift ;;
         --baseline)
             SELECTIVE_BASELINE=${2:-}
             [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
@@ -218,11 +232,27 @@ Focused gates (run one matrix/lane and exit):
   --privileged-only             PMU/CPUID-dependent tests only.
   --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps) against the already-built
                                 tree; build first with ci/run-dag.sh <lane>.
-  --selective, --since-green    Run only the portable DAG nodes affected by changes
-                                since the last known-green baseline (fail-safe: any
-                                doubt or no trustworthy baseline runs the full lane).
-  --baseline <sha>              Known-green baseline commit for --selective (else
+  --selective, --since-green    Run ONLY the affected portable DAG nodes (no
+                                privileged lane) — the portable-lane building
+                                block used by CI. Fail-safe: any doubt or no
+                                trustworthy baseline runs the full portable lane.
+  --baseline <sha>              Known-green baseline commit for selection (else
                                 $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
+
+Default selection (a plain `./validate.sh`, i.e. the full level with no focused
+mode) now runs SMART: the portable lane is pruned to the nodes the change since
+the last known-green base can affect, and the privileged lane always runs. Any
+doubt (unknown path, no green base, tool error) runs the full portable lane —
+selection only ever removes work the tool PROVED inert, never masks a failure.
+  --all, --full-run             Force the complete suite with NO selection
+                                pruning (the pre-selection default). Use for
+                                nightly runs, before a release, and before a
+                                submodule pin bump. Same as VALIDATE_FORCE_FULL=1.
+  --shallow-select              Anchor default selection to HEAD~1 (last-commit
+                                footprint, assuming everything before it was
+                                green) instead of walking back to the last green
+                                base. Cheapest; use only when the parent commit
+                                is trusted green.
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -244,6 +274,10 @@ Environment:
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
+  VALIDATE_FORCE_FULL=1                          Same as --all (no selection pruning).
+  VALIDATE_FULL_RUN_EVERY=N                      Force a full run after N consecutive
+                                                 selective/skip runs in this slot's
+                                                 ledger (chain-depth safety; default 10).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -278,6 +312,21 @@ if ((only_modes > 1)); then
 fi
 if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
     echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+# --all / --shallow-select tune the DEFAULT full-level selection; they are
+# meaningless with a focused mode (which already runs one fixed lane) or with
+# explicit --selective, and mutually exclusive with each other.
+if ((FORCE_FULL == 1 && SHALLOW_SELECT == 1)); then
+    echo "validate.sh: --all and --shallow-select are mutually exclusive" >&2
+    exit 2
+fi
+if ((FORCE_FULL == 1 || SHALLOW_SELECT == 1)) && ((only_modes > 0)); then
+    echo "validate.sh: --all/--shallow-select apply to the default full run, not focused modes (--selective, --only, --*-compat-only, --envelope-*)" >&2
+    exit 2
+fi
+if ((SHALLOW_SELECT == 1)) && [[ $VALIDATION_LEVEL != full ]]; then
+    echo "validate.sh: --shallow-select applies only to the default full level" >&2
     exit 2
 fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
@@ -396,10 +445,22 @@ fi
 # affected/explicit subset. Recorded separately from the profile so the ledger
 # distinguishes a partial run from a complete one (selection is only sound on a
 # complete commit, so a subset run must never masquerade as full coverage).
+#
+# This is the INITIAL intent only. It is deliberately NOT readonly: a default
+# plain `./validate.sh` at the full profile runs smart selection, and the actual
+# outcome (skip|selective|full for the portable lane) is only known after the
+# selector runs. run_smart_full_suite rewrites VALIDATION_SELECTION_MODE to the
+# ACTUAL outcome so the ledger records what really executed, never the intent.
 if ((SELECTIVE_MODE == 1)); then
     VALIDATION_SELECTION_MODE=selective
 elif ((ONLY_MODE == 1)); then
     VALIDATION_SELECTION_MODE=only
+elif [[ $VALIDATION_LEVEL == full ]] && ((FORCE_FULL == 0 && VALIDATION_COMMIT_ANCHORED == 1)); then
+    # A plain full run defaults to smart affected-test selection. This "smart"
+    # intent is a placeholder: once select-tests runs, run_smart_full_suite
+    # rewrites it to the resolved outcome (skip|selective|full), and every
+    # complete-suite fallback in run_full_dispatch rewrites it to "full".
+    VALIDATION_SELECTION_MODE=smart
 else
     VALIDATION_SELECTION_MODE=full
 fi
@@ -407,7 +468,7 @@ readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERM
 readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
 readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
-readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
+readonly VALIDATION_COMMIT_ANCHORED
 
 # Refuse to run on a dirty working tree so no validation record is silently
 # misattributed to a HEAD that never ran. The caller's escapes are, in order of
@@ -3714,54 +3775,77 @@ function build_selected_portable_dag {
     [[ $(jq '.steps | length' "$out" 2>/dev/null || echo 0) -gt 0 ]]
 }
 
-# --selective / --since-green: run only the portable DAG nodes affected by the
-# delta since the last known-green baseline. FAIL-SAFE: a skip decision runs
-# nothing, a selective decision runs the dependency-closed subset, and ANY other
-# outcome (full, tool error, no baseline, empty/failed subset build) runs the
-# complete portable lane — never fewer tests than the tool proved safe to omit.
-function run_selective_suite {
+# Run the portable lane with smart affected-test selection, FAIL-SAFE. Sets the
+# global SELECTION_OUTCOME to what actually ran on the portable lane
+# (skip|selective|full) and accumulates into the shared `failures` counter, but
+# does NOT print a summary — the caller owns print_summary so it can aggregate
+# the portable and privileged lanes into one report.
+#
+# FAIL-SAFE rules (never run fewer tests than the tool PROVED safe to omit):
+#   * skip     : select-tests proved every changed file inert -> portable skipped.
+#   * selective: run exactly the dependency-closed affected subset.
+#   * anything else (full decision, tool error, no baseline, empty/failed subset
+#     build) -> run the COMPLETE portable lane.
+#
+# baseline_override: when non-empty, diff against exactly that commit (used by
+# --shallow-select's HEAD~1 baseline). Otherwise the last-known-green baseline is
+# resolved from --baseline / $HERMIT_LAST_GREEN_SHA / the validate-run ledger.
+function run_selected_portable_lane {
+    local baseline_override=${1:-}
     local baseline sel_json decision nodes total dag_override rc
-    baseline=$(resolve_selective_baseline)
+    if [[ -n $baseline_override ]]; then
+        baseline=$baseline_override
+    else
+        baseline=$(resolve_selective_baseline)
+    fi
     local -a sel_args=(--since-green --format json)
     if [[ -n $baseline ]]; then
         sel_args=(--since-green --baseline "$baseline" --format json)
-        printf "Selective validation: last-known-green baseline = %s\n" "$baseline"
+        if [[ -n $baseline_override ]]; then
+            printf "Smart selection: baseline pinned to %s\n" "$baseline"
+        else
+            printf "Smart selection: last-known-green baseline = %s\n" "$baseline"
+        fi
     else
-        printf "Selective validation: no trustworthy green baseline; running the FULL portable lane.\n"
+        printf "Smart selection: no trustworthy green baseline; running the FULL portable lane.\n"
     fi
 
+    total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
     if ! sel_json=$("$ROOT_DIR/ci/select-tests.rs" "${sel_args[@]}" 2>>"$LOG_FILE"); then
-        printf "Selective validation: select-tests.rs failed; running the FULL portable lane.\n"
-        run_portable_only_suite
+        printf "Smart selection: select-tests.rs failed; running the FULL portable lane.\n"
+        SELECTION_OUTCOME=full
+        run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
         return $?
     fi
     decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
-    total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
 
     case "$decision" in
         skip)
-            printf "Selective validation: no CI-relevant changes since baseline — nothing to run (0/%s nodes).\n" \
+            printf "Smart selection: no CI-relevant changes since baseline — portable lane skipped (0/%s nodes).\n" \
                 "$total"
-            print_summary
-            ((failures == 0))
-            return $?
+            SELECTION_OUTCOME=skip
+            return 0
             ;;
         selective)
             nodes=$(printf '%s' "$sel_json" | jq -r '.nodes | join(",")' 2>/dev/null || echo "")
             if [[ -z $nodes ]]; then
-                printf "Selective validation: empty selected node set — running the FULL portable lane.\n"
-                run_portable_only_suite
+                printf "Smart selection: empty selected node set — running the FULL portable lane.\n"
+                SELECTION_OUTCOME=full
+                run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
                 return $?
             fi
             dag_override="$VALIDATION_TMP_DIR/portable-selective.json"
             if ! build_selected_portable_dag "$nodes" "$dag_override"; then
-                printf "Selective validation: could not build subset DAG; running the FULL portable lane.\n"
-                run_portable_only_suite
+                printf "Smart selection: could not build subset DAG; running the FULL portable lane.\n"
+                SELECTION_OUTCOME=full
+                run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
                 return $?
             fi
-            printf "Selective validation: running %s/%s portable DAG nodes:\n  %s\n" \
+            printf "Smart selection: running %s/%s portable DAG nodes:\n  %s\n" \
                 "$(printf '%s' "$sel_json" | jq -r '.node_count')" "$total" \
                 "${nodes//,/ }"
+            SELECTION_OUTCOME=selective
             run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
@@ -3769,16 +3853,108 @@ function run_selective_suite {
                 ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-2}" -v
             rc=$?
             unset RUN_DAG_FILE_OVERRIDE
-            print_summary
-            ((failures == 0))
-            return $?
+            return $rc
             ;;
         *)
-            printf "Selective validation: decision=%s — running the FULL portable lane.\n" "$decision"
-            run_portable_only_suite
+            printf "Smart selection: decision=%s — running the FULL portable lane.\n" "$decision"
+            SELECTION_OUTCOME=full
+            run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
             return $?
             ;;
     esac
+}
+
+# --selective / --since-green: run ONLY the affected portable DAG nodes since the
+# last known-green baseline (no privileged lane). Records the ACTUAL portable
+# outcome in the ledger via VALIDATION_SELECTION_MODE.
+function run_selective_suite {
+    run_selected_portable_lane
+    VALIDATION_SELECTION_MODE=$SELECTION_OUTCOME
+    print_summary
+    ((failures == 0))
+}
+
+# Chain-depth total-run trigger. Affected-test selection accumulates silent risk,
+# so after VALIDATE_FULL_RUN_EVERY consecutive incremental (selective/skip) runs
+# on this slot, force the next run to validate the COMPLETE suite. Returns 0
+# (force full) when the ledger tail shows a streak >= the configured threshold.
+# Fail-safe: any parse/tool problem returns non-zero (do NOT force), because the
+# default path already fails open to a complete run on the situations that matter.
+function smart_selection_chain_depth_forces_full {
+    local every=${VALIDATE_FULL_RUN_EVERY:-10}
+    [[ $every =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -n $VALIDATION_LEDGER_FILE && -f $VALIDATION_LEDGER_FILE ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    local streak
+    streak=$(jq -r --arg slot "$VALIDATION_SLOT" '
+        select(.slot == $slot) | .selection_mode // "full"' \
+        "$VALIDATION_LEDGER_FILE" 2>/dev/null \
+        | awk '{ if ($0 == "selective" || $0 == "skip") c++; else c = 0 } END { print c + 0 }')
+    [[ $streak =~ ^[0-9]+$ ]] || return 1
+    if ((streak >= every)); then
+        printf "Chain-depth trigger: %s consecutive incremental runs on slot %s (>= %s) — forcing a COMPLETE run.\n" \
+            "$streak" "$VALIDATION_SLOT" "$every"
+        return 0
+    fi
+    return 1
+}
+
+# Default plain `./validate.sh` at the full profile: smart-select the portable
+# lane, but ALWAYS run the privileged lane in full. select-tests only models the
+# portable DAG (privileged is 7 unmodeled PMU/CPUID/KVM nodes), so pruning it
+# would be unsound — it is never selected. Records the ACTUAL portable outcome
+# in VALIDATION_SELECTION_MODE. Prints no summary; the caller owns it.
+function run_smart_full_suite {
+    local baseline_override=${1:-}
+    run_selected_portable_lane "$baseline_override"
+    VALIDATION_SELECTION_MODE=$SELECTION_OUTCOME
+    if [[ $SELECTION_OUTCOME != full ]]; then
+        printf "Smart selection: privileged lane always runs in full (never pruned by selection).\n"
+    fi
+    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
+}
+
+# Full-profile dispatch. A plain `./validate.sh` (full profile, no focused mode,
+# no --all) defaults to SMART affected-test selection on the portable lane. It is
+# pruned back to the COMPLETE suite (run_full_suite) whenever selection would be
+# unsound or a total-run trigger fires:
+#   * --all / --full-run / VALIDATE_FORCE_FULL=1 : caller demands the full suite.
+#   * not commit-anchored : a dirty/forced HEAD makes the diff basis unsound.
+#   * chain-depth         : VALIDATE_FULL_RUN_EVERY consecutive incremental runs.
+# --shallow-select pins the baseline to HEAD~1 (assume green before the tip
+# commit). Prints no summary; the outer print_summary + label logic own it.
+function run_full_dispatch {
+    if ((FORCE_FULL == 1)); then
+        printf "Full validation: complete suite requested (--all / VALIDATE_FORCE_FULL=1).\n"
+        VALIDATION_SELECTION_MODE=full
+        run_full_suite
+        return
+    fi
+    if ((VALIDATION_COMMIT_ANCHORED == 0)); then
+        printf "Full validation: run is not commit-anchored; smart selection is unsound — running the COMPLETE suite.\n"
+        VALIDATION_SELECTION_MODE=full
+        run_full_suite
+        return
+    fi
+    if ((SHALLOW_SELECT == 0)) && smart_selection_chain_depth_forces_full; then
+        VALIDATION_SELECTION_MODE=full
+        run_full_suite
+        return
+    fi
+    local baseline_override=""
+    if ((SHALLOW_SELECT == 1)); then
+        if baseline_override=$(git rev-parse --verify --quiet "HEAD~1^{commit}" 2>/dev/null) \
+            && [[ -n $baseline_override ]]; then
+            printf "Shallow selection: baseline = HEAD~1 (%s); assuming green before the tip commit.\n" \
+                "$baseline_override"
+        else
+            printf "Shallow selection: HEAD~1 unavailable — running the COMPLETE suite.\n"
+            VALIDATION_SELECTION_MODE=full
+            run_full_suite
+            return
+        fi
+    fi
+    run_smart_full_suite "$baseline_override"
 }
 
 function run_exact_detcore_cases {
@@ -4150,20 +4326,26 @@ fi
 case "$VALIDATION_LEVEL" in
     quick) run_quick_suite ;;
     portable-only) run_portable_only_suite ;;
-    full) run_full_suite ;;
+    full) run_full_dispatch ;;
     super) run_super_suite ;;
 esac
 
 print_summary
 
 # On a fully-green full run, tag the PR unless explicitly disabled. GitHub
-# failures are warnings and never affect the final validation exit status.
+# failures are warnings and never affect the final validation exit status. The
+# '%s' label certifies a COMPLETE local suite, so a run that pruned the portable
+# lane with affected-test selection (selection_mode != full) does NOT earn it —
+# that PR must rely on the authoritative hosted CI gate instead.
 if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
-        apply_locally_validated_label
-    else
+    if ((VALIDATION_COMMIT_ANCHORED == 0)); then
         printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
             "$LOCALLY_VALIDATED_LABEL" >&2
+    elif [[ $VALIDATION_SELECTION_MODE != full ]]; then
+        printf "⚠️  Skipping '%s' label: this run used affected-test selection (mode=%s), not a complete suite. Re-run with --all to earn the stamp.\n" \
+            "$LOCALLY_VALIDATED_LABEL" "$VALIDATION_SELECTION_MODE" >&2
+    else
+        apply_locally_validated_label
     fi
 fi
 
