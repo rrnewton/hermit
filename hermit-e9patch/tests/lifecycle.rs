@@ -35,6 +35,7 @@ fn ensure(root: &Path, request: &EnsureRequest) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hermit-e9patch"))
         .arg("ensure")
         .env("HERMIT_DIR", root)
+        .env("HERMIT_SELECTED_HELPER", root.join("bin/hermit-e9patch"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -150,6 +151,8 @@ fn exact_version_mismatch_fails_before_extraction() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("package version mismatch"));
     assert!(stderr.contains("refusing backend 'e9patch'"));
-    assert!(stderr.contains("cargo install --force --locked hermit-e9patch@=0.2.1"));
+    assert!(stderr.contains("cargo install --root"));
+    assert!(stderr.contains("--force --locked hermit-e9patch@=0.2.1"));
+    assert!(stderr.contains("repaired selected plugin:"));
     assert!(!directory.path().join("plugins").exists());
 }

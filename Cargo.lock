@@ -1110,6 +1110,7 @@ name = "hermit-plugin-protocol"
 version = "0.2.0"
 dependencies = [
  "serde",
+ "tempfile",
 ]
 
 [[package]]

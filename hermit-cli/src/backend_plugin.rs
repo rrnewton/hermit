@@ -15,6 +15,7 @@ use hermit_plugin_protocol::EX_UNAVAILABLE;
 use hermit_plugin_protocol::EnsureRequest;
 use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
+use hermit_plugin_protocol::cargo_install_repair;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PluginSpec {
@@ -69,13 +70,15 @@ fn select_helper_from(
             return Ok(path.clone());
         }
         if fs::symlink_metadata(path).is_ok() {
+            let repair = cargo_install_repair(path, spec.helper, env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| error);
             return Err(PluginFailure {
                 code: EX_CONFIG,
                 message: format!(
-                    "error: selected {} helper {} exists but is not executable; refusing to fall back to a different plugin\nrepair: reinstall it with `cargo install --force {}` or fix its execute permission",
+                    "error: selected {} helper {} exists but is not executable; refusing to fall back to a different plugin\nrepair selected plugin in place with:\n  {}\nor fix its execute permission",
                     spec.helper,
                     path.display(),
-                    spec.helper,
+                    repair,
                 ),
             });
         }
@@ -111,6 +114,7 @@ pub(crate) fn ensure_payload(spec: PluginSpec) -> Result<PayloadManifest, Plugin
     let request = EnsureRequest { host: host.clone() };
     let mut child = Command::new(&helper)
         .arg("ensure")
+        .env("HERMIT_SELECTED_HELPER", &helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

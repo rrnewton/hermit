@@ -28,6 +28,7 @@ use hermit_plugin_protocol::EX_UNAVAILABLE;
 use hermit_plugin_protocol::EnsureRequest;
 use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
+use hermit_plugin_protocol::cargo_install_repair;
 
 const DIAGNOSTIC_FD: libc::c_int = 198;
 
@@ -73,11 +74,14 @@ fn select_helper_from(
             return Ok(path.clone());
         }
         if fs::symlink_metadata(path).is_ok() {
+            let repair = cargo_install_repair(path, "hermit-dynamorio", env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| error);
             return Err(PluginFailure {
                 code: EX_CONFIG,
                 message: format!(
-                    "error: selected hermit-dynamorio helper {} exists but is not executable; refusing to fall back to a different plugin\nrepair: reinstall it with `cargo install --force hermit-dynamorio` or fix its execute permission",
-                    path.display()
+                    "error: selected hermit-dynamorio helper {} exists but is not executable; refusing to fall back to a different plugin\nrepair selected plugin in place with:\n  {}\nor fix its execute permission",
+                    path.display(),
+                    repair,
                 ),
             });
         }
@@ -107,6 +111,7 @@ pub(super) fn ensure_payload() -> Result<PayloadManifest, PluginFailure> {
     let request = EnsureRequest { host: host.clone() };
     let mut child = Command::new(&helper)
         .arg("ensure")
+        .env("HERMIT_SELECTED_HELPER", &helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

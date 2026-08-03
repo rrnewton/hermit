@@ -3,6 +3,8 @@
 #![deny(missing_docs)]
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -24,6 +26,38 @@ pub const EX_UNAVAILABLE: i32 = 69;
 pub const EX_CANTCREAT: i32 = 73;
 /// `sysexits.h` configuration failure used for incompatible components.
 pub const EX_CONFIG: i32 = 78;
+
+/// Returns a shell command that reinstalls `package` over the exact selected helper.
+///
+/// Cargo installs executables below `<root>/bin`. Refusing paths outside that
+/// shape prevents a plausible-looking command from updating a different copy.
+pub fn cargo_install_repair(
+    selected: &Path,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
+    let bin = selected.parent().filter(|parent| {
+        parent
+            .file_name()
+            .is_some_and(|name| name == OsStr::new("bin"))
+    });
+    let Some(root) = bin.and_then(Path::parent) else {
+        return Err(format!(
+            "selected helper {} is not under a Cargo install root's bin/ directory; replace or remove that exact file before reinstalling {package}",
+            selected.display()
+        ));
+    };
+    let root = shell_quote(&root.as_os_str().to_string_lossy());
+    let selected = selected.as_os_str().to_string_lossy();
+    Ok(format!(
+        "cargo install --root {root} --force --locked {package}@={version} && printf '%s\\n' {confirmation}",
+        confirmation = shell_quote(&format!("repaired selected plugin: {selected}")),
+    ))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+}
 
 /// Fixed C layout exported by the Detcore DBT shared object.
 #[derive(Clone, Copy)]
@@ -211,6 +245,28 @@ mod tests {
         plugin = host.clone();
         plugin.detcore_build_id = "build-b".to_owned();
         assert_eq!(host.mismatch(&plugin), Some("Detcore build ID"));
+    }
+
+    #[test]
+    fn repair_command_targets_exact_cargo_root_and_reports_replacement() {
+        let selected = Path::new("/tmp/hermit root/bin/hermit-dynamorio");
+        let command = cargo_install_repair(selected, "hermit-dynamorio", "0.2.0").unwrap();
+        assert!(command.contains("--root '/tmp/hermit root'"));
+        assert!(command.contains("--force --locked hermit-dynamorio@=0.2.0"));
+        assert!(command.contains("repaired selected plugin:"));
+        assert!(command.contains("/tmp/hermit root/bin/hermit-dynamorio"));
+    }
+
+    #[test]
+    fn repair_command_refuses_to_claim_an_unknown_install_root() {
+        let error = cargo_install_repair(
+            Path::new("/tmp/target/debug/hermit-dynamorio"),
+            "hermit-dynamorio",
+            "0.2.0",
+        )
+        .unwrap_err();
+        assert!(error.contains("not under a Cargo install root's bin/ directory"));
+        assert!(error.contains("replace or remove that exact file"));
     }
 
     #[test]

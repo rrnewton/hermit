@@ -17,6 +17,7 @@ use hermit_plugin_protocol::EX_CONFIG;
 use hermit_plugin_protocol::EnsureRequest;
 use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
+use hermit_plugin_protocol::cargo_install_repair;
 use sha2::Digest as _;
 use sha2::Sha256;
 
@@ -113,13 +114,18 @@ fn incompatible_message(
     plugin: &PluginIdentity,
     field: &str,
 ) -> HelperError {
-    let selected = env::current_exe().unwrap_or_else(|_| PathBuf::from("hermit-e9patch"));
+    let selected = env::var_os("HERMIT_SELECTED_HELPER")
+        .map(PathBuf::from)
+        .or_else(|| env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("hermit-e9patch"));
+    let repair = cargo_install_repair(&selected, "hermit-e9patch", &host.package_version)
+        .unwrap_or_else(|error| error);
     HelperError::config(format!(
         "error: incompatible hermit-e9patch plugin; refusing backend 'e9patch' ({field} mismatch)\n\
          host:   hermit-run {}, Detcore ABI {}, build {}\n\
          plugin: hermit-e9patch {}, Detcore ABI {}, build {}\n\
          selected plugin: {}\n\
-         repair with:\n  cargo install --force --locked hermit-e9patch@={}",
+         repair selected plugin in place with:\n  {}",
         host.package_version,
         host.detcore_abi,
         host.detcore_build_id,
@@ -127,7 +133,7 @@ fn incompatible_message(
         plugin.detcore_abi,
         plugin.detcore_build_id,
         selected.display(),
-        host.package_version,
+        repair,
     ))
 }
 
