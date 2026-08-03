@@ -258,7 +258,7 @@ jobs:
       - name: Run preflight nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '[.preflight_nodes[].node]|join(",")' ci/portable-shards.json)"
       - name: Upload preflight node performance report
         if: always()
         uses: actions/upload-artifact@v4

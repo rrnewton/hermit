@@ -6,13 +6,15 @@
     "matrix (ci/test_harness.sh plan). ci/check-shard-coverage.sh fails closed if this",
     "map ever drifts from portable.json, so coverage == the trusted DAG by construction.",
     "Node commands live ONLY in portable.json; shards reference nodes by group.job key",
-    "and execute them via ci/run-node.sh. Blocks are sized so each job targets <10min."
+    "and execute them via ci/run-node.sh. Blocks are sized so each job targets <10min.",
+    "Every preflight entry runs in GitHub's preflight job; add_to_selection marks the",
+    "three gates also added to local and GitHub selective node sets."
   ],
   "preflight_nodes": [
-    "check.backend_abstraction",
-    "check.portability_paths",
-    "check.script_sigpipe",
-    "lint.rustfmt"
+    { "node": "check.backend_abstraction", "add_to_selection": true },
+    { "node": "check.portability_paths",   "add_to_selection": true },
+    { "node": "check.script_sigpipe",      "add_to_selection": false },
+    { "node": "lint.rustfmt",              "add_to_selection": true }
   ],
   "build_debug_nodes": [
     "e2e.metadata",
