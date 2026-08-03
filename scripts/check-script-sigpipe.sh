@@ -15,6 +15,22 @@
 # asserts the pipeline is clean.
 set -euo pipefail
 
+case "${1:-}" in
+  -h | --help)
+    cat <<'EOF'
+Usage: scripts/check-script-sigpipe.sh
+
+Regression guard for shared SIGPIPE handling: compiles a tiny fixture that uses
+the real rust_script_prelude and asserts `prog | head` terminates cleanly
+(no panic, no exit 141) so `set -o pipefail` pipelines stay green. Run from
+anywhere in the repository; takes no arguments.
+
+Exit codes: 0 clean, non-zero on regression or missing prerequisites.
+EOF
+    exit 0
+    ;;
+esac
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 

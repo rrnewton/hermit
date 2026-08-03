@@ -22,6 +22,25 @@
 
 set -uo pipefail
 
+case "${1:-}" in
+  -h | --help)
+    cat <<'EOF'
+Usage: scripts/progress-report.sh
+
+Generate a Hermit progress report with LIVE, measured test numbers, written to
+docs/progress-reports/vN-YYYY-MM-DD.md. This runs the full ratchet, envelope,
+record_replay, and e2e suites and can take a long time.
+
+Environment variables:
+  REPORT_VERSION=vN   report version tag (default: v3)
+  NO_PULL=1           skip the initial git pull step
+
+Idempotent: re-running overwrites today's report and the /tmp logs.
+EOF
+    exit 0
+    ;;
+esac
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 1
 
