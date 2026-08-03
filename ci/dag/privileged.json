@@ -4,6 +4,24 @@
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
   "default_step_timeout": 120,
+    "cpu_timeout_policy": {
+      "_doc": "Per-step cpu_timeout is a CPU-second runaway catcher complementing the wall 'timeout'. CPU-seconds are width-invariant (fixed work regardless of -j) and load-independent (a blocked step accrues ~0 CPU), so one budget is correct on any machine. Enforced by the Python safe-ci-dag-runner scheduler (polls cgroup cpu.stat usage_usec at 1Hz, reaps on breach); the Rust engine round-trips it schema-only. Both engines ignore this block and per-node cpu_timeout_basis as unknown keys.",
+      "formula": "cpu_timeout = max(floor_cpu_s, ceil(est_duration_s * cpu_per_wall[classification] * safety))",
+      "inputs": {
+        "floor_cpu_s": 30,
+        "safety": 3,
+        "cpu_per_wall": {
+          "light": 1,
+          "latency-bound": 1,
+          "cpu-bound": 3
+        }
+      },
+      "cpu_per_wall_rationale": "cpu-bound=3 anchored on the one measured DAG compile ratio (build.workspace ~919 raw max cpu_s / 360s est ~= 2.55, rounded up). light/latency-bound=1: wall-bound work accrues ~1 cpu-s per wall-s. For cpu-bound nodes the 9x-est budget can exceed the wall 'timeout' BY DESIGN: a multi-core runaway burns cpu-seconds ~N times faster than wall-seconds, so the budget trips fast under parallelism (a 32-core clippy spin hits 2700 cpu_s in ~85s wall) while single-core spins are caught by the wall timeout. Generous by intent: a runaway-catcher is asymmetric -- catching a hang late beats never catching it.",
+      "measured_override": "Where >=5 real samples exist, a measured budget = round(1.5 * max_observed_cpu_s) WINS over the formula. Current agent-env samples are inflated => fail-safe-loose (acceptable for a catcher). Node basis strings mark which rule set each value.",
+      "excluded": {
+        "build.dbi_release": "Left bare intentionally: OOM premise (peak==cap) refuted -- 5.03 GiB aggregate vs 8 GiB cap; fails a portable manifest gate in ~55s, not an OOM. Owned by hermit-lander. Add a budget only with a real >=5-sample measurement."
+      }
+    },
   "steps": [
     {
       "group": "build", "job": "privileged_tests",
@@ -11,6 +29,8 @@
       "cmd": "cargo build -p hermit --features third-party-backends --bin hermit && cargo test -p detcore --test tests_misc --no-run",
       "deps": ["e2e.metadata"],
       "timeout": 120,
+      "cpu_timeout": 540,
+      "cpu_timeout_basis": "formula: max(30,ceil(60*3*3))=540 [est=60s,class=cpu-bound,cpu_per_wall=3,safety=3]",
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
@@ -20,6 +40,8 @@
       "cmd": "timeout 30 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
       "deps": ["build.privileged_tests"],
       "timeout": 40,
+      "cpu_timeout": 135,
+      "cpu_timeout_basis": "formula: max(30,ceil(15*3*3))=135 [est=15s,class=cpu-bound,cpu_per_wall=3,safety=3]",
       "hint": {"est_duration_s": 15,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
@@ -30,6 +52,8 @@
       "cmd": "cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
       "deps": ["build.privileged_tests"],
       "timeout": 30,
+      "cpu_timeout": 45,
+      "cpu_timeout_basis": "formula: max(30,ceil(5*3*3))=45 [est=5s,class=cpu-bound,cpu_per_wall=3,safety=3]",
       "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
@@ -39,6 +63,8 @@
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
       "timeout": 20,
+      "cpu_timeout": 18,
+      "cpu_timeout_basis": "measured(n>=5): round(1.5*max_cpu_s); agent-env inflated=fail-safe-loose",
       "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
                "classification": "light"}
@@ -49,6 +75,8 @@
       "cmd": "./ci/test_harness.sh build --lane privileged --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 120,
+      "cpu_timeout": 675,
+      "cpu_timeout_basis": "formula: max(30,ceil(75*3*3))=675 [est=75s,class=cpu-bound,cpu_per_wall=3,safety=3]",
       "hint": {"est_duration_s": 75,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "cpu-bound"}
@@ -60,6 +88,8 @@
       "cmd": "./ci/test_harness.sh run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/privileged/applications/results.jsonl --junit ignored/e2e/privileged/applications/junit.xml",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 130,
+      "cpu_timeout": 270,
+      "cpu_timeout_basis": "formula: max(30,ceil(90*1*3))=270 [est=90s,class=latency-bound,cpu_per_wall=1,safety=3]",
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
@@ -71,6 +101,8 @@
       "cmd": "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results ignored/e2e/privileged/backend-parity-c/results.jsonl --junit ignored/e2e/privileged/backend-parity-c/junit.xml",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 120,
+      "cpu_timeout": 30,
+      "cpu_timeout_basis": "formula: max(30,ceil(5*1*3))=30 [est=5s,class=latency-bound,cpu_per_wall=1,safety=3]",
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
