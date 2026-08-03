@@ -580,7 +580,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
+sabre = "Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
