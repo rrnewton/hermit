@@ -381,19 +381,34 @@ impl HbRuntime {
     }
 }
 
-/// Which end of a thread's priority band a deferred run-queue admission targets.
-///
-/// Recorded at the moment a global-request handler decides admission (so any
-/// PRNG draw that picks the side, e.g. `child_runs_first_post_fork`, happens in
-/// the same deterministic order as an immediate push would) and replayed when
-/// the scheduler drains the admission buffer. See
-/// [`Scheduler::admit_to_run_queue`].
+/// Which end of a thread's priority band a run-queue admission targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmitSide {
     /// Run before an equal-priority peer (`runqueue_push_front`).
     Front,
     /// Ordinary tail admission (`runqueue_push_back`).
     Back,
+}
+
+/// How a run-queue admission's side is determined.
+///
+/// The side is *resolved* — not merely applied — at the admission point
+/// ([`Scheduler::resolve_admit_intent`]): immediately for a synchronous
+/// (in-turn) admission, or at the deterministic drain
+/// ([`Scheduler::drain_pending_run_queue_admissions`]) for one deferred while a
+/// `tentative_pop` transaction was live. Buffering the *intent* rather than an
+/// already-chosen `AdmitSide` is what makes the admission a pure function of
+/// deterministic scheduler state: any PRNG draw that picks the side
+/// (`RunsPostFork::Random`) is consumed at the drain, in canonical `DetTid`
+/// order, instead of in host RPC / lock-acquisition order at the racing
+/// handler. See [`Scheduler::admit_to_run_queue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitIntent {
+    /// The side is fixed regardless of scheduler state; consumes no PRNG.
+    Fixed(AdmitSide),
+    /// The side follows the post-fork policy; `RunsPostFork::Random` draws from
+    /// the scheduler PRNG at resolution time.
+    PostFork(RunsPostFork),
 }
 
 /// The state for the deterministic scheduler.
@@ -437,9 +452,12 @@ pub struct Scheduler {
     /// next deterministic drain point (`step2`) so it cannot mutate the run
     /// queue underneath the daemon's tentative selection. Keyed by `DetTid`
     /// so the drain order among co-pending admissions is canonical rather than
-    /// lock-acquisition dependent. See [`Scheduler::admit_to_run_queue`] and
+    /// lock-acquisition dependent. The stored value is the *unresolved*
+    /// [`AdmitIntent`], so any side-selecting PRNG draw is deferred to the
+    /// `DetTid`-ordered drain rather than performed in host RPC order. See
+    /// [`Scheduler::admit_to_run_queue`] and
     /// [`Scheduler::drain_pending_run_queue_admissions`].
-    pending_run_queue_admissions: BTreeMap<DetTid, AdmitSide>,
+    pending_run_queue_admissions: BTreeMap<DetTid, AdmitIntent>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -1564,7 +1582,7 @@ impl Scheduler {
         // (`caller == new_leader`, no siblings), which this PR fully fixes;
         // this push routing hardens the non-leader-exec push without regressing
         // the pre-existing removal behavior.
-        self.admit_to_run_queue(new_leader, AdmitSide::Back);
+        self.admit_to_run_queue(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
         self.started_up.try_put(());
 
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
@@ -3107,9 +3125,16 @@ impl Scheduler {
     /// window. On synchronous backends (ptrace) these handlers run after the
     /// selecting thread's turn has committed, i.e. with no tentative selection
     /// live, so this always pushes immediately and preserves existing behavior.
-    pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, side: AdmitSide) {
+    ///
+    /// The caller supplies an unresolved [`AdmitIntent`], not a chosen
+    /// `AdmitSide`. The side (and any `RunsPostFork::Random` PRNG draw) is
+    /// resolved here on the immediate path or at the `DetTid`-ordered drain on
+    /// the deferred path, so that both the admission *order* and the chosen
+    /// *side* are pure functions of deterministic scheduler state rather than of
+    /// the host RPC / lock-acquisition order in which racing handlers run.
+    pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, intent: AdmitIntent) {
         if self.run_queue.tentative_pop_in_progress() {
-            let prev = self.pending_run_queue_admissions.insert(dtid, side);
+            let prev = self.pending_run_queue_admissions.insert(dtid, intent);
             debug_assert!(
                 prev.is_none(),
                 "thread {:?} recorded for run-queue admission twice before draining",
@@ -3124,7 +3149,29 @@ impl Scheduler {
             // each thread is admitted by exactly one handler invocation -- but
             // cheap defense against a future second admitter.)
             self.pending_run_queue_admissions.remove(&dtid);
+            // Synchronous (in-turn) admission: resolve the side now. On ptrace
+            // these handlers run post-commit, one per committed turn, so any
+            // PRNG draw is consumed in deterministic schedule order -- identical
+            // to the pre-deferral behavior.
+            let side = self.resolve_admit_intent(intent);
             self.admit_now(dtid, side);
+        }
+    }
+
+    /// Resolve an [`AdmitIntent`] to a concrete [`AdmitSide`], consuming the
+    /// post-fork PRNG draw for `RunsPostFork::Random`. Called at the point of
+    /// admission (immediate or drain) so the draw's ordering is a function of
+    /// deterministic scheduler state, never of host RPC / lock timing.
+    fn resolve_admit_intent(&mut self, intent: AdmitIntent) -> AdmitSide {
+        match intent {
+            AdmitIntent::Fixed(side) => side,
+            AdmitIntent::PostFork(mode) => {
+                if self.child_runs_first_post_fork(mode) {
+                    AdmitSide::Front
+                } else {
+                    AdmitSide::Back
+                }
+            }
         }
     }
 
@@ -3155,7 +3202,12 @@ impl Scheduler {
             return;
         }
         let pending = std::mem::take(&mut self.pending_run_queue_admissions);
-        for (dtid, side) in pending {
+        // `pending` is a `BTreeMap`, so iteration visits `DetTid`s in sorted
+        // order. Resolving each intent here (rather than at the racing handler)
+        // means any `RunsPostFork::Random` PRNG draw is consumed in this
+        // canonical order, so both the admission order *and* the chosen side are
+        // pure functions of deterministic state.
+        for (dtid, intent) in pending {
             // A thread retired (exec/kill) between record and drain is skipped.
             // `remove_blocking_entries` also clears the buffer on teardown, so
             // this guard is defensive against any teardown path that does not.
@@ -3166,6 +3218,7 @@ impl Scheduler {
                 );
                 continue;
             }
+            let side = self.resolve_admit_intent(intent);
             self.admit_now(dtid, side);
         }
     }
