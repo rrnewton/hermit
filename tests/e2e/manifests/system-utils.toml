@@ -32,7 +32,7 @@ backends_enabled = ["ptrace"]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
-sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
+sabre = "The exec-socket regression is fixed, but required date/clock virtual-time parity remains owner-gated for SaBRe"
 
 [test.modes.replay]
 ci = false
