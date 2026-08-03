@@ -37,10 +37,10 @@ on:
 
 # Never cancel a required gate run. GitHub can retain an older successful check
 # with the same context when a newer run is cancelled, which masks NOT-PASSED as
-# mergeable. These control-plane runs are short and use the dedicated gate pool;
-# queued duplicates are cheaper than ambiguous required-check state.
+# mergeable. Include the exact head in the concurrency key so an obsolete head
+# cannot queue ahead of the current one; duplicate events for one head serialize.
 concurrency:
-  group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}
+  group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}-${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
