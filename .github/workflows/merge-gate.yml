@@ -82,11 +82,15 @@ jobs:
         run: |
           set -euo pipefail
           test_script="$GITHUB_WORKSPACE/trusted/scripts/test-require-check-success.sh"
+          policy_lint="$GITHUB_WORKSPACE/trusted/scripts/check-merge-gate-policy.sh"
           if [ ! -x "$test_script" ]; then
             test_script="$GITHUB_WORKSPACE/candidate/scripts/test-require-check-success.sh"
+            policy_lint="$GITHUB_WORKSPACE/candidate/scripts/check-merge-gate-policy.sh"
           fi
           test -x "$test_script"
+          test -x "$policy_lint"
           "$test_script"
+          "$policy_lint" "$GITHUB_WORKSPACE/candidate"
       - name: Require a complete test inventory on the merge result
         run: |
           set -euo pipefail
