@@ -1,0 +1,46 @@
+[package]
+name = "hermit-dynamorio"
+description = "Source-built DynamoRIO execution plugin for Hermit."
+version = "0.2.0"
+edition = "2024"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
+readme = "README.md"
+build = "build.rs"
+
+[[bin]]
+name = "hermit-dynamorio"
+path = "src/main.rs"
+
+[dependencies]
+detcore = { version = "0.0.0", path = "../detcore" }
+flate2 = "1.1.9"
+hex = "0.4.3"
+hermit-plugin-protocol = { version = "0.2.0", path = "../hermit-plugin-protocol" }
+libc = "0.2.186"
+libloading = "0.8.9"
+serde_json = "1.0.140"
+sha2 = "0.10.6"
+tar = "0.4.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# This table is ignored while the crate is a workspace member (the workspace
+# root carries the same setting) and becomes authoritative when crates.io
+# installs this package as a standalone root. Without it, Cargo compiles the
+# Detcore build-dependency unoptimized and the embedded payload is not the one
+# measured and ratcheted by this package.
+[profile.release.build-override]
+opt-level = 3
+
+[build-dependencies]
+detcore = { version = "0.0.0", path = "../detcore" }
+detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
+flate2 = "1.1.9"
+hex = "0.4.3"
+hermit-plugin-protocol = { version = "0.2.0", path = "../hermit-plugin-protocol" }
+reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "15c92042d1d9f8dd6f06de8c52128558721cc403", default-features = false }
+serde_json = "1.0.140"
+sha2 = "0.10.6"
+tar = "0.4.44"

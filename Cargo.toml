@@ -12,6 +12,8 @@ members = [
   "flaky-tests",
   "hermit-cli",
   "hermit-install",
+  "hermit-dynamorio",
+  "hermit-plugin-protocol",
   "hermit-resources",
   "hermit-verify",
   "tests",
@@ -42,3 +44,11 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# `hermit-dynamorio` packages the `detcore-dbi` build dependency as a runtime
+# shared object. Cargo otherwise compiles build dependencies without
+# optimization even in a release build, inflating that one payload by 7 MiB
+# after stripping. Keep build dependencies release-optimized so a clean
+# `cargo install hermit-dynamorio` produces the measured runtime payload.
+[profile.release.build-override]
+opt-level = 3

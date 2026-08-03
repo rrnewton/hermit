@@ -64,6 +64,7 @@ pub mod util;
 pub mod detlog;
 pub mod preemptions;
 pub mod types;
+include!(concat!(env!("OUT_DIR"), "/detcore-build-id.rs"));
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::RawFd;

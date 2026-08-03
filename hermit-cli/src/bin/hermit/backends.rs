@@ -21,21 +21,14 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "dbi")]
 use std::collections::BTreeSet;
-#[cfg(feature = "dbi")]
 use std::env;
-#[cfg(feature = "dbi")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
-#[cfg(feature = "dbi")]
 use std::io::IsTerminal as _;
-#[cfg(feature = "dbi")]
 use std::io::Read;
-#[cfg(feature = "dbi")]
 use std::io::Seek as _;
-#[cfg(feature = "dbi")]
 use std::io::SeekFrom;
-#[cfg(feature = "dbi")]
 use std::io::Write;
 #[cfg(feature = "dbi")]
 use std::os::fd::AsRawFd;
@@ -43,10 +36,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(feature = "dbi")]
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-#[cfg(feature = "dbi")]
 use std::process::Output;
 
 use detcore::Config;
@@ -56,8 +47,10 @@ use hermit::ExitStatus;
 use reverie_dbi::DbiRunner;
 use tracing::metadata::LevelFilter;
 
+#[cfg(not(feature = "dbi"))]
+use super::dbt_plugin::DbiRunner;
+
 #[derive(Debug)]
-#[cfg(feature = "dbi")]
 struct DbiSummary {
     branches: u64,
     syscalls: u64,
@@ -66,7 +59,6 @@ struct DbiSummary {
     memory_hash: String,
 }
 
-#[cfg(feature = "dbi")]
 impl DbiSummary {
     fn same_observable_behavior(&self, other: &Self) -> bool {
         // `branches` is the count at the last intercepted syscall, not an execution digest.
@@ -86,7 +78,6 @@ impl DbiSummary {
 /// counted-branch clock (cbr/ubr/call/return retired), **not** a count of
 /// translated basic blocks, and `memory hash` is the client's observed
 /// guest-memory digest, not a Detcore RunSummary field.
-#[cfg(feature = "dbi")]
 fn format_dbi_stats(summary: &DbiSummary) -> String {
     format!(
         "=== DBI backend stats (native DynamoRIO client) ===\n\
@@ -104,13 +95,11 @@ fn format_dbi_stats(summary: &DbiSummary) -> String {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-#[cfg(feature = "dbi")]
 struct DbiGuestCommand {
     program: PathBuf,
     args: Vec<OsString>,
 }
 
-#[cfg(feature = "dbi")]
 fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     env::split_paths(path)
         .map(|directory| directory.join(program))
@@ -129,7 +118,6 @@ fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 /// token with the equivalent absolute PATH match. More complex `env` forms are
 /// left unchanged for the normal launcher rather than partially interpreting
 /// options or assignments here.
-#[cfg(feature = "dbi")]
 fn prepare_dbi_guest_command(
     program: &Path,
     args: &[String],
@@ -169,7 +157,6 @@ fn prepare_dbi_guest_command(
     }
 }
 
-#[cfg(feature = "dbi")]
 fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsString, OsString>) {
     // DbiRunner reconstructs its launcher command from Command::get_envs(),
     // which cannot expose env_clear(). Make removals explicit so --base-env
@@ -344,13 +331,11 @@ impl Drop for DbiUnsupportedSyscallReport {
     }
 }
 
-#[cfg(feature = "dbi")]
 struct TeeReader<R, W> {
     input: R,
     replay: W,
 }
 
-#[cfg(feature = "dbi")]
 impl<R: Read, W: Write> Read for TeeReader<R, W> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.input.read(buffer)?;
@@ -547,18 +532,142 @@ pub(super) fn run_dbi(
 
 #[cfg(not(feature = "dbi"))]
 pub(super) fn run_dbi(
-    _program: &Path,
-    _args: &[String],
-    _verify: bool,
-    _summary: bool,
-    _log: Option<LevelFilter>,
-    _config: &Config,
-    _environment: BTreeMap<OsString, OsString>,
+    program: &Path,
+    args: &[String],
+    verify: bool,
+    summary: bool,
+    log: Option<LevelFilter>,
+    config: &Config,
+    mut environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
-    Err(Error::msg("DBI support was not included in this build"))
+    if !config.sequentialize_threads {
+        return Err(Error::msg(
+            "the dbt backend requires sequentialized threads; \
+             remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
+        ));
+    }
+    let payload = match super::dbt_plugin::ensure_payload() {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("{}", error.message);
+            return Ok(ExitStatus::Exited(error.code));
+        }
+    };
+    let config_json = serde_json::to_string(config).map_err(|error| {
+        Error::msg(format!(
+            "failed to serialize the Detcore config for the DBT backend: {error}"
+        ))
+    })?;
+    let mut runner = DbiRunner::new(&payload.drrun, &payload.client)
+        .map_err(|error| Error::msg(format!("failed to configure DBT runner: {error}")))?
+        .summary(true)
+        .isolated_process_group(config.panic_on_unsupported_syscalls);
+    if config.panic_on_unsupported_syscalls {
+        runner = runner.client_argument("-panic-on-unsupported-syscalls");
+    }
+
+    eprintln!(
+        "hermit: [dbt backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
+        payload.drrun.display()
+    );
+    let prepared = prepare_dbi_guest_command(
+        program,
+        args,
+        environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
+    );
+    let mut guest = StdCommand::new(&prepared.program);
+    if let Some(level) = log {
+        environment.insert("HERMIT_LOG".into(), level.to_string().into());
+    }
+    environment.insert("HERMIT_DBI_DETCONFIG".into(), config_json.into());
+    apply_exact_environment(&mut guest, &environment);
+    guest.args(&prepared.args);
+
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    if !verify {
+        if stdin_is_terminal {
+            let status = runner
+                .status(&guest)
+                .map_err(|error| launch_error(&payload.drrun, error))?;
+            if summary {
+                eprintln!(":: DBT summary: see the `reverie-dbi: tool=Detcore ...` line above");
+            }
+            return Ok(process_status(status));
+        }
+        let output = run_once(&runner, &guest, &payload.drrun, std::io::stdin())?;
+        write_output(&output)?;
+        if summary {
+            match detcore_summary(&output) {
+                Ok(stats) => eprint!("{}", format_dbi_stats(&stats)),
+                Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
+            }
+        }
+        return Ok(output_status(&output));
+    }
+
+    let mut replay = if stdin_is_terminal {
+        None
+    } else {
+        Some(tempfile::tempfile()?)
+    };
+    eprintln!(":: DBT Run1...");
+    let first = match replay.as_mut() {
+        Some(replay) => run_once(
+            &runner,
+            &guest,
+            &payload.drrun,
+            TeeReader {
+                input: std::io::stdin(),
+                replay: replay.try_clone()?,
+            },
+        )?,
+        None => run_once_with_terminal_input(&runner, &guest, &payload.drrun)?,
+    };
+    if !first.status.success() {
+        write_output(&first)?;
+        return Ok(output_status(&first));
+    }
+    let first_summary = detcore_summary(&first)?;
+    if stdin_is_terminal && first_summary.stdin_reads != 0 {
+        write_output(&first)?;
+        return Err(Error::msg(format!(
+            "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read syscall(s)",
+            first_summary.stdin_reads
+        )));
+    }
+    eprintln!(":: DBT Run2...");
+    let second = match replay.as_mut() {
+        Some(replay) => {
+            replay.seek(SeekFrom::Start(0))?;
+            run_once(&runner, &guest, &payload.drrun, replay.try_clone()?)?
+        }
+        None => run_once_with_terminal_input(&runner, &guest, &payload.drrun)?,
+    };
+    if !second.status.success() {
+        write_output(&second)?;
+        return Ok(output_status(&second));
+    }
+    let second_summary = detcore_summary(&second)?;
+    if first.stdout != second.stdout {
+        return Err(Error::msg(dbi_stdout_mismatch(
+            &first.stdout,
+            &second.stdout,
+        )));
+    }
+    if !first_summary.same_observable_behavior(&second_summary) {
+        return Err(Error::msg(format!(
+            "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
+        )));
+    }
+    write_output(&first)?;
+    eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
+    eprintln!(":: Success: deterministic. Determinism verified.");
+    if summary {
+        eprint!("{}", format_dbi_stats(&first_summary));
+    }
+    Ok(ExitStatus::Exited(0))
 }
 
-#[cfg(feature = "dbi")]
 fn dbi_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
     const CONTEXT_BEFORE: usize = 40;
     const CONTEXT_AFTER: usize = 120;
@@ -589,7 +698,6 @@ fn dbi_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
     )
 }
 
-#[cfg(feature = "dbi")]
 fn run_once<R: Read + Send + 'static>(
     runner: &DbiRunner,
     guest: &StdCommand,
@@ -601,7 +709,6 @@ fn run_once<R: Read + Send + 'static>(
         .map_err(|error| launch_error(drrun, error))
 }
 
-#[cfg(feature = "dbi")]
 fn run_once_with_terminal_input(
     runner: &DbiRunner,
     guest: &StdCommand,
@@ -612,7 +719,6 @@ fn run_once_with_terminal_input(
         .map_err(|error| launch_error(drrun, error))
 }
 
-#[cfg(feature = "dbi")]
 fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     Error::msg(format!(
         "failed to launch drrun ({}): {error}",
@@ -620,12 +726,10 @@ fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     ))
 }
 
-#[cfg(feature = "dbi")]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
     ExitStatus::Exited(status.code().unwrap_or(1))
 }
 
-#[cfg(feature = "dbi")]
 fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let summary = stderr
@@ -681,14 +785,12 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     })
 }
 
-#[cfg(feature = "dbi")]
 fn write_output(output: &Output) -> Result<(), Error> {
     std::io::stdout().write_all(&output.stdout)?;
     std::io::stderr().write_all(&output.stderr)?;
     Ok(())
 }
 
-#[cfg(feature = "dbi")]
 fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::Exited(output.status.code().unwrap_or(1))
 }

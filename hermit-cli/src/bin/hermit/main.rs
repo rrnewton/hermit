@@ -22,6 +22,8 @@ mod bisect;
 mod bnz;
 mod clean;
 mod container;
+#[cfg(not(feature = "dbi"))]
+mod dbt_plugin;
 mod global_opts;
 mod image;
 mod instruction_map;

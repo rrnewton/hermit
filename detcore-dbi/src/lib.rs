@@ -40,6 +40,7 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use hermit_plugin_protocol::DetcoreDescriptorV1;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -77,6 +78,25 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
 /// Fixed inherited descriptor receiving unsupported syscall records.
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
+
+static PLUGIN_DESCRIPTOR: LazyLock<DetcoreDescriptorV1> =
+    LazyLock::new(|| DetcoreDescriptorV1::new(detcore::DETCORE_BUILD_ID));
+
+/// Returns the exact native ABI and Detcore build identity embedded in this shared object.
+#[unsafe(no_mangle)]
+pub extern "C" fn hermit_detcore_plugin_descriptor_v1() -> *const DetcoreDescriptorV1 {
+    &*PLUGIN_DESCRIPTOR
+}
+
+/// Returns the DBI statistics wire code for the external Detcore runtime.
+///
+/// Reverie's built-in wire mapping reserves 0 through 2 for its prototype and
+/// counter tools. Detcore is an external runtime, so it deliberately uses the
+/// documented unknown/extension code instead of impersonating a built-in tool.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_kind_code() -> u8 {
+    255
+}
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbi::RuntimeEmitter;
@@ -1569,6 +1589,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_runtime_uses_extension_wire_code() {
+        assert_eq!(reverie_dbi_runtime_kind_code(), 255);
+    }
 
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {

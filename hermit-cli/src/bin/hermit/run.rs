@@ -760,6 +760,13 @@ fn backend_values_parse_and_round_trip() {
 }
 
 #[test]
+fn dbt_alias_selects_dynamorio_backend() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--backend", "dbt", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Dbi);
+}
+
+#[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--backend", "e9patch", "/bin/echo", "hello"]);
     ro.e9patch_overlay = Some(E9patchOverlay {
@@ -1785,17 +1792,17 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else if backend != Backend::Kvm {
+        } else if !matches!(backend, Backend::Kvm | Backend::Dbi) {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;
-        // The KVM backend reaches real reverie-kvm code from its dispatch path
-        // and reports an accurate, program-specific error there, so it is not
-        // pre-empted by the generic availability probe above. E9patch is a CLI
-        // preprocessor and probes its ptrace runtime and tool separately.
+        // KVM and DBT reach their real dispatch paths before availability is
+        // known. In particular, DBT must run the selected helper's exact
+        // identity handshake rather than treating executable presence as
+        // compatibility. E9patch probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
         if self.hb_list_events {

@@ -596,6 +596,7 @@ pub enum Backend {
     #[default]
     Ptrace,
     /// Use the DynamoRIO backend.
+    #[value(alias = "dbt")]
     Dbi,
     /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
