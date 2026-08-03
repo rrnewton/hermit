@@ -1,21 +1,25 @@
-# Hermit 0.2 package map
+# Hermit 0.2 package map analysis
 
-This is the package-name and publication-surface map for the Hermit 0.2
-release. It was audited from every `Cargo.toml` in this repository on
-2026-08-03. Virtual workspace manifests are not packages. The table includes
-the root workspace, nested build workspaces, and the standalone CI utility
-workspace.
+This is a pre-release analysis of the current package-name and publication
+surface. It was audited from every `Cargo.toml` in this repository on
+2026-08-03. It does not select permanent public names or authorize a publish.
+The final surface and names remain deferred until the third-party backend
+factoring is decided. Virtual workspace manifests are not packages. The table
+includes the root workspace, nested build workspaces, and the standalone CI
+utility workspace.
 
-`Public` below means Cargo permits publishing the package. `Private` means the
-manifest has `publish = false`; private packages are not subject to the 0.2.0
-release-version floor. A name marked `PENDING-OWNER-DECISION` must not be
+`Public` below means Cargo currently permits publishing the package, not that
+the package belongs in the final release. `Private` means the manifest has
+`publish = false`; private packages are not subject to the 0.2.0
+release-version floor. Every candidate name is provisional until backend
+factoring is settled. A name marked `PENDING-OWNER-DECISION` must not be
 renamed or published until the owner selects it.
 
-## Hermit release packages
+## Current Hermit publish-enabled packages
 
-| Manifest | Current package | Version | Intended published name | Surface | Status |
+| Manifest | Current package | Version | Candidate or unresolved name | Surface | Status |
 |---|---|---:|---|---|---|
-| `hermit-cli/Cargo.toml` | `hermit` | 0.2.0 | `hermit-run` | Public | Rename approved and reserved, but not applied in this change |
+| `hermit-cli/Cargo.toml` | `hermit` | 0.2.0 | `hermit-run` | Public | Previously approved and reserved; application is deferred pending backend factoring |
 | `detcore/Cargo.toml` | `detcore` | 0.2.0 | `PENDING-OWNER-DECISION` | Public | Current name is owned by another publisher |
 | `detcore-model/Cargo.toml` | `detcore-model` | 0.2.0 | `detcore-model` | Public | Reserved by `rrnewton` as a 0.0.1 placeholder |
 | `detcore-dbi/Cargo.toml` | `detcore-dbi` | 0.2.0 | `detcore-dbt` (`PENDING-OWNER-DECISION`) | Public | DBI-to-DBT rename is deliberately not applied |
@@ -25,10 +29,11 @@ renamed or published until the owner selects it.
 | `hermit-resources/Cargo.toml` | `hermit-resources` | 0.2.0 | `hermit-resources` | Public | Reserved by `rrnewton` as a 0.0.1 placeholder |
 | `hermit-verify/Cargo.toml` | `hermit-verify` | 0.2.0 | `hermit-verify` | Public | Reserved by `rrnewton` as a 0.0.1 placeholder |
 
-These nine packages are the Hermit repository's public 0.2 release surface.
-All are at the 0.2.0 floor and carry a crates.io description. The name map is
-not permission to publish: dependency publication order and the unresolved
-names above still gate a real release.
+These nine packages are the Hermit repository's current publish-enabled
+surface, not a final 0.2 release decision. All are at the 0.2.0 floor and carry
+a crates.io description. The map is not permission to publish: backend
+factoring, dependency publication order, and unresolved names still gate a
+future release.
 
 ## Private and auxiliary packages
 
