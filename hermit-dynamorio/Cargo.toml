@@ -40,7 +40,7 @@ detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
 flate2 = "1.1.9"
 hex = "0.4.3"
 hermit-plugin-protocol = { version = "0.2.0", path = "../hermit-plugin-protocol" }
-reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "a730afe13c4b64b90f052d73e7396763bfce5965", default-features = false }
+reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "7c67585f8e1405ab767798586a7340384b5e9cbb", default-features = false }
 serde_json = "1.0.140"
 sha2 = "0.10.6"
 tar = "0.4.44"
