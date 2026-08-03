@@ -301,7 +301,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe openssl qualification is tracked by backend compatibility"
+sabre = "SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
