@@ -221,6 +221,26 @@ class Fixtures:
                 local / "mremap_resize.c",
                 ("-D_GNU_SOURCE",),
             ),
+            "bind_getsockname": (
+                local / "bind_getsockname.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sockname_unnamed": (
+                local / "sockname_unnamed.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "shutdown_socketpair": (
+                local / "shutdown_socketpair.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "socket_options": (
+                local / "socket_options.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "socketpair_flags": (
+                local / "socketpair_flags.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -367,6 +387,31 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("mremap_resize"))],
             0,
             b"mremap ok=6\n",
+        ),
+        "bind_getsockname": (
+            [str(fixtures.binary("bind_getsockname"))],
+            0,
+            b"bind_name ok=6\n",
+        ),
+        "sockname_unnamed": (
+            [str(fixtures.binary("sockname_unnamed"))],
+            0,
+            b"sockname ok=6\n",
+        ),
+        "shutdown_socketpair": (
+            [str(fixtures.binary("shutdown_socketpair"))],
+            0,
+            b"shutdown ok=5\n",
+        ),
+        "socket_options": (
+            [str(fixtures.binary("socket_options"))],
+            0,
+            b"sockopt ok=6\n",
+        ),
+        "socketpair_flags": (
+            [str(fixtures.binary("socketpair_flags"))],
+            0,
+            b"socketpair ok=7\n",
         ),
     }
     try:

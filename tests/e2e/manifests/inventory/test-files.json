@@ -212,6 +212,36 @@
       "why": "tests/backend-parity/fixtures/mremap_resize.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic mremap(2) grow/shrink/MREMAP_MAYMOVE resize round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
     },
     {
+      "path": "tests/backend-parity/fixtures/bind_getsockname.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/bind_getsockname.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic bind(2)/getsockname(2) local-address round-tripping on an AF_UNIX socket bound to an abstract name as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/sockname_unnamed.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sockname_unnamed.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic getsockname(2)/getpeername(2) behavior on an unnamed AF_UNIX socketpair as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/shutdown_socketpair.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/shutdown_socketpair.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic shutdown(2) half-close semantics (SHUT_RD/SHUT_WR/SHUT_RDWR) on an AF_UNIX socketpair as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/socket_options.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/socket_options.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic setsockopt(2)/getsockopt(2) round-tripping of SO_REUSEADDR/SO_KEEPALIVE/SO_BROADCAST option values as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/socketpair_flags.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/socketpair_flags.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic socketpair(2) SOCK_CLOEXEC/SOCK_NONBLOCK flag propagation and SO_TYPE/SO_DOMAIN/SO_ACCEPTCONN readback as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
       "path": "tests/backend-parity/fixtures/thp_disable.c",
       "disposition": "guest-fixture",
       "runner": "tests/backend-parity/run_matrix.py",

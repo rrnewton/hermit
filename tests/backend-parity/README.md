@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 33/33 | 100% |
-| DBI | 32/33 | 97% |
-| KVM | 23/33 | 70% |
+| ptrace | 38/38 | 100% |
+| DBI | 37/38 | 97% |
+| KVM | 23/38 | 61% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 33/33 | DETLOG-bitwise | 100% |
-| DBI | 31/33 | DETLOG-bitwise | 94% |
-| KVM | 22/33 | guest-visible only | 67% |
+| ptrace | 38/38 | DETLOG-bitwise | 100% |
+| DBI | 36/38 | DETLOG-bitwise | 95% |
+| KVM | 22/38 | guest-visible only | 58% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -135,6 +135,11 @@ is not reached.
 | `mprotect_transitions` | pass / detlog | pass / detlog | **gap** / gap |
 | `mlock_family` | pass / detlog | pass / detlog | **gap** / gap |
 | `mremap_resize` | pass / detlog | pass / detlog | **gap** / gap |
+| `bind_getsockname` | pass / detlog | pass / detlog | **gap** / gap |
+| `sockname_unnamed` | pass / detlog | pass / detlog | **gap** / gap |
+| `shutdown_socketpair` | pass / detlog | pass / detlog | **gap** / gap |
+| `socket_options` | pass / detlog | pass / detlog | **gap** / gap |
+| `socketpair_flags` | pass / detlog | pass / detlog | **gap** / gap |
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
