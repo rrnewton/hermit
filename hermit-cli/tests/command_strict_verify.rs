@@ -283,6 +283,60 @@ fn common_commands_are_deterministic_under_strict_verify() {
 }
 
 #[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + audited Unix command tools"]
+fn audited_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "tail",
+            candidates: &["/usr/bin/tail", "/bin/tail"],
+            args: &["-n", "3", "/etc/passwd"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "mount",
+            candidates: &["/usr/bin/mount", "/bin/mount"],
+            args: &[],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vim",
+            candidates: &["/usr/bin/vim", "/usr/bin/vim.basic", "/usr/bin/vim.tiny"],
+            args: &["--version"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "less",
+            candidates: &["/usr/bin/less", "/bin/less"],
+            args: &["--version"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "man",
+            candidates: &["/usr/bin/man", "/bin/man"],
+            args: &["--version"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "tmux",
+            candidates: &["/usr/bin/tmux", "/bin/tmux"],
+            args: &["-V"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "false exit status",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &["-c", "/usr/bin/false; test \"$?\" -eq 1"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+#[test]
 #[ignore = "e2e: requires hermit + mount namespaces + whoami/groups"]
 fn identity_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();

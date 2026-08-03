@@ -1,6 +1,6 @@
 {
   "resource_caps": {"pmu": 1},
-  "mem_cap_factor": 1.25,
+  "mem_cap_factor": 1.5,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
   "default_step_timeout": 3600,
@@ -10,16 +10,16 @@
       "desc": "Build workspace (cargo build --workspace)",
       "cmd": "cargo build --workspace",
       "timeout": 1800,
-      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 9395240960,
+               "hard_mem_max_bytes": 13958643712, "classification": "cpu-bound"}
     },
     {
       "group": "build", "job": "release_hermit",
       "desc": "Build release Hermit for record/replay compatibility",
       "cmd": "cargo build --release -p hermit",
       "timeout": 1800,
-      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 10066329600,
+               "hard_mem_max_bytes": 15032385536, "classification": "cpu-bound"}
     },
     {
       "group": "cpuid", "job": "host_probe",

@@ -41,6 +41,8 @@ jobs:
       STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner
+        run: git submodule update --init agent-utils
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -66,7 +68,7 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: GitHub-hosted test lane
-        run: ./validate.sh --hosted-only --no-label-pr
+        run: env CI_DAG_CGROUPS=0 CI_DAG_JOBS=1 ./validate.sh --hosted-only --no-label-pr
       - name: Upload nextest JUnit report
         if: always()
         uses: actions/upload-artifact@v4

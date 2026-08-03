@@ -24,6 +24,23 @@ ci/run-dag.sh hardware -j 2                    # PMU lane, one gate at a time
 ci/run-dag.sh hosted   ascii                   # visualize instead of run
 ```
 
+On hosts with a systemd user session, `ci/run-dag.sh` automatically re-execs a
+run inside a delegated cgroup-v2 scope. One complete run is hard-capped at 32
+GiB with swap disabled, and every node requests its `hard_mem_max_bytes` cap.
+Any delegation or cap-application failure is reported visibly by the runner.
+Runs without `-j` or `--max-mem` use that same 32 GiB scheduler budget. All
+concurrent runs also share a `safe-ci.slice` cap equal to the smaller of 64 GiB
+and 75% of host RAM, so additional agents cannot expose the host to their sum.
+The wrapper requires that shared cap to hold two complete outer scopes; the
+default pair therefore needs roughly 86 GiB of host RAM and fails preflight on
+smaller hosts instead of starting an underprovisioned run. `CI_DAG_JOBS` sets a
+default explicit job count when callers do not pass `-j` or `--max-mem`.
+Set `CI_DAG_OUTER_MEMORY_MAX` to tune the per-run cap or `CI_DAG_CGROUPS=0` only
+when an already-isolated environment must opt out;
+`CI_DAG_AGGREGATE_MEMORY_MAX` tunes the shared cap. Local hosts without a user
+scope fail closed. GitHub-hosted disposable VMs opt out explicitly and run one
+node at a time; they remain bounded by the VM rather than the shared host slice.
+
 ## Status: active validation lanes
 
 `hosted.json` drives the required `Regular tests (GitHub-hosted)` job, and
@@ -62,8 +79,9 @@ A successful PR run on 2026-07-26 provided the baseline:
 - `Validation Levels` independently repeated the same 14-minute hosted suite,
   consuming another GitHub-hosted runner.
 
-The diagnostics now run in the scheduled `super` tier. The required lane uses a 14 GiB memory budget, which the current model
-maps to `-j 2` on the 16 GiB hosted runner. Compile, lint, documentation, unit,
+The diagnostics now run in the scheduled `super` tier. The required 16 GiB
+GitHub-hosted lane explicitly uses `-j 1`; the measured local cold-build caps
+are intentionally not treated as a portable VM memory model. Compile, lint, documentation, unit,
 and contract nodes may overlap when dependencies allow, while Hermit guest
 executions retain the
 `hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
@@ -128,11 +146,14 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   serial after the initial builds.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
   runner picks the largest `-j` whose modeled worst-case footprint (summed
-  `rss_baseline_bytes` of a schedulable set) fits the budget.
+  `hard_mem_max_bytes` of a schedulable set) fits the budget. It always permits
+  at least one node, even when that node's cap exceeds the scheduler budget;
+  constrained hosted VMs therefore use explicit `-j 1` instead.
 
 **Inner** — each gate's own box:
 
-- `rss_baseline_bytes` — estimated peak RSS, the input to `-j` sizing.
+- `rss_baseline_bytes` — rounded observed peak RSS retained as profile data and
+  used for sizing only when a hard cap is absent.
 - `hard_mem_max_bytes` — explicit inner cgroup `MemoryMax` (applied only under
   `--cgroups`); a gate that exceeds it is OOM-killed **in isolation** rather
   than taking down the run.
@@ -141,11 +162,24 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 - `classification` — `cpu-bound` (compiles, PMU compute), `latency-bound`
   (guest execution / I/O), or `light` (fmt, contract checks).
 
-> **The `rss_baseline_bytes` / `hard_mem_max_bytes` / `est_duration_s` values
-> are hand-estimated, not measured.** They are safe starting points for
-> `--max-mem` sizing and inner caps, not benchmarks. Refine them from a real
-> run's `--perf-dir` CSVs (`ci/run-dag.sh hosted --perf-dir ./perf`) before
-> relying on tight memory budgets.
+The hosted lane's memory values were measured at Hermit `c1c3eb2d` on an AMD
+EPYC 9D85 host using cgroup-v2 `memory.peak`. Compile-sensitive nodes were
+profiled from cold target directories. Baselines round observed peaks up to 128
+MiB; hard caps round at least 1.5x the observed peak to 128 MiB, with a 256 MiB
+minimum for small shell checks. The largest observed peaks were rustdoc 16.00
+GiB, workspace build 8.65 GiB, and strict compatibility 8.36 GiB. Re-profile
+after material dependency, toolchain, or test-matrix changes with
+`ci/run-dag.sh hosted --perf-dir ./perf`.
+
+The `setup.nextest` limit includes a separately profiled cold
+`cargo install cargo-nextest` fallback (2.90 GiB peak), not only the installed
+binary's fast version check.
+
+The hardware lane's cold release build peaked at 10,006,720,512 bytes and uses
+the same rounded 1.5x rule. Remaining hardware-only test values stay
+conservative until a complete successful PMU profile is available; the current
+single runner repeatedly times out in the parallel memory-race family before
+later nodes execute.
 
 ## Conservatism and how to relax it
 

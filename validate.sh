@@ -8,9 +8,16 @@
 set -uo pipefail
 
 # Deny warnings for every compiler and rustdoc invocation while preserving any
-# caller-provided flags.
-export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
-export RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings"
+# caller-provided flags. Keep this idempotent because hosted-only delegates to
+# DAG nodes that invoke focused validate.sh modes.
+case " ${RUSTFLAGS:-} " in
+    *" -D warnings "*) ;;
+    *) export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings" ;;
+esac
+case " ${RUSTDOCFLAGS:-} " in
+    *" -D warnings "*) ;;
+    *) export RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings" ;;
+esac
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 readonly ROOT_DIR
@@ -174,6 +181,15 @@ case "$VALIDATION_PROFILE" in
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
 esac
 readonly VALIDATION_ESTIMATE
+
+# Hosted validation is the high-frequency path agents run concurrently. Route
+# it through the measured DAG so the shared outer cap and per-step MemoryMax
+# limits are applied even when callers use validate.sh directly.
+if [[ $VALIDATION_LEVEL == hosted-only ]]; then
+    dag_args=()
+    ((VERBOSE == 1)) && dag_args+=(-v)
+    exec env -u VALIDATE_LEVEL "$ROOT_DIR/ci/run-dag.sh" hosted "${dag_args[@]}"
+fi
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -2985,6 +3001,15 @@ function run_hermit_targets_serial {
     cargo "${cargo_args[@]}" -- --test-threads=1
 }
 
+# CI DAG RSS profile (c1c3eb2d, AMD EPYC 9D85, cgroup-v2 memory.peak):
+# cold rustdoc 17,179,869,184 B; cold workspace build 9,284,624,384 B;
+# strict compatibility 8,981,835,776 B; cold cargo-nextest install
+# 3,114,622,976 B; clippy 2,360,946,688 B; every remaining hosted gate <=
+# 1,992,224,768 B. ci/dag/hosted.json rounds each
+# observed peak up to 128 MiB for scheduling and sets MemoryMax at >= 1.5x
+# peak (256 MiB minimum). The hosted-only entrypoint above delegates to
+# ci/run-dag.sh so direct validate.sh callers receive the same containment;
+# this function remains the command-level source of truth for the DAG.
 function run_hosted_only_suite {
     run_check "Detcore backend-abstraction check" \
         ./scripts/check-detcore-backend-abstraction.sh
@@ -3297,13 +3322,6 @@ function run_super_suite {
     run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
-
-# Envelope-only fast path: build the binary, measure the envelope, optionally
-# enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
-if [[ $VALIDATION_LEVEL == hosted-only ]]; then
-    run_hosted_only_suite
-    exit $?
-fi
 
 if ((HARDWARE_ONLY == 1)); then
     run_hardware_validation
