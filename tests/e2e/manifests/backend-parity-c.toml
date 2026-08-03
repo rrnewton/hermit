@@ -3017,6 +3017,9 @@ occasional = false
 program = "tests/c/rlimit_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
+[test.build]
+cflags = ["-D_GNU_SOURCE"]
+
 [test.modes.verify]
 ci = false
 backends_enabled = ["ptrace", "dbi", "kvm"]
