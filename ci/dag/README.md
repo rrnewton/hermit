@@ -171,6 +171,40 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 > run's `--perf-dir` CSVs (`ci/run-dag.sh portable --perf-dir ./perf`) before
 > relying on tight memory budgets.
 
+## `cpu_timeout` (CPU-second budget) and how it is derived
+
+Each step may carry a step-level **`cpu_timeout`** (integer seconds) alongside
+its wall `timeout`. Wall time inflates under host load and only catches a
+*stuck-and-idle* node; a CPU-second is physical work, so `cpu_timeout` catches a
+runaway that *burns CPU* (a hang that pins a core, like a reap spin) without
+flaking when the box is merely busy. The wall `timeout` stays as the
+idle-hang backstop. Enforcement lives in `safe-ci-dag-runner` and fires only
+when the step is boxed; the field is an inert unknown key to a runner that does
+not implement it, so declaring it is byte-safe ahead of the runner rollout.
+
+**Never hand-write `cpu_timeout` values.** Derive them from measurement with
+[`derive-cpu-timeouts.rs`](derive-cpu-timeouts.rs):
+
+```sh
+ci/dag/derive-cpu-timeouts.rs --samples <perf-or-study.csv> [--step g/j] --apply
+ci/dag/derive-cpu-timeouts.rs --self-test
+```
+
+It reads the node universe from the manifests, ingests per-node CPU-second
+samples (runner `--perf-dir` CSVs or an isolation study), and sets
+`cpu_timeout = round(max(observed cpu_s) * 1.5)` **only** for nodes with enough
+samples (`--min-samples`, default 5); every other node is left **without** a
+`cpu_timeout` and reported, so the pipeline never invents a number and does not
+rot as nodes are added.
+
+Under the planned **opt-out boxing** model (cgroups on by default, escape hatch
+`--unsafe-no-cgroups`, and a small default cap of 1 core / 1 GB / 10 s CPU per
+undeclared node), one full DAG run produces a *breach table* — each node that
+exceeds the default reports its real requirement — which is exactly this tool's
+input. Today only `e2e/metadata` has real data (a 35-sample study: max 12.24 s
+CPU → `cpu_timeout: 18`); the rest are intentionally undeclared and will be
+derived from the first breach-table run.
+
 ## Conservatism and how to relax it
 
 The `hermit_guest: 1` / `pmu: 1` serialization faithfully reproduces

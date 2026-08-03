@@ -78,6 +78,7 @@
       "desc": "Validate multi-mode E2E metadata and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
       "timeout": 60,
+      "cpu_timeout": 18,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
