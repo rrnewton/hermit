@@ -66,6 +66,11 @@ Protocol for every PR:
    exact revision; it tells reviewers the local gate has been satisfied.
    Re-run `validate.sh` and re-apply the label after any subsequent push that
    changes code.
+4. Every asserted ratchet constant must carry an adjacent provenance comment:
+   what was measured, when and at which full commit SHA, the method, and why the
+   value is the correct floor or denominator. If history cannot establish those
+   facts, write `origin unknown; re-derive before trusting` instead of supplying
+   a plausible story. `make lint` enforces this for compatibility ratchets.
 
 A PR that changes code but is missing the `locally-validated` label — or whose
 description does not account for any check that could not run locally — is not
