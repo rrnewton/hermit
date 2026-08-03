@@ -371,6 +371,16 @@ readonly HOST_OS
 
 checks=0
 failures=0
+# Environmental (sandbox) blocks that survived all retries. Counted toward
+# `failures` too, so every existing `((failures == 0))` exit gate still fails a
+# blocked run, but tracked separately so the summary can distinguish an
+# INFRASTRUCTURE block from a genuine TEST failure. See is_environmental_block.
+environmental=0
+# Number of automatic retries when a check dies on a transient environmental
+# sandbox block (e.g. a BPFJailer FS/EXEC/NET enforcer killing a build/test
+# subprocess). Total attempts = retries + 1. Override with VALIDATE_ENV_BLOCK_RETRIES.
+ENV_BLOCK_MAX_RETRIES=${VALIDATE_ENV_BLOCK_RETRIES:-2}
+readonly ENV_BLOCK_MAX_RETRIES
 active_check_pid=""
 declare -a background_pids=()
 declare -a background_names=()
@@ -735,6 +745,43 @@ function interrupted {
 trap cleanup EXIT
 trap interrupted INT TERM
 
+# Return success (0) when the failed check's log region carries the signature of
+# an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
+# Code agent runs inside a BPFJailer jail inherited by every descendant
+# (validate.sh -> cargo -> rustc/cmake/cc1/ld); its FS/EXEC/NET enforcers can
+# transiently deny a file open by a build or test subprocess for reasons
+# unrelated to the code under test.
+#
+# The denial surfaces in TWO forms, both of which we must catch:
+#
+#   1. The canonical BPFJailer banner ("blocked on this server based on a
+#      security policy", "BpfJailer", "Enforcer: FS, Reason: ..."). This is what
+#      appears when the jailer itself prints to the process's output.
+#   2. A raw EPERM/EACCES leaked to a build tool with NO banner. The FS enforcer
+#      denies open() and the toolchain reports the errno verbatim, e.g. cc1
+#      `fatal error: /usr/lib/gcc/.../stddef.h: Operation not permitted` while
+#      building DynamoRIO, or a CMake/linker "Permission denied" on a system
+#      path. On this host those files are world-readable (root:root -rw-r--r--),
+#      so a *compiler* reporting it cannot open a header for a permission reason
+#      is never legitimate product behavior -- it is always the sandbox. This is
+#      how the DynamoRIO "host permission" block (validate-dynamorio-host-
+#      permission-block) manifests: same jail, same FS/FILE_OPEN denial as the
+#      BPFJailer transient, but banner-less.
+#
+# The form-2 patterns are anchored on compiler/build-tool phrasing
+# (`fatal error: <path>:`, `CMake Error`, `cannot open ...`) so ordinary GUEST
+# test output that legitimately produces EPERM -- DETLOG lines such as
+# `madvise ... EPERM (Operation not permitted)`, the kcmp-eperm fixture, or a
+# `context: Mount` EPERM -- never trips a false positive. Misclassifying a real
+# test failure as environmental is as harmful as the reverse, so keep these
+# signatures build-toolchain-specific.
+function is_environmental_block {
+    local output_start=$1
+    tail -n "+$output_start" "$LOG_FILE" |
+        sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
+        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)'
+}
+
 function failure_summary {
     local output_start=$1
     local output
@@ -840,6 +887,8 @@ function run_check_with_timeout {
     local status
     local summary
     local duration
+    local attempt=1
+    local max_attempts=$((ENV_BLOCK_MAX_RETRIES + 1))
 
     {
         printf "=== %s ===\n" "$name"
@@ -856,19 +905,54 @@ function run_check_with_timeout {
         printf "\n  timeout: %ss\n" "$timeout_seconds"
     fi
 
-    if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
-        status=0
+    # Run the check, auto-retrying transient environmental sandbox blocks so a
+    # host FS-permission denial (BPFJailer banner, or a banner-less EPERM leaked
+    # to cc1/cmake/ld) that kills a build/test subprocess never masquerades as a
+    # product failure or an ambiguous early death. Each retry starts a fresh log
+    # region so classification only inspects the latest attempt.
+    while :; do
+        if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
+            status=0
+            duration=$((SECONDS - started_at))
+            if ((attempt > 1)); then
+                printf "✅ %s (1 passed, 0 failed, %ss; recovered after %s environmental retry attempt(s))\n" \
+                    "$name" "$duration" "$((attempt - 1))"
+            else
+                printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
+            fi
+            break
+        else
+            status=$?
+        fi
+
         duration=$((SECONDS - started_at))
-        printf "✅ %s (1 passed, 0 failed, %ss)\n" \
-            "$name" "$duration"
-    else
-        status=$?
-        duration=$((SECONDS - started_at))
-        failures=$((failures + 1))
-        summary=$(failure_summary "$output_start")
-        printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
-            "$name" "$status" "$summary" "$LOG_FILE"
-    fi
+
+        if is_environmental_block "$output_start"; then
+            if ((attempt < max_attempts)); then
+                printf "⚠️  %s: ENVIRONMENTAL sandbox block (host FS-permission denial, not a test failure) on attempt %s/%s — retrying\n" \
+                    "$name" "$attempt" "$max_attempts"
+                printf "validate.sh: ENVIRONMENTAL sandbox block on attempt %s/%s; retrying (not a test failure)\n" \
+                    "$attempt" "$max_attempts" >>"$LOG_FILE"
+                attempt=$((attempt + 1))
+                started_at=$SECONDS
+                output_start=$(($(wc -l <"$LOG_FILE") + 1))
+                continue
+            fi
+            # Retries exhausted: fail (non-green) but label unambiguously as an
+            # infrastructure block, and tally it separately from test failures.
+            failures=$((failures + 1))
+            environmental=$((environmental + 1))
+            summary=$(failure_summary "$output_start")
+            printf "🧱 %s (ENVIRONMENTAL BLOCK after %s attempt(s): host sandbox FS-permission denial (BPFJailer), NOT a test failure — validate could not complete; exit %s: %s; full log: %s)\n" \
+                "$name" "$max_attempts" "$status" "$summary" "$LOG_FILE"
+        else
+            failures=$((failures + 1))
+            summary=$(failure_summary "$output_start")
+            printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
+                "$name" "$status" "$summary" "$LOG_FILE"
+        fi
+        break
+    done
 
     {
         printf "Exit: %s\n" "$status"
@@ -980,6 +1064,15 @@ function wait_for_background_checks {
 
         if ((status == 0)); then
             printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
+        elif is_environmental_block "$output_start"; then
+            # Background checks run to completion before collection, so they
+            # cannot be retried in place; still label the block unambiguously as
+            # infrastructure rather than a test failure (already counted in
+            # failures above) and tally it separately.
+            environmental=$((environmental + 1))
+            summary=$(failure_summary "$output_start")
+            printf "🧱 %s (ENVIRONMENTAL BLOCK: host sandbox FS-permission denial (BPFJailer), NOT a test failure — validate could not complete; exit %s: %s; full log: %s)\n" \
+                "$name" "$status" "$summary" "$LOG_FILE"
         else
             summary=$(failure_summary "$output_start")
             printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
@@ -3160,9 +3253,19 @@ function check_copyright_headers {
 
 function print_summary {
     local passed=$((checks - failures))
+    local test_failures=$((failures - environmental))
     if ((failures == 0)); then
         printf "✅ Validation summary [%s] (%s passed, 0 failed; full log: %s)\n" \
             "$VALIDATION_PROFILE" "$passed" "$LOG_FILE"
+    elif ((test_failures == 0)); then
+        # Only environmental (sandbox) blocks failed — validate could not
+        # complete, but nothing under test is broken. Keep it non-green (never a
+        # false pass) while making the cause unambiguous.
+        printf "🧱 Validation summary [%s] (%s passed, 0 TEST failures, %s ENVIRONMENTAL block(s) — validate INCOMPLETE due to sandbox denial, not a product failure; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$environmental" "$LOG_FILE"
+    elif ((environmental > 0)); then
+        printf "❌ Validation summary [%s] (%s passed, %s failed = %s test + %s environmental; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$failures" "$test_failures" "$environmental" "$LOG_FILE"
     else
         printf "❌ Validation summary [%s] (%s passed, %s failed; full log: %s)\n" \
             "$VALIDATION_PROFILE" "$passed" "$failures" "$LOG_FILE"
