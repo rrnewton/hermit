@@ -9,12 +9,16 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
 
-# Keep the active run and only the newest pending run for each pull request or
-# branch. GitHub replaces an older pending run in the group without cancelling
-# the active run when cancel-in-progress is false.
+# When a new commit is pushed to a PR, cancel the superseded in-progress run so a
+# stale privileged build for an outdated head does not hold this scarce PMU/KVM
+# lane while its replacement waits. The group key is per-PR (or per-ref
+# otherwise), so a push only ever supersedes its OWN predecessor, never an
+# unrelated PR's run. Cancellation is restricted to pull_request events: main
+# pushes (grouped by github.ref) and workflow_dispatch runs are never cancelled,
+# so post-land coverage and manual runs stay intact -- matching ci-portable.yml.
 concurrency:
   group: privileged-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
