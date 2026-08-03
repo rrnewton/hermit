@@ -28,6 +28,19 @@
 //! `ci/dag/portable.json` (single source of truth); the path→node relation is
 //! read from `ci/test-footprints.json`.
 //!
+//! CONFIG vs MACHINERY. All selection POLICY is external declarative DATA, not
+//! code: `ci/test-footprints-policy.json` (hand-authored: force_full,
+//! ci_irrelevant, package/path→node edges, the `preflight` gate list, and the
+//! `backend_builds` cell-backend→release-artifact map) is compiled by
+//! `ci/manifest-plan/src/bin/generate-test-footprints.rs` into the generated
+//! `ci/test-footprints.json` this file reads. THIS FILE is the MACHINERY: the
+//! glob engine, DAG dependency closure, shard/cell projection, git plumbing,
+//! and — critically — the fail-safe PRECEDENCE in `select()`
+//! (force_full → footprint → ci_irrelevant → unknown ⇒ full). That precedence
+//! is deliberately code, never data: config can declare WHICH paths are inert,
+//! but it can never declare THAT an unknown path may skip. To change a rule,
+//! edit the policy JSON and regenerate; to change the engine, edit this file.
+//!
 //! Usage:
 //!   ci/select-tests.rs --base origin/main            # diff HEAD against base
 //!   git diff --name-only A B | ci/select-tests.rs --files -
@@ -139,6 +152,10 @@ struct Footprints {
     force_full: Vec<String>,
     ci_irrelevant: Vec<String>,
     footprints: Vec<Fp>,
+    /// Always-on cheap safety gates added to any selective run (policy data).
+    preflight: Vec<String>,
+    /// Cell backend → release build artifact ("dbi" or "aux") (policy data).
+    backend_builds: BTreeMap<String, String>,
 }
 
 impl Footprints {
@@ -174,7 +191,17 @@ impl Footprints {
             })
             .unwrap_or_default();
 
-        Footprints { groups, force_full, ci_irrelevant, footprints }
+        let preflight = str_vec(&v["preflight"]);
+        let backend_builds = v["backend_builds"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        Footprints { groups, force_full, ci_irrelevant, footprints, preflight, backend_builds }
     }
 
     /// Expand a node-reference list, resolving `@GROUP` aliases recursively.
@@ -246,13 +273,6 @@ impl Dag {
         out
     }
 }
-
-// Always-on cheap safety gates for any selective run.
-const PREFLIGHT: &[&str] = &[
-    "check.backend_abstraction",
-    "check.portability_paths",
-    "lint.rustfmt",
-];
 
 // ---------------------------------------------------------------------------
 // Shard model (ci/portable-shards.json) + e2e cell plan (expected-e2e-plan.json)
@@ -444,10 +464,10 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         return full(dag.all_nodes.clone(), reasons);
     }
 
-    // Selective: add preflight, then close over build deps.
-    for pf in PREFLIGHT {
-        if dag.all_nodes.contains(*pf) {
-            matched.insert((*pf).to_string());
+    // Selective: add preflight (policy data), then close over build deps.
+    for pf in &fp.preflight {
+        if dag.all_nodes.contains(pf) {
+            matched.insert(pf.clone());
         }
     }
     // Drop any footprint node that is not in the current DAG (schema drift guard).
@@ -503,7 +523,12 @@ struct RunPlan {
 /// runs iff the change is e2e_all, or the cell's backend is in the selection's
 /// backend set. Build jobs are pulled in only when a selected shard/cell needs
 /// them. `full` runs everything; `skip` runs nothing.
-fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
+fn derive_run_plan(
+    sel: &Selection,
+    shards: &Shards,
+    plan: &Plan,
+    backend_builds: &BTreeMap<String, String>,
+) -> RunPlan {
     let total_shards = shards.debug.len() + shards.release.len();
     let total_cells = plan.cells.len();
 
@@ -545,9 +570,11 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
         }
     }
     for c in &cells {
-        match c.backend.as_str() {
-            "dbi" | "sabre" => build_dbi = true,
-            "liteinst" => build_aux = true,
+        // backend → release artifact is policy data (ci/test-footprints-policy.json);
+        // shard.needs above already names the artifact directly.
+        match backend_builds.get(&c.backend).map(String::as_str) {
+            Some("dbi") => build_dbi = true,
+            Some("aux") => build_aux = true,
             _ => {}
         }
     }
@@ -753,7 +780,7 @@ fn main() {
                 let files = local_changed_files(&b);
                 let mut sel = select(&fp, &dag, &files);
                 sel.reasons.insert(0, format!("LOCAL delta vs known-green baseline {b}"));
-                let rp = derive_run_plan(&sel, &shards, &plan);
+                let rp = derive_run_plan(&sel, &shards, &plan, &fp.backend_builds);
                 emit(&sel, &rp, &format, files.len());
                 return;
             }
@@ -769,7 +796,7 @@ fn main() {
                             .into(),
                     ],
                 };
-                let rp = derive_run_plan(&sel, &shards, &plan);
+                let rp = derive_run_plan(&sel, &shards, &plan, &fp.backend_builds);
                 emit(&sel, &rp, &format, 0);
                 return;
             }
@@ -783,7 +810,7 @@ fn main() {
     };
 
     let sel = select(&fp, &dag, &files);
-    let rp = derive_run_plan(&sel, &shards, &plan);
+    let rp = derive_run_plan(&sel, &shards, &plan, &fp.backend_builds);
     emit(&sel, &rp, &format, files.len());
 }
 
@@ -1034,12 +1061,12 @@ fn self_test() {
     let total_cells = plan.cells.len();
     let total_shards = shards.debug.len() + shards.release.len();
 
-    let rp_docs = derive_run_plan(&docs, &shards, &plan);
+    let rp_docs = derive_run_plan(&docs, &shards, &plan, &fp.backend_builds);
     check("docs ⇒ 0 shards", rp_docs.shards.is_empty());
     check("docs ⇒ 0 cells", rp_docs.cells.is_empty());
     check("docs ⇒ no debug build", !rp_docs.build_debug);
 
-    let rp_full = derive_run_plan(&lock, &shards, &plan);
+    let rp_full = derive_run_plan(&lock, &shards, &plan, &fp.backend_builds);
     check("full ⇒ all shards", rp_full.shards.len() == total_shards);
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
     check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbi && rp_full.build_aux);
@@ -1047,7 +1074,7 @@ fn self_test() {
     // DBI is a Cargo dependency of hermit. Package-level reverse-dependency
     // closure therefore includes Hermit's other third-party-backend test
     // nodes, while explicit backend affinity still limits e2e cells to DBI.
-    let rp_dbi = derive_run_plan(&dbi, &shards, &plan);
+    let rp_dbi = derive_run_plan(&dbi, &shards, &plan, &fp.backend_builds);
     check("dbi ⇒ dbi-parity shard", rp_dbi.shards.contains(&"dbi-parity".to_string()));
     check("dbi ⇒ hermit reverse-dep sabre shard", rp_dbi.shards.contains(&"sabre".to_string()));
     check("dbi ⇒ only dbi cells", !rp_dbi.cells.is_empty() && rp_dbi.cells.iter().all(|c| c.backend == "dbi"));
@@ -1056,24 +1083,24 @@ fn self_test() {
 
     // SaBRe backend change: only sabre cells + sabre shard.
     let sabre = select(&fp, &dag, &vec!["detcore-sabre/src/lib.rs".into()]);
-    let rp_sabre = derive_run_plan(&sabre, &shards, &plan);
+    let rp_sabre = derive_run_plan(&sabre, &shards, &plan, &fp.backend_builds);
     check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
     check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
     check("sabre ⇒ build_dbi, not aux", rp_sabre.build_dbi && !rp_sabre.build_aux);
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
     let liteinst = select(&fp, &dag, &vec!["scripts/stage-liteinst-runtime.sh".into()]);
-    let rp_lite = derive_run_plan(&liteinst, &shards, &plan);
+    let rp_lite = derive_run_plan(&liteinst, &shards, &plan, &fp.backend_builds);
     check("liteinst ⇒ liteinst shard", rp_lite.shards.contains(&"liteinst".to_string()));
     check("liteinst ⇒ only liteinst cells", !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"));
 
     // Core change: all backends' cells (shared Detcore path).
-    let rp_core = derive_run_plan(&core, &shards, &plan);
+    let rp_core = derive_run_plan(&core, &shards, &plan, &fp.backend_builds);
     check("core ⇒ all e2e cells", rp_core.cells.len() == total_cells);
     check("core ⇒ e2e_all set", core.e2e_all);
 
     // Pure standalone-script change: shards but no e2e cells.
-    let rp_scripts = derive_run_plan(&rs_lint, &shards, &plan);
+    let rp_scripts = derive_run_plan(&rs_lint, &shards, &plan, &fp.backend_builds);
     check("hermit-verify ⇒ 0 e2e cells", rp_scripts.cells.is_empty());
 
     // Backend disjointness: the dbi and sabre cell sets never overlap.

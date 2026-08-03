@@ -9,8 +9,15 @@
     "harness edges and fail-safe path policy come from ci/test-footprints-policy.json.",
     "",
     "Safety is unchanged: force_full and unknown paths run everything. CI is skipped",
-    "only when every changed path is explicitly ci_irrelevant and no footprint matches."
+    "only when every changed path is explicitly ci_irrelevant and no footprint matches.",
+    "preflight (always-on selective gates) and backend_builds (cell backend -> release",
+    "artifact) are passed through verbatim from the policy file for the selection engine."
   ],
+  "backend_builds": {
+    "dbi": "dbi",
+    "liteinst": "aux",
+    "sabre": "dbi"
+  },
   "ci_irrelevant": [
     "**/*.md",
     "docs/**",
@@ -648,5 +655,10 @@
     ".github/workflows/ci-privileged.yml"
   ],
   "groups": {},
+  "preflight": [
+    "check.backend_abstraction",
+    "check.portability_paths",
+    "lint.rustfmt"
+  ],
   "version": 2
 }

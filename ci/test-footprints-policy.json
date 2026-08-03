@@ -7,7 +7,14 @@
     "Keep ci_irrelevant deliberately narrow: it is the only classification that can",
     "skip CI. Unmatched paths still force the complete suite. Package Rust sources,",
     "manifests, reverse dependencies, and Cargo-command DAG nodes are generated.",
-    "package_paths adds package-local fixtures/resources that Cargo metadata cannot name."
+    "package_paths adds package-local fixtures/resources that Cargo metadata cannot name.",
+    "",
+    "preflight and backend_builds are the two non-path policy inputs the selection",
+    "engine (ci/select-tests.rs) reads as DATA rather than deriving. Neither can weaken",
+    "the fail-safe: preflight only ADDS gates to an already-selective run, and",
+    "backend_builds only names which release artifact a selected cell needs (a wrong",
+    "value makes a cell fail loudly, never silently skip). The skip/selective/full",
+    "PRECEDENCE stays in the engine's code and is not configurable here."
   ],
   "version": 1,
   "force_full": [
@@ -38,6 +45,16 @@
     "**/*.jpg",
     ".github/**"
   ],
+  "preflight": [
+    "check.backend_abstraction",
+    "check.portability_paths",
+    "lint.rustfmt"
+  ],
+  "backend_builds": {
+    "dbi": "dbi",
+    "sabre": "dbi",
+    "liteinst": "aux"
+  },
   "package_paths": {
     "detcore": ["detcore/**"],
     "edit-distance": ["common/edit-distance/**"],
