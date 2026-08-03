@@ -79,13 +79,15 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// Fixed inherited descriptor receiving unsupported syscall records.
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
-static PLUGIN_DESCRIPTOR: LazyLock<DetcoreDescriptorV1> =
-    LazyLock::new(|| DetcoreDescriptorV1::new(detcore::DETCORE_BUILD_ID));
+/// Fixed-layout identity exported in the DSO for validation without executing it.
+#[unsafe(no_mangle)]
+pub static HERMIT_DETCORE_PLUGIN_DESCRIPTOR_V1: DetcoreDescriptorV1 =
+    DetcoreDescriptorV1::new(detcore::DETCORE_BUILD_ID);
 
 /// Returns the exact native ABI and Detcore build identity embedded in this shared object.
 #[unsafe(no_mangle)]
 pub extern "C" fn hermit_detcore_plugin_descriptor_v1() -> *const DetcoreDescriptorV1 {
-    &*PLUGIN_DESCRIPTOR
+    &HERMIT_DETCORE_PLUGIN_DESCRIPTOR_V1
 }
 
 /// Returns the DBI statistics wire code for the external Detcore runtime.

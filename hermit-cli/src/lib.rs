@@ -10,6 +10,7 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+mod backend_plugin;
 mod chroot;
 mod consts;
 mod desync;
@@ -673,34 +674,81 @@ impl Backend {
     }
 }
 
-// SaBRe and e9patch add no third-party Rust dependencies to `hermit-cli` (SaBRe
-// shells out to an external loader plus `libdetcore_sabre.so`, and e9patch shells
-// out to `e9tool`/`e9patch`). They are still gated behind the `sabre` and
-// `e9patch` cargo features so the default `hermit` binary reports them as absent
-// and only the `third-party-backends` build offers them. The reverie-sabre Rust
-// dependency lives in the `detcore-sabre` crate, which is excluded from the
-// workspace's `default-members`.
-#[cfg(feature = "sabre")]
+/// Exact process-level failure returned while locating an optional backend
+/// package. CLI callers preserve this exit status instead of rounding an
+/// unavailable plugin into a generic status 1.
+#[doc(hidden)]
+pub struct BackendPluginError {
+    /// `sysexits.h`-style status supplied by the helper protocol.
+    pub code: i32,
+    /// Complete actionable diagnostic.
+    pub message: String,
+}
+
+/// Materializes a separately installed backend payload when the selected
+/// backend needs one. Existing explicit or monolithic-development resources
+/// remain valid compatibility paths.
+#[doc(hidden)]
+pub fn ensure_optional_backend_package(backend: Backend) -> Result<(), BackendPluginError> {
+    let spec = match backend {
+        Backend::Sabre => backend_plugin::PluginSpec {
+            backend: "sabre",
+            helper: "hermit-sabre",
+            abi: hermit_plugin_protocol::SABRE_DETCORE_ABI_TAG,
+        },
+        Backend::E9patch => backend_plugin::PluginSpec {
+            backend: "e9patch",
+            helper: "hermit-e9patch",
+            abi: hermit_plugin_protocol::E9PATCH_ABI_TAG,
+        },
+        _ => return Ok(()),
+    };
+
+    let has_legacy_payload = match backend {
+        Backend::Sabre => {
+            std::env::var_os(SABRE_BINARY_ENV).is_some()
+                || hermit_resources::resource("sabre").ok().flatten().is_some()
+                || (resolve_sabre_binary().is_ok() && sabre_runtime_library_path().is_ok())
+        }
+        Backend::E9patch => {
+            std::env::var_os(e9patch::E9TOOL_ENV).is_some()
+                || hermit_resources::resource("e9tool")
+                    .ok()
+                    .flatten()
+                    .is_some()
+                || std::env::var_os("PATH").is_some_and(|path| {
+                    std::env::split_paths(&path)
+                        .map(|directory| directory.join("e9tool"))
+                        .any(|candidate| is_executable_file(&candidate))
+                })
+        }
+        _ => unreachable!(),
+    };
+    if has_legacy_payload {
+        return Ok(());
+    }
+
+    backend_plugin::ensure_payload(spec)
+        .map(|_| ())
+        .map_err(|error| BackendPluginError {
+            code: error.code,
+            message: error.message,
+        })
+}
+
+// SaBRe and e9patch dispatch glue adds no third-party Rust dependency to the
+// flagship binary. Their separately installed helpers own the source-built
+// payloads; keeping this glue in core lets installation work without rebuilding
+// or reconfiguring hermit-run.
 fn sabre_unavailable_reason() -> Option<String> {
     sabre_runtime_unavailable_reason()
 }
 
-#[cfg(not(feature = "sabre"))]
-fn sabre_unavailable_reason() -> Option<String> {
-    Some("SaBRe support was not included in this build".to_owned())
-}
-
-#[cfg(feature = "e9patch")]
 fn e9patch_unavailable_reason() -> Option<String> {
     validate_tracing_environment()
         .err()
         .map(|error| error.to_string())
         .or_else(e9patch::unavailable_reason)
-}
-
-#[cfg(not(feature = "e9patch"))]
-fn e9patch_unavailable_reason() -> Option<String> {
-    Some("e9patch support was not included in this build".to_owned())
 }
 
 #[cfg(feature = "dbi")]
@@ -892,16 +940,26 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
-#[cfg(feature = "sabre")]
-fn sabre_runtime_unavailable_reason() -> Option<String> {
-    if let Err(error) = resolve_sabre_binary() {
-        return Some(error.to_string());
+fn resolve_sabre_payload() -> Result<(PathBuf, PathBuf), Error> {
+    let explicit = std::env::var_os(SABRE_BINARY_ENV).is_some();
+    let packaged = hermit_resources::resource("sabre")?.is_some();
+    let legacy_loader = resolve_sabre_binary();
+    let legacy_runtime = sabre_runtime_library_path();
+    if explicit || packaged || (legacy_loader.is_ok() && legacy_runtime.is_ok()) {
+        return Ok((legacy_loader?, legacy_runtime?));
     }
-    sabre_runtime_library_path().err().map(|error| {
-        format!(
-            "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
-        )
+
+    let payload = backend_plugin::ensure_payload(backend_plugin::PluginSpec {
+        backend: "sabre",
+        helper: "hermit-sabre",
+        abi: hermit_plugin_protocol::SABRE_DETCORE_ABI_TAG,
     })
+    .map_err(backend_plugin::as_io_error)?;
+    Ok((payload.sabre, payload.detcore_runtime))
+}
+
+fn sabre_runtime_unavailable_reason() -> Option<String> {
+    resolve_sabre_payload().err().map(|error| error.to_string())
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -999,9 +1057,7 @@ async fn run_sabre(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
-    let sabre = resolve_sabre_binary()?;
-    let plugin = sabre_runtime_library_path()
-        .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
+    let (sabre, plugin) = resolve_sabre_payload()?;
     let program = command.find_program().map_err(|error| {
         anyhow!(
             "failed to resolve SaBRe guest executable {:?}: {error}",

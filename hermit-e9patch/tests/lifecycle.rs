@@ -23,11 +23,16 @@ use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
 
 fn identity() -> PluginIdentity {
-    PluginIdentity::current("dbt", env!("CARGO_PKG_VERSION"), detcore::DETCORE_BUILD_ID)
+    PluginIdentity::with_abi(
+        "e9patch",
+        env!("CARGO_PKG_VERSION"),
+        hermit_plugin_protocol::E9PATCH_ABI_TAG,
+        detcore::DETCORE_BUILD_ID,
+    )
 }
 
 fn ensure(root: &Path, request: &EnsureRequest) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit-dynamorio"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit-e9patch"))
         .arg("ensure")
         .env("HERMIT_DIR", root)
         .stdin(Stdio::piped())
@@ -72,17 +77,16 @@ fn concurrent_first_runs_publish_one_complete_release() {
 
     assert!(manifests.windows(2).all(|pair| pair[0] == pair[1]));
     let expected = root
-        .join("plugins/dynamorio/releases")
+        .join("plugins/e9patch/releases")
         .join(identity().release_key());
     assert_eq!(
         fs::canonicalize(&expected).unwrap(),
         manifests[0].release_dir
     );
-    assert!(manifests[0].drrun.is_file());
-    assert!(manifests[0].client.is_file());
-    assert!(manifests[0].detcore_runtime.is_file());
+    assert!(manifests[0].e9tool.is_file());
+    assert!(manifests[0].e9patch.is_file());
 
-    let plugin_root = root.join("plugins/dynamorio");
+    let plugin_root = root.join("plugins/e9patch");
     assert_eq!(
         fs::canonicalize(plugin_root.join("current")).unwrap(),
         fs::canonicalize(expected).unwrap()
@@ -102,7 +106,7 @@ fn concurrent_first_runs_publish_one_complete_release() {
 fn exact_release_key_invalidates_stale_current_symlink() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let plugin_root = root.join("plugins/dynamorio");
+    let plugin_root = root.join("plugins/e9patch");
     let stale = plugin_root.join("releases/0.1.0/stale");
     fs::create_dir_all(&stale).unwrap();
     fs::write(stale.join("not-a-plugin"), b"stale").unwrap();
@@ -131,7 +135,7 @@ fn unwritable_install_root_has_actionable_exit() {
 
     assert_eq!(output.status.code(), Some(EX_CANTCREAT));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot materialize backend 'dbt' payload"));
+    assert!(stderr.contains("cannot materialize backend 'e9patch' payload"));
     assert!(stderr.contains("set HERMIT_DIR to a writable directory"));
 }
 
@@ -145,7 +149,7 @@ fn exact_version_mismatch_fails_before_extraction() {
     assert_eq!(output.status.code(), Some(EX_CONFIG));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("package version mismatch"));
-    assert!(stderr.contains("refusing backend 'dbt'"));
-    assert!(stderr.contains("cargo install --force --locked hermit-dynamorio@=0.2.1"));
+    assert!(stderr.contains("refusing backend 'e9patch'"));
+    assert!(stderr.contains("cargo install --force --locked hermit-e9patch@=0.2.1"));
     assert!(!directory.path().join("plugins").exists());
 }

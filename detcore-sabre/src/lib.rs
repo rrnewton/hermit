@@ -26,6 +26,23 @@ use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
 use reverie_sabre as sabre;
 use reverie_sabre::RemoteReverieAdapter;
+
+/// Fixed-layout identity exported in the DSO for validation without executing it.
+#[unsafe(no_mangle)]
+pub static HERMIT_DETCORE_PLUGIN_DESCRIPTOR_V1: hermit_plugin_protocol::DetcoreDescriptorV1 =
+    hermit_plugin_protocol::DetcoreDescriptorV1::with_abi(
+        hermit_plugin_protocol::SABRE_DETCORE_ABI_TAG,
+        detcore::DETCORE_BUILD_ID,
+    );
+
+/// Returns the exact native ABI and Detcore build identity compiled into this
+/// SaBRe shared object. The separately installed helper validates it before the
+/// host can launch the payload.
+#[unsafe(no_mangle)]
+pub extern "C" fn hermit_detcore_plugin_descriptor_v1()
+-> *const hermit_plugin_protocol::DetcoreDescriptorV1 {
+    &HERMIT_DETCORE_PLUGIN_DESCRIPTOR_V1
+}
 use reverie_syscalls::Errno;
 use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallArgs;

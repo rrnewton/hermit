@@ -103,7 +103,7 @@ fn select_helper_from(
 
 pub(super) fn ensure_payload() -> Result<PayloadManifest, PluginFailure> {
     let helper = select_helper()?;
-    let host = PluginIdentity::current(env!("CARGO_PKG_VERSION"), detcore::DETCORE_BUILD_ID);
+    let host = PluginIdentity::current("dbt", env!("CARGO_PKG_VERSION"), detcore::DETCORE_BUILD_ID);
     let request = EnsureRequest { host: host.clone() };
     let mut child = Command::new(&helper)
         .arg("ensure")

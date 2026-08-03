@@ -16,32 +16,19 @@ use sha2::Sha256;
 use tar::Builder;
 use tar::Header;
 
-const DYNAMORIO_FILES: &[&str] = &[
-    "bin64/drrun",
-    "lib64/release/libdynamorio.so",
-    "lib64/release/libdrpreload.so",
-    "ext/lib64/release/libdrx.so",
-    "ext/lib64/release/libdrmgr.so",
-    "ext/lib64/release/libdrreg.so",
-    "ext/lib64/release/libdrwrap.so",
-];
-const MAX_PARALLEL_JOBS: usize = 16;
-
-// Provenance: the 2026-08-03 release source-build measurement produced a
-// 3,228,825-byte stripped gzip payload. Four MiB retains 29.9% headroom while
-// making growth visible at install time. Debug builds intentionally carry an
-// unoptimized build-dependency and are not a shipping-size measurement.
+// Provenance: the 2026-08-03 measured stripped SaBRe loader plus Detcore DSO
+// compressed to 1,733,462 bytes. Four MiB is more than twice that observation
+// while still making accidental payload growth fail during a release build.
 const MAX_EMBEDDED_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=native-client");
     println!("cargo:rerun-if-env-changed=STRIP");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
-        panic!("hermit-dynamorio currently supports only x86_64 Linux");
+        panic!("hermit-sabre currently supports only x86_64 Linux");
     }
 
     let out = PathBuf::from(required_env("OUT_DIR"));
@@ -49,49 +36,35 @@ fn main() {
     if payload.exists() {
         fs::remove_dir_all(&payload).expect("failed to reset the payload directory");
     }
-    fs::create_dir_all(payload.join("lib/dynamorio"))
-        .expect("failed to create payload DynamoRIO directory");
+    fs::create_dir_all(payload.join("bin")).expect("failed to create payload bin directory");
+    fs::create_dir_all(payload.join("lib")).expect("failed to create payload lib directory");
     fs::create_dir_all(payload.join("licenses"))
         .expect("failed to create payload license directory");
 
-    let dynamorio = reverie_dbi::bundled_drrun_path()
-        .parent()
-        .and_then(Path::parent)
-        .expect("bundled drrun path has no DynamoRIO root");
-    for relative in DYNAMORIO_FILES {
-        let destination = payload.join("lib/dynamorio").join(relative);
-        copy_file(&dynamorio.join(relative), &destination);
-        strip_file(&destination);
-    }
+    let sabre = payload.join("bin/sabre");
+    copy_file(reverie_sabre::bundled_sabre_path(), &sabre);
+    strip_file(&sabre);
 
-    let runtime = payload.join("lib/libdetcore_dbi.so");
+    let runtime = payload.join("lib/libdetcore_sabre.so");
     build_detcore_runtime(&out, &runtime);
     strip_file(&runtime);
 
-    let client = payload.join("lib/libreverie_dbi_client.so");
-    build_native_client(&out, &payload.join("lib"));
-    assert!(
-        client.is_file(),
-        "native client build did not produce {}",
-        client.display()
-    );
-    strip_file(&client);
-
     copy_licenses(&payload);
 
-    let identity = PluginIdentity::current(
-        "dbt",
+    let identity = PluginIdentity::with_abi(
+        "sabre",
         &env::var("CARGO_PKG_VERSION").expect("Cargo did not set CARGO_PKG_VERSION"),
+        hermit_plugin_protocol::SABRE_DETCORE_ABI_TAG,
         detcore::DETCORE_BUILD_ID,
     );
     let files = payload_hashes(&payload);
     let manifest = PayloadManifest {
         plugin: identity,
         release_dir: PathBuf::new(),
-        drrun: PathBuf::from("lib/dynamorio/bin64/drrun"),
-        client: PathBuf::from("lib/libreverie_dbi_client.so"),
-        detcore_runtime: PathBuf::from("lib/libdetcore_dbi.so"),
-        sabre: PathBuf::new(),
+        drrun: PathBuf::new(),
+        client: PathBuf::new(),
+        detcore_runtime: PathBuf::from("lib/libdetcore_sabre.so"),
+        sabre: PathBuf::from("bin/sabre"),
         e9tool: PathBuf::new(),
         e9patch: PathBuf::new(),
         files,
@@ -111,10 +84,10 @@ fn main() {
     if profile == "release" {
         assert!(
             archive_bytes <= MAX_EMBEDDED_ARCHIVE_BYTES,
-            "embedded DynamoRIO payload is {archive_bytes} bytes, exceeding the documented {MAX_EMBEDDED_ARCHIVE_BYTES}-byte release ratchet"
+            "embedded SaBRe payload is {archive_bytes} bytes, exceeding the documented {MAX_EMBEDDED_ARCHIVE_BYTES}-byte release ratchet"
         );
     }
-    println!("cargo:warning=embedded DynamoRIO payload ({profile} profile): {archive_bytes} bytes");
+    println!("cargo:warning=embedded SaBRe payload ({profile} profile): {archive_bytes} bytes");
 }
 
 fn required_env(name: &str) -> std::ffi::OsString {
@@ -127,52 +100,13 @@ fn build_detcore_runtime(out: &Path, destination: &Path) {
         .ancestors()
         .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(profile.as_str()))
         .expect("Cargo OUT_DIR has no active profile ancestor");
-    let cdylib = profile_dir.join("deps/libdetcore_dbi.so");
+    let cdylib = profile_dir.join("deps/libdetcore_sabre.so");
     assert!(
         cdylib.is_file(),
-        "Cargo did not expose the detcore-dbi build-dependency cdylib at {}",
+        "Cargo did not expose the detcore-sabre build-dependency cdylib at {}",
         cdylib.display()
     );
     copy_file(&cdylib, destination);
-}
-
-fn build_native_client(out: &Path, payload_lib: &Path) {
-    let manifest = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
-    let build = out.join("native-client-build");
-    let source = reverie_dbi::native_client_source_dir().join("client.c");
-    let mut configure = Command::new("cmake");
-    configure
-        .arg("-S")
-        .arg(manifest.join("native-client"))
-        .arg("-B")
-        .arg(&build)
-        .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg(format!(
-            "-DDynamoRIO_DIR={}",
-            reverie_dbi::bundled_dynamorio_cmake_dir().display()
-        ))
-        .arg(format!("-DREVERIE_DBI_NATIVE_SOURCE={}", source.display()))
-        .arg(format!(
-            "-DHERMIT_PAYLOAD_LIB_DIR={}",
-            payload_lib.display()
-        ));
-    run(&mut configure, "configure the DynamoRIO native client");
-
-    let mut build_command = Command::new("cmake");
-    build_command.arg("--build").arg(&build).args([
-        "--config",
-        "Release",
-        "--target",
-        "reverie_dbi_client",
-        "--parallel",
-    ]);
-    let jobs = env::var("NUM_JOBS")
-        .ok()
-        .and_then(|jobs| jobs.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, MAX_PARALLEL_JOBS);
-    build_command.arg(jobs.to_string());
-    run(&mut build_command, "build the DynamoRIO native client");
 }
 
 fn copy_licenses(payload: &Path) {
@@ -181,20 +115,14 @@ fn copy_licenses(payload: &Path) {
         &manifest.parent().unwrap().join("LICENSE"),
         &payload.join("licenses/hermit-LICENSE"),
     );
-    let reverie_dbi = reverie_dbi::native_client_source_dir()
-        .parent()
-        .expect("reverie-dbi native source has no crate root");
+    let sabre = reverie_sabre::bundled_sabre_source_dir();
     copy_file(
-        &reverie_dbi.join("vendor/dynamorio/License.txt"),
-        &payload.join("licenses/dynamorio-License.txt"),
+        &sabre.join("LICENSE"),
+        &payload.join("licenses/sabre-LICENSE"),
     );
     copy_file(
-        &reverie_dbi.join("vendor/dynamorio/ACKNOWLEDGEMENTS"),
-        &payload.join("licenses/dynamorio-ACKNOWLEDGEMENTS"),
-    );
-    copy_file(
-        &reverie_dbi.parent().unwrap().join("LICENSE"),
-        &payload.join("licenses/reverie-LICENSE"),
+        &sabre.join("LICENSE.BSD-3"),
+        &payload.join("licenses/sabre-LICENSE.BSD-3"),
     );
 }
 

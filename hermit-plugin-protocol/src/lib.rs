@@ -12,6 +12,12 @@ use serde::Serialize;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Exact Detcore native callback ABI implemented by the DBT plugin.
 pub const DETCORE_ABI_TAG: &str = "hdt1";
+/// Exact Detcore/SaBRe shared-object ABI implemented by the SaBRe plugin.
+pub const SABRE_DETCORE_ABI_TAG: &str = "hsb1";
+/// Exact host/tool handoff understood by the e9patch package.
+pub const E9PATCH_ABI_TAG: &str = "hep1";
+/// Exported ELF data symbol containing a [`DetcoreDescriptorV1`].
+pub const DETCORE_DESCRIPTOR_SYMBOL: &str = "HERMIT_DETCORE_PLUGIN_DESCRIPTOR_V1";
 /// `sysexits.h` unavailable-service status used for an absent helper.
 pub const EX_UNAVAILABLE: i32 = 69;
 /// `sysexits.h` creation failure used for an unwritable Hermit root.
@@ -35,11 +41,15 @@ pub struct DetcoreDescriptorV1 {
 
 impl DetcoreDescriptorV1 {
     /// Constructs the exported descriptor, rejecting values that do not fit the ABI.
-    pub fn new(detcore_build_id: &str) -> Self {
-        assert!(DETCORE_ABI_TAG.len() < 16, "Detcore ABI tag is too long");
-        assert_eq!(
-            detcore_build_id.len(),
-            64,
+    pub const fn new(detcore_build_id: &str) -> Self {
+        Self::with_abi(DETCORE_ABI_TAG, detcore_build_id)
+    }
+
+    /// Constructs a descriptor for a specific backend ABI.
+    pub const fn with_abi(detcore_abi: &str, detcore_build_id: &str) -> Self {
+        assert!(detcore_abi.len() < 16, "Detcore ABI tag is too long");
+        assert!(
+            detcore_build_id.len() == 64,
             "Detcore build ID must be a SHA-256 hex digest"
         );
         let mut descriptor = Self {
@@ -48,9 +58,18 @@ impl DetcoreDescriptorV1 {
             detcore_abi: [0; 16],
             detcore_build_id: [0; 65],
         };
-        descriptor.detcore_abi[..DETCORE_ABI_TAG.len()].copy_from_slice(DETCORE_ABI_TAG.as_bytes());
-        descriptor.detcore_build_id[..detcore_build_id.len()]
-            .copy_from_slice(detcore_build_id.as_bytes());
+        let abi = detcore_abi.as_bytes();
+        let mut index = 0;
+        while index < abi.len() {
+            descriptor.detcore_abi[index] = abi[index];
+            index += 1;
+        }
+        let build = detcore_build_id.as_bytes();
+        index = 0;
+        while index < build.len() {
+            descriptor.detcore_build_id[index] = build[index];
+            index += 1;
+        }
         descriptor
     }
 
@@ -73,6 +92,8 @@ fn fixed_c_string(bytes: &[u8]) -> Option<&str> {
 /// Exact identity that must agree before a backend payload can run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PluginIdentity {
+    /// Backend selected by the host; a helper for another backend is incompatible.
+    pub backend: String,
     /// Control protocol major.
     pub protocol: u32,
     /// Exact Hermit Cargo package version.
@@ -86,20 +107,33 @@ pub struct PluginIdentity {
 }
 
 impl PluginIdentity {
-    /// Constructs an identity for the current target.
-    pub fn current(package_version: &str, detcore_build_id: &str) -> Self {
+    /// Constructs a DBT identity for the current target.
+    pub fn current(backend: &str, package_version: &str, detcore_build_id: &str) -> Self {
+        Self::with_abi(backend, package_version, DETCORE_ABI_TAG, detcore_build_id)
+    }
+
+    /// Constructs an identity for a specific backend ABI and current target.
+    pub fn with_abi(
+        backend: &str,
+        package_version: &str,
+        detcore_abi: &str,
+        detcore_build_id: &str,
+    ) -> Self {
         Self {
+            backend: backend.to_owned(),
             protocol: PROTOCOL_VERSION,
             package_version: package_version.to_owned(),
             target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-            detcore_abi: DETCORE_ABI_TAG.to_owned(),
+            detcore_abi: detcore_abi.to_owned(),
             detcore_build_id: detcore_build_id.to_owned(),
         }
     }
 
     /// Returns the first exact-identity mismatch.
     pub fn mismatch(&self, plugin: &Self) -> Option<&'static str> {
-        if self.protocol != plugin.protocol {
+        if self.backend != plugin.backend {
+            Some("backend")
+        } else if self.protocol != plugin.protocol {
             Some("protocol")
         } else if self.package_version != plugin.package_version {
             Some("package version")
@@ -143,6 +177,15 @@ pub struct PayloadManifest {
     pub client: PathBuf,
     /// Detcore DBT shared object.
     pub detcore_runtime: PathBuf,
+    /// SaBRe loader, empty for other backends.
+    #[serde(default)]
+    pub sabre: PathBuf,
+    /// e9tool executable, empty for other backends.
+    #[serde(default)]
+    pub e9tool: PathBuf,
+    /// e9patch backend executable, empty for other backends.
+    #[serde(default)]
+    pub e9patch: PathBuf,
     /// SHA-256 by payload-relative path.
     pub files: BTreeMap<String, String>,
 }
@@ -153,10 +196,13 @@ mod tests {
 
     #[test]
     fn exact_identity_rejects_every_skew_dimension() {
-        let host = PluginIdentity::current("0.2.0", "build-a");
+        let host = PluginIdentity::current("dbt", "0.2.0", "build-a");
         assert_eq!(host.mismatch(&host), None);
 
         let mut plugin = host.clone();
+        plugin.backend = "sabre".to_owned();
+        assert_eq!(host.mismatch(&plugin), Some("backend"));
+        plugin = host.clone();
         plugin.package_version = "0.2.1".to_owned();
         assert_eq!(host.mismatch(&plugin), Some("package version"));
         plugin = host.clone();

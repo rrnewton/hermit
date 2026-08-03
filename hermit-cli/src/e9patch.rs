@@ -821,14 +821,20 @@ fn resolve_e9tool() -> Result<PathBuf, Error> {
     }
 
     let path_env = env::var_os("PATH").unwrap_or_default();
-    env::split_paths(&path_env)
+    if let Some(candidate) = env::split_paths(&path_env)
         .map(|directory| directory.join(&requested))
         .find(|candidate| is_executable_file(candidate))
-        .ok_or_else(|| {
-            Error::msg(format!(
-                "e9tool was not found in PATH; install e9patch or set {E9TOOL_ENV} to its executable"
-            ))
-        })
+    {
+        return Ok(candidate);
+    }
+
+    let payload = crate::backend_plugin::ensure_payload(crate::backend_plugin::PluginSpec {
+        backend: "e9patch",
+        helper: "hermit-e9patch",
+        abi: hermit_plugin_protocol::E9PATCH_ABI_TAG,
+    })
+    .map_err(|error| Error::msg(format!("{} (exit {})", error.message, error.code)))?;
+    Ok(payload.e9tool)
 }
 
 fn resolve_e9patch_backend(e9tool: &Path) -> Result<PathBuf, Error> {

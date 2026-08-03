@@ -12,15 +12,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use flate2::read::GzDecoder;
-use hermit_plugin_protocol::DETCORE_ABI_TAG;
-use hermit_plugin_protocol::DetcoreDescriptorV1;
 use hermit_plugin_protocol::EX_CANTCREAT;
 use hermit_plugin_protocol::EX_CONFIG;
 use hermit_plugin_protocol::EnsureRequest;
-use hermit_plugin_protocol::PROTOCOL_VERSION;
 use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
-use libloading::Library;
 use sha2::Digest as _;
 use sha2::Sha256;
 
@@ -54,8 +50,8 @@ impl HelperError {
         Self {
             code: EX_CANTCREAT,
             message: format!(
-                "error: cannot materialize backend 'dbt' payload under {}: {error}\n\
-                 repair: set HERMIT_DIR to a writable directory or have an administrator materialize this exact hermit-dynamorio version",
+                "error: cannot materialize backend 'e9patch' payload under {}: {error}\n\
+                 repair: set HERMIT_DIR to a writable directory or have an administrator materialize this exact hermit-e9patch version",
                 path.display()
             ),
         }
@@ -69,19 +65,19 @@ fn run() -> Result<(), HelperError> {
         (Some(command), None) if command == OsStr::new("ensure") => {}
         _ => {
             return Err(HelperError::config(
-                "error: hermit-dynamorio is an internal Hermit backend helper; expected `hermit-dynamorio ensure`",
+                "error: hermit-e9patch is an internal Hermit backend helper; expected `hermit-e9patch ensure`",
             ));
         }
     }
 
     let request: EnsureRequest = serde_json::from_reader(io::stdin()).map_err(|error| {
         HelperError::config(format!(
-            "error: invalid hermit-dynamorio host request: {error}"
+            "error: invalid hermit-e9patch host request: {error}"
         ))
     })?;
     let embedded: PayloadManifest = serde_json::from_str(PAYLOAD_MANIFEST).map_err(|error| {
         HelperError::config(format!(
-            "error: hermit-dynamorio embedded manifest is invalid: {error}"
+            "error: hermit-e9patch embedded manifest is invalid: {error}"
         ))
     })?;
     if let Some(field) = request.host.mismatch(&embedded.plugin) {
@@ -89,7 +85,7 @@ fn run() -> Result<(), HelperError> {
     }
 
     let root = hermit_dir()?;
-    let plugin_root = root.join("plugins/dynamorio");
+    let plugin_root = root.join("plugins/e9patch");
     fs::create_dir_all(plugin_root.join("releases"))
         .map_err(|error| HelperError::create(&root, error))?;
     let _lock =
@@ -117,13 +113,13 @@ fn incompatible_message(
     plugin: &PluginIdentity,
     field: &str,
 ) -> HelperError {
-    let selected = env::current_exe().unwrap_or_else(|_| PathBuf::from("hermit-dynamorio"));
+    let selected = env::current_exe().unwrap_or_else(|_| PathBuf::from("hermit-e9patch"));
     HelperError::config(format!(
-        "error: incompatible hermit-dynamorio plugin; refusing backend 'dbt' ({field} mismatch)\n\
+        "error: incompatible hermit-e9patch plugin; refusing backend 'e9patch' ({field} mismatch)\n\
          host:   hermit-run {}, Detcore ABI {}, build {}\n\
-         plugin: hermit-dynamorio {}, Detcore ABI {}, build {}\n\
+         plugin: hermit-e9patch {}, Detcore ABI {}, build {}\n\
          selected plugin: {}\n\
-         repair with:\n  cargo install --force --locked hermit-dynamorio@={}",
+         repair with:\n  cargo install --force --locked hermit-e9patch@={}",
         host.package_version,
         host.detcore_abi,
         host.detcore_build_id,
@@ -282,10 +278,7 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
         if actual != *expected {
             return Err(format!("payload hash mismatch for {}", path.display()));
         }
-        if (relative == Path::new("lib/dynamorio/bin64/drrun")
-            || relative
-                .extension()
-                .is_some_and(|extension| extension == "so"))
+        if (relative == Path::new("bin/e9tool") || relative == Path::new("bin/e9patch"))
             && fs::metadata(&path)
                 .map_err(|error| error.to_string())?
                 .permissions()
@@ -300,7 +293,7 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
         }
     }
     let resolved = resolved_manifest(release, installed);
-    for required in [&resolved.drrun, &resolved.client, &resolved.detcore_runtime] {
+    for required in [&resolved.e9tool, &resolved.e9patch] {
         if !required.is_file() {
             return Err(format!(
                 "required payload file is missing: {}",
@@ -308,42 +301,18 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
             ));
         }
     }
-    if fs::metadata(&resolved.drrun)
-        .map_err(|error| error.to_string())?
-        .permissions()
-        .mode()
-        & 0o111
-        == 0
-    {
-        return Err(format!(
-            "DynamoRIO launcher is not executable: {}",
-            resolved.drrun.display()
-        ));
-    }
-    validate_descriptor(&resolved.detcore_runtime, &embedded.plugin)?;
-    Ok(())
-}
-
-fn validate_descriptor(runtime: &Path, identity: &PluginIdentity) -> Result<(), String> {
-    unsafe {
-        let library = Library::new(runtime)
-            .map_err(|error| format!("cannot load {}: {error}", runtime.display()))?;
-        let descriptor = library
-            .get::<unsafe extern "C" fn() -> *const DetcoreDescriptorV1>(
-                b"hermit_detcore_plugin_descriptor_v1\0",
-            )
-            .map_err(|error| format!("{} has no Detcore descriptor: {error}", runtime.display()))?;
-        let descriptor = descriptor();
-        if descriptor.is_null() {
-            return Err("Detcore descriptor is null".to_owned());
-        }
-        let descriptor = &*descriptor;
-        if descriptor.size as usize != std::mem::size_of::<DetcoreDescriptorV1>()
-            || descriptor.protocol != PROTOCOL_VERSION
-            || descriptor.abi_tag() != Some(DETCORE_ABI_TAG)
-            || descriptor.build_id() != Some(identity.detcore_build_id.as_str())
+    for executable in [&resolved.e9tool, &resolved.e9patch] {
+        if fs::metadata(executable)
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
         {
-            return Err("Detcore shared-object descriptor does not match the helper".to_owned());
+            return Err(format!(
+                "e9patch payload is not executable: {}",
+                executable.display()
+            ));
         }
     }
     Ok(())
@@ -351,9 +320,8 @@ fn validate_descriptor(runtime: &Path, identity: &PluginIdentity) -> Result<(), 
 
 fn resolved_manifest(release: &Path, mut manifest: PayloadManifest) -> PayloadManifest {
     manifest.release_dir = release.to_path_buf();
-    manifest.drrun = release.join(&manifest.drrun);
-    manifest.client = release.join(&manifest.client);
-    manifest.detcore_runtime = release.join(&manifest.detcore_runtime);
+    manifest.e9tool = release.join(&manifest.e9tool);
+    manifest.e9patch = release.join(&manifest.e9patch);
     manifest
 }
 
@@ -397,7 +365,12 @@ mod tests {
         let manifest: PayloadManifest = serde_json::from_str(PAYLOAD_MANIFEST).unwrap();
         assert_eq!(
             manifest.plugin,
-            PluginIdentity::current("dbt", env!("CARGO_PKG_VERSION"), detcore::DETCORE_BUILD_ID)
+            PluginIdentity::with_abi(
+                "e9patch",
+                env!("CARGO_PKG_VERSION"),
+                hermit_plugin_protocol::E9PATCH_ABI_TAG,
+                detcore::DETCORE_BUILD_ID,
+            )
         );
         assert!(!manifest.files.is_empty());
     }

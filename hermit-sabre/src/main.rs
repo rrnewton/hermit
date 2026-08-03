@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use flate2::read::GzDecoder;
-use hermit_plugin_protocol::DETCORE_ABI_TAG;
+use goblin::elf::Elf;
+use goblin::elf::program_header::PT_LOAD;
+use hermit_plugin_protocol::DETCORE_DESCRIPTOR_SYMBOL;
 use hermit_plugin_protocol::DetcoreDescriptorV1;
 use hermit_plugin_protocol::EX_CANTCREAT;
 use hermit_plugin_protocol::EX_CONFIG;
@@ -20,7 +22,7 @@ use hermit_plugin_protocol::EnsureRequest;
 use hermit_plugin_protocol::PROTOCOL_VERSION;
 use hermit_plugin_protocol::PayloadManifest;
 use hermit_plugin_protocol::PluginIdentity;
-use libloading::Library;
+use hermit_plugin_protocol::SABRE_DETCORE_ABI_TAG;
 use sha2::Digest as _;
 use sha2::Sha256;
 
@@ -54,8 +56,8 @@ impl HelperError {
         Self {
             code: EX_CANTCREAT,
             message: format!(
-                "error: cannot materialize backend 'dbt' payload under {}: {error}\n\
-                 repair: set HERMIT_DIR to a writable directory or have an administrator materialize this exact hermit-dynamorio version",
+                "error: cannot materialize backend 'sabre' payload under {}: {error}\n\
+                 repair: set HERMIT_DIR to a writable directory or have an administrator materialize this exact hermit-sabre version",
                 path.display()
             ),
         }
@@ -69,19 +71,17 @@ fn run() -> Result<(), HelperError> {
         (Some(command), None) if command == OsStr::new("ensure") => {}
         _ => {
             return Err(HelperError::config(
-                "error: hermit-dynamorio is an internal Hermit backend helper; expected `hermit-dynamorio ensure`",
+                "error: hermit-sabre is an internal Hermit backend helper; expected `hermit-sabre ensure`",
             ));
         }
     }
 
     let request: EnsureRequest = serde_json::from_reader(io::stdin()).map_err(|error| {
-        HelperError::config(format!(
-            "error: invalid hermit-dynamorio host request: {error}"
-        ))
+        HelperError::config(format!("error: invalid hermit-sabre host request: {error}"))
     })?;
     let embedded: PayloadManifest = serde_json::from_str(PAYLOAD_MANIFEST).map_err(|error| {
         HelperError::config(format!(
-            "error: hermit-dynamorio embedded manifest is invalid: {error}"
+            "error: hermit-sabre embedded manifest is invalid: {error}"
         ))
     })?;
     if let Some(field) = request.host.mismatch(&embedded.plugin) {
@@ -89,7 +89,7 @@ fn run() -> Result<(), HelperError> {
     }
 
     let root = hermit_dir()?;
-    let plugin_root = root.join("plugins/dynamorio");
+    let plugin_root = root.join("plugins/sabre");
     fs::create_dir_all(plugin_root.join("releases"))
         .map_err(|error| HelperError::create(&root, error))?;
     let _lock =
@@ -117,13 +117,13 @@ fn incompatible_message(
     plugin: &PluginIdentity,
     field: &str,
 ) -> HelperError {
-    let selected = env::current_exe().unwrap_or_else(|_| PathBuf::from("hermit-dynamorio"));
+    let selected = env::current_exe().unwrap_or_else(|_| PathBuf::from("hermit-sabre"));
     HelperError::config(format!(
-        "error: incompatible hermit-dynamorio plugin; refusing backend 'dbt' ({field} mismatch)\n\
+        "error: incompatible hermit-sabre plugin; refusing backend 'sabre' ({field} mismatch)\n\
          host:   hermit-run {}, Detcore ABI {}, build {}\n\
-         plugin: hermit-dynamorio {}, Detcore ABI {}, build {}\n\
+         plugin: hermit-sabre {}, Detcore ABI {}, build {}\n\
          selected plugin: {}\n\
-         repair with:\n  cargo install --force --locked hermit-dynamorio@={}",
+         repair with:\n  cargo install --force --locked hermit-sabre@={}",
         host.package_version,
         host.detcore_abi,
         host.detcore_build_id,
@@ -282,7 +282,7 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
         if actual != *expected {
             return Err(format!("payload hash mismatch for {}", path.display()));
         }
-        if (relative == Path::new("lib/dynamorio/bin64/drrun")
+        if (relative == Path::new("bin/sabre")
             || relative
                 .extension()
                 .is_some_and(|extension| extension == "so"))
@@ -300,7 +300,7 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
         }
     }
     let resolved = resolved_manifest(release, installed);
-    for required in [&resolved.drrun, &resolved.client, &resolved.detcore_runtime] {
+    for required in [&resolved.sabre, &resolved.detcore_runtime] {
         if !required.is_file() {
             return Err(format!(
                 "required payload file is missing: {}",
@@ -308,7 +308,7 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
             ));
         }
     }
-    if fs::metadata(&resolved.drrun)
+    if fs::metadata(&resolved.sabre)
         .map_err(|error| error.to_string())?
         .permissions()
         .mode()
@@ -316,8 +316,8 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
         == 0
     {
         return Err(format!(
-            "DynamoRIO launcher is not executable: {}",
-            resolved.drrun.display()
+            "SaBRe loader is not executable: {}",
+            resolved.sabre.display()
         ));
     }
     validate_descriptor(&resolved.detcore_runtime, &embedded.plugin)?;
@@ -325,34 +325,59 @@ fn validate_release(release: &Path, embedded: &PayloadManifest) -> Result<(), St
 }
 
 fn validate_descriptor(runtime: &Path, identity: &PluginIdentity) -> Result<(), String> {
-    unsafe {
-        let library = Library::new(runtime)
-            .map_err(|error| format!("cannot load {}: {error}", runtime.display()))?;
-        let descriptor = library
-            .get::<unsafe extern "C" fn() -> *const DetcoreDescriptorV1>(
-                b"hermit_detcore_plugin_descriptor_v1\0",
+    let bytes =
+        fs::read(runtime).map_err(|error| format!("cannot read {}: {error}", runtime.display()))?;
+    let elf = Elf::parse(&bytes)
+        .map_err(|error| format!("cannot parse {} as ELF: {error}", runtime.display()))?;
+    let symbol = elf
+        .dynsyms
+        .iter()
+        .find(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(DETCORE_DESCRIPTOR_SYMBOL))
+        .ok_or_else(|| {
+            format!(
+                "{} has no {DETCORE_DESCRIPTOR_SYMBOL} data symbol",
+                runtime.display()
             )
-            .map_err(|error| format!("{} has no Detcore descriptor: {error}", runtime.display()))?;
-        let descriptor = descriptor();
-        if descriptor.is_null() {
-            return Err("Detcore descriptor is null".to_owned());
-        }
-        let descriptor = &*descriptor;
-        if descriptor.size as usize != std::mem::size_of::<DetcoreDescriptorV1>()
-            || descriptor.protocol != PROTOCOL_VERSION
-            || descriptor.abi_tag() != Some(DETCORE_ABI_TAG)
-            || descriptor.build_id() != Some(identity.detcore_build_id.as_str())
-        {
-            return Err("Detcore shared-object descriptor does not match the helper".to_owned());
-        }
+        })?;
+    let descriptor_size = std::mem::size_of::<DetcoreDescriptorV1>();
+    if symbol.st_size as usize != descriptor_size {
+        return Err("Detcore shared-object descriptor has the wrong size".to_owned());
+    }
+    let segment = elf
+        .program_headers
+        .iter()
+        .find(|segment| {
+            segment.p_type == PT_LOAD
+                && symbol.st_value >= segment.p_vaddr
+                && symbol.st_value + symbol.st_size <= segment.p_vaddr + segment.p_filesz
+        })
+        .ok_or_else(|| "Detcore descriptor is not backed by a loadable file segment".to_owned())?;
+    let offset = (segment.p_offset + symbol.st_value - segment.p_vaddr) as usize;
+    let raw = bytes
+        .get(offset..offset + descriptor_size)
+        .ok_or_else(|| "Detcore descriptor extends past the shared object".to_owned())?;
+    let size = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+    let protocol = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+    let abi = fixed_c_string(&raw[8..24]);
+    let build_id = fixed_c_string(&raw[24..89]);
+    if size != descriptor_size
+        || protocol != PROTOCOL_VERSION
+        || abi != Some(SABRE_DETCORE_ABI_TAG)
+        || build_id != Some(identity.detcore_build_id.as_str())
+    {
+        return Err("Detcore shared-object descriptor does not match the helper".to_owned());
     }
     Ok(())
 }
 
+fn fixed_c_string(bytes: &[u8]) -> Option<&str> {
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&bytes[..end]).ok()
+}
+
 fn resolved_manifest(release: &Path, mut manifest: PayloadManifest) -> PayloadManifest {
     manifest.release_dir = release.to_path_buf();
-    manifest.drrun = release.join(&manifest.drrun);
-    manifest.client = release.join(&manifest.client);
+    manifest.sabre = release.join(&manifest.sabre);
     manifest.detcore_runtime = release.join(&manifest.detcore_runtime);
     manifest
 }
@@ -397,7 +422,12 @@ mod tests {
         let manifest: PayloadManifest = serde_json::from_str(PAYLOAD_MANIFEST).unwrap();
         assert_eq!(
             manifest.plugin,
-            PluginIdentity::current("dbt", env!("CARGO_PKG_VERSION"), detcore::DETCORE_BUILD_ID)
+            PluginIdentity::with_abi(
+                "sabre",
+                env!("CARGO_PKG_VERSION"),
+                SABRE_DETCORE_ABI_TAG,
+                detcore::DETCORE_BUILD_ID,
+            )
         );
         assert!(!manifest.files.is_empty());
     }

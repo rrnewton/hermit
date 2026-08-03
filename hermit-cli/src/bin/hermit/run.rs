@@ -1784,6 +1784,13 @@ impl RunOpts {
                  original guest path"
             );
         }
+        if !self.namespace_only
+            && matches!(backend, Backend::Sabre | Backend::E9patch)
+            && let Err(error) = hermit::ensure_optional_backend_package(backend)
+        {
+            eprintln!("{}", error.message);
+            return Ok(ExitStatus::Exited(error.code));
+        }
         if self.namespace_only {
             if let Some(explicit_backend) = self.backend {
                 anyhow::bail!(
