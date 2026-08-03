@@ -291,6 +291,6 @@ int main(void) {
   require_zero(unlink(symlink_path), "unlink symlink");
   require_zero(unlink(hardlink_path), "unlink hardlink");
   require_zero(unlink(path), "unlink file");
-  puts("syscall-file-metadata-ok count=27");
+  puts("syscall-file-metadata-ok count=20");
   return 0;
 }
