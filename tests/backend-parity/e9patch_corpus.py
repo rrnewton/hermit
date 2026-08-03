@@ -91,6 +91,1014 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "fcntl_cloexec": (0, b"stdout_fd_flags=0\nopened_fd=3\nopened_flags=0\n"),
     "proc_self_fd_count": (0, None),
     "readlink_exe": (0, None),
+    # Round-3 new-family ratchet batch (non-time, non-gated). Widens coverage
+    # beyond fd/output hygiene into content I/O, stat mode bits, memory
+    # protection, errno paths, and credential syscalls -- families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. The identity
+    # guests emit host-specific absolute values, so they assert golden==e9patch
+    # parity only (None); the rest pin exact deterministic stdout.
+    "read_devzero": (0, b"zeros=16\n"),
+    "read_devnull_eof": (0, b"eof=0\n"),
+    "fstat_devnull": (0, b"chardev=1\n"),
+    "lseek_pipe": (0, b"espipe=-29\n"),
+    "write_badfd": (0, b"ebadf=-9\n"),
+    "mprotect_roundtrip": (0, b"mprotect=ok\n"),
+    "getid_identity": (0, None),
+    "getgroups_identity": (0, None),
+    # Round-4 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into heap/brk, memory advice, file-backed mmap, anonymous-file seek
+    # positioning, ioctl error paths, filesystem access checks, signal-
+    # disposition queries, and process hierarchy -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. getppid emits a
+    # host-specific virtualized pid, so it asserts golden==e9patch parity only.
+    "brk_grow": (0, b"brk=ok\n"),
+    "madvise_dontneed": (0, b"madvise=ok\n"),
+    "file_mmap_zero": (0, b"mzero=1\n"),
+    "memfd_seek": (0, b"end=4096\n"),
+    "ioctl_enotty": (0, b"enotty=-25\n"),
+    "access_devnull": (0, b"access=0\n"),
+    "sigaction_query": (0, b"sigaction=ok\n"),
+    "getppid_check": (0, None),
+    # Round-5 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into filesystem errno paths, prctl thread-name round-trips, cwd queries,
+    # pipe data I/O, statx mode bits, scatter reads, umask round-trips, and
+    # fstat size reporting -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. getcwd emits a host-specific path, so it
+    # asserts golden==e9patch parity only.
+    "open_enoent": (0, b"enoent=-2\n"),
+    "prctl_name": (0, b"name=cg\n"),
+    "getcwd_check": (0, None),
+    "pipe_rw": (0, b"pipe=hi\n"),
+    "statx_devnull": (0, b"statx_chr=1\n"),
+    "readv_zero": (0, b"readv=16\n"),
+    "umask_set": (0, b"umask=18\n"),
+    "fstat_size_memfd": (0, b"size=5\n"),
+    # Round-6 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into *at-suffixed stat/access syscalls, the sendfile zero-copy transfer,
+    # positioned I/O (pwrite64/pread64), eventfd counters, signal-pending
+    # queries, and fchmod -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. (copy_file_range was intentionally not
+    # added: hermit returns -ENOSYS for it, so it exercises no working feature.)
+    "newfstatat_devnull": (0, b"fstatat_chr=1\n"),
+    "faccessat_devnull": (0, b"faccessat=0\n"),
+    "sendfile_memfd": (0, b"sent=5\n"),
+    "pwrite_pread_memfd": (0, b"pread=abc\n"),
+    "eventfd_rw": (0, b"eventfd=5\n"),
+    "rt_sigpending_empty": (0, b"pending=0\n"),
+    "fchmod_memfd": (0, b"chmod=ok\n"),
+    # Round-7 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into dup2 fd placement, chdir/fchdir + getcwd against the host-independent
+    # root, fsync, AF_UNIX socketpair data transfer, flock, the nonblocking
+    # empty-pipe errno path, and getpgid -- all families e9patch preprocessing
+    # must leave byte-identical to golden ptrace. getpgid emits a host-specific
+    # process-group id, so it asserts golden==e9patch parity only.
+    "dup2_high": (0, b"dup2=20\n"),
+    "chdir_root": (0, b"cwd=/\n"),
+    "fchdir_root": (0, b"cwd=/\n"),
+    "fsync_memfd": (0, b"fsync=ok\n"),
+    "socketpair_rw": (0, b"sp=hi\n"),
+    "flock_memfd": (0, b"flock=ok\n"),
+    "pipe_nonblock_eagain": (0, b"eagain=-11\n"),
+    "getpgid_check": (0, None),
+    # Round-8 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into dup fd allocation, fcntl F_DUPFD/F_GETFL, lseek SEEK_CUR composition,
+    # pread past EOF, readlinkat, getresuid, and prlimit64 -- all families
+    # e9patch preprocessing must leave byte-identical to golden ptrace. The
+    # readlinkat/getresuid/prlimit64 guests emit host-specific values (exe path,
+    # uid, and RLIMIT_NOFILE), so they assert golden==e9patch parity only.
+    "dup_lowest": (0, b"dup=4\n"),
+    "fcntl_dupfd": (0, b"dupfd=20\n"),
+    "fcntl_getfl": (0, b"getfl=0\n"),
+    "lseek_seekcur_memfd": (0, b"cur=5\n"),
+    "pread_past_eof": (0, b"eof=0\n"),
+    "readlinkat_exe": (0, None),
+    "getresuid_check": (0, None),
+    "prlimit_nofile": (0, None),
+    # Round-9 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into positioned vector I/O (preadv/pwritev), fcntl F_SETFL and
+    # F_DUPFD_CLOEXEC, mremap growth, socketpair sendmsg/recvmsg, and the
+    # getsid/getpgrp process-group queries -- all families e9patch preprocessing
+    # must leave byte-identical to golden ptrace. getsid/getpgrp emit
+    # host-specific ids, so they assert golden==e9patch parity only.
+    "preadv_memfd": (0, b"preadv=cdef\n"),
+    "pwritev_memfd": (0, b"pwritev=hiyo\n"),
+    "fcntl_setfl_nonblock": (0, b"nonblock=1\n"),
+    "fcntl_dupfd_cloexec": (0, b"cloexec=1\n"),
+    "mremap_grow": (0, b"mremap=ok\n"),
+    "sendmsg_socketpair": (0, b"msg=hi\n"),
+    "getsid_check": (0, None),
+    "getpgrp_check": (0, None),
+    # Round-10 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into socketpair sendto/recvfrom, getsockname/getpeername address copyout,
+    # fallocate size-extension on a memfd, fdatasync, mincore residency query,
+    # fadvise64 hints, and sysinfo -- all families e9patch preprocessing must
+    # leave byte-identical to golden ptrace. getsockname/getpeername report the
+    # AF_UNIX family constant (1); fdatasync/mincore/fadvise/sysinfo print the
+    # syscall return (0 on success), so every value is host-independent.
+    "sendto_socketpair": (0, b"sf=hi\n"),
+    "getsockname_unix": (0, b"sockname=1\n"),
+    "getpeername_unix": (0, b"peername=1\n"),
+    "fallocate_memfd": (0, b"falloc=8\n"),
+    "fdatasync_memfd": (0, b"fdatasync=0\n"),
+    "mincore_resident": (0, b"mincore=0\n"),
+    "fadvise_memfd": (0, b"fadvise=0\n"),
+    "sysinfo_ok": (0, b"sysinfo=0\n"),
+    # Round-11 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into signal-mask/altstack queries (no delivery, no scheduling), epoll fd
+    # registration (no wait), memfd fcntl sealing, uname, prctl PR_GET_DUMPABLE,
+    # capget, and fstatfs -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. Every printed value is host-independent:
+    # constants (uname sysname "Linux", SS_DISABLE=2, F_SEAL_SEAL=1,
+    # PR_GET_DUMPABLE=1) or the syscall return (0 on success). splice was
+    # evaluated and DROPPED: hermit returns -ENOSYS (golden itself prints
+    # "splice=-38"), so it would encode a hermit limitation, not a parity claim
+    # (no false-parity), exactly like round-6's copy_file_range.
+    "rt_sigprocmask_query": (0, b"sigprocmask=0\n"),
+    "sigaltstack_query": (0, b"altstack=2\n"),
+    "epoll_ctl_add": (0, b"epoll=0\n"),
+    "memfd_seal": (0, b"seals=1\n"),
+    "uname_sysname": (0, b"uname=Linux\n"),
+    "prctl_dumpable": (0, b"dumpable=1\n"),
+    "capget_ok": (0, b"capget=0\n"),
+    "fstatfs_memfd": (0, b"fstatfs=0\n"),
+    # Round-12 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into path-based stat/lstat on /dev/null, openat(AT_FDCWD) read-to-EOF,
+    # memory locking (mlock/mlock2/munlock), msync(MS_SYNC) on an anonymous
+    # mapping, inotify watch registration (no event wait), and readahead over a
+    # memfd -- all families e9patch preprocessing must leave byte-identical to
+    # golden ptrace. Every printed value is host-independent: constants (S_IFCHR
+    # file-type test => 1, first inotify wd => 1) or the syscall return (0 on
+    # success). All eight ran clean under golden ptrace (no -ENOSYS drop).
+    "stat_devnull": (0, b"stat_chr=1\n"),
+    "lstat_devnull": (0, b"lstat_chr=1\n"),
+    "openat_devnull": (0, b"openat=0\n"),
+    "mlock_page": (0, b"mlock=0\n"),
+    "mlock2_page": (0, b"mlock2=0\n"),
+    "msync_anon": (0, b"msync=0\n"),
+    "inotify_watch_root": (0, b"inotify=1\n"),
+    "readahead_memfd": (0, b"readahead=0\n"),
+    # Round-13 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into path-based statfs on "/", the legacy pipe(2) syscall, directory
+    # enumeration (getdents64, reduced to a non-empty boolean since contents are
+    # host-specific), signalfd registration (no signal delivered or read),
+    # close_range fd teardown, socket-option get/set on a socketpair
+    # (getsockopt SO_TYPE, setsockopt SO_REUSEADDR), and fcntl F_GETLK record-lock
+    # querying on a memfd -- all families e9patch preprocessing must leave
+    # byte-identical to golden ptrace. Every printed value is host-independent:
+    # constants (SOCK_STREAM=1, F_UNLCK=2, lowest pipe fd=3, non-empty getdents
+    # boolean, valid-fd boolean) or the syscall return (0 on success). All eight
+    # ran clean under golden ptrace (no -ENOSYS drop).
+    "statfs_root": (0, b"statfs=0\n"),
+    "pipe_legacy": (0, b"pipe=3\n"),
+    "getdents_root": (0, b"getdents=1\n"),
+    "signalfd_create": (0, b"signalfd=1\n"),
+    "close_range_high": (0, b"close_range=0\n"),
+    "getsockopt_socktype": (0, b"socktype=1\n"),
+    "setsockopt_reuseaddr": (0, b"setsockopt=0\n"),
+    "fcntl_getlk": (0, b"getlk=2\n"),
+    # Round-14 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into a lone AF_UNIX SOCK_DGRAM socket (distinct from socketpair), socket
+    # half-close (shutdown), robust-futex-list registration/query
+    # (set_robust_list/get_robust_list, registration only -- no futex contended),
+    # MADV_WILLNEED advice (distinct from MADV_DONTNEED), shared anonymous mmap
+    # (MAP_SHARED flag path, distinct from MAP_PRIVATE), prctl PR_GET_KEEPCAPS
+    # (distinct op), and arch_prctl ARCH_GET_FS -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace. Every printed
+    # value is host-independent: the lowest free fd (3), the PR_GET_KEEPCAPS
+    # default (0), or the syscall return (0 on success); the FS base and robust
+    # head pointer are read but not printed. All eight ran clean under golden
+    # ptrace (no -ENOSYS drop).
+    "socket_dgram": (0, b"socket=3\n"),
+    "shutdown_socketpair": (0, b"shutdown=0\n"),
+    "set_robust_list_ok": (0, b"robust=0\n"),
+    "get_robust_list_ok": (0, b"getrobust=0\n"),
+    "madvise_willneed": (0, b"willneed=0\n"),
+    "mmap_shared_anon": (0, b"shmap=0\n"),
+    "prctl_keepcaps": (0, b"keepcaps=0\n"),
+    "arch_prctl_getfs": (0, b"getfs=0\n"),
+    # Round-15 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into filesystem/memory flush (syncfs on a memfd), memory-ordering
+    # (membarrier CMD_GLOBAL), the getcpu query, the LEGACY getdents(78)
+    # (distinct syscall number from round-13's getdents64), the execution-domain
+    # persona query (personality), an advisory write-lock set/release (fcntl
+    # F_SETLK, distinct from round-13's F_GETLK query), and inotify watch removal
+    # (inotify_rm_watch, distinct from round-12's add-only guest) -- all families
+    # e9patch preprocessing must leave byte-identical to golden ptrace. Every
+    # printed value is host-independent: the syscall return (0 on success) or a
+    # boolean (getdents entries present -> 1, personality query succeeded -> 1).
+    # The cpu/node and persona value are read/used but never printed.
+    # process_vm_readv(self) was DROPPED: it returns -1 under golden hermit
+    # ptrace (the tracer/self read is not supported), so it would encode a hermit
+    # limitation, not parity (no false parity, #152); the batch kept 7 of 8.
+    "syncfs_memfd": (0, b"syncfs=0\n"),
+    "membarrier_global": (0, b"membarrier=0\n"),
+    "getcpu_check": (0, b"getcpu=0\n"),
+    "getdents_legacy": (0, b"getdents=1\n"),
+    "personality_query": (0, b"persona=1\n"),
+    "fcntl_setlk_memfd": (0, b"setlk=0\n"),
+    "inotify_rm_watch": (0, b"inotify_rm=0\n"),
+    # Round-16 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into randomness (getrandom -- prints the byte count filled, not the random
+    # bytes), the gettid thread-id query, the LEGACY getrlimit(97) (distinct from
+    # round-8's prlimit64), clear-child-tid registration (set_tid_address), two
+    # scheduler QUERIES that read but never change scheduling (sched_get_priority_max
+    # SCHED_OTHER and sched_getscheduler, both fixed constant 0 for the default
+    # policy), and the no-argument sync (distinct from round-15's fd-scoped
+    # syncfs) -- all families e9patch preprocessing must leave byte-identical to
+    # golden ptrace. Every printed value is host-independent: the syscall return
+    # on success (0), a boolean (gettid/set_tid_address returned a positive
+    # tid -> 1), a fixed byte count (getrandom fills 16), or a fixed scheduler
+    # constant (SCHED_OTHER = 0). The random bytes, tid values, and rlimit fields
+    # are read/used but never printed. The scheduler guests only QUERY policy/
+    # range; they do not alter scheduling, so they are routine backend-parity
+    # coverage, not a DetCore scheduling change. prctl PR_GET_CHILD_SUBREAPER was
+    # DROPPED: it returns -ENOSYS (-38) under golden hermit ptrace, so it would
+    # encode a hermit limitation, not parity (no false parity, #152); the batch
+    # kept 7 of 8.
+    "getrandom_bytes": (0, b"getrandom=16\n"),
+    "gettid_check": (0, b"gettid=1\n"),
+    "getrlimit_nofile": (0, b"getrlimit=0\n"),
+    "set_tid_address_ok": (0, b"settid=1\n"),
+    "sched_priority_max": (0, b"priomax=0\n"),
+    "sched_getscheduler_check": (0, b"sched=0\n"),
+    "sync_all": (0, b"sync=0\n"),
+    # Round-17 new-family ratchet batch (non-time, non-gated). Extends coverage
+    # into fd-flag/ownership fcntl ops (F_SETFD+F_GETFD FD_CLOEXEC round-trip
+    # -> boolean, F_GETOWN on a pipe -> 0 no owner, F_GETPIPE_SZ -> boolean
+    # size>0), two working ioctls beyond round-4's TCGETS/ENOTTY (FIONREAD on a
+    # pipe holding 3 bytes -> 3, FIONBIO set-nonblocking -> 0), the semaphore
+    # eventfd flag path (EFD_SEMAPHORE read returns 1, distinct from round-6's
+    # plain eventfd), the AF_UNIX/SOCK_DGRAM socketpair round-trip (distinct
+    # from round-7's SOCK_STREAM pair), and an abstract-namespace bind (leading
+    # NUL, no filesystem entry) -> 0. Every printed value is host-independent:
+    # the syscall return on success (0), a boolean (cloexec bit / pipe size>0),
+    # a fixed readable-byte count (3), a fixed semaphore decrement (1), or fixed
+    # round-tripped text ("hi"). The exact pipe capacity, owner pid, and fd
+    # numbers are read/used but never printed. All are ordinary fd/socket/ioctl
+    # families e9patch preprocessing must leave byte-identical to golden ptrace;
+    # none changes scheduling, time, or randomness.
+    "fcntl_setfd_cloexec": (0, b"setfd=1\n"),
+    "fcntl_getown_pipe": (0, b"getown=0\n"),
+    "ioctl_fionread_pipe": (0, b"fionread=3\n"),
+    "ioctl_fionbio_pipe": (0, b"fionbio=0\n"),
+    "eventfd_semaphore": (0, b"efdsem=1\n"),
+    "socketpair_dgram": (0, b"sp=hi\n"),
+    "bind_abstract": (0, b"bind=0\n"),
+    "fcntl_getpipe_sz": (0, b"pipesz=1\n"),
+    # Round-18 new-family ratchet batch (non-time, non-gated). This round targets
+    # syscalls with NO existing guest at all (the corpus already covers umask,
+    # access, chdir, msync, fstat, statx, prctl-name, and uname, so those were
+    # deliberately not duplicated). New syscalls: sched_getparam(143) and
+    # sched_get_priority_min(147) -- two pure scheduler QUERIES that read but
+    # never change scheduling (return 0 / SCHED_OTHER constants), a dedicated
+    # ftruncate(77) memfd resize (return 0; previously only a helper),
+    # sync_file_range(277) on a memfd (return 0), the AF_UNIX/SOCK_SEQPACKET
+    # socketpair (distinct from the SOCK_STREAM and SOCK_DGRAM pairs),
+    # pidfd_open(434) on self (boolean valid-fd, the fd number not printed), and
+    # sendmmsg(307) of one datagram on a socketpair (message count 1). Every
+    # printed value is host-independent: the syscall return on success (0), a
+    # fixed scheduler constant (0), a boolean, a fixed message count (1), or
+    # fixed round-tripped text ("hi"). None changes scheduling, time, or
+    # randomness, so all are routine backend-parity coverage that e9patch
+    # preprocessing must leave byte-identical to golden ptrace. An eighth
+    # candidate, prctl PR_SET_NO_NEW_PRIVS/PR_GET_NO_NEW_PRIVS, was DROPPED: the
+    # PR_SET_NO_NEW_PRIVS operation returns -ENOSYS (-38) under golden hermit
+    # ptrace, so keeping it would encode a hermit limitation, not parity (no
+    # false parity, #152); the batch kept seven of eight.
+    "sched_getparam_check": (0, b"getparam=0\n"),
+    "sched_get_priority_min_check": (0, b"priomin=0\n"),
+    "ftruncate_memfd": (0, b"ftruncate=0\n"),
+    "sync_file_range_memfd": (0, b"syncrange=0\n"),
+    "socketpair_seqpacket": (0, b"sp=hi\n"),
+    "pidfd_open_self": (0, b"pidfd=1\n"),
+    "sendmmsg_socketpair": (0, b"sendmmsg=1\n"),
+    # Round-19 new-family ratchet batch (non-time, non-gated). More syscalls with
+    # no existing guest: listen(50) on a bound abstract AF_UNIX socket (return 0,
+    # complements bind_abstract), recvmsg(47) and recvfrom(45) round-trips on a
+    # socketpair (distinct receive-side counterparts to the sendmsg/sendto
+    # guests), arch_prctl ARCH_GET_GS (return 0 only; the GS base is host-specific
+    # and never printed, distinct from the ARCH_GET_FS guest), prctl
+    # PR_GET_PDEATHSIG (return 0; no parent-death signal set), kill(62) and
+    # tgkill(234) with signal 0 (existence/permission checks that deliver no
+    # signal, return 0), and flistxattr(196) on a memfd (0-length attribute list).
+    # Every printed value is host-independent: the syscall return on success (0)
+    # or fixed round-tripped text ("hi"). The signal-0 guests deliver nothing, so
+    # they do not exercise signal handling or scheduling; none of the batch
+    # changes scheduling, time, or randomness, so all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace.
+    "listen_abstract": (0, b"listen=0\n"),
+    "recvmsg_socketpair": (0, b"recvmsg=hi\n"),
+    "recvfrom_socketpair": (0, b"recvfrom=hi\n"),
+    "arch_prctl_getgs": (0, b"getgs=0\n"),
+    "prctl_pdeathsig": (0, b"pdeathsig=0\n"),
+    "kill_self_sig0": (0, b"kill=0\n"),
+    "tgkill_self_sig0": (0, b"tgkill=0\n"),
+    "flistxattr_memfd": (0, b"flistxattr=0\n"),
+    # Round-20 new-family ratchet batch (non-time, non-gated). Yet more syscalls
+    # with no existing guest: fchown(93) as the fchown(fd,-1,-1) no-op that
+    # changes neither owner nor group (return 0); munlockall(152), which always
+    # succeeds even with nothing locked (return 0); setrlimit(160) writing the
+    # current RLIMIT_NOFILE back unchanged (a no-op, return 0; the host-specific
+    # limit values are read but never printed); and four pure scheduler/process
+    # QUERIES that read but never change scheduling -- sched_getaffinity(204)
+    # (boolean success only; the returned byte count is host CPU-count dependent
+    # and never printed), sched_rr_get_interval(148) (return 0; interval not
+    # printed), sched_getattr(275) (return 0; attributes not printed), and
+    # setpgid(0,0) (109) which sets the process group to the pid, a process-group
+    # change and not a thread-scheduling change (return 0). poll(7) with no fds
+    # and a zero timeout returns immediately with 0 and never blocks. Every
+    # printed value is host-independent: the syscall return on success (0) or a
+    # boolean. None changes scheduling, time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace. An eighth candidate, sched_getattr(275), was DROPPED: it
+    # returns -ENOSYS (-38) under golden hermit ptrace, so keeping it would be a
+    # false-parity claim (#152) -- the batch kept seven of eight.
+    "fchown_memfd": (0, b"fchown=0\n"),
+    "munlockall_ok": (0, b"munlockall=0\n"),
+    "setrlimit_nofile": (0, b"setrlimit=0\n"),
+    "sched_getaffinity_check": (0, b"affinity=1\n"),
+    "sched_rr_get_interval_check": (0, b"rrinterval=0\n"),
+    "setpgid_self": (0, b"setpgid=0\n"),
+    "poll_timeout_zero": (0, b"poll=0\n"),
+    # Round-21 new-family ratchet batch (non-time, non-gated). Yet more syscalls
+    # with no existing guest: munlock(11) after an mlock, unlocking one page
+    # (return 0); connect(42) of a second AF_UNIX stream socket to a listening
+    # abstract-namespace address (return 0, exercising the connect path that
+    # complements bind_abstract/listen_abstract); recvmmsg(299) reading back one
+    # datagram previously sent with sendmmsg over a socketpair (round-trips "hi",
+    # the receive-side counterpart to sendmmsg_socketpair); preadv2(327) and
+    # pwritev2(328) positional scatter/gather I/O on a memfd (round-trip "hi",
+    # the flagged v2 counterparts to preadv/pwritev); prctl PR_CAP_AMBIENT(47)
+    # PR_CAP_AMBIENT_IS_SET query for CAP_CHOWN (boolean 0, not in the ambient
+    # set); and pidfd_getfd(438) duplicating one of the process's own descriptors
+    # through a self pidfd (boolean valid-fd; the fd number is host-specific and
+    # not printed). Every printed value is host-independent: the syscall return on
+    # success (0), a boolean, or fixed round-tripped text ("hi"). None changes
+    # scheduling, time, or randomness, so all are routine backend-parity coverage
+    # that e9patch preprocessing must leave byte-identical to golden ptrace.
+    "munlock_page": (0, b"munlock=0\n"),
+    "connect_abstract": (0, b"connect=0\n"),
+    "recvmmsg_socketpair": (0, b"recvmmsg=hi\n"),
+    "preadv2_memfd": (0, b"preadv2=hi\n"),
+    "pwritev2_memfd": (0, b"pwritev2=hi\n"),
+    "prctl_cap_ambient": (0, b"capambient=0\n"),
+    "pidfd_getfd_self": (0, b"pidfdgetfd=1\n"),
+    # Round-22 new-family ratchet batch (non-time, non-gated). More syscalls with
+    # no existing guest: the four credential-changing syscalls in their no-op
+    # forms -- setresuid(117) and setresgid(119) with (-1,-1,-1), and setreuid(113)
+    # and setregid(114) with (-1,-1) -- which leave every real/effective/saved id
+    # unchanged and return 0 (distinct kernel entry points, an identity change
+    # rather than scheduling); accept4(288) accepting a pending connection on a
+    # listening abstract AF_UNIX socket with SOCK_NONBLOCK (boolean valid-fd; the
+    # accepted fd number is host-specific and not printed); and ioprio_get(252)
+    # querying this process's I/O priority (boolean success only, since the
+    # class/level value is host-configuration dependent and not printed). Every
+    # printed value is host-independent: the syscall return on success (0) or a
+    # boolean. None changes CPU scheduling, time, or randomness, so all are
+    # routine backend-parity coverage that e9patch preprocessing must leave
+    # byte-identical to golden ptrace.
+    "setresuid_noop": (0, b"setresuid=0\n"),
+    "setresgid_noop": (0, b"setresgid=0\n"),
+    "setreuid_noop": (0, b"setreuid=0\n"),
+    "setregid_noop": (0, b"setregid=0\n"),
+    "accept4_abstract": (0, b"accept4=1\n"),
+    "ioprio_get_check": (0, b"ioprio=1\n"),
+    # Round-23 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: scheduling *priority* (not CPU scheduling) via
+    # setpriority(141) as a PRIO_PROCESS no-op returning 0 and getpriority(140)
+    # reporting only a boolean (the 20-nice value is host-configuration
+    # dependent and not printed); NUMA
+    # memory policy via get_mempolicy(239) and set_mempolicy(238) in their
+    # default forms returning 0; the x86 local descriptor table via
+    # modify_ldt(154) func=0 read, which yields 0 bytes for a process with no
+    # custom LDT entries; and rt_sigqueueinfo(129) queuing signal 0 to self,
+    # which performs only the permission check (no delivery) and returns 0.
+    # Every printed value is host-independent: the syscall return on success (0)
+    # or a boolean. None of these change CPU scheduling, virtual time, or
+    # randomness -- setpriority/getpriority adjust nice-level accounting, not the
+    # deterministic thread schedule -- so all are routine backend-parity coverage
+    # that e9patch preprocessing must leave byte-identical to golden ptrace.
+    # (io_setup(206)/io_destroy(207) were probed and DROPPED per no-false-parity
+    # #152: io_setup returns -ENOSYS under hermit, so the AIO family has no guest.)
+    "setpriority_self": (0, b"setpriority=0\n"),
+    "getpriority_self": (0, b"getpriority=1\n"),
+    "get_mempolicy_default": (0, b"getmempolicy=0\n"),
+    "set_mempolicy_default": (0, b"setmempolicy=0\n"),
+    "modify_ldt_read": (0, b"modifyldt=0\n"),
+    "rt_sigqueueinfo_self": (0, b"sigqueueinfo=0\n"),
+    # Round-24 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: whole-address-space memory locking via mlockall(151)
+    # MCL_CURRENT (paired with munlockall) returning 0; faccessat2(439) checking
+    # read access to /dev/null returning 0; and pidfd-based signalling via
+    # pidfd_send_signal(424) delivering signal 0 through a self pidfd (permission
+    # check only, no delivery) returning 0. Every printed value is
+    # host-independent: the syscall return on success (0) or a boolean. None
+    # changes CPU scheduling, virtual time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    # (openat2(437) and the three System V IPC creation syscalls shmget(29),
+    # semget(64), msgget(68) were probed and DROPPED per no-false-parity #152:
+    # each returns failure under hermit -- openat2 is not supported, and there is
+    # no usable System V IPC namespace -- so those families have no guest.)
+    "mlockall_all": (0, b"mlockall=0\n"),
+    "faccessat2_devnull": (0, b"faccessat2=0\n"),
+    "pidfd_send_signal_self": (0, b"pidfdsignal=0\n"),
+    # Round-25 new-family ratchet batch (non-time, non-gated). Families with no
+    # existing guest: capability writeback via capset(126), reading this thread's
+    # capability sets with capget and writing the identical sets back (a no-op
+    # returning 0; distinct from the existing capget read guest); and non-blocking
+    # readiness polling via epoll_wait(232) with timeout 0 on an empty epoll
+    # interest set, which returns 0 ready events. Every printed value is
+    # host-independent: the syscall return on success (0) or a boolean. None
+    # changes CPU scheduling, virtual time, or randomness, so all are routine
+    # backend-parity coverage that e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    # (keyctl(250) KEYCTL_GET_KEYRING_ID was probed and DROPPED per no-false-parity
+    # #152: it returns failure under hermit, so the kernel-keyring family has no
+    # guest.)
+    "capset_noop": (0, b"capset=0\n"),
+    "epoll_wait_timeout_zero": (0, b"epollwait=0\n"),
+    # Round-26 new-family ratchet batch (non-time, non-gated). Thread-directed
+    # signalling syscalls with no existing guest: tkill(200) sending signal 0 to
+    # this thread and rt_tgsigqueueinfo(297) queuing signal 0 to this thread with
+    # an SI_QUEUE siginfo, both performing only the permission check (no delivery)
+    # and returning 0. Every printed value is host-independent: the syscall return
+    # on success (0). Neither changes CPU scheduling, virtual time, or randomness,
+    # so both are routine backend-parity coverage that e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    # (Two prctl query options were probed and DROPPED per no-false-parity #152:
+    # PR_GET_SECUREBITS(27) and PR_MCE_KILL_GET(34) both return -ENOSYS under
+    # hermit. userfaultfd(323) was dropped before shipping: it fails even natively
+    # here -- unprivileged userfaultfd is disabled -- so it is an error path, not
+    # a supported-success guest.)
+    "tkill_self_sig0": (0, b"tkill=0\n"),
+    "rt_tgsigqueueinfo_self": (0, b"tgsigqueueinfo=0\n"),
+    # Round-27 new-family ratchet batch (non-time, non-gated). Non-blocking
+    # readiness / connection / usage syscalls with no existing guest: the legacy
+    # accept(43) accepting a pending abstract AF_UNIX connection (distinct from
+    # round-22's accept4); the select(23), pselect6(270), and ppoll(271) readiness
+    # multiplexers each called with no descriptors and a zero timeout so they
+    # return 0 immediately without blocking or registering a timed waiter (the
+    # non-blocking-poll family already established by poll_timeout_zero); the
+    # epoll_pwait(281) sigmask-carrying variant of epoll_wait, timeout 0 on an
+    # empty interest set returning 0; and getrusage(98) filling a rusage struct
+    # for RUSAGE_SELF, printing only the syscall return (0) since the usage fields
+    # are host-specific. Every printed value is host-independent: the syscall
+    # return on success (0) or a boolean valid-fd. A zero-timeout readiness poll
+    # returns immediately and registers no timed waiter, so none changes CPU
+    # scheduling, virtual time, or randomness; all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace.
+    "accept_abstract": (0, b"accept=1\n"),
+    "select_timeout_zero": (0, b"select=0\n"),
+    "pselect6_timeout_zero": (0, b"pselect=0\n"),
+    "ppoll_timeout_zero": (0, b"ppoll=0\n"),
+    "epoll_pwait_timeout_zero": (0, b"epollpwait=0\n"),
+    "getrusage_self": (0, b"getrusage=0\n"),
+    # Round-28 new-family ratchet batch (non-time, non-gated). Legacy/variant
+    # syscall numbers with no existing guest, each distinct from a covered
+    # newer counterpart: the LEGACY size-hint epoll_create(213) (vs
+    # epoll_create1(291)), the LEGACY single-argument eventfd(284) (vs
+    # eventfd2(290)) round-tripping a counter of 5, the LEGACY no-argument
+    # inotify_init(253) (vs inotify_init1(294)), and the LEGACY 3-argument
+    # signalfd(282) over an empty mask (vs signalfd4(289); no signal delivered).
+    # Also mbind(237) setting an anonymous page to MPOL_DEFAULT (the
+    # range-scoped NUMA-policy call complementing get_mempolicy/set_mempolicy),
+    # ioprio_set(251) setting this process's best-effort I/O priority (an
+    # I/O-priority accounting change, not a CPU-schedule change, complementing
+    # ioprio_get(252)), and the timespec-based epoll_pwait2(441) with a zero
+    # timeout on an empty interest set (returns 0 immediately, no timed waiter;
+    # distinct from the millisecond epoll_pwait(281)). Every printed value is
+    # host-independent: a boolean valid-fd (1), a fixed round-tripped counter
+    # (5), or the syscall return on success (0). The fd creators register no
+    # events; none of the batch changes CPU scheduling, virtual time, or
+    # randomness, so all are routine backend-parity coverage e9patch
+    # preprocessing must leave byte-identical to golden ptrace. Zero drops: all
+    # seven ran clean under golden hermit ptrace on the first attempt.
+    "epoll_create_legacy": (0, b"epollcreate=1\n"),
+    "eventfd_legacy": (0, b"eventfdlegacy=5\n"),
+    "inotify_init_legacy": (0, b"inotifyinit=1\n"),
+    "signalfd_legacy": (0, b"signalfdlegacy=1\n"),
+    "mbind_default": (0, b"mbind=0\n"),
+    "ioprio_set_self": (0, b"ioprioset=0\n"),
+    "epoll_pwait2_timeout_zero": (0, b"epollpwait2=0\n"),
+    # Round-29 new-family ratchet batch (non-time, non-gated). Syscalls and
+    # prctl/credential operations with no existing guest: sched_yield(24), which
+    # with a single runnable guest thread is a no-op that returns immediately and
+    # changes no scheduling decision (a voluntary-yield hint, not a DetCore
+    # scheduling change); three new prctl QUERY operations distinct from every
+    # existing prctl guest -- PR_CAPBSET_READ(23) for CAP_CHOWN, PR_GET_THP_DISABLE
+    # (42), each reduced to a boolean "query succeeded" (return >= 0) because the
+    # raw bit/flag is host/config dependent; and the setfsuid(122)/setfsgid(123)
+    # credential queries in their setfs*(-1) no-op forms, which change nothing and
+    # return the previous fs id, reduced to a boolean "call succeeded" since the
+    # previous id is host-dependent. Every printed value is host-independent: the
+    # syscall return on success (yield=0) or a boolean. None changes CPU
+    # scheduling, virtual time, or randomness, so all are routine backend-parity
+    # coverage that e9patch preprocessing must leave byte-identical to golden
+    # ptrace. Two candidates were probed and DROPPED per no-false-parity #152:
+    # prctl PR_GET_NO_NEW_PRIVS(39) and rseq(334) both return -ENOSYS (-38) under
+    # golden hermit ptrace, so keeping them would encode a hermit limitation
+    # rather than parity; the batch kept five of seven.
+    "sched_yield_noop": (0, b"yield=0\n"),
+    "prctl_capbset_read": (0, b"capbset=1\n"),
+    "prctl_thp_disable": (0, b"thpdisable=1\n"),
+    "setfsuid_noop": (0, b"setfsuid=1\n"),
+    "setfsgid_noop": (0, b"setfsgid=1\n"),
+    # round-30: process-config query, process-time accounting, and xattr error
+    # paths. prctl_timerslack queries the timer slack (a config value inert
+    # under hermit's virtual time), reduced to a boolean since the raw value is
+    # host-dependent. times_check reads process CPU-tick accounting whose return
+    # is host/timing dependent, so it is a PARITY-ONLY guest (None): golden and
+    # e9patch must agree byte-for-byte under one deterministic run, but the value
+    # is not asserted. The get/lget/fgetxattr guests read a nonexistent user
+    # xattr from /dev/null, which always fails negative (-ENODATA where user
+    # xattrs are supported, -EOPNOTSUPP otherwise); each prints the boolean
+    # "returned an error", a faithful Linux semantic that is host/filesystem
+    # independent. None changes CPU scheduling, virtual time, or randomness, so
+    # all are routine backend-parity coverage e9patch must leave byte-identical
+    # to golden ptrace. Three candidates were probed and DROPPED per
+    # no-false-parity #152: prctl PR_GET_FP_MODE(46) returns -ENOSYS (-38) under
+    # golden hermit ptrace, and name_to_handle_at(303) and seccomp(317) both
+    # return -EOPNOTSUPP (-95); keeping any would encode a hermit limitation
+    # rather than parity, so the batch kept five of eight.
+    "prctl_timerslack": (0, b"timerslack=1\n"),
+    "times_check": (0, None),
+    "getxattr_devnull": (0, b"getxattr=1\n"),
+    "lgetxattr_devnull": (0, b"lgetxattr=1\n"),
+    "fgetxattr_devnull": (0, b"fgetxattr=1\n"),
+    # round-31: xattr write-side error paths, inert fd/query probes, and a
+    # non-blocking signal poll. The remove/lremove/fremovexattr guests remove a
+    # nonexistent user xattr from /dev/null, which always fails negative
+    # (-ENODATA or -EOPNOTSUPP by filesystem); each prints the boolean "returned
+    # an error", the write-side counterpart to round-30's get/lget/fgetxattr.
+    # timerfd_create_check creates but never arms a monotonic timer fd (no
+    # settime, no expiration, no timed waiter), printing a boolean valid-fd.
+    # clock_getres_monotonic reads the fixed CLOCK_MONOTONIC resolution (a kernel
+    # constant, not the current time), returning 0. rt_sigtimedwait_empty polls
+    # an empty signal set with a {0,0} timeout, returning -EAGAIN immediately
+    # without blocking or registering a timed waiter (same class as the
+    # zero-timeout poll/select guests). Every printed value is host-independent;
+    # none changes CPU scheduling, virtual time, or randomness. One candidate was
+    # DROPPED per no-false-parity #152: kcmp(312) returns -1 under golden hermit
+    # ptrace (native returns 0) because pid virtualization breaks the kernel's
+    # pid-based comparison, so it would encode a hermit limitation; the batch
+    # kept six of seven.
+    "removexattr_devnull": (0, b"removexattr=1\n"),
+    "lremovexattr_devnull": (0, b"lremovexattr=1\n"),
+    "fremovexattr_devnull": (0, b"fremovexattr=1\n"),
+    "timerfd_create_check": (0, b"timerfd=1\n"),
+    "clock_getres_monotonic": (0, b"clockres=0\n"),
+    "rt_sigtimedwait_empty": (0, b"sigtimedwait=-11\n"),
+    # round-32: inert fd/timer/sleep probes. memfd_create_check allocates an
+    # anonymous memfd and prints a boolean valid-fd (the fd number itself is
+    # host-dependent). getitimer_real reads the unarmed ITIMER_REAL interval
+    # timer, returning 0. clock_nanosleep_relative sleeps a fixed 1ms relative
+    # interval on CLOCK_MONOTONIC, which hermit virtualizes deterministically,
+    # returning 0. Every printed value is host-independent; none changes CPU
+    # scheduling, virtual time, or randomness. Five candidates were DROPPED per
+    # no-false-parity #152: splice(275), tee(276), vmsplice(278), and
+    # copy_file_range(326) each return -ENOSYS under golden hermit ptrace though
+    # native Linux moves the bytes, and process_vm_readv(310) returns -EPERM on
+    # a self target under hermit's ptrace supervision though native succeeds;
+    # keeping any of them would encode a hermit limitation as expected Linux
+    # behavior. The batch kept three of eight.
+    "memfd_create_check": (0, b"memfd=1\n"),
+    "getitimer_real": (0, b"getitimer=0\n"),
+    "clock_nanosleep_relative": (0, b"clocknanosleep=0\n"),
+    # round-33: inert futex/time/scheduler query probes. futex_wake_empty issues
+    # futex(FUTEX_WAKE) on a private word with no waiters, deterministically
+    # waking zero threads (return 0) in a single-threaded guest. gettimeofday_check
+    # calls gettimeofday(96) — a distinct syscall from clock_gettime(228) — and
+    # prints only the return (0); the virtualized timeval is not emitted.
+    # sched_getattr_self reads its own sched_attr via the unified query (315),
+    # returning 0. sched_setaffinity_self round-trips the calling thread's CPU
+    # affinity (getaffinity then setaffinity the identical mask), a no-op that
+    # returns 0; the host-dependent mask is never printed. Every printed value is
+    # host-independent and none perturbs scheduling, virtual time, or randomness.
+    "futex_wake_empty": (0, b"futexwake=0\n"),
+    "gettimeofday_check": (0, b"gettimeofday=0\n"),
+    "sched_getattr_self": (0, b"schedgetattr=0\n"),
+    "sched_setaffinity_self": (0, b"setaffinity=0\n"),
+    # round-34: more inert query/no-op probes on uncovered boundaries.
+    # timer_create_gettime creates a POSIX per-process timer (222) and queries it
+    # unarmed via timer_gettime (224), returning 0 with a zeroed itimerspec that is
+    # not printed. timerfd_gettime_unarmed creates a timerfd and reads it unarmed
+    # via timerfd_gettime (287) — return 0, zeroed spec not printed — distinct from
+    # timerfd_create_check (creation only). futex_wait_mismatch issues
+    # futex(FUTEX_WAIT) with an expected value that does not match the word, so the
+    # kernel returns -EAGAIN (-11) immediately WITHOUT blocking or registering a
+    # timed waiter. wait4_nochild calls wait4(-1,...,WNOHANG) with no children,
+    # returning -ECHILD (-10) immediately. membarrier_query issues
+    # membarrier(CMD_QUERY) and prints only success as a boolean (1); the supported-
+    # command bitmask is host-dependent and not emitted. getrusage_thread reads
+    # RUSAGE_THREAD (a distinct who from getrusage_self's RUSAGE_SELF), returning 0
+    # with the timing-dependent rusage fields never printed. Every printed value is
+    # host-independent and none blocks, perturbs scheduling, or touches randomness.
+    "timer_create_gettime": (0, b"timergettime=0\n"),
+    "timerfd_gettime_unarmed": (0, b"timerfdgettime=0\n"),
+    "futex_wait_mismatch": (0, b"futexwait=-11\n"),
+    "wait4_nochild": (0, b"wait4=-10\n"),
+    "membarrier_query": (0, b"membarrierquery=1\n"),
+    "getrusage_thread": (0, b"getrusagethread=0\n"),
+    # round-35: inert query/no-op probes on uncovered socket, fcntl, mmap, and
+    # dup2 boundaries. socket_stream creates a lone AF_UNIX SOCK_STREAM socket
+    # (a distinct socket TYPE from socket_dgram's SOCK_DGRAM), printing the
+    # lowest free fd (3). getsockopt_soerror and getsockopt_acceptconn read two
+    # more socket OPTIONS beyond round-13's SO_TYPE: SO_ERROR (no pending error
+    # on a fresh socketpair endpoint -> 0) and SO_ACCEPTCONN (a connected, non-
+    # listening endpoint -> 0). fcntl_getsig reads F_GETSIG on a fresh pipe read-
+    # end (no signal set -> 0), a distinct fcntl OP from the F_GETFL/F_GETFD/
+    # F_GETOWN guests. mmap_noreserve exercises the MAP_NORESERVE flag path
+    # (distinct from mmap_anon's plain MAP_PRIVATE|MAP_ANONYMOUS), writing and
+    # reading back a sentinel byte (42) to confirm the mapping is writable.
+    # dup2_same_fd covers the POSIX oldfd==newfd special case: dup2 on an already-
+    # open fd is a no-op that returns newfd (3) without closing it. Every printed
+    # value is host-independent (a fixed fd number, a queried 0, or the written-
+    # back sentinel byte); none blocks, perturbs scheduling, or touches
+    # randomness -- all families e9patch preprocessing must leave byte-identical
+    # to golden ptrace.
+    "socket_stream": (0, b"socketstream=3\n"),
+    "getsockopt_soerror": (0, b"soerror=0\n"),
+    "getsockopt_acceptconn": (0, b"acceptconn=0\n"),
+    "fcntl_getsig": (0, b"getsig=0\n"),
+    "mmap_noreserve": (0, b"noreserve=42\n"),
+    "dup2_same_fd": (0, b"dup2same=3\n"),
+    # round-36: inert query/no-op probes widening coverage of already-supported
+    # socket, madvise, mmap, open, and wait families along new axes.
+    # getsockopt_domain and getsockopt_protocol read two more socket OPTIONS
+    # beyond SO_TYPE/SO_ERROR/SO_ACCEPTCONN: SO_DOMAIN (AF_UNIX -> 1) and
+    # SO_PROTOCOL (default AF_UNIX protocol -> 0). madvise_free exercises the
+    # MADV_FREE advice (distinct from madvise_dontneed's MADV_DONTNEED),
+    # asserting only the host-independent syscall return (0). mmap_stack adds the
+    # MAP_STACK flag path (distinct from mmap_anon/mmap_noreserve), confirming a
+    # sentinel byte (42) round-trips through the mapping. open_directory opens "/"
+    # with O_DIRECTORY (a distinct open-flag path from open_enoent/openat_devnull)
+    # and prints the lowest free fd (3). waitid_nochild is the waitid (247)
+    # analogue of wait4_nochild's ECHILD boundary, printing the negated errno
+    # (10 = ECHILD). Every printed value is host-independent (a queried constant,
+    # a fixed fd, a written-back sentinel, or a fixed errno); none blocks,
+    # perturbs scheduling, or touches randomness -- all families e9patch
+    # preprocessing must leave byte-identical to golden ptrace.
+    "getsockopt_domain": (0, b"domain=1\n"),
+    "getsockopt_protocol": (0, b"protocol=0\n"),
+    "madvise_free": (0, b"madvfree=0\n"),
+    "mmap_stack": (0, b"mmapstack=42\n"),
+    "open_directory": (0, b"opendir=3\n"),
+    "waitid_nochild": (0, b"waitid=10\n"),
+    # round-37: inert query/no-op probes on more uncovered socket and lseek axes.
+    # getsockopt_reuseaddr and getsockopt_broadcast read two more socket OPTIONS
+    # (SO_REUSEADDR, SO_BROADCAST) that are unset on a fresh socketpair endpoint
+    # -> 0. lseek_devnull_end seeks /dev/null to SEEK_END: a character device whose
+    # seek is a no-op reporting offset 0 (distinct from lseek_pipe's ESPIPE and the
+    # memfd seekable-file guests). Every printed value is host-independent (a
+    # queried constant or a device no-op offset); none blocks, perturbs
+    # scheduling, or touches randomness -- all families e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    #
+    # DROPPED (no false parity, hermit #152): prctl_child_subreaper
+    # (PR_GET_CHILD_SUBREAPER=37), prctl_tsc (PR_GET_TSC=25), and prctl_mce_kill_get
+    # (PR_MCE_KILL_GET=34) each return a value natively (0/1/2) but golden hermit
+    # ptrace returns an ERROR for these prctl subcommands (Detcore does not support
+    # them), so golden diverges from native. The e9-vs-golden parity check passes
+    # (both error identically) but the golden-vs-native truth gate fails, so these
+    # are excluded rather than admitted as false parity.
+    "getsockopt_reuseaddr": (0, b"reuseaddr=0\n"),
+    "getsockopt_broadcast": (0, b"broadcast=0\n"),
+    "lseek_devnull_end": (0, b"devnullend=0\n"),
+    # round-38: four more inert getsockopt OPTIONS and two more getitimer timers.
+    # getsockopt_keepalive/oobinline/dontroute read boolean SO_* flags that are
+    # unset on a fresh AF_UNIX socketpair endpoint (-> 0); getsockopt_rcvlowat
+    # reads the non-boolean SO_RCVLOWAT receive low-water mark, which defaults to 1
+    # byte. getitimer_virtual and getitimer_prof query the ITIMER_VIRTUAL and
+    # ITIMER_PROF interval timers with none armed, so each itimerval reads all-zero
+    # (field sum 0) -- distinct timers from getitimer_real. Every printed value is a
+    # queried constant with no time, randomness, PID, or host-variable input, so
+    # e9patch preprocessing must leave all six byte-identical to golden ptrace.
+    "getsockopt_keepalive": (0, b"keepalive=0\n"),
+    "getsockopt_oobinline": (0, b"oobinline=0\n"),
+    "getsockopt_dontroute": (0, b"dontroute=0\n"),
+    "getsockopt_rcvlowat": (0, b"rcvlowat=1\n"),
+    "getitimer_virtual": (0, b"getitimervirt=0\n"),
+    "getitimer_prof": (0, b"getitimerprof=0\n"),
+    # round-39: more madvise advice values, an mmap flag, and a fixed socket
+    # option. madvise_normal/sequential/random/dontfork exercise four more advice
+    # codes (MADV_NORMAL=0, MADV_SEQUENTIAL=2, MADV_RANDOM=1, MADV_DONTFORK=10)
+    # beyond the covered DONTNEED/WILLNEED/FREE, each an inert hint returning 0.
+    # mmap_populate maps anonymous memory with MAP_POPULATE (prefault), writes and
+    # reads back a sentinel (42), a distinct flag path from mmap_anon/mmap_noreserve.
+    # getsockopt_sndlowat reads SO_SNDLOWAT, fixed at 1 on Linux (the send-side
+    # counterpart of getsockopt_rcvlowat). Every printed value is host-independent
+    # (an inert advice return, a sentinel echo, or a fixed constant) with no time,
+    # randomness, PID, or host-variable input -- families e9patch preprocessing must
+    # leave byte-identical to golden ptrace.
+    "madvise_normal": (0, b"madvnormal=0\n"),
+    "madvise_sequential": (0, b"madvseq=0\n"),
+    "madvise_random": (0, b"madvrandom=0\n"),
+    "madvise_dontfork": (0, b"madvdontfork=0\n"),
+    "mmap_populate": (0, b"mmappopulate=42\n"),
+    "getsockopt_sndlowat": (0, b"sndlowat=1\n"),
+    # round-40: four more boolean getsockopt options, one non-boolean option, and
+    # a memfd fcntl seal query. getsockopt_reuseport/passcred/timestamp/nocheck
+    # read SO_REUSEPORT/SO_PASSCRED/SO_TIMESTAMP/SO_NO_CHECK, each unset on a fresh
+    # endpoint (-> 0); getsockopt_priority reads SO_PRIORITY, which defaults to 0.
+    # fcntl_get_seals creates a memfd (born with F_SEAL_SEAL) and reads F_GET_SEALS
+    # -> 1, a new fcntl OP and a new memfd contract. Every printed value is a
+    # queried constant with no time, randomness, PID, or host-variable input, so
+    # e9patch preprocessing must leave all six byte-identical to golden ptrace.
+    "getsockopt_reuseport": (0, b"reuseport=0\n"),
+    "getsockopt_passcred": (0, b"passcred=0\n"),
+    "getsockopt_timestamp": (0, b"timestamp=0\n"),
+    "getsockopt_nocheck": (0, b"nocheck=0\n"),
+    "getsockopt_priority": (0, b"priority=0\n"),
+    "fcntl_get_seals": (0, b"seals=1\n"),
+    # round-41: two new fcntl OPs, three more getsockopt options, and AF_INET
+    # socket creation. fcntl_getlease_memfd reads F_GETLEASE on a lease-free memfd
+    # (-> F_UNLCK=2); fcntl_getownex_pipe reads F_GETOWN_EX on an unowned pipe
+    # (owner type -> 0, a struct-copyout OP distinct from scalar F_GETOWN).
+    # getsockopt_linger reads struct linger (l_onoff -> 0); getsockopt_sndbuf and
+    # getsockopt_rcvbuf print only the host-independent invariant that a fresh
+    # socket has positive buffers (-> 1); getsockopt_peekoff reads SO_PEEK_OFF,
+    # disabled by default (-> -1, a negative-default option). socket_inet_stream
+    # and socket_inet_dgram create AF_INET TCP/UDP sockets that take the lowest
+    # free fd (-> 3) and never bind or connect, so nothing communicates. Every
+    # printed value is a queried constant with no time, randomness, PID, or
+    # host-variable input, so e9patch preprocessing must leave all eight
+    # byte-identical to golden ptrace.
+    "fcntl_getlease_memfd": (0, b"getlease=2\n"),
+    "fcntl_getownex_pipe": (0, b"getownex=0\n"),
+    "getsockopt_linger": (0, b"linger=0\n"),
+    "getsockopt_sndbuf": (0, b"sndbuf=1\n"),
+    "getsockopt_rcvbuf": (0, b"rcvbuf=1\n"),
+    "getsockopt_peekoff": (0, b"peekoff=-1\n"),
+    "socket_inet_stream": (0, b"inetstream=3\n"),
+    "socket_inet_dgram": (0, b"inetdgram=3\n"),
+    # round-42: two more fcntl OPs, a working ioctl, two socket-option ops, a new
+    # madvise advice, and a path-based xattr list. fcntl_setpipe_sz resizes a pipe
+    # (F_SETPIPE_SZ granted 4096); fcntl_ofd_getlk_memfd queries an OFD lock on an
+    # unlocked memfd (l_type rewritten to F_UNLCK=2); ioctl_fioclex_pipe sets
+    # close-on-exec via FIOCLEX (-> 0); getsockopt_rcvtimeo reads SO_RCVTIMEO
+    # (tv_sec -> 0); setsockopt_broadcast enables SO_BROADCAST on a UDP socket
+    # (-> 0); madvise_cold applies MADV_COLD to an anon page (-> 0);
+    # listxattr_devnull size-queries /dev/null's xattrs (-> 0). Every printed value
+    # is a queried constant with no time, randomness, PID, or host-variable input,
+    # so e9patch preprocessing must leave all seven byte-identical to golden ptrace.
+    "fcntl_setpipe_sz": (0, b"setpipesz=4096\n"),
+    "fcntl_ofd_getlk_memfd": (0, b"ofdgetlk=2\n"),
+    "ioctl_fioclex_pipe": (0, b"fioclex=0\n"),
+    "getsockopt_rcvtimeo": (0, b"rcvtimeo=0\n"),
+    "setsockopt_broadcast": (0, b"setbroadcast=0\n"),
+    "madvise_cold": (0, b"madvcold=0\n"),
+    "listxattr_devnull": (0, b"listxattr=0\n"),
+    # round-43: a file-time call, an OFD-lock SET path, two more socket options, an
+    # mmap flag, a protection transition, and a memory-protection-key pair.
+    # utimensat_memfd sets a memfd's timestamps to now (return 0, times not read
+    # back); fcntl_ofd_setlk_memfd clears a whole-file OFD lock (F_OFD_SETLK with
+    # F_UNLCK -> 0); getsockopt_timestampns reads SO_TIMESTAMPNS (off -> 0);
+    # getsockopt_busy_poll reads SO_BUSY_POLL (0 -> 0); mmap_32bit maps a page with
+    # MAP_32BIT (success boolean -> 1, address not printed); mprotect_none drops a
+    # page to PROT_NONE then restores PROT_READ (-> 0); pkey_alloc_free allocates
+    # and frees a protection key (success boolean -> 1, key index not printed).
+    # Every printed value is a constant with no time, randomness, PID, or
+    # host-variable input, so e9patch preprocessing must leave all seven
+    # byte-identical to golden ptrace.
+    "utimensat_memfd": (0, b"utimens=0\n"),
+    "fcntl_ofd_setlk_memfd": (0, b"ofdsetlk=0\n"),
+    "getsockopt_timestampns": (0, b"timestampns=0\n"),
+    "getsockopt_busy_poll": (0, b"busypoll=0\n"),
+    "mmap_32bit": (0, b"map32=1\n"),
+    "mprotect_none": (0, b"protnone=0\n"),
+    "pkey_alloc_free": (0, b"pkeyalloc=1\n"),
+    # round-44: a path-based *at credential no-op, two more socket options, two more
+    # mmap flags, a netlink socket, a packet-mode pipe, a fcntl I/O-signal op, and
+    # a CPUID-fault query. fchownat_devnull issues a no-op chown(-1,-1) on /dev/null
+    # (-> 0); getsockopt_zerocopy / getsockopt_mark read SO_ZEROCOPY / SO_MARK
+    # defaults (-> 0); mmap_locked / mmap_growsdown map a page with MAP_LOCKED /
+    # MAP_GROWSDOWN (success boolean -> 1, address not printed); socket_netlink
+    # opens an AF_NETLINK/SOCK_RAW socket (success boolean -> 1); pipe2_direct
+    # round-trips two bytes through an O_DIRECT packet pipe (-> hi); fcntl_setsig
+    # sets and reads back the I/O signal SIGUSR1 (-> 10); arch_prctl_getcpuid reads
+    # the CPUID-fault flag (disabled -> 0). Every printed value is a queried
+    # constant with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all nine byte-identical to golden ptrace.
+    "fchownat_devnull": (0, b"fchownat=0\n"),
+    "getsockopt_zerocopy": (0, b"zerocopy=0\n"),
+    "getsockopt_mark": (0, b"mark=0\n"),
+    "mmap_locked": (0, b"maplocked=1\n"),
+    "mmap_growsdown": (0, b"growsdown=1\n"),
+    "socket_netlink": (0, b"netlink=1\n"),
+    "pipe2_direct": (0, b"pd=hi\n"),
+    "fcntl_setsig": (0, b"setsig=10\n"),
+    "arch_prctl_getcpuid": (0, b"getcpuid=0\n"),
+    # round-45: a memory-protection-key application, an xattr-list query, a
+    # session op, four setsockopt set-and-confirm ops, an executable mprotect, a
+    # core-dump madvise, and an IPv6 socket. pkey_mprotect_page applies a pkey to
+    # an anon page with pkey_mprotect (-> 0); llistxattr_devnull reads the empty
+    # xattr list size of /dev/null (-> 0); setsid_check starts a new session
+    # (host-variable sid, success boolean -> 1); setsockopt_keepalive /
+    # setsockopt_rcvbuf / setsockopt_reuseport / setsockopt_sndbuf set an option
+    # then confirm it (readback boolean -> 1); getrandom_nonblock fills 16 bytes
+    # via GRND_NONBLOCK (count -> 16, not the bytes); mprotect_exec makes a page
+    # read+execute (-> 0); madvise_dontdump excludes a page from core dumps
+    # (-> 0); socket_inet6 opens an AF_INET6 stream socket (lowest fd -> 3).
+    # Every printed value is a queried constant, a success boolean, or the lowest
+    # free fd with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all eleven byte-identical to golden ptrace.
+    "pkey_mprotect_page": (0, b"pkeymprotect=0\n"),
+    "llistxattr_devnull": (0, b"llistxattr=0\n"),
+    "setsid_check": (0, b"setsid=1\n"),
+    "setsockopt_keepalive": (0, b"setkeepalive=1\n"),
+    "getrandom_nonblock": (0, b"grndnb=16\n"),
+    "setsockopt_rcvbuf": (0, b"setrcvbuf=1\n"),
+    "setsockopt_reuseport": (0, b"setreuseport=1\n"),
+    "mprotect_exec": (0, b"protexec=0\n"),
+    "madvise_dontdump": (0, b"dontdump=0\n"),
+    "socket_inet6": (0, b"inet6=3\n"),
+    "setsockopt_sndbuf": (0, b"setsndbuf=1\n"),
+    # round-46: nine getsockopt reads at the IPPROTO_TCP / IPPROTO_IP /
+    # IPPROTO_IPV6 protocol levels, a new option-level dimension distinct from
+    # every prior SOL_SOCKET socket-option guest. On a fresh socket each reads a
+    # fixed kernel default: TCP_NODELAY / TCP_CORK off (-> 0), TCP_KEEPCNT (-> 9),
+    # TCP_KEEPINTVL (-> 75s), TCP_SYNCNT (-> 6), TCP_MAXSEG advertised MSS
+    # (-> 536), IP_MTU_DISCOVER = IP_PMTUDISC_WANT (-> 1), IPV6_V6ONLY dual-stack
+    # (-> 0), IPV6_UNICAST_HOPS (-> 64). Every printed value is a queried default
+    # constant with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing must leave all nine byte-identical to golden ptrace.
+    "getsockopt_tcp_nodelay": (0, b"tcpnodelay=0\n"),
+    "getsockopt_tcp_cork": (0, b"tcpcork=0\n"),
+    "getsockopt_tcp_keepcnt": (0, b"tcpkeepcnt=9\n"),
+    "getsockopt_tcp_keepintvl": (0, b"tcpkeepintvl=75\n"),
+    "getsockopt_tcp_syncnt": (0, b"tcpsyncnt=6\n"),
+    "getsockopt_tcp_maxseg": (0, b"tcpmaxseg=536\n"),
+    "getsockopt_ip_mtudiscover": (0, b"ipmtudisc=1\n"),
+    "getsockopt_ipv6_v6only": (0, b"v6only=0\n"),
+    "getsockopt_ipv6_hops": (0, b"v6hops=64\n"),
+    # round-47: ten more protocol-level getsockopt reads extending the round-46
+    # option-level dimension with new IPPROTO_TCP / IPPROTO_IP / IPPROTO_IPV6
+    # members, including the multicast sub-family on datagram sockets. Each reads
+    # a fixed per-socket default: TCP_QUICKACK (-> 1), TCP_DEFER_ACCEPT /
+    # TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_FASTOPEN (-> 0), IP_TOS (-> 0),
+    # IP_MULTICAST_TTL (-> 1), IP_MULTICAST_LOOP (-> 1), IPV6_MULTICAST_HOPS
+    # (-> 1), IPV6_TCLASS (-> 0). These are per-socket option defaults (not
+    # host-tuned sysctls), so no time, randomness, PID, or host-variable input
+    # feeds the output and e9patch preprocessing stays byte-identical to golden
+    # ptrace. TCP_KEEPIDLE and TCP_LINGER2 were dropped: they mirror host sysctls
+    # (tcp_keepalive_time, tcp_fin_timeout) and diverge from golden.
+    "getsockopt_tcp_quickack": (0, b"tcpquickack=1\n"),
+    "getsockopt_tcp_defer_accept": (0, b"tcpdeferaccept=0\n"),
+    "getsockopt_tcp_window_clamp": (0, b"tcpwinclamp=0\n"),
+    "getsockopt_tcp_user_timeout": (0, b"tcpusertimeo=0\n"),
+    "getsockopt_tcp_fastopen": (0, b"tcpfastopen=0\n"),
+    "getsockopt_ip_tos": (0, b"iptos=0\n"),
+    "getsockopt_ip_multicast_ttl": (0, b"ipmcttl=1\n"),
+    "getsockopt_ip_multicast_loop": (0, b"ipmcloop=1\n"),
+    "getsockopt_ipv6_multicast_hops": (0, b"v6mchops=1\n"),
+    "getsockopt_ipv6_tclass": (0, b"v6tclass=0\n"),
+    # round-48: twelve getsockopt reads of the receive/ancillary-control option
+    # sub-family at the IPPROTO_IP / IPPROTO_IPV6 / IPPROTO_TCP levels. These
+    # booleans gate delivery of ancillary control messages or per-socket
+    # behaviors and are all disabled by default on a fresh socket, so each reads
+    # the fixed constant 0: IP_RECVTOS / IP_RECVTTL / IP_PKTINFO / IP_RECVOPTS /
+    # IP_FREEBIND / IP_NODEFRAG, IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT /
+    # IPV6_RECVTCLASS / IPV6_DONTFRAG, and TCP_INQ / TCP_SAVE_SYN. Every value is
+    # a per-socket default with no time, randomness, PID, or host-variable input,
+    # so e9patch preprocessing stays byte-identical to golden ptrace.
+    "getsockopt_ip_recvtos": (0, b"iprecvtos=0\n"),
+    "getsockopt_ip_recvttl": (0, b"iprecvttl=0\n"),
+    "getsockopt_ip_pktinfo": (0, b"ippktinfo=0\n"),
+    "getsockopt_ip_recvopts": (0, b"iprecvopts=0\n"),
+    "getsockopt_ip_freebind": (0, b"ipfreebind=0\n"),
+    "getsockopt_ip_nodefrag": (0, b"ipnodefrag=0\n"),
+    "getsockopt_ipv6_recvpktinfo": (0, b"v6recvpktinfo=0\n"),
+    "getsockopt_ipv6_recvhoplimit": (0, b"v6recvhoplim=0\n"),
+    "getsockopt_ipv6_recvtclass": (0, b"v6recvtclass=0\n"),
+    "getsockopt_ipv6_dontfrag": (0, b"v6dontfrag=0\n"),
+    "getsockopt_tcp_inq": (0, b"tcpinq=0\n"),
+    "getsockopt_tcp_save_syn": (0, b"tcpsavesyn=0\n"),
+    # round-49: ten remaining SOL_SOCKET(1) option flags not previously covered,
+    # completing the generic socket-level option coverage. Each is a per-socket
+    # boolean/flag disabled by default on a fresh socket, so each reads the fixed
+    # constant 0: SO_BSDCOMPAT, SO_RXQ_OVFL, SO_NOFCS, SO_LOCK_FILTER,
+    # SO_SELECT_ERR_QUEUE, SO_TIMESTAMPING, SO_TXTIME, SO_BINDTOIFINDEX,
+    # SO_INCOMING_NAPI_ID, SO_WIFI_STATUS. Every value is a per-socket default
+    # with no time, randomness, PID, or host-variable input, so e9patch
+    # preprocessing stays byte-identical to golden ptrace.
+    "getsockopt_bsdcompat": (0, b"sobsdcompat=0\n"),
+    "getsockopt_rxq_ovfl": (0, b"sorxqovfl=0\n"),
+    "getsockopt_nofcs": (0, b"sonofcs=0\n"),
+    "getsockopt_lock_filter": (0, b"solockfilter=0\n"),
+    "getsockopt_select_err_queue": (0, b"soselecterrq=0\n"),
+    "getsockopt_timestamping": (0, b"sotimestamping=0\n"),
+    "getsockopt_txtime": (0, b"sotxtime=0\n"),
+    "getsockopt_bindtoifindex": (0, b"sobindtoifidx=0\n"),
+    "getsockopt_incoming_napi_id": (0, b"sonapiid=0\n"),
+    "getsockopt_wifi_status": (0, b"sowifistatus=0\n"),
+    # Round 50: NEW syscall families beyond the now-exhausted getsockopt lane.
+    # Two credential no-ops (setuid/setgid to the current identity, return 0,
+    # distinct from the setres*, setre*, setfs* guests) plus nine more madvise
+    # advice codes on a private anon page and a private-expedited membarrier.
+    # Every value is a host-independent constant: madvise advice succeeds (0)
+    # except MADV_COLLAPSE, which returns -EINVAL(-22) on a 4 KiB anon range
+    # both natively and under golden ptrace (faithful Linux parity, not a hermit
+    # limitation). No time/randomness/PID/host-variable input, so e9patch
+    # preprocessing stays byte-identical to golden ptrace.
+    "setuid_noop": (0, b"setuid=0\n"),
+    "setgid_noop": (0, b"setgid=0\n"),
+    "madvise_hugepage": (0, b"madvhugepage=0\n"),
+    "madvise_nohugepage": (0, b"madvnohugepage=0\n"),
+    "madvise_wipeonfork": (0, b"madvwipeonfork=0\n"),
+    "madvise_keeponfork": (0, b"madvkeeponfork=0\n"),
+    "madvise_mergeable": (0, b"madvmergeable=0\n"),
+    "madvise_unmergeable": (0, b"madvunmergeable=0\n"),
+    "madvise_dodump": (0, b"madvdodump=0\n"),
+    "madvise_pageout": (0, b"madvpageout=0\n"),
+    "madvise_collapse": (0, b"madvcollapse=-22\n"),
+    "membarrier_private": (0, b"membarpriv=0\n"),
+    # Round 51 (setsockopt write-path round-trips + mlockall on-fault). Each
+    # setsockopt_* guest sets a NON-default option value with setsockopt(54) then
+    # reads it back with getsockopt(55) and prints the round-tripped constant;
+    # the kernel echoes exactly what was written, identical native and golden, so
+    # these exercise the setsockopt WRITE path distinct from the read-only
+    # getsockopt guests (IP_TTL/IP_TOS/IP_MULTICAST_TTL/TCP_CORK/IPV6_UNICAST_HOPS
+    # were host-variable or default-only on the read side but round-trip
+    # deterministically once written). mlockall_onfault locks with
+    # MCL_CURRENT|MCL_ONFAULT (a distinct flag combo from mlockall_all) and
+    # releases, returning 0. No time/randomness/PID/host-variable input, so
+    # e9patch preprocessing stays byte-identical to golden ptrace.
+    "setsockopt_priority": (0, b"sopriority=6\n"),
+    "setsockopt_nodelay": (0, b"setnodelay=1\n"),
+    "setsockopt_ipttl": (0, b"setipttl=33\n"),
+    "setsockopt_rcvlowat": (0, b"setrcvlowat=2\n"),
+    "setsockopt_iptos": (0, b"setiptos=8\n"),
+    "setsockopt_ip_multicast_ttl": (0, b"setipmcttl=5\n"),
+    "setsockopt_tcp_cork": (0, b"settcpcork=1\n"),
+    "setsockopt_ipv6_hops": (0, b"setipv6hops=5\n"),
+    "mlockall_onfault": (0, b"mlockonfault=0\n"),
+    # Round 52 (more setsockopt write-path round-trips, TCP timer/segment/MTU +
+    # multicast-loop options). Each sets a NON-default value with setsockopt(54)
+    # then reads it back with getsockopt(55) and prints the round-tripped
+    # constant. TCP_KEEPIDLE and TCP_LINGER2 read-only defaults mirrored host
+    # sysctls (tcp_keepalive_time / tcp_fin_timeout) and were dropped in round 47;
+    # writing a fixed value pins them deterministically, recovering that coverage.
+    # No time/randomness/PID/host-variable input, so e9patch preprocessing stays
+    # byte-identical to golden ptrace.
+    "setsockopt_keepidle": (0, b"setkeepidle=120\n"),
+    "setsockopt_keepcnt": (0, b"setkeepcnt=5\n"),
+    "setsockopt_keepintvl": (0, b"setkeepintvl=30\n"),
+    "setsockopt_linger2": (0, b"setlinger2=15\n"),
+    "setsockopt_maxseg": (0, b"setmaxseg=1000\n"),
+    "setsockopt_syncnt": (0, b"setsyncnt=3\n"),
+    "setsockopt_ip_mtu_discover": (0, b"setipmtudisc=2\n"),
+    "setsockopt_v6only": (0, b"setv6only=1\n"),
+    "setsockopt_ip_multicast_loop": (0, b"setipmcloop=0\n"),
+    "setsockopt_ipv6_multicast_loop": (0, b"setv6mcloop=0\n"),
+    "setsockopt_ipv6_multicast_hops": (0, b"setv6mchops=7\n"),
+    # Round 53 (socket-identity getsockopt constants). Each reads a fixed property
+    # of the socket itself (address family, protocol, or type) with getsockopt(55)
+    # at SOL_SOCKET(1). SO_DOMAIN and SO_PROTOCOL are options not previously
+    # covered; getsockopt_so_type_dgram exercises SO_TYPE on an AF_INET dgram
+    # socket returning SOCK_DGRAM(2), a distinct socket type and return value from
+    # the existing AF_UNIX/SOCK_STREAM getsockopt_socktype guest. Every value is a
+    # host-independent constant, so e9patch preprocessing stays byte-identical to
+    # golden ptrace.
+    "getsockopt_so_domain_inet": (0, b"sodomain_inet=2\n"),
+    "getsockopt_so_domain_inet6": (0, b"sodomain_inet6=10\n"),
+    "getsockopt_so_protocol_tcp": (0, b"soprotocol_tcp=6\n"),
+    "getsockopt_so_protocol_udp": (0, b"soprotocol_udp=17\n"),
+    "getsockopt_so_type_dgram": (0, b"sotype_dgram=2\n"),
+    # Round 54 (socket-syscall ERROR-path constants). Each drives a socket
+    # operation into a faithful Linux errno on a socket in the wrong state:
+    # getpeername/shutdown on an unconnected socket -> -ENOTCONN(-107), accept on
+    # a non-listening socket -> -EINVAL(-22), listen on a dgram socket ->
+    # -EOPNOTSUPP(-95). getsockname_family reads AF_INET(2) from an unbound socket.
+    # Every value is host-independent and native==golden (faithful error parity,
+    # not a hermit limitation), so e9patch preprocessing stays byte-identical to
+    # golden ptrace. These are ERROR paths distinct from the success-path AF_UNIX
+    # getpeername_unix/getsockname_unix/shutdown_socketpair/accept_abstract/
+    # listen_abstract guests.
+    "getpeername_unconnected": (0, b"getpeername=-107\n"),
+    "shutdown_unconnected": (0, b"shutdownunc=-107\n"),
+    "accept_nonlisten": (0, b"acceptnolis=-22\n"),
+    "listen_dgram": (0, b"listendgram=-95\n"),
+    "getsockname_family": (0, b"gsnfamily=2\n"),
+    # Round 55 (removed kernel-module / sysctl-management syscalls -> faithful
+    # ENOSYS). Each drives a syscall number that once existed in older Linux and
+    # was later removed: _sysctl(156) removed in 5.5; create_module(174),
+    # query_module(178), get_kernel_syms(177) all stubbed to -ENOSYS since 2.6
+    # and removed in 5.18; nfsservctl(180) removed in 3.1. The kernel returns
+    # -ENOSYS(-38) for these numbers both natively and under golden ptrace, so
+    # this is faithful native==golden parity (not a hermit limitation), and the
+    # value is a host-independent constant. These exercise e9patch's
+    # rewritten-SYSCALL dispatch of a removed/unknown number, which must classify
+    # to the same ENOSYS as golden ptrace, keeping e9patch preprocessing
+    # byte-identical. Distinct from the not-implemented-here restart_syscall and
+    # from every success/error-path guest above.
+    "sysctl_enosys": (0, b"sysctl=-38\n"),
+    "create_module_enosys": (0, b"createmod=-38\n"),
+    "query_module_enosys": (0, b"querymod=-38\n"),
+    "get_kernel_syms_enosys": (0, b"getkernelsyms=-38\n"),
+    "nfsservctl_enosys": (0, b"nfsservctl=-38\n"),
 }
 
 FREESTANDING_FLAGS = (
