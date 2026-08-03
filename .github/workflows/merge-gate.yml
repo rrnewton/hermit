@@ -20,12 +20,13 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head only after the
-# repository GitHub-managed portable CI job succeeds. A locally-validated label
-# is supporting evidence, never a substitute for a required GitHub check.
-# Inventory completeness is checked unconditionally on the synthesized PR +
-# current-main tree. The independent Reverie-pin lint does not taint this
-# product-test result. Demo-relevant changes
+# This lightweight required check accepts an exact PR head after either the
+# repository GitHub-managed portable CI job succeeds, or an unavailable/soft
+# CI state is paired with a locally-validated label AND a complete exact-head
+# validate.sh evidence comment. A real CI failure or timeout is never
+# overridable. Inventory completeness is checked unconditionally on the
+# synthesized PR + current-main tree. The independent Reverie-pin lint does not
+# taint this product-test result. Demo-relevant changes
 # additionally require the exact-SHA P0 demo gate; local validation never bypasses
 # that owner-mandated gate. Privileged CI is an independent bonus signal.
 # Merge-group checks inspect their constituent PR heads instead of trusting the
@@ -82,14 +83,18 @@ jobs:
         run: |
           set -euo pipefail
           test_script="$GITHUB_WORKSPACE/trusted/scripts/test-require-check-success.sh"
+          substitution_test="$GITHUB_WORKSPACE/trusted/scripts/test-local-validation-substitution.sh"
           policy_lint="$GITHUB_WORKSPACE/trusted/scripts/check-merge-gate-policy.sh"
           if [ ! -x "$test_script" ]; then
             test_script="$GITHUB_WORKSPACE/candidate/scripts/test-require-check-success.sh"
+            substitution_test="$GITHUB_WORKSPACE/candidate/scripts/test-local-validation-substitution.sh"
             policy_lint="$GITHUB_WORKSPACE/candidate/scripts/check-merge-gate-policy.sh"
           fi
           test -x "$test_script"
+          test -x "$substitution_test"
           test -x "$policy_lint"
           "$test_script"
+          "$substitution_test"
           "$policy_lint" "$GITHUB_WORKSPACE/candidate"
       - name: Require a complete test inventory on the merge result
         run: |
@@ -352,6 +357,31 @@ jobs:
             return 1
           }
 
+          classify_required_check() {
+            if [ -x scripts/classify-required-check.sh ]; then
+              scripts/classify-required-check.sh "$@"
+              return
+            fi
+            # Bootstrap this guard's own PR from trusted main. The committed
+            # helper becomes authoritative after this change lands.
+            local status=${1,,} conclusion=${2,,}
+            if [ "$status" = completed ] && [ "$conclusion" = success ]; then
+              echo success
+              return
+            fi
+            case "$conclusion" in
+              failure | timed_out | error | action_required | startup_failure | stale)
+                echo hard-failure
+                ;;
+              cancelled | skipped | neutral | "" | success)
+                echo substitutable
+                ;;
+              *)
+                echo hard-failure
+                ;;
+            esac
+          }
+
           if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
              [ "$INVALIDATION_RESULT" != success ]; then
             echo "::error::Could not invalidate local validation from the previous PR head."
@@ -414,7 +444,7 @@ jobs:
           fi
 
           failed=0
-          while IFS=$'\t' read -r pr_number head_sha; do
+          while IFS=$'\t' read -r pr_number head_sha locally_validated; do
             if [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
               echo "::error::PR #${pr_number} has no head SHA."
               failed=1
@@ -430,14 +460,14 @@ jobs:
             ' <<< "$runs")"
             run_id="$(jq -r '.id // ""' <<< "$run")"
             url="$(jq -r '.html_url // ""' <<< "$run")"
+            job_status=missing
+            job_conclusion=
+            job_url=
 
             # Gate on the authoritative product-test job, not the whole run.
             # The same workflow contains the independent `reverie-pin` lint;
             # a stale pin can fail that job while Regular tests are green.
-            if [ -z "$run_id" ]; then
-              echo "::error::No ci-portable.yml run for PR #${pr_number} at $head_sha."
-              failed=1
-            else
+            if [ -n "$run_id" ]; then
               jobs="$(
                 gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
               )"
@@ -448,16 +478,44 @@ jobs:
               job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
               job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
               job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
-
-              if require_check_success \
-                   "Regular tests for PR #${pr_number} at $head_sha" \
-                   "$job_status" "$job_conclusion"; then
-                echo "Authoritative portable job: ${job_url:-$url}"
-              else
-                echo "::error::Required portable job is not passed: ${job_url:-${url:-no run URL}}."
-                failed=1
-              fi
             fi
+
+            required_state="$(classify_required_check "$job_status" "$job_conclusion")"
+            case "$required_state" in
+              success)
+                echo "Authoritative portable job: ${job_url:-$url}"
+                ;;
+              hard-failure)
+                echo "::error::Regular tests for PR #${pr_number} at $head_sha had a hard failure ($job_status/${job_conclusion:-none}); locally-validated cannot override it: ${job_url:-${url:-no run URL}}."
+                failed=1
+                ;;
+              substitutable)
+                if [ "$locally_validated" != true ]; then
+                  echo "::error::Regular tests for PR #${pr_number} at $head_sha are unavailable/not passed ($job_status/${job_conclusion:-none}) and no locally-validated label is present; re-run is required."
+                  failed=1
+                elif [ ! -x scripts/check-local-validation-evidence.sh ]; then
+                  echo "::error::Trusted main lacks the local-validation evidence checker; refusing substitution."
+                  failed=1
+                else
+                  comments="$(
+                    gh api --paginate \
+                      "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
+                      --jq '.[]' | jq -s '.'
+                  )"
+                  if printf '%s\n' "$comments" |
+                     scripts/check-local-validation-evidence.sh "$head_sha"; then
+                    echo "Audited local validation substitutes for unavailable portable CI on PR #${pr_number}."
+                  else
+                    echo "::error::locally-validated on PR #${pr_number} lacks complete exact-head evidence; refusing substitution."
+                    failed=1
+                  fi
+                fi
+                ;;
+              *)
+                echo "::error::Internal required-check classification error: $required_state"
+                failed=1
+                ;;
+            esac
 
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
             files="$(
@@ -494,7 +552,7 @@ jobs:
             fi
           done < <(jq -r '
             .[]
-            | [.number, .head.sha]
+            | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
             | @tsv
           ' <<< "$pull_requests")
 

@@ -85,7 +85,11 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
 # ---------------------------------------------------------------------------
 ENRICH_JQ='
 def result: (.conclusion // .state // .status // "PENDING");
-def red: ["FAILURE","TIMED_OUT","CANCELLED","ERROR","ACTION_REQUIRED","STARTUP_FAILURE","STALE"];
+def hard: ["FAILURE","TIMED_OUT","ERROR","ACTION_REQUIRED","STARTUP_FAILURE","STALE"];
+def soft: ["CANCELLED","SKIPPED","NEUTRAL","PENDING","EXPECTED","QUEUED","IN_PROGRESS","WAITING","REQUESTED","NONE"];
+def regular_hard($state):
+  ((hard | index($state)) != null)
+  or ($state != "SUCCESS" and ((soft | index($state)) == null));
 def run_id:
   (try ((.detailsUrl // "") | capture("/runs/(?<id>[0-9]+)") | .id | tonumber) catch -1);
 def latest($rollup; $name):
@@ -103,10 +107,11 @@ def ci_of($rollup):
                 | if $x==null then "NONE" else ($x|result) end) }
   | . as $o
   | $o + { overall:
-      (if $o.regular=="SUCCESS" and $o.gate=="SUCCESS" then "PASS"
-       elif (red | index($o.regular)) or (red | index($o.gate)) then "FAIL"
+      (if regular_hard($o.regular) then "FAIL"
+       elif $o.gate=="SUCCESS" then "PASS"
        elif $o.regular=="NONE" and $o.gate=="NONE" then (if $o.checks==0 then "NONE" else "OTHER" end)
-       else "PENDING" end) };
+       elif (soft | index($o.gate)) then "PENDING"
+       else "FAIL" end) };
 
 . as $prs
 | ($prs | map({(.headRefName): .number}) | add // {}) as $byhead

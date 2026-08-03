@@ -31,18 +31,16 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
+            self.merge_gate(),
         ]
         self.assertEqual(
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
         )
 
-    def test_every_completed_non_success_required_check_is_red(self) -> None:
+    def test_every_hard_portable_failure_is_red_even_if_gate_passed(self) -> None:
         for conclusion in (
             "FAILURE",
             "TIMED_OUT",
-            "CANCELLED",
-            "SKIPPED",
-            "NEUTRAL",
             "STALE",
             "ACTION_REQUIRED",
             "STARTUP_FAILURE",
@@ -53,12 +51,35 @@ class ClassifyCiRollupTest(unittest.TestCase):
                     "name": pr_status.REGULAR_PORTABLE_CHECK,
                     "conclusion": conclusion,
                     "status": "COMPLETED",
-                }
+                },
+                self.merge_gate(),
             ]
             self.assertEqual(
                 pr_status.classify_ci_rollup("rrnewton/hermit", checks),
                 "red",
                 msg=conclusion,
+            )
+
+    def test_soft_or_unavailable_portable_is_green_after_gate_substitution(self) -> None:
+        for conclusion, status in (
+            ("CANCELLED", "COMPLETED"),
+            ("SKIPPED", "COMPLETED"),
+            ("NEUTRAL", "COMPLETED"),
+            ("", "QUEUED"),
+            ("", "IN_PROGRESS"),
+        ):
+            checks = [
+                {
+                    "name": pr_status.REGULAR_PORTABLE_CHECK,
+                    "conclusion": conclusion,
+                    "status": status,
+                },
+                self.merge_gate(),
+            ]
+            self.assertEqual(
+                pr_status.classify_ci_rollup("rrnewton/hermit", checks),
+                "green",
+                msg=f"{status}/{conclusion}",
             )
 
     def test_incomplete_status_is_pending(self) -> None:

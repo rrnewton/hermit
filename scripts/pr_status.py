@@ -48,6 +48,10 @@ REQUIRED_CHECKS = {
 PENDING_STATES = frozenset(
     ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
 )
+SOFT_CONCLUSIONS = frozenset(("CANCELLED", "SKIPPED", "NEUTRAL"))
+HARD_CONCLUSIONS = frozenset(
+    ("FAILURE", "TIMED_OUT", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE")
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,42 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
 
     if not latest:
         return "none"
+
+    if repo == "rrnewton/hermit":
+        # The repository ruleset requires merge-gate. A successful gate means
+        # either portable CI passed or a soft/unavailable portable state had
+        # audited exact-head local-validation evidence. Retain a defensive veto
+        # for a visible hard portable failure even if an old/broken gate says
+        # success; soft states remain drainable once the fixed gate passes.
+        gate_entry = latest.get("merge-gate")
+        if gate_entry is None:
+            return "pending"
+        gate = gate_entry[1]
+        gate_conclusion = str(gate.get("conclusion") or gate.get("state") or "").upper()
+        gate_status = str(gate.get("status") or "").upper()
+        if not gate_conclusion or (gate_status and gate_status != "COMPLETED"):
+            return "pending"
+        if gate_conclusion != "SUCCESS":
+            return "red"
+
+        portable_entry = latest.get(REGULAR_PORTABLE_CHECK)
+        if portable_entry is None:
+            return "green"
+        portable = portable_entry[1]
+        portable_conclusion = str(
+            portable.get("conclusion") or portable.get("state") or ""
+        ).upper()
+        portable_status = str(portable.get("status") or "").upper()
+        if portable_conclusion in HARD_CONCLUSIONS:
+            return "red"
+        if (
+            portable_conclusion
+            and portable_conclusion not in SOFT_CONCLUSIONS
+            and portable_conclusion != "SUCCESS"
+            and (not portable_status or portable_status == "COMPLETED")
+        ):
+            return "red"
+        return "green"
 
     saw_pending = len(latest) != len(required)
     for _, check in latest.values():
