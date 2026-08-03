@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2024"
 publish = false
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
 detcore = { version = "0.0.0", path = "../../detcore" }
 libc = "0.2.186"
