@@ -98,6 +98,7 @@ use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
 pub use reverie::process::Namespace;
+use reverie::syscalls::Addr;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
@@ -765,6 +766,81 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// Emit a one-shot DETLOG line summarizing the guest's environment at exec:
+    /// the number of variables and a SHA-256 of their concatenation. A
+    /// cross-backend environment difference (for example KVM vs. ptrace) then
+    /// surfaces as a single differing hash line instead of an eyeballed syscall
+    /// stream. Callers must gate this on active INFO logging; it is read-only
+    /// and never feeds guest-visible state, so it cannot affect determinism.
+    async fn detlog_guest_env<G: Guest<Self>>(&self, guest: &mut G) {
+        let dettid = guest.thread_state().dettid;
+        match Self::hash_guest_env(guest).await {
+            Ok((count, hash)) => {
+                detlog!("[env, dtid {}] count={} hash={}", dettid, count, hash)
+            }
+            // A backend may legitimately be unable to read the initial stack
+            // (e.g. an out-of-process guest at an unexpected stop). Report it on
+            // the same line rather than propagating an error that would abort
+            // the guest.
+            Err(errno) => {
+                detlog!("[env, dtid {}] unavailable ({:?})", dettid, errno)
+            }
+        }
+    }
+
+    /// Read the guest's environment strings from its initial process stack and
+    /// return `(count, sha256)`. This reads through `guest.memory()` so it
+    /// behaves identically across backends (ptrace/KVM/DBI/e9patch); reading
+    /// `/proc/<pid>/environ` would be wrong under KVM, where `guest.pid()` is
+    /// the host VMM process rather than the guest.
+    async fn hash_guest_env<G: Guest<Self>>(
+        guest: &mut G,
+    ) -> Result<(usize, digest::Digest), Errno> {
+        // System V x86-64 process-entry stack layout, in ascending addresses:
+        //   [ argc:u64 ][ argv[0..argc]:*const u8 ][ NULL ]
+        //   [ envp[0..]:*const u8 ][ NULL ][ auxv... ]
+        // At the post-exec stop the guest has not executed any instruction yet,
+        // so %rsp still points at `argc`.
+        let sp = guest.regs().await.rsp;
+        let memory = guest.memory();
+
+        let read_word = |addr: u64| -> Result<u64, Errno> {
+            let addr = Addr::<u64>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+            memory.read_value(addr)
+        };
+
+        let argc = read_word(sp)?;
+        // envp begins after `argc` (1 word), the `argc` argv pointers, and the
+        // NULL word that terminates argv.
+        let skip_words = argc.checked_add(2).ok_or(Errno::EFAULT)?;
+        let mut cursor = sp
+            .checked_add(skip_words.checked_mul(8).ok_or(Errno::EFAULT)?)
+            .ok_or(Errno::EFAULT)?;
+
+        // Order-preserving concatenation with a NUL after each entry so that,
+        // e.g., {"A=", "B"} and {"A", "=B"} hash differently.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut count: usize = 0;
+        // Bound the scan so a corrupt or unexpected stack cannot loop or
+        // allocate without limit.
+        const MAX_ENTRIES: usize = 1 << 16;
+        const MAX_BYTES: usize = 1 << 20;
+        while count < MAX_ENTRIES && buf.len() < MAX_BYTES {
+            let ptr = read_word(cursor)?;
+            if ptr == 0 {
+                break; // NULL terminator ends the envp array.
+            }
+            let str_addr = Addr::<u8>::from_raw(ptr as usize).ok_or(Errno::EFAULT)?;
+            let s = memory.read_cstring(str_addr)?;
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+            count += 1;
+            cursor = cursor.checked_add(8).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok((count, digest::Digest::new(&buf)))
+    }
+
     fn display_syscall_finished<'a, M: MemoryAccess>(
         syscall: &'a Syscall,
         memory: &'a M,
@@ -1352,6 +1428,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
+        }
+
+        // Emit a hash of the guest's environment for cross-backend diffing. The
+        // read + hash is only performed when INFO logging (and thus DETLOG) is
+        // active, so it costs nothing in a normal run.
+        if tracing::enabled!(tracing::Level::INFO) {
+            self.detlog_guest_env(guest).await;
         }
 
         self.post_handler_hook(guest).await;
