@@ -48,6 +48,13 @@ if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
 fi
 grep -Fq 'NO_RESULT)' "$WORKFLOW" || fail "gate must handle NO_RESULT explicitly"
 grep -Fq 'dispatch_no_result' "$WORKFLOW" || fail "NO_RESULT must re-dispatch"
+grep -Fq 'queue_dispatch demo-hot-path-rerun' "$WORKFLOW" ||
+    fail "demo NO_RESULT must rerun the selected pull-request run"
+grep -Fq 'actions/runs/${run_id}/rerun' "$WORKFLOW" ||
+    fail "demo recovery must use the selected run ID"
+if grep -Fq 'queue_dispatch demo-hot-path.yml' "$WORKFLOW"; then
+    fail "workflow_dispatch demo runs are ineligible and must not be queued"
+fi
 grep -Fq 'cancel_no_result_gate' "$WORKFLOW" || fail "NO_RESULT must not exit red or green"
 grep -Fq '/force-cancel' "$WORKFLOW" || fail "if: always() gate requires force-cancel for NO_RESULT"
 grep -Fq 'GATE_RUN_ID' "$WORKFLOW" || fail "self-cancellation must identify the exact gate run"

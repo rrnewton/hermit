@@ -527,16 +527,18 @@ jobs:
 
           queue_dispatch() {
             local workflow=$1 head_ref=$2 head_repo=$3 pr_number=$4 head_sha=$5
+            local run_id=${6:-}
             no_result=1
             if [ "$head_repo" != "$REPO" ]; then
               echo "::warning::NO_RESULT for PR #$pr_number at $head_sha cannot be dispatched from external head repository $head_repo."
               return
             fi
-            printf '%s\t%s\t%s\t%s\n' "$workflow" "$head_ref" "$pr_number" "$head_sha" >>"$dispatch_file"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$workflow" "$head_ref" "$pr_number" "$head_sha" "$run_id" >>"$dispatch_file"
           }
 
           dispatch_no_result() {
-            sort -u "$dispatch_file" | while IFS=$'\t' read -r workflow head_ref pr_number head_sha; do
+            sort -u "$dispatch_file" | while IFS=$'\t' read -r workflow head_ref pr_number head_sha run_id; do
               [ -n "$workflow" ] || continue
               echo "NO_RESULT: re-dispatching $workflow for PR #$pr_number at $head_sha (ref=$head_ref)."
               case "$workflow" in
@@ -544,9 +546,13 @@ jobs:
                   gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref" \
                     -f pr_number="$pr_number"
                   ;;
-                demo-hot-path.yml)
-                  gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref" \
-                    -f sha="$head_sha"
+                demo-hot-path-rerun)
+                  if [ -z "$run_id" ]; then
+                    echo "::warning::No pull-request demo run exists to rerun for PR #$pr_number at $head_sha."
+                    continue
+                  fi
+                  gh api --method POST \
+                    "repos/${REPO}/actions/runs/${run_id}/rerun" --silent
                   ;;
                 *)
                   gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref"
@@ -781,6 +787,7 @@ jobs:
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
+              demo_run_id="$(jq -r '.id // ""' <<< "$demo_run")"
               demo_state=$(classify_check "$demo_status" "$demo_conclusion")
               case "$demo_state" in
                 PASSED)
@@ -792,7 +799,8 @@ jobs:
                   ;;
                 NO_RESULT)
                   echo "P0 demo gate has NO_RESULT for hot-path PR #${pr_number} at $head_sha ($demo_status/${demo_conclusion:-none})."
-                  queue_dispatch demo-hot-path.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+                  queue_dispatch demo-hot-path-rerun "$head_ref" "$head_repo" \
+                    "$pr_number" "$head_sha" "$demo_run_id"
                   ;;
               esac
             else
