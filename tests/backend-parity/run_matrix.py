@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import os
+import re
 import signal
 from pathlib import Path
 import shutil
@@ -18,6 +20,7 @@ import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIR.parent.parent
 MATRIX_PATH = SCRIPT_DIR / "matrix.tsv"
+README_PATH = SCRIPT_DIR / "README.md"
 BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
 
@@ -681,6 +684,124 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
         writer.writerows(results)
 
 
+# Human-facing backend labels for the generated README scorecard tables.
+BACKEND_LABELS = {"ptrace": "ptrace", "dbi": "DBI", "kvm": "KVM"}
+
+# The README scorecard tables are a pure projection of matrix.tsv, so they are
+# generated rather than hand-maintained: the corpus denominator shifts whenever
+# any parity pair is ratcheted, which used to make every open parity PR conflict
+# with main on these counts (and picking a side could ship a WRONG number). The
+# counts now live in exactly one place -- matrix.tsv -- and each table body below
+# is rendered between BEGIN/END GENERATED markers. Regenerate with
+# `run_matrix.py --emit-readme`; `--check-readme` (and `--check`) fail if the
+# committed README does not match, so a stale or wrong count cannot land.
+README_GENERATED_BLOCKS = ("parity-scorecard-l1", "parity-scorecard-l2")
+
+
+def l2_kind_label(detlog: int, guest: int) -> str:
+    """Describe the L2 assurance kind from the observed detlog/guest split.
+
+    The label is derived from the actual per-backend counts, not hardcoded, so
+    it always carries the condition it reports: an all-DETLOG column reads
+    "DETLOG-bitwise", an all-guest column reads "guest-visible only", and a mix
+    (not currently reachable given L2_ALLOWED) is reported honestly as both.
+    """
+    if detlog and guest:
+        return "DETLOG-bitwise + guest-visible"
+    if detlog:
+        return "DETLOG-bitwise"
+    if guest:
+        return "guest-visible only"
+    return "none"
+
+
+def scorecard_tables(rows: list[dict[str, str]]) -> dict[str, str]:
+    """Render the README scorecard table bodies from the validated matrix."""
+    baseline = sum(row["ptrace"] == "pass" for row in rows)
+
+    l1_lines = [
+        "| Backend | Passing pairs | Parity vs ptrace |",
+        "| --- | ---: | ---: |",
+    ]
+    for backend in BACKENDS:
+        passing = sum(row[backend] == "pass" for row in rows)
+        l1_lines.append(
+            f"| {BACKEND_LABELS[backend]} | {passing}/{baseline} "
+            f"| {passing / baseline:.0%} |"
+        )
+
+    l2_lines = [
+        "| Backend | Verified pairs | L2 kind | Parity vs ptrace |",
+        "| --- | ---: | --- | ---: |",
+    ]
+    for backend in BACKENDS:
+        detlog = sum(row[f"{backend}_l2"] == "detlog" for row in rows)
+        guest = sum(row[f"{backend}_l2"] == "guest" for row in rows)
+        verified = detlog + guest
+        l2_lines.append(
+            f"| {BACKEND_LABELS[backend]} | {verified}/{baseline} "
+            f"| {l2_kind_label(detlog, guest)} | {verified / baseline:.0%} |"
+        )
+
+    return {
+        "parity-scorecard-l1": "\n".join(l1_lines),
+        "parity-scorecard-l2": "\n".join(l2_lines),
+    }
+
+
+def render_readme(text: str, tables: dict[str, str]) -> str:
+    """Return README text with each generated block replaced by fresh output."""
+    for slug in README_GENERATED_BLOCKS:
+        body = tables[slug]
+        pattern = re.compile(
+            r"(<!-- BEGIN GENERATED: " + re.escape(slug) + r"[^\n]*-->\n)"
+            r".*?"
+            r"(<!-- END GENERATED: " + re.escape(slug) + r" -->)",
+            re.DOTALL,
+        )
+        if pattern.search(text) is None:
+            raise MatrixError(
+                f"{README_PATH} is missing the '{slug}' generated markers; "
+                f"expected '<!-- BEGIN GENERATED: {slug} ... -->' and "
+                f"'<!-- END GENERATED: {slug} -->'"
+            )
+        text = pattern.sub(lambda match: match.group(1) + body + "\n" + match.group(2), text)
+    return text
+
+
+def sync_readme(check_only: bool) -> int:
+    """Regenerate (or verify) the README scorecard from matrix.tsv.
+
+    read_matrix() has already validated the matrix, so the tables cannot be
+    rendered from an inconsistent source. In check mode a mismatch prints a
+    unified diff and returns non-zero; in emit mode the README is rewritten.
+    """
+    rows = read_matrix()
+    tables = scorecard_tables(rows)
+    original = README_PATH.read_text(encoding="utf-8")
+    updated = render_readme(original, tables)
+    if check_only:
+        if updated != original:
+            diff = difflib.unified_diff(
+                original.splitlines(keepends=True),
+                updated.splitlines(keepends=True),
+                fromfile="README.md (committed)",
+                tofile="README.md (from matrix.tsv)",
+            )
+            sys.stderr.write("".join(diff))
+            raise MatrixError(
+                "backend-parity README scorecard is out of date with matrix.tsv; "
+                "regenerate with `run_matrix.py --emit-readme`"
+            )
+        return 0
+    if updated != original:
+        README_PATH.write_text(updated, encoding="utf-8")
+        print(f"updated {README_PATH}")
+    else:
+        print(f"{README_PATH} already up to date")
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -693,7 +814,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="validate the matrix and print ratchet rates without running guests",
+        help=(
+            "validate the matrix, print ratchet rates, and verify the README "
+            "scorecard matches matrix.tsv, all without running guests"
+        ),
+    )
+    parser.add_argument(
+        "--emit-readme",
+        action="store_true",
+        help=(
+            "regenerate the README scorecard tables from matrix.tsv in place "
+            "(the counts are a generated artifact, not hand-maintained)"
+        ),
+    )
+    parser.add_argument(
+        "--check-readme",
+        action="store_true",
+        help=(
+            "verify the committed README scorecard matches matrix.tsv without "
+            "running guests; exits non-zero with a diff when stale"
+        ),
     )
     parser.add_argument(
         "--hermit",
@@ -733,6 +873,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     rows = read_matrix()
+    # README scorecard generation/verification is a pure projection of the
+    # (already validated) matrix and needs neither a hermit binary nor backends.
+    if args.emit_readme:
+        return sync_readme(check_only=False)
+    if args.check_readme:
+        return sync_readme(check_only=True)
     backends = args.backends or list(BACKENDS)
     # --verify is the L2 lift and presupposes strict mode (L2 = --strict
     # --verify); enable strict implicitly so callers can ask for L2 with one flag.
@@ -758,7 +904,9 @@ def main() -> int:
             f"({verified / baseline:.1%}) [detlog={detlog} guest-visible={guest}]"
         )
     if args.check:
-        return 0
+        # A stale or wrong hand-typed count cannot pass --check: the scorecard
+        # is verified against matrix.tsv here.
+        return sync_readme(check_only=True)
 
     hermit = args.hermit.resolve()
     if not hermit.is_file() or not os.access(hermit, os.X_OK):

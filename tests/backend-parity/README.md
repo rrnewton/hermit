@@ -12,21 +12,29 @@ The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the L2
 ratchet (`--strict --verify`, hermit's own double-run bitwise comparison) are
 tracked separately, because a contract can hold at L1 yet not at L2.
 
+The two tables below are generated from `matrix.tsv` by
+`run_matrix.py --emit-readme` and verified by `run_matrix.py --check-readme` (and
+by `--check`); do not hand-edit the rows between the `GENERATED` markers.
+
 L1 (`hermit run --strict`):
 
+<!-- BEGIN GENERATED: parity-scorecard-l1 (regenerate with `python3 tests/backend-parity/run_matrix.py --emit-readme`) -->
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
 | DBI | 27/28 | 96% |
 | KVM | 23/28 | 82% |
+<!-- END GENERATED: parity-scorecard-l1 -->
 
 L2 (`hermit run --strict --verify`):
 
+<!-- BEGIN GENERATED: parity-scorecard-l2 (regenerate with `python3 tests/backend-parity/run_matrix.py --emit-readme`) -->
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
 | ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBI | 26/28 | DETLOG-bitwise | 93% |
+| DBI | 27/28 | DETLOG-bitwise | 96% |
 | KVM | 22/28 | guest-visible only | 79% |
+<!-- END GENERATED: parity-scorecard-l2 -->
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG

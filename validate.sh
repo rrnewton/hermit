@@ -3787,6 +3787,10 @@ function run_ci_manifest_lane {
     local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+    # The backend-parity README scorecard is generated from matrix.tsv; fail the
+    # lane if the committed counts drift from the data (no backend/binary needed).
+    run_check "Backend parity README scorecard is generated from matrix.tsv" \
+        python3 tests/backend-parity/run_matrix.py --check-readme
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
         ./ci/run-dag.sh "$lane" -j "$jobs" -v
 }
