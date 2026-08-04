@@ -53,7 +53,8 @@
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound",
+               "preferred_inner_jobs": 16}
     },
     {
       "group": "build", "job": "sabre_release",
