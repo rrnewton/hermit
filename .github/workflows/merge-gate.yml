@@ -537,6 +537,18 @@ jobs:
               "$workflow" "$head_ref" "$pr_number" "$head_sha" "$run_id" >>"$dispatch_file"
           }
 
+          queue_hosted_retry() {
+            local status=$1
+            shift
+            case "$status" in
+              queued | in_progress | waiting | requested)
+                no_result=1
+                echo "NO_RESULT is still active ($status); completion will refire the gate."
+                ;;
+              *) queue_dispatch "$@" ;;
+            esac
+          }
+
           dispatch_no_result() {
             sort -u "$dispatch_file" | while IFS=$'\t' read -r workflow head_ref pr_number head_sha run_id; do
               [ -n "$workflow" ] || continue
@@ -732,6 +744,7 @@ jobs:
             priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
             priv_status="$(jq -r '.status // "missing"' <<< "$priv_run")"
             priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_run")"
+            priv_run_status=$priv_status
             priv_run_state=$(classify_check "$priv_status" "$priv_conclusion")
             priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
             priv_job_found=false
@@ -767,8 +780,10 @@ jobs:
               echo "Exact-head full local validation PASSED; it supplies the alternate leg for hosted NO_RESULT on PR #${pr_number}."
             else
               echo "Hosted validation has NO_RESULT for PR #${pr_number}: portable=$job_status/${job_conclusion:-none} privileged=$priv_status/${priv_conclusion:-none}."
-              [ "$portable_state" = PASSED ] || queue_dispatch ci-portable.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
-              [ "$privileged_state" = PASSED ] || queue_dispatch ci-privileged.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+              [ "$portable_state" = PASSED ] || queue_hosted_retry "$run_status" \
+                ci-portable.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
+              [ "$privileged_state" = PASSED ] || queue_hosted_retry "$priv_run_status" \
+                ci-privileged.yml "$head_ref" "$head_repo" "$pr_number" "$head_sha"
             fi
 
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
@@ -813,7 +828,7 @@ jobs:
                   ;;
                 NO_RESULT)
                   echo "P0 demo gate has NO_RESULT for hot-path PR #${pr_number} at $head_sha ($demo_status/${demo_conclusion:-none})."
-                  queue_dispatch demo-hot-path-rerun "$head_ref" "$head_repo" \
+                  queue_hosted_retry "$demo_status" demo-hot-path-rerun "$head_ref" "$head_repo" \
                     "$pr_number" "$head_sha" "$demo_run_id"
                   ;;
               esac

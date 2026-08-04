@@ -16,10 +16,10 @@
 #      ci-red, detached-base, pending).
 #   2. Builds the dependency DAG from branch stacking: PR X depends on PR Y when
 #      X's base branch is Y's head branch.
-#   3. Checks per-PR health: can it merge onto its base (no conflicts), and is
-#      the meaningful CI job ("Regular tests (GitHub-managed portable)") green. The
-#      "Privileged capability and E2E tests" job is reported
-#      separately because it is not a landing gate.
+#   3. Checks per-PR health: can it merge onto its base (no conflicts), and did
+#      the repository's authoritative merge-gate context pass. Portable and
+#      privileged jobs remain visible as diagnostics; Hermit's hosted leg
+#      requires both unless an exact-head local receipt supplies its alternate.
 #   4. Ranks review priority: "Review PR #X -> releases N PRs from floating to
 #      landed", where N is the size of X's dependent subtree.
 #   5. For floating (non-main-based) PRs, checks whether the PR's own commits
@@ -79,6 +79,8 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
 [ -n "$RAW" ] || die "gh returned no data"
 RAW="$(printf '%s' "$RAW" | python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups)" \
     || die "check-status annotation failed"
+GATE_CONTEXT=merge-gate
+[[ $REPO == rrnewton/hermit ]] && GATE_CONTEXT=merge-gate-v4
 
 # ---------------------------------------------------------------------------
 # Enrich each PR and build the dependency DAG (jq). Emits an array of PRs, each
@@ -94,7 +96,7 @@ def latest_named($rollup; $name):
    | first);
 def ci_of($rollup):
   ($rollup // []) as $r
-  | latest_named($r; "merge-gate-v4") as $gate
+  | latest_named($r; $gate_context) as $gate
   | latest_named($r; "Regular tests (GitHub-managed portable)") as $regular
   | latest_named($r; "Privileged capability and E2E tests") as $hostdep
   | { checks: ($r|length),
@@ -142,7 +144,8 @@ def ci_of($rollup):
          blocked_on_human_review, releases, released_prs, class})
 '
 
-ENRICHED="$(printf '%s' "$RAW" | jq -L "$SCRIPT_DIR" --arg main "$MAIN_BRANCH" "$ENRICH_JQ")" \
+ENRICHED="$(printf '%s' "$RAW" | jq -L "$SCRIPT_DIR" \
+    --arg main "$MAIN_BRANCH" --arg gate_context "$GATE_CONTEXT" "$ENRICH_JQ")" \
     || die "jq enrichment failed"
 
 # ---------------------------------------------------------------------------

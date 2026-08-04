@@ -46,8 +46,10 @@ grep -Fq '"rrnewton/hermit": ("merge-gate-v4",)' "$ROOT_DIR/scripts/pr_status.py
     fail "Hermit PR rollup must read the live versioned gate context"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "lander rollup must call the parent-authority adapter"
-grep -Fq 'latest_named($r; "merge-gate-v4")' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
-    fail "lander rollup must read the live versioned gate context"
+grep -Fq '[[ $REPO == rrnewton/hermit ]] && GATE_CONTEXT=merge-gate-v4' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "lander rollup must use Hermit's live versioned gate context"
+grep -Fq 'latest_named($r; $gate_context)' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "lander rollup must select the repository-specific gate context"
 grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "main-health rollup must select the latest check at the exact head"
 [[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||
@@ -63,8 +65,10 @@ if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
 fi
 grep -Fq 'NO_RESULT)' "$WORKFLOW" || fail "gate must handle NO_RESULT explicitly"
 grep -Fq 'dispatch_no_result' "$WORKFLOW" || fail "NO_RESULT must re-dispatch"
-grep -Fq 'queue_dispatch demo-hot-path-rerun' "$WORKFLOW" ||
+grep -Fq 'queue_hosted_retry "$demo_status" demo-hot-path-rerun' "$WORKFLOW" ||
     fail "demo NO_RESULT must rerun the selected pull-request run"
+grep -Fq 'queued | in_progress | waiting | requested)' "$WORKFLOW" ||
+    fail "active NO_RESULT runs must wait for workflow_run completion, not rerun"
 grep -Fq 'actions/runs/${run_id}/rerun' "$WORKFLOW" ||
     fail "demo recovery must use the selected run ID"
 if grep -Fq 'queue_dispatch demo-hot-path.yml' "$WORKFLOW"; then
