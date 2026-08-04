@@ -324,6 +324,14 @@ function assert_validate_entrypoint {
 # prove that those same fail-closed semantics cannot be bypassed by selecting a
 # different local, DAG, hosted-CI, merge-gate, or receipt path.
 function assert_reverie_pin_enforcement {
+    local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
+    grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
+        die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
+    ! grep -Fq 'main_sha' "$checker" ||
+        die "latest-Reverie checker must not accept a pre-recorded main SHA"
+    ! grep -Fq -- '--reverie-remote' "$checker" ||
+        die "production callers must not redirect the latest-Reverie authority"
+
     local dag
     for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
         jq -e '
@@ -348,6 +356,8 @@ function assert_reverie_pin_enforcement {
         die "portable CI must expose exactly one latest-Reverie job"
     [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
         die "the authoritative portable aggregate must depend on the Reverie pin job"
+    [[ $(grep -Fxc '          "$checker"' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical live-query checker"
     ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
         die "portable CI must not retain a stale-Reverie override"
 
@@ -356,6 +366,12 @@ function assert_reverie_pin_enforcement {
         die "merge-gate must check exact PR heads with the trusted pin checker"
     [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
         die "merge-gate must depend on its exact-head Reverie pin job"
+    grep -Fq 'trusted/scripts/check-reverie-pin.rs -o "$checker"' "$merge_workflow" ||
+        die "merge-gate must compile the checker from trusted main"
+    grep -Fq 'git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"' "$merge_workflow" ||
+        die "merge-gate must inspect the exact PR head"
+    grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
+        die "merge-gate must run the canonical live-query checker on the exact PR head"
 }
 
 function dag_critical_path_seconds {
