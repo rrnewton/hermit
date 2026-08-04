@@ -1030,11 +1030,54 @@ function append_validation_ledger {
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
 
-    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
-    # are additive; the parent ledger aggregator reads via .get() and is
-    # unaffected until it is taught to surface them. (warm-vs-cold is already
-    # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    # executed_tests / filtered_tests: the two counts a GREEN must CARRY to be
+    # trusted for landing. The parent consumer (ci-hub validate_status.rs
+    # is_clean_full_pass) admits a full-profile pass only when
+    # executed_tests == Some(n>0) AND filtered_tests == Some(0); a receipt that
+    # OMITS either is refused as an unqualified claim (an absent count is worse
+    # than a demonstrated zero -- a zero-test run at least logs `running 0 tests`,
+    # greppable; an absent count leaves nothing to catch). Single-sourced from the
+    # parent's nonzero_result.py --ledger-fields extractor over this run's own log,
+    # so this writer carries NO second `running N tests` / `N filtered out` regex
+    # that could drift from the reader. Emitted as JSON literals: an integer, or
+    # `null` for UNKNOWN. Standalone Hermit with no dev-hermit parent normally
+    # writes no ledger at all (VALIDATION_LEDGER_FILE empty -> early return above);
+    # if a caller forces one via HERMIT_VALIDATE_LEDGER, DEV_HERMIT_PARENT is empty
+    # so the extractor is unreachable and both counts stay `null` -- an honest
+    # UNKNOWN the reader treats fail-safe, NEVER a fabricated count. This writer
+    # deliberately carries no bash banner regex of its own, so it cannot emit a
+    # count without the single-source extractor having produced one.
+    local executed_tests_json=null filtered_tests_json=null
+    local ledger_counts extracted_executed extracted_filtered
+    local nonzero_extractor="$DEV_HERMIT_PARENT/ci-hub/remediation/nonzero_result.py"
+    if [[ -n $DEV_HERMIT_PARENT && -f $nonzero_extractor && -f $LOG_FILE ]] \
+        && command -v python3 >/dev/null 2>&1 \
+        && ledger_counts=$(python3 "$nonzero_extractor" --ledger-fields "$LOG_FILE" 2>/dev/null); then
+        read -r extracted_executed extracted_filtered <<<"$ledger_counts"
+        # Accept ONLY a JSON integer or the literal `null`. Anything else (a
+        # changed extractor contract, a truncated read) leaves the field `null`,
+        # so the record is never malformed JSON nor a fabricated number.
+        [[ $extracted_executed == null || $extracted_executed =~ ^[0-9]+$ ]] \
+            && executed_tests_json=$extracted_executed
+        [[ $extracted_filtered == null || $extracted_filtered =~ ^[0-9]+$ ]] \
+            && filtered_tests_json=$extracted_filtered
+    fi
+
+    # schema_version 5 is the first CLEAN "counts present" anchor: it declares
+    # that this writer is COUNT-CAPABLE and therefore emits executed_tests and
+    # filtered_tests unconditionally (as fields; the value is a JSON integer, or
+    # `null` for a genuinely UNKNOWN count). 1/2/3 predate the counts and 4 is
+    # already contaminated in the ledger with null-count rows, so neither can key
+    # "this receipt can prove coverage" -- see the transition-design note
+    # (count-schema-tightening-transition). The consumer
+    # (ci-hub validate_status.rs is_clean_full_pass) keys strictness on
+    # `schema_version >= COUNTS_SCHEMA (=5) || counts_present`: at schema 5 a
+    # receipt that emits `null` counts (a producer bug, or a no-banner run) is
+    # still routed to STRICT and refused -- the version escalator closes exactly
+    # the hole that pure presence-keying leaves open. All fields remain additive;
+    # the aggregator reads via .get() and is unaffected until taught to surface
+    # them. (warm-vs-cold is already recorded as cache_state, not duplicated here.)
+    line="{\"schema_version\":5,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
@@ -1045,6 +1088,7 @@ function append_validation_ledger {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
