@@ -1590,31 +1590,12 @@ function hermit_run_smoke {
     fi
 }
 
-function hermit_determinism_check {
-    local first_output
-    local second_output
-    local status
-
-    first_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    second_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    if [[ "$first_output" != "$second_output" ]]; then
-        echo "Hermit stdout differed between identical runs:" >&2
-        diff -u \
-            <(printf "%s\n" "$first_output") \
-            <(printf "%s\n" "$second_output") >&2 || true
-        return 1
-    fi
-}
+# NOTE: a former `hermit_determinism_check` reimplemented determinism checking in
+# bash (run the guest twice, string-compare stdout). That duplicated the shipped
+# `hermit run --verify` path and only compared stdout, so it could pass while the
+# product's own verifier (which also compares stderr, the DETLOG event stream, and
+# exit status) diverged. It was removed; `hermit_verify_smoke` below is the
+# product-backed determinism check for the same echo workload.
 
 function hermit_verify_smoke {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
@@ -1623,21 +1604,14 @@ function hermit_verify_smoke {
 }
 
 function hermit_record_replay_smoke {
-    local case_dir="$VALIDATION_TMP_DIR/record-smoke"
-    local data_dir="$case_dir/recording"
-    local record_stdout="$case_dir/record.stdout"
-    local replay_stdout="$case_dir/replay.stdout"
-
-    rm -rf "$case_dir"
-    mkdir -p "$case_dir"
+    # Delegate to the shipped record/replay verifier instead of reimplementing it
+    # in bash. `record start --verify` records the guest, replays the recording,
+    # and diffs stdout, stderr, the DETLOG event stream, and exit status, failing
+    # nonzero on any divergence. The former bash version only recorded (without
+    # --verify), replayed with --autopilot, and `cmp`-ed stdout, so it exercised a
+    # strictly weaker check than the product actually ships.
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" record start --data-dir "$data_dir" -- \
-        /bin/echo "$SMOKE_MARKER" >"$record_stdout" || return
-    timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" replay --autopilot --data-dir "$data_dir" \
-        >"$replay_stdout" || return
-    grep -Fxq "$SMOKE_MARKER" "$record_stdout" &&
-        cmp -s "$record_stdout" "$replay_stdout"
+        "$HERMIT_BIN" record start --verify -- /bin/echo "$SMOKE_MARKER"
 }
 
 function kvm_backend_available {
@@ -2136,22 +2110,18 @@ function rr_compatibility_probe {
     fi
 
     local case_dir="$VALIDATION_TMP_DIR/rr-$label"
-    local data_dir="$case_dir/recording"
     local started_at=$SECONDS
     local output_start
-    local record_status
-    local replay_status=125
-    local stdout_equal=no
+    local verify_status
     local summary
 
     RR_COMPAT_TOTAL=$((RR_COMPAT_TOTAL + 1))
     mkdir -p "$case_dir"
     {
         printf "=== R/R compatibility: %s ===\n" "$label"
-        printf "Record:"
-        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-        printf "\nReplay: %q replay --autopilot --data-dir %q\n" \
-            "$STRICT_COMPAT_HERMIT_BIN" "$data_dir"
+        printf "Verify:"
+        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --verify -- "$@"
+        printf "\n"
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
@@ -2159,25 +2129,23 @@ function rr_compatibility_probe {
         printf "  R/R compatibility probe: %s\n" "$label"
     fi
 
-    run_rr_compatibility_phase "$case_dir/record.stdout" "$case_dir/record.stderr" \
-        "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-    record_status=$?
-    if ((record_status == 0)); then
-        run_rr_compatibility_phase "$case_dir/replay.stdout" "$case_dir/replay.stderr" \
-            "$STRICT_COMPAT_HERMIT_BIN" replay --autopilot --data-dir "$data_dir"
-        replay_status=$?
-        if cmp -s "$case_dir/record.stdout" "$case_dir/replay.stdout"; then
-            stdout_equal=yes
-        else
-            diff -u "$case_dir/record.stdout" "$case_dir/replay.stdout" \
-                >"$case_dir/stdout.diff" || true
-        fi
-    fi
+    # Use the shipped record/replay verifier as the single source of truth for
+    # this probe. `record start --verify` records the guest, replays the
+    # recording, and diffs stdout, stderr, the DETLOG event stream, and exit
+    # status; a nonzero exit means any of those diverged. The previous bash logic
+    # recorded WITHOUT --verify, replayed with --autopilot, and only `cmp`-ed
+    # stdout, so it exercised a strictly weaker check than Hermit ships and could
+    # report R/R "PASS" while stderr, the DETLOG event stream, or the exit status
+    # actually diverged. Delegating here keeps the ratchet honest against the
+    # product's own verifier.
+    run_rr_compatibility_phase "$case_dir/verify.stdout" "$case_dir/verify.stderr" \
+        "$STRICT_COMPAT_HERMIT_BIN" record start --verify -- "$@"
+    verify_status=$?
 
-    if ((record_status == 0 && replay_status == 0)) && [[ $stdout_equal == yes ]]; then
+    if ((verify_status == 0)); then
         RR_COMPAT_PASSED=$((RR_COMPAT_PASSED + 1))
         printf "  ✅ %-12s PASS R/R (%ss)\n" "$label" "$((SECONDS - started_at))"
-        printf "Record exit: 0\nReplay exit: 0\nStdout equal: yes\n\n" >>"$LOG_FILE"
+        printf "Verify exit: 0\n\n" >>"$LOG_FILE"
         rm -rf "$case_dir"
         return 0
     fi
@@ -2189,25 +2157,20 @@ function rr_compatibility_probe {
         printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
     fi
     {
-        printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
-            "$record_status" "$replay_status" "$stdout_equal"
-        if [[ -s $case_dir/record.stderr ]]; then
-            printf '%s\n' "--- record stderr ---"
-            tail -n 120 "$case_dir/record.stderr"
+        printf "Verify exit: %s\n" "$verify_status"
+        if [[ -s $case_dir/verify.stdout ]]; then
+            printf '%s\n' "--- verify stdout ---"
+            tail -n 120 "$case_dir/verify.stdout"
         fi
-        if [[ -s $case_dir/replay.stderr ]]; then
-            printf '%s\n' "--- replay stderr ---"
-            tail -n 120 "$case_dir/replay.stderr"
-        fi
-        if [[ -s $case_dir/stdout.diff ]]; then
-            printf '%s\n' "--- stdout diff ---"
-            sed -n '1,120p' "$case_dir/stdout.diff"
+        if [[ -s $case_dir/verify.stderr ]]; then
+            printf '%s\n' "--- verify stderr ---"
+            tail -n 120 "$case_dir/verify.stderr"
         fi
         printf "\n"
     } >>"$LOG_FILE"
     summary=$(failure_summary "$output_start")
-    printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
-        "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
+    printf "  ❌ %-12s FAIL R/R (verify %s: %s)\n" \
+        "$label" "$verify_status" "$summary"
     return 0
 }
 
@@ -4002,7 +3965,6 @@ function run_quick_suite {
         ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
-    run_check "Hermit output determinism" hermit_determinism_check
     run_check "Hermit verify-mode smoke test" hermit_verify_smoke
     run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
 }
