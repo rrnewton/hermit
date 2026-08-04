@@ -206,7 +206,7 @@ jobs:
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
           gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
             --jq .content | tr -d '\n' | base64 --decode >"$verifier"
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
@@ -465,7 +465,7 @@ jobs:
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
           gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
             --jq .content | tr -d '\n' | base64 --decode >"$verifier"
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
@@ -474,7 +474,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42
+          ref: 4b78d727f35bc8612ac460a6e270dda5f5df304c
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require a passed result or re-dispatch a no-result check

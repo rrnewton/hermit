@@ -19,7 +19,7 @@ fail() {
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
-grep -Fq 'ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42' "$WORKFLOW" ||
+grep -Fq 'ref: 4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
 grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
