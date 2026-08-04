@@ -34,6 +34,23 @@ and the correspondence audit proves that this cannot hide a calibrated cell.
 Every entry still declares all five modes and every backend exclusion, so
 inventory does not silently imply support.
 
+## Matrix symmetry and the test front door
+
+Compatibility coverage enters through these shared schema-v2 manifests, not
+through a backend-owned guest list. Every test declares all five modes, and
+every non-naked mode partitions the complete `ptrace`, `dbi`, `kvm`, `sabre`,
+and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
+include ptrace so the reference behavior is established before another backend
+ratchets it.
+
+`ci/matrix-symmetry-baseline.json` records the small amount of older policy
+debt: ptrace-less manifest rows and guest fixtures owned by a backend-specific
+or legacy backend-parity driver. `hermit-manifest-plan` requires that baseline
+to match exactly, so private corpora cannot grow. Migrating a baseline entry to
+a shared manifest is allowed, but the same change must remove it from the
+baseline. This makes the shared test identity the row axis; backend support or
+gaps remain cells of that one row rather than creating backend-private rows.
+
 ## Schema contract
 
 Every `[[test]]` names either a repo-relative `program` or a `direct` shell
@@ -70,6 +87,21 @@ The mode contracts are:
 | `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
+
+An enabled `verify` cell records backend-local L2 support under the manifest's
+declared status/stdout/stderr/artifact observation. It is not, by itself, a
+full cross-backend parity claim. Full parity additionally requires matching the
+complete INFO trace, `--detlog-stack`, and `--detlog-heap` between backends.
+
+An enabled SaBRe cell has an additional execution-path contract. Every E2E
+Hermit execution writes structured evidence into the cell capture: the
+in-guest tool must have issued a coordinator RPC, and both
+`ptrace_fallback_sites` and `trusted_shared_object_sites` must be zero. A
+ptrace-installed SaBRe marker is
+classified as fallback; a raw syscall observed in a trusted shared object is
+classified as native execution outside the measured SaBRe path. Either makes
+the cell fail even when status and stdout match. The JSONL result retains the
+per-execution records and aggregate eligibility under `execution_path`.
 
 Any mode may declare backend-specific guest arguments. The harness appends
 these after the guest executable, separately from Hermit's own arguments:

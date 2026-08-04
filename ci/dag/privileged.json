@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"pmu": 1, "kvm": 1},
+  "resource_caps": {"kvm": 1},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -30,13 +30,13 @@
       "cmd": "cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
       "deps": ["build.privileged_tests"],
       "timeout": 30,
-      "hint": {"resources": {"pmu": 1}, "est_duration_s": 5,
+      "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "cpu-bound"}
     },
     {
       "group": "e2e", "job": "metadata",
-      "desc": "Validate multi-mode E2E metadata and required-cell plan",
+      "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
       "timeout": 20,
       "hint": {"est_duration_s": 5,

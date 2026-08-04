@@ -91,9 +91,13 @@ function validation_slot_name {
 #                                            # first (ci/run-dag.sh <lane>).
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
-# Every foreground/background gate has a process-tree timeout. Override the
+# Every foreground/background gate has a process-tree WALL timeout. Override the
 # profile default with VALIDATE_GATE_TIMEOUT_SECONDS; tune TERM-to-KILL grace
-# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS.
+# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS. A gate may ALSO be given a
+# load-immune CPU-time budget with VALIDATE_GATE_CPU_TIMEOUT_SECONDS (0=off, the
+# default): the gate is killed once its process-tree CPU (user+sys) crosses the
+# budget, catching hangs that burn CPU (e.g. a reap/futex spin) regardless of
+# machine load, while the wall timeout remains the backstop for idle-stuck gates.
 # A fully-green full run labels the current PR `locally-validated` by default.
 # PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
@@ -132,6 +136,10 @@ PRIVILEGED_ONLY=0
 ONLY_MODE=0
 ONLY_LANE=""
 ONLY_NODES=""
+SELECTIVE_MODE=0
+SELECTIVE_BASELINE=""
+RUN_ON_DIRTY_TREE=0
+[[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -166,6 +174,11 @@ while [[ $# -gt 0 ]]; do
         --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
+        --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --baseline)
+            SELECTIVE_BASELINE=${2:-}
+            [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
+            shift 2 ;;
         --only)
             ONLY_LANE=${2:-}; ONLY_NODES=${3:-}
             if [[ -z $ONLY_LANE || -z $ONLY_NODES ]]; then
@@ -174,6 +187,7 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             ONLY_MODE=1; shift 3 ;;
+        --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -208,19 +222,33 @@ Focused gates (run one matrix/lane and exit):
   --privileged-only             PMU/CPUID-dependent tests only.
   --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps) against the already-built
                                 tree; build first with ci/run-dag.sh <lane>.
+  --selective, --since-green    Run only the portable DAG nodes affected by changes
+                                since the last known-green baseline (fail-safe: any
+                                doubt or no trustworthy baseline runs the full lane).
+  --baseline <sha>              Known-green baseline commit for --selective (else
+                                $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
+  --run-on-dirty-tree  Escape hatch: run despite uncommitted changes. AGENTS SHOULD
+                   NOT USE THIS. By default a dirty working tree is a hard error,
+                   because a result validated against uncommitted changes describes
+                   a tree that exists nowhere in history and cannot be reproduced
+                   or compared. A run forced with this flag is recorded as
+                   NOT-commit-anchored (commit_anchored=false) and never applies
+                   the `locally-validated` label.
   --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
   --no-label-pr    Disable the non-fatal GitHub label update.
   -h, --help       Show this help and exit.
 
 Environment:
   VALIDATE_LEVEL=quick|portable-only|full|super  Select the level.
-  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree timeout.
+  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree WALL timeout.
+  VALIDATE_GATE_CPU_TIMEOUT_SECONDS=N            Per-gate CPU-time budget (user+sys, whole tree); 0=off (default).
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
+  VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -248,6 +276,7 @@ only_modes=0
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
 ((ONLY_MODE == 1)) && ((only_modes += 1))
+((SELECTIVE_MODE == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -267,24 +296,14 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
 ((ONLY_MODE == 1)) && VALIDATION_PROFILE="only-$ONLY_LANE"
+((SELECTIVE_MODE == 1)) && VALIDATION_PROFILE="selective"
 
-case "$VALIDATION_PROFILE" in
-    quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
-    portable-only) VALIDATION_ESTIMATE="about 8 minutes" ;;
-    full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
-    super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
-    strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    portable-strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
-    sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
-    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
-    liteinst-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
-    privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
-    envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
-    only-*) VALIDATION_ESTIMATE="one prebuilt DAG shard" ;;
-esac
-readonly VALIDATION_ESTIMATE
+# The runtime estimate is NOT a hand-written static guess anymore (a fabricated
+# range is exactly the cost-blindness we want to avoid). It is measured from this
+# machine's own validate-run history for the SAME profile and the SAME build-cache
+# state (warm/cold target/ dominates wall time), computed at banner time by
+# history_estimate below. When history is too thin the banner says so honestly
+# instead of printing an invented range.
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -309,10 +328,27 @@ fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
 VERBOSE_INTERVAL_SECONDS=${VALIDATE_VERBOSE_INTERVAL_SECONDS:-10}
+# Per-gate CPU-time budget (user+sys across the whole process tree), a load-immune
+# companion to the wall timeout above. Default 0 = disabled: no per-gate CPU
+# budget is HAND-WRITTEN here because there is no measured per-gate CPU history to
+# justify a specific value, and a fabricated constant is exactly the cost-blindness
+# this file avoids elsewhere. The mechanism ships enabled-by-opt-in; a data-derived
+# default (round(max_cpu*1.5), >=5 samples) can be set once the ledger accumulates
+# per-gate CPU history, mirroring the DAG-node cpu_timeout derivation.
+default_gate_cpu_timeout_seconds=0
+GATE_CPU_TIMEOUT_SECONDS=${VALIDATE_GATE_CPU_TIMEOUT_SECONDS:-$default_gate_cpu_timeout_seconds}
 if [[ ! $GATE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_GATE_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 2
 fi
+if [[ ! $GATE_CPU_TIMEOUT_SECONDS =~ ^[0-9]+$ ]]; then
+    echo "validate.sh: VALIDATE_GATE_CPU_TIMEOUT_SECONDS must be a non-negative integer (0 disables)" >&2
+    exit 2
+fi
+# Clock ticks per second, needed to convert /proc/<pid>/stat utime+stime into
+# seconds. Cached once; falls back to the near-universal 100 if getconf is absent.
+CLK_TCK_CACHED=$(getconf CLK_TCK 2>/dev/null || echo 100)
+[[ $CLK_TCK_CACHED =~ ^[1-9][0-9]*$ ]] || CLK_TCK_CACHED=100
 if [[ ! $TIMEOUT_KILL_GRACE_SECONDS =~ ^[0-9]+$ ]]; then
     echo "validate.sh: VALIDATE_TIMEOUT_KILL_GRACE_SECONDS must be a non-negative integer" >&2
     exit 2
@@ -321,13 +357,15 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_VERBOSE_INTERVAL_SECONDS must be a positive integer" >&2
     exit 2
 fi
-readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
+readonly VERBOSE GATE_TIMEOUT_SECONDS GATE_CPU_TIMEOUT_SECONDS CLK_TCK_CACHED
+readonly TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
+VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
 DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
 VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
 VALIDATION_LEDGER_FILE=${HERMIT_VALIDATE_LEDGER:-}
@@ -343,9 +381,79 @@ if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
         git rev-list --left-right --count origin/main...HEAD 2>/dev/null || printf "0 0\n"
     )
 fi
-readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH DEV_HERMIT_PARENT
+
+# Commit anchoring: VALIDATION_COMMIT faithfully names what ran only when the
+# tree exactly matches HEAD. Otherwise the record would be misattributed to a
+# HEAD that never actually ran, and selection baselines, green-time, and
+# speculative-land verification -- all of which join on the SHA -- would compare
+# against a tree that exists nowhere in history. Detect once, up front, before
+# any gate mutates build outputs (which live under gitignored target/, so they
+# do not themselves make the tree dirty).
+#
+# Two distinct notions, both recorded honestly:
+#   tree_dirty      = the tree differs from HEAD in ANY way (staged or not). This
+#                     is the porcelain-nonempty condition and drives anchoring.
+#   worktree_dirty  = the WORKING TREE proper carries changes that `git add`
+#                     would capture: unstaged edits to tracked files, or untracked
+#                     files. This drives the hard gate, because staging WIP (or
+#                     committing) is the caller's escape from it.
+# Outside a git repo VALIDATION_COMMIT is "unknown" and both probes are empty, so
+# the run is simply "not anchored" rather than "dirty".
+if [[ -n "$(git status --porcelain 2>/dev/null || printf "")" ]]; then
+    VALIDATION_TREE_DIRTY=1
+else
+    VALIDATION_TREE_DIRTY=0
+fi
+VALIDATION_WORKTREE_DIRTY=0
+if ! git diff --quiet 2>/dev/null; then
+    VALIDATION_WORKTREE_DIRTY=1
+elif [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null || printf "")" ]]; then
+    VALIDATION_WORKTREE_DIRTY=1
+fi
+if [[ $VALIDATION_COMMIT != unknown ]] && ((VALIDATION_TREE_DIRTY == 0)); then
+    VALIDATION_COMMIT_ANCHORED=1
+else
+    VALIDATION_COMMIT_ANCHORED=0
+fi
+# Selection mode: whether this run validated the whole configured lane or only an
+# affected/explicit subset. Recorded separately from the profile so the ledger
+# distinguishes a partial run from a complete one (selection is only sound on a
+# complete commit, so a subset run must never masquerade as full coverage).
+if ((SELECTIVE_MODE == 1)); then
+    VALIDATION_SELECTION_MODE=selective
+elif ((ONLY_MODE == 1)); then
+    VALIDATION_SELECTION_MODE=only
+else
+    VALIDATION_SELECTION_MODE=full
+fi
+readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
 readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
+readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
+readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
+
+# Refuse to run on a dirty working tree so no validation record is silently
+# misattributed to a HEAD that never ran. The caller's escapes are, in order of
+# preference: commit (fully anchored), stage the WIP with `git add` (captured and
+# runnable; the record is still commit_anchored=false because HEAD does not yet
+# contain it), or force with --run-on-dirty-tree / VALIDATE_RUN_ON_DIRTY_TREE=1
+# (agents must not). A forced run is likewise stamped commit_anchored=false. This
+# gate runs before the validation tmp dir and EXIT trap are established, so a
+# refused run leaves no partial state behind.
+if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
+    {
+        printf "validate.sh: refusing to run on a dirty working tree.\n"
+        printf "  HEAD %s has uncommitted changes in the working tree, so a\n" "$VALIDATION_COMMIT"
+        printf "  validation record anchored to it would describe a tree that exists\n"
+        printf "  nowhere in history and cannot be reproduced or compared. Commit your\n"
+        printf "  changes (preferred), or at least stage the WIP with 'git add' so it\n"
+        printf "  is captured, then re-run. To force an explicitly unanchored run pass\n"
+        printf "  --run-on-dirty-tree (VALIDATE_RUN_ON_DIRTY_TREE=1) -- agents must not.\n"
+        printf "  Working-tree changes:\n"
+        git status --short 2>/dev/null | sed 's/^/    /'
+    } >&2
+    exit 2
+fi
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
 if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
@@ -356,12 +464,34 @@ host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1
 if [[ ! $host_cpus =~ ^[1-9][0-9]*$ ]]; then
     host_cpus=1
 fi
+
+# Default scheduler width for the CI DAG lanes (`./ci/run-dag.sh -j N`).
+# SINGLE SOURCE OF TRUTH: every run-dag.sh invocation below reads
+# ${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}; do not re-hardcode the fallback (it lived
+# in two places as `:-2` and drifted). Override per run with the CI_DAG_JOBS env var.
+#
+# HOST-ADAPTIVE, capped at 16. The cap is measurement-backed, not a guess: on the
+# 316-CPU dev box the portable DAG measured CPU/wall 2.6x at -j2 (the old flat
+# default) vs ~21.8x at -j16 (target/perf-width-sweep/run-j16.log), and it becomes
+# critical-path-bound near width 16 (longest node ~106s + serial build spine), so
+# wider buys little wall while raising peak demand. But the SAME validate.sh runs
+# on GitHub's ubuntu-latest portable job (~4 CPU / 16 GiB); a flat 16 there would
+# schedule many 5-8 GiB build/e2e nodes at once (the runner sets no --max-mem, so
+# -j is a hard cap, not memory-gated) and OOM a job that -j2 kept green. Scaling
+# with host_cpus keeps ubuntu-latest at 2 while the big box reaches the measured 16.
+# host_cpus/8: 316->16(cap), 128->16, 64->8, 32->4, <=16->2(floor). Concurrency
+# budget on the dev box: lander runs one validate per active worktree slot (cap 12)
+# concurrently; 12 x ~22 effective cores/validate = 264 <= 316, fits.
+CI_DAG_JOBS_DEFAULT=$((host_cpus / 8))
+((CI_DAG_JOBS_DEFAULT < 2)) && CI_DAG_JOBS_DEFAULT=2
+((CI_DAG_JOBS_DEFAULT > 16)) && CI_DAG_JOBS_DEFAULT=16
+
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
     exit 2
 fi
-readonly SUPER_REPETITIONS SUPER_JOBS host_cpus
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -369,8 +499,44 @@ HOST_OS=${HOST_OS%\"}
 [[ -n $HOST_OS ]] || HOST_OS="unknown Linux"
 readonly HOST_OS
 
+# Cap the parallelism of the vendored third-party (DynamoRIO/elfutils) build.
+# The DAG build cells run `CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)}
+# cargo build ... --features third-party-backends`, and CARGO_BUILD_JOBS flows
+# through NUM_JOBS into reverie-dbi/build.rs as the cmake `--build --parallel N`
+# for the bundled DynamoRIO. On a many-core host nproc can be 300+, and an
+# unbounded `--parallel` drives the elfutils dependency scan into a
+# concurrency-exposed SIGABRT (core dump) roughly half the time -- an
+# ENVIRONMENTAL flake, not a Hermit defect (measured ~2/4 portable-only runs at
+# nproc=316). Cap the DEFAULT so that build is stable, while still honoring an
+# explicit THIRD_PARTY_BUILD_JOBS override. This bounds only the third-party
+# build cells; the main workspace build keeps full parallelism. Override the cap
+# itself with VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP.
+VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP=${VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP:-32}
+if [[ ! $VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP =~ ^[1-9][0-9]*$ ]]; then
+    VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP=32
+fi
+if [[ -z ${THIRD_PARTY_BUILD_JOBS:-} ]]; then
+    if ((host_cpus > VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP)); then
+        THIRD_PARTY_BUILD_JOBS=$VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
+    else
+        THIRD_PARTY_BUILD_JOBS=$host_cpus
+    fi
+fi
+export THIRD_PARTY_BUILD_JOBS
+readonly VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
+
 checks=0
 failures=0
+# Environmental (sandbox) blocks that survived all retries. Counted toward
+# `failures` too, so every existing `((failures == 0))` exit gate still fails a
+# blocked run, but tracked separately so the summary can distinguish an
+# INFRASTRUCTURE block from a genuine TEST failure. See is_environmental_block.
+environmental=0
+# Number of automatic retries when a check dies on a transient environmental
+# sandbox block (e.g. a BPFJailer FS/EXEC/NET enforcer killing a build/test
+# subprocess). Total attempts = retries + 1. Override with VALIDATE_ENV_BLOCK_RETRIES.
+ENV_BLOCK_MAX_RETRIES=${VALIDATE_ENV_BLOCK_RETRIES:-2}
+readonly ENV_BLOCK_MAX_RETRIES
 active_check_pid=""
 declare -a background_pids=()
 declare -a background_names=()
@@ -391,6 +557,127 @@ export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
 
+# Classify the build-cache state BEFORE this run builds anything. A cold target/
+# forces a full rebuild of hermit + its dependency graph, which dominates wall
+# time; a warm target/ reuses it and the build becomes near-incremental. This is
+# the single biggest factor in how long a run takes, so the estimate and the
+# history ledger both record it. The presence of a compiled hermit binary is a
+# reliable proxy for "target/ has been populated by a prior build":
+#   warm    = both debug and release binaries present
+#   partial = exactly one present (the other profile still rebuilds cold)
+#   cold    = neither present (fresh target/, full rebuild ahead)
+function detect_cache_state {
+    local have_debug=0 have_release=0
+    [[ -x "$ROOT_DIR/target/debug/hermit" ]] && have_debug=1
+    [[ -x "$ROOT_DIR/target/release/hermit" ]] && have_release=1
+    if ((have_debug == 1 && have_release == 1)); then
+        printf "warm"
+    elif ((have_debug == 1 || have_release == 1)); then
+        printf "partial"
+    else
+        printf "cold"
+    fi
+}
+
+# Print a REAL runtime estimate derived from this machine's validate-run history,
+# or an honest "not enough history" message. It consumes the shared
+# validate-run-ledger schema (schema_version >= 1) that this script writes and
+# that ci-hub/validate/aggregate.py aggregates machine-wide -- we read the same
+# records rather than inventing a parallel store. Only successful (result=="pass")
+# runs of the SAME profile count, because a fast-failing or timed-out run is not a
+# representative completion time. The estimate is bucketed by cache state because
+# warm vs cold dominates wall time; it degrades through progressively broader
+# scopes and, when even the broadest is too thin, says so instead of fabricating.
+# Args: profile cache_state host ledger_file
+function history_estimate {
+    local profile=$1 cache=$2 host=$3 ledger=$4
+
+    if [[ -z $ledger || ! -f $ledger ]]; then
+        printf "no measured estimate yet (no run-history ledger; this run seeds it)"
+        return 0
+    fi
+
+    awk -v PROFILE="$profile" -v CACHE="$cache" -v HOST="$host" '
+        # POSIX-awk scalar extractors (no gawk match()-with-array extension).
+        # The ledger fields we read (profile/cache_state/host/result are simple
+        # token strings; real_seconds is a bare integer) never contain escaped
+        # quotes, so anchored regex extraction is safe.
+        function field(line, key,   re, s) {
+            re = "\"" key "\":\"[^\"]*\""
+            if (match(line, re)) {
+                s = substr(line, RSTART, RLENGTH)
+                sub("^\"" key "\":\"", "", s)
+                sub("\"$", "", s)
+                return s
+            }
+            return ""
+        }
+        function numfield(line, key,   re, s) {
+            re = "\"" key "\":[0-9]+"
+            if (match(line, re)) {
+                s = substr(line, RSTART, RLENGTH)
+                sub("^\"" key "\":", "", s)
+                return s + 0
+            }
+            return -1
+        }
+        function isort(a, n,   i, j, key) {
+            for (i = 1; i < n; i++) {
+                key = a[i]; j = i - 1
+                while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j-- }
+                a[j + 1] = key
+            }
+        }
+        function dur(s,   x, h, m, sec) {
+            x = int(s + 0.5)
+            h = int(x / 3600); m = int((x % 3600) / 60); sec = x % 60
+            if (h > 0) return sprintf("%dh%02dm%02ds", h, m, sec)
+            if (m > 0) return sprintf("%dm%02ds", m, sec)
+            return sprintf("%ds", sec)
+        }
+        function emit(a, n, scope,   md, lo, hi) {
+            isort(a, n)
+            lo = a[0]; hi = a[n - 1]
+            if (n % 2 == 1) md = a[int(n / 2)]
+            else md = (a[n / 2 - 1] + a[n / 2]) / 2
+            if (lo == hi)
+                printf "~%s (%s, n=%d)\n", dur(md), scope, n
+            else
+                printf "~%s (median; range %s-%s; %s, n=%d)\n", \
+                    dur(md), dur(lo), dur(hi), scope, n
+        }
+        BEGIN { n1 = 0; n2 = 0; n3 = 0; MIN = 3 }
+        {
+            if (field($0, "profile") != PROFILE) next
+            if (field($0, "result") != "pass") next
+            w = numfield($0, "real_seconds")
+            if (w <= 0) next
+            cs = field($0, "cache_state")
+            hs = field($0, "host")
+            t3[n3++] = w                                   # any cache, any host
+            if (cs == CACHE) {
+                t2[n2++] = w                               # same cache, any host
+                if (hs == HOST) t1[n1++] = w               # same cache, same host
+            }
+        }
+        END {
+            if (n1 >= MIN)
+                emit(t1, n1, CACHE " cache, " HOST ", this profile")
+            else if (n2 >= MIN)
+                emit(t2, n2, CACHE " cache, any host, this profile")
+            else if (n3 >= MIN)
+                emit(t3, n3, "MIXED warm/cold -- no " CACHE \
+                    "-specific history yet, treat as a wide prior; this profile")
+            else
+                printf "insufficient history to estimate (only %d prior successful %s run(s); need >=%d). Current cache: %s. This run seeds the estimate.\n", \
+                    n3, PROFILE, MIN, CACHE
+        }
+    ' "$ledger"
+}
+
+VALIDATION_CACHE_STATE=$(detect_cache_state)
+readonly VALIDATION_CACHE_STATE
+
 LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/hermit-validate.XXXXXX.log")
 if [[ -z $LOG_FILE ]]; then
     echo "Unable to create validation log." >&2
@@ -400,7 +687,21 @@ readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
     "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
 printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
-printf "Estimated time: %s\n" "$VALIDATION_ESTIMATE"
+if ((VALIDATION_COMMIT_ANCHORED == 1)); then
+    printf "Commit: %s (clean tree, commit-anchored); selection: %s\n" \
+        "$VALIDATION_COMMIT" "$VALIDATION_SELECTION_MODE"
+else
+    printf "Commit: %s (⚠️  NOT commit-anchored: %s); selection: %s\n" \
+        "$VALIDATION_COMMIT" \
+        "$([[ $VALIDATION_COMMIT == unknown ]] && printf 'not a git checkout' || printf 'dirty tree')" \
+        "$VALIDATION_SELECTION_MODE"
+fi
+printf "Build cache: %s (target/ debug=%s release=%s)\n" \
+    "$VALIDATION_CACHE_STATE" \
+    "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
+    "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
+printf "Estimated time: %s\n" \
+    "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -409,8 +710,13 @@ if ((VERBOSE == 1)); then
     printf "Verbose validation enabled\n"
     printf "  root: %s\n" "$ROOT_DIR"
     printf "  log: %s\n" "$LOG_FILE"
-    printf "  gate timeout: %ss (kill grace: %ss; heartbeat: %ss)\n" \
+    printf "  gate timeout: %ss wall (kill grace: %ss; heartbeat: %ss)\n" \
         "$GATE_TIMEOUT_SECONDS" "$TIMEOUT_KILL_GRACE_SECONDS" "$VERBOSE_INTERVAL_SECONDS"
+    if ((GATE_CPU_TIMEOUT_SECONDS > 0)); then
+        printf "  gate CPU budget: %ss CPU-time (user+sys, whole tree)\n" "$GATE_CPU_TIMEOUT_SECONDS"
+    else
+        printf "  gate CPU budget: off (set VALIDATE_GATE_CPU_TIMEOUT_SECONDS to enable)\n"
+    fi
 fi
 
 readonly NEXTEST_VERSION=0.9.100
@@ -460,7 +766,7 @@ readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
 # rows to make the aggregate floor alternate between green and red.
-readonly SABRE_COMPAT_EXPECTED=205
+readonly SABRE_COMPAT_EXPECTED=207
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
@@ -599,6 +905,47 @@ readonly L4_REPS=${L4_REPS:-20}
 ENVELOPE_JSON=${ENVELOPE_JSON:-"$ROOT_DIR/envelope.json"}
 ENVELOPE_LAST_JSON=""
 
+# Aggregate CPU seconds (user+sys) consumed by the process tree rooted at $1,
+# summed from /proc/<pid>/stat over the root and all its descendants. This is
+# controller-free and host-portable: it does NOT need a delegated cgroup cpu
+# controller (often absent on the many-core dev hosts), unlike reading cpu.stat.
+# Prints an integer count of CPU-seconds, or 0 when /proc is unreadable or the
+# tree has already exited. The comm field (2) can contain spaces and parentheses,
+# so parsing splits on the LAST ")" and indexes the fixed fields after it.
+function tree_cpu_seconds {
+    local root=$1
+    cat /proc/[0-9]*/stat 2>/dev/null | awk -v root="$root" -v clk="$CLK_TCK_CACHED" '
+    {
+        rp = 0
+        for (i = length($0); i >= 1; i--) {
+            if (substr($0, i, 1) == ")") { rp = i; break }
+        }
+        if (rp == 0) next
+        pid = $1 + 0
+        n = split(substr($0, rp + 2), f, " ")
+        if (n < 13) next
+        ppid[pid] = f[2] + 0        # ppid: field 4 of stat = field 2 after comm
+        ticks[pid] = f[12] + f[13]  # utime (14) + stime (15) = fields 12,13 after comm
+        seen[pid] = 1
+    }
+    END {
+        intree[root] = 1
+        changed = 1
+        while (changed) {
+            changed = 0
+            for (p in seen) {
+                if (!intree[p] && (p in ppid) && intree[ppid[p]]) {
+                    intree[p] = 1
+                    changed = 1
+                }
+            }
+        }
+        total = 0
+        for (p in seen) if (intree[p]) total += ticks[p]
+        printf "%d", int(total / clk)
+    }'
+}
+
 function kill_process_tree {
     local pid=$1
     local signal=$2
@@ -609,6 +956,23 @@ function kill_process_tree {
         kill_process_tree "$child" "$signal"
     done < <(ps -o pid= --ppid "$pid" 2>/dev/null)
     kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+# Send TERM to the process tree rooted at $1, wait out the kill grace, then
+# escalate to KILL if anything survives, and reap the root. Mirrors the wall
+# timeout's teardown so a CPU-budget kill leaves no stragglers behind.
+function terminate_gate_tree {
+    local pid=$1
+    local grace_deadline
+    kill_process_tree "$pid" TERM
+    grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill_process_tree "$pid" KILL
+    fi
+    wait "$pid" 2>/dev/null || true
 }
 
 function record_ledger_gate {
@@ -627,31 +991,20 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
+# are computed once by the caller (cleanup) in the top-level shell so they match
+# the human summary exactly and so the `times` builtin sees the accumulated child
+# CPU (a subshell would report only its own times). See print_wall_cpu_summary.
 function append_validation_ledger {
     local exit_status=$1
-    local finished_at finished_epoch wall_seconds cpu_times cpu_user cpu_sys
-    local result gates_json gate_result line host
+    local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
+    local finished_at result gates_json gate_result line
+    local commit_anchored_json tree_dirty_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
 
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    finished_epoch=$(date +%s)
-    wall_seconds=$((finished_epoch - VALIDATION_STARTED_EPOCH))
-    times >"$VALIDATION_TMP_DIR/cpu-times"
-    cpu_times=$(<"$VALIDATION_TMP_DIR/cpu-times")
-    read -r cpu_user cpu_sys < <(
-        awk '
-            function seconds(value, parts) {
-                split(value, parts, "m")
-                sub(/s$/, "", parts[2])
-                return parts[1] * 60 + parts[2]
-            }
-            NR == 1 { user += seconds($1); sys += seconds($2) }
-            NR == 2 { user += seconds($1); sys += seconds($2) }
-            END { printf "%.3f %.3f\n", user, sys }
-        ' <<<"$cpu_times"
-    )
 
     if ((exit_status == 0 && failures == 0)); then
         result=pass
@@ -674,13 +1027,22 @@ function append_validation_ledger {
     done
     gates_json+=']'
 
-    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
-    line="{\"schema_version\":1,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
-    line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$host"),"
+    if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
+    if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+
+    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
+    # are additive; the parent ledger aggregator reads via .get() and is
+    # unaffected until it is taught to surface them. (warm-vs-cold is already
+    # recorded as cache_state, so this does not duplicate it.)
+    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
+    line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
+    line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
+    line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
@@ -705,6 +1067,51 @@ function append_validation_ledger {
     fi
 }
 
+function human_duration {
+    awk -v t="$1" 'BEGIN {
+        x = int(t + 0.5)
+        h = int(x / 3600); m = int((x % 3600) / 60); s = x % 60
+        if (h > 0) printf "%dh%02dm%02ds", h, m, s
+        else if (m > 0) printf "%dm%02ds", m, s
+        else printf "%ds", s
+    }'
+}
+
+# Always-printed final line: wall AND CPU for the whole run. CPU (user+sys, whole
+# process tree) vs wall is what distinguishes a genuinely-busy run from one that
+# is blocked or spinning while merely appearing hung: CPU near zero against a
+# large wall means waiting/blocked, while ~1 core pinned across a multi-core host
+# can mean single-threaded work or a spin. Emitted on success, failure, timeout,
+# and interruption alike.
+function print_wall_cpu_summary {
+    local exit_status=$1 wall=$2 user=$3 sys=$4
+    local cpu ratio marker hint=""
+
+    cpu=$(awk -v u="$user" -v s="$sys" 'BEGIN { printf "%.1f", u + s }')
+    if ((wall > 0)); then
+        ratio=$(awk -v c="$cpu" -v w="$wall" 'BEGIN { printf "%.1f", c / w }')
+    else
+        ratio="n/a"
+    fi
+    if ((exit_status == 0 && failures == 0)); then
+        marker="✅"
+    else
+        marker="❌"
+    fi
+    if ((wall >= 30)); then
+        if awk -v c="$cpu" -v w="$wall" 'BEGIN { exit !(c < 0.10 * w) }'; then
+            hint="  (low CPU vs wall — mostly waiting/blocked, not compute-bound)"
+        elif ((host_cpus > 2)) && \
+            awk -v r="$ratio" 'BEGIN { exit !(r + 0 >= 0.8 && r + 0 <= 1.2) }'; then
+            hint="  (~1 core busy — single-threaded or possibly spinning)"
+        fi
+    fi
+    printf "%s Elapsed: wall %s | CPU %s (user %s, sys %s) | CPU/wall %sx across %s cores%s\n" \
+        "$marker" "$(human_duration "$wall")" "$(human_duration "$cpu")" \
+        "$(human_duration "$user")" "$(human_duration "$sys")" \
+        "$ratio" "$host_cpus" "$hint"
+}
+
 function cleanup {
     local exit_status=$?
     local pid
@@ -718,12 +1125,37 @@ function cleanup {
         kill_process_tree "$pid" TERM
     done
     wait 2>/dev/null || true
+
+    # Wall + CPU for the whole run, computed ONCE here in the trap's top-level
+    # shell context (a subshell's `times` would miss the accumulated child CPU).
+    # The same numbers feed both the ledger and the always-printed summary.
+    local finished_epoch validation_wall validation_user="0" validation_sys="0"
+    finished_epoch=$(date +%s)
+    validation_wall=$((finished_epoch - VALIDATION_STARTED_EPOCH))
+    if times >"$VALIDATION_TMP_DIR/cpu-times" 2>/dev/null; then
+        read -r validation_user validation_sys < <(
+            awk '
+                function seconds(value, parts) {
+                    split(value, parts, "m")
+                    sub(/s$/, "", parts[2])
+                    return parts[1] * 60 + parts[2]
+                }
+                NR == 1 { user += seconds($1); sys += seconds($2) }
+                NR == 2 { user += seconds($1); sys += seconds($2) }
+                END { printf "%.3f %.3f\n", user, sys }
+            ' "$VALIDATION_TMP_DIR/cpu-times"
+        )
+    fi
+
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
-    append_validation_ledger "$exit_status"
+    append_validation_ledger "$exit_status" \
+        "$validation_wall" "$validation_user" "$validation_sys"
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
+    print_wall_cpu_summary "$exit_status" \
+        "$validation_wall" "$validation_user" "$validation_sys"
     exit "$exit_status"
 }
 
@@ -734,6 +1166,62 @@ function interrupted {
 }
 trap cleanup EXIT
 trap interrupted INT TERM
+
+# Return success (0) when the failed check's log region carries the signature of
+# an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
+# Code agent runs inside a BPFJailer jail inherited by every descendant
+# (validate.sh -> cargo -> rustc/cmake/cc1/ld); its FS/EXEC/NET enforcers can
+# transiently deny a file open by a build or test subprocess for reasons
+# unrelated to the code under test.
+#
+# The denial surfaces in TWO forms, both of which we must catch:
+#
+#   1. The canonical BPFJailer banner ("blocked on this server based on a
+#      security policy", "BpfJailer", "Enforcer: FS, Reason: ..."). This is what
+#      appears when the jailer itself prints to the process's output.
+#   2. A raw EPERM/EACCES leaked to a build tool with NO banner. The FS enforcer
+#      denies open() and the toolchain reports the errno verbatim, e.g. cc1
+#      `fatal error: /usr/lib/gcc/.../stddef.h: Operation not permitted` while
+#      building DynamoRIO, or a CMake/linker "Permission denied" on a system
+#      path. On this host those files are world-readable (root:root -rw-r--r--),
+#      so a *compiler* reporting it cannot open a header for a permission reason
+#      is never legitimate product behavior -- it is always the sandbox. This is
+#      how the DynamoRIO "host permission" block (validate-dynamorio-host-
+#      permission-block) manifests: same jail, same FS/FILE_OPEN denial as the
+#      BPFJailer transient, but banner-less.
+#
+# The form-2 patterns are anchored on compiler/build-tool phrasing
+# (`fatal error: <path>:`, `CMake Error`, `cannot open ...`) so ordinary GUEST
+# test output that legitimately produces EPERM -- DETLOG lines such as
+# `madvise ... EPERM (Operation not permitted)`, the kcmp-eperm fixture, or a
+# `context: Mount` EPERM -- never trips a false positive. Misclassifying a real
+# test failure as environmental is as harmful as the reverse, so keep these
+# signatures build-toolchain-specific.
+#
+#   3. A failure of the vendored third-party DynamoRIO build, surfaced by cargo
+#      as `failed to run custom build command for reverie-dbi ...` or a panic in
+#      `reverie-dbi/build.rs` (which asserts the DynamoRIO cmake `--build`
+#      status). The bundled DynamoRIO/elfutils build is driven at
+#      `--parallel ${THIRD_PARTY_BUILD_JOBS:-$(nproc)}`; on a many-core host an
+#      unbounded parallelism drives the elfutils dependency scan into a
+#      concurrency-exposed SIGABRT (`Aborted (core dumped)`), observed ~2/4
+#      portable-only runs at nproc=316. That is a HOST build flake, not a Hermit
+#      product defect (Hermit source is not what failed to compile), so it is the
+#      same class as the sandbox blocks above. We PREVENT it by capping
+#      THIRD_PARTY_BUILD_JOBS (see the export near the counters), and detect it
+#      here so any residual transient is retried and clearly labeled. This anchor
+#      is narrow to the reverie-dbi third-party build script: a *persistent*
+#      breakage (e.g. a bad reverie pin) fails every retry and still leaves the
+#      run RED via the retry-exhaustion path -- it is never silently greened,
+#      only relabeled from "test failure" to "third-party build (environmental)".
+#      Only reverie-dbi's own build script matches, so a Hermit test that merely
+#      prints "panicked at .../build.rs" for a different crate cannot trip it.
+function is_environmental_block {
+    local output_start=$1
+    tail -n "+$output_start" "$LOG_FILE" |
+        sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
+        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\.rs'
+}
 
 function failure_summary {
     local output_start=$1
@@ -773,6 +1261,8 @@ function run_timed_command {
     local status
     local elapsed
     local grace_deadline
+    local cpu_seconds
+    local cpu_next_sample=$((SECONDS + 1))
 
     (
         if ((VERBOSE == 1)); then
@@ -810,6 +1300,23 @@ function run_timed_command {
             return 124
         fi
 
+        # Load-immune CPU-time budget: kill a gate that burns more CPU (user+sys,
+        # whole tree) than allowed, even while it is well under the wall timeout.
+        # Sampled ~1 Hz (cheaper than the 0.2s wall poll) to bound /proc overhead.
+        if ((GATE_CPU_TIMEOUT_SECONDS > 0 && SECONDS >= cpu_next_sample)); then
+            cpu_seconds=$(tree_cpu_seconds "$pid")
+            cpu_next_sample=$((SECONDS + 1))
+            if ((cpu_seconds >= GATE_CPU_TIMEOUT_SECONDS)); then
+                terminate_gate_tree "$pid"
+                active_check_pid=""
+                printf "Gate exceeded CPU budget: %ss CPU >= %ss budget (wall %ss, subprocess PID %s)\n" \
+                    "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid" >>"$log_file"
+                printf "🔥 %s exceeded CPU budget: %ss CPU-time >= %ss (wall %ss, subprocess PID %s)\n" \
+                    "$name" "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid"
+                return 125
+            fi
+        fi
+
         if ((VERBOSE == 1 && elapsed >= next_report)); then
             printf "  still running: %s (PID %s, elapsed %ss/%ss)\n" \
                 "$name" "$pid" "$elapsed" "$timeout_seconds"
@@ -840,6 +1347,8 @@ function run_check_with_timeout {
     local status
     local summary
     local duration
+    local attempt=1
+    local max_attempts=$((ENV_BLOCK_MAX_RETRIES + 1))
 
     {
         printf "=== %s ===\n" "$name"
@@ -856,19 +1365,55 @@ function run_check_with_timeout {
         printf "\n  timeout: %ss\n" "$timeout_seconds"
     fi
 
-    if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
-        status=0
+    # Run the check, auto-retrying transient environmental blocks so a host
+    # FS-permission denial (BPFJailer banner, or a banner-less EPERM leaked to
+    # cc1/cmake/ld) or a vendored third-party (DynamoRIO/elfutils) build flake
+    # that kills a build/test subprocess never masquerades as a product failure
+    # or an ambiguous early death. Each retry starts a fresh log region so
+    # classification only inspects the latest attempt.
+    while :; do
+        if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
+            status=0
+            duration=$((SECONDS - started_at))
+            if ((attempt > 1)); then
+                printf "✅ %s (1 passed, 0 failed, %ss; recovered after %s environmental retry attempt(s))\n" \
+                    "$name" "$duration" "$((attempt - 1))"
+            else
+                printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
+            fi
+            break
+        else
+            status=$?
+        fi
+
         duration=$((SECONDS - started_at))
-        printf "✅ %s (1 passed, 0 failed, %ss)\n" \
-            "$name" "$duration"
-    else
-        status=$?
-        duration=$((SECONDS - started_at))
-        failures=$((failures + 1))
-        summary=$(failure_summary "$output_start")
-        printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
-            "$name" "$status" "$summary" "$LOG_FILE"
-    fi
+
+        if is_environmental_block "$output_start"; then
+            if ((attempt < max_attempts)); then
+                printf "⚠️  %s: ENVIRONMENTAL block (host sandbox FS-permission denial or third-party build flake, not a test failure) on attempt %s/%s — retrying\n" \
+                    "$name" "$attempt" "$max_attempts"
+                printf "validate.sh: ENVIRONMENTAL block on attempt %s/%s; retrying (not a test failure)\n" \
+                    "$attempt" "$max_attempts" >>"$LOG_FILE"
+                attempt=$((attempt + 1))
+                started_at=$SECONDS
+                output_start=$(($(wc -l <"$LOG_FILE") + 1))
+                continue
+            fi
+            # Retries exhausted: fail (non-green) but label unambiguously as an
+            # infrastructure block, and tally it separately from test failures.
+            failures=$((failures + 1))
+            environmental=$((environmental + 1))
+            summary=$(failure_summary "$output_start")
+            printf "🧱 %s (ENVIRONMENTAL BLOCK after %s attempt(s): host sandbox FS-permission denial (BPFJailer) or vendored third-party (DynamoRIO) build flake, NOT a test failure — validate could not complete; exit %s: %s; full log: %s)\n" \
+                "$name" "$max_attempts" "$status" "$summary" "$LOG_FILE"
+        else
+            failures=$((failures + 1))
+            summary=$(failure_summary "$output_start")
+            printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
+                "$name" "$status" "$summary" "$LOG_FILE"
+        fi
+        break
+    done
 
     {
         printf "Exit: %s\n" "$status"
@@ -980,6 +1525,15 @@ function wait_for_background_checks {
 
         if ((status == 0)); then
             printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
+        elif is_environmental_block "$output_start"; then
+            # Background checks run to completion before collection, so they
+            # cannot be retried in place; still label the block unambiguously as
+            # infrastructure rather than a test failure (already counted in
+            # failures above) and tally it separately.
+            environmental=$((environmental + 1))
+            summary=$(failure_summary "$output_start")
+            printf "🧱 %s (ENVIRONMENTAL BLOCK: host sandbox FS-permission denial (BPFJailer) or vendored third-party (DynamoRIO) build flake, NOT a test failure — validate could not complete; exit %s: %s; full log: %s)\n" \
+                "$name" "$status" "$summary" "$LOG_FILE"
         else
             summary=$(failure_summary "$output_start")
             printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
@@ -3102,11 +3656,16 @@ function apply_locally_validated_label {
         timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
         passed_checks=$((checks - failures))
         # Single quotes keep the Markdown backticks literal in the comment body.
+        # The trailing HTML marker is machine-parseable: label-strip-evidence.sh
+        # locates this comment by `sha=<head>` when the label is later stripped,
+        # so the record of what was validated (commit, profile, durable log) is
+        # never lost. Keep the marker key names in sync with that script.
         # shellcheck disable=SC2016
         printf -v comment_body \
-            '[impl agent, validate.sh]\n\nLocal validation passed.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Timestamp (UTC): `%s`' \
-            "$local_head" "$VALIDATION_PROFILE" "$passed_checks" \
-            "$host_name" "$timestamp"
+            '[impl agent, validate.sh]\n\nLocal validation passed — `%s` label applied.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Log: `%s:%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ts=%s -->' \
+            "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
+            "$passed_checks" "$host_name" "$host_name" "$LOG_FILE" "$timestamp" \
+            "$local_head" "$VALIDATION_PROFILE" "$host_name" "$LOG_FILE" "$timestamp"
         if "${gh_cmd[@]}" pr comment "$pr" \
             --repo "$LOCALLY_VALIDATED_REPOSITORY" \
             --body "$comment_body" >>"$LOG_FILE" 2>&1; then
@@ -3160,9 +3719,19 @@ function check_copyright_headers {
 
 function print_summary {
     local passed=$((checks - failures))
+    local test_failures=$((failures - environmental))
     if ((failures == 0)); then
         printf "✅ Validation summary [%s] (%s passed, 0 failed; full log: %s)\n" \
             "$VALIDATION_PROFILE" "$passed" "$LOG_FILE"
+    elif ((test_failures == 0)); then
+        # Only environmental (sandbox) blocks failed — validate could not
+        # complete, but nothing under test is broken. Keep it non-green (never a
+        # false pass) while making the cause unambiguous.
+        printf "🧱 Validation summary [%s] (%s passed, 0 TEST failures, %s ENVIRONMENTAL block(s) — validate INCOMPLETE due to a host sandbox/third-party-build block, not a product failure; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$environmental" "$LOG_FILE"
+    elif ((environmental > 0)); then
+        printf "❌ Validation summary [%s] (%s passed, %s failed = %s test + %s environmental; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$failures" "$test_failures" "$environmental" "$LOG_FILE"
     else
         printf "❌ Validation summary [%s] (%s passed, %s failed; full log: %s)\n" \
             "$VALIDATION_PROFILE" "$passed" "$failures" "$LOG_FILE"
@@ -3215,7 +3784,7 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-2}
+    local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
@@ -3226,6 +3795,122 @@ function run_portable_only_suite {
     run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     print_summary
     ((failures == 0))
+}
+
+# Resolve the last-known-green baseline commit for --selective. Precedence:
+# explicit --baseline, then $HERMIT_LAST_GREEN_SHA, then the most recent passing
+# validate-run-ledger entry (preferring this slot). Only a commit that exists
+# locally is returned; anything else prints nothing so selection falls back to
+# the full lane. Never fail-open on a stale or missing baseline.
+function resolve_selective_baseline {
+    local sha=""
+    if [[ -n ${SELECTIVE_BASELINE:-} ]]; then
+        sha=$SELECTIVE_BASELINE
+    elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
+        sha=$HERMIT_LAST_GREEN_SHA
+    elif [[ -n $VALIDATION_LEDGER_FILE && -f $VALIDATION_LEDGER_FILE ]] \
+        && command -v jq >/dev/null 2>&1; then
+        sha=$(jq -r --arg slot "$VALIDATION_SLOT" '
+            select(.result == "pass" and .commit != "unknown" and .slot == $slot)
+            | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
+        if [[ -z $sha ]]; then
+            sha=$(jq -r '
+                select(.result == "pass" and .commit != "unknown")
+                | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
+        fi
+    fi
+    [[ -n $sha ]] || return 0
+    # select-tests diffs against this commit; trust it only if it exists here.
+    if git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+        printf '%s\n' "$sha"
+    fi
+}
+
+# Write a dependency-closed subset of ci/dag/portable.json (keeping only the
+# selected nodes and top-level lane config) to $2. Each surviving step's deps are
+# pruned to the selected set; because select-tests emits a closed node set, no
+# genuine dependency is dropped. Returns non-zero if no step survives.
+function build_selected_portable_dag {
+    local nodes_csv=$1 out=$2 nodes_json
+    nodes_json=$(printf '%s' "$nodes_csv" | tr ', ' '\n\n' \
+        | sed '/^$/d' | jq -R . | jq -s .) || return 1
+    jq --argjson keep "$nodes_json" '
+        ($keep) as $k
+        | .steps |= [ .[]
+            | (.group + "." + .job) as $tag
+            | select($k | index($tag))
+            | if (.deps // null) != null
+              then .deps |= [ .[] | select($k | index(.)) ]
+              else . end ]
+    ' "$ROOT_DIR/ci/dag/portable.json" > "$out" || return 1
+    [[ $(jq '.steps | length' "$out" 2>/dev/null || echo 0) -gt 0 ]]
+}
+
+# --selective / --since-green: run only the portable DAG nodes affected by the
+# delta since the last known-green baseline. FAIL-SAFE: a skip decision runs
+# nothing, a selective decision runs the dependency-closed subset, and ANY other
+# outcome (full, tool error, no baseline, empty/failed subset build) runs the
+# complete portable lane — never fewer tests than the tool proved safe to omit.
+function run_selective_suite {
+    local baseline sel_json decision nodes total dag_override rc
+    baseline=$(resolve_selective_baseline)
+    local -a sel_args=(--since-green --format json)
+    if [[ -n $baseline ]]; then
+        sel_args=(--since-green --baseline "$baseline" --format json)
+        printf "Selective validation: last-known-green baseline = %s\n" "$baseline"
+    else
+        printf "Selective validation: no trustworthy green baseline; running the FULL portable lane.\n"
+    fi
+
+    if ! sel_json=$("$ROOT_DIR/ci/select-tests.rs" "${sel_args[@]}" 2>>"$LOG_FILE"); then
+        printf "Selective validation: select-tests.rs failed; running the FULL portable lane.\n"
+        run_portable_only_suite
+        return $?
+    fi
+    decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
+    total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
+    case "$decision" in
+        skip)
+            printf "Selective validation: no CI-relevant changes since baseline — nothing to run (0/%s nodes).\n" \
+                "$total"
+            print_summary
+            ((failures == 0))
+            return $?
+            ;;
+        selective)
+            nodes=$(printf '%s' "$sel_json" | jq -r '.nodes | join(",")' 2>/dev/null || echo "")
+            if [[ -z $nodes ]]; then
+                printf "Selective validation: empty selected node set — running the FULL portable lane.\n"
+                run_portable_only_suite
+                return $?
+            fi
+            dag_override="$VALIDATION_TMP_DIR/portable-selective.json"
+            if ! build_selected_portable_dag "$nodes" "$dag_override"; then
+                printf "Selective validation: could not build subset DAG; running the FULL portable lane.\n"
+                run_portable_only_suite
+                return $?
+            fi
+            printf "Selective validation: running %s/%s portable DAG nodes:\n  %s\n" \
+                "$(printf '%s' "$sel_json" | jq -r '.node_count')" "$total" \
+                "${nodes//,/ }"
+            run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+            export RUN_DAG_FILE_OVERRIDE="$dag_override"
+            run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
+                "portable CI DAG (selective subset)" \
+                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
+            rc=$?
+            unset RUN_DAG_FILE_OVERRIDE
+            print_summary
+            ((failures == 0))
+            return $?
+            ;;
+        *)
+            printf "Selective validation: decision=%s — running the FULL portable lane.\n" "$decision"
+            run_portable_only_suite
+            return $?
+            ;;
+    esac
 }
 
 function run_exact_detcore_cases {
@@ -3469,6 +4154,14 @@ if ((ONLY_MODE == 1)); then
     exit $?
 fi
 
+# --selective / --since-green: run only the portable DAG nodes affected by the
+# delta since the last known-green baseline, falling back to the full portable
+# lane on any doubt (see run_selective_suite for the fail-safe rules).
+if ((SELECTIVE_MODE == 1)); then
+    run_selective_suite
+    exit $?
+fi
+
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
 if [[ $VALIDATION_LEVEL == portable-only ]]; then
@@ -3505,7 +4198,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
             "$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            "$ROOT_DIR/target/liteinst-runtime-build-d973a85"
+            "$ROOT_DIR/target/liteinst-runtime-build-7951770"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
@@ -3598,7 +4291,12 @@ print_summary
 # On a fully-green full run, tag the PR unless explicitly disabled. GitHub
 # failures are warnings and never affect the final validation exit status.
 if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    apply_locally_validated_label
+    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
+        apply_locally_validated_label
+    else
+        printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
+            "$LOCALLY_VALIDATED_LABEL" >&2
+    fi
 fi
 
 ((failures == 0))

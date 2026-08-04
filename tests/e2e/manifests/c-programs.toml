@@ -180,10 +180,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Path evidence found one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -400,7 +401,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "CLONE_VM completion is observed through SIGCHLD and wait; that process-lifecycle family is owner-gated for SaBRe"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -891,7 +892,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "This fixture deliberately invokes unsupported restart_syscall; new syscall policy is outside the non-gated SaBRe frontier"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -1262,63 +1263,6 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
-id = "c-programs/getcpu"
-description = "Strict verification for tests/c/getCpu.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/getCpu.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
 id = "c-programs/get-robust-list-child"
 description = "Strict verification for tests/c/get_robust_list_child.c"
 lane = "portable"
@@ -1434,6 +1378,63 @@ timeout_seconds = 90
 occasional = false
 program = "tests/c/get_robust_list_thread.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "sabre"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "c-programs/getcpu"
+description = "Strict verification for tests/c/getCpu.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/getCpu.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
 ci = false
@@ -1606,6 +1607,64 @@ backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "c-programs/hello-nostdlib"
+description = "Strict verification for tests/c/simple/hello_nostdlib.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/simple/hello_nostdlib.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -1944,7 +2003,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "The oracle prints concurrent pthread pipe, socketpair, eventfd, and epoll ordering; core scheduling parity is owner-gated"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -2269,7 +2328,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "The manifest supplies no required subcommand; functional subcommands exercise owner-gated clock, scheduling, signal, or SIGCHLD paths"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -3224,6 +3283,121 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "c-programs/nanosleep-threads-nocrash"
+description = "Strict verification for tests/c/simple/nanosleep-threads-nocrash.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/simple/nanosleep-threads-nocrash.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "sabre"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "c-programs/nanosleep-threads-simple"
+description = "Strict verification for tests/c/simple/nanosleep-threads-simple.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/simple/nanosleep-threads-simple.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
 id = "c-programs/netlink-autobind-generic"
 description = "Strict verification for tests/c/netlink_autobind_generic.c"
 lane = "portable"
@@ -4132,6 +4306,64 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "c-programs/pread64-nostdlib"
+description = "Strict verification for tests/c/simple/pread64_nostdlib.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/simple/pread64_nostdlib.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
 id = "c-programs/print-memaddrs"
 description = "Strict verification for tests/c/print_memaddrs.c"
 lane = "portable"
@@ -4150,7 +4382,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe and ptrace each reach L2, but backend loader layouts produce different stack, heap, PIE, and shared-mapping addresses in stdout"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -4697,7 +4929,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Finite timeouts plus nanosleep-delayed pthread and asynchronous signal delivery are outside the non-gated SaBRe frontier"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -5005,6 +5237,64 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "c-programs/racewrite-nostdlib"
+description = "Strict verification for tests/c/simple/racewrite_nostdlib.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/simple/racewrite_nostdlib.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
 id = "c-programs/random-sources"
 description = "Strict verification for tests/c/random_sources.c"
 lane = "portable"
@@ -5023,7 +5313,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "The default oracle includes per-thread getrandom and urandom assignment; multithreaded-random parity is owner-gated"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -5186,7 +5476,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe returns ENOSYS for this fixture's sendfile path; adding syscall support is outside non-gated qualification"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -5237,11 +5527,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "sabre"]
+guest_args = { ptrace = ["README.md"], sabre = ["README.md"] }
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "The manifest supplies no required fixture-file argument; current ptrace and SaBRe probes both exit nonzero before the lseek oracle"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -5619,7 +5909,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Host resource, sysinfo, rusage, and fork-inheritance observations are outside the non-gated SaBRe frontier"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6062,7 +6352,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Timer-driven, scheduler-yielding asynchronous signal delivery is owner-gated; no non-gated SaBRe parity claim"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6120,7 +6410,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Signal-policy qualification is gated; the SaBRe probe observed handler count 3 where the ptrace oracle requires 2"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6178,7 +6468,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Cross-thread SIGTERM delivery currently times out under SaBRe; signal and scheduler semantics are owner-gated"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -6286,295 +6576,6 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
   [test.build]
   cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "c-programs/hello-nostdlib"
-description = "Strict verification for tests/c/simple/hello_nostdlib.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/simple/hello_nostdlib.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe's static no-libc loader faults in host libc at address 0x1 before guest execution"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "c-programs/nanosleep-threads-nocrash"
-description = "Strict verification for tests/c/simple/nanosleep-threads-nocrash.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/simple/nanosleep-threads-nocrash.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "c-programs/nanosleep-threads-simple"
-description = "Strict verification for tests/c/simple/nanosleep-threads-simple.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/simple/nanosleep-threads-simple.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "c-programs/pread64-nostdlib"
-description = "Strict verification for tests/c/simple/pread64_nostdlib.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/simple/pread64_nostdlib.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe's static no-libc loader faults in host libc at address 0x1 before guest execution"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "c-programs/racewrite-nostdlib"
-description = "Strict verification for tests/c/simple/racewrite_nostdlib.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/simple/racewrite_nostdlib.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
 
 [test.modes.verify]
 ci = false
@@ -6955,7 +6956,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SIOCGSTAMP and SIOCGSTAMPNS output plus delayed receive advancement are part of the owner-gated virtual-time family"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -7965,63 +7966,6 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
-id = "c-programs/threadexhaustion"
-description = "Strict verification for tests/c/threadExhaustion.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/threadExhaustion.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
 id = "c-programs/thread-self-procfs-handoff"
 description = "Strict verification for tests/c/thread_self_procfs_handoff.c"
 lane = "portable"
@@ -8090,10 +8034,68 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm", "sabre"]
-guest_args = { ptrace = ["cancellation"], kvm = ["cancellation"], sabre = ["cancellation"] }
+backends_enabled = ["ptrace", "kvm"]
+guest_args = { ptrace = ["cancellation"], kvm = ["cancellation"] }
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+sabre = "Cancellation reaches one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "c-programs/threadexhaustion"
+description = "Strict verification for tests/c/threadExhaustion.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/threadExhaustion.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "sabre"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8474,7 +8476,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "vfork completion and wait depend on the owner-gated SIGCHLD/process-lifecycle path; current SaBRe probes time out"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8582,7 +8584,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Virtual PID topology and parent/child output ordering are owner-gated; no non-gated SaBRe parity claim"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8633,10 +8635,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "The first verify run exits with waitpid error 512 after one raw libc syscall site; neither functional L2 nor a pure SaBRe path is established"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
