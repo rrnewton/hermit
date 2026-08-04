@@ -98,9 +98,10 @@ function validation_slot_name {
 # default): the gate is killed once its process-tree CPU (user+sys) crosses the
 # budget, catching hangs that burn CPU (e.g. a reap/futex spin) regardless of
 # machine load, while the wall timeout remains the backstop for idle-stuck gates.
-# A fully-green full run labels the current PR `locally-validated` by default.
-# PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
-# VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
+# After a fully-green full run writes its counted ledger row, the parent ci-hub
+# publisher binds `locally-validated` to an immutable receipt. PR_NUMBER=N
+# overrides branch-based PR detection. Use --no-label-pr or VALIDATE_LABEL_PR=0
+# to disable that non-fatal publication.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | super
@@ -237,8 +238,8 @@ Other options:
                    or compared. A run forced with this flag is recorded as
                    NOT-commit-anchored (commit_anchored=false) and never applies
                    the `locally-validated` label.
-  --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
-  --no-label-pr    Disable the non-fatal GitHub label update.
+  --label-pr       Publish a receipt and label the PR after a full green (default).
+  --no-label-pr    Disable the non-fatal receipt publication and label update.
   -h, --help       Show this help and exit.
 
 Environment:
@@ -246,7 +247,8 @@ Environment:
   VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree WALL timeout.
   VALIDATE_GATE_CPU_TIMEOUT_SECONDS=N            Per-gate CPU-time budget (user+sys, whole tree); 0=off (default).
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
-  VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
+  VALIDATE_LABEL_PR=0                            Disable receipt publication/labeling.
+  CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
@@ -485,13 +487,31 @@ fi
 CI_DAG_JOBS_DEFAULT=$((host_cpus / 8))
 ((CI_DAG_JOBS_DEFAULT < 2)) && CI_DAG_JOBS_DEFAULT=2
 ((CI_DAG_JOBS_DEFAULT > 16)) && CI_DAG_JOBS_DEFAULT=16
+VALIDATION_DAG_JOBS=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
+if [[ ! $VALIDATION_DAG_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: CI_DAG_JOBS must be a positive integer" >&2
+    exit 2
+fi
+
+# Gate-count obligation for landing-eligible full runs. A full run is init plus
+# two independently recorded gates (manifest check + lane execution) for each of
+# portable and privileged. Partial/custom profiles are deliberately `null` until
+# their dynamic plans carry an equally strong declaration; they cannot certify a
+# full landing receipt anyway. The shared outcome authority uses run < expected
+# as TRUNCATED, never FAILED.
+if [[ $VALIDATION_PROFILE == full ]]; then
+    VALIDATION_GATES_EXPECTED_JSON=5
+else
+    VALIDATION_GATES_EXPECTED_JSON=null
+fi
 
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
     exit 2
 fi
-readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT VALIDATION_DAG_JOBS
+readonly VALIDATION_GATES_EXPECTED_JSON
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -545,6 +565,7 @@ declare -a background_duration_files=()
 declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
+VALIDATION_CONCURRENCY_MONITOR_PID=""
 
 mkdir -p "$ROOT_DIR/target/validation"
 VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
@@ -553,6 +574,8 @@ if [[ -z $VALIDATION_TMP_DIR ]]; then
     exit 1
 fi
 readonly VALIDATION_TMP_DIR
+VALIDATION_CONCURRENT_MARKER="$VALIDATION_TMP_DIR/concurrent-validate-observed"
+readonly VALIDATION_CONCURRENT_MARKER
 export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
@@ -991,6 +1014,56 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Observe overlapping top-level validate process groups for the whole run. A
+# point-in-time count at start or finish misses a validate that starts and ends
+# in the middle; the one-second monitor leaves a durable marker for this receipt.
+# Subshells of this validate share its process group and are excluded, so a gate
+# invoking another validate.sh internally cannot forge concurrency.
+function start_validation_concurrency_monitor {
+    local root_pid=$$ root_pgid
+    root_pgid=$(ps -o pgid= -p "$root_pid" 2>/dev/null | tr -d ' ')
+    [[ $root_pgid =~ ^[0-9]+$ ]] || return 0
+    if [[ ${CI_HUB_VALIDATE_CONCURRENT:-} == true ]]; then
+        printf '1\n' >"$VALIDATION_CONCURRENT_MARKER"
+    fi
+    (
+        while kill -0 "$root_pid" 2>/dev/null; do
+            local count previous=0
+            count=$(ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
+                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { seen[$1]=1 }
+                END { print length(seen) }
+            ')
+            [[ $count =~ ^[0-9]+$ ]] || count=0
+            if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+                previous=$(<"$VALIDATION_CONCURRENT_MARKER")
+                [[ $previous =~ ^[0-9]+$ ]] || previous=0
+            fi
+            if ((count > previous)); then
+                printf '%s\n' "$count" >"$VALIDATION_CONCURRENT_MARKER"
+            fi
+            sleep 1
+        done
+    ) &
+    VALIDATION_CONCURRENCY_MONITOR_PID=$!
+}
+
+# Prove that this shell is a descendant of the live process-bound validate-lock
+# owner. Merely setting an environment variable is not enough: the owner sidecar
+# must name the same PID, and that PID must occur in this process's ancestry.
+function validate_lock_exclusivity_proven {
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
+    local recorded_pid current=$$
+    [[ $owner_pid =~ ^[1-9][0-9]*$ && -r $owner_file ]] || return 1
+    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
+    [[ $recorded_pid == "$owner_pid" ]] || return 1
+    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
+        [[ $current == "$owner_pid" ]] && return 0
+        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
+    done
+    return 1
+}
+
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
 # are computed once by the caller (cleanup) in the top-level shell so they match
 # the human summary exactly and so the `times` builtin sees the accumulated child
@@ -999,7 +1072,12 @@ function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
-    local commit_anchored_json tree_dirty_json
+    local count_helper counts executed_tests_json=null filtered_tests_json=null
+    local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
+    local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
+    local known_flaky_failure_json=null solo_rerun_confirmation_json=false
+    local solo_rerun_of_json=null
+    local evidence_available=0 failure_origin_json gate_substeps_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1010,6 +1088,35 @@ function append_validation_ledger {
         result=pass
     else
         result=fail
+    fi
+
+    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
+        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+        concurrency_proof_json='"process_group_overlap_monitor"'
+    elif validate_lock_exclusivity_proven; then
+        concurrent_validates_json=0
+        concurrency_proof_json='"validate_lock_owner_ancestry"'
+    else
+        # A bare run with no observed peer is UNKNOWN, not proven exclusive.
+        concurrent_validates_json=null
+        concurrency_proof_json=null
+    fi
+
+    evidence_helper="$DEV_HERMIT_PARENT/ci-hub/validate/failure_evidence.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $evidence_helper ]] \
+        && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        if evidence_json=$(python3 "$evidence_helper" --log "$LOG_FILE" \
+            --ledger "$VALIDATION_LEDGER_FILE" --commit "$VALIDATION_COMMIT" \
+            --dag-jobs "$VALIDATION_DAG_JOBS" \
+            --concurrent-validates "$concurrent_validates_json" 2>>"$LOG_FILE"); then
+            failed_substeps_json=$(jq -c '.failed_substeps' <<<"$evidence_json")
+            flaky_failed_substeps_json=$(jq -c '.flaky_failed_substeps' <<<"$evidence_json")
+            known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
+            solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
+            solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
+            evidence_available=1
+        fi
     fi
 
     gates_json='['
@@ -1023,12 +1130,40 @@ function append_validation_ledger {
         gates_json+="{\"name\":$(json_quote "${ledger_gate_names[i]}"),"
         gates_json+="\"result\":\"$gate_result\","
         gates_json+="\"exit_code\":${ledger_gate_statuses[i]},"
-        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
+        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}"
+        if ((ledger_gate_statuses[i] != 0)); then
+            failure_origin_json=null
+            gate_substeps_json='[]'
+            if ((evidence_available == 1)); then
+                if [[ ${ledger_gate_names[i]} == *" CI DAG lane" && $failed_substeps_json != '[]' ]]; then
+                    failure_origin_json='"lane_substep"'
+                    gate_substeps_json=$failed_substeps_json
+                else
+                    failure_origin_json='"outer_gate"'
+                fi
+            fi
+            gates_json+=",\"failure_origin\":$failure_origin_json,"
+            gates_json+="\"failed_substeps\":$gate_substeps_json"
+        fi
+        gates_json+='}'
     done
     gates_json+=']'
+    gates_run=${#ledger_gate_names[@]}
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+
+    # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
+    # the receipt publisher fails closed rather than turning missing evidence
+    # into zero or a pass. The fields are additive to schema 3 during the
+    # coverage-schema transition.
+    count_helper="$DEV_HERMIT_PARENT/ci-hub/remediation/nonzero_result.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $count_helper ]] && command -v python3 >/dev/null 2>&1; then
+        counts=$(python3 "$count_helper" --ledger-fields "$LOG_FILE" 2>/dev/null) || counts="null null"
+        read -r executed_tests_json filtered_tests_json <<<"$counts"
+        [[ $executed_tests_json =~ ^(null|[0-9]+)$ ]] || executed_tests_json=null
+        [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
+    fi
 
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
     # are additive; the parent ledger aggregator reads via .get() and is
@@ -1045,6 +1180,14 @@ function append_validation_ledger {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
+    line+="\"concurrency_proof\":$concurrency_proof_json,"
+    line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
+    line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
+    line+="\"solo_rerun_of\":$solo_rerun_of_json,"
+    line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
+    line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
@@ -1112,11 +1255,46 @@ function print_wall_cpu_summary {
         "$ratio" "$host_cpus" "$hint"
 }
 
+function publish_receipt_backed_label {
+    local pr=${PR_NUMBER:-}
+    local ci_hub=${CI_HUB_APPLY_LOCAL_LABEL:-}
+    local -a gh_cmd=(gh)
+
+    if [[ -z $ci_hub && -n $DEV_HERMIT_PARENT ]]; then
+        ci_hub="$DEV_HERMIT_PARENT/ci-hub/ci-hub"
+    fi
+    if [[ -z $ci_hub || ! -x $ci_hub ]]; then
+        printf "⚠️  counted validation recorded, but the ci-hub receipt publisher is unavailable; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if [[ -z $pr ]] && command -v gh >/dev/null 2>&1; then
+        if command -v with-proxy >/dev/null 2>&1; then
+            gh_cmd=(with-proxy gh)
+        fi
+        pr=$("${gh_cmd[@]}" pr view --repo rrnewton/hermit \
+            --json number -q .number 2>/dev/null) || true
+    fi
+    if [[ -z $pr ]]; then
+        printf "⚠️  counted validation recorded, but no PR was found; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if ! "$ci_hub" apply-local-label --pr "$pr" --repo rrnewton/hermit \
+        --ledger "$VALIDATION_LEDGER_FILE"; then
+        printf "⚠️  receipt publication failed for PR #%s; locally-validated was not authorized\n" \
+            "$pr" >&2
+    fi
+}
+
 function cleanup {
     local exit_status=$?
     local pid
 
     trap - EXIT
+
+    if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
+        kill "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+    fi
 
     if [[ -n $active_check_pid ]]; then
         kill_process_tree "$active_check_pid" TERM
@@ -1152,6 +1330,11 @@ function cleanup {
     fi
     append_validation_ledger "$exit_status" \
         "$validation_wall" "$validation_user" "$validation_sys"
+    if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+        VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
+       [[ $VALIDATION_LEVEL == full ]]; then
+        publish_receipt_backed_label
+    fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
@@ -1166,6 +1349,7 @@ function interrupted {
 }
 trap cleanup EXIT
 trap interrupted INT TERM
+start_validation_concurrency_monitor
 
 # Return success (0) when the failed check's log region carries the signature of
 # an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
@@ -1449,6 +1633,24 @@ function initialize_repository_submodules {
         printf "validate.sh: rr submodule is missing\n" >&2
         return 1
     }
+}
+
+# Independent enforcement of the Reverie dependency pin. `git commit --no-verify`
+# bypasses the pre-commit hook, so validate.sh (and therefore every CI profile
+# that runs it) must catch a drifted or orphaned pin on its own. The check is
+# cheap: check-reverie-pin.rs scans tracked Cargo.toml/Cargo.lock and confirms
+# the pin is a real commit on rrnewton/reverie:main history. When the nested
+# lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
+# runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
+function validate_reverie_pin_consistency {
+    local -a proxy=()
+    if command -v with-proxy >/dev/null 2>&1; then
+        proxy=(with-proxy)
+    fi
+    "${proxy[@]}" ./scripts/check-reverie-pin.rs || return 1
+    if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
+        "${proxy[@]}" ./scripts/check-nested-lockfiles.rs || return 1
+    fi
 }
 
 function start_check {
@@ -3581,124 +3783,6 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run, add
-# an audit comment with the validation results, then cancel the redundant
-# in-flight CI run for the exact validated commit.
-# Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Label application and CI cancellation are
-# best-effort so GitHub or proxy failures never change the validation result.
-# The PR is taken from $PR_NUMBER when set, else detected from the current branch
-# via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
-# never changes validation's exit status.
-readonly LOCALLY_VALIDATED_REPOSITORY="rrnewton/hermit"
-readonly LOCALLY_VALIDATED_LABEL="locally-validated"
-
-function apply_locally_validated_label {
-    local pr=$PR_NUMBER
-    local pr_head=""
-    local local_head
-    local comment_body=""
-    local host_name=""
-    local passed_checks=0
-    local timestamp=""
-    local run_id=""
-    local -a gh_cmd=(gh)
-
-    if ! command -v gh >/dev/null 2>&1; then
-        printf "⚠️  gh CLI not found; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    # gh on Meta devservers needs the forward proxy; mirror ensure_cargo_nextest.
-    if command -v with-proxy >/dev/null 2>&1; then
-        gh_cmd=(with-proxy gh)
-    fi
-
-    if [[ -z $pr ]]; then
-        pr=$("${gh_cmd[@]}" pr view --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --json number -q .number 2>/dev/null) || true
-    fi
-    if [[ -z $pr ]]; then
-        printf "⚠️  no PR found for the current branch; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    pr_head=$("${gh_cmd[@]}" pr view "$pr" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --json headRefOid -q .headRefOid 2>/dev/null) || true
-    if [[ -z $pr_head ]]; then
-        printf "⚠️  could not read PR #%s head; skipping '%s' label\n" \
-            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    local_head=$(git rev-parse HEAD)
-    if [[ $pr_head != "$local_head" ]]; then
-        printf "⚠️  PR #%s advanced from %s to %s; skipping '%s' label\n" \
-            "$pr" "$local_head" "$pr_head" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-
-    # Ensure a fresh repository can accept the label. Failure is harmless here:
-    # the edit below reports the actionable warning and validation remains green.
-    "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --color 1d76db \
-        --description "Full local validation passed for the current PR head" \
-        --force >>"$LOG_FILE" 2>&1 || true
-
-    if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        >>"$LOG_FILE" 2>&1; then
-        printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
-
-        host_name=$(hostname -f 2>/dev/null) || \
-            host_name=$(hostname 2>/dev/null) || host_name="unknown"
-        timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
-        passed_checks=$((checks - failures))
-        # Single quotes keep the Markdown backticks literal in the comment body.
-        # The trailing HTML marker is machine-parseable: label-strip-evidence.sh
-        # locates this comment by `sha=<head>` when the label is later stripped,
-        # so the record of what was validated (commit, profile, durable log) is
-        # never lost. Keep the marker key names in sync with that script.
-        # shellcheck disable=SC2016
-        printf -v comment_body \
-            '[impl agent, validate.sh]\n\nLocal validation passed — `%s` label applied.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Log: `%s:%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ts=%s -->' \
-            "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
-            "$passed_checks" "$host_name" "$host_name" "$LOG_FILE" "$timestamp" \
-            "$local_head" "$VALIDATION_PROFILE" "$host_name" "$LOG_FILE" "$timestamp"
-        if "${gh_cmd[@]}" pr comment "$pr" \
-            --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --body "$comment_body" >>"$LOG_FILE" 2>&1; then
-            printf "💬 Added local validation results to PR #%s\n" "$pr"
-        else
-            printf "⚠️  failed to comment validation results on PR #%s (full log: %s)\n" \
-                "$pr" "$LOG_FILE" >&2
-        fi
-
-        if ! run_id=$("${gh_cmd[@]}" api \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
-            --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
-            2>>"$LOG_FILE"); then
-            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
-                "$local_head" "$LOG_FILE" >&2
-            return 0
-        fi
-        if [[ -z $run_id ]]; then
-            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
-        elif "${gh_cmd[@]}" api --method POST \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/runs/${run_id}/cancel" \
-            >>"$LOG_FILE" 2>&1; then
-            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
-        else
-            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
-                "$run_id" "$local_head" "$LOG_FILE" >&2
-        fi
-    else
-        printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
-            "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
-    fi
-}
-
 # fbsource import lints require the Meta copyright header on every imported Rust
 # source file. `head -n 8` permits a rust-script shebang first.
 function check_copyright_headers {
@@ -3784,11 +3868,10 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
-    run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
-        ./ci/run-dag.sh "$lane" -j "$jobs" -v
+    run_check_with_timeout "$timeout_seconds" "$lane CI DAG lane" \
+        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v
 }
 
 function run_portable_only_suite {
@@ -3898,7 +3981,7 @@ function run_selective_suite {
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
                 "portable CI DAG (selective subset)" \
-                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
+                ./ci/run-dag.sh portable -j "$VALIDATION_DAG_JOBS" -v
             rc=$?
             unset RUN_DAG_FILE_OVERRIDE
             print_summary
@@ -4138,6 +4221,9 @@ function run_super_suite {
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
 run_check "Initialize repository submodules" initialize_repository_submodules
+# Fail fast on Reverie pin drift before any heavy build/test work. Independent of
+# the pre-commit hook, which git commit --no-verify can bypass.
+run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
     exit 1
@@ -4287,16 +4373,5 @@ case "$VALIDATION_LEVEL" in
 esac
 
 print_summary
-
-# On a fully-green full run, tag the PR unless explicitly disabled. GitHub
-# failures are warnings and never affect the final validation exit status.
-if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
-        apply_locally_validated_label
-    else
-        printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-    fi
-fi
 
 ((failures == 0))
