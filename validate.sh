@@ -1024,21 +1024,44 @@ function start_validation_concurrency_monitor {
     root_pgid=$(ps -o pgid= -p "$root_pid" 2>/dev/null | tr -d ' ')
     [[ $root_pgid =~ ^[0-9]+$ ]] || return 0
     if [[ ${CI_HUB_VALIDATE_CONCURRENT:-} == true ]]; then
-        : >"$VALIDATION_CONCURRENT_MARKER"
+        printf '1\n' >"$VALIDATION_CONCURRENT_MARKER"
     fi
     (
         while kill -0 "$root_pid" 2>/dev/null; do
-            if ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
-                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { found=1 }
-                END { exit !found }
-            '; then
-                : >"$VALIDATION_CONCURRENT_MARKER"
-                exit 0
+            local count previous=0
+            count=$(ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
+                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { seen[$1]=1 }
+                END { print length(seen) }
+            ')
+            [[ $count =~ ^[0-9]+$ ]] || count=0
+            if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+                previous=$(<"$VALIDATION_CONCURRENT_MARKER")
+                [[ $previous =~ ^[0-9]+$ ]] || previous=0
+            fi
+            if ((count > previous)); then
+                printf '%s\n' "$count" >"$VALIDATION_CONCURRENT_MARKER"
             fi
             sleep 1
         done
     ) &
     VALIDATION_CONCURRENCY_MONITOR_PID=$!
+}
+
+# Prove that this shell is a descendant of the live process-bound validate-lock
+# owner. Merely setting an environment variable is not enough: the owner sidecar
+# must name the same PID, and that PID must occur in this process's ancestry.
+function validate_lock_exclusivity_proven {
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
+    local recorded_pid current=$$
+    [[ $owner_pid =~ ^[1-9][0-9]*$ && -r $owner_file ]] || return 1
+    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
+    [[ $recorded_pid == "$owner_pid" ]] || return 1
+    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
+        [[ $current == "$owner_pid" ]] && return 0
+        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
+    done
+    return 1
 }
 
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
@@ -1048,10 +1071,12 @@ function start_validation_concurrency_monitor {
 function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
-    local finished_at result raw_result gates_json gate_result line
+    local finished_at result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json concurrent_json gates_run
-    local outcome_helper classified_line
+    local commit_anchored_json tree_dirty_json concurrent_validates_json gates_run
+    local evidence_helper evidence_json failed_substeps_json='[]'
+    local known_flaky_failure_json=null solo_rerun_confirmation_json=false
+    local evidence_available=0 failure_origin_json gate_substeps_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1059,14 +1084,33 @@ function append_validation_ledger {
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     if ((exit_status == 0 && failures == 0)); then
-        raw_result=pass
         result=pass
     else
-        raw_result=fail
-        # A raw nonzero exit is not yet an earned product failure. If the shared
-        # classifier is unavailable, retain it as NO_RESULT rather than forging a
-        # permanent FAILED row from conditions this writer could not interpret.
-        result=no_result
+        result=fail
+    fi
+
+    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
+        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+    elif validate_lock_exclusivity_proven; then
+        concurrent_validates_json=0
+    else
+        # A bare run with no observed peer is UNKNOWN, not proven exclusive.
+        concurrent_validates_json=null
+    fi
+
+    evidence_helper="$DEV_HERMIT_PARENT/ci-hub/validate/failure_evidence.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $evidence_helper ]] \
+        && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        if evidence_json=$(python3 "$evidence_helper" --log "$LOG_FILE" \
+            --ledger "$VALIDATION_LEDGER_FILE" --commit "$VALIDATION_COMMIT" \
+            --dag-jobs "$VALIDATION_DAG_JOBS" \
+            --concurrent-validates "$concurrent_validates_json" 2>>"$LOG_FILE"); then
+            failed_substeps_json=$(jq -c '.failed_substeps' <<<"$evidence_json")
+            known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
+            solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
+            evidence_available=1
+        fi
     fi
 
     gates_json='['
@@ -1080,14 +1124,28 @@ function append_validation_ledger {
         gates_json+="{\"name\":$(json_quote "${ledger_gate_names[i]}"),"
         gates_json+="\"result\":\"$gate_result\","
         gates_json+="\"exit_code\":${ledger_gate_statuses[i]},"
-        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
+        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}"
+        if ((ledger_gate_statuses[i] != 0)); then
+            failure_origin_json=null
+            gate_substeps_json='[]'
+            if ((evidence_available == 1)); then
+                if [[ ${ledger_gate_names[i]} == *" CI DAG lane" && $failed_substeps_json != '[]' ]]; then
+                    failure_origin_json='"lane_substep"'
+                    gate_substeps_json=$failed_substeps_json
+                else
+                    failure_origin_json='"outer_gate"'
+                fi
+            fi
+            gates_json+=",\"failure_origin\":$failure_origin_json,"
+            gates_json+="\"failed_substeps\":$gate_substeps_json"
+        fi
+        gates_json+='}'
     done
     gates_json+=']'
     gates_run=${#ledger_gate_names[@]}
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
-    if [[ -e $VALIDATION_CONCURRENT_MARKER ]]; then concurrent_json=true; else concurrent_json=false; fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1114,27 +1172,15 @@ function append_validation_ledger {
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
-    line+="\"raw_result\":\"$raw_result\",\"result\":\"$result\",\"exit_code\":$exit_status,"
+    line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
-    line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validate\":$concurrent_json,"
+    line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
+    line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
-
-    outcome_helper="$DEV_HERMIT_PARENT/ci-hub/validation/record_outcome.py"
-    if [[ -n $DEV_HERMIT_PARENT && -r $outcome_helper ]] && command -v python3 >/dev/null 2>&1; then
-        if classified_line=$(printf '%s\n' "$line" | python3 "$outcome_helper" \
-            --log "$LOG_FILE" --ledger "$VALIDATION_LEDGER_FILE" 2>>"$LOG_FILE"); then
-            line=$classified_line
-        else
-            printf "validate.sh: outcome classifier failed; recording NO_RESULT, never FAILED\n" \
-                >>"$LOG_FILE"
-        fi
-    elif [[ $raw_result != pass ]]; then
-        printf "validate.sh: shared outcome classifier unavailable; recording NO_RESULT, never FAILED\n" \
-            >>"$LOG_FILE"
-    fi
 
     if ! mkdir -p "$(dirname -- "$VALIDATION_LEDGER_FILE")"; then
         printf "⚠️  unable to create validation ledger directory for %s\n" \
@@ -3797,7 +3843,7 @@ function run_ci_manifest_lane {
     local timeout_seconds=${2:-7200}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
-    run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
+    run_check_with_timeout "$timeout_seconds" "$lane CI DAG lane" \
         ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v
 }
 
