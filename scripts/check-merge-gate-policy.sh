@@ -21,7 +21,7 @@ fail() {
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'ref: f9e61247e83bb07c11297541b591606de24a89a8' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
-grep -Fq '.dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
+grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
     fail "local shell adapter must delegate to the parent status authority"

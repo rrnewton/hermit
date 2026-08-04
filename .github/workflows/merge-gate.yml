@@ -326,7 +326,7 @@ jobs:
           set -euo pipefail
 
           classify_check() {
-            .dev-hermit-policy/ci-hub/check_outcome.py \
+            python3 .dev-hermit-policy/ci-hub/check_outcome.py \
               --status "$1" --conclusion "$2"
           }
 
