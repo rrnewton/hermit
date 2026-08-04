@@ -46,6 +46,7 @@ use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
+use super::verify::write_verification_json;
 
 #[derive(Debug)]
 struct E9patchRecordOverlay {
@@ -194,6 +195,16 @@ pub struct StartOpts {
     /// The recording is deleted if the replay was successful.
     #[clap(long)]
     verify: bool,
+
+    /// With --verify, write the verification verdict as a single JSON line to
+    /// this path: `{"verified":bool,"verdict":"matched"|"diverged",
+    /// "guest_exit_code":int|null,"guest_signal":int|null}`. This is the
+    /// exit-code-independent verdict channel: `verified` reflects whether the
+    /// record and replay runs matched, regardless of what the guest exited with,
+    /// so a caller need not (and must not) infer the verdict from the process
+    /// exit code, which still carries the guest's own status.
+    #[clap(long, requires = "verify", value_name = "PATH")]
+    verify_json: Option<PathBuf>,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -399,7 +410,7 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
-        compare_two_runs(
+        let outcome = compare_two_runs(
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
@@ -414,7 +425,17 @@ impl StartOpts {
                 verbose: false,
                 compare_logs: true,
             },
-        )
+        )?;
+
+        // Emit the machine-readable verdict (if requested) before collapsing the
+        // outcome to the historical exit-code convention, so the verdict is
+        // recorded whether or not the runs matched and independent of the guest's
+        // own exit status.
+        if let Some(path) = &self.verify_json {
+            write_verification_json(path, &outcome)?;
+        }
+
+        outcome.into_exit_status()
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -547,6 +568,7 @@ mod tests {
             data_dir: None,
             record_timeout: None,
             verify: false,
+            verify_json: None,
             gdbex: Vec::new(),
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();
