@@ -469,7 +469,8 @@
     {
       "group": "test", "job": "strict_compat",
       "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix. This cmd is a NESTED ./validate.sh that does a cold RELEASE build (reverie-dbi/build.rs C++ DynamoRIO + full release hermit); with CARGO_BUILD_JOBS unset that build fanned rustc/cc1plus out to nproc and OOM-killed at the 6.0GiB inner cap (8 oom_kill events; the reverie-dbi/build.rs:339 'panic' seen in logs is a DOWNSTREAM artifact of cc1plus being SIGKILLed by cgroup memory.max, not a real build break). CARGO_BUILD_JOBS=8 is inherited by the nested cargo invocations, bounding the fan-out. Cap KEPT at 6.0GiB (sibling build.dbi_release does the same release DBI build at j8 within 5.5GiB, so 6.0GiB is adequate headroom once pinned); peak≈6.0GiB in the failing run was cap-limited (reclaim + OOM), NOT a true required-memory reading. hermit@b384187e.",
+      "cmd": "CARGO_BUILD_JOBS=8 ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
       "deps": ["lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates", "build.flaky_harnesses",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
