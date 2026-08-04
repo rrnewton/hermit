@@ -697,11 +697,14 @@ fn run_dbi_strict_returns_with_blocked_stdin_source() {
 fn run_liteinst_verifies_detcore_backend() {
     liteinst_runtime::ensure_liteinst_runtime();
     let args = [
+        "--log",
+        "info",
         "run",
         "--backend",
         "liteinst",
         "--strict",
         "--verify",
+        "--verify-logs",
         "--",
         "/bin/echo",
         "liteinst-cli-ok",
@@ -712,19 +715,59 @@ fn run_liteinst_verifies_detcore_backend() {
     let stderr = stderr(&output);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
         ),
         "{stderr}"
     );
+    for field in [
+        "backend run complete backend=liteinst",
+        "LiteInst instrumentation stats: process_reports=1 distinct_rips_patched=",
+        "cacheline_straddlers=",
+        "non_straddling=",
+        "paths[first_site_seccomp=0",
+        "ptrace_installation=",
+        "in_guest_sigsys=",
+        "in_guest_nested_sigsys=",
+        "unpatchable_or_other=",
+        "direct_hook=",
+        "instruction_lengths[1=",
+        "straddle_prefix[1=",
+    ] {
+        assert!(
+            stderr.contains(field),
+            "missing instrumentation field {field:?}: {stderr}"
+        );
+    }
     assert!(
         stderr.contains("Success: deterministic. Determinism verified."),
         "{stderr}"
     );
     assert!(
         stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+            "LiteInst in-guest Tool (reverie-liteinst runtime + coordinator GlobalTool RPC)"
         ),
         "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Detcore Tool active in ptrace host"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn backend_stats_are_info_gated_for_ptrace() {
+    let default_args = ["run", "--strict", "--", "/bin/true"];
+    let default_output = hermit(&default_args);
+    assert_success(&default_output, &default_args);
+    assert!(!stderr(&default_output).contains("backend run complete"));
+
+    let info_args = ["--log", "info", "run", "--strict", "--", "/bin/true"];
+    let info_output = hermit(&info_args);
+    assert_success(&info_output, &info_args);
+    assert!(
+        stderr(&info_output).contains("backend run complete backend=ptrace stats=metrics=none"),
+        "{}",
+        stderr(&info_output)
     );
 }
 

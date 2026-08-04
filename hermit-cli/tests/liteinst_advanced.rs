@@ -215,6 +215,91 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
+fn assert_liteinst_stats(
+    output: &Output,
+    expected_run_reports: usize,
+    expected_process_reports: usize,
+) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("backend run complete backend=liteinst")
+            .count(),
+        expected_run_reports,
+        "{stderr}"
+    );
+    let process_field = format!(
+        "LiteInst instrumentation stats: process_reports={expected_process_reports} distinct_rips_patched="
+    );
+    assert!(
+        stderr.contains(&process_field),
+        "missing {process_field:?}: {stderr}"
+    );
+    let path_reports = stderr
+        .lines()
+        .filter(|line| line.contains("backend run complete backend=liteinst"))
+        .map(|line| {
+            let fields = line
+                .split_once(" paths[")
+                .and_then(|(_, suffix)| suffix.split_once(']'))
+                .map(|(fields, _)| fields)
+                .unwrap_or_else(|| panic!("missing LiteInst path totals: {line}"));
+            let fields = fields.split(',').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 7, "unexpected LiteInst path count: {line}");
+            let mut paths = [0_u64; 7];
+            for (index, (expected_name, field)) in [
+                "first_site_seccomp",
+                "ptrace_installation",
+                "in_guest_sigsys",
+                "in_guest_nested_sigsys",
+                "cacheline_straddler",
+                "unpatchable_or_other",
+                "direct_hook",
+            ]
+            .into_iter()
+            .zip(fields)
+            .enumerate()
+            {
+                let (name, value) = field
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("malformed LiteInst path total {field:?}: {line}"));
+                assert_eq!(
+                    name, expected_name,
+                    "unexpected LiteInst path order: {line}"
+                );
+                paths[index] = value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid LiteInst path total {field:?}: {line}"));
+            }
+            paths
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        path_reports.len(),
+        expected_run_reports,
+        "missing per-run path totals: {stderr}"
+    );
+    for paths in path_reports {
+        // Nested SIGSYS includes Tool-internal RPC/polling syscalls. Its exact
+        // diagnostic count follows scheduler polling, while all other paths
+        // are fixed for this plain-fork fixture.
+        assert!(paths[3] > 0, "missing nested SIGSYS hits: {stderr}");
+        assert_eq!(
+            [paths[0], paths[1], paths[2], paths[4], paths[5], paths[6]],
+            [0, 0, 29, 0, 0, 51],
+            "unexpected LiteInst path totals: {stderr}"
+        );
+    }
+    for field in [
+        "patch_candidates=",
+        "decisions[direct_pun=",
+        "instruction_lengths[1=",
+        "straddle_prefix[1=",
+    ] {
+        assert!(stderr.contains(field), "missing {field:?}: {stderr}");
+    }
+}
+
 fn assert_liteinst_virtual_time_is_continuous() {
     const EPOCH_SECONDS: u64 = 1_767_225_600;
     const MAX_STARTUP_SECONDS: u64 = 60;
@@ -274,7 +359,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
         ),
         "{stderr}"
     );
@@ -290,7 +375,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     );
     assert!(
         stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+            "LiteInst in-guest Tool (reverie-liteinst runtime + coordinator GlobalTool RPC)"
         ),
         "{stderr}"
     );
@@ -311,6 +396,16 @@ fn liteinst_detcore_strict_verify_micro_suite() {
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_hides_coordinator_selector() {
+    let output = run_liteinst_strict_verify(Path::new("/usr/bin/env"), &[]);
+    let stdout = String::from_utf8(output.stdout).expect("env output should be UTF-8");
+    assert!(
+        !stdout.contains("REVERIE_LITEINST_COORDINATOR="),
+        "private coordinator selector leaked into the guest: {stdout}"
     );
 }
 
@@ -810,10 +905,7 @@ fn assert_clone_boundary(mode: &str) {
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ENOTSUPP (Operation is not supported)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Operation not supported"), "{stderr}");
     assert!(!stderr.contains("Bad system call"), "{stderr}");
 }
 
@@ -826,13 +918,9 @@ fn liteinst_runtime_library() -> PathBuf {
     liteinst_runtime::liteinst_runtime_library()
 }
 
-/// A bare preload must not create a second in-guest Detcore Tool.
-///
-/// Host mode is selected only by `run_host_with_preload`. Without that private
-/// selector, even a stale legacy coordinator variable must leave the patch DSO
-/// inert and let the program run normally.
+/// A bare preload without a coordinator selector must not create a Detcore Tool.
 #[test]
-fn liteinst_preload_is_inert_without_host_runtime_selector() {
+fn liteinst_preload_is_inert_without_coordinator_selector() {
     let runtime = liteinst_runtime_library();
     assert!(
         runtime.is_file(),
@@ -841,10 +929,7 @@ fn liteinst_preload_is_inert_without_host_runtime_selector() {
     );
 
     let output = Command::new("/bin/true")
-        .env(
-            reverie_liteinst::COORDINATOR_ENV,
-            "/definitely/not/a/coordinator.sock",
-        )
+        .env_remove(reverie_liteinst::COORDINATOR_ENV)
         .env("LD_PRELOAD", &runtime)
         .output()
         .expect("failed to launch /bin/true under the LiteInst preload");
@@ -870,8 +955,40 @@ fn liteinst_thread_clone_fails_closed_without_sigsys() {
 }
 
 #[test]
-fn liteinst_fork_fails_closed_without_hanging() {
-    assert_clone_boundary("fork");
+fn liteinst_fork_process_tree_strict_verify() {
+    let output = run_liteinst_strict_verify(advanced_guest(), &["fork"]);
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert_liteinst_stats(&output, 2, 9);
+}
+
+#[test]
+fn liteinst_fork_process_tree_reports_stats_on_normal_path() {
+    let output = run_liteinst(advanced_guest(), &["fork"], false);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert_liteinst_stats(&output, 1, 9);
+}
+
+#[test]
+fn liteinst_disabled_stats_ignore_an_inherited_stats_socket() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let output = Command::new(liteinst_runtime::hermit_binary())
+        .args(["run", "--backend", "liteinst", "--strict", "--"])
+        .arg(advanced_guest())
+        .arg("fork")
+        .env(
+            reverie_liteinst::STATS_COORDINATOR_ENV,
+            "/definitely/missing/liteinst-stats.sock",
+        )
+        .output()
+        .expect("failed to run Hermit LiteInst with statistics disabled");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"fork-ok\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("backend run complete backend=liteinst"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
