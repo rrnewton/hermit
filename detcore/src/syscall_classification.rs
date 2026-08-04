@@ -621,7 +621,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setregid
         | Sysno::setgroups
         | Sysno::setfsuid
-        | Sysno::setfsgid => SyscallClassification::Determinized,
+        | Sysno::setfsgid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1549): Determinize the credential
+        // *query* family so it actually implements the fixed virtual-root
+        // identity the setuid no-ops above already assume. Previously
+        // getuid/geteuid/getgid/getegid/getresuid/getresgid were pass-through
+        // and returned 0 only because the ptrace backend runs the guest inside a
+        // CLONE_NEWUSER namespace (hermit-cli/src/lib.rs) that maps the real uid
+        // to 0. In-process backends (DBI) have no such namespace, so pass-through
+        // leaked the host uid/gid and contradicted the credential model.
+        // Emulating the query side to the constant virtual-root identity (0)
+        // makes the result backend-independent, matches the ptrace golden
+        // reference, and is never forwarded to the host, so it is
+        // bitwise-identical across --verify and record/replay.
+        | Sysno::getuid
+        | Sysno::geteuid
+        | Sysno::getgid
+        | Sysno::getegid
+        | Sysno::getresuid
+        | Sysno::getresgid => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -634,9 +653,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#663)
         | Sysno::chown
         | Sysno::getcwd
-        | Sysno::getegid
-        | Sysno::geteuid
-        | Sysno::getgid
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -645,7 +661,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getppid
         | Sysno::getsid
         | Sysno::gettid
-        | Sysno::getuid
         | Sysno::mprotect
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
@@ -695,10 +710,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsync
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresgid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresuid
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::munlock
         // AUTONOMOUS-BOT-IMPLEMENTED
