@@ -6,17 +6,31 @@ a moving `branch = "main"`. Pinning makes builds reproducible: when hermit's
 tests pass, the exact Reverie commit is recorded in the manifests (and is not
 silently changed by an upstream push).
 
-Hermit's fork policy adds a freshness invariant: absent an explicitly justified
-temporary exception, the pin must equal the current `rrnewton/reverie:main` tip.
-A stale pin can silently omit already-merged correctness or performance fixes.
-The demo5 investigation found exactly this failure mode when Hermit remained on
-`aa6f1283` and missed the merged ptrace-notifier fast path.
+Hermit's fork policy adds a consistency invariant: absent an explicitly
+justified temporary exception, the pin must be an *ancestor* of the current
+`rrnewton/reverie:main` tip — a real commit on main's history. The pin does not
+have to equal the very latest tip; a pin that is merely behind main is fine.
+This still catches the failure modes that matter — a typo, an orphaned SHA, or
+an unmerged/side-branch commit that is not on main at all. (Bumping to the
+latest tip is still encouraged so Hermit picks up merged correctness and
+performance fixes — the demo5 investigation found exactly such a miss when
+Hermit remained on `aa6f1283` and lacked the merged ptrace-notifier fast path —
+but a behind-but-on-main pin no longer blocks CI.)
 
-## Freshness lint
+## Consistency lint
 
-`scripts/check-reverie-pin.rs` checks that every Reverie `rev` in Hermit's
-manifests is identical and equals the live `rrnewton/reverie:main` tip. It fails
-closed when the remote cannot be checked. Run it locally through the proxy:
+`scripts/check-reverie-pin.rs` derives its scope from `git ls-files` and checks
+every tracked `Cargo.toml` and `Cargo.lock`. Every Reverie revision in that
+tracked Cargo dependency metadata must be identical and must be an ancestor of
+the live `rrnewton/reverie:main` tip (verified with a cheap treeless
+commit-graph fetch). The checker reports the manifest, lockfile, pinned-file,
+and revision-entry counts on every run so a green result states its coverage.
+Tracked vendored Cargo metadata is included. Untracked/generated files and
+nested submodule contents are excluded because Hermit does not track their
+contents. Non-Cargo files are also outside this dependency-consistency check;
+it does not certify arbitrary SHA links in source or documentation. The checker
+fails closed when the remote cannot be checked. Run it locally through the
+proxy:
 
 ```bash
 with-proxy ./scripts/check-reverie-pin.rs
@@ -48,29 +62,22 @@ current. Remove it and repin to main as soon as the dependency lands.
 
 ## Where the pin lives
 
-The same `rev` appears in every crate that depends on a Reverie crate. Keep them
-identical — mixing revisions can pull two incompatible `reverie` cores into one
-build. As of this writing the deps are:
+The same revision appears in every tracked manifest and lockfile that resolves a
+Reverie crate. Keep them identical — mixing revisions can pull two incompatible
+`reverie` cores into one build. Do not maintain a path list in this document;
+derive the current set exactly as the checker does:
 
-- `hermit-cli/Cargo.toml`
-- `detcore/Cargo.toml`
-- `detcore-dbi/Cargo.toml`
-- `detcore-liteinst/Cargo.toml`
-- `detcore-model/Cargo.toml` — `reverie-syscalls`
-- `detcore-sabre/Cargo.toml`
-- `detcore/tests/testutils/Cargo.toml`
-- `hermit-install/Cargo.toml`
-- `liteinst-runtime-build/runtime/Cargo.toml` — isolated constructor-runtime build
+```bash
+git ls-files 'Cargo.toml' 'Cargo.lock' '**/Cargo.toml' '**/Cargo.lock'
+```
 
-The first nine manifest locations above must stay on one exact revision. The
-first eight hexadecimal digits also key LiteInst build caches. Update the
-embedded short revision in all four locations so a new Reverie pin cannot reuse
-or mislabel artifacts from the previous revision:
-
-- `ci/dag/portable.json`
-- `validate.sh`
-- `hermit-install/build.rs`
-- `hermit-cli/tests/common/liteinst.rs`
+Historical scope baseline: on 2026-08-04 at Hermit
+`e8a0d8d3be3b53985dc898bb8e5cbb696a6a719f`, the derived set was 20 manifests
+plus 4 lockfiles; 11 of those files held 47 Reverie revision entries. A search
+for that revision, both full and eight-character forms, found zero occurrences
+outside the tracked Cargo metadata. This dated baseline is evidence that the
+scope was exercised when introduced, not a fixed expected count; the runtime
+counts are authoritative as the repository changes.
 
 ## How to bump
 

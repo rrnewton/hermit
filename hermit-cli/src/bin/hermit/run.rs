@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
@@ -25,10 +26,16 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::happens_before::HappensBeforeProgram;
+use detcore_model::happens_before::Strength;
 use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::happens_before::DebugInfoResolver;
+use hermit::happens_before::describe_anchor;
+use hermit::happens_before::load_program;
+use hermit::happens_before::resolve_program;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -54,6 +61,38 @@ use super::verify::validate_log_level;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
+    let mut log = OpenOptions::new().append(true).open(path)?;
+    let mut guest_stderr = Vec::with_capacity(stderr.len());
+    let mut syscall_records = 0;
+    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
+        let start = line
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let payload = line[start..].strip_suffix(b"\n").unwrap_or(&line[start..]);
+        let payload = payload.strip_suffix(b"\r").unwrap_or(payload);
+        if payload.starts_with(b"INFO detcore") && contains_bytes(payload, b" DETLOG ") {
+            log.write_all(NORMALIZED_SABRE_DETLOG_TIMESTAMP.as_bytes())?;
+            log.write_all(b" ")?;
+            log.write_all(payload)?;
+            log.write_all(b"\n")?;
+            syscall_records += usize::from(contains_bytes(payload, b"DETLOG [syscall]"));
+        } else {
+            guest_stderr.extend_from_slice(line);
+        }
+    }
+    *stderr = guest_stderr;
+    Ok(syscall_records)
+}
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
@@ -95,6 +134,28 @@ pub struct RunOpts {
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
+
+    /// Path to a happens-before specification (JSON; see RFC #1146) that places
+    /// deterministic ordering edges between anchored events. Anchor code
+    /// locations (`func`, `file:line`) are resolved against the guest program's
+    /// debug info. Scheduler enforcement is not yet wired; combine with
+    /// `--hb-list-events` to preview how the spec resolves against the binary.
+    #[clap(long, value_name = "filepath")]
+    happens_before: Option<PathBuf>,
+
+    /// Load the `--happens-before` specification, resolve its anchors against the
+    /// guest program's debug info, print the resolved anchor/edge program, and
+    /// exit without running the guest.
+    #[clap(long, requires = "happens_before")]
+    hb_list_events: bool,
+
+    /// Runtime-only cache of the resolved happens-before program. Populated in
+    /// `main()` after the guest binary's debug info is available (so anchor code
+    /// locations resolve to addresses), then copied into `DetConfig` for the
+    /// scheduler. It is never a CLI argument and never serialized; `#[clap(skip)]`
+    /// defaults it to `None` when `RunOpts` is parsed or round-tripped.
+    #[clap(skip)]
+    resolved_happens_before: Option<HappensBeforeProgram>,
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
@@ -384,7 +445,7 @@ impl FromStr for VerifyAllow {
 }
 
 impl VerifyAllow {
-    fn satisfies(&self, status: ExitStatus) -> bool {
+    pub(crate) fn satisfies(&self, status: ExitStatus) -> bool {
         match self {
             VerifyAllow::Success => status == ExitStatus::SUCCESS,
             VerifyAllow::Failure => status != ExitStatus::SUCCESS,
@@ -538,6 +599,15 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.save_config {
             let s = p.to_str().expect("valid string provided to --save-config");
             write!(f, " --save-config={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.happens_before {
+            let s = p
+                .to_str()
+                .expect("valid string provided to --happens-before");
+            write!(f, " --happens-before={}", shell_words::quote(s))?;
+        }
+        if self.hb_list_events {
+            write!(f, " --hb-list-events")?;
         }
 
         for mount in &self.mount {
@@ -1728,6 +1798,15 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
+        if self.hb_list_events {
+            return self.list_happens_before_events();
+        }
+        if self.happens_before.is_some() {
+            // Resolve the spec against the guest binary's debug info now and cache
+            // it so every subsequent `effective_det_config()` (including both
+            // `--verify` runs) hands the scheduler the identical resolved program.
+            self.resolved_happens_before = Some(self.load_and_resolve_happens_before()?);
+        }
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
@@ -1747,6 +1826,7 @@ impl RunOpts {
                     &self.program,
                     &self.args,
                     self.verify,
+                    self.verify_allow,
                     self.summary,
                     global.log,
                     &self.effective_det_config(),
@@ -1953,6 +2033,19 @@ impl RunOpts {
             }
         }
 
+        // Happens-before enforcement parks the "after" thread until its "before"
+        // anchor fires. That deterministic parking is only meaningful when the
+        // scheduler owns thread selection; with threads running in parallel there
+        // is no single serial order to constrain. Fail closed rather than silently
+        // ignore the spec.
+        if self.happens_before.is_some() && !config.sequentialize_threads {
+            anyhow::bail!(
+                "--happens-before requires deterministic sequential thread execution; remove \
+                 --no-sequentialize-threads (and --strace-only) so the scheduler can enforce \
+                 ordering edges"
+            );
+        }
+
         // The gdbserver listens on a TCP port that is bound inside the guest's
         // network namespace. With the default isolated (`local`) networking, that
         // port lives in the guest's unshared netns and is unreachable from a host
@@ -2147,6 +2240,131 @@ impl RunOpts {
             GuestPathMapping::Hidden => None,
             GuestPathMapping::Unchanged => Some(guest.to_path_buf()),
         }
+    }
+
+    /// Load the `--happens-before` spec, resolve its anchors against the guest
+    /// program's debug info, print the resolved anchor/edge program, and return
+    /// success without running the guest. Scheduler enforcement of these edges is
+    /// a separate, forthcoming change; this path is pure introspection.
+    /// Load the `--happens-before` spec and resolve its anchor code locations
+    /// against the guest binary's debug info, returning the resolved program the
+    /// scheduler will enforce. Unresolved code locations are reported but do not
+    /// fail the run: a count-based anchor (after N syscalls / M RCBs) needs no
+    /// debug info, and a purely deferred RIP anchor that never resolves simply
+    /// never fires. This shares the same load/resolve path as
+    /// `list_happens_before_events` so the preview and the enforced program agree.
+    fn load_and_resolve_happens_before(&self) -> Result<HappensBeforeProgram, Error> {
+        let spec_path = self
+            .happens_before
+            .as_ref()
+            .expect("load_and_resolve_happens_before requires --happens-before");
+        let mut program = load_program(spec_path)?;
+
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        match DebugInfoResolver::open(&host) {
+            Ok(resolver) if !resolver.is_empty() => {
+                let unresolved = resolve_program(&mut program, &resolver);
+                if !unresolved.is_empty() {
+                    eprintln!(
+                        "hermit: {} happens-before anchor(s) with unresolved code locations \
+                         (they will never fire): {}",
+                        unresolved.len(),
+                        unresolved.join(", ")
+                    );
+                }
+            }
+            Ok(_) => {
+                let unresolved: Vec<String> = program
+                    .unresolved_locations()
+                    .map(|a| a.name.clone())
+                    .collect();
+                if !unresolved.is_empty() {
+                    eprintln!(
+                        "hermit: {} has no usable symbol/debug info; {} code-location anchor(s) \
+                         will never fire: {}",
+                        host.display(),
+                        unresolved.len(),
+                        unresolved.join(", ")
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "hermit: could not read debug info from {}: {:#}; code-location anchors will \
+                     never fire",
+                    host.display(),
+                    err
+                );
+            }
+        }
+        Ok(program)
+    }
+
+    fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {
+        let spec_path = self
+            .happens_before
+            .as_ref()
+            .expect("--hb-list-events requires --happens-before");
+        let mut program = load_program(spec_path)?;
+
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        let resolver = match DebugInfoResolver::open(&host) {
+            Ok(r) if !r.is_empty() => Some(r),
+            Ok(_) => {
+                eprintln!(
+                    "hermit: {} has no usable symbol/debug info; code-location anchors will not \
+                     resolve",
+                    host.display()
+                );
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "hermit: could not read debug info from {}: {:#}",
+                    host.display(),
+                    err
+                );
+                None
+            }
+        };
+
+        let unresolved = match &resolver {
+            Some(r) => resolve_program(&mut program, r),
+            None => program
+                .unresolved_locations()
+                .map(|a| a.name.clone())
+                .collect(),
+        };
+
+        println!(
+            "happens-before program: {} anchor(s), {} edge(s)",
+            program.anchors.len(),
+            program.edges.len()
+        );
+        println!("anchors:");
+        for (name, anchor) in &program.anchors {
+            println!(
+                "  {} = {}",
+                name,
+                describe_anchor(anchor, resolver.as_ref())
+            );
+        }
+        println!("edges:");
+        for edge in &program.edges {
+            let op = match edge.strength {
+                Strength::Hard => "<",
+                Strength::Soft => "<~",
+            };
+            println!("  {} {} {}", edge.before, op, edge.after);
+        }
+        if !unresolved.is_empty() {
+            eprintln!(
+                "hermit: {} anchor(s) with unresolved code locations: {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            );
+        }
+        Ok(ExitStatus::SUCCESS)
     }
 
     fn resolve_guest_and_host_program(&self) -> Result<(PathBuf, PathBuf), Error> {
@@ -2417,7 +2635,10 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let out1: Output = self.run_verify(log1_file, global)?;
+        let mut out1: Output = self.run_verify(log1_file, global)?;
+        let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
+            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
+            .transpose()?;
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -2446,7 +2667,18 @@ impl RunOpts {
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let out2 = self.run_verify(log2_file, global)?;
+        let mut out2 = self.run_verify(log2_file, global)?;
+        if let Some(sabre_syscalls1) = sabre_syscalls1 {
+            let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
+            if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
+                return Err(Error::msg(format!(
+                    "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                )));
+            }
+            eprintln!(
+                ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+            );
+        }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
         let status = compare_two_runs(
@@ -2728,6 +2960,11 @@ impl RunOpts {
             config.panic_on_unsupported_syscalls = true;
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
+        // Hand the scheduler the resolved happens-before program (already resolved
+        // against the guest binary in `main()`). `#[serde(skip)]` on the field means
+        // this is in-process only; it reaches the ptrace backend directly and is not
+        // carried through the DBI JSON config or `--save-config`.
+        config.happens_before = self.resolved_happens_before.clone();
         config
     }
 
@@ -2814,5 +3051,37 @@ impl<'a> Tmpfs<'a> {
             Self::Path(path) => path,
             Self::Temp(temp) => temp.path(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            log.path(),
+            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
+        )
+        .unwrap();
+        let mut stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
+              INFO detcore: DETLOG scheduler event\n\
+              INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
+            .to_vec();
+        let syscall_records = extract_sabre_detlogs(log.path(), &mut stderr).unwrap();
+
+        assert_eq!(syscall_records, 1);
+        assert_eq!(
+            stderr,
+            b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.path()).unwrap(),
+            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
+             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG scheduler event\n\
+             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
+        );
     }
 }

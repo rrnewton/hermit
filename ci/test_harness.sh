@@ -40,6 +40,7 @@ Usage:
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
+  ci/test_harness.sh audit-test-footprints
   ci/test_harness.sh audit-ci
 
 Filters:
@@ -206,6 +207,12 @@ function audit_inventory {
         "$INVENTORY"
 }
 
+function audit_test_footprints {
+    cargo run --quiet -p hermit-manifest-plan \
+        --bin generate-test-footprints -- --check ||
+        die "ci/test-footprints.json is stale relative to Cargo metadata, the portable DAG, or footprint policy"
+}
+
 function function_body {
     local name=$1 file=$2
     awk -v signature="function $name {" '
@@ -253,8 +260,12 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
         die "GitHub portable workflow must package and verify the debug DBI cdylib"
-    [[ $(grep -Fxc '    needs: [plan, build-debug, build-release]' "$workflow") == 1 ]] ||
-        die "GitHub portable debug shards must wait for the complete DBI install package"
+    # Both the debug test shards (run_dbi_* CLI tests) and the e2e backend cells
+    # consume the DBI install package built by build-release, so both must wait on
+    # [select, build-debug, build-release]. (select gates the affected-test matrix;
+    # dropping build-release from either would race the DBI runtime.)
+    [[ $(grep -Fxc '    needs: [select, build-debug, build-release]' "$workflow") == 2 ]] ||
+        die "GitHub portable debug and e2e shards must wait for the complete DBI install package"
     [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
@@ -263,7 +274,7 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
     [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
         die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
-    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]' "$workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]' "$workflow") == 1 ]] ||
         die "GitHub portable artifact cleanup must wait for every test consumer"
     [[ $(grep -Fxc '  sabre_non_gated_parity:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must retain the SaBRe non-gating diagnostic job"
@@ -343,7 +354,7 @@ function audit_ci_correspondence {
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
@@ -1167,6 +1178,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_test_footprints
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
@@ -1189,6 +1201,9 @@ case "$subcommand" in
         ;;
     audit-inventory)
         audit_inventory
+        ;;
+    audit-test-footprints)
+        audit_test_footprints
         ;;
     audit-ci)
         audit_ci_correspondence

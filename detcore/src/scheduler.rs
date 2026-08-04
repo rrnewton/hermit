@@ -24,6 +24,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::vec::IntoIter;
 
+use detcore_model::happens_before::HappensBeforeProgram;
+use detcore_model::happens_before::Position;
+use detcore_model::happens_before::Strength;
+use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
@@ -276,6 +280,107 @@ fn external_continue_id(req: &Resources) -> ExternalOpId {
     }
 }
 
+/// Runtime state for enforcing a [`HappensBeforeProgram`] inside the scheduler.
+///
+/// The scheduler holds each edge's AFTER anchor -- removing that thread from the
+/// run queue -- until the edge's BEFORE anchor has *fired*, so an authored
+/// partial order deterministically reproduces a known race instead of relying on
+/// a seed lottery. An anchor "fires" when its thread is granted passage past the
+/// corresponding checkpoint (see [`Scheduler::hb_checkpoint`]).
+///
+/// Only [`Position::SyscallCount`] anchors are enforced in this milestone. Other
+/// position kinds are retained for diagnostics but never fire; [`HbRuntime::new`]
+/// warns about them so a run never silently ignores an ordering constraint.
+#[derive(Debug)]
+struct HbRuntime {
+    /// The validated, normalized program (anchors indexed by name, plus edges).
+    program: HappensBeforeProgram,
+    /// Names of anchors that have fired. Monotonic: an anchor fires at most once,
+    /// when its thread is first granted passage past it.
+    fired: BTreeSet<String>,
+    /// Threads currently parked at an AFTER anchor, out of the run queue, awaiting
+    /// their gating BEFORE anchor(s). A `BTreeSet` keeps re-admission order
+    /// deterministic.
+    parked: BTreeSet<DetTid>,
+    /// Threads observed at creation time, in deterministic spawn order, so an
+    /// anchor addressed by `spawn_ordinal` resolves to a concrete `DetTid`.
+    /// Index 0 is the root thread; index N (1-based) is the Nth spawned child,
+    /// matching [`ThreadRef::spawn_ordinal`] semantics.
+    spawn_order: Vec<DetTid>,
+    /// Set when a newly fired anchor may have opened a parked thread's gate, so
+    /// [`Scheduler::hb_flush_wakes`] re-admits parked threads at the next
+    /// `step3` boundary. Re-admission is *deferred* to that boundary because it
+    /// pushes to the run queue, which is illegal while a `tentative_pop`
+    /// selection is in progress (as it is inside `block_for_one_resource`,
+    /// where anchors fire).
+    wake_pending: bool,
+}
+
+impl HbRuntime {
+    /// Build runtime state from a normalized program, warning about any anchor
+    /// whose position kind this milestone does not enforce.
+    fn new(program: HappensBeforeProgram) -> Self {
+        for anchor in program.unenforced_positions() {
+            tracing::warn!(
+                "[happens-before] anchor {} uses position '{}', which the scheduler does not yet \
+                 enforce (only 'after N syscalls' is enforced); this ordering constraint will NOT \
+                 be applied",
+                anchor.name,
+                anchor.position,
+            );
+        }
+        Self {
+            program,
+            fired: BTreeSet::new(),
+            parked: BTreeSet::new(),
+            spawn_order: Vec::new(),
+            wake_pending: false,
+        }
+    }
+
+    /// Record a thread at creation time for `spawn_ordinal` resolution. Idempotent
+    /// and cheap; the root thread lands at index 0, the Nth child at index N.
+    fn note_spawn(&mut self, dettid: DetTid) {
+        if !self.spawn_order.contains(&dettid) {
+            self.spawn_order.push(dettid);
+        }
+    }
+
+    /// True when `tref` resolves to `dettid`, by explicit `DetTid` or by
+    /// `spawn_ordinal` against the observed spawn order.
+    fn thread_matches(&self, tref: &ThreadRef, dettid: DetTid) -> bool {
+        if let Some(d) = tref.dettid {
+            return d == dettid;
+        }
+        if let Some(ord) = tref.spawn_ordinal {
+            return self.spawn_order.get(ord as usize).copied() == Some(dettid);
+        }
+        false
+    }
+
+    /// Names of anchors on `dettid` whose enforced position is exactly
+    /// `SyscallCount(count)`.
+    fn anchors_at_syscall(&self, dettid: DetTid, count: u64) -> Vec<String> {
+        self.program
+            .anchors
+            .values()
+            .filter(|a| {
+                matches!(a.position, Position::SyscallCount(n) if n == count)
+                    && self.thread_matches(&a.thread, dettid)
+            })
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// True when anchor `name` is the AFTER endpoint of a Hard edge whose BEFORE
+    /// endpoint has not yet fired -- i.e. a thread reaching `name` must be held.
+    fn anchor_blocked(&self, name: &str) -> bool {
+        self.program.edges.iter().any(|e| {
+            e.after == name && e.strength == Strength::Hard && !self.fired.contains(&e.before)
+        })
+    }
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -416,6 +521,11 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
+
+    /// Happens-before enforcement state, present only when the run carries a
+    /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
+    /// fire, deterministically constructing an authored race ordering.
+    happens_before: Option<HbRuntime>,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -438,6 +548,14 @@ pub struct ThreadTree {
     /// transitive closure of `thread_tree`).  Every thread should have an entry in
     /// here. If, however, a thread is a group leader, this will map back to itself.
     thread_to_leader: HashMap<DetTid, DetPid>,
+
+    /// Reverse map from a process (group-leader `DetPid`) to the `DetPid` of the
+    /// process that created it. Populated when a new group leader is registered
+    /// (a `clone`/`fork` without `CLONE_THREAD`); the root process has no entry.
+    /// Used to target a deterministic child-exit `SIGCHLD` at the reaping
+    /// parent. Entries are not removed on exit (mirroring `tree`/`thread_to_leader`);
+    /// a stale parent is handled gracefully by `select_signal_target`.
+    process_parent: HashMap<DetPid, DetPid>,
 }
 
 use pretty::Doc;
@@ -565,6 +683,14 @@ impl ThreadTree {
         if is_group_leader {
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
+            // Record the creating process (the parent thread's group leader) so a
+            // deterministic child-exit SIGCHLD can later be targeted at it. The
+            // root process (parent == child) has no parent process.
+            if parent_dettid != child_dettid
+                && let Some(parent_leader) = self.thread_to_leader.get(&parent_dettid).copied()
+            {
+                self.process_parent.insert(child_dettid, parent_leader);
+            }
         } else {
             let parent_leader: DetPid =
                     *self
@@ -576,6 +702,14 @@ impl ThreadTree {
                         });
             self.thread_to_leader.insert(child_dettid, parent_leader);
         }
+    }
+
+    /// The process that created `pid` (its parent process), if `pid` is not the
+    /// root process. Returns a possibly-stale parent if that process has since
+    /// exited; callers deliver through `select_signal_target`, which drops a
+    /// signal to a `Gone` target.
+    pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
+        self.process_parent.get(pid).copied()
     }
 
     /// Return the set of thread IDs in the "same process" as me (same TGID), including
@@ -985,6 +1119,107 @@ impl Scheduler {
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
+            happens_before: cfg.happens_before.clone().map(HbRuntime::new),
+        }
+    }
+
+    /// Record a newly created thread for happens-before `spawn_ordinal`
+    /// resolution. A no-op unless a happens-before program is active.
+    pub fn hb_note_spawn(&mut self, dettid: DetTid) {
+        if let Some(hb) = self.happens_before.as_mut() {
+            hb.note_spawn(dettid);
+        }
+    }
+
+    /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
+    /// intercepted syscall (see `Detcore::handle_syscall_event`).
+    ///
+    /// Grants passage (firing every anchor at `SyscallCount(count)` on this
+    /// thread and re-admitting any parked threads whose gate may now be open)
+    /// unless a reached anchor is the AFTER endpoint of a Hard edge whose BEFORE
+    /// anchor has not fired, in which case the thread is parked out of the run
+    /// queue until a later firing wakes it. Mirrors the `SleepUntil` park/skip
+    /// protocol: the request/response ivars are left intact so the re-admitted
+    /// thread re-evaluates this same checkpoint on its next turn.
+    fn hb_checkpoint(&mut self, dettid: DetTid, count: u64) -> Result<(), SkipTurn> {
+        let (reached, blocked) = {
+            let hb = self
+                .happens_before
+                .as_ref()
+                .expect("hb checkpoint issued without a happens-before program");
+            let reached = hb.anchors_at_syscall(dettid, count);
+            let blocked = reached.iter().any(|name| hb.anchor_blocked(name));
+            (reached, blocked)
+        };
+
+        if reached.is_empty() {
+            // No anchor addresses this (thread, count); nothing to gate or fire.
+            return Ok(());
+        }
+
+        if blocked {
+            info!(
+                "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} held at happens-before \
+                 anchor(s) {:?} (syscall count {}) awaiting a BEFORE anchor",
+                self.turn, dettid, reached, count
+            );
+            self.happens_before.as_mut().unwrap().parked.insert(dettid);
+            return self.skip_turn_blocked(dettid);
+        }
+
+        // Grant passage: fire the reached anchors. Only wake parked threads when a
+        // new anchor actually fired, so an idempotent re-grant causes no churn.
+        let mut newly_fired = false;
+        {
+            let hb = self.happens_before.as_mut().unwrap();
+            for name in &reached {
+                if hb.fired.insert(name.clone()) {
+                    newly_fired = true;
+                }
+            }
+        }
+        if newly_fired {
+            debug!(
+                "[happens-before] dettid {} fired anchor(s) {:?} at syscall count {}",
+                dettid, reached, count
+            );
+            // Defer the actual re-admission: we are inside `block_for_one_resource`
+            // with a `tentative_pop` selection live, and pushing to the run queue
+            // now would trip the queue's transaction assertion. `step3` flushes.
+            self.happens_before.as_mut().unwrap().wake_pending = true;
+        }
+        Ok(())
+    }
+
+    /// If a happens-before anchor fired since the last check, re-admit every
+    /// parked thread to the run queue so it re-evaluates its gate on its next
+    /// turn. Threads still blocked re-park; the request/response ivars are
+    /// untouched, so no request needs re-filling. Deterministic: parked threads
+    /// are iterated in `DetTid` order.
+    ///
+    /// Called from `step3_peek` *before* the turn's `tentative_pop`, the only
+    /// safe point to push to the run queue: anchors fire deep inside
+    /// `block_for_one_resource` while a selection transaction is live, so the
+    /// actual re-admission must be deferred to here.
+    fn hb_flush_wakes(&mut self) {
+        match self.happens_before.as_mut() {
+            Some(hb) if hb.wake_pending => hb.wake_pending = false,
+            _ => return,
+        }
+        let parked: Vec<DetTid> = self
+            .happens_before
+            .as_ref()
+            .map(|hb| hb.parked.iter().copied().collect())
+            .unwrap_or_default();
+        for dettid in parked {
+            self.happens_before.as_mut().unwrap().parked.remove(&dettid);
+            if !self.run_queue.contains_tid(dettid) {
+                let pos = self.runqueue_push_back(dettid);
+                trace!(
+                    "[happens-before] re-admitting parked dettid {} at queue position {}",
+                    dettid, pos
+                );
+            }
         }
     }
 
@@ -1658,6 +1893,30 @@ impl Scheduler {
         {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
+                TimedEvent::SignalEvt(
+                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
+                    dtid,
+                    sig,
+                ) => {
+                    // Deterministic child-exit SIGCHLD. If the host-async signal
+                    // already arrived and was parked by the InboundSignal deferral
+                    // gate, release it now at this logical time — that real signal
+                    // is sufficient, so do not also synthesize one (avoids a
+                    // duplicate delivery). Otherwise synthesize the delivery so the
+                    // parent is notified deterministically regardless of host
+                    // signal latency. Either way mark the parent `sigchld_ready` so
+                    // its InboundSignal turn is granted here rather than deferred a
+                    // second time. Releasing the deferred signal at a logical
+                    // deadline (rather than only at run-queue quiescence, as
+                    // step2e does) is what breaks the redis_deep starvation
+                    // deadlock: a busy sibling can no longer starve the reaper.
+                    self.blocked.sigchld_ready.insert(parent);
+                    if self.blocked.sigchld_deferred.remove(&parent) {
+                        self.run_queue.push_eager_io_repoll(parent);
+                    } else {
+                        self.fire_alarm(parent, dtid, sig);
+                    }
+                }
                 TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
@@ -2056,6 +2315,10 @@ impl Scheduler {
     ///
     /// This is a "peek" in the sense that it leaves the thread in the run queue.
     fn step3_peek(&mut self) -> Option<(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>)> {
+        // Re-admit any happens-before threads whose gate opened since last turn.
+        // Must precede `tentative_pop_next`: the run queue forbids pushes while a
+        // selection transaction is live.
+        self.hb_flush_wakes();
         debug!(
             "[sched-step3] Stepping scheduler, queue len {}, current turn {}, committed_time {}",
             self.run_queue.len(),
@@ -2281,12 +2544,34 @@ impl Scheduler {
             ResourceID::Path(_) => Ok(()),
             ResourceID::PathsTransitive(_) => Ok(()),
             ResourceID::Device(_) => Ok(()),
-            ResourceID::Exit { .. } => Ok(()),
+            // The scheduler-ordered `Exit` grant is the deterministic moment a
+            // child process leaves the run set. Register a one-shot child-exit
+            // `SIGCHLD` for the reaping parent, to be delivered at a deterministic
+            // logical time by `step2b_process_timed`, instead of relying on the
+            // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
+            // `make -jN` / redis `--strict --verify` nondeterminism source).
+            ResourceID::Exit { group, process, .. } => {
+                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
+                    // Fire strictly after the current committed time so the event
+                    // is dispatched on a subsequent scheduler pass (DetTid == DetPid
+                    // for a group leader, so `parent` is also the parent thread id).
+                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                    self.blocked
+                        .timed_waiters
+                        .insert_child_exit(deadline, *process, parent, parent);
+                }
+                Ok(())
+            }
             ResourceID::ParentContinue { .. } => Ok(()),
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
             ResourceID::SchedYield => Ok(()),
+
+            // A guest thread checking in at a happens-before anchor point. Delegate
+            // to the enforcement logic, which either grants passage (firing anchors)
+            // or parks the thread until its gating BEFORE anchor fires.
+            ResourceID::HappensBeforeCheckpoint(count) => self.hb_checkpoint(dettid, *count),
 
             // A host-async SIGCHLD (a guest child process exited) is delivered to
             // the parent at a moment decided by host timing. Committing that turn
@@ -3673,5 +3958,92 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    /// Build an `HbRuntime` from a JSON happens-before spec for testing.
+    fn hb_runtime(json: &str) -> HbRuntime {
+        let program = detcore_model::happens_before::HappensBeforeSpec::from_json(json)
+            .unwrap()
+            .normalize()
+            .unwrap();
+        HbRuntime::new(program)
+    }
+
+    /// The enforcement predicates that drive `hb_checkpoint`: an anchor is
+    /// reached at exactly its `SyscallCount` on the right thread, an AFTER anchor
+    /// of a Hard edge is blocked until its BEFORE anchor fires, and firing the
+    /// BEFORE anchor opens the gate. This mirrors the two-thread race validated
+    /// end-to-end (main_write < worker_write forcing A before B).
+    #[test]
+    fn hb_runtime_gate_opens_only_after_before_anchor_fires() {
+        let mut hb = hb_runtime(
+            r#"{
+              "version": 1,
+              "threads": { "main": {"dettid": 3}, "worker": {"dettid": 5} },
+              "events": {
+                "main_write":   {"thread": "main",   "syscalls": 47},
+                "worker_write": {"thread": "worker", "syscalls": 8}
+              },
+              "edges": [ {"before": "main_write", "after": "worker_write", "strength": "hard"} ]
+            }"#,
+        );
+        let main = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(5);
+
+        // Anchors resolve to the addressed (thread, count) and nothing else.
+        assert_eq!(
+            hb.anchors_at_syscall(main, 47),
+            vec!["main_write".to_string()]
+        );
+        assert_eq!(
+            hb.anchors_at_syscall(worker, 8),
+            vec!["worker_write".to_string()]
+        );
+        assert!(hb.anchors_at_syscall(main, 8).is_empty());
+        assert!(hb.anchors_at_syscall(worker, 47).is_empty());
+        assert!(hb.anchors_at_syscall(worker, 7).is_empty());
+
+        // Before its gating BEFORE anchor fires, the AFTER anchor is blocked and
+        // the BEFORE anchor is free (it gates nothing).
+        assert!(hb.anchor_blocked("worker_write"));
+        assert!(!hb.anchor_blocked("main_write"));
+
+        // Firing the BEFORE anchor opens the gate exactly once.
+        assert!(hb.fired.insert("main_write".to_string()));
+        assert!(!hb.anchor_blocked("worker_write"));
+    }
+
+    /// A soft edge never parks its AFTER thread, and `spawn_ordinal` addressing
+    /// resolves against the observed spawn order (index 0 = root).
+    #[test]
+    fn hb_runtime_soft_edge_and_spawn_ordinal_resolution() {
+        let mut hb = hb_runtime(
+            r#"{
+              "version": 1,
+              "threads": {
+                "root":  {"spawn_ordinal": 0},
+                "child": {"spawn_ordinal": 1}
+              },
+              "events": {
+                "a": {"thread": "root",  "syscalls": 3},
+                "b": {"thread": "child", "syscalls": 4}
+              },
+              "edges": [ {"before": "a", "after": "b", "strength": "soft"} ]
+            }"#,
+        );
+        // A soft edge biases but never hard-blocks, so its AFTER is never parked.
+        assert!(!hb.anchor_blocked("b"));
+
+        // spawn_ordinal is unresolved until threads are observed at creation time.
+        let root = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        assert!(hb.anchors_at_syscall(root, 3).is_empty());
+        hb.note_spawn(root); // index 0 -> root
+        hb.note_spawn(child); // index 1 -> first spawned child
+        assert_eq!(hb.anchors_at_syscall(root, 3), vec!["a".to_string()]);
+        assert_eq!(hb.anchors_at_syscall(child, 4), vec!["b".to_string()]);
+        // note_spawn is idempotent, so a re-registration does not shift indices.
+        hb.note_spawn(root);
+        assert_eq!(hb.anchors_at_syscall(child, 4), vec!["b".to_string()]);
     }
 }
