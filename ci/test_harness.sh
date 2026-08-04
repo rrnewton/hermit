@@ -260,6 +260,10 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
         die "GitHub portable workflow must package and verify the debug DBI cdylib"
+    [[ $(grep -Fxc '            target/ci \' "$workflow") == 1 ]] ||
+        die "GitHub portable release artifact must transport the strict-compat Hermit"
+    [[ $(grep -Fxc '          test -x target/ci/hermit-strict' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the strict-compat Hermit"
     # Both the debug test shards (run_dbi_* CLI tests) and the e2e backend cells
     # consume the DBI install package built by build-release, so both must wait on
     # [select, build-debug, build-release]. (select gates the affected-test matrix;
@@ -393,7 +397,7 @@ function audit_ci_correspondence {
     local runner_body
     runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
     # shellcheck disable=SC2016
-    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$jobs" -v' <<<"$runner_body") == 1 ]] ||
+    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
 
     local privileged_critical_path
