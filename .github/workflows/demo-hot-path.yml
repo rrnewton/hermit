@@ -5,6 +5,18 @@ name: P0 Demo Gate (Hermit hot paths)
 # check out the current parent demo harness, then overlay the exact Hermit
 # commit that triggered this workflow. Keep this paths list synchronized with
 # the hot-path test in merge-gate.yml.
+#
+# tests/e2e/** and tests/backend-parity/** are deliberately subtracted (via the
+# trailing "!" negations under each "tests/**"): the demo job runs
+# `scripts/super-validate.sh --demos-only`, which builds the hermit binary and
+# executes ONLY the parent demo suite (demos 1-8) — it never runs the hermit e2e
+# corpus or the backend-parity fixtures. So a PR that only touches those trees
+# provably cannot affect a demo verdict; triggering a serial PMU demo run for it
+# just clogs the lane and (when cancelled) wedges the PR. Removing them here
+# means the workflow does not even fire for such PRs, mirroring the merge-gate
+# classifier's `grep -vE '^tests/(e2e|backend-parity)/'` subtraction so the
+# trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
+# detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
 on:
   push:
     branches: [main]
@@ -21,6 +33,8 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/**"
+      - "!tests/backend-parity/**"
   pull_request:
     branches: [main]
     paths:
@@ -36,13 +50,40 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/**"
+      - "!tests/backend-parity/**"
   workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Exact Hermit SHA to demo-gate on demand. Use this to attribute a
+          post-land main red to a specific landed commit (git-bisect style)
+          now that main runs collapse to the newest tip. Empty = the dispatched
+          ref's tip.
+        required: false
+        type: string
 
 concurrency:
-  # Never cancel a main-push run: each red must identify its exact culprit.
-  # Superseded PR heads may be cancelled so they do not monopolize the serial
-  # PMU/QEMU lane.
-  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  # Group each ref's runs, but NEVER cancel a RUNNING main demo (owner directive
+  # 2026-08-03, Directive B). cancel-in-progress is event-aware:
+  #   * pull_request -> TRUE: a new push to a PR supersedes the older head, so PR
+  #     demo runs never STACK on the scarce serial PMU lane (the head that lands
+  #     re-runs). Grouped per PR number. This is the pre-land gate merge-gate.yml
+  #     requires at the PR head SHA.
+  #   * push(main) -> FALSE: all main pushes share ONE group (github.ref), so a
+  #     burst of N landings is queue-depth-1 -- GitHub lets the RUNNING demo
+  #     finish and supersedes only the older PENDING run. The old
+  #     cancel-in-progress:true KILLED the running main demo on every landing,
+  #     producing a pile of CANCELLED runs with no data; this stops that and
+  #     yields a sparse dataset of COMPLETE post-land health runs.
+  #   * workflow_dispatch -> FALSE, grouped per github.run_id (unique): manual
+  #     on-demand runs never collide, preserving per-SHA post-land culprit
+  #     attribution (bisect a post-land main red by dispatching several `sha`
+  #     inputs; they queue serially, or `git bisect` with
+  #     scripts/super-validate.sh --demos-only).
+  # cancel-in-progress never touches COMPLETED runs, so a submodule bump or
+  # queue-health check citing the newest completed main demo run is unaffected.
+  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -55,7 +96,7 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   SUITE_DIR: ${{ github.workspace }}/dev-hermit-demo-suite
-  TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  TARGET_SHA: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   reject-untrusted-fork:
@@ -79,7 +120,14 @@ jobs:
         github.event_name != 'pull_request' ||
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
+    # No pmu-serial: demos are not counter-scarce and PMU skid is an
+    # instruction-space hardware property independent of concurrency, so there
+    # is no determinism reason to pin every demo to one serialized box. If a
+    # demo turns out to be load-sensitive once it can co-run, that is a real
+    # determinism finding to file, not a reason to restore serialization. The
+    # concurrency block below still collapses each ref to its newest run so
+    # bursts of landings do not stack.
+    runs-on: [Linux, X64, hermit, pmu]
     timeout-minutes: 360
     steps:
       - name: Remove stale checkout locks
@@ -187,15 +235,23 @@ jobs:
           # Ubuntu's /usr/bin/bpftool wrapper insists that its packaged kernel
           # version match uname. This runner uses an Ubuntu userspace on a
           # Fedora host kernel, but the real generic bpftool is kernel-agnostic
-          # for BTF decoding. Promote that binary ahead of the wrapper.
+          # for BTF decoding. Install it into a PATH dir promoted ahead of the
+          # wrapper (via $GITHUB_PATH) rather than a hardcoded system prefix, so
+          # this works on any runner. Override the destination with BPFTOOL_BIN_DIR.
           if ! bpftool version >/dev/null 2>&1; then
             # linux-tools ships bpftool under a hyphen/version-suffixed dir
             # (e.g. /usr/lib/linux-tools-6.8.0-136/), not a bare
             # /usr/lib/linux-tools, so search /usr/lib for any linux-tools* path.
             bpftool_bin=$(find /usr/lib -path '*linux-tools*' -name bpftool \
               -type f -perm -111 -print 2>/dev/null | sort -V | tail -n 1)
-            test -x "$bpftool_bin"
-            sudo install -m755 "$bpftool_bin" /usr/local/bin/bpftool
+            if [ -z "$bpftool_bin" ] || [ ! -x "$bpftool_bin" ]; then
+              echo "::error::no usable bpftool found under /usr/lib/*linux-tools*; install linux-tools-generic (Debian/Ubuntu) or the equivalent, or set BPFTOOL_BIN_DIR to a dir containing a working bpftool" >&2
+              exit 1
+            fi
+            bpftool_dir="${BPFTOOL_BIN_DIR:-$HOME/.local/bin}"
+            mkdir -p "$bpftool_dir"
+            install -m755 "$bpftool_bin" "$bpftool_dir/bpftool"
+            echo "$bpftool_dir" >>"$GITHUB_PATH"
           fi
 
           if ! command -v drgn >/dev/null 2>&1; then
