@@ -30,8 +30,9 @@ Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 Modes:
   --check          Verify the live v2 context, main-workflow blob, and disabled
                    transition shim without changing GitHub (default).
-  --prepare REF    Before landing v2, require legacy and v2 together, bind the
-                   branch workflow blob, and enable the legacy context shim.
+  --prepare REF    Bind a candidate workflow blob. During initial v2 migration,
+                   require legacy+v2 and enable the shim; for later v2-only
+                   updates, preserve v2-only enforcement and a disabled shim.
   --apply          After v2 lands on main, bind main's blob, remove the legacy
                    required context, and disable the shim.
 
@@ -139,15 +140,16 @@ if [[ $mode == prepare ]]; then
         exit 1
     fi
 
-    # PREPARE is an overlap migration, not only a variable update. Requiring
-    # legacy and v2 together before this PR lands prevents a stale v1 branch
-    # from satisfying the live ruleset during the land-to-apply window.
-    if ! { [[ $legacy_count == 1 && $v2_count == 0 &&
-              $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
-           [[ $legacy_count == 1 && $v2_count == 1 &&
-              $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" &&
-              $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
-        printf 'configure-merge-gate-ruleset: prepare requires legacy-only or legacy+v2 Actions contexts; got legacy=%s/%s v2=%s/%s\n' \
+    migration=false
+    if [[ $legacy_count == 1 &&
+          $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] &&
+       { [[ $v2_count == 0 ]] ||
+         [[ $v2_count == 1 &&
+            $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
+        migration=true
+    elif ! [[ $legacy_count == 0 && $v2_count == 1 &&
+              $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; then
+        printf 'configure-merge-gate-ruleset: prepare requires legacy migration or v2-only Actions context; got legacy=%s/%s v2=%s/%s\n' \
             "$legacy_count" "${legacy_integration:-unset}" \
             "$v2_count" "${v2_integration:-unset}" >&2
         exit 1
@@ -172,7 +174,11 @@ if [[ $mode == prepare ]]; then
           }
         ' <<<"$current")
 
-    set_variable "$LEGACY_SHIM_VARIABLE" true
+    if [[ $migration == true ]]; then
+        # Initial migration needs an overlap so the old required context remains
+        # satisfiable until the v2 candidate lands.
+        set_variable "$LEGACY_SHIM_VARIABLE" true
+    fi
     latest=$(read_ruleset)
     if [[ $(policy_fingerprint <<<"$latest") != $(policy_fingerprint <<<"$current") ]]; then
         printf 'configure-merge-gate-ruleset: ruleset changed concurrently; refusing stale overlap PUT\n' >&2
@@ -191,18 +197,30 @@ if [[ $mode == prepare ]]; then
     updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
     updated_v2_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
     updated_legacy_integration=$(required_context_integration "$LEGACY_CONTEXT" <<<"$updated")
+    expected_legacy_count=0
+    expected_shim=false
+    if [[ $migration == true ]]; then
+        expected_legacy_count=1
+        expected_shim=true
+    fi
     if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
-       [[ $updated_v2_count != 1 || $updated_legacy_count != 1 ]] ||
+       [[ $updated_v2_count != 1 || $updated_legacy_count != "$expected_legacy_count" ]] ||
        [[ $updated_v2_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
-       [[ $updated_legacy_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+       { [[ $migration == true ]] &&
+         [[ $updated_legacy_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; } ||
        [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$blob" ]] ||
-       [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != true ]]; then
+       [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != "$expected_shim" ]]; then
         printf 'configure-merge-gate-ruleset: overlap transition verification failed\n' >&2
         exit 1
     fi
-    printf 'PREPARED: ruleset requires %s + %s; %s=%s for %s; legacy shim enabled.\n' \
-        "$LEGACY_CONTEXT" "$REQUIRED_CONTEXT" \
-        "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
+    if [[ $migration == true ]]; then
+        printf 'PREPARED MIGRATION: ruleset requires %s + %s; %s=%s for %s; legacy shim enabled.\n' \
+            "$LEGACY_CONTEXT" "$REQUIRED_CONTEXT" \
+            "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
+    else
+        printf 'PREPARED UPDATE: ruleset remains %s-only; %s=%s for %s; legacy shim disabled.\n' \
+            "$REQUIRED_CONTEXT" "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
+    fi
     exit 0
 fi
 
