@@ -39,6 +39,7 @@
 mod config;
 mod consts;
 mod cpuid;
+mod digest;
 mod dirents;
 mod fd;
 #[allow(unused)]
@@ -75,6 +76,10 @@ pub use config::BlockingMode;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
+pub use consts::ROOT_DETPID;
+pub use digest::Digest;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
@@ -714,6 +719,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !(self.cfg.detlog_stack || self.cfg.detlog_heap) {
             // Don't incur the *significant* performance penalty for reading
             // /proc/maps unless one of these flags is enabled.
+            return Ok(());
+        }
+        // Out-of-process backends (e.g. KVM) report their guest memory regions
+        // directly, because `guest.pid()` is the host VMM process there and its
+        // `/proc/<pid>/maps` describes the VMM, not the guest address space.
+        // Reading those host addresses through `guest.memory()` (guest-address
+        // space) would fault and abort the syscall. When the backend supplies
+        // regions, hash those guest ranges; otherwise fall back to the ptrace
+        // path of parsing `/proc/<pid>/maps`.
+        if let Some(regions) = guest.detlog_memory_regions() {
+            for region in regions {
+                let want = match region.kind {
+                    reverie::DetlogRegionKind::Stack => self.cfg.detlog_stack,
+                    reverie::DetlogRegionKind::Heap => self.cfg.detlog_heap,
+                };
+                if !want {
+                    continue;
+                }
+                let dettid = guest.thread_state().dettid;
+                detlog!(
+                    "[memory][dtid {}] {:?} {:#x}-{:#x}->{}",
+                    dettid,
+                    region.kind,
+                    region.start,
+                    region.end,
+                    procmaps::compute_hash_range(guest, region.start, region.end)?
+                )
+            }
             return Ok(());
         }
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
@@ -1467,6 +1500,29 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
             thread_state.stats.syscall_count
         };
+
+        // Happens-before enforcement checkpoint. When the run carries a
+        // happens-before program with syscall-count anchors, every intercepted
+        // syscall checks in with the scheduler at its prehook, carrying this
+        // thread's running syscall count. The scheduler fires any anchor at
+        // `Position::SyscallCount(new_count)` on this thread and parks the thread
+        // (out of the run queue) when that anchor is the AFTER endpoint of a Hard
+        // edge whose BEFORE endpoint has not fired yet. This is the gate that
+        // makes an authored partial order reproduce a known race deterministically
+        // (see detcore-model `happens_before`). It requires sequentialized
+        // threads (enforced by the CLI) so the scheduler owns ordering.
+        if guest
+            .config()
+            .happens_before
+            .as_ref()
+            .is_some_and(|p| p.has_syscall_count_anchors())
+        {
+            let request = guest.thread_state().mk_request(
+                ResourceID::HappensBeforeCheckpoint(new_count),
+                Permission::R,
+            );
+            resource_request(guest, request).await;
+        }
 
         let res = match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a

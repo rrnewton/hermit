@@ -1,19 +1,20 @@
 name: CI (privileged)
 
 on:
+  # NO `pull_request` trigger (owner directive 2026-08-03): don't auto-fire the
+  # scarce self-hosted privileged PMU lane on PRs. It is a bonus signal, NOT a
+  # required merge-gate check, so removing its PR trigger cannot block landing.
+  # Run it on a PR MANUALLY via `workflow_dispatch` when a privileged smoke is
+  # actually needed.
   push:
     branches: [ "main" ]
-  # Keep stacked pull requests covered before they are retargeted to main. A
-  # closed events still enter the workflow, but the privileged job skips them.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
 
-# Keep the active run and only the newest pending run for each pull request or
-# branch. GitHub replaces an older pending run in the group without cancelling
-# the active run when cancel-in-progress is false.
+# QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref); with
+# cancel-in-progress:false GitHub lets the running job finish and supersedes only
+# the older PENDING run in the group.
 concurrency:
-  group: privileged-${{ github.event.pull_request.number || github.ref }}
+  group: privileged-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -24,7 +25,7 @@ env:
 
 jobs:
   # GitHub Actions supports timeout-minutes on jobs, not at workflow scope.
-  # This workflow has one independent five-minute job, so its job timeout is
+  # This workflow has one independent eight-minute job, so its job timeout is
   # also stronger than the requested 60-minute workflow ceiling.
   # This scarce lane is a sub-five-minute privileged capability smoke only:
   #   * retired-conditional-branch PMU timer delivery,
@@ -50,7 +51,7 @@ jobs:
         )
       }}
     runs-on: [Linux, X64, hermit, pmu]
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -76,10 +77,44 @@ jobs:
           test -r /proc/sys/kernel/perf_event_paranoid
           test -r /dev/kvm -a -w /dev/kvm
           command -v cc
-          command -v flock
         '
+    # The privileged lane is NOT serialized by a PMU counter lock. Measurement
+    # (experiments/pmu-concurrency-ceiling-measured_20260803 in the dev-hermit
+    # parent) showed the counter-exhaustion premise is false: reverie's RCB
+    # counters are per-task (cpu=-1), so the kernel context-switches them and
+    # only the running task's 2 counters need be resident; 32 concurrent
+    # --strict --verify pinned to ONE core all pass with zero perf_event_open
+    # failures. The former `flock /tmp/hermit-privileged-pmu.lock` guarded that
+    # non-existent limit and had no other purpose (perf-dir is already keyed by
+    # $RUNNER_TEMP; kvm nodes are capped in-DAG by resource_caps.kvm), so it is
+    # removed. The `pmu-serial` runner label was retired for the same reason:
+    # PMU skid is an instruction-space hardware property independent of
+    # concurrency, so no determinism argument justifies serializing PMU work.
     - name: PMU, CPUID-faulting, and KVM smoke DAG
-      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      # --allow-cgroup-failure: at the advanced runner pin, `run` boxes fail-closed
+      # (exit 3) by default, but GitHub Actions (hosted AND self-hosted) sets
+      # $GITHUB_ACTIONS, which makes the runner deliberately SKIP the systemd
+      # --user scope; without this flag the skipped-boxing path would fail-close
+      # this self-hosted lane. Opt out to best-effort UNBOXED (process-group
+      # teardown only) — the pre-pin behavior — rather than regress the lane RED.
+      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+    - name: Run non-gating occasional KVM probes
+      id: kvm_occasional
+      continue-on-error: true
+      run: |
+        timeout --foreground --kill-after=10s 210s \
+          env HERMIT_BIN="$PWD/target/debug/hermit" \
+          bash -euo pipefail -c '
+            ./ci/test_harness.sh build --lane privileged --category applications \
+              --ci-only --include-occasional
+            ./ci/test_harness.sh run --lane privileged --category applications \
+              --ci-only --include-occasional --prebuilt \
+              --results ignored/e2e/privileged/occasional/results.jsonl \
+              --junit ignored/e2e/privileged/occasional/junit.xml
+          '
+    - name: Warn when an occasional KVM probe is red
+      if: steps.kvm_occasional.outcome == 'failure'
+      run: echo '::warning::Known load-sensitive KVM probes are RED; see the privileged E2E artifact and fix-load-dependent-scheduling-vtime.'
     - name: Upload privileged DAG performance report
       if: always()
       uses: actions/upload-artifact@v4

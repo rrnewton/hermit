@@ -40,6 +40,7 @@ Usage:
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
+  ci/test_harness.sh audit-test-footprints
   ci/test_harness.sh audit-ci
 
 Filters:
@@ -50,7 +51,7 @@ Filters:
   --test ID               exact category/test ID
   --ci-only               select only cells explicitly marked ci=true
   --prebuilt              require artifacts produced by the build command
-  --allow-empty           permit an empty selection (DAG bucket nodes only)
+  --allow-empty           permit an empty selection (DAG build/bucket nodes only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
   --probe-disabled        run one explicitly disabled backend cell; requires exact
@@ -206,6 +207,12 @@ function audit_inventory {
         "$INVENTORY"
 }
 
+function audit_test_footprints {
+    cargo run --quiet -p hermit-manifest-plan \
+        --bin generate-test-footprints -- --check ||
+        die "ci/test-footprints.json is stale relative to Cargo metadata, the portable DAG, or footprint policy"
+}
+
 function function_body {
     local name=$1 file=$2
     awk -v signature="function $name {" '
@@ -225,6 +232,80 @@ function assert_workflow_entrypoint {
         die "GitHub $lane workflow must have exactly one executable ci/run-dag.sh $lane command"
     [[ ${commands[0]} == "$expected" ]] ||
         die "GitHub $lane workflow command diverged: ${commands[0]}"
+}
+
+function assert_parallel_portable_workflow {
+    local workflow=$1
+    local run_dag_count run_node_count
+    run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
+    run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
+
+    ((run_dag_count == 0)) ||
+        die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
+    ((run_node_count == 5)) ||
+        die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
+    [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must run the shard-coverage guard exactly once"
+    # Match the literal command embedded in workflow YAML.
+    # shellcheck disable=SC2016
+    [[ $(grep -Fxc '          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must derive one e2e matrix from the audited plan"
+    [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must expose exactly one stable aggregate gate"
+    [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must run against merge-queue commits"
+    [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbi.so \' "$workflow") == 1 ]] ||
+        die "GitHub portable debug artifact must preserve the installed DBI runtime"
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbi.so' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the installed DBI runtime"
+    [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
+        die "GitHub portable workflow must package and verify the debug DBI cdylib"
+    # Both the debug test shards (run_dbi_* CLI tests) and the e2e backend cells
+    # consume the DBI install package built by build-release, so both must wait on
+    # [select, build-debug, build-release]. (select gates the affected-test matrix;
+    # dropping build-release from either would race the DBI runtime.)
+    [[ $(grep -Fxc '    needs: [select, build-debug, build-release]' "$workflow") == 2 ]] ||
+        die "GitHub portable debug and e2e shards must wait for the complete DBI install package"
+    [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the DynamoRIO launcher"
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 4 ]] ||
+        die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
+    [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
+        die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
+    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]' "$workflow") == 1 ]] ||
+        die "GitHub portable artifact cleanup must wait for every test consumer"
+    [[ $(grep -Fxc '  sabre_non_gated_parity:' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must retain the SaBRe non-gating diagnostic job"
+    [[ $(grep -Fxc '    continue-on-error: true' "$workflow") == 1 ]] ||
+        die "SaBRe exec diagnostics must remain explicitly non-gating"
+    [[ $(grep -Fxc '          probe data-handling/archive-roundtrip' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe archive-roundtrip"
+    [[ $(grep -Fxc '          probe system-utils/date-nanoseconds' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe date-nanoseconds"
+    [[ $(grep -Fxc '          probe system-utils/random-device' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe random-device"
+    [[ $(grep -Fc -- '--mode verify --backend sabre --probe-disabled' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must execute disabled cells through the harness"
+    jq -e '
+        .debug_shards[]
+        | select(.slug == "integration")
+        | .nodes | index("test.cli") != null
+    ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
+        die "GitHub portable integration shard must retain the run_dbi_* CLI tests"
+}
+
+function assert_privileged_diagnostics {
+    local workflow=$1
+    [[ $(grep -Fxc '    - name: Run non-gating occasional KVM probes' "$workflow") == 1 ]] ||
+        die "GitHub privileged workflow must run the occasional KVM diagnostics"
+    [[ $(grep -Fc -- '--ci-only --include-occasional' "$workflow") == 2 ]] ||
+        die "GitHub privileged workflow must build and run occasional KVM cells"
+    [[ $(grep -Fxc '      continue-on-error: true' "$workflow") == 1 ]] ||
+        die "GitHub occasional KVM diagnostics must remain explicitly non-gating"
+    [[ $(grep -Fxc '              --results ignored/e2e/privileged/occasional/results.jsonl \' "$workflow") == 1 ]] ||
+        die "GitHub occasional KVM diagnostics must publish structured results"
 }
 
 function assert_validate_entrypoint {
@@ -267,13 +348,14 @@ function audit_ci_correspondence {
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
-    # These are literal workflow/validate expressions, not local expansions.
-    # shellcheck disable=SC2016
-    assert_workflow_entrypoint portable "$ROOT_DIR/.github/workflows/ci-portable.yml" \
-        'env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh portable --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v'
+    # Portable CI fans the audited DAG out across jobs; privileged CI still runs
+    # its small hardware DAG within one job.
+    assert_parallel_portable_workflow "$ROOT_DIR/.github/workflows/ci-portable.yml"
+    # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+    assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
         '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
@@ -332,7 +414,7 @@ function audit_ci_correspondence {
             and ([.steps[] | select(has("manifest")) | .manifest.category] | unique | length)
                 == ([.steps[] | select(has("manifest"))] | length)
             and ([.steps[] | select(.group == "build" and .job == "manifest_guests"
-                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only"))] | length) == 1
+                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only --allow-empty"))] | length) == 1
         ' "$dag" >/dev/null || {
             rm -rf "$scratch"
             die "$lane DAG manifest nodes do not match the fail-closed build/run contract"
@@ -502,8 +584,15 @@ function parse_options {
     [[ -z $LANE_FILTER ]] || contains "$LANE_FILTER" portable privileged || die "invalid lane: $LANE_FILTER"
     [[ -z $MODE_FILTER ]] || contains "$MODE_FILTER" "${MODES[@]}" || die "invalid mode: $MODE_FILTER"
     [[ -z $BACKEND_FILTER ]] || contains "$BACKEND_FILTER" "${BACKENDS[@]}" || die "invalid backend: $BACKEND_FILTER"
-    if ((ALLOW_EMPTY == 1)) && { ((CI_ONLY == 0)) || [[ -z $CATEGORY_FILTER ]]; }; then
-        die "--allow-empty requires --ci-only and an explicit --category"
+    if ((ALLOW_EMPTY == 1)); then
+        ((CI_ONLY == 1)) || die "--allow-empty requires --ci-only"
+        case $subcommand in
+            build) [[ -n $LANE_FILTER || -n $CATEGORY_FILTER ]] ||
+                die "build --allow-empty requires an explicit --lane or --category" ;;
+            run) [[ -n $CATEGORY_FILTER ]] ||
+                die "run --allow-empty requires an explicit --category" ;;
+            *) die "--allow-empty is accepted by build and run only" ;;
+        esac
     fi
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
     if ((INCLUDE_MANUAL)); then
@@ -1089,6 +1178,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_test_footprints
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
@@ -1111,6 +1201,9 @@ case "$subcommand" in
         ;;
     audit-inventory)
         audit_inventory
+        ;;
+    audit-test-footprints)
+        audit_test_footprints
         ;;
     audit-ci)
         audit_ci_correspondence

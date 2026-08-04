@@ -20,6 +20,7 @@ mod error;
 mod event;
 mod event_stream;
 mod fd;
+pub mod happens_before;
 mod id;
 pub mod instruction_map;
 mod interp;
@@ -798,6 +799,7 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 }
 
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
 struct StagedSabreProgram {
@@ -1033,6 +1035,10 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove(SABRE_DETLOG_FORWARD_ENV);
+    if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
+        command.env(SABRE_DETLOG_FORWARD_ENV, "1");
+    }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
 
@@ -1252,6 +1258,11 @@ async fn run_kvm(
     let random_seed = config.rng_seed();
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
+    backend
+        .set_root_pid(detcore::ROOT_DETPID.as_raw())
+        .map_err(|error| anyhow!("failed to configure KVM root PID: {error}"))?;
     backend
         .install_static_elf_with_context(&image, &argv, &envp, &cwd)
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
