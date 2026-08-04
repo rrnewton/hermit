@@ -94,7 +94,7 @@ def latest_named($rollup; $name):
    | first);
 def ci_of($rollup):
   ($rollup // []) as $r
-  | latest_named($r; "merge-gate") as $gate
+  | latest_named($r; "merge-gate-v4") as $gate
   | latest_named($r; "Regular tests (GitHub-managed portable)") as $regular
   | latest_named($r; "Privileged capability and E2E tests") as $hostdep
   | { checks: ($r|length),

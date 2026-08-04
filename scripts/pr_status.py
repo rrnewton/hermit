@@ -44,7 +44,7 @@ REQUIRED_CHECKS = {
     # Live repository policy (queried 2026-08-04): both main branches require
     # the merge-gate context. Product jobs are inputs to that gate, not separate
     # required contexts, so a status consumer must not substitute its own set.
-    "rrnewton/hermit": ("merge-gate",),
+    "rrnewton/hermit": ("merge-gate-v4",),
     "rrnewton/reverie": ("merge-gate",),
 }
 

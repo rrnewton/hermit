@@ -29,8 +29,8 @@ substitute.
 
 ## Status consumer inventory
 
-Parent `ci-hub/check_outcome.py` is the check-status authority. The gate checks
-out the exact parent authority commit and executes it directly. Hermit's shell,
+Parent `ci-hub/check_outcome.py` is the check-status authority. The gate fetches
+it at the exact parent authority commit, verifies its digest, and executes it. Hermit's shell,
 PR-status, lander/DAG, and pinned landing-planner entry points share one
 `agent-utils` adapter; it locates and digest-checks the same parent source rather
 than carrying a conclusion table.
@@ -43,7 +43,7 @@ decision surface:
 - `scripts/pr_status.py` reports required-check rollups and main workflow
   history without counting NO_RESULT as red or green.
 - `scripts/pr-dag-health.sh` and the pinned `agent-utils` landing planner use
-  the live required `merge-gate` context; an absent context is never
+  the live required `merge-gate-v4` context; an absent context is never
   `landable-now`.
 - Parent `ci-hub` uses its canonical `check_outcome.py` model in landing,
   validate-status, health, remediation, and history consumers.
@@ -98,15 +98,15 @@ when a green run must not update GitHub.
 
 The label is an alternate merge admission signal, not a partial-test waiver.
 Apply it only through a full green validator run on the exact pull request head.
-The privileged workflow remains an independent bonus signal and is not a merge
-admission requirement.
+Without that local receipt, the hosted leg requires both the portable and
+privileged jobs to pass. A hosted failure is never overridden by local evidence.
 
 ## Validation-evidence trail
 
 The label is only a cache of a validation receipt; it cannot create evidence.
 Parent `ci-hub/validation/verify_receipt.sh` is the receipt authority used by
-the gate. The gate executes it from the same exact parent checkout rather than
-running PR-controlled or copied verifier code. It resolves the marker's receipt
+the gate. The gate fetches it from the exact parent authority commit and verifies
+its digest rather than running PR-controlled verifier code. It resolves the marker's receipt
 commit, proves that commit belongs to the receipt branch, reads the exact path
 at that commit, recomputes SHA-256, and then validates the exact-head counted
 ledger row. A well-shaped comment without that backing receipt is refused.

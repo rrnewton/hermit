@@ -27,12 +27,27 @@ grep -Fq '"$CHECK_OUTCOME_AUTHORITY"' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
 [[ $(grep -Fc -- '--select-latest-run' "$WORKFLOW") -eq 3 ]] ||
     fail "portable, privileged, and demo selectors must use the exact-head/latest authority"
+grep -Fq 'job_status=missing' "$WORKFLOW" ||
+    fail "a missing portable job must start as NO_RESULT"
+grep -Fq 'priv_status=missing' "$WORKFLOW" ||
+    fail "a missing privileged job must start as NO_RESULT"
+if grep -Fq 'job_status=$run_status' "$WORKFLOW"; then
+    fail "workflow success must not stand in for a missing authoritative job"
+fi
+grep -Fq '[ "$job_found" != true ] && [ "$run_state" = FAILED ]' "$WORKFLOW" ||
+    fail "a complete workflow failure must remain a failure fallback"
+grep -Fq '[ "$priv_job_found" != true ] && [ "$priv_run_state" = FAILED ]' "$WORKFLOW" ||
+    fail "a complete privileged workflow failure must remain a failure fallback"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
     fail "local shell adapter must delegate to the parent status authority"
 grep -Fq 'from ci_hub_check_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
     fail "PR rollup must import the parent-authority adapter"
+grep -Fq '"rrnewton/hermit": ("merge-gate-v4",)' "$ROOT_DIR/scripts/pr_status.py" ||
+    fail "Hermit PR rollup must read the live versioned gate context"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "lander rollup must call the parent-authority adapter"
+grep -Fq 'latest_named($r; "merge-gate-v4")' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "lander rollup must read the live versioned gate context"
 grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "main-health rollup must select the latest check at the exact head"
 [[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||

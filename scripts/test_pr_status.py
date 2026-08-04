@@ -23,7 +23,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_failure_conclusion_is_red(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
@@ -35,7 +35,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_incomplete_status_is_pending(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "",
                 "status": "IN_PROGRESS",
             }
@@ -47,7 +47,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_all_success_is_green(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             }
@@ -65,7 +65,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:01:00Z",
@@ -78,13 +78,13 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_latest_authoritative_rerun_wins(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:05:00Z",
@@ -97,14 +97,14 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_newer_queued_run_wins_over_older_success(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
                 "detailsUrl": "https://github.com/o/r/actions/runs/10/job/1",
             },
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "",
                 "status": "QUEUED",
                 "startedAt": "0001-01-01T00:00:00Z",
@@ -118,7 +118,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_hermit_privileged_failure_is_nonblocking(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             },
@@ -162,7 +162,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_cancelled_required_check_is_no_result_not_red_or_green(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": "merge-gate-v4",
                 "conclusion": "CANCELLED",
                 "status": "COMPLETED",
             }

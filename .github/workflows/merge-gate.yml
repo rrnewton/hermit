@@ -698,9 +698,11 @@ jobs:
             run_id="$(jq -r '.id // ""' <<< "$run")"
             run_status="$(jq -r '.status // "missing"' <<< "$run")"
             run_conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
-            job_status=$run_status
-            job_conclusion=$run_conclusion
+            run_state=$(classify_check "$run_status" "$run_conclusion")
+            job_status=missing
+            job_conclusion=
             job_url="$(jq -r '.html_url // ""' <<< "$run")"
+            job_found=false
             if [ -n "$run_id" ]; then
               jobs="$(
                 gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
@@ -711,12 +713,16 @@ jobs:
                   | jq '[.[] | select(.name == "Regular tests (GitHub-managed portable)")] | first // {}'
               )"
               if [ "$(jq 'length' <<< "$regular_job")" -gt 0 ]; then
+                job_found=true
                 job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
                 job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
                 job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
               fi
             fi
             portable_state=$(classify_check "$job_status" "$job_conclusion")
+            if [ "$job_found" != true ] && [ "$run_state" = FAILED ]; then
+              portable_state=FAILED
+            fi
 
             priv_runs="$(
               gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
@@ -726,7 +732,11 @@ jobs:
             priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
             priv_status="$(jq -r '.status // "missing"' <<< "$priv_run")"
             priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_run")"
+            priv_run_state=$(classify_check "$priv_status" "$priv_conclusion")
             priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
+            priv_job_found=false
+            priv_status=missing
+            priv_conclusion=
             if [ -n "$priv_run_id" ]; then
               priv_jobs="$(
                 gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
@@ -737,12 +747,16 @@ jobs:
                   | jq '[.[] | select(.name == "Privileged capability and E2E tests")] | first // {}'
               )"
               if [ "$(jq 'length' <<< "$priv_job")" -gt 0 ]; then
+                priv_job_found=true
                 priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
                 priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
                 priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
               fi
             fi
             privileged_state=$(classify_check "$priv_status" "$priv_conclusion")
+            if [ "$priv_job_found" != true ] && [ "$priv_run_state" = FAILED ]; then
+              privileged_state=FAILED
+            fi
 
             if [ "$portable_state" = FAILED ] || [ "$privileged_state" = FAILED ]; then
               echo "::error::Hosted validation FAILED for PR #${pr_number} at $head_sha: portable=$job_status/${job_conclusion:-none} privileged=$priv_status/${priv_conclusion:-none}. Local evidence cannot override a failure."
