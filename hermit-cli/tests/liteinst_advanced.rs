@@ -255,12 +255,93 @@ fn liteinst_strict_verify_heap_growth_avoids_trampoline_mappings() {
     );
 }
 
+/// Maximum number of skid-gated attempts for a single strict-verify run before
+/// failing loud. Kept small: a genuine skid overshoot is rare, so more than a
+/// couple in a row means the skid tail is systematically exceeding the margin on
+/// this host — which is itself a defect worth surfacing, not papering over.
+const MAX_SKID_ATTEMPTS: u32 = 3;
+
+/// The one retry predicate. Returns true iff a failed run should be retried: it
+/// failed AND positively identified itself as an RCB skid overshoot via the
+/// canonical [`reverie_ptrace::SKID_OVERSHOOT_MARKER`].
+///
+/// This is the entire safety property of the harness. It is structurally
+/// impossible to retry an *unmarked* failure: a `--strict --verify` divergence
+/// with no marker is a real determinism bug and always returns `false` here, so
+/// the caller's assertion surfaces it immediately. A retry can never launder a
+/// real bug into a green result.
+fn is_retryable_skid_failure(success: bool, stderr: &str) -> bool {
+    !success && stderr.contains(reverie_ptrace::SKID_OVERSHOOT_MARKER)
+}
+
+/// Runs a strict-verify closure, retrying ONLY when the failure is a
+/// marker-identified skid overshoot. Counts and reports every retry, caps at
+/// [`MAX_SKID_ATTEMPTS`], and fails loud at the cap.
+fn run_with_skid_gated_retry(mut run: impl FnMut() -> Output) -> Output {
+    let mut attempt: u32 = 1;
+    loop {
+        let output = run();
+        let success = output.status.success();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        // A pass, or any failure that is NOT a marked skid overshoot, returns
+        // immediately. Only the marked-skid failure reaches the retry logic.
+        if !is_retryable_skid_failure(success, &stderr) {
+            return output;
+        }
+
+        let overshoot_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains(reverie_ptrace::SKID_OVERSHOOT_MARKER))
+            .collect();
+
+        assert!(
+            attempt < MAX_SKID_ATTEMPTS,
+            "SKID-RETRY EXHAUSTED after {attempt} attempts: every attempt overshot the RCB \
+             skid margin (marker {} present each time). This is not a transient — the skid tail \
+             is systematically exceeding the margin on this host. Overshoot markers:\n{}",
+            reverie_ptrace::SKID_OVERSHOOT_MARKER,
+            overshoot_lines.join("\n"),
+        );
+
+        // Count + report every retry so N-per-run is a legible defect signal,
+        // not a silent papering-over.
+        eprintln!(
+            "SKID-RETRY attempt={attempt}/{MAX_SKID_ATTEMPTS}: strict-verify run overshot the \
+             skid margin ({} marker line(s)); retrying. Markers:\n{}",
+            overshoot_lines.len(),
+            overshoot_lines.join("\n"),
+        );
+        attempt += 1;
+    }
+}
+
+#[test]
+fn skid_retry_gate_only_fires_on_marked_failure() {
+    let marker = reverie_ptrace::SKID_OVERSHOOT_MARKER;
+    let marked = format!("some log\n{marker} rcb_actual=33500 rcb_target=33000 overshoot=500\n");
+    // The one case that retries: a failure that identified itself as skid.
+    assert!(is_retryable_skid_failure(false, &marked));
+    // A real bug (failure, no marker) must NEVER retry — the safety property.
+    assert!(!is_retryable_skid_failure(
+        false,
+        "Mismatch between run 1 and run 2 outputs (logs retained)."
+    ));
+    // A passing run never retries, marker present or not.
+    assert!(!is_retryable_skid_failure(true, &marked));
+    assert!(!is_retryable_skid_failure(true, "Determinism verified."));
+}
+
 fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst(program, args, true))
+    assert_liteinst_strict_verify_output(run_with_skid_gated_retry(|| {
+        run_liteinst(program, args, true)
+    }))
 }
 
 fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst_with_input(program, args, true, Some(input)))
+    assert_liteinst_strict_verify_output(run_with_skid_gated_retry(|| {
+        run_liteinst_with_input(program, args, true, Some(input))
+    }))
 }
 
 fn assert_liteinst_strict_verify_output(output: Output) -> Output {

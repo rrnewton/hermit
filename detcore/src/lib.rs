@@ -231,6 +231,22 @@ fn report_rcb_overshoot(
         "prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
         clock_value, delta_rcbs, last_timer
     );
+    // Emit the single canonical skid-overshoot marker to stderr on BOTH the
+    // panic and the (default) log-and-continue path, so this higher-level guard
+    // carries the same greppable token as the reverie-ptrace precise single-step
+    // guard. This is the one shape a skid-gated retry harness keys on: it may
+    // retry a --strict --verify divergence iff the same run emitted this marker.
+    // The default here is log-and-continue, which is precisely the path that
+    // silently diverges the schedule under load; making it machine-classifiable
+    // is what lets a retry distinguish skid from a real determinism bug.
+    eprintln!(
+        "{} rcb_actual={} rcb_target={} overshoot={} clock_value={}",
+        reverie::SKID_OVERSHOOT_MARKER,
+        delta_rcbs,
+        last_timer,
+        delta_rcbs.saturating_sub(last_timer),
+        clock_value,
+    );
     if panic_on_rcb_overshoot {
         panic!("{}", message);
     }
