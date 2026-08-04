@@ -23,9 +23,9 @@ on:
         required: true
         type: string
 
-# Gate semantics version: v3. The required status context is `merge-gate-v3`.
-# `MERGE_GATE_V3_BLOB` catches accidental v3 drift that retains the guard, and
-# the versioned context means an unmodified stale v2 branch cannot satisfy v3.
+# Gate semantics version: v4. The required status context is `merge-gate-v4`.
+# `MERGE_GATE_V4_BLOB` catches accidental v4 drift that retains the guard, and
+# the versioned context means an unmodified stale v3 branch cannot satisfy v4.
 # The guard itself remains PR-owned YAML: a deliberate gate-policy edit can
 # remove it, so gate-policy PRs still require escalated adversarial review.
 #
@@ -73,7 +73,7 @@ permissions:
 # (selected by the `gate` label only) that picks these jobs up in seconds;
 # the three PMU runners also carry the `gate` label as fallback, so a single-node
 # outage cannot block landing. Because the required-check context is the job name
-# (`merge-gate-v3`), changing `runs-on` does not change the ruleset requirement.
+# (`merge-gate-v4`), changing `runs-on` does not change the ruleset requirement.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
@@ -259,13 +259,13 @@ jobs:
             echo "::warning::Trusted receipt verifier is unavailable; failing closed."
           fi
 
-          # Invalidate both the steady-state v3 context and the transition-only
-          # v2 context before mutating the label. The issue_comment job
+          # Invalidate both the steady-state v4 context and the transition-only
+          # v3 context before mutating the label. The issue_comment job
           # itself is not required, and a follow-up dispatch can fail (fork
           # heads cannot be dispatched at all). Publishing both failures keeps
           # either ruleset version fail-closed at the exact PR head.
           summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
-          for context in merge-gate-v3 merge-gate-v2; do
+          for context in merge-gate-v4 merge-gate-v3; do
             gh api --method POST \
               -H "Accept: application/vnd.github+json" \
               "repos/${REPO}/check-runs" \
@@ -422,7 +422,7 @@ jobs:
           exit "$failed"
 
   merge-gate:
-    name: merge-gate-v3
+    name: merge-gate-v4
     needs: [invalidate-local-validation, core-review-protocol]
     if: >-
       always() &&
@@ -437,9 +437,9 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - name: Require the registered v3 gate definition
+      - name: Require the registered v4 gate definition
         env:
-          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V3_BLOB }}
+          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V4_BLOB }}
           GATE_PATH: .github/workflows/merge-gate.yml
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -447,17 +447,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$EXPECTED_GATE_BLOB" ]; then
-            echo "::error::MERGE_GATE_V3_BLOB is not configured; refusing an unbound gate result."
+            echo "::error::MERGE_GATE_V4_BLOB is not configured; refusing an unbound gate result."
             exit 1
           fi
           actual_blob="$(
             gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
           )"
           if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
-            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v3 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v4 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
             exit 1
           fi
-          echo "Gate definition is registered v3 blob ${actual_blob}."
+          echo "Gate definition is registered v4 blob ${actual_blob}."
       - name: Fetch the trusted receipt verifier
         env:
           GH_TOKEN: ${{ github.token }}
@@ -823,12 +823,12 @@ jobs:
 
           echo "Every required leg has a PASSED result."
 
-  # Transition only: before the ruleset moves from `merge-gate-v2` to
-  # `merge-gate-v3`, mirror v3 into the legacy context so this policy PR can
+  # Transition only: before the ruleset moves from `merge-gate-v3` to
+  # `merge-gate-v4`, mirror v4 into the legacy context so this policy PR can
   # land without an admin bypass. The reconciler disables this variable after
   # the ruleset switch, leaving a skipped job that consumes no runner.
   merge-gate-legacy-context:
-    name: merge-gate-v2
+    name: merge-gate-v3
     needs: merge-gate
     if: >-
       always() &&
@@ -837,13 +837,13 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
     steps:
-      - name: Mirror the registered v3 result during migration
+      - name: Mirror the registered v4 result during migration
         env:
-          V3_RESULT: ${{ needs.merge-gate.result }}
+          V4_RESULT: ${{ needs.merge-gate.result }}
         run: |
           set -euo pipefail
-          if [ "$V3_RESULT" != success ]; then
-            echo "::error::merge-gate-v3 did not pass (result=${V3_RESULT})."
+          if [ "$V4_RESULT" != success ]; then
+            echo "::error::merge-gate-v4 did not pass (result=${V4_RESULT})."
             exit 1
           fi
-          echo "merge-gate-v3 passed; emitting temporary v2 context."
+          echo "merge-gate-v4 passed; emitting temporary v3 context."
