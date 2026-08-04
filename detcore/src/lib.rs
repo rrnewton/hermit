@@ -51,6 +51,7 @@ mod mvar;
 mod procfs;
 mod procmaps;
 mod record_or_replay;
+mod regdigest;
 mod resources;
 mod scheduler;
 mod sock_diag;
@@ -763,6 +764,43 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         }
         Ok(())
+    }
+
+    /// Hash the guest general-purpose register file at a guest-logical-control
+    /// point and emit it as a `DETLOG [regs]` record.
+    ///
+    /// Registers are the most volatile guest state and were previously uncovered
+    /// by `--verify`. Like the memory-region hashing above (and the guest-env
+    /// digest), this is a determinism instrument: it does the register read and
+    /// SHA-256 only when INFO-level determinism logging is actually active
+    /// (`--verify` requires `--log>=info`), and is otherwise zero-cost. Host
+    /// addresses in the register file are canonicalized to ordinals by first
+    /// appearance, so an address-only difference compares equal while any order,
+    /// aliasing, or non-address value change is a hard catch. See
+    /// [`crate::regdigest`] for the domain definition and canonicalization
+    /// contract.
+    ///
+    /// Callers must invoke this only where the guest holds logical control (the
+    /// syscall-commit boundary), after any clobber canonicalization, so that the
+    /// hook's own register rewrites are never sampled.
+    async fn detlog_registers<G: Guest<Self>>(&self, guest: &mut G) {
+        // Zero-cost unless someone is actually consuming the INFO determinism
+        // stream (a local INFO subscriber, or an out-of-process backend's
+        // forwarder). Mirrors the guest-env digest gating.
+        if !(tracing::enabled!(tracing::Level::INFO) || crate::detlog::forwarding_enabled()) {
+            return;
+        }
+        let regs = guest.regs().await;
+        let dettid = guest.thread_state().dettid;
+        let (summary, digest) = regdigest::canonicalize_and_hash(&regs);
+        // The digest is printed with a leading `h` so the whole token begins with
+        // a letter and survives log-diff address/number normalization intact.
+        detlog!(
+            "[regs][detcore, dtid {}] {} hash=h{:x}",
+            dettid,
+            summary,
+            digest
+        );
     }
 
     fn display_syscall_finished<'a, M: MemoryAccess>(
@@ -2278,6 +2316,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !self.cfg.syscall_clobbers_virtualized_by_backend {
             self.canonicalize_syscall_clobbers(guest).await;
         }
+
+        // Guest-logical-control point: the syscall is committed and %rcx/%r11
+        // hold their faithful SYSRET values, so the register file now reflects
+        // guest-logical state about to be resumed. Sample it here (never
+        // mid-hook). The syscall return value lands in %rax later in Reverie's
+        // post-hook and is deliberately outside the sampled register domain.
+        self.detlog_registers(guest).await;
 
         res
     }
