@@ -1,6 +1,6 @@
 [package]
 name = "hermit-liteinst-runtime-artifact"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 
@@ -8,6 +8,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-detcore = { version = "0.0.0", path = "../../detcore" }
+detcore = { version = "0.2.0", path = "../../detcore" }
 libc = "0.2.186"
 reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "3eda4286ff222069ef22437c5755d35a9c181ce2", default-features = false, features = ["preload-constructor"] }
