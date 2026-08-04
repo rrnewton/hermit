@@ -7,7 +7,7 @@ Hermit binary keeps DBT dispatch glue but does not link DynamoRIO or
 ## Install
 
 ```console
-cargo install hermit-dynamorio
+cargo install --locked hermit-dynamorio
 ```
 
 This is a source install. It requires CMake and a C/C++ toolchain, builds the

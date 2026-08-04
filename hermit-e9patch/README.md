@@ -1,6 +1,6 @@
 # hermit-e9patch
 
-`cargo install hermit-e9patch` builds the pinned e9patch source, embeds the
+`cargo install --locked hermit-e9patch` builds the pinned e9patch source, embeds the
 stripped `e9tool` and `e9patch` runtime in the helper, and installs only the
 `hermit-e9patch` executable. Hermit invokes it on first use; it atomically
 extracts the exact payload under `$HERMIT_DIR/plugins/e9patch` (default

@@ -97,7 +97,7 @@ fn select_helper_from(
         code: EX_UNAVAILABLE,
         message: format!(
             "error: backend 'dbt' is unavailable: hermit-dynamorio was not found\n\
-             install it with:\n  cargo install hermit-dynamorio\n\
+             install it with:\n  cargo install --locked hermit-dynamorio\n\
              searched:\n  {}\n  {}\n  PATH",
             direct[0].display(),
             direct[1].display()
@@ -362,7 +362,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, EX_UNAVAILABLE);
-        assert!(error.message.contains("cargo install hermit-dynamorio"));
+        assert!(
+            error
+                .message
+                .contains("cargo install --locked hermit-dynamorio")
+        );
     }
 
     #[test]

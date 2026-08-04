@@ -30,7 +30,7 @@ fn absent_plugin_exits_with_exact_install_remedy() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("error: backend 'dbt' is unavailable: hermit-dynamorio was not found"));
-    assert!(stderr.contains("install it with:\n  cargo install hermit-dynamorio"));
+    assert!(stderr.contains("install it with:\n  cargo install --locked hermit-dynamorio"));
     assert!(stderr.contains("searched:"));
 }
 
@@ -54,7 +54,9 @@ fn assert_absent_plugin(backend: &str, helper: &str) {
     assert!(stderr.contains(&format!(
         "error: backend '{backend}' is unavailable: {helper} was not found"
     )));
-    assert!(stderr.contains(&format!("install it with:\n  cargo install {helper}")));
+    assert!(stderr.contains(&format!(
+        "install it with:\n  cargo install --locked {helper}"
+    )));
 }
 
 #[test]

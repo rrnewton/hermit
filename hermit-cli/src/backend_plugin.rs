@@ -93,7 +93,7 @@ fn select_helper_from(
     Err(PluginFailure {
         code: EX_UNAVAILABLE,
         message: format!(
-            "error: backend '{}' is unavailable: {} was not found\ninstall it with:\n  cargo install {}\nsearched:\n  {}\n  {}\n  PATH",
+            "error: backend '{}' is unavailable: {} was not found\ninstall it with:\n  cargo install --locked {}\nsearched:\n  {}\n  {}\n  PATH",
             spec.backend,
             spec.helper,
             spec.helper,
@@ -249,7 +249,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, EX_UNAVAILABLE);
-        assert!(error.message.contains("cargo install hermit-sabre"));
+        assert!(
+            error
+                .message
+                .contains("cargo install --locked hermit-sabre")
+        );
     }
 
     #[test]

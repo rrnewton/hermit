@@ -42,7 +42,7 @@ normally `~/.cargo/bin`:
 ```bash
 git clone https://github.com/rrnewton/hermit.git
 cd hermit
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
 ```
 

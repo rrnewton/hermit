@@ -1,6 +1,6 @@
 # hermit-sabre
 
-`cargo install hermit-sabre` builds the pinned SaBRe source and the matching
+`cargo install --locked hermit-sabre` builds the pinned SaBRe source and the matching
 Detcore shared object, embeds their stripped runtime payload in the helper, and
 installs only the `hermit-sabre` executable. Hermit invokes the helper on first
 use; it atomically extracts the exact payload under
