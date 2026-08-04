@@ -200,7 +200,7 @@ jobs:
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
           gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=f9e61247e83bb07c11297541b591606de24a89a8' \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=173d87688483189154cdd44feb031347a737e29a' \
             --jq .content | tr -d '\n' | base64 --decode >"$verifier"
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
@@ -428,7 +428,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: f9e61247e83bb07c11297541b591606de24a89a8
+          ref: 173d87688483189154cdd44feb031347a737e29a
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require a passed result or re-dispatch a no-result check
@@ -632,7 +632,8 @@ jobs:
             fi
 
             runs="$(gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100")"
-            run="$(jq --arg sha "$head_sha" '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.created_at) | last // {}' <<< "$runs")"
+            run="$(python3 .dev-hermit-policy/ci-hub/check_outcome.py \
+              --select-latest-run --head-sha "$head_sha" <<< "$runs")"
             run_id="$(jq -r '.id // ""' <<< "$run")"
             run_status="$(jq -r '.status // "missing"' <<< "$run")"
             run_conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
@@ -649,7 +650,8 @@ jobs:
             portable_state=$(classify_check "$job_status" "$job_conclusion")
 
             priv_runs="$(gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100")"
-            priv_run="$(jq --arg sha "$head_sha" '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.created_at) | last // {}' <<< "$priv_runs")"
+            priv_run="$(python3 .dev-hermit-policy/ci-hub/check_outcome.py \
+              --select-latest-run --head-sha "$head_sha" <<< "$priv_runs")"
             priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
             priv_status="$(jq -r '.status // "missing"' <<< "$priv_run")"
             priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_run")"
@@ -700,15 +702,9 @@ jobs:
               all_runs="$(
                 gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
               )"
-              demo_run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[]
-                  | select(
-                      .head_sha == $sha
-                      and .name == "P0 Demo Gate (Hermit hot paths)"
-                    )]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$all_runs")"
+              demo_runs="$(jq '{workflow_runs: [.workflow_runs[] | select(.name == "P0 Demo Gate (Hermit hot paths)")]}' <<< "$all_runs")"
+              demo_run="$(python3 .dev-hermit-policy/ci-hub/check_outcome.py \
+                --select-latest-run --head-sha "$head_sha" <<< "$demo_runs")"
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"

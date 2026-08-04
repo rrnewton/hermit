@@ -74,7 +74,7 @@ git_() { if [ -n "$PROXY" ]; then "$PROXY" git "$@"; else git "$@"; fi; }
 log "pr-dag-health: querying open PRs for $REPO ..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
-    --json number,title,headRefName,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
+    --json number,title,headRefName,headRefOid,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
     || die "gh pr list failed (is the proxy/auth configured?)"
 [ -n "$RAW" ] || die "gh returned no data"
 RAW="$(printf '%s' "$RAW" | python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups)" \
@@ -91,8 +91,7 @@ def result: (.conclusion // .state // "NONE");
 def latest_named($rollup; $name):
   ($rollup
    | map(select((.name // .context)==$name))
-   | sort_by(.startedAt // .createdAt // .completedAt // .detailsUrl // "")
-   | last);
+   | first);
 def ci_of($rollup):
   ($rollup // []) as $r
   | latest_named($r; "merge-gate") as $gate
@@ -184,9 +183,13 @@ fi
 # ---------------------------------------------------------------------------
 # main HEAD + its CI (green check).
 # ---------------------------------------------------------------------------
-MAIN_SHA="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH" --jq '.sha' 2>/dev/null | cut -c1-12)"
-MAIN_CI="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" \
-    --jq '[.check_runs[] | select(.name=="Regular tests (GitHub-managed portable)")] | (.[0].conclusion // "none")' 2>/dev/null)"
+MAIN_FULL_SHA="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH" --jq '.sha' 2>/dev/null)"
+MAIN_SHA="${MAIN_FULL_SHA:0:12}"
+MAIN_CHECKS="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" 2>/dev/null)"
+MAIN_CI="$(printf '%s' "$MAIN_CHECKS" \
+    | python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" \
+        --select-latest-rollup --head-sha "$MAIN_FULL_SHA" \
+    | jq -r '[.[] | select(.name=="Regular tests (GitHub-managed portable)")] | (.[0].conclusion // "none")')"
 [ -n "$MAIN_SHA" ] || MAIN_SHA="unknown"
 [ -n "$MAIN_CI" ]  || MAIN_CI="unknown"
 MAIN_OUTCOME="$(python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" \

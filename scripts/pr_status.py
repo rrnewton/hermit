@@ -31,10 +31,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Sequence
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-utils" / "py"))
-from ci_hub_check_outcome import classify_check  # noqa: E402
+from ci_hub_check_outcome import classify_check, select_latest_checks  # noqa: E402
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
@@ -64,23 +63,6 @@ class PullRequest:
         return HUMAN_REVIEW_LABEL in self.labels
 
 
-def _check_sort_key(check: dict[object, object], index: int) -> tuple[int, str, int]:
-    details_url = str(check.get("detailsUrl") or "")
-    path_parts = [part for part in urlparse(details_url).path.split("/") if part]
-    try:
-        runs_index = path_parts.index("runs")
-        run_id = int(path_parts[runs_index + 1])
-    except (ValueError, IndexError):
-        run_id = -1
-    timestamp = str(
-        check.get("startedAt")
-        or check.get("createdAt")
-        or check.get("completedAt")
-        or ""
-    )
-    return run_id, timestamp, index
-
-
 def classify_check_outcome(conclusion: object, status: object) -> str:
     """Return passed, failed, or no-result for one GitHub status.
 
@@ -96,7 +78,7 @@ def classify_check_outcome(conclusion: object, status: object) -> str:
     }[classify_check(status, conclusion)]
 
 
-def classify_ci_rollup(repo: str, checks: object) -> str:
+def classify_ci_rollup(repo: str, checks: object, *, head_sha: str = "") -> str:
     """Classify the latest required checks as green, red, or no-result.
 
     GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
@@ -104,27 +86,23 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
     Missing, cancelled, skipped, neutral, stale, active, and unknown checks all
     block as ``no-result`` without inflating the red count.
     """
-    if not isinstance(checks, list) or not checks:
+    checks = select_latest_checks(checks, head_sha=head_sha)
+    if not checks:
         return "no-result"
 
     required = REQUIRED_CHECKS.get(repo, (REGULAR_PORTABLE_CHECK,))
-    latest: dict[str, tuple[tuple[int, str, int], dict[object, object]]] = {}
-    for index, check in enumerate(checks):
-        if not isinstance(check, dict):
-            continue
+    latest: dict[str, dict[object, object]] = {}
+    for check in checks:
         name = str(check.get("name") or check.get("context") or "")
         if name not in required:
             continue
-        sort_key = _check_sort_key(check, index)
-        previous = latest.get(name)
-        if previous is None or sort_key > previous[0]:
-            latest[name] = (sort_key, check)
+        latest[name] = check
 
     if not latest:
         return "no-result"
 
     saw_no_result = len(latest) != len(required)
-    for _, check in latest.values():
+    for check in latest.values():
         conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         status = str(check.get("status") or "").upper()
         outcome = classify_check_outcome(conclusion, status)
@@ -161,7 +139,11 @@ def parse_pull_request(repo: str, raw: object) -> PullRequest:
         url=url,
         is_draft=raw.get("isDraft") is True,
         labels=labels,
-        ci_status=classify_ci_rollup(repo, raw.get("statusCheckRollup")),
+        ci_status=classify_ci_rollup(
+            repo,
+            raw.get("statusCheckRollup"),
+            head_sha=str(raw.get("headRefOid") or ""),
+        ),
     )
 
 
@@ -178,7 +160,7 @@ def fetch_open_prs(repo: str) -> list[PullRequest]:
         "--limit",
         "200",
         "--json",
-        "number,title,url,isDraft,labels,statusCheckRollup",
+        "number,title,url,isDraft,labels,headRefOid,statusCheckRollup",
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)

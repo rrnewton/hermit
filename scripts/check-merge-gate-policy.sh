@@ -19,16 +19,20 @@ fail() {
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
-grep -Fq 'ref: f9e61247e83bb07c11297541b591606de24a89a8' "$WORKFLOW" ||
+grep -Fq 'ref: 173d87688483189154cdd44feb031347a737e29a' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
 grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
+[[ $(grep -Fc -- '--select-latest-run' "$WORKFLOW") -eq 3 ]] ||
+    fail "portable, privileged, and demo selectors must use the exact-head/latest authority"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
     fail "local shell adapter must delegate to the parent status authority"
 grep -Fq 'from ci_hub_check_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
     fail "PR rollup must import the parent-authority adapter"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "lander rollup must call the parent-authority adapter"
+grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "main-health rollup must select the latest check at the exact head"
 [[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||
     fail "duplicate jq status classifier must not exist"
 [[ ! -e $ROOT_DIR/scripts/check_status_outcome.py ]] ||
