@@ -248,8 +248,8 @@
     },
     {
       "group": "lint", "job": "rustfmt",
-      "desc": "Rustfmt (cargo fmt --all -- --check)",
-      "cmd": "cargo fmt --all -- --check",
+      "desc": "Ratchet provenance lint and Rustfmt",
+      "cmd": "./scripts/check-compat-ratchet-provenance-test.sh && ./scripts/check-compat-ratchet-provenance.sh && cargo fmt --all -- --check",
       "timeout": 120,
       "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}

@@ -751,25 +751,51 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# The compatibility corpus contains semantic workloads only. Banner-only wget,
-# netcat, socat, and sensors probes were removed when the E2E harness landed.
+# Ratchet provenance:
+#   What: 191 semantic workload rows selected by run_compatibility_corpus in
+#   strict mode; this is a structural denominator, not a passing-result claim.
+#   Measured: 2026-07-27 at 6044c2d39ace4bd84f32598a9fde692fcea67b3f; PR
+#   #1014 recorded no focused strict-corpus run for the migrated denominator.
+#   Method: #1014 changed 195 to 191 by removing the banner-only wget, netcat,
+#   socat, and sensors rows; the runtime sums pass, fail, flaky, and unavailable.
+#   Why: exact equality detects any later row addition or removal so the corpus
+#   cannot change silently; re-run the focused corpus when changing this value.
 readonly STRICT_COMPAT_TOTAL=191
-# The R/R ratchet asserts exactly the programs measured to pass record/replay.
-# History: PR #729 established a 131-row set (incl. ruby/dc/tcl) and PR #662 added
-# descriptor-state and writable-filesystem rows, reaching 144. A measured sweep
-# (see RR_COMPAT_KNOWN_FAILURES below) then found five gcc/binutils toolchain
-# programs -- g++, ar, strip, gprof, gcov -- that diverge on replay, so the honest
-# passing set is 139, not 144. Do NOT raise this number without a fresh sweep
-# proving the added rows pass R/R: an aspirational count is a phantom ratchet that
-# either fails the parse-time size check or masks real divergences.
+# Ratchet provenance:
+#   What: the exact RR_COMPAT_PASSING_LABELS set measured to pass record/replay.
+#   Measured: 2026-07-28 at ce2bc6ef3b3d0d7f852cae484143896339fd4a05.
+#   Method: PR #1044 ran the repaired R/R sweep to 139/139; five prior labels
+#   (g++, ar, strip, gprof, gcov) recorded but diverged and are excluded below.
+#   Why: the parse-time label count and run-time selected count must both equal
+#   this proven passing set; raise it only with a fresh successful R/R sweep.
 readonly RR_COMPAT_EXPECTED=139
-# Require the established SaBRe compatibility floor across the full measured corpus.
-# Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
-# rows to make the aggregate floor alternate between green and red.
+# Ratchet provenance:
+#   What: the minimum passing rows in the fixed 212-row SaBRe compatibility run.
+#   Measured: 2026-07-31 at c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b.
+#   Method: PR #1223's canonical landed-main sweep passed 207/212; gcc, g++, cpp,
+#   java, and timeout were the five recorded failures, while required rows below
+#   independently prevent aggregate success from masking a fixed-row regression.
+#   Why: 207 is the highest fully measured green floor, not an aspirational goal.
 readonly SABRE_COMPAT_EXPECTED=207
+# Ratchet provenance:
+#   What: all 212 rows selected by run_compatibility_corpus in SaBRe mode.
+#   Measured: 2026-07-29 at e340d85438b96a502833739df694e85f0893c9f3.
+#   Method: PR #1154 ran ./validate.sh --sabre-compat-only to 199/212 in 842s
+#   (/tmp/hermit-validate.MtTH22.log); the runtime independently recomputes total.
+#   Why: exact equality makes corpus growth or loss explicit and keeps the pass
+#   floor's denominator stable.
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
+# Ratchet provenance:
+#   What: all 155 shared compatibility rows selected in e9patch mode; this is a
+#   structural denominator and preprocessing-classification count, not a pass floor.
+#   Measured: 2026-07-27 at 6044c2d39ace4bd84f32598a9fde692fcea67b3f; PR
+#   #1014 recorded no focused e9patch run for the migrated denominator.
+#   Method: #1014 changed 156 to 155 when it removed the shared sensors --version
+#   row; the other three removed banner probes were not selected in e9patch mode.
+#   Why: both total rows and preprocessing classifications must equal this value,
+#   so an unaccounted row addition, removal, or missing diagnostic fails closed.
 readonly E9PATCH_COMPAT_TOTAL=155
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
