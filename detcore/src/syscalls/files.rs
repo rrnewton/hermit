@@ -2336,7 +2336,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// reads are replayed from the recorded log). Outside these conditions the
     /// handlers fall back to the ordinary host-timed path, so behavior is
     /// preserved for existing consumers.
-    fn timerfd_virtualized(&self) -> bool {
+    pub(crate) fn timerfd_virtualized(&self) -> bool {
         self.cfg.sequentialize_threads && self.cfg.virtualize_time && !self.cfg.recordreplay_modes
     }
 
@@ -2384,12 +2384,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// clock so that a subsequent `read()` reports expirations as a function of
     /// the deterministic schedule rather than host wall-clock.
     ///
-    /// The virtual arming (`TimerfdState`) is what `read()` and `gettime`
-    /// consult. The host timer is still armed (with `old_value` cleared so it
-    /// cannot overwrite guest memory) to keep `poll`/`epoll` readiness working
-    /// for consumers that wait that way; Detcore never itself reads the host
-    /// timerfd. `old_value`, when requested, is reported from the prior virtual
-    /// arming, keeping the whole operation deterministic.
+    /// The virtual arming (`TimerfdState`) is what `read()`, `gettime`, and the
+    /// virtual-aware poll/epoll paths consult. The host timer is mirrored only
+    /// for kernel validation and non-virtualized fallback modes; its readiness
+    /// is never authoritative while virtual time is active. `old_value`, when
+    /// requested, is reported from the prior virtual arming.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
@@ -2424,7 +2423,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = thread_observe_time(guest).await;
 
         // Validate the arming against the kernel BEFORE committing any virtual
-        // state: mirror it to the host timer (for poll/epoll readiness) and let
+        // state: mirror it to the host timer for validation/fallback and let
         // the host reject invalid `tv_nsec`/`tv_sec`/flags with `EINVAL`. Do not
         // let the host write the guest's old_value buffer. On host error we
         // return here, leaving the prior virtual arming untouched — so an invalid

@@ -8,6 +8,7 @@
 
 //! Deterministic file descriptor
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -89,6 +90,22 @@ pub struct TimerfdState {
     pub interval_ns: u64,
 }
 
+/// Guest-visible epoll registration retained so virtual readiness sources can
+/// participate in `epoll_wait` without depending on host readiness timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpollInterest {
+    /// File descriptor registered in the epoll instance.
+    pub fd: RawFd,
+    /// Requested epoll flags.
+    pub events: u32,
+    /// Opaque payload copied back in the readiness event.
+    pub data: u64,
+    /// Detcore-owned payload installed in the host epoll instance. Translating
+    /// this token back to `data` identifies the registered fd without trusting
+    /// a guest payload that may be duplicated across registrations.
+    pub host_token: u64,
+}
+
 /// Deterministic file descriptor
 ///
 /// Notice `statbuf` can be cached here, this is because
@@ -158,6 +175,9 @@ struct OpenFileDescription {
     // TODO-HUMAN-REVIEW(#1169)
     #[serde(default)]
     timerfd: Option<TimerfdState>,
+    /// Interest list for a modeled epoll instance, keyed by registered fd.
+    #[serde(default)]
+    epoll_interests: BTreeMap<RawFd, EpollInterest>,
 }
 
 impl PartialEq for DetFd {
@@ -203,6 +223,7 @@ impl DetFd {
                 sock_diag: false,
                 loopback_peer: false,
                 timerfd: None,
+                epoll_interests: BTreeMap::new(),
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -507,6 +528,28 @@ impl DetFd {
     /// periodic timer past the expirations it has just reported.
     pub(crate) fn set_timerfd_state(&self, state: TimerfdState) {
         self.description().timerfd = Some(state);
+    }
+
+    /// Add or replace one modeled epoll interest after the kernel accepts the
+    /// corresponding `EPOLL_CTL_ADD` or `EPOLL_CTL_MOD` operation.
+    pub(crate) fn set_epoll_interest(&self, interest: EpollInterest) {
+        self.description()
+            .epoll_interests
+            .insert(interest.fd, interest);
+    }
+
+    /// Remove a modeled epoll interest after a successful `EPOLL_CTL_DEL`.
+    pub(crate) fn remove_epoll_interest(&self, fd: RawFd) {
+        self.description().epoll_interests.remove(&fd);
+    }
+
+    /// Snapshot the modeled interest list in deterministic descriptor order.
+    pub(crate) fn epoll_interests(&self) -> Vec<EpollInterest> {
+        self.description()
+            .epoll_interests
+            .values()
+            .copied()
+            .collect()
     }
 }
 
