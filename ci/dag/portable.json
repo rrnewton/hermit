@@ -49,12 +49,13 @@
     {
       "group": "build", "job": "dbi_release",
       "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
+      "description": "Measured 2026-08-04: one cc1plus peaked at 522 MiB, so the prior j32 could demand about 16.3 GiB before non-compiler memory under this node's 8 GiB inner cap. j8 verified clean at a cgroup-recorded 6659153920-byte peak, leaving 1930780672 bytes (22.5%) headroom; j12 left only 1.2%. A controlled clean sweep trades 67s (+62%: 175s at j8 versus 108s at unsafe j32).",
       "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound",
-               "preferred_inner_jobs": 16}
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "build", "job": "sabre_release",
