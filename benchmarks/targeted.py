@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure targeted native, ptrace, DBI, and KVM backend workloads."""
+"""Measure targeted native, ptrace, DBI, LiteInst, and KVM workloads."""
 
 from __future__ import annotations
 
@@ -22,7 +22,14 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
-BACKEND_NAMES = ("native", "ptrace", "dbi", "kvm")
+BACKEND_NAMES = ("native", "ptrace", "dbi", "liteinst", "kvm")
+BACKEND_LABELS = {
+    "native": "Native",
+    "ptrace": "Ptrace",
+    "dbi": "DBI",
+    "liteinst": "LiteInst",
+    "kvm": "KVM",
+}
 
 
 class BenchmarkError(RuntimeError):
@@ -78,8 +85,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backends",
-        default="native,ptrace,dbi,kvm",
-        help="comma-separated backend set (default: native,ptrace,dbi,kvm)",
+        default="native,ptrace,dbi,liteinst,kvm",
+        help="comma-separated backend set (default: native,ptrace,dbi,liteinst,kvm)",
     )
     parser.add_argument(
         "--benchmarks",
@@ -411,6 +418,10 @@ def format_mode(mode: dict[str, object], native: bool) -> str:
 def render_summary(results: dict[str, object]) -> str:
     configuration = results["configuration"]
     assert isinstance(configuration, dict)
+    header = [
+        "Benchmark",
+        *(f"{BACKEND_LABELS[name]} median" for name in BACKEND_NAMES),
+    ]
     rows = [
         "# Targeted Hermit backend benchmark results",
         "",
@@ -420,8 +431,8 @@ def render_summary(results: dict[str, object]) -> str:
         f"(+ {configuration['warmups']} warmup per available backend)",
         "Hermit modes: strict, log=error, relaxations=none",
         "",
-        "| Benchmark | Native median | Ptrace median | DBI median | KVM median |",
-        "| --- | ---: | ---: | ---: | ---: |",
+        "| " + " | ".join(header) + " |",
+        "| --- |" + " ---: |" * len(BACKEND_NAMES),
     ]
     benchmarks = results["benchmarks"]
     assert isinstance(benchmarks, list)
@@ -441,10 +452,7 @@ def render_summary(results: dict[str, object]) -> str:
                 failures.append(
                     f"- {benchmark['name']} / {backend}: {mode['reason']}"
                 )
-        rows.append(
-            f"| {benchmark['name']} | {cells[0]} | {cells[1]} | "
-            f"{cells[2]} | {cells[3]} |"
-        )
+        rows.append("| " + " | ".join([str(benchmark["name"]), *cells]) + " |")
 
     rows.extend(
         [
