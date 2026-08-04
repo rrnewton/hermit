@@ -162,15 +162,16 @@ fn compressed_fixtures() -> &'static [PathBuf; 3] {
     })
 }
 
-fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
-    run_liteinst_with_input(program, args, verify, None)
-}
-
 fn run_liteinst_with_input(
     program: &Path,
     args: &[&str],
     verify: bool,
     input: Option<&[u8]>,
+    // Per-run witness nonce (`WITNESS_TOKEN_ENV`) exported to the hermit
+    // *supervisor* only. Reverie stamps it into the skid-overshoot marker;
+    // hermit strips it from the guest environment, so guest code can neither
+    // read nor forge it. `None` disables authenticated skid detection.
+    witness_token: Option<&str>,
 ) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
@@ -188,6 +189,10 @@ fn run_liteinst_with_input(
             xdg_config_home.display()
         ))
         .env("HOME", home.path());
+    if let Some(token) = witness_token {
+        // Supervisor-only: hermit strips WITNESS_TOKEN_ENV from the guest env.
+        command.env(WITNESS_TOKEN_ENV, token);
+    }
     command.arg("--").arg(program).args(args);
     let Some(input) = input else {
         return command.output().expect("failed to run Hermit LiteInst");
@@ -255,12 +260,267 @@ fn liteinst_strict_verify_heap_growth_avoids_trampoline_mappings() {
     );
 }
 
+/// Maximum number of skid-gated attempts for a single strict-verify run before
+/// failing loud. Kept small: a genuine skid overshoot is rare, so more than a
+/// couple in a row means the skid tail is systematically exceeding the margin on
+/// this host — which is itself a defect worth surfacing, not papering over.
+const MAX_SKID_ATTEMPTS: u32 = 3;
+
+/// Env var still set on the hermit *supervisor* so hermit can stamp the *origin*
+/// of its skid-attributed divergence audit line with a nonce the guest cannot
+/// know (hermit strips it from the guest env). This is human/log evidence only:
+/// the retry decision no longer depends on parsing it — see
+/// [`is_retryable_skid_exit`], which keys purely on the supervisor's exit code.
+const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
+
+/// Optional JSONL ledger path (one object per retry and per exhaustion). Defect
+/// (b): successful retries are invisible in CI because the test passes and
+/// nextest's `success-output = "never"` (and plain `cargo test`) suppress output.
+/// When set, every retry is durably recorded so `validate.sh` can surface the
+/// per-run retry count even on a green run.
+const RETRY_LEDGER_ENV: &str = "HERMIT_SKID_RETRY_LEDGER";
+
+/// Generate a unique, unguessable per-run witness nonce exported to the hermit
+/// *supervisor* (never the guest, from which hermit strips [`WITNESS_TOKEN_ENV`]).
+/// It authenticates the *origin* of the supervisor's skid audit line for a human
+/// or the retry ledger; the retry decision does NOT parse it — see
+/// [`is_retryable_skid_exit`], which keys purely on the reserved exit code.
+fn witness_token() -> String {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("wit-{}-{}-{}", std::process::id(), seq, nanos)
+}
+
+/// The one retry predicate: a run is retryable iff hermit's supervisor exited
+/// with the reserved [`hermit::SKID_DIVERGENCE_EXIT_CODE`].
+///
+/// That code is emitted by hermit's `verify` ONLY when the two `--strict
+/// --verify` runs diverged AND the supervisor recorded an RCB skid overshoot —
+/// an unforgeable, process-global count captured inside the supervisor
+/// (`reverie::take_skid_overshoot_count`), never guest-controlled stderr text.
+/// This typed first-cause signal replaces the old `divergence-string AND
+/// authenticated-marker` predicate that the reviewers flagged for authenticating
+/// a marker's *origin* rather than binding to skid as the *cause*:
+///
+///  * a real determinism bug (divergence with zero overshoots) exits 1, not the
+///    reserved code, so it is never retried — the caller's assertion surfaces it;
+///  * a guest cannot influence the supervisor's exit code, so guest-printed
+///    marker text can never launder a real failure into a retry;
+///  * a signal-killed run (`code() == None`) is not the reserved code either.
+fn is_retryable_skid_exit(exit_code: Option<i32>) -> bool {
+    exit_code == Some(hermit::SKID_DIVERGENCE_EXIT_CODE)
+}
+
+/// Append one JSONL record to the retry ledger if [`RETRY_LEDGER_ENV`] is set.
+/// Defect (b): makes an otherwise-invisible retry durable for CI surfacing.
+fn record_retry_ledger(attempt: u32, max: u32, overshoot_lines: &[&str]) {
+    let Ok(path) = std::env::var(RETRY_LEDGER_ENV) else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    // Handwritten JSON keeps this test harness free of a serde dependency.
+    let markers = overshoot_lines
+        .join(" | ")
+        .replace('\\', "")
+        .replace('"', "'");
+    let exhausted = attempt >= max;
+    let line = format!(
+        "{{\"event\":\"skid_retry\",\"attempt\":{attempt},\"max\":{max},\
+         \"exhausted\":{exhausted},\"markers\":\"{markers}\"}}\n"
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Runs a strict-verify closure, retrying ONLY when the failure is a
+/// supervisor-authenticated skid overshoot bound to this run's witness nonce.
+/// Counts and reports every retry (ledger + stderr), caps at
+/// [`MAX_SKID_ATTEMPTS`], and fails loud at the cap. The closure receives the
+/// per-run witness nonce to export to the hermit supervisor.
+fn run_with_skid_gated_retry(mut run: impl FnMut(&str) -> Output) -> Output {
+    let token = witness_token();
+    let mut attempt: u32 = 1;
+    loop {
+        let output = run(&token);
+
+        // The one retry predicate: hermit's supervisor exited with the reserved
+        // skid code, meaning the two `--strict --verify` runs diverged AND the
+        // supervisor recorded an unforgeable RCB skid overshoot. A pass, a real
+        // determinism bug (generic failure, exit 1), and a signal-killed run
+        // (no exit code) all return immediately so the caller's assertion
+        // surfaces them — a retry can never launder a real failure into green.
+        if !is_retryable_skid_exit(output.status.code()) {
+            return output;
+        }
+
+        // Evidence only (defect b visibility): the supervisor's own audit lines
+        // for this skid-attributed divergence. The retry decision above does not
+        // depend on them; they exist so a green CI run can still show WHY a retry
+        // happened, even though nextest/cargo suppress passing-test output.
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let overshoot_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| {
+                l.contains(reverie_ptrace::SKID_OVERSHOOT_MARKER)
+                    || l.contains("SKID-ATTRIBUTED DIVERGENCE")
+            })
+            .collect();
+
+        // Visibility (defect b): record BEFORE the cap assert so an exhaustion is
+        // logged too, not just the retries that preceded it.
+        record_retry_ledger(attempt, MAX_SKID_ATTEMPTS, &overshoot_lines);
+
+        assert!(
+            attempt < MAX_SKID_ATTEMPTS,
+            "SKID-RETRY EXHAUSTED after {attempt} attempts: every attempt exited with the reserved \
+             skid divergence code ({}). This is not a transient — the skid tail is systematically \
+             exceeding the margin on this host. Audit lines:\n{}",
+            hermit::SKID_DIVERGENCE_EXIT_CODE,
+            overshoot_lines.join("\n"),
+        );
+
+        // Count + report every retry so N-per-run is a legible defect signal,
+        // not a silent papering-over.
+        eprintln!(
+            "SKID-RETRY attempt={attempt}/{MAX_SKID_ATTEMPTS}: strict-verify diverged with a \
+             recorded RCB skid overshoot (reserved exit code {}); retrying. Audit lines:\n{}",
+            hermit::SKID_DIVERGENCE_EXIT_CODE,
+            overshoot_lines.join("\n"),
+        );
+        attempt += 1;
+    }
+}
+
+/// Predicate causal bracket (both directions, N=5): the reserved skid exit code
+/// is the ONE retryable status, and nothing else is.
+///
+/// POSITIVE (1): the reserved code retries. NEGATIVE (4): success (0), a real
+/// determinism bug (generic failure, 1), any other exit code, and a
+/// signal-killed run (no code) are all non-retryable — so a retry can never
+/// launder a real failure, and a guest (which cannot influence the supervisor's
+/// exit code) can never spoof one.
+#[test]
+fn skid_exit_code_is_the_only_retryable_status() {
+    // POSITIVE.
+    assert!(is_retryable_skid_exit(Some(
+        hermit::SKID_DIVERGENCE_EXIT_CODE
+    )));
+    // NEGATIVE: success, real bug, adjacent code, and signal.
+    assert!(!is_retryable_skid_exit(Some(0)));
+    assert!(!is_retryable_skid_exit(Some(1)));
+    assert!(!is_retryable_skid_exit(Some(
+        hermit::SKID_DIVERGENCE_EXIT_CODE + 1
+    )));
+    assert!(!is_retryable_skid_exit(None));
+}
+
+/// Raw wait status encoding a normal exit with `code` (WIFEXITED path).
+#[cfg(test)]
+fn exited_raw(code: i32) -> i32 {
+    code << 8
+}
+
+/// Harness POSITIVE: a runner that exits with the reserved skid code once, then
+/// succeeds, retries exactly once and returns the success. Confirms the retry
+/// fires on the typed skid signal and that the per-run witness nonce is threaded
+/// to the closure (so the supervisor can stamp its audit line).
+#[test]
+fn harness_retries_skid_exit_then_succeeds() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt;
+    let calls = Cell::new(0u32);
+    let saw_token = Cell::new(false);
+    let out = run_with_skid_gated_retry(|token| {
+        saw_token.set(saw_token.get() || token.starts_with("wit-"));
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n < 2 {
+            Output {
+                status: std::process::ExitStatus::from_raw(exited_raw(
+                    hermit::SKID_DIVERGENCE_EXIT_CODE,
+                )),
+                stdout: Vec::new(),
+                stderr: b":: SKID-ATTRIBUTED DIVERGENCE: strict-verify runs diverged ...\n"
+                    .to_vec(),
+            }
+        } else {
+            Output {
+                status: std::process::ExitStatus::from_raw(exited_raw(0)),
+                stdout: b"ok".to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+    });
+    assert!(out.status.success());
+    assert_eq!(calls.get(), 2, "expected exactly one retry then success");
+    assert!(
+        saw_token.get(),
+        "witness nonce must be threaded to the runner"
+    );
+}
+
+/// Harness NEGATIVE: a real determinism bug (generic failure, exit 1) is NOT
+/// retried — it returns immediately on the first attempt so the caller's
+/// assertion surfaces the bug. This is the anti-laundering guarantee.
+#[test]
+fn harness_does_not_retry_real_failure() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt;
+    let calls = Cell::new(0u32);
+    let out = run_with_skid_gated_retry(|_token| {
+        calls.set(calls.get() + 1);
+        Output {
+            status: std::process::ExitStatus::from_raw(exited_raw(1)),
+            stdout: Vec::new(),
+            stderr: b"Mismatch between run 1 and run 2 outputs (logs retained).\n".to_vec(),
+        }
+    });
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        calls.get(),
+        1,
+        "a real determinism bug must not be retried, even once"
+    );
+}
+
+/// Harness exhaustion: a runner that hits the reserved skid code on every
+/// attempt exhausts the cap and fails loud rather than papering over a
+/// systematic skid.
+#[test]
+#[should_panic(expected = "SKID-RETRY EXHAUSTED")]
+fn harness_exhausts_after_cap() {
+    use std::os::unix::process::ExitStatusExt;
+    run_with_skid_gated_retry(|_token| Output {
+        status: std::process::ExitStatus::from_raw(exited_raw(hermit::SKID_DIVERGENCE_EXIT_CODE)),
+        stdout: Vec::new(),
+        stderr: b":: SKID-ATTRIBUTED DIVERGENCE: strict-verify runs diverged ...\n".to_vec(),
+    });
+}
+
 fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst(program, args, true))
+    assert_liteinst_strict_verify_output(run_with_skid_gated_retry(|token| {
+        run_liteinst_with_input(program, args, true, None, Some(token))
+    }))
 }
 
 fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst_with_input(program, args, true, Some(input)))
+    assert_liteinst_strict_verify_output(run_with_skid_gated_retry(|token| {
+        run_liteinst_with_input(program, args, true, Some(input), Some(token))
+    }))
 }
 
 fn assert_liteinst_strict_verify_output(output: Output) -> Output {

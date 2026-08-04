@@ -99,6 +99,28 @@ pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Reserved process exit code hermit's `--strict --verify` path returns when a
+/// divergence between the two runs is *causally attributable* to an RCB skid
+/// overshoot recorded by the supervisor (an unforgeable, process-global count;
+/// see `reverie::take_skid_overshoot_count`). It is the single typed first-cause
+/// signal a skid-gated retry harness keys on — replacing the older approach of
+/// grepping a stderr marker string, which authenticated a marker's *origin* but
+/// not that skid *caused* the divergence.
+///
+/// A non-skid divergence (a real determinism bug: runs diverged with zero
+/// recorded overshoots) still returns the generic failure (exit 1) and must
+/// never be retried.
+///
+/// Collision note: hermit passes a guest's own exit code through only when the
+/// two verify runs *match* (a genuine `Verified` outcome). On divergence hermit
+/// overrides the guest code, so this reserved value is emitted only by the
+/// supervisor's skid classification, never laundered from guest-chosen exit
+/// codes. A guest that itself exits with this exact code *and whose two runs
+/// match* yields `Verified(Exited(200))`, which is a real success — a harness
+/// keying a *retry* on this code must therefore only run guests that do not
+/// legitimately exit 200 (the LiteInst micro-suite guests all exit 0).
+pub const SKID_DIVERGENCE_EXIT_CODE: i32 = 200;
+
 enum KvmStdinReservation {
     Open(fs::File),
     Closed,

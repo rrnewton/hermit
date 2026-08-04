@@ -4134,9 +4134,23 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
             "$ROOT_DIR/target/liteinst-runtime-build-7951770"
     fi
     if ((failures == 0)); then
+        # Defect (b): a skid-gated strict-verify retry that ultimately passes is
+        # otherwise invisible (nextest `success-output = "never"`; plain
+        # `cargo test` suppresses passing output). Point the harness at a JSONL
+        # ledger so every retry is durable and surfaced below even on a green run.
+        skid_retry_ledger="$VALIDATION_TMP_DIR/skid-retry-ledger.jsonl"
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
             env HERMIT_LITEINST_TEST_BINARY="$ROOT_DIR/target/release/hermit" \
+            HERMIT_SKID_RETRY_LEDGER="$skid_retry_ledger" \
             cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1
+        if [[ -s $skid_retry_ledger ]]; then
+            printf '== Skid-gated strict-verify retries (this run) ==\n'
+            cat "$skid_retry_ledger"
+            printf '(%s authenticated skid-overshoot retry record(s); each is a strict-verify run re-executed after a supervisor-authenticated RCB skid overshoot.)\n' \
+                "$(wc -l <"$skid_retry_ledger")"
+        else
+            printf '== Skid-gated strict-verify retries: none this run ==\n'
+        fi
     fi
     print_summary
     ((failures == 0))
