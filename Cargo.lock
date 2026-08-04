@@ -1015,6 +1015,7 @@ dependencies = [
  "reverie-liteinst",
  "reverie-ptrace",
  "reverie-rpc-transport",
+ "reverie-sabre-stats",
  "serde",
  "serde_json",
  "shell-words",

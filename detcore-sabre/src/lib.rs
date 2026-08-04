@@ -260,6 +260,9 @@ impl reverie_sabre::Tool for Plugin {
                 return Self::libc_getrandom_undetoured(buffer, length, flags);
             }
             let _guard = DetourGuard(active);
+            sabre::stats::increment_guest_slow_path(
+                sabre::stats::SabreSlowPath::LibcGetrandomDetour,
+            );
 
             let syscall = Syscall::from_raw(
                 Sysno::getrandom,
