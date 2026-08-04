@@ -71,11 +71,14 @@ Replace `REPOSITORY` with `hermit` or `reverie`.
 
 ## Local validation
 
-A full green `./validate.sh` run automatically creates and applies the
-`locally-validated` label to the current branch's pull request. Set
-`PR_NUMBER=<number>` when branch-based detection is unavailable. GitHub CLI,
-authentication, proxy, missing-PR, and label-edit failures are warnings and do
-not change validation's exit status.
+A full green `./validate.sh` run writes its local ledger row on exit and then
+delegates to the parent `ci-hub apply-local-label`. The applier requires that
+exact head to have a clean, commit-anchored, full-selection PASS with a nonzero
+executed-test count, hashes the referenced log, and publishes the selected row
+on `rrnewton/dev-hermit:validation-receipts`. Only after that immutable receipt
+exists does it post the binding comment and apply `locally-validated`.
+Publication or GitHub failures fail closed; the command can be run manually to
+backfill a validated head.
 
 Use `./validate.sh --no-label-pr` or `VALIDATE_LABEL_PR=0 ./validate.sh`
 when a green run must not update GitHub.
@@ -118,6 +121,30 @@ Known strip paths — all must leave the trail:
    .../labels/locally-validated`, or a remove+add re-fire toggle) must run
    `scripts/label-strip-evidence.sh --pr <n> --validated-sha <sha> [--remove]`
    so the evidence is preserved. The `--remove` flag also strips the label.
+3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
+   current exact-head receipt. If no dereferenceable receipt remains, the
+   workflow first publishes a failing required `merge-gate` check at the exact
+   head, then removes `locally-validated`. Same-repository branches explicitly
+   dispatch a new exact-head gate because label changes made with `GITHUB_TOKEN`
+   do not recursively trigger another workflow. A dispatch failure therefore
+   remains blocked by the already-published failure. Fork heads cannot be used as
+   base-repository workflow-dispatch refs; their failing check remains until a
+   new receipt and label re-fire the pull-request gate. There remains a
+   narrow race if a merge completes before the edit/delete event is processed.
+
+The receipt is remotely readable from every gate runner and immutable at its
+referenced commit, unlike a devbig014-local ledger path. The local applier reads
+the ledger and log before publication; the gate verifies the receipt content
+digest, including the publisher's asserted log path and digest, but cannot
+reopen and re-hash the host-local log. Shared `rrnewton` credentials still do not
+provide individual signer identity, so a holder could deliberately publish a
+false receipt. This prevents accidental label/comment forgery; malicious-token
+resistance needs a dedicated signing identity.
+
+The gate fetches its verifier from immutable parent commit `f9e61247` and checks
+the script's SHA-256 before execution. It never executes a verifier from the PR
+under test; otherwise a PR could authorize itself without changing the gate
+workflow.
 
 ## Repository settings
 
