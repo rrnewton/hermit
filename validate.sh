@@ -53,6 +53,147 @@ function validation_slot_name {
     esac
 }
 
+# --- Unbypassable admission guards ------------------------------------------
+# validate.sh is box-exclusive, stale-base-gated, receipt-emitting compute. When
+# this hermit checkout is a submodule nested inside the dev-hermit harness (the
+# parent that carries the ci-hub admission gate), running validate.sh DIRECTLY
+# routes around that gate: box-exclusive serialization, the stale-base rebase
+# floor, and receipt binding are all skipped, so every other agent's validate
+# contends for the same box, PMU, and build caches. These guards fire from the
+# ONE place every entry path funnels through -- the systemd-run producer, an
+# agent shell, and the DAG all exec THIS file -- so no launcher can escape them.
+#
+# Detection predicate for "harnessed": find_dev_hermit_parent walks up for a
+# .gitmodules whose submodule.hermit.path == hermit (the parent that owns this
+# checkout) AND that parent has a ci-hub/ tree. A genuinely standalone/bare
+# hermit clone (GitHub-hosted CI, an external user's clone) has no such parent,
+# so the predicate is false and the guard never fires -- bare checkouts run.
+readonly VALIDATE_EXIT_UNHARNESSED=3
+readonly VALIDATE_EXIT_STALE_REVERIE_PIN=4
+
+# True iff `target` is this process or a live ancestor of it (walks /proc PPid).
+function pid_is_ancestor {
+    local target=$1 cur=$$ ppid
+    [[ $target =~ ^[0-9]+$ ]] || return 1
+    while ((cur > 1)); do
+        [[ $cur == "$target" ]] && return 0
+        ppid=$(awk '/^PPid:/{print $2; exit}' "/proc/$cur/status" 2>/dev/null) || return 1
+        [[ $ppid =~ ^[0-9]+$ ]] || return 1
+        cur=$ppid
+    done
+    [[ $cur == "$target" ]]
+}
+
+# Strong proof: this run descends from a live `ci-hub validate-lock run` owner,
+# which exports its PID and owner sidecar into the child env (validate_lock.rs).
+# We confirm the sidecar records that same PID and that it is a live ancestor,
+# so a stale/hand-copied env var alone cannot satisfy it.
+function admitted_via_lock_run {
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
+    [[ -n $owner_pid && -n $owner_file && -r $owner_file ]] || return 1
+    local file_pid
+    file_pid=$(sed -n 's/^pid=//p' "$owner_file")
+    [[ $file_pid == "$owner_pid" ]] || return 1
+    pid_is_ancestor "$owner_pid"
+}
+
+# General proof: the validate box is actively HELD by a live owner right now.
+# This also covers producers that `validate-lock acquire` and then run
+# validate.sh as a sibling (which get no owner env). It dereferences the lock
+# authority (`validate-lock status`) rather than reimplementing lease liveness.
+# Overridable for tests via HERMIT_VALIDATE_ADMISSION_STATUS_CMD.
+function admission_box_is_held {
+    local parent=$1 status_out
+    if [[ -n ${HERMIT_VALIDATE_ADMISSION_STATUS_CMD:-} ]]; then
+        status_out=$(eval "$HERMIT_VALIDATE_ADMISSION_STATUS_CMD" 2>/dev/null) || return 1
+    else
+        [[ -x $parent/ci-hub/ci-hub ]] || return 1
+        status_out=$(cd "$parent" && ./ci-hub/ci-hub validate-lock status 2>/dev/null) || return 1
+    fi
+    grep -q '^HELD:' <<<"$status_out"
+}
+
+function assert_harnessed_or_admitted {
+    local parent
+    parent=$(find_dev_hermit_parent) || return 0   # bare/standalone -> RUN
+    [[ -d $parent/ci-hub ]] || return 0            # dev-hermit but no gate -> RUN
+
+    admitted_via_lock_run && return 0
+    admission_box_is_held "$parent" && return 0
+
+    cat >&2 <<EOF
+======================================================================
+validate.sh: REFUSING TO RUN UNHARNESSED INSIDE dev-hermit
+======================================================================
+This hermit checkout is nested under the dev-hermit harness at:
+    $parent
+which carries the ci-hub admission gate ($parent/ci-hub). Running
+validate.sh directly bypasses box-exclusive serialization, the stale-base
+rebase floor, and receipt binding, so it would contend with every other
+agent's validate for the same box, PMU counters, and build caches.
+
+REMEDY -- start the run THROUGH the admission gate (this is the ONLY
+supported invocation; it serializes, counts, and receipt-binds the run):
+    "$parent"/ci-hub/ci-hub validate-lock run \\
+        --agent <you> --kind validate --target <40-hex-head-sha> \\
+        -- env PR_NUMBER=<n> "$ROOT_DIR"/validate.sh
+
+A genuinely standalone/bare hermit clone (no dev-hermit parent) is never
+refused by this guard.
+======================================================================
+EOF
+    exit "$VALIDATE_EXIT_UNHARNESSED"
+}
+
+# Refuse to validate against a Reverie pin that is not consistent with
+# rrnewton/reverie:main. Delegates to the single authority (check-reverie-pin.rs)
+# and names the remedy so a bare "refused" cannot get the guard disabled.
+# --allow-stale-reverie-pin (EXTREMELY DISCOURAGED) is the bisection escape.
+# Overridable for tests via HERMIT_VALIDATE_REVERIE_PIN_CMD.
+function assert_reverie_pin_fresh {
+    local -a cmd
+    if [[ -n ${HERMIT_VALIDATE_REVERIE_PIN_CMD:-} ]]; then
+        read -r -a cmd <<<"$HERMIT_VALIDATE_REVERIE_PIN_CMD"
+    else
+        cmd=("$ROOT_DIR/scripts/check-reverie-pin.rs")
+        if command -v with-proxy >/dev/null 2>&1; then
+            cmd=(with-proxy "${cmd[@]}")
+        fi
+    fi
+    if ((ALLOW_STALE_REVERIE_PIN == 1)); then
+        local reason=${HERMIT_STALE_REVERIE_PIN_REASON:-"bisection or local iteration explicitly authorized via validate.sh --allow-stale-reverie-pin"}
+        cat >&2 <<EOF
+validate.sh: --allow-stale-reverie-pin ACTIVE (EXTREMELY DISCOURAGED).
+Validating against a Reverie pin that may not be current with
+rrnewton/reverie:main. Any green produced here is NOT a receipt for main
+and must never gate a landing. Reason recorded: $reason
+EOF
+        cmd+=(--allow-stale-reverie-pin "$reason")
+    fi
+    if "${cmd[@]}"; then
+        return 0
+    fi
+    cat >&2 <<EOF
+======================================================================
+validate.sh: REVERIE PIN IS OUT OF DATE -- REFUSING TO VALIDATE
+======================================================================
+The Reverie dependency pin is not consistent with rrnewton/reverie:main
+(exact revisions/files are in the REVERIE PIN LINT output above). A
+validate against a stale/divergent Reverie pin measures a Hermit+Reverie
+pair that is not the one main will ship, so its result is not portable.
+
+REMEDY -- pick one:
+  * Update the pin: follow docs/updating-reverie.md, or run
+      scripts/checkout-hermit-pr-latest-reverie.sh for a PR checkout.
+  * Bisection ONLY: re-run with
+      ./validate.sh --allow-stale-reverie-pin
+    (EXTREMELY DISCOURAGED; the result is not a landing receipt).
+======================================================================
+EOF
+    exit "$VALIDATE_EXIT_STALE_REVERIE_PIN"
+}
+
 # --- Argument parsing -------------------------------------------------------
 # Usage: ./validate.sh [quick|portable-only|full|super] [options]
 # Default (no level): run the full validation suite, which also prints the
@@ -145,6 +286,8 @@ LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
 [[ ${VALIDATE_VERBOSE:-0} == 1 ]] && VERBOSE=1
+ALLOW_STALE_REVERIE_PIN=0
+[[ ${VALIDATE_ALLOW_STALE_REVERIE_PIN:-0} == 1 ]] && ALLOW_STALE_REVERIE_PIN=1
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -189,6 +332,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ONLY_MODE=1; shift 3 ;;
         --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
+        --allow-stale-reverie-pin) ALLOW_STALE_REVERIE_PIN=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -240,7 +384,22 @@ Other options:
                    the `locally-validated` label.
   --label-pr       Publish a receipt and label the PR after a full green (default).
   --no-label-pr    Disable the non-fatal receipt publication and label update.
+  --allow-stale-reverie-pin
+                   EXTREMELY DISCOURAGED. Validate against a Reverie pin that is
+                   NOT current with rrnewton/reverie:main. The ONLY intended use
+                   is bisection: pinning an unmerged/side-branch Reverie commit
+                   on purpose. A green produced with this flag is NOT a landing
+                   receipt (it measures a Hermit+Reverie pair that main will not
+                   ship). By default an out-of-date Reverie pin is a hard error
+                   that names the remedy (update the pin per docs/updating-reverie.md).
   -h, --help       Show this help and exit.
+
+Harness note: inside the dev-hermit workspace this checkout is box-exclusive,
+stale-base-gated compute. Running validate.sh directly there is REFUSED; launch
+it through the admission gate instead:
+  <parent>/ci-hub/ci-hub validate-lock run --agent <you> --kind validate \
+      --target <sha> -- env PR_NUMBER=<n> ./validate.sh
+A standalone/bare hermit clone (no dev-hermit parent) runs directly as normal.
 
 Environment:
   VALIDATE_LEVEL=quick|portable-only|full|super  Select the level.
@@ -253,6 +412,8 @@ Environment:
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
+  VALIDATE_ALLOW_STALE_REVERIE_PIN=1            Same as --allow-stale-reverie-pin (bisection only; DISCOURAGED).
+  HERMIT_STALE_REVERIE_PIN_REASON="why"        Reason recorded for the stale-pin override.
 
 Examples:
   ./validate.sh                    # full suite + working-envelope vector
@@ -299,6 +460,23 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
 ((ONLY_MODE == 1)) && VALIDATION_PROFILE="only-$ONLY_LANE"
 ((SELECTIVE_MODE == 1)) && VALIDATION_PROFILE="selective"
+
+# Admission guards run for EVERY profile, from this single funnel point, before
+# any validation work, network fetch, or box-consuming compute. --help already
+# exited inside the argument loop above, so help never trips these.
+assert_harnessed_or_admitted
+assert_reverie_pin_fresh
+
+# Test-only barrier. With HERMIT_VALIDATE_ADMISSION_SELFTEST set, both admission
+# guards above have already run (and would have exited non-zero on a refusal), so
+# reaching here means "admitted". Stop now so the guard verdict can be asserted
+# without launching the full, box-consuming validation suite. This can never fake
+# a green: it exits 0 having done NO validation work and emits NO receipt/label.
+# Never set in normal use; it is intentionally absent from --help.
+if [[ -n ${HERMIT_VALIDATE_ADMISSION_SELFTEST:-} ]]; then
+    echo "validate.sh: admission guards PASSED (HERMIT_VALIDATE_ADMISSION_SELFTEST; no validation run)"
+    exit 0
+fi
 
 # The runtime estimate is NOT a hand-written static guess anymore (a fabricated
 # range is exactly the cost-blindness we want to avoid). It is measured from this
