@@ -3845,6 +3845,154 @@ mod test {
         assert!(sched.pending_run_queue_removals.is_empty());
     }
 
+    /// F6 (real-path regression): when the thread `step3_peek` tentatively
+    /// selected dies while the daemon awaits its request, `do_a_turn_blocking`
+    /// takes the `Err(ThreadExited)` fizzle arm. That arm MUST undo the tentative
+    /// pop so the selection does not outlive the turn; otherwise the next pass's
+    /// step2 removal drain calls `remove_tid` while `tentative_selection` is
+    /// still `Some`, tripping the run queue's transaction guard -- the "reconnect
+    /// panic moved one pass" defect (reachable in NORMAL async-DBI operation, not
+    /// just the reviewed edge case: any thread that exits during the await window
+    /// races here). This drives the ACTUAL async daemon function end to end
+    /// rather than poking `RunQueue` directly, which is the coverage gap the
+    /// pre-existing tests left. Positive control: after the fizzle the window is
+    /// closed and the following real step2 removal drain does not panic.
+    #[tokio::test]
+    async fn reconnect_fizzle_closes_window_so_next_removal_drain_is_safe() {
+        let config = Config::default();
+        let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let dead = DetTid::from_raw(7);
+        {
+            let mut s = sched.lock().unwrap();
+            s.priorities.insert(dead, DEFAULT_PRIORITY);
+            s.next_turns.insert(
+                dead,
+                ThreadNextTurn {
+                    dettid: dead,
+                    child_tid_addr: 0,
+                    // Request already resolved to `ThreadExited`: the daemon will
+                    // observe the thread died the moment it awaits `req.get()`.
+                    req: Ivar::full(Err(ThreadExited)),
+                    resp: Ivar::new(),
+                },
+            );
+            s.runqueue_push_back(dead);
+        }
+        let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+
+        // Pass 1: step1 sees a filled request (quiescent), step3 tentatively
+        // pops `dead`, then `req.get().await` yields `Err(ThreadExited)`. The
+        // fizzle arm returns `SkipTurn` and undoes the tentative pop.
+        let first = do_a_turn_blocking(sched.clone(), global_time.clone(), &last).await;
+        assert!(first.is_err(), "fizzled reconnect turn skips");
+        assert!(
+            !sched.lock().unwrap().run_queue.tentative_pop_in_progress(),
+            "the ThreadExited arm must undo the tentative pop"
+        );
+
+        // Pass 2: the dead thread's run-queue removal is now buffered, exactly
+        // as a reconnect/kill handler would leave it. Because pass 1 closed the
+        // window, the real step2 removal drain calls `remove_tid` with
+        // `tentative_selection == None` and does NOT trip the guard. Pre-fix
+        // (window left open) this call panicked.
+        {
+            let mut s = sched.lock().unwrap();
+            s.deschedule_or_defer(dead);
+            s.next_turns.remove(&dead);
+            let _ = s.step2_process_blocked(&global_time);
+            assert!(!s.run_queue.contains_tid(dead), "dead thread drained out");
+            assert!(s.pending_run_queue_removals.is_empty());
+        }
+    }
+
+    /// Liveness (negative control) for the F6 fix above: proves the guard the
+    /// fizzle arm protects is real, so the positive test is not vacuous. If a
+    /// fizzled turn does NOT undo its tentative pop (the pre-fix behavior), the
+    /// next pass's step2 removal drain calls `remove_tid` while
+    /// `tentative_selection` is `Some`, and the run queue's transaction guard
+    /// panics. This is precisely the panic `undo_tentative_pop` prevents.
+    #[test]
+    #[should_panic(expected = "tentative_selection.is_none()")]
+    fn removal_drain_panics_if_tentative_window_left_open() {
+        let mut sched = Scheduler::new(&Config::default());
+        let dead = DetTid::from_raw(7);
+        register_known_thread(&mut sched, dead);
+        sched.runqueue_push_back(dead);
+
+        // Simulate step3_peek selecting `dead` with the turn neither committing
+        // nor undoing -- i.e., the fizzle arm WITHOUT its undo.
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(dead));
+        assert!(sched.run_queue.tentative_pop_in_progress());
+
+        // Next pass buffers the removal and drains: remove_tid trips the guard.
+        sched.deschedule_or_defer(dead);
+        sched.next_turns.remove(&dead);
+        sched.drain_pending_run_queue_removals();
+    }
+
+    /// F7 (adjacent-snapshot straddle): Codex asked whether host timing could
+    /// split two off-turn admissions across two ADJACENT step2 drains and
+    /// thereby choose which one draws the `post_fork` PRNG first. Structurally it
+    /// cannot -- under `sequentialize_threads` at most one guest thread runs per
+    /// turn, so at most one thread issues admission RPCs between two consecutive
+    /// drains, and step2 drains the WHOLE buffer every turn before step3 reopens
+    /// a window -- so which drain snapshot an admission lands in is fixed by the
+    /// schedule, not by host mutex timing. `deferred_admission_side_is_arrival_
+    /// order_independent` already pins the WITHIN-one-drain canonicalization;
+    /// this test pins the CROSS-drain consequences:
+    ///   (1) POSITIVE/determinism: replaying the identical split (child `a` in
+    ///       drain 1, child `b` in drain 2) at a fixed seed is byte-identical
+    ///       (2/2 runs equal).
+    ///   (2) LIVENESS: the outcome genuinely binds to schedule-fixed snapshot
+    ///       membership -- swapping which child occupies drain 1 changes the
+    ///       resolved run-queue order -- so IF host timing could pick the
+    ///       snapshot (the defect Codex feared), it would be observable here.
+    #[test]
+    fn deferred_admission_binds_to_snapshot_membership_across_adjacent_drains() {
+        let config = Config {
+            sched_seed: Some(0x5107),
+            runs_post_fork: RunsPostFork::Random,
+            ..Default::default()
+        };
+        let anchor = DetTid::from_raw(3);
+        let a = DetTid::from_raw(31);
+        let b = DetTid::from_raw(37);
+
+        // Admit `first` in drain 1 and `second` in drain 2 (two adjacent step2
+        // drains) and return the final run-queue order relative to a fixed
+        // anchor, which encodes each child's resolved front/back side.
+        let split = |first: DetTid, second: DetTid| -> Vec<DetTid> {
+            let mut sched = Scheduler::new(&config);
+            register_known_thread(&mut sched, anchor);
+            register_known_thread(&mut sched, a);
+            register_known_thread(&mut sched, b);
+            sched.runqueue_push_back(anchor);
+
+            sched.admit_to_run_queue(first, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.drain_pending_run_queue_admissions(); // drain 1
+            sched.admit_to_run_queue(second, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.drain_pending_run_queue_admissions(); // drain 2 (adjacent)
+
+            sched.run_queue.tids().copied().collect()
+        };
+
+        // (1) Deterministic across identical replays.
+        let canonical = split(a, b);
+        assert_eq!(canonical, split(a, b), "identical schedule -> identical result");
+        assert!(
+            canonical.contains(&a) && canonical.contains(&b) && canonical.contains(&anchor)
+        );
+
+        // (2) The result binds to schedule-fixed snapshot membership: swapping
+        // which child is in drain 1 changes the outcome for this seed.
+        assert_ne!(
+            split(a, b),
+            split(b, a),
+            "swapping snapshot membership changes the resolved order"
+        );
+    }
+
     #[test]
     fn vfork_registration_barrier_blocks_until_child_registration() {
         let mut scheduler = Scheduler::new(&Config::default());
