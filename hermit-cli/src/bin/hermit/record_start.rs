@@ -43,6 +43,7 @@ use super::run::is_elf_file;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
+use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
@@ -197,14 +198,31 @@ pub struct StartOpts {
     verify: bool,
 
     /// With --verify, write the verification verdict as a single JSON line to
-    /// this path: `{"verified":bool,"verdict":"matched"|"diverged",
-    /// "guest_exit_code":int|null,"guest_signal":int|null}`. This is the
-    /// exit-code-independent verdict channel: `verified` reflects whether the
-    /// record and replay runs matched, regardless of what the guest exited with,
-    /// so a caller need not (and must not) infer the verdict from the process
-    /// exit code, which still carries the guest's own status.
+    /// this path: `{"verified":bool,"bitwise_parity":bool,
+    /// "verdict":"matched"|"diverged","comparison":{"strictness":
+    /// "stripped"|"bitwise","compare_logs":bool,"strip_lines":bool,
+    /// "full_trace":bool,"ignore_lines":bool,"skip_commit":bool,
+    /// "skip_detlog":bool},"guest_exit_code":int|null,"guest_signal":int|null}`.
+    /// This is the exit-code-independent verdict channel: `verified` reflects
+    /// whether the record and replay runs matched, regardless of what the guest
+    /// exited with, so a caller need not (and must not) infer the verdict from the
+    /// process exit code. A record/replay parity ratchet must key on
+    /// `bitwise_parity`, NOT `verified`: `bitwise_parity` is true only when the
+    /// match rests on a full-INFO, unstripped, unfiltered log comparison (see
+    /// --verify-strict) rather than a stripped match.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
+
+    /// With --verify, compare the record and replay logs BITWISE: every byte of
+    /// the full captured trace must match, including virtual-time timestamps and
+    /// raw syscall argument/result values. Without this the default `--verify`
+    /// normalizes away numbers, addresses, tmp paths, and timestamps before
+    /// comparing, so a "verified" result asserts only stripped parity, not
+    /// bitwise identity. A record/replay determinism ratchet keying on the
+    /// verdict should set this so it cannot be silently weakened to a stripped
+    /// comparison.
+    #[clap(long, requires = "verify")]
+    verify_strict: bool,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -423,6 +441,11 @@ impl StartOpts {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
+                strictness: if self.verify_strict {
+                    LogCompareStrictness::Bitwise
+                } else {
+                    LogCompareStrictness::Stripped
+                },
                 compare_logs: true,
             },
         )?;
@@ -569,6 +592,7 @@ mod tests {
             record_timeout: None,
             verify: false,
             verify_json: None,
+            verify_strict: false,
             gdbex: Vec::new(),
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();
