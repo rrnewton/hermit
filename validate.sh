@@ -91,12 +91,17 @@ function validation_slot_name {
 #                                            # first (ci/run-dag.sh <lane>).
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
-# Every foreground/background gate has a process-tree timeout. Override the
+# Every foreground/background gate has a process-tree WALL timeout. Override the
 # profile default with VALIDATE_GATE_TIMEOUT_SECONDS; tune TERM-to-KILL grace
-# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS.
-# A fully-green full run labels the current PR `locally-validated` by default.
-# PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
-# VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
+# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS. A gate may ALSO be given a
+# load-immune CPU-time budget with VALIDATE_GATE_CPU_TIMEOUT_SECONDS (0=off, the
+# default): the gate is killed once its process-tree CPU (user+sys) crosses the
+# budget, catching hangs that burn CPU (e.g. a reap/futex spin) regardless of
+# machine load, while the wall timeout remains the backstop for idle-stuck gates.
+# After a fully-green full run writes its counted ledger row, the parent ci-hub
+# publisher binds `locally-validated` to an immutable receipt. PR_NUMBER=N
+# overrides branch-based PR detection. Use --no-label-pr or VALIDATE_LABEL_PR=0
+# to disable that non-fatal publication.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | super
@@ -233,15 +238,17 @@ Other options:
                    or compared. A run forced with this flag is recorded as
                    NOT-commit-anchored (commit_anchored=false) and never applies
                    the `locally-validated` label.
-  --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
-  --no-label-pr    Disable the non-fatal GitHub label update.
+  --label-pr       Publish a receipt and label the PR after a full green (default).
+  --no-label-pr    Disable the non-fatal receipt publication and label update.
   -h, --help       Show this help and exit.
 
 Environment:
   VALIDATE_LEVEL=quick|portable-only|full|super  Select the level.
-  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree timeout.
+  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree WALL timeout.
+  VALIDATE_GATE_CPU_TIMEOUT_SECONDS=N            Per-gate CPU-time budget (user+sys, whole tree); 0=off (default).
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
-  VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
+  VALIDATE_LABEL_PR=0                            Disable receipt publication/labeling.
+  CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
@@ -323,10 +330,27 @@ fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
 VERBOSE_INTERVAL_SECONDS=${VALIDATE_VERBOSE_INTERVAL_SECONDS:-10}
+# Per-gate CPU-time budget (user+sys across the whole process tree), a load-immune
+# companion to the wall timeout above. Default 0 = disabled: no per-gate CPU
+# budget is HAND-WRITTEN here because there is no measured per-gate CPU history to
+# justify a specific value, and a fabricated constant is exactly the cost-blindness
+# this file avoids elsewhere. The mechanism ships enabled-by-opt-in; a data-derived
+# default (round(max_cpu*1.5), >=5 samples) can be set once the ledger accumulates
+# per-gate CPU history, mirroring the DAG-node cpu_timeout derivation.
+default_gate_cpu_timeout_seconds=0
+GATE_CPU_TIMEOUT_SECONDS=${VALIDATE_GATE_CPU_TIMEOUT_SECONDS:-$default_gate_cpu_timeout_seconds}
 if [[ ! $GATE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_GATE_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 2
 fi
+if [[ ! $GATE_CPU_TIMEOUT_SECONDS =~ ^[0-9]+$ ]]; then
+    echo "validate.sh: VALIDATE_GATE_CPU_TIMEOUT_SECONDS must be a non-negative integer (0 disables)" >&2
+    exit 2
+fi
+# Clock ticks per second, needed to convert /proc/<pid>/stat utime+stime into
+# seconds. Cached once; falls back to the near-universal 100 if getconf is absent.
+CLK_TCK_CACHED=$(getconf CLK_TCK 2>/dev/null || echo 100)
+[[ $CLK_TCK_CACHED =~ ^[1-9][0-9]*$ ]] || CLK_TCK_CACHED=100
 if [[ ! $TIMEOUT_KILL_GRACE_SECONDS =~ ^[0-9]+$ ]]; then
     echo "validate.sh: VALIDATE_TIMEOUT_KILL_GRACE_SECONDS must be a non-negative integer" >&2
     exit 2
@@ -335,7 +359,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_VERBOSE_INTERVAL_SECONDS must be a positive integer" >&2
     exit 2
 fi
-readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
+readonly VERBOSE GATE_TIMEOUT_SECONDS GATE_CPU_TIMEOUT_SECONDS CLK_TCK_CACHED
+readonly TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
@@ -687,8 +712,13 @@ if ((VERBOSE == 1)); then
     printf "Verbose validation enabled\n"
     printf "  root: %s\n" "$ROOT_DIR"
     printf "  log: %s\n" "$LOG_FILE"
-    printf "  gate timeout: %ss (kill grace: %ss; heartbeat: %ss)\n" \
+    printf "  gate timeout: %ss wall (kill grace: %ss; heartbeat: %ss)\n" \
         "$GATE_TIMEOUT_SECONDS" "$TIMEOUT_KILL_GRACE_SECONDS" "$VERBOSE_INTERVAL_SECONDS"
+    if ((GATE_CPU_TIMEOUT_SECONDS > 0)); then
+        printf "  gate CPU budget: %ss CPU-time (user+sys, whole tree)\n" "$GATE_CPU_TIMEOUT_SECONDS"
+    else
+        printf "  gate CPU budget: off (set VALIDATE_GATE_CPU_TIMEOUT_SECONDS to enable)\n"
+    fi
 fi
 
 readonly NEXTEST_VERSION=0.9.100
@@ -877,6 +907,47 @@ readonly L4_REPS=${L4_REPS:-20}
 ENVELOPE_JSON=${ENVELOPE_JSON:-"$ROOT_DIR/envelope.json"}
 ENVELOPE_LAST_JSON=""
 
+# Aggregate CPU seconds (user+sys) consumed by the process tree rooted at $1,
+# summed from /proc/<pid>/stat over the root and all its descendants. This is
+# controller-free and host-portable: it does NOT need a delegated cgroup cpu
+# controller (often absent on the many-core dev hosts), unlike reading cpu.stat.
+# Prints an integer count of CPU-seconds, or 0 when /proc is unreadable or the
+# tree has already exited. The comm field (2) can contain spaces and parentheses,
+# so parsing splits on the LAST ")" and indexes the fixed fields after it.
+function tree_cpu_seconds {
+    local root=$1
+    cat /proc/[0-9]*/stat 2>/dev/null | awk -v root="$root" -v clk="$CLK_TCK_CACHED" '
+    {
+        rp = 0
+        for (i = length($0); i >= 1; i--) {
+            if (substr($0, i, 1) == ")") { rp = i; break }
+        }
+        if (rp == 0) next
+        pid = $1 + 0
+        n = split(substr($0, rp + 2), f, " ")
+        if (n < 13) next
+        ppid[pid] = f[2] + 0        # ppid: field 4 of stat = field 2 after comm
+        ticks[pid] = f[12] + f[13]  # utime (14) + stime (15) = fields 12,13 after comm
+        seen[pid] = 1
+    }
+    END {
+        intree[root] = 1
+        changed = 1
+        while (changed) {
+            changed = 0
+            for (p in seen) {
+                if (!intree[p] && (p in ppid) && intree[ppid[p]]) {
+                    intree[p] = 1
+                    changed = 1
+                }
+            }
+        }
+        total = 0
+        for (p in seen) if (intree[p]) total += ticks[p]
+        printf "%d", int(total / clk)
+    }'
+}
+
 function kill_process_tree {
     local pid=$1
     local signal=$2
@@ -887,6 +958,23 @@ function kill_process_tree {
         kill_process_tree "$child" "$signal"
     done < <(ps -o pid= --ppid "$pid" 2>/dev/null)
     kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+# Send TERM to the process tree rooted at $1, wait out the kill grace, then
+# escalate to KILL if anything survives, and reap the root. Mirrors the wall
+# timeout's teardown so a CPU-budget kill leaves no stragglers behind.
+function terminate_gate_tree {
+    local pid=$1
+    local grace_deadline
+    kill_process_tree "$pid" TERM
+    grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill_process_tree "$pid" KILL
+    fi
+    wait "$pid" 2>/dev/null || true
 }
 
 function record_ledger_gate {
@@ -913,6 +1001,7 @@ function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
+    local count_helper counts executed_tests_json=null filtered_tests_json=null
     local commit_anchored_json tree_dirty_json
     local i
 
@@ -944,6 +1033,18 @@ function append_validation_ledger {
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
 
+    # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
+    # the receipt publisher fails closed rather than turning missing evidence
+    # into zero or a pass. The fields are additive to schema 3 during the
+    # coverage-schema transition.
+    count_helper="$DEV_HERMIT_PARENT/ci-hub/remediation/nonzero_result.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $count_helper ]] && command -v python3 >/dev/null 2>&1; then
+        counts=$(python3 "$count_helper" --ledger-fields "$LOG_FILE" 2>/dev/null) || counts="null null"
+        read -r executed_tests_json filtered_tests_json <<<"$counts"
+        [[ $executed_tests_json =~ ^(null|[0-9]+)$ ]] || executed_tests_json=null
+        [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
+    fi
+
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
     # are additive; the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
@@ -959,6 +1060,7 @@ function append_validation_ledger {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
@@ -1026,6 +1128,36 @@ function print_wall_cpu_summary {
         "$ratio" "$host_cpus" "$hint"
 }
 
+function publish_receipt_backed_label {
+    local pr=${PR_NUMBER:-}
+    local ci_hub=${CI_HUB_APPLY_LOCAL_LABEL:-}
+    local -a gh_cmd=(gh)
+
+    if [[ -z $ci_hub && -n $DEV_HERMIT_PARENT ]]; then
+        ci_hub="$DEV_HERMIT_PARENT/ci-hub/ci-hub"
+    fi
+    if [[ -z $ci_hub || ! -x $ci_hub ]]; then
+        printf "⚠️  counted validation recorded, but the ci-hub receipt publisher is unavailable; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if [[ -z $pr ]] && command -v gh >/dev/null 2>&1; then
+        if command -v with-proxy >/dev/null 2>&1; then
+            gh_cmd=(with-proxy gh)
+        fi
+        pr=$("${gh_cmd[@]}" pr view --repo rrnewton/hermit \
+            --json number -q .number 2>/dev/null) || true
+    fi
+    if [[ -z $pr ]]; then
+        printf "⚠️  counted validation recorded, but no PR was found; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if ! "$ci_hub" apply-local-label --pr "$pr" --repo rrnewton/hermit \
+        --ledger "$VALIDATION_LEDGER_FILE"; then
+        printf "⚠️  receipt publication failed for PR #%s; locally-validated was not authorized\n" \
+            "$pr" >&2
+    fi
+}
+
 function cleanup {
     local exit_status=$?
     local pid
@@ -1066,6 +1198,11 @@ function cleanup {
     fi
     append_validation_ledger "$exit_status" \
         "$validation_wall" "$validation_user" "$validation_sys"
+    if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+        VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
+       [[ $VALIDATION_LEVEL == full ]]; then
+        publish_receipt_backed_label
+    fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
@@ -1175,6 +1312,8 @@ function run_timed_command {
     local status
     local elapsed
     local grace_deadline
+    local cpu_seconds
+    local cpu_next_sample=$((SECONDS + 1))
 
     (
         if ((VERBOSE == 1)); then
@@ -1210,6 +1349,23 @@ function run_timed_command {
             printf "⏱️  %s timed out after %ss (subprocess PID %s)\n" \
                 "$name" "$timeout_seconds" "$pid"
             return 124
+        fi
+
+        # Load-immune CPU-time budget: kill a gate that burns more CPU (user+sys,
+        # whole tree) than allowed, even while it is well under the wall timeout.
+        # Sampled ~1 Hz (cheaper than the 0.2s wall poll) to bound /proc overhead.
+        if ((GATE_CPU_TIMEOUT_SECONDS > 0 && SECONDS >= cpu_next_sample)); then
+            cpu_seconds=$(tree_cpu_seconds "$pid")
+            cpu_next_sample=$((SECONDS + 1))
+            if ((cpu_seconds >= GATE_CPU_TIMEOUT_SECONDS)); then
+                terminate_gate_tree "$pid"
+                active_check_pid=""
+                printf "Gate exceeded CPU budget: %ss CPU >= %ss budget (wall %ss, subprocess PID %s)\n" \
+                    "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid" >>"$log_file"
+                printf "🔥 %s exceeded CPU budget: %ss CPU-time >= %ss (wall %ss, subprocess PID %s)\n" \
+                    "$name" "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid"
+                return 125
+            fi
         fi
 
         if ((VERBOSE == 1 && elapsed >= next_report)); then
@@ -3476,124 +3632,6 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run, add
-# an audit comment with the validation results, then cancel the redundant
-# in-flight CI run for the exact validated commit.
-# Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Label application and CI cancellation are
-# best-effort so GitHub or proxy failures never change the validation result.
-# The PR is taken from $PR_NUMBER when set, else detected from the current branch
-# via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
-# never changes validation's exit status.
-readonly LOCALLY_VALIDATED_REPOSITORY="rrnewton/hermit"
-readonly LOCALLY_VALIDATED_LABEL="locally-validated"
-
-function apply_locally_validated_label {
-    local pr=$PR_NUMBER
-    local pr_head=""
-    local local_head
-    local comment_body=""
-    local host_name=""
-    local passed_checks=0
-    local timestamp=""
-    local run_id=""
-    local -a gh_cmd=(gh)
-
-    if ! command -v gh >/dev/null 2>&1; then
-        printf "⚠️  gh CLI not found; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    # gh on Meta devservers needs the forward proxy; mirror ensure_cargo_nextest.
-    if command -v with-proxy >/dev/null 2>&1; then
-        gh_cmd=(with-proxy gh)
-    fi
-
-    if [[ -z $pr ]]; then
-        pr=$("${gh_cmd[@]}" pr view --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --json number -q .number 2>/dev/null) || true
-    fi
-    if [[ -z $pr ]]; then
-        printf "⚠️  no PR found for the current branch; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    pr_head=$("${gh_cmd[@]}" pr view "$pr" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --json headRefOid -q .headRefOid 2>/dev/null) || true
-    if [[ -z $pr_head ]]; then
-        printf "⚠️  could not read PR #%s head; skipping '%s' label\n" \
-            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    local_head=$(git rev-parse HEAD)
-    if [[ $pr_head != "$local_head" ]]; then
-        printf "⚠️  PR #%s advanced from %s to %s; skipping '%s' label\n" \
-            "$pr" "$local_head" "$pr_head" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-
-    # Ensure a fresh repository can accept the label. Failure is harmless here:
-    # the edit below reports the actionable warning and validation remains green.
-    "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --color 1d76db \
-        --description "Full local validation passed for the current PR head" \
-        --force >>"$LOG_FILE" 2>&1 || true
-
-    if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        >>"$LOG_FILE" 2>&1; then
-        printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
-
-        host_name=$(hostname -f 2>/dev/null) || \
-            host_name=$(hostname 2>/dev/null) || host_name="unknown"
-        timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
-        passed_checks=$((checks - failures))
-        # Single quotes keep the Markdown backticks literal in the comment body.
-        # The trailing HTML marker is machine-parseable: label-strip-evidence.sh
-        # locates this comment by `sha=<head>` when the label is later stripped,
-        # so the record of what was validated (commit, profile, durable log) is
-        # never lost. Keep the marker key names in sync with that script.
-        # shellcheck disable=SC2016
-        printf -v comment_body \
-            '[impl agent, validate.sh]\n\nLocal validation passed — `%s` label applied.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Log: `%s:%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ts=%s -->' \
-            "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
-            "$passed_checks" "$host_name" "$host_name" "$LOG_FILE" "$timestamp" \
-            "$local_head" "$VALIDATION_PROFILE" "$host_name" "$LOG_FILE" "$timestamp"
-        if "${gh_cmd[@]}" pr comment "$pr" \
-            --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --body "$comment_body" >>"$LOG_FILE" 2>&1; then
-            printf "💬 Added local validation results to PR #%s\n" "$pr"
-        else
-            printf "⚠️  failed to comment validation results on PR #%s (full log: %s)\n" \
-                "$pr" "$LOG_FILE" >&2
-        fi
-
-        if ! run_id=$("${gh_cmd[@]}" api \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
-            --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
-            2>>"$LOG_FILE"); then
-            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
-                "$local_head" "$LOG_FILE" >&2
-            return 0
-        fi
-        if [[ -z $run_id ]]; then
-            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
-        elif "${gh_cmd[@]}" api --method POST \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/runs/${run_id}/cancel" \
-            >>"$LOG_FILE" 2>&1; then
-            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
-        else
-            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
-                "$run_id" "$local_head" "$LOG_FILE" >&2
-        fi
-    else
-        printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
-            "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
-    fi
-}
-
 # fbsource import lints require the Meta copyright header on every imported Rust
 # source file. `head -n 8` permits a rust-script shebang first.
 function check_copyright_headers {
@@ -4093,7 +4131,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
             "$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            "$ROOT_DIR/target/liteinst-runtime-build-d973a85"
+            "$ROOT_DIR/target/liteinst-runtime-build-7951770"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
@@ -4182,16 +4220,5 @@ case "$VALIDATION_LEVEL" in
 esac
 
 print_summary
-
-# On a fully-green full run, tag the PR unless explicitly disabled. GitHub
-# failures are warnings and never affect the final validation exit status.
-if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
-        apply_locally_validated_label
-    else
-        printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-    fi
-fi
 
 ((failures == 0))

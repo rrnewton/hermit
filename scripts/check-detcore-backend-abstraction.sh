@@ -251,7 +251,16 @@ fi
 # from the scratch workspace after the planted dependency is added.
 run_negative_controls() {
     local scratch backend output status
-    for backend in liteinst sabre e9patch; do
+    local -a control_crates=("${BACKEND_CRATES[@]}")
+
+    # e9patch is not currently declared by a workspace member, so it cannot be
+    # part of the derived set yet. Keep it as a sentinel until it is declared;
+    # once present, the derived list supplies it and this append is skipped.
+    if [[ " ${control_crates[*]} " != *" reverie-e9patch "* ]]; then
+        control_crates+=(reverie-e9patch)
+    fi
+
+    for backend in "${control_crates[@]}"; do
         if ! scratch=$(mktemp -d); then
             err "negative control could not create a scratch directory"
             return 1
@@ -259,9 +268,9 @@ run_negative_controls() {
         if ! cp -a "$REPO_ROOT/detcore" "$scratch/detcore" ||
            ! printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' \
                 > "$scratch/Cargo.toml" ||
-           ! printf '\n[target.'"'"'cfg(any())'"'"'.dependencies]\nreverie-%s = "0.2.0"\n' \
+           ! printf '\n[target.'"'"'cfg(any())'"'"'.dependencies]\n%s = "0.2.0"\n' \
                 "$backend" >> "$scratch/detcore/Cargo.toml"; then
-            err "negative control could not prepare the reverie-$backend scratch copy"
+            err "negative control could not prepare the $backend scratch copy"
             rm -rf -- "$scratch"
             return 1
         fi
@@ -272,16 +281,16 @@ run_negative_controls() {
         rm -rf -- "$scratch"
 
         if ((status != 1)); then
-            err "negative control for reverie-$backend returned $status, expected 1"
+            err "negative control for $backend returned $status, expected 1"
             printf '%s\n' "$output" >&2
             return 1
         fi
-        if ! grep -Fq "reverie-$backend" <<< "$output"; then
-            err "negative control failed without identifying reverie-$backend"
+        if ! grep -Fq "$backend" <<< "$output"; then
+            err "negative control failed without identifying $backend"
             printf '%s\n' "$output" >&2
             return 1
         fi
-        ok "negative control: planted reverie-$backend dependency was rejected"
+        ok "negative control: planted $backend dependency was rejected"
     done
 }
 
