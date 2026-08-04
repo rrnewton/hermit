@@ -1017,6 +1017,146 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Build a JSON string array from a comma-separated list (empty list -> "[]").
+# Each element is quoted through json_quote so a node name is never emitted raw.
+function json_string_array {
+    local csv=$1 out='[' first=1 item
+    local IFS=,
+    local -a items
+    read -r -a items <<<"$csv"
+    for item in "${items[@]}"; do
+        [[ -n $item ]] || continue
+        ((first)) || out+=','
+        first=0
+        out+=$(json_quote "$item")
+    done
+    out+=']'
+    printf '%s' "$out"
+}
+
+# Compute the test-count diagnostics AND the per-node coverage obligation that a
+# GREEN must CARRY to be trusted for landing (see the parent design note
+# bind-validation-counts-per-node-coverage). SELF-CONTAINED: parses only this
+# run's own $LOG_FILE and the in-repo DAG manifests; carries NO dependency on the
+# dev-hermit parent (no nonzero_result.py) so a standalone Hermit checkout works
+# identically. Sets three globals consumed by append_validation_ledger:
+#   __vc_executed  aggregate tests executed (JSON int or `null` if unknowable)
+#   __vc_filtered  aggregate tests filtered out (JSON int or `null`)
+#   __vc_coverage  coverage{} object for a FULL run, else `null`
+#
+# WHY per-node, not `filtered == 0`: a correct full run legitimately filters
+# hundreds of cross-shard tests, so a global `filtered == 0` predicate rejects
+# every real full green, and a global `executed > 0` can hide one inert
+# zero-test node behind hundreds executed elsewhere. The condition therefore
+# travels with the value at DAG-node granularity: every planned test-bearing
+# node must have RUN (a runner terminal line) and, if it emitted any libtest
+# banner, its passed-sum must be > 0. `filtered` is retained ONLY as a
+# diagnostic; it is no longer a predicate. Counts are honest: an UNKNOWN value
+# is emitted as `null` and NEVER fabricated -- the consumer fails such a
+# count-capable receipt closed rather than trusting an absent obligation.
+function compute_validation_counts {
+    __vc_executed=null
+    __vc_filtered=null
+    __vc_coverage=null
+
+    [[ -n ${LOG_FILE:-} && -f $LOG_FILE ]] || return 0
+
+    # Aggregate diagnostics from STREAMED libtest banners only. The runner echoes
+    # each node's summary inside its terminal line ("[node] ✓ PASS ... [test
+    # result: ...]"); those echo lines are skipped so a banner's numbers are
+    # counted exactly once. executed = summed `running N tests` (the count that
+    # is never echoed); on the rare binary that prints no `running` line we fall
+    # back to its `N passed`.
+    local agg
+    agg=$(awk '
+        /^\[[a-z0-9_.]+\] (✓ PASS|✗ FAIL)/ { next }   # runner terminal echo -> skip
+        match($0, /(^|\] )running [0-9]+ tests?/) {
+            if (match($0, /running [0-9]+/)) { s = substr($0, RSTART, RLENGTH); sub(/running /, "", s); run_sum += s + 0; run_lines++ }
+        }
+        match($0, /(^|\] )test result: (ok|FAILED)\./) {
+            result_lines++
+            if (match($0, /[0-9]+ passed/))       { s = substr($0, RSTART, RLENGTH); sub(/ passed/, "", s); pass_sum += s + 0 }
+            if (match($0, /[0-9]+ filtered out/)) { s = substr($0, RSTART, RLENGTH); sub(/ filtered out/, "", s); filt_sum += s + 0 }
+        }
+        END {
+            if (run_lines == 0 && result_lines == 0) { print "NONE"; exit }
+            executed = (run_lines > 0 ? run_sum : pass_sum)
+            printf "%d %d", executed, filt_sum
+        }
+    ' "$LOG_FILE" 2>/dev/null)
+    if [[ $agg != NONE && $agg =~ ^[0-9]+\ [0-9]+$ ]]; then
+        __vc_executed=${agg% *}
+        __vc_filtered=${agg#* }
+    fi
+
+    # The per-node coverage obligation is only meaningful for a FULL run (the
+    # complete portable + privileged lanes over the committed manifests). A
+    # subset/only/compat/quick run never claims full coverage, and the consumer
+    # only enforces the obligation on profile==full receipts, so we emit
+    # coverage:null for anything else rather than a misleading partial object.
+    [[ $VALIDATION_PROFILE == full ]] || return 0
+
+    # Planned test-bearing node set = union of `test.*` tags across the DAG
+    # manifests the full run executes. If jq or a manifest is unavailable we
+    # CANNOT prove coverage, so coverage stays null and the consumer fails the
+    # count-capable receipt closed -- never fabricate a satisfied obligation.
+    command -v jq >/dev/null 2>&1 || return 0
+    local planned manifest
+    local -a manifests=("$ROOT_DIR/ci/dag/portable.json" "$ROOT_DIR/ci/dag/privileged.json")
+    planned=$(
+        for manifest in "${manifests[@]}"; do
+            [[ -f $manifest ]] || continue
+            jq -r '.steps[] | (.group + "." + .job) | select(startswith("test."))' "$manifest" 2>/dev/null
+        done | sort -u
+    )
+    [[ -n $planned ]] || return 0
+
+    # Cross the planned set against the log: a planned node with no runner
+    # terminal line is ABSENT (never ran); a node that emitted >=1 banner whose
+    # passed-sum is 0 is INERT (ran but executed nothing). Either violates the
+    # obligation. A planned node that ran but emitted no banner (a shell/e2e test
+    # node) is EXEMPT from the zero-executed check -- the precise line that keeps
+    # a legitimate banner-less node from recreating the stall.
+    local cov
+    cov=$(awk -v planned="$planned" '
+        BEGIN {
+            n = split(planned, P, "\n")
+            for (i = 1; i <= n; i++) if (P[i] != "") plan[P[i]] = 1
+        }
+        match($0, /(^|\] )test result: (ok|FAILED)\./) {
+            if (match($0, /^\[test\.[a-z0-9_]+\]/)) {
+                node = substr($0, 2, RLENGTH - 2)
+                had_banner[node] = 1
+                if (match($0, /[0-9]+ passed/)) { s = substr($0, RSTART, RLENGTH); sub(/ passed/, "", s); psum[node] += s + 0 }
+            }
+            next
+        }
+        /^\[test\.[a-z0-9_]+\] (✓ PASS|✗ FAIL)/ {
+            match($0, /^\[test\.[a-z0-9_]+\]/)
+            ran[substr($0, 2, RLENGTH - 2)] = 1
+            next
+        }
+        END {
+            planned_n = 0; executed_n = 0; absent = ""; zero = ""
+            for (node in plan) {
+                planned_n++
+                if (!(node in ran)) { absent = absent (absent == "" ? "" : ",") node; continue }
+                if ((node in had_banner) && psum[node] == 0) { zero = zero (zero == "" ? "" : ",") node }
+                if (!(node in had_banner) || psum[node] > 0) executed_n++
+            }
+            printf "%d\t%d\t%s\t%s", planned_n, executed_n, absent, zero
+        }
+    ' "$LOG_FILE" 2>/dev/null)
+
+    local planned_n executed_n absent_csv zero_csv
+    IFS=$'\t' read -r planned_n executed_n absent_csv zero_csv <<<"$cov"
+    [[ $planned_n =~ ^[0-9]+$ && $executed_n =~ ^[0-9]+$ ]] || return 0
+    __vc_coverage="{\"planned_test_nodes\":$planned_n,"
+    __vc_coverage+="\"executed_test_nodes\":$executed_n,"
+    __vc_coverage+="\"zero_executed_nodes\":$(json_string_array "$zero_csv"),"
+    __vc_coverage+="\"absent_nodes\":$(json_string_array "$absent_csv")}"
+}
+
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
 # are computed once by the caller (cleanup) in the top-level shell so they match
 # the human summary exactly and so the `times` builtin sees the accumulated child
@@ -1056,11 +1196,40 @@ function append_validation_ledger {
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
 
-    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
-    # are additive; the parent ledger aggregator reads via .get() and is
-    # unaffected until it is taught to surface them. (warm-vs-cold is already
-    # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    # executed_tests / filtered_tests / coverage: what a GREEN must CARRY to be
+    # trusted for landing, computed SELF-CONTAINED from this run's own $LOG_FILE
+    # (see compute_validation_counts). executed_tests/filtered_tests are
+    # DIAGNOSTICS; the load-bearing signal is the per-node `coverage` obligation.
+    # Each value is a JSON literal: an integer/object, or `null` for a genuinely
+    # UNKNOWN value that the consumer must treat fail-safe -- counts are never
+    # fabricated. A standalone Hermit checkout works identically (no dev-hermit
+    # parent dependency); when there is no ledger file the function above returns
+    # early before reaching here.
+    local executed_tests_json filtered_tests_json coverage_json
+    local __vc_executed __vc_filtered __vc_coverage
+    compute_validation_counts
+    executed_tests_json=$__vc_executed
+    filtered_tests_json=$__vc_filtered
+    coverage_json=$__vc_coverage
+
+    # schema_version 5 is the first CLEAN "counts present" anchor: it declares
+    # that this writer is COUNT-CAPABLE and therefore emits executed_tests,
+    # filtered_tests, and the per-node coverage{} obligation (each an integer /
+    # object, or `null` for a genuinely UNKNOWN value). 1/2/3 predate the counts
+    # and 4 is already contaminated in the ledger with null-count rows, so neither
+    # can key "this receipt can prove coverage" -- see the transition-design note
+    # (count-schema-tightening-transition) and bind-validation-counts-per-node-
+    # coverage. The consumer (ci-hub validate_status.rs is_clean_full_pass) keys
+    # strictness on `schema_version >= COUNTS_SCHEMA (=5) || counts_present`: at
+    # schema 5 a full receipt that emits `null` coverage (a producer bug, or an
+    # unprovable run) is still routed to STRICT and refused -- the version
+    # escalator closes exactly the hole that pure presence-keying leaves open. The
+    # retired `filtered_tests == 0` predicate is deliberately NOT emitted as a
+    # gate: legitimate full runs filter hundreds of cross-shard tests, so filtered
+    # is a diagnostic only and coverage carries scope per DAG node instead. All
+    # fields remain additive; the aggregator reads via .get() and is unaffected
+    # until taught to surface them. (warm-vs-cold is recorded as cache_state.)
+    line="{\"schema_version\":5,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
@@ -1071,6 +1240,8 @@ function append_validation_ledger {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
+    line+="\"coverage\":$coverage_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
