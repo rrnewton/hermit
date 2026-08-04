@@ -548,6 +548,59 @@ fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
         stderr(&output)
     );
 }
+/// The env-hash DETLOG line is emitted once per exec only when INFO logging is
+/// active, is absent otherwise (the read + hash cost is not paid), and is a
+/// deterministic function of the guest environment. It is the diagnostic for
+/// cross-backend environment divergence (for example KVM vs. ptrace).
+#[test]
+fn run_info_logging_emits_deterministic_env_hash() {
+    let program = "/bin/true";
+
+    // Default log level: the env line must be absent (the zero-cost path).
+    let quiet_args = ["run", "--", program];
+    let quiet = hermit(&quiet_args);
+    assert_success(&quiet, &quiet_args);
+    assert!(
+        !stderr(&quiet).contains("[env,"),
+        "env hash line leaked into a default (non-INFO) run:\n{}",
+        stderr(&quiet)
+    );
+
+    // With --log info the line appears, carrying a count and a 64-hex SHA-256.
+    let args = ["--log", "info", "run", "--", program];
+    let first = hermit(&args);
+    assert_success(&first, &args);
+    let hash1 = extract_env_hash(&stderr(&first));
+
+    // Same guest and same environment -> identical hash (determinism).
+    let second = hermit(&args);
+    assert_success(&second, &args);
+    let hash2 = extract_env_hash(&stderr(&second));
+    assert_eq!(
+        hash1, hash2,
+        "env hash differed across two identical runs: {hash1} vs {hash2}"
+    );
+}
+
+fn extract_env_hash(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("DETLOG [env,"))
+        .unwrap_or_else(|| panic!("no DETLOG [env, ...] line in stderr:\n{stderr}"));
+    assert!(line.contains("count="), "env line missing count=: {line}");
+    let hash = line
+        .split("hash=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("env line missing hash=: {line}"))
+        .trim();
+    assert_eq!(hash.len(), 64, "env hash is not 64 hex chars: {hash:?}");
+    assert!(
+        hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        "env hash is not hex: {hash:?}"
+    );
+    hash.to_string()
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
 #[test]
