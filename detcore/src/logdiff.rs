@@ -47,7 +47,9 @@ pub struct LogDiffOpts {
 
     /// Canonicalize host memory addresses before comparison WITHOUT erasing them.
     ///
-    /// Each distinct `0x...` address is rewritten to an ordinal placeholder
+    /// Only addresses a producer has explicitly marked with the
+    /// `<hostaddr 0x...>` wrapper (see [`host_addr`]) are canonicalized; each
+    /// distinct marked address is rewritten to an ordinal placeholder
     /// `<addr{N}>` assigned by order of first appearance within a single run
     /// (see [`canonicalize_addresses_in_line`]). Unlike [`Self::strip_lines`],
     /// this discards ONLY the host-specific raw pointer value: it preserves
@@ -59,6 +61,14 @@ pub struct LogDiffOpts {
     /// parity policy: canonicalizing preserves the ability to DETECT a
     /// difference (allocation-order or aliasing changes still diverge), which
     /// wholesale stripping throws away.
+    ///
+    /// The marker is REQUIRED (a bare `0x...` literal is left exact) because
+    /// nothing in the compared DETLOG stream can otherwise distinguish a varying
+    /// host pointer from a reproducible hex value -- syscall arguments printed
+    /// `{:#x}` (e.g. `flock` `operation=0x2` vs `0x6`), guest memory ranges,
+    /// content digests, cpuid leaves. A blanket `0x` canonicalization would
+    /// collapse those too, silently erasing real syscall-argument divergence:
+    /// a "softer strip" and exactly the fake-green this policy exists to prevent.
     #[clap(skip)]
     pub canonicalize_addresses: bool,
 
@@ -227,12 +237,28 @@ pub fn strip_log_entry(log: &str) -> String {
     String::from(log)
 }
 
-/// Rewrite each host memory address (`0x...`) in `line` to an ordinal
-/// placeholder `<addr{N}>`, numbered by order of first appearance within a
-/// single run. `map`/`next` carry the per-run assignment state threaded across
-/// all of that run's lines, so `next` should start at 1 and the same `map`/`next`
-/// must be reused for every line of one run (and a FRESH pair used for the other
-/// run).
+/// Wrap a host memory address so [`canonicalize_addresses_in_line`] will
+/// canonicalize it. Producers that print a genuinely host-specific pointer
+/// (one that varies run-to-run, e.g. a supervisor-side allocation) should emit
+/// it via this helper -- `<hostaddr 0x7fcfb7e7d450>` -- instead of a bare
+/// `0x...` literal. Only marked addresses are canonicalized, so reproducible hex
+/// (syscall arguments, guest memory ranges, digests) is compared exactly.
+///
+/// Note: nothing in detcore's current DETLOG output prints a varying host
+/// pointer -- guest addresses are determinized and every logged `0x...` value is
+/// reproducible -- so this marker is presently unused in production and exists
+/// so a future host-pointer print opts into canonicalization deliberately rather
+/// than being swept up by a blanket regex.
+pub fn host_addr(addr: usize) -> String {
+    format!("<hostaddr {addr:#x}>")
+}
+
+/// Rewrite each MARKED host memory address (`<hostaddr 0x...>`, see
+/// [`host_addr`]) in `line` to an ordinal placeholder `<addr{N}>`, numbered by
+/// order of first appearance within a single run. `map`/`next` carry the per-run
+/// assignment state threaded across all of that run's lines, so `next` should
+/// start at 1 and the same `map`/`next` must be reused for every line of one run
+/// (and a FRESH pair used for the other run).
 ///
 /// This is the tier-2 CANONICALIZE step (as opposed to tier-1 STRIP of the
 /// wall-clock prefix and tier-3 EXACT comparison of everything else). It differs
@@ -242,20 +268,27 @@ pub fn strip_log_entry(log: &str) -> String {
 /// addresses), compare EQUAL -- the exact defect parity exists to catch. An
 /// ordinal assigned by first appearance keeps identity, order, and aliasing, so
 /// those cases still diverge while a pure ASLR-shift (same structure, different
-/// raw values) compares equal. Only `0x`-prefixed hex is canonicalized; decimal
-/// values (virtual-time timestamps, counts, sizes) are left for exact comparison.
+/// raw values) compares equal.
+///
+/// Only the explicit `<hostaddr ...>` marker is canonicalized. A bare `0x...`
+/// literal is left byte-for-byte for exact comparison: a blanket regex cannot
+/// tell a varying host pointer from a reproducible syscall argument printed
+/// `{:#x}` (`flock` `operation=0x2` vs `0x6`, `membarrier` bitmasks), so
+/// canonicalizing every hex token would erase real syscall-argument divergence.
+/// Decimal values (virtual-time timestamps, counts, sizes) are likewise exact.
 fn canonicalize_addresses_in_line(
     line: &str,
     map: &mut HashMap<String, usize>,
     next: &mut usize,
 ) -> String {
-    // Same shape as `strip_log_entry`'s RE0: an `0x`/`0X` hex literal.
-    static RE_ADDR: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap());
+    // Match ONLY the explicit host-address marker emitted by `host_addr`; the
+    // captured group is the raw `0x...` value used as the ordinal key.
+    static RE_HOSTADDR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<hostaddr (0[xX][A-Fa-f0-9]+)>").unwrap());
 
-    RE_ADDR
+    RE_HOSTADDR
         .replace_all(line, |caps: &regex::Captures| {
-            let addr = &caps[0];
+            let addr = &caps[1];
             let ord = match map.get(addr) {
                 Some(existing) => *existing,
                 None => {
@@ -1180,10 +1213,12 @@ mod test {
     /// canonicalization is doing real work and is not just the identity.
     #[test]
     fn canonical_address_only_difference_compares_equal() -> std::io::Result<()> {
-        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=0x1111 q=0x2222
-2022-09-06T14:15:48.000000Z  INFO detcore: [t] use 0x1111 then 0x2222";
-        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=0xaaaa q=0xbbbb
-2022-09-06T14:15:48.000000Z  INFO detcore: [t] use 0xaaaa then 0xbbbb";
+        let run_a =
+            "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=<hostaddr 0x1111> q=<hostaddr 0x2222>
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] use <hostaddr 0x1111> then <hostaddr 0x2222>";
+        let run_b =
+            "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=<hostaddr 0xaaaa> q=<hostaddr 0xbbbb>
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] use <hostaddr 0xaaaa> then <hostaddr 0xbbbb>";
 
         let canonical = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
@@ -1220,12 +1255,12 @@ mod test {
         // Both runs: alloc, alloc, then a line pairing the two addresses. In run_b
         // the two addresses are introduced in the opposite order, so the ordinals
         // on the shared "pair" line are swapped.
-        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc 0x1111
-2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc 0x2222
-2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair 0x1111 0x2222";
-        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc 0xbbbb
-2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc 0xaaaa
-2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair 0xaaaa 0xbbbb";
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc <hostaddr 0x1111>
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc <hostaddr 0x2222>
+2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair <hostaddr 0x1111> <hostaddr 0x2222>";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc <hostaddr 0xbbbb>
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc <hostaddr 0xaaaa>
+2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair <hostaddr 0xaaaa> <hostaddr 0xbbbb>";
 
         let canonical = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
@@ -1258,8 +1293,8 @@ mod test {
     /// the same positions. `<addr1>,<addr1>` vs `<addr1>,<addr2>` diverges.
     #[test]
     fn canonical_aliasing_difference_compares_unequal() -> std::io::Result<()> {
-        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two 0x1111 0x1111";
-        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two 0xaaaa 0xbbbb";
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two <hostaddr 0x1111> <hostaddr 0x1111>";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two <hostaddr 0xaaaa> <hostaddr 0xbbbb>";
 
         let canonical = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
@@ -1270,6 +1305,44 @@ mod test {
         assert!(
             super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
             "an aliasing difference (1,1 vs 1,2) must compare UNEQUAL"
+        );
+        Ok(())
+    }
+
+    /// Canonical parity, tier 3 (the finding this design fixes): a reproducible
+    /// hex value printed as a syscall argument (`flock` `operation={:#x}`) is
+    /// NOT a host address and must be compared EXACTLY. Two runs differing only
+    /// in `operation=0x2` vs `0x6` must compare UNEQUAL under canonicalization --
+    /// proving the canonicalizer touches only marked `<hostaddr ...>` pointers
+    /// and does not become a "softer strip" that swallows syscall-argument
+    /// divergence. A marked host address on the SAME line, differing only by an
+    /// ASLR shift, must not by itself make the runs diverge.
+    #[test]
+    fn canonical_syscall_arg_hex_difference_compares_unequal() -> std::io::Result<()> {
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0x1111>";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: flock(fd=3, operation=0x6) at <hostaddr 0xaaaa>";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "a bare syscall-argument hex difference (0x2 vs 0x6) must compare UNEQUAL: \
+             it is reproducible and NOT a host address"
+        );
+
+        // Positive control: with ONLY the marked host address differing (same
+        // syscall argument), the ASLR shift is canonicalized away and the runs
+        // compare EQUAL -- so the divergence above is due to the syscall arg, not
+        // the address.
+        let addr_only_a = "2022-09-06T14:15:47.000000Z  INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0x1111>";
+        let addr_only_b = "2022-09-06T14:15:47.000000Z  INFO detcore: flock(fd=3, operation=0x2) at <hostaddr 0xaaaa>";
+        assert!(
+            !super::log_diff_from_strs(addr_only_a, addr_only_b, &canonical, &mut Vec::new())?,
+            "an address-only difference alongside an identical syscall arg must compare EQUAL"
         );
         Ok(())
     }
@@ -1368,21 +1441,32 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         use std::collections::HashMap;
         let mut map = HashMap::new();
         let mut next = 1usize;
-        // First appearance numbers by order; a repeated address reuses its ordinal
-        // (identity + aliasing); decimal values are left untouched (tier 3).
+        // First appearance numbers marked addresses by order; a repeated address
+        // reuses its ordinal (identity + aliasing). A BARE `0x...` literal and
+        // decimal values are left untouched (tier 3, exact comparison).
         assert_eq!(
             super::canonicalize_addresses_in_line(
-                "a=0x1111 b=0x2222 c=0x1111 n=42",
+                "a=<hostaddr 0x1111> b=<hostaddr 0x2222> c=<hostaddr 0x1111> raw=0x4444 n=42",
                 &mut map,
                 &mut next
             ),
-            "a=<addr1> b=<addr2> c=<addr1> n=42"
+            "a=<addr1> b=<addr2> c=<addr1> raw=0x4444 n=42"
         );
         // State threads across lines within one run: a known address keeps its
         // ordinal, a new one continues the count.
         assert_eq!(
-            super::canonicalize_addresses_in_line("use 0x2222 then 0x3333", &mut map, &mut next),
+            super::canonicalize_addresses_in_line(
+                "use <hostaddr 0x2222> then <hostaddr 0x3333>",
+                &mut map,
+                &mut next
+            ),
             "use <addr2> then <addr3>"
+        );
+        // A bare hex literal is never canonicalized, even one identical to a
+        // marked address seen earlier: reproducible hex is compared exactly.
+        assert_eq!(
+            super::canonicalize_addresses_in_line("bare 0x1111", &mut map, &mut next),
+            "bare 0x1111"
         );
     }
 
