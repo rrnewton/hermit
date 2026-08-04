@@ -42,12 +42,32 @@
 #                      cgroup boxing cannot be established. NOT recommended (defeats the
 #                      whole point); provided for parity with the underlying runner.
 #
-# EXIT CODES (passthrough from safe-ci-dag-runner)
-#   0  command succeeded within budget
-#   1  command failed OR was reaped for exceeding the CPU-time budget (grep the output for
-#      "CPU-TIMEOUT" to distinguish; a reaped runaway is exactly the leak this prevents)
-#   2  bad usage
-#   3  cgroup boxing required but unavailable (pass --allow-cgroup-failure to run unboxed)
+#   --passthrough      (alias --exec) TRANSPARENT-PASSTHROUGH mode. Stream the child's fd1/fd2
+#                      VERBATIM (byte-identical: no `[box.<tag>]` banner/prefix, no scope id on
+#                      the consumed streams) and propagate the child's REAL exit status (a
+#                      nonzero exit is NOT collapsed to 1). The reaper is KEPT: a transient
+#                      systemd --user scope gives a cgroup whose cpu.stat usage_usec is polled
+#                      against --cpu-budget and torn down cgroup.kill-first on overrun or exit;
+#                      exit 3 (fail-closed) if cgroup boxing is unavailable. Use this whenever
+#                      the caller consumes the guest's stdout/stderr (determinism fingerprints,
+#                      ASAN/QEMU/verify grep evidence). The DEFAULT (capture) mode drives
+#                      safe-ci-dag-runner and is a PASS/FAIL harness that swallows guest output.
+#   --diag-fd N        (passthrough only) write box diagnostics (scope id, CPU-TIMEOUT notices,
+#                      resource CSV) to already-open fd N instead of a temp log. NEVER onto the
+#                      consumed fd1/fd2. Use `--diag-fd 2` only when stderr is not consumed.
+#   --diag-log FILE    (passthrough only) write box diagnostics to FILE (appended).
+#                      Default: a temp file (path announced only on the diag stream, never fd1/fd2).
+#
+# EXIT CODES
+#   default (capture) mode — passthrough from safe-ci-dag-runner:
+#     0  command succeeded within budget
+#     1  command failed OR was reaped for exceeding the CPU-time budget (grep the output for
+#        "CPU-TIMEOUT" to distinguish; a reaped runaway is exactly the leak this prevents)
+#     2  bad usage
+#     3  cgroup boxing required but unavailable (pass --allow-cgroup-failure to run unboxed)
+#   --passthrough mode — the child's REAL exit status is propagated verbatim (0 on success, the
+#     real nonzero on failure, 137 for a SIGKILL/cgroup.kill reap; a CPU-TIMEOUT is announced on
+#     the diag stream). 2 = bad usage, 3 = cgroup boxing unavailable (unless --allow-cgroup-failure).
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -59,6 +79,9 @@ cores=""
 label="box"
 perf_dir=""
 allow_cgroup_failure=0
+passthrough=0
+diag_fd=""
+diag_log=""
 
 die() { echo "hermit-box-run: $*" >&2; exit 2; }
 
@@ -73,7 +96,12 @@ while [ $# -gt 0 ]; do
     --perf-dir)   [ $# -ge 2 ] || die "--perf-dir needs a value"; perf_dir="$2"; shift 2 ;;
     --perf-dir=*) perf_dir="${1#*=}"; shift ;;
     --allow-cgroup-failure) allow_cgroup_failure=1; shift ;;
-    -h|--help)    sed -n '2,60p' "$SELF"; exit 0 ;;
+    --passthrough|--exec) passthrough=1; shift ;;
+    --diag-fd)    [ $# -ge 2 ] || die "--diag-fd needs a value"; diag_fd="$2"; shift 2 ;;
+    --diag-fd=*)  diag_fd="${1#*=}"; shift ;;
+    --diag-log)   [ $# -ge 2 ] || die "--diag-log needs a value"; diag_log="$2"; shift 2 ;;
+    --diag-log=*) diag_log="${1#*=}"; shift ;;
+    -h|--help)    sed -n '2,80p' "$SELF"; exit 0 ;;
     --)           shift; break ;;
     -*)           die "unknown option '$1' (put the command after '--')" ;;
     *)            break ;;
@@ -84,6 +112,174 @@ done
 case "$cpu_budget" in ''|*[!0-9]*) die "--cpu-budget must be a positive integer (seconds)";; esac
 [ "$cpu_budget" -gt 0 ] || die "--cpu-budget must be > 0"
 if [ -n "$cores" ]; then case "$cores" in ''|*[!0-9]*) die "--cores must be a positive integer";; esac; fi
+if [ -n "$diag_fd" ]; then case "$diag_fd" in ''|*[!0-9]*) die "--diag-fd must be a file descriptor number";; esac; fi
+if [ "$passthrough" -eq 0 ]; then
+  [ -z "$diag_fd" ]  || die "--diag-fd is only valid with --passthrough"
+  [ -z "$diag_log" ] || die "--diag-log is only valid with --passthrough"
+fi
+
+# ---------------------------------------------------------------------------
+# TRANSPARENT-PASSTHROUGH mode.
+#
+# The default (capture) path below drives safe-ci-dag-runner, a PASS/FAIL harness that
+# swallows guest stdout/stderr (only a `[box.<tag>]` tail survives) and injects a
+# nondeterministic `safe-ci-<pid>.scope` id into consumed output — fatal for any caller that
+# hashes/greps the guest streams. Passthrough instead runs the command in a transient
+# systemd --user *scope* whose stdio is INHERITED verbatim, so fd1/fd2 reach the caller
+# byte-identically, while the SAME reaper guarantees hold: the scope is a cgroup-v2 subtree
+# whose cpu.stat usage_usec (CPU-time, immune to wall slowdown) is polled against the budget
+# and torn down cgroup.kill-first (SIGKILLs setsid/double-fork escapees atomically). No
+# external kill is used; we only ever signal our OWN scope's cgroup. All box diagnostics go
+# to a SEPARATE stream (fd 9 -> --diag-fd / --diag-log / temp log), never onto fd1/fd2.
+# ---------------------------------------------------------------------------
+passthrough_run() {
+  # Open the diagnostic stream on fd 9 (NEVER fd1/fd2).
+  if [ -n "$diag_fd" ]; then
+    eval "exec 9>&$diag_fd" || die "cannot dup diag fd $diag_fd (is it open?)"
+  elif [ -n "$diag_log" ]; then
+    exec 9>>"$diag_log" || die "cannot open --diag-log $diag_log"
+  else
+    diag_log="$(mktemp -t hermit-box-run.XXXXXX.diag.log)"
+    exec 9>>"$diag_log"
+    # Auto-created diag log: remove on exit so repeated per-run invocations (determinism
+    # sweeps etc.) do not accumulate temp files. An explicit --diag-log/--diag-fd is caller-owned.
+    HBR_AUTO_DIAG="$diag_log"
+    trap 'rm -f "${HBR_AUTO_DIAG:-}"' EXIT
+  fi
+  diag() { echo "[hermit-box-run] $*" >&9; }
+
+  # Pre-check the box substrate BEFORE launching anything, so an unavailable cgroup is a
+  # fail-closed exit 3 with NO child started (unless explicitly downgraded).
+  local have_box=1
+  [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)" = "cgroup2fs" ] || have_box=0
+  systemctl --user show -p Version >/dev/null 2>&1 || have_box=0
+  if [ "$have_box" -eq 0 ]; then
+    if [ "$allow_cgroup_failure" -eq 1 ]; then
+      diag "WARNING: cgroup boxing unavailable — running UNBOXED (--allow-cgroup-failure). No reaper."
+      exec "$@"   # verbatim fd0/1/2, real exit status, but NO reaper.
+    fi
+    diag "cgroup boxing required but unavailable (cgroup-v2 + systemd --user scope). Refusing (exit 3)."
+    echo "hermit-box-run: cgroup boxing unavailable; pass --allow-cgroup-failure to run unboxed (exit 3)" >&2
+    exit 3
+  fi
+
+  # Optional core pinning: K least-busy CPUs -> systemd AllowedCPUs (cgroup cpuset).
+  local allowed_cpus=""
+  if [ -n "$cores" ]; then
+    allowed_cpus="$(python3 - "$cores" <<'PY'
+import sys, time
+k = int(sys.argv[1])
+def snap():
+    d = {}
+    for ln in open('/proc/stat'):
+        if ln.startswith('cpu') and ln[3:4].isdigit():
+            p = ln.split()
+            n = int(p[0][3:]); vals = list(map(int, p[1:]))
+            d[n] = (sum(vals), vals[3] + (vals[4] if len(vals) > 4 else 0))  # total, idle+iowait
+    return d
+a = snap(); time.sleep(0.2); b = snap()
+busy = {}
+for n in a:
+    if n in b:
+        dt = b[n][0] - a[n][0]; di = b[n][1] - a[n][1]
+        busy[n] = (dt - di) / dt if dt else 0.0
+picks = sorted(busy, key=lambda n: (busy[n], n))[:max(1, k)]
+print(",".join(str(n) for n in sorted(picks)))
+PY
+)" || allowed_cpus=""
+    [ -n "$allowed_cpus" ] && diag "core pin: --cores $cores -> AllowedCPUs=$allowed_cpus"
+  fi
+
+  local unit="hermit-box-run-$$-$(date +%s%N).scope"
+  local -a sr=(systemd-run --user --scope --quiet --unit="$unit"
+               --description="hermit-box-run passthrough: $*")
+  [ -n "$allowed_cpus" ] && sr+=(-p "AllowedCPUs=$allowed_cpus")
+  diag "scope=$unit cpu-budget=${cpu_budget}s cmd: $*"
+
+  # Preserve BYTE-IDENTICAL passthrough: the boxed CHILD must own the caller's REAL fd1/fd2,
+  # while the wrapper shell's OWN output — including bash async job notifications like
+  # "Terminated" when the backgrounded scope is signalled — must NOT touch those consumed
+  # streams. Save the real stdout/stderr (fd7/fd8), then redirect the wrapper's own fd1/fd2 to
+  # the diag stream (fd9). The child is launched with fd1<-7, fd2<-8 (the real streams), and
+  # fds 7/8/9 closed so no box bookkeeping fd leaks into the guest.
+  exec 7>&1 8>&2
+  exec 1>&9 2>&9
+  "${sr[@]}" -- "$@" 1>&7 2>&8 7>&- 8>&- 9>&- &
+  local runner_pid=$!
+
+  # Resolve the scope's cgroup path (may take a beat to register).
+  local cg="" cgpath="" i
+  for i in $(seq 1 40); do
+    cg="$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null || true)"
+    if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cpu.stat" ]; then
+      cgpath="/sys/fs/cgroup$cg"; break
+    fi
+    kill -0 "$runner_pid" 2>/dev/null || break   # child already finished
+    sleep 0.05
+  done
+
+  # If we are ourselves signalled (e.g. an outer wall `timeout` sends SIGTERM), tear the WHOLE
+  # scope down via cgroup.kill so no setsid/double-fork escapee survives us, then exit with the
+  # 128+signal convention. cgpath/runner_pid are visible here via bash dynamic scope.
+  _pt_teardown() {
+    if [ -n "$cgpath" ] && [ -w "$cgpath/cgroup.kill" ]; then echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true; fi
+    kill "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    exit 143
+  }
+  trap _pt_teardown TERM INT HUP
+
+  local budget_usec=$(( cpu_budget * 1000000 ))
+  local reaped=0 last_usage=0
+  if [ -z "$cgpath" ]; then
+    # Could not establish the reaper cgroup. Fail closed: tear down our own child, exit 3.
+    if kill -0 "$runner_pid" 2>/dev/null; then
+      diag "ERROR: could not resolve scope cgroup for $unit; killing own child and failing closed."
+      kill "$runner_pid" 2>/dev/null || true
+      wait "$runner_pid" 2>/dev/null || true
+      if [ "$allow_cgroup_failure" -eq 0 ]; then
+        echo "hermit-box-run: could not establish reaper cgroup (exit 3)" >&8  # fd8 = real stderr
+        exit 3
+      fi
+    fi
+  else
+    diag "cgroup=$cgpath"
+    # Monitor loop: poll CPU-time usage; reap cgroup.kill-first on budget overrun.
+    while kill -0 "$runner_pid" 2>/dev/null; do
+      last_usage="$(awk '/^usage_usec/{print $2}' "$cgpath/cpu.stat" 2>/dev/null || echo "$last_usage")"
+      if [ "${last_usage:-0}" -gt "$budget_usec" ]; then
+        diag "CPU-TIMEOUT: usage_usec=$last_usage exceeded budget=${budget_usec} (${cpu_budget}s) — reaping via cgroup.kill"
+        echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+        reaped=1
+        break
+      fi
+      sleep 0.25
+    done
+  fi
+
+  local status=0
+  wait "$runner_pid" 2>/dev/null || status=$?
+  # cgroup.kill-FIRST teardown: systemd-run returns when the MAIN scope process exits, but a
+  # setsid/double-fork escapee it reparented can still linger in the scope cgroup — the exact
+  # leak this wrapper prevents. Sweep the whole scope subtree unconditionally on exit so no
+  # process survives us. (Only ever our OWN scope's cgroup.kill; never an external/broad kill.)
+  if [ -n "$cgpath" ] && [ -w "$cgpath/cgroup.kill" ]; then
+    echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+  fi
+  diag "final usage_usec=${last_usage:-0} reaped=${reaped} exit=${status}"
+  if [ -n "$perf_dir" ]; then
+    mkdir -p "$perf_dir" 2>/dev/null || true
+    { printf 'label,scope,cpu_budget_s,usage_usec,reaped,exit\n'
+      printf '%s,%s,%s,%s,%s,%s\n' "$label" "$unit" "$cpu_budget" "${last_usage:-0}" "$reaped" "$status"
+    } >> "$perf_dir/hermit-box-run-passthrough.csv" 2>/dev/null || true
+  fi
+  exit "$status"   # REAL child exit status (137 on a SIGKILL/cgroup.kill reap); never collapsed.
+}
+
+if [ "$passthrough" -eq 1 ]; then
+  passthrough_run "$@"
+fi
+
 [ -x "$RUNNER" ] || die "runner not found/executable at $RUNNER"
 
 # Build the one-step DAG with correct JSON escaping via python3 (argv passed as $@).
