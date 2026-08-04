@@ -1074,8 +1074,9 @@ function append_validation_ledger {
     local finished_at result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
     local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
-    local evidence_helper evidence_json failed_substeps_json='[]'
+    local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
+    local solo_rerun_of_json=null
     local evidence_available=0 failure_origin_json gate_substeps_json
     local i
 
@@ -1110,8 +1111,10 @@ function append_validation_ledger {
             --dag-jobs "$VALIDATION_DAG_JOBS" \
             --concurrent-validates "$concurrent_validates_json" 2>>"$LOG_FILE"); then
             failed_substeps_json=$(jq -c '.failed_substeps' <<<"$evidence_json")
+            flaky_failed_substeps_json=$(jq -c '.flaky_failed_substeps' <<<"$evidence_json")
             known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
             solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
+            solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
             evidence_available=1
         fi
     fi
@@ -1180,7 +1183,9 @@ function append_validation_ledger {
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
+    line+="\"solo_rerun_of\":$solo_rerun_of_json,"
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
