@@ -757,7 +757,7 @@ readonly STRICT_COMPAT_TOTAL=191
 # The R/R ratchet asserts exactly the programs measured to pass record/replay.
 # History: PR #729 established a 131-row set (incl. ruby/dc/tcl) and PR #662 added
 # descriptor-state and writable-filesystem rows, reaching 144. A measured sweep
-# (see RR_COMPAT_KNOWN_FAILURES below) then found five gcc/binutils toolchain
+# (see record_replay_xfail_strict.rs) then found five gcc/binutils toolchain
 # programs -- g++, ar, strip, gprof, gcov -- that diverge on replay, so the honest
 # passing set is 139, not 144. Do NOT raise this number without a fresh sweep
 # proving the added rows pass R/R: an aspirational count is a phantom ratchet that
@@ -819,23 +819,11 @@ declare -ar COMPAT_SUMMARY_CATEGORIES=(
     other
 )
 
-# Programs owned by the strict corpus that are measured to FAIL record/replay and
-# are therefore excluded from the R/R passing ratchet below. Each records cleanly
-# but diverges on replay at hermit-cli/src/replayer/mod.rs:776 (the two runs part
-# on a specific thread/syscall event) -- a deeper multi-threaded compile/link/
-# analyze desync, distinct from the regular-file lseek(SEEK_CUR) divergence fixed
-# alongside this ratchet. They remain probed under strict/sabre modes; this list
-# documents why rr mode does not gate on them (the gcc/binutils toolchain R/R gap).
-declare -Ar RR_COMPAT_KNOWN_FAILURES=(
-    [g++]="replay diverges (thread 13, ~event 132): C++ front-end header/.gch path resolution (readlink vs newfstatat) desyncs the event stream"
-    [ar]="replay diverges (thread 11, ~event 3): archive workload teardown (execveat rm -rf) reorders against the recorded stream"
-    [strip]="replay diverges at replayer/mod.rs:776 after a clean record"
-    [gprof]="replay diverges at replayer/mod.rs:776 after a clean record"
-    [gcov]="replay diverges at replayer/mod.rs:776 after a clean record"
-)
 # Commands remain owned by the strict corpus below; this exact set only selects
-# rows measured to pass R/R. The five RR_COMPAT_KNOWN_FAILURES toolchain programs
-# (g++, ar, strip, gprof, gcov) are intentionally absent.
+# rows measured to pass R/R. The five toolchain divergences (g++, ar, strip,
+# gprof, gcov) are intentionally absent here and are exercised by the product's
+# xfail-strict record_replay_xfail_strict integration test. That test fails when
+# a listed divergence passes or changes to an unrecognized failure shape.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -4246,6 +4234,11 @@ if ((RR_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
+    fi
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Record/replay expected-divergence ratchet (xfail-strict)" \
+            env HERMIT_RR_XFAIL_BINARY="$STRICT_COMPAT_HERMIT_BIN" \
+            cargo test -p hermit --test record_replay_xfail_strict -- --test-threads=1
     fi
     print_summary
     ((failures == 0))
