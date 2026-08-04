@@ -22,9 +22,9 @@ on:
         required: true
         type: string
 
-# Gate semantics version: v2. The required status context is `merge-gate-v2`.
-# `MERGE_GATE_V2_BLOB` catches accidental v2 drift that retains the guard, and
-# the versioned context means an unmodified stale v1 branch cannot satisfy v2.
+# Gate semantics version: v3. The required status context is `merge-gate-v3`.
+# `MERGE_GATE_V3_BLOB` catches accidental v3 drift that retains the guard, and
+# the versioned context means an unmodified stale v2 branch cannot satisfy v3.
 # The guard itself remains PR-owned YAML: a deliberate gate-policy edit can
 # remove it, so gate-policy PRs still require escalated adversarial review.
 #
@@ -72,7 +72,7 @@ permissions:
 # (selected by the `gate` label only) that picks these jobs up in seconds;
 # the three PMU runners also carry the `gate` label as fallback, so a single-node
 # outage cannot block landing. Because the required-check context is the job name
-# (`merge-gate-v2`), changing `runs-on` does not change the ruleset requirement.
+# (`merge-gate-v3`), changing `runs-on` does not change the ruleset requirement.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
@@ -258,13 +258,13 @@ jobs:
             echo "::warning::Trusted receipt verifier is unavailable; failing closed."
           fi
 
-          # Invalidate both the steady-state v2 context and the transition-only
-          # legacy context before mutating the label. The issue_comment job
+          # Invalidate both the steady-state v3 context and the transition-only
+          # v2 context before mutating the label. The issue_comment job
           # itself is not required, and a follow-up dispatch can fail (fork
           # heads cannot be dispatched at all). Publishing both failures keeps
           # either ruleset version fail-closed at the exact PR head.
           summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
-          for context in merge-gate-v2 merge-gate; do
+          for context in merge-gate-v3 merge-gate-v2; do
             gh api --method POST \
               -H "Accept: application/vnd.github+json" \
               "repos/${REPO}/check-runs" \
@@ -421,7 +421,7 @@ jobs:
           exit "$failed"
 
   merge-gate:
-    name: merge-gate-v2
+    name: merge-gate-v3
     needs: [invalidate-local-validation, core-review-protocol]
     if: >-
       always() &&
@@ -431,9 +431,9 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
-      - name: Require the registered v2 gate definition
+      - name: Require the registered v3 gate definition
         env:
-          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V2_BLOB }}
+          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V3_BLOB }}
           GATE_PATH: .github/workflows/merge-gate.yml
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -441,17 +441,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$EXPECTED_GATE_BLOB" ]; then
-            echo "::error::MERGE_GATE_V2_BLOB is not configured; refusing an unbound gate result."
+            echo "::error::MERGE_GATE_V3_BLOB is not configured; refusing an unbound gate result."
             exit 1
           fi
           actual_blob="$(
             gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
           )"
           if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
-            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v2 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v3 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
             exit 1
           fi
-          echo "Gate definition is registered v2 blob ${actual_blob}."
+          echo "Gate definition is registered v3 blob ${actual_blob}."
       - name: Fetch the trusted receipt verifier
         env:
           GH_TOKEN: ${{ github.token }}
@@ -464,6 +464,18 @@ jobs:
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+      - name: Fetch the trusted check-outcome authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          authority="$RUNNER_TEMP/check_outcome.py"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
+            --jq .content | tr -d '\n' | base64 --decode >"$authority"
+          echo '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8  '"$authority" | sha256sum --check
+          chmod +x "$authority"
+          echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
       - name: Require the core-change review protocol
         env:
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
@@ -591,11 +603,8 @@ jobs:
               runs="$(
                 gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[] | select(.head_sha == $sha)]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$runs")"
+              run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" <<<"$runs")"
               run_id="$(jq -r '.id // ""' <<< "$run")"
               url="$(jq -r '.html_url // ""' <<< "$run")"
 
@@ -609,18 +618,21 @@ jobs:
                 jobs="$(
                   gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
                 )"
-                regular_job="$(jq '
-                  [.jobs[] | select(.name == "Regular tests (GitHub-managed portable)")]
-                  | last // {}
-                ' <<< "$jobs")"
+                regular_job="$(
+                  jq '.jobs' <<<"$jobs" \
+                    | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                    | jq '[.[] | select(.name == "Regular tests (GitHub-managed portable)")] | first // {}'
+                )"
                 job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
                 job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
                 job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
+                job_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                  --status "$job_status" --conclusion "$job_conclusion")"
 
-                if [ "$job_status:$job_conclusion" = completed:success ]; then
+                if [ "$job_outcome" = PASSED ]; then
                   echo "Authoritative portable job passed for PR #${pr_number} at $head_sha: ${job_url:-$url}"
                 else
-                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_status/${job_conclusion:-none}: ${job_url:-${url:-no run URL}}."
+                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_outcome ($job_status/${job_conclusion:-none}): ${job_url:-${url:-no run URL}}."
                   failed=1
                 fi
               fi
@@ -633,11 +645,8 @@ jobs:
               priv_runs="$(
                 gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              priv_run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[] | select(.head_sha == $sha)]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$priv_runs")"
+              priv_run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" <<<"$priv_runs")"
               priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
               priv_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
 
@@ -648,18 +657,21 @@ jobs:
                 priv_jobs="$(
                   gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
                 )"
-                priv_job="$(jq '
-                  [.jobs[] | select(.name == "Privileged capability and E2E tests")]
-                  | last // {}
-                ' <<< "$priv_jobs")"
+                priv_job="$(
+                  jq '.jobs' <<<"$priv_jobs" \
+                    | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                    | jq '[.[] | select(.name == "Privileged capability and E2E tests")] | first // {}'
+                )"
                 priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
                 priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
                 priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
+                priv_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                  --status "$priv_status" --conclusion "$priv_conclusion")"
 
-                if [ "$priv_status:$priv_conclusion" = completed:success ]; then
+                if [ "$priv_outcome" = PASSED ]; then
                   echo "Privileged job passed for PR #${pr_number} at $head_sha: ${priv_job_url:-$priv_url}"
                 else
-                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_status/${priv_conclusion:-none}: ${priv_job_url:-${priv_url:-no run URL}}."
+                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_outcome ($priv_status/${priv_conclusion:-none}): ${priv_job_url:-${priv_url:-no run URL}}."
                   failed=1
                 fi
               fi
@@ -686,26 +698,22 @@ jobs:
                 | grep -vE '^tests/(e2e|backend-parity)/' || true
             )"
             if [ -n "$hot_files" ]; then
-              all_runs="$(
-                gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
+              demo_runs="$(
+                gh api "repos/${REPO}/actions/workflows/demo-hot-path.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              demo_run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[]
-                  | select(
-                      .head_sha == $sha
-                      and .name == "P0 Demo Gate (Hermit hot paths)"
-                    )]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$all_runs")"
+              demo_run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" \
+                --event pull_request <<<"$demo_runs")"
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
+              demo_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                --status "$demo_status" --conclusion "$demo_conclusion")"
 
-              if [ "$demo_status:$demo_conclusion" = completed:success ]; then
+              if [ "$demo_outcome" = PASSED ]; then
                 echo "P0 demo gate passed for hot-path PR #${pr_number} at $head_sha: $demo_url"
               else
-                echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_status/${demo_conclusion:-none}: ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
+                echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_outcome ($demo_status/${demo_conclusion:-none}): ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
                 failed=1
               fi
             else
@@ -719,12 +727,12 @@ jobs:
 
           exit "$failed"
 
-  # Transition only: before the ruleset moves from `merge-gate` to
-  # `merge-gate-v2`, mirror v2 into the legacy context so this policy PR can
+  # Transition only: before the ruleset moves from `merge-gate-v2` to
+  # `merge-gate-v3`, mirror v3 into the legacy context so this policy PR can
   # land without an admin bypass. The reconciler disables this variable after
   # the ruleset switch, leaving a skipped job that consumes no runner.
   merge-gate-legacy-context:
-    name: merge-gate
+    name: merge-gate-v2
     needs: merge-gate
     if: >-
       always() &&
@@ -733,13 +741,13 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
     steps:
-      - name: Mirror the registered v2 result during migration
+      - name: Mirror the registered v3 result during migration
         env:
-          V2_RESULT: ${{ needs.merge-gate.result }}
+          V3_RESULT: ${{ needs.merge-gate.result }}
         run: |
           set -euo pipefail
-          if [ "$V2_RESULT" != success ]; then
-            echo "::error::merge-gate-v2 did not pass (result=${V2_RESULT})."
+          if [ "$V3_RESULT" != success ]; then
+            echo "::error::merge-gate-v3 did not pass (result=${V3_RESULT})."
             exit 1
           fi
-          echo "merge-gate-v2 passed; emitting temporary legacy context."
+          echo "merge-gate-v3 passed; emitting temporary v2 context."
