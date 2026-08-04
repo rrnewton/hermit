@@ -4198,7 +4198,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
             "$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            "$ROOT_DIR/target/liteinst-runtime-build-6b9282c"
+            "$ROOT_DIR/target/liteinst-runtime-build-b5e3a2a"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
