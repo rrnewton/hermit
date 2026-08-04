@@ -308,8 +308,8 @@
     },
     {
       "group": "test", "job": "detcore_unit",
-      "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
-      "cmd": "cargo test -p detcore --lib --bins",
+      "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
+      "cmd": "cargo test -p hermit-detcore --lib --bins",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"est_duration_s": 120,
@@ -319,7 +319,7 @@
     {
       "group": "test", "job": "detcore_misc",
       "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
-      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
+      "cmd": "cargo test -p hermit-detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
@@ -329,7 +329,7 @@
     {
       "group": "test", "job": "detcore_parallel",
       "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
-      "cmd": "cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4",
+      "cmd": "cargo test -p hermit-detcore --test tests_parallelism -- --skip detcore --test-threads=4",
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,

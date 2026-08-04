@@ -8,7 +8,7 @@
     {
       "group": "build", "job": "privileged_tests",
       "desc": "Build Hermit and the focused test binaries used by the privileged lane",
-      "cmd": "cargo build -p hermit --features third-party-backends --bin hermit && cargo test -p detcore --test tests_misc --no-run",
+      "cmd": "cargo build -p hermit --features third-party-backends --bin hermit && cargo test -p hermit-detcore --test tests_misc --no-run",
       "deps": ["e2e.metadata"],
       "timeout": 120,
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 5368709120,
@@ -17,7 +17,7 @@
     {
       "group": "cpuid", "job": "faulting",
       "desc": "CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits",
-      "cmd": "timeout 30 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
+      "cmd": "timeout 30 cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
       "deps": ["build.privileged_tests"],
       "timeout": 40,
       "hint": {"est_duration_s": 15,

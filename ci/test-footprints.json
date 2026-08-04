@@ -44,7 +44,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.dbi_release",
@@ -93,7 +93,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.dbi_release",
@@ -175,7 +175,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore, detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.dbi_release",
@@ -244,7 +244,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.dbi_release",

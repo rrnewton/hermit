@@ -79,8 +79,8 @@ cargo test --workspace
 During iteration, prefer the narrowest relevant target, for example:
 
 ```bash
-cargo test -p detcore
-cargo test -p detcore --test tests_time
+cargo test -p hermit-detcore
+cargo test -p hermit-detcore --test tests_time
 cargo test -p hermit
 ```
 

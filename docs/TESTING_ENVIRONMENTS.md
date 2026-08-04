@@ -164,7 +164,7 @@ subset**:
 - `cargo nextest run --profile ci --workspace` **excluding** `detcore`,
   `hermit`, and `hermetic_infra_hermit_flaky-tests`
 - `cargo test -p hermit --lib --bins` (no namespace-dependent integration tests)
-- `cargo test -p detcore --lib --bins`
+- `cargo test -p hermit-detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 
 GitHub-managed portable runners have **no usable PMU and no CPUID faulting**, so the
@@ -267,7 +267,7 @@ grep -m1 '^flags' /proc/cpuinfo
 cat /proc/sys/kernel/perf_event_paranoid
 systemd-detect-virt || true
 cargo test --workspace --no-fail-fast
-cargo test -p detcore --test tests_misc -- --nocapture
+cargo test -p hermit-detcore --test tests_misc -- --nocapture
 ```
 
 What matters in the output:
