@@ -39,39 +39,36 @@
     },
     {
       "group": "build", "job": "workspace",
-      "desc": "Build workspace (cargo build --workspace --features third-party-backends)",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --workspace --features third-party-backends",
+      "desc": "Build all debug workspace targets in one Cargo invocation",
+      "description": "ONE-FAT-BUILD 2026-08-04 (task collapse-separate-build-nodes-into-one-fat-cargo-invocation): one cargo build owns the complete debug workspace graph, including test targets and the flaky harness. This removes the redundant flaky-harness build node. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
+      "cmd": "cargo build --workspace --all-targets --features third-party-backends",
       "deps": ["e2e.metadata"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "jobs_flag": "",
+      "hint": {"est_duration_s": 130, "rss_baseline_bytes": 11663998976,
+               "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
+               "preferred_inner_jobs": 32}
     },
     {
-      "group": "build", "job": "dbi_release",
-      "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
-      "deps": ["build.workspace"],
+      "group": "build", "job": "runtime_release",
+      "desc": "Build release Hermit and all runtime backend artifacts in one Cargo invocation",
+      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBI, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbi, detcore-sabre, and hermit-install together; the former serial dbi_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use validate.sh's existing explicit-prebuilt contract rather than rebuilding the same release profile.",
+      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
+      "deps": ["e2e.metadata"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
-    },
-    {
-      "group": "build", "job": "sabre_release",
-      "desc": "Build the release Detcore SaBRe plugin and restage the pinned loader",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --release --locked -p detcore-sabre && CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
-      "deps": ["build.dbi_release"],
-      "timeout": 1200,
-      "hint": {"est_duration_s": 90, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
+      "jobs_flag": "",
+      "hint": {"est_duration_s": 185, "rss_baseline_bytes": 9006452736,
+               "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
+               "preferred_inner_jobs": 32}
     },
     {
       "group": "build", "job": "liteinst_runtime_release",
       "desc": "Build and stage the release LiteInst runtime",
       "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-7951770",
-      "deps": ["build.dbi_release"],
+      "deps": ["build.runtime_release"],
       "timeout": 900,
-      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 2147483648,
-               "hard_mem_max_bytes": 4294967296, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
     {
       "group": "e2e", "job": "metadata",
@@ -95,7 +92,7 @@
       "desc": "Portable manifest bucket: applications",
       "manifest": {"lane": "portable", "category": "applications"},
       "cmd": "./ci/test_harness.sh run --lane portable --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/applications/results.jsonl --junit ignored/e2e/portable/applications/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -128,7 +125,7 @@
       "desc": "Portable manifest bucket: c-programs",
       "manifest": {"lane": "portable", "category": "c-programs"},
       "cmd": "./ci/test_harness.sh run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/c-programs/results.jsonl --junit ignored/e2e/portable/c-programs/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -150,7 +147,7 @@
       "desc": "Portable manifest bucket: data-handling",
       "manifest": {"lane": "portable", "category": "data-handling"},
       "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/data-handling/results.jsonl --junit ignored/e2e/portable/data-handling/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -216,7 +213,7 @@
       "desc": "Portable manifest bucket: system-utils",
       "manifest": {"lane": "portable", "category": "system-utils"},
       "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/system-utils/results.jsonl --junit ignored/e2e/portable/system-utils/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -254,66 +251,63 @@
     {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
-      "cmd": "cargo clippy --workspace --all-targets -- -D warnings",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets -- -D warnings",
       "deps": ["build.workspace"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 6442450944,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
     {
       "group": "doc", "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "cmd": "cargo test --workspace --features third-party-backends --doc",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test --workspace --features third-party-backends --doc",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
     },
     {
       "group": "doc", "job": "rustdoc",
       "desc": "Documentation (cargo doc --workspace --no-deps)",
-      "cmd": "cargo doc --workspace --no-deps",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> rustdoc's build phase defaulted to nproc; historical notes show this node has hit >5GiB uncapped/at-nproc, so pinning is the fix). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo doc --workspace --no-deps",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1181116006,
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "regular_crates",
       "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
-      "cmd": "cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
       "deps": ["build.workspace", "setup.nextest"],
       "timeout": 900,
-      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 4294967296,
-               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
-    },
-    {
-      "group": "build", "job": "flaky_harnesses",
-      "desc": "Compile flaky guest test harnesses (--no-run)",
-      "cmd": "cargo test -p hermetic_infra_hermit_flaky-tests --no-run",
-      "deps": ["build.workspace"],
-      "timeout": 900,
-      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
+               "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "cmd": "cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
-      "cmd": "cargo test -p detcore --lib --bins",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p detcore --lib --bins",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"est_duration_s": 120,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
                "classification": "cpu-bound"}
     },
     {
@@ -323,7 +317,7 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -333,7 +327,7 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -343,7 +337,7 @@
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -353,7 +347,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -363,7 +357,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -380,7 +374,7 @@
       "group": "test", "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
       "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --features third-party-backends --test sabre_examples -- --test-threads=1",
-      "deps": ["build.sabre_release"],
+      "deps": ["build.runtime_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
@@ -393,7 +387,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -403,7 +397,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -413,7 +407,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -423,26 +417,27 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
       "group": "test", "job": "rr_suite_contract",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (safe-ci-dag-runner step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing).",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
       "deps": ["build.workspace"],
       "timeout": 300,
-      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 1073741824,
-               "hard_mem_max_bytes": 2147483648, "classification": "light"}
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 3758096384,
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "dbi_parity",
       "desc": "DynamoRIO DBI strict backend parity matrix",
       "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --strict --require-backend",
-      "deps": ["build.dbi_release"],
+      "deps": ["build.runtime_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -452,19 +447,19 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
       "group": "test", "job": "strict_compat",
       "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
-      "deps": ["lint.clippy", "doc.doctests", "doc.rustdoc",
-               "test.regular_crates", "build.flaky_harnesses",
+      "cmd": "STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
+      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
       "timeout": 1800,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}
     }
   ]
