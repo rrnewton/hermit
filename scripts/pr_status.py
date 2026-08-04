@@ -38,26 +38,20 @@ DEFAULT_MAIN_LIMIT = 10
 HUMAN_REVIEW_LABEL = "human-review"
 REGULAR_PORTABLE_CHECK = "Regular tests (GitHub-managed portable)"
 REQUIRED_CHECKS = {
-    "rrnewton/hermit": (REGULAR_PORTABLE_CHECK,),
-    "rrnewton/reverie": (
-        REGULAR_PORTABLE_CHECK,
-        "Host-dependent tests (privileged)",
-    ),
+    # Live repository policy (queried 2026-08-04): both main branches require
+    # the merge-gate context. Product jobs are inputs to that gate, not separate
+    # required contexts, so a status consumer must not substitute its own set.
+    "rrnewton/hermit": ("merge-gate",),
+    "rrnewton/reverie": ("merge-gate",),
 }
 
-RED_CONCLUSIONS = frozenset(
+FAILED_CONCLUSIONS = frozenset(
     (
         "FAILURE",
         "TIMED_OUT",
-        "CANCELLED",
         "ERROR",
-        "ACTION_REQUIRED",
         "STARTUP_FAILURE",
-        "STALE",
     )
-)
-PENDING_STATES = frozenset(
-    ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
 )
 
 
@@ -93,16 +87,34 @@ def _check_sort_key(check: dict[object, object], index: int) -> tuple[int, str, 
     return run_id, timestamp, index
 
 
+def classify_check_outcome(conclusion: object, status: object) -> str:
+    """Return passed, failed, or no-result for one GitHub status.
+
+    GitHub CheckRun objects carry ``status=COMPLETED``. Legacy StatusContext
+    objects have a terminal ``state`` but no separate status, so empty status is
+    also terminal. Every other shape is NO-RESULT; unknown values fail closed
+    without being misreported as product failures.
+    """
+    concl = str(conclusion or "").upper()
+    stat = str(status or "").upper()
+    terminal = not stat or stat == "COMPLETED"
+    if terminal and concl == "SUCCESS":
+        return "passed"
+    if terminal and concl in FAILED_CONCLUSIONS:
+        return "failed"
+    return "no-result"
+
+
 def classify_ci_rollup(repo: str, checks: object) -> str:
-    """Classify the latest authoritative checks as green, red, pending, or none.
+    """Classify the latest required checks as green, red, or no-result.
 
     GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
-    In particular, Hermit's merge gate intentionally starts red and refires
-    after portable CI completes. Those historical placeholders must not turn a
-    portable-green pull request red in this operational report.
+    Only the newest instance of each live required context controls the result.
+    Missing, cancelled, skipped, neutral, stale, active, and unknown checks all
+    block as ``no-result`` without inflating the red count.
     """
     if not isinstance(checks, list) or not checks:
-        return "none"
+        return "no-result"
 
     required = REQUIRED_CHECKS.get(repo, (REGULAR_PORTABLE_CHECK,))
     latest: dict[str, tuple[tuple[int, str, int], dict[object, object]]] = {}
@@ -118,23 +130,19 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
             latest[name] = (sort_key, check)
 
     if not latest:
-        return "none"
+        return "no-result"
 
-    saw_pending = len(latest) != len(required)
+    saw_no_result = len(latest) != len(required)
     for _, check in latest.values():
         conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         status = str(check.get("status") or "").upper()
-
-        if conclusion in RED_CONCLUSIONS:
+        outcome = classify_check_outcome(conclusion, status)
+        if outcome == "failed":
             return "red"
-        if (
-            conclusion in PENDING_STATES
-            or not conclusion
-            or (status and status != "COMPLETED")
-        ):
-            saw_pending = True
+        if outcome == "no-result":
+            saw_no_result = True
 
-    return "pending" if saw_pending else "green"
+    return "no-result" if saw_no_result else "green"
 
 
 def parse_pull_request(repo: str, raw: object) -> PullRequest:
@@ -296,23 +304,9 @@ def _format_run_time(created_at: object) -> str:
 
 
 def classify_run_conclusion(conclusion: object, status: object) -> str:
-    """Map a run's ``conclusion``/``status`` to pass/fail/pending/skipped/other.
-
-    A run with no conclusion yet (empty conclusion, or a non-completed status)
-    is ``pending``. ``RED_CONCLUSIONS`` (failure, timed out, cancelled, ...)
-    are ``fail`` so they can be highlighted; ``success`` is ``pass``.
-    """
-    concl = str(conclusion or "").upper()
-    stat = str(status or "").upper()
-    if concl == "SUCCESS":
-        return "pass"
-    if concl in RED_CONCLUSIONS:
-        return "fail"
-    if concl in ("SKIPPED", "NEUTRAL"):
-        return "skipped"
-    if not concl or (stat and stat != "COMPLETED"):
-        return "pending"
-    return "other"
+    """Map a workflow run to the same pass/fail/no-result model."""
+    outcome = classify_check_outcome(conclusion, status)
+    return {"passed": "pass", "failed": "fail", "no-result": "no-result"}[outcome]
 
 
 def parse_workflow_run(repo: str, raw: object) -> WorkflowRun:
@@ -369,9 +363,7 @@ def fetch_main_runs(repo: str, limit: int) -> list[WorkflowRun]:
 _STATE_MARKER = {
     "pass": "ok",
     "fail": "FAIL",
-    "pending": "...",
-    "skipped": "skip",
-    "other": "?",
+    "no-result": "NONE",
 }
 
 
@@ -395,8 +387,7 @@ def render_main_ci(runs: Sequence[WorkflowRun], repo: str, limit: int) -> str:
 
     passing = sum(run.state == "pass" for run in runs)
     failing = sum(run.state == "fail" for run in runs)
-    pending = sum(run.state == "pending" for run in runs)
-    skipped = sum(run.state == "skipped" for run in runs)
+    no_result = sum(run.state == "no-result" for run in runs)
     commits = len({run.head_sha for run in runs})
     lines.extend(
         (
@@ -405,8 +396,7 @@ def render_main_ci(runs: Sequence[WorkflowRun], repo: str, limit: int) -> str:
             f"  runs shown:  {len(runs)} across {commits} commits",
             f"  pass:        {passing}",
             f"  fail:        {failing}",
-            f"  pending:     {pending}",
-            f"  skipped:     {skipped}",
+            f"  no-result:   {no_result}",
         )
     )
 

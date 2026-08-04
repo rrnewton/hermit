@@ -6,10 +6,47 @@ request head from bypassing changes that landed ahead of it.
 
 The required check is `merge-gate`. It passes when either:
 
-- the latest `.github/workflows/ci-portable.yml` run for the exact pull request
-  head completed successfully; or
+- the authoritative jobs in the latest `.github/workflows/ci-portable.yml` and
+  `.github/workflows/ci-privileged.yml` runs for the exact pull request head
+  both completed successfully; or
 - the pull request has the `locally-validated` label from a fully green
-  `./validate.sh` run.
+  `./validate.sh` run, plus a complete exact-head full-validation evidence
+  comment.
+
+Every check reader uses three outcomes:
+
+- **PASSED**: a terminal success result. This is the only hosted state that can
+  satisfy the gate.
+- **FAILED**: a terminal `failure`, `timed_out`, `error`, or `startup_failure`.
+  Exact-head local evidence cannot override it.
+- **NO_RESULT**: cancelled, skipped, neutral, stale, action-required, active,
+  absent, or unknown. It blocks landing without being counted as a failure. The
+  gate re-dispatches a terminal/absent workflow and records its own required
+  context as cancelled until a real result exists.
+
+An exact-head full local PASSED record is a separate admission leg, not a rule
+that converts hosted NO_RESULT into success. The P0 demo gate has no local
+substitute.
+
+## Status consumer inventory
+
+The state table is enforced at every decision surface:
+
+- `.github/workflows/merge-gate.yml` classifies portable, privileged, demo,
+  review-protocol, and validation-invalidation results before admission.
+- `scripts/pr_status.py` reports required-check rollups and main workflow
+  history without counting NO_RESULT as red or green.
+- `scripts/pr-dag-health.sh` and the pinned `agent-utils` landing planner use
+  the live required `merge-gate` context; an absent context is never
+  `landable-now`.
+- Parent `ci-hub` uses its canonical `check_outcome.py` model in landing,
+  validate-status, health, remediation, and history consumers.
+
+Two consumers are intentionally not generic admission classifiers.
+`ci-portable.yml` accepts a skipped internal shard only after affected-test
+selection proves that shard deselected; a cancelled selected shard still fails
+the aggregate. `ci-portable-autoretry.yml` consumes cancellation as a trigger
+to create a new result and never treats it as pass or failure.
 
 The workflow removes `locally-validated` whenever the pull request head
 changes. It also re-runs the gate after CI completes and on label changes, so a

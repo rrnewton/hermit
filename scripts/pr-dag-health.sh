@@ -72,6 +72,7 @@ gh_()  { if [ -n "$PROXY" ]; then "$PROXY" gh  "$@"; else gh  "$@"; fi; }
 git_() { if [ -n "$PROXY" ]; then "$PROXY" git "$@"; else git "$@"; fi; }
 
 log "pr-dag-health: querying open PRs for $REPO ..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
     --json number,title,headRefName,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
     || die "gh pr list failed (is the proxy/auth configured?)"
@@ -84,21 +85,23 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
 # class.
 # ---------------------------------------------------------------------------
 ENRICH_JQ='
-def result: (.conclusion // .state // .status // "PENDING");
-def red: ["FAILURE","TIMED_OUT","CANCELLED","ERROR","ACTION_REQUIRED","STARTUP_FAILURE","STALE"];
+include "check_outcome";
+def result: (.conclusion // .state // "NONE");
+def latest_named($rollup; $name):
+  ($rollup
+   | map(select((.name // .context)==$name))
+   | sort_by(.startedAt // .createdAt // .completedAt // .detailsUrl // "")
+   | last);
 def ci_of($rollup):
   ($rollup // []) as $r
+  | latest_named($r; "merge-gate") as $gate
+  | latest_named($r; "Regular tests (GitHub-managed portable)") as $regular
+  | latest_named($r; "Privileged capability and E2E tests") as $hostdep
   | { checks: ($r|length),
-      regular: (($r | map(select((.name // .context)=="Regular tests (GitHub-managed portable)")) | .[0]) as $x
-                | if $x==null then "NONE" else ($x|result) end),
-      hostdep: (($r | map(select((.name // .context)=="Privileged capability and E2E tests")) | .[0]) as $x
-                | if $x==null then "NONE" else ($x|result) end) }
-  | . as $o
-  | $o + { overall:
-      (if $o.regular=="SUCCESS" then "PASS"
-       elif (red | index($o.regular)) then "FAIL"
-       elif $o.regular=="NONE" then (if $o.checks==0 then "NONE" else "OTHER" end)
-       else "PENDING" end) };
+      gate: (if $gate==null then "NONE" else ($gate|result) end),
+      regular: (if $regular==null then "NONE" else ($regular|result) end),
+      hostdep: (if $hostdep==null then "NONE" else ($hostdep|result) end),
+      overall: (if $gate==null then "NO_RESULT" else ($gate|check_outcome) end) };
 
 . as $prs
 | ($prs | map({(.headRefName): .number}) | add // {}) as $byhead
@@ -129,8 +132,8 @@ def ci_of($rollup):
          elif .parent != null then (if anc_hr(.number) then "blocked-on-human-review" else "blocked-on-dependency" end)
          elif (.base_is_main | not) then "detached-base"
          elif .conflicts then "conflicted"
-         elif .ci.overall=="FAIL" then "ci-red"
-         elif (.ci.overall=="PASS" or .ci.overall=="NONE") then "landable-now"
+         elif .ci.overall=="FAILED" then "ci-red"
+         elif .ci.overall=="PASSED" then "landable-now"
          else "pending" end) })
   | map({number, title, headRefName, baseRefName,
          author: (.author.login // "?"),
@@ -139,7 +142,7 @@ def ci_of($rollup):
          blocked_on_human_review, releases, released_prs, class})
 '
 
-ENRICHED="$(printf '%s' "$RAW" | jq --arg main "$MAIN_BRANCH" "$ENRICH_JQ")" \
+ENRICHED="$(printf '%s' "$RAW" | jq -L "$SCRIPT_DIR" --arg main "$MAIN_BRANCH" "$ENRICH_JQ")" \
     || die "jq enrichment failed"
 
 # ---------------------------------------------------------------------------
@@ -150,7 +153,6 @@ ENRICHED="$(printf '%s' "$RAW" | jq --arg main "$MAIN_BRANCH" "$ENRICH_JQ")" \
 # ---------------------------------------------------------------------------
 COMMUTE_JSON='{}'
 if [ "$DO_COMMUTE" -eq 1 ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -z "$REPO_DIR" ]; then
         log "pr-dag-health: no local checkout found; skipping commute check"
@@ -190,21 +192,24 @@ MAIN_CI="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" \
 # ---------------------------------------------------------------------------
 # Assemble the final JSON model.
 # ---------------------------------------------------------------------------
-MODEL="$(printf '%s' "$ENRICHED" | jq \
+MODEL="$(printf '%s' "$ENRICHED" | jq -L "$SCRIPT_DIR" \
     --arg repo "$REPO" --arg main "$MAIN_BRANCH" \
     --arg mainsha "$MAIN_SHA" --arg mainci "$MAIN_CI" \
     --argjson commute "$COMMUTE_JSON" '
+  include "check_outcome";
   map(. + {commutes_to_main: ($commute[(.number|tostring)] // "n/a")}) as $prs
+  | ({status:"COMPLETED", conclusion:$mainci} | check_outcome) as $main_outcome
   | {
       generated_by: "pr-dag-health.sh",
       repo: $repo,
       main: {branch: $main, head: $mainsha, ci_regular: $mainci,
-             green: (($mainci|ascii_downcase)=="success")},
+             outcome: $main_outcome, green: ($main_outcome=="PASSED")},
       summary: {
         total: ($prs | length),
         by_class: ($prs | group_by(.class) | map({key: .[0].class, value: length}) | from_entries),
         conflicted: ($prs | map(select(.conflicts)) | length),
-        ci_red: ($prs | map(select(.ci.overall=="FAIL")) | length),
+        ci_red: ($prs | map(select(.ci.overall=="FAILED")) | length),
+        ci_no_result: ($prs | map(select(.ci.overall=="NO_RESULT")) | length),
         floating: ($prs | map(select(.base_is_main|not)) | length)
       },
       review_priority: ($prs
@@ -240,7 +245,7 @@ if [ "$FORMAT" != json ]; then
       "==================================================================",
       "main \(.main.branch) @ \(.main.head)  |  Regular-tests CI: \(.main.ci_regular)  |  green: \(.main.green)",
       "",
-      "Open PRs: \(.summary.total)   floating(non-main base): \(.summary.floating)   conflicted: \(.summary.conflicted)   ci-red: \(.summary.ci_red)",
+      "Open PRs: \(.summary.total)   floating(non-main base): \(.summary.floating)   conflicted: \(.summary.conflicted)   ci-red: \(.summary.ci_red)   ci-no-result: \(.summary.ci_no_result)",
       "By class:",
       (.summary.by_class | to_entries[] | "  \(.key|col(26)) \(.value)"),
       "",
