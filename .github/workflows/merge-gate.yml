@@ -20,28 +20,55 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head after the repository
-# GitHub-managed portable CI job succeeds or after a fully green local validate.sh
-# run applies the locally-validated label. The independent Reverie-pin lint does
-# not taint this product-test result. Demo-relevant changes
-# additionally require the exact-SHA P0 demo gate; local validation never bypasses
-# that owner-mandated gate. Privileged CI is an independent bonus signal.
-# Merge-group checks inspect their constituent PR heads instead of trusting the
-# synthetic queue commit.
+# This required check is the SOLE required status check on main (branch ruleset
+# "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
+# fully green local validate.sh run applied the locally-validated label, OR the
+# GitHub-Actions leg is green -- and GitHub-Actions-green now means the portable
+# job AND the privileged job both succeeded, not the portable job alone. The
+# independent Reverie-pin lint does not taint this product-test result. Owner
+# rationale: GitHub CI flakiness must never block a locally-validated PR, so the
+# standalone "Regular tests (GitHub-managed portable)" requirement was folded
+# into this gate's GitHub-Actions leg and dropped from the ruleset. Demo-relevant
+# changes additionally require the exact-SHA P0 demo gate; local validation never
+# bypasses that owner-mandated gate. Merge-group checks inspect their constituent
+# PR heads instead of trusting the synthetic queue commit.
 #
 # The gate is fork-only because facebookexperimental/hermit has no access to the
 # fork privileged runners and fork pull requests receive a read-only token in
 # that repository. Upstream relies on the GitHub-managed portable Rust job instead.
+
+# Deduplicate superseded runs. Every push/label to a PR re-fires this workflow;
+# without cancellation those runs stack in the shared hosted-runner queue (they
+# ran ~40 deep on 2026-08-03), so even this ~5s stamp-check waits behind 40-min
+# builds and landing stalls. The check is idempotent (it re-reads the current PR
+# head state), so cancelling an in-flight PR run is always safe. Cancel ONLY
+# pull_request runs; merge_group, workflow_run, and workflow_dispatch runs each
+# get a unique group and are never cancelled. Mirrors demo-hot-path.yml.
+concurrency:
+  group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   actions: read
   contents: read
   pull-requests: read
 
+# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
+# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
+# a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
+# ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
+# ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
+# stamp-check queued behind 40-min builds and NOTHING landed. Routing to
+# `[self-hosted, gate]` targets an always-idle lightweight runner
+# (selected by the `gate` label only) that picks these jobs up in seconds;
+# the three PMU runners also carry the `gate` label as fallback, so a single-node
+# outage cannot block landing. Because the required-check context is the job name
+# (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       actions: write
@@ -87,18 +114,30 @@ jobs:
       github.repository == 'rrnewton/hermit' &&
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       contents: read
       issues: write
       pull-requests: write
     steps:
+      - name: Check out the trusted label-strip evidence helper
+        uses: actions/checkout@v4
+        with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so executing scripts/label-strip-evidence.sh from
+          # PR-controlled code would run arbitrary PR code on our infrastructure.
+          # The helper only reads its arguments and calls the GitHub API, so
+          # main's copy is the correct and safe version to run.
+          ref: main
+          persist-credentials: false
       - name: Remove validation and stale approvals inherited from an older PR head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
         run: |
           set -euo pipefail
           # A new push invalidates prior sign-off on the previous revision:
@@ -107,21 +146,41 @@ jobs:
           #     so their approval must be re-earned before the core-review-protocol
           #     job (below) will let a post-facto-human-review PR land again.
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          cleared=()
+          locally_validated_cleared=0
           for stale in locally-validated passed-review-codex passed-review-claude; do
             if grep -Fxq "$stale" <<< "$labels"; then
               gh api --method DELETE \
                 "repos/${REPO}/issues/${PR_NUMBER}/labels/${stale}" \
                 --silent
               echo "Removed stale ${stale} label from PR #$PR_NUMBER."
+              cleared+=("$stale")
+              [ "$stale" = locally-validated ] && locally_validated_cleared=1
             fi
           done
+
+          # Preserve the validation record so stripping the label never silently
+          # erases WHAT was validated (commit, profile, durable log pointer). The
+          # helper is best-effort and always exits 0, so it can never fail this
+          # job — merge-gate requires invalidate-local-validation to succeed.
+          if [ "$locally_validated_cleared" = 1 ]; then
+            bash scripts/label-strip-evidence.sh \
+              --pr "$PR_NUMBER" \
+              --repo "$REPO" \
+              --validated-sha "$BEFORE_SHA" \
+              --new-sha "$AFTER_SHA" \
+              --labels "${cleared[*]}" \
+              --actor "invalidate-local-validation (push synchronize)" \
+              --reason "a new push advanced the PR head; local validation applied to the previous head" \
+              || echo "label-strip-evidence helper returned non-zero (ignored; best-effort)."
+          fi
 
   core-review-protocol:
     name: core-review-protocol
     if: >-
       github.repository == 'rrnewton/hermit' &&
       github.event_name != 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -130,6 +189,14 @@ jobs:
       - name: Check out the review-protocol linter
         uses: actions/checkout@v4
         with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so checking out PR-controlled code and executing
+          # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
+          # code on our infrastructure. The linter reads only environment inputs
+          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER), so main's copy is the correct
+          # and safe version to run — and a PR cannot weaken its own gate by
+          # editing the lint script.
+          ref: main
           persist-credentials: false
       - name: Enforce the core-change review protocol
         env:
@@ -221,7 +288,7 @@ jobs:
       always() &&
       github.repository == 'rrnewton/hermit' &&
       github.event_name != 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
       - name: Require the core-change review protocol
@@ -361,14 +428,68 @@ jobs:
                   failed=1
                 fi
               fi
+
+              # Owner policy (2026-08-02): GitHub-Actions validation means the
+              # portable job AND the privileged job are both green. Only a
+              # locally-validated PR bypasses this leg entirely. The privileged
+              # job runs on the fork's self-hosted PMU runner (ci-privileged.yml)
+              # and is the KVM/PMU/E2E authority the portable lane cannot provide.
+              priv_runs="$(
+                gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
+              )"
+              priv_run="$(jq --arg sha "$head_sha" '
+                [.workflow_runs[] | select(.head_sha == $sha)]
+                | sort_by(.created_at)
+                | last // {}
+              ' <<< "$priv_runs")"
+              priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
+              priv_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
+
+              if [ -z "$priv_run_id" ]; then
+                echo "::error::No ci-privileged.yml run for PR #${pr_number} at $head_sha; GitHub-Actions validation requires the privileged job green. Apply locally-validated to use the local-validation leg instead."
+                failed=1
+              else
+                priv_jobs="$(
+                  gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
+                )"
+                priv_job="$(jq '
+                  [.jobs[] | select(.name == "Privileged capability and E2E tests")]
+                  | last // {}
+                ' <<< "$priv_jobs")"
+                priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
+                priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
+                priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
+
+                if [ "$priv_status:$priv_conclusion" = completed:success ]; then
+                  echo "Privileged job passed for PR #${pr_number} at $head_sha: ${priv_job_url:-$priv_url}"
+                else
+                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_status/${priv_conclusion:-none}: ${priv_job_url:-${priv_url:-no run URL}}."
+                  failed=1
+                fi
+              fi
             fi
 
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
+            # Match the hot-path globs, then subtract the test trees the demo
+            # suite provably never executes. The demo job runs
+            # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
+            # and never runs the Hermit e2e corpus, so nothing under
+            # `tests/e2e/**` can change a demo outcome; the standalone
+            # `tests/backend-parity/**` parity fixtures are likewise never read.
+            # A PR whose only hot-path-matching files live under those trees is
+            # NOT a demo hot path, so it does not require the serial P0 gate.
+            # Genuinely demo-affecting paths (detcore*/, hermit-cli/, other
+            # guest programs under tests/ such as tests/c/**, Cargo.*, and
+            # demo-hot-path.yml itself) are NOT subtracted and stay hot.
             files="$(
               gh api "repos/${REPO}/pulls/${pr_number}/files" \
                 --paginate --jq '.[].filename'
             )"
-            if grep -Eq '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files"; then
+            hot_files="$(
+              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
+                | grep -vE '^tests/(e2e|backend-parity)/' || true
+            )"
+            if [ -n "$hot_files" ]; then
               all_runs="$(
                 gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
               )"

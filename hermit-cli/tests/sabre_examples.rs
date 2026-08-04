@@ -245,6 +245,10 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
         diagnostics.contains("Success: deterministic. Determinism verified."),
         "SaBRe verifier omitted its success verdict for {label}:\n{diagnostics}",
     );
+    assert!(
+        diagnostics.contains("SaBRe syscall DETLOG records included: run1="),
+        "SaBRe verifier omitted its syscall DETLOG inclusion count for {label}:\n{diagnostics}",
+    );
 }
 
 fn assert_three_run_determinism(

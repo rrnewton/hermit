@@ -19,6 +19,7 @@ mod error;
 mod event;
 mod event_stream;
 mod fd;
+pub mod happens_before;
 mod id;
 pub mod instruction_map;
 mod interp;
@@ -797,6 +798,7 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 }
 
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
 struct StagedSabreProgram {
@@ -1032,6 +1034,10 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove(SABRE_DETLOG_FORWARD_ENV);
+    if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
+        command.env(SABRE_DETLOG_FORWARD_ENV, "1");
+    }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
 
