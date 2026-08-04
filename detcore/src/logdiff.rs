@@ -51,7 +51,7 @@ pub struct LogDiffOpts {
     /// `<hostaddr 0x...>` wrapper (see [`host_addr`]) are canonicalized; each
     /// distinct marked address is rewritten to an ordinal placeholder
     /// `<addr{N}>` assigned by order of first appearance within a single run
-    /// (see [`canonicalize_addresses_in_line`]). Unlike [`Self::strip_lines`],
+    /// (see `canonicalize_addresses_in_line`). Unlike [`Self::strip_lines`],
     /// this discards ONLY the host-specific raw pointer value: it preserves
     /// identity (same address -> same ordinal), ordering (introduction
     /// sequence), and aliasing (two names for one address collapse to one
@@ -237,7 +237,7 @@ pub fn strip_log_entry(log: &str) -> String {
     String::from(log)
 }
 
-/// Wrap a host memory address so [`canonicalize_addresses_in_line`] will
+/// Wrap a host memory address so `canonicalize_addresses_in_line` will
 /// canonicalize it. Producers that print a genuinely host-specific pointer
 /// (one that varies run-to-run, e.g. a supervisor-side allocation) should emit
 /// it via this helper -- `<hostaddr 0x7fcfb7e7d450>` -- instead of a bare
