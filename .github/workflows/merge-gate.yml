@@ -23,6 +23,12 @@ on:
         required: true
         type: string
 
+# Gate semantics version: v2. The required status context is `merge-gate-v2`.
+# `MERGE_GATE_V2_BLOB` catches accidental v2 drift that retains the guard, and
+# the versioned context means an unmodified stale v1 branch cannot satisfy v2.
+# The guard itself remains PR-owned YAML: a deliberate gate-policy edit can
+# remove it, so gate-policy PRs still require escalated adversarial review.
+#
 # This required check is the SOLE required status check on main (branch ruleset
 # "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
 # fully green local validate.sh run recorded exact-head evidence and then applied
@@ -67,7 +73,7 @@ permissions:
 # (selected by the `gate` label only) that picks these jobs up in seconds;
 # the three PMU runners also carry the `gate` label as fallback, so a single-node
 # outage cannot block landing. Because the required-check context is the job name
-# (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
+# (`merge-gate-v2`), changing `runs-on` does not change the ruleset requirement.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
@@ -200,7 +206,7 @@ jobs:
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
           gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=173d87688483189154cdd44feb031347a737e29a' \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
             --jq .content | tr -d '\n' | base64 --decode >"$verifier"
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
@@ -253,23 +259,26 @@ jobs:
             echo "::warning::Trusted receipt verifier is unavailable; failing closed."
           fi
 
-          # Invalidate the required context before mutating the label. The
-          # issue_comment job itself is not a required check, and a follow-up
-          # workflow dispatch can fail. Publishing this check first makes every
-          # later failure fail closed at the exact PR head.
+          # Invalidate both the steady-state v2 context and the transition-only
+          # legacy context before mutating the label. The issue_comment job
+          # itself is not required, and a follow-up dispatch can fail (fork
+          # heads cannot be dispatched at all). Publishing both failures keeps
+          # either ruleset version fail-closed at the exact PR head.
           summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "repos/${REPO}/check-runs" \
-            -f name=merge-gate \
-            -f head_sha="$head_sha" \
-            -f status=completed \
-            -f conclusion=failure \
-            -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
-            -f 'output[title]=Local validation evidence invalidated' \
-            -f "output[summary]=${summary}" \
-            --silent
-          echo "Published a failing merge-gate check for PR #${PR_NUMBER} at ${head_sha}."
+          for context in merge-gate-v2 merge-gate; do
+            gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPO}/check-runs" \
+              -f name="$context" \
+              -f head_sha="$head_sha" \
+              -f status=completed \
+              -f conclusion=failure \
+              -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              -f 'output[title]=Local validation evidence invalidated' \
+              -f "output[summary]=${summary}" \
+              --silent
+            echo "Published failing ${context} for PR #${PR_NUMBER} at ${head_sha}."
+          done
 
           gh api --method DELETE \
             "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
@@ -325,6 +334,7 @@ jobs:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -338,8 +348,16 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
             pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
-              jq -r 'select(.base.ref == "main") | .number')"
+              jq -r --arg sha "$expected_head" '
+                select(.base.ref == "main" and .state == "open" and .head.sha == $sha)
+                | .number')"
+            if [ -z "$pr_numbers" ]; then
+              echo "::error::PR #${PR_NUMBER} is not an open main PR at dispatched head ${expected_head}."
+              exit 1
+            fi
           else
             owner="${REPO%%/*}"
             name="${REPO#*/}"
@@ -404,7 +422,7 @@ jobs:
           exit "$failed"
 
   merge-gate:
-    name: merge-gate
+    name: merge-gate-v2
     needs: [invalidate-local-validation, core-review-protocol]
     if: >-
       always() &&
@@ -419,16 +437,44 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - name: Check out trusted gate policy
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          persist-credentials: false
+      - name: Require the registered v2 gate definition
+        env:
+          EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V2_BLOB }}
+          GATE_PATH: .github/workflows/merge-gate.yml
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::MERGE_GATE_V2_BLOB is not configured; refusing an unbound gate result."
+            exit 1
+          fi
+          actual_blob="$(
+            gh api "repos/${REPO}/contents/${GATE_PATH}?ref=${SHA}" --jq .sha
+          )"
+          if [ "$actual_blob" != "$EXPECTED_GATE_BLOB" ]; then
+            echo "::error::Gate definition mismatch: run used ${actual_blob}, registered v2 is ${EXPECTED_GATE_BLOB}. Rebase onto current main; a branch-owned gate cannot authorize itself."
+            exit 1
+          fi
+          echo "Gate definition is registered v2 blob ${actual_blob}."
+      - name: Fetch the trusted receipt verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
+            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
+          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          chmod +x "$verifier"
+          echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Check out canonical CI authorities
         uses: actions/checkout@v4
         with:
           repository: rrnewton/dev-hermit
-          ref: 173d87688483189154cdd44feb031347a737e29a
+          ref: 8ea20e121073e7c1fc3ce7a131a4950d7574ce42
           path: .dev-hermit-policy
           persist-credentials: false
       - name: Require a passed result or re-dispatch a no-result check
@@ -441,6 +487,7 @@ jobs:
           PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -552,8 +599,10 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
-              [select(.base.ref == "main") | {
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$expected_head" '
+              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
                 number,
                 head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name},
                 labels
@@ -750,3 +799,28 @@ jobs:
           fi
 
           echo "Every required leg has a PASSED result."
+
+  # Transition only: before the ruleset moves from `merge-gate` to
+  # `merge-gate-v2`, mirror v2 into the legacy context so this policy PR can
+  # land without an admin bypass. The reconciler disables this variable after
+  # the ruleset switch, leaving a skipped job that consumes no runner.
+  merge-gate-legacy-context:
+    name: merge-gate
+    needs: merge-gate
+    if: >-
+      always() &&
+      github.repository == 'rrnewton/hermit' &&
+      vars.MERGE_GATE_LEGACY_CONTEXT == 'true'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 5
+    steps:
+      - name: Mirror the registered v2 result during migration
+        env:
+          V2_RESULT: ${{ needs.merge-gate.result }}
+        run: |
+          set -euo pipefail
+          if [ "$V2_RESULT" != success ]; then
+            echo "::error::merge-gate-v2 did not pass (result=${V2_RESULT})."
+            exit 1
+          fi
+          echo "merge-gate-v2 passed; emitting temporary legacy context."
