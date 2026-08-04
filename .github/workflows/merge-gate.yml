@@ -311,6 +311,13 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Self-hosted gate runners use Actions' minimal PATH; Rust lives in
+          # the agent user's tracked rustup installation rather than /usr/bin.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v rustc >/dev/null || {
+            echo "::error::trusted pin checker requires rustc on the gate runner"
+            exit 1
+          }
 
           if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
