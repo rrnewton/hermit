@@ -38,6 +38,7 @@ queued:
 in_progress:
 waiting:
 requested:
+pending:
 missing:
 completed:future_state
 EOF
@@ -61,4 +62,4 @@ for rollup in "[$older,$newer,$wrong_head]" "[$wrong_head,$newer,$older]"; do
     [[ $(jq -r '.[0].conclusion' <<<"$selected") == SUCCESS ]]
 done
 
-echo "PASS: one authority handles N=2 passed, N=4 failed, N=11 no-result and exact-head/latest rollups"
+echo "PASS: one authority handles N=2 passed, N=4 failed, N=12 no-result and exact-head/latest rollups"

@@ -512,14 +512,14 @@ jobs:
           for state in \
             completed:cancelled completed:skipped completed:neutral \
             completed:stale completed:action_required queued:none \
-            in_progress:none waiting:none requested:none missing:none \
+            in_progress:none waiting:none requested:none pending:none missing:none \
             completed:future_state; do
             status=${state%%:*}
             conclusion=${state#*:}
             [ "$conclusion" != none ] || conclusion=
             [ "$(classify_check "$status" "$conclusion")" = NO_RESULT ]
           done
-          echo "Required-check predicate: N=2 PASSED, N=4 FAILED, N=11 NO_RESULT."
+          echo "Required-check predicate: N=2 PASSED, N=4 FAILED, N=12 NO_RESULT."
 
           dispatch_file="${RUNNER_TEMP:-/tmp}/merge-gate-redispatch-${GATE_RUN_ID}.tsv"
           : >"$dispatch_file"
@@ -541,7 +541,7 @@ jobs:
             local status=$1
             shift
             case "$status" in
-              queued | in_progress | waiting | requested)
+              queued | in_progress | waiting | requested | pending)
                 no_result=1
                 echo "NO_RESULT is still active ($status); completion will refire the gate."
                 ;;

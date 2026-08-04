@@ -178,7 +178,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
         )
         self.assertEqual(pr_status.classify_check_outcome("success", ""), "passed")
 
-    def test_four_failures_and_eleven_no_results(self) -> None:
+    def test_four_failures_and_twelve_no_results(self) -> None:
         failures = ("failure", "timed_out", "error", "startup_failure")
         for conclusion in failures:
             self.assertEqual(
@@ -194,6 +194,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
             ("", "in_progress"),
             ("", "waiting"),
             ("", "requested"),
+            ("", "pending"),
             ("", "missing"),
             ("future_state", "completed"),
         )

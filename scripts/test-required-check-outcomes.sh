@@ -19,11 +19,11 @@ for conclusion in failure timed_out error startup_failure; do
     [[ $("$CLASSIFIER" completed "$conclusion") == FAILED ]] || exit 1
 done
 
-# N=11 terminal, active, absent, and unknown representations have NO_RESULT.
+# N=12 terminal, active, absent, and unknown representations have NO_RESULT.
 for state in \
     completed:cancelled completed:skipped completed:neutral \
     completed:stale completed:action_required queued:none \
-    in_progress:none waiting:none requested:none missing:none \
+    in_progress:none waiting:none requested:none pending:none missing:none \
     completed:future_state; do
     status=${state%%:*}
     conclusion=${state#*:}
@@ -31,4 +31,4 @@ for state in \
     [[ $("$CLASSIFIER" "$status" "$conclusion") == NO_RESULT ]] || exit 1
 done
 
-echo "PASS: N=2 passed, N=4 failed, N=11 no-result"
+echo "PASS: N=2 passed, N=4 failed, N=12 no-result"

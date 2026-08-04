@@ -67,7 +67,7 @@ grep -Fq 'NO_RESULT)' "$WORKFLOW" || fail "gate must handle NO_RESULT explicitly
 grep -Fq 'dispatch_no_result' "$WORKFLOW" || fail "NO_RESULT must re-dispatch"
 grep -Fq 'queue_hosted_retry "$demo_status" demo-hot-path-rerun' "$WORKFLOW" ||
     fail "demo NO_RESULT must rerun the selected pull-request run"
-grep -Fq 'queued | in_progress | waiting | requested)' "$WORKFLOW" ||
+grep -Fq 'queued | in_progress | waiting | requested | pending)' "$WORKFLOW" ||
     fail "active NO_RESULT runs must wait for workflow_run completion, not rerun"
 grep -Fq 'actions/runs/${run_id}/rerun' "$WORKFLOW" ||
     fail "demo recovery must use the selected run ID"
