@@ -81,7 +81,7 @@ To install the current checkout into Cargo's binary directory, normally
 `~/.cargo/bin`:
 
 ```bash
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
 ```
 
