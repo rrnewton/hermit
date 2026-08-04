@@ -198,8 +198,8 @@ function audit_inventory {
     find "$MANIFEST_ROOT" -type f -name '*.toml' -printf 'tests/e2e/manifests/%P\n' |
         LC_ALL=C sort >"$manifest_documents"
 
-    comm -12 "$explicit_paths" "$manifest_programs" >"$overlap"
-    comm -12 "$explicit_paths" "$manifest_documents" >>"$overlap"
+    LC_ALL=C comm -12 "$explicit_paths" "$manifest_programs" >"$overlap"
+    LC_ALL=C comm -12 "$explicit_paths" "$manifest_documents" >>"$overlap"
     if [[ -s $overlap ]]; then
         cat "$overlap" >&2
         rm -rf "$scratch"
