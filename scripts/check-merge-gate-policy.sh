@@ -19,9 +19,11 @@ fail() {
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
-grep -Fq 'ref: 4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
+grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
-grep -Fq 'python3 .dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
+grep -Fq '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8' "$WORKFLOW" ||
+    fail "gate must content-pin the check-status authority"
+grep -Fq '"$CHECK_OUTCOME_AUTHORITY"' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
 [[ $(grep -Fc -- '--select-latest-run' "$WORKFLOW") -eq 3 ]] ||
     fail "portable, privileged, and demo selectors must use the exact-head/latest authority"
@@ -37,7 +39,9 @@ grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scri
     fail "duplicate jq status classifier must not exist"
 [[ ! -e $ROOT_DIR/scripts/check_status_outcome.py ]] ||
     fail "duplicate Hermit status adapter must not exist"
-grep -Fq '.dev-hermit-policy/ci-hub/validation/verify_receipt.sh' "$WORKFLOW" ||
+grep -Fq 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79' "$WORKFLOW" ||
+    fail "gate must content-pin the parent receipt verifier"
+grep -Fq '"$RECEIPT_VERIFIER"' "$WORKFLOW" ||
     fail "local alternate leg must call the parent receipt verifier"
 if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
     fail "gate must not call a PR-local validation-evidence verifier"

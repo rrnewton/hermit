@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Migrate Hermit's personal-repository ruleset to a versioned Merge Gate status
-# context and bind that context to one server-side expected workflow blob.
+# Migrate Hermit's personal-repository ruleset between versioned Merge Gate
+# status contexts and bind the new context to one expected workflow blob.
 #
 # GitHub's stronger required-workflow rule is organization/enterprise-only.
 # For this user-owned repository, a versioned context prevents an unmodified old
-# branch from satisfying a tightened gate. MERGE_GATE_V2_BLOB catches accidental
-# v2 drift that retains the guard; it is not a trusted-workflow signature.
+# branch from satisfying a tightened gate. MERGE_GATE_V3_BLOB catches accidental
+# v3 drift that retains the guard; it is not a trusted-workflow signature.
 
 set -euo pipefail
 
 readonly DEFAULT_REPO="rrnewton/hermit"
 readonly DEFAULT_RULESET_NAME="main check gating (admin-bypassable)"
 readonly GATE_PATH=".github/workflows/merge-gate.yml"
-readonly REQUIRED_CONTEXT="merge-gate-v2"
-readonly LEGACY_CONTEXT="merge-gate"
-readonly EXPECTED_BLOB_VARIABLE="MERGE_GATE_V2_BLOB"
+readonly REQUIRED_CONTEXT="merge-gate-v3"
+readonly LEGACY_CONTEXT="merge-gate-v2"
+readonly EXPECTED_BLOB_VARIABLE="MERGE_GATE_V3_BLOB"
 readonly LEGACY_SHIM_VARIABLE="MERGE_GATE_LEGACY_CONTEXT"
 readonly GITHUB_ACTIONS_INTEGRATION_ID=15368
 
@@ -28,12 +28,11 @@ usage() {
 Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 
 Modes:
-  --check          Verify the live v2 context, main-workflow blob, and disabled
+  --check          Verify the live v3 context, main-workflow blob, and disabled
                    transition shim without changing GitHub (default).
-  --prepare REF    Bind a candidate workflow blob. During initial v2 migration,
-                   require legacy+v2 and enable the shim; for later v2-only
-                   updates, preserve v2-only enforcement and a disabled shim.
-  --apply          After v2 lands on main, bind main's blob, remove the legacy
+  --prepare REF    Before landing v3, require v2 and v3 together, bind the
+                   branch workflow blob, and enable the legacy context shim.
+  --apply          After v3 lands on main, bind main's blob, remove the v2
                    required context, and disable the shim.
 
 Options:
@@ -125,9 +124,9 @@ policy_fingerprint() {
 }
 
 current=$(read_ruleset)
-v2_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$current")
+required_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$current")
 legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$current")
-v2_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$current")
+required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$current")
 legacy_integration=$(required_context_integration "$LEGACY_CONTEXT" <<<"$current")
 
 if [[ $mode == prepare ]]; then
@@ -140,18 +139,17 @@ if [[ $mode == prepare ]]; then
         exit 1
     fi
 
-    migration=false
-    if [[ $legacy_count == 1 &&
-          $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] &&
-       { [[ $v2_count == 0 ]] ||
-         [[ $v2_count == 1 &&
-            $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
-        migration=true
-    elif ! [[ $legacy_count == 0 && $v2_count == 1 &&
-              $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; then
-        printf 'configure-merge-gate-ruleset: prepare requires legacy migration or v2-only Actions context; got legacy=%s/%s v2=%s/%s\n' \
+    # PREPARE is an overlap migration, not only a variable update. Requiring
+    # v2 and v3 together before this PR lands prevents a stale v2 branch from
+    # satisfying the live ruleset during the land-to-apply window.
+    if ! { [[ $legacy_count == 1 && $required_count == 0 &&
+              $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+           [[ $legacy_count == 1 && $required_count == 1 &&
+              $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" &&
+              $required_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
+        printf 'configure-merge-gate-ruleset: prepare requires v2-only or v2+v3 Actions contexts; got v2=%s/%s v3=%s/%s\n' \
             "$legacy_count" "${legacy_integration:-unset}" \
-            "$v2_count" "${v2_integration:-unset}" >&2
+            "$required_count" "${required_integration:-unset}" >&2
         exit 1
     fi
 
@@ -174,11 +172,7 @@ if [[ $mode == prepare ]]; then
           }
         ' <<<"$current")
 
-    if [[ $migration == true ]]; then
-        # Initial migration needs an overlap so the old required context remains
-        # satisfiable until the v2 candidate lands.
-        set_variable "$LEGACY_SHIM_VARIABLE" true
-    fi
+    set_variable "$LEGACY_SHIM_VARIABLE" true
     latest=$(read_ruleset)
     if [[ $(policy_fingerprint <<<"$latest") != $(policy_fingerprint <<<"$current") ]]; then
         printf 'configure-merge-gate-ruleset: ruleset changed concurrently; refusing stale overlap PUT\n' >&2
@@ -189,38 +183,26 @@ if [[ $mode == prepare ]]; then
             --method PUT "repos/$repo/rulesets/$ruleset_id" --input - >/dev/null
     fi
 
-    # Bind the candidate only after v2 is required. If this write fails, the
-    # newly-required v2 check remains fail-closed rather than admitting v1.
+    # Bind the candidate only after v3 is required. If this write fails, the
+    # newly-required v3 check remains fail-closed rather than admitting v2.
     set_variable "$EXPECTED_BLOB_VARIABLE" "$blob"
     updated=$(read_ruleset)
-    updated_v2_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
+    updated_required_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
     updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
-    updated_v2_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
+    updated_required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
     updated_legacy_integration=$(required_context_integration "$LEGACY_CONTEXT" <<<"$updated")
-    expected_legacy_count=0
-    expected_shim=false
-    if [[ $migration == true ]]; then
-        expected_legacy_count=1
-        expected_shim=true
-    fi
     if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
-       [[ $updated_v2_count != 1 || $updated_legacy_count != "$expected_legacy_count" ]] ||
-       [[ $updated_v2_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
-       { [[ $migration == true ]] &&
-         [[ $updated_legacy_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; } ||
+       [[ $updated_required_count != 1 || $updated_legacy_count != 1 ]] ||
+       [[ $updated_required_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+       [[ $updated_legacy_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
        [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$blob" ]] ||
-       [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != "$expected_shim" ]]; then
+       [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != true ]]; then
         printf 'configure-merge-gate-ruleset: overlap transition verification failed\n' >&2
         exit 1
     fi
-    if [[ $migration == true ]]; then
-        printf 'PREPARED MIGRATION: ruleset requires %s + %s; %s=%s for %s; legacy shim enabled.\n' \
-            "$LEGACY_CONTEXT" "$REQUIRED_CONTEXT" \
-            "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
-    else
-        printf 'PREPARED UPDATE: ruleset remains %s-only; %s=%s for %s; legacy shim disabled.\n' \
-            "$REQUIRED_CONTEXT" "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
-    fi
+    printf 'PREPARED: ruleset requires %s + %s; %s=%s for %s; legacy shim enabled.\n' \
+        "$LEGACY_CONTEXT" "$REQUIRED_CONTEXT" \
+        "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
     exit 0
 fi
 
@@ -230,10 +212,10 @@ legacy_shim=$(read_variable "$LEGACY_SHIM_VARIABLE")
 
 if [[ $mode == check ]]; then
     failed=0
-    if [[ $v2_count != 1 || $legacy_count != 0 ||
-          $v2_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; then
-        printf 'FAIL: ruleset %s has v2 count/integration %s/%s and %s legacy contexts.\n' \
-            "$ruleset_id" "$v2_count" "${v2_integration:-unset}" "$legacy_count" >&2
+    if [[ $required_count != 1 || $legacy_count != 0 ||
+          $required_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; then
+        printf 'FAIL: ruleset %s has v3 count/integration %s/%s and %s v2 contexts.\n' \
+            "$ruleset_id" "$required_count" "${required_integration:-unset}" "$legacy_count" >&2
         failed=1
     fi
     if [[ $expected_blob != "$main_blob" ]]; then
@@ -261,14 +243,14 @@ if ! grep -Fq "name: $REQUIRED_CONTEXT" <<<"$source" ||
         "$REQUIRED_CONTEXT" >&2
     exit 1
 fi
-if ! { [[ $legacy_count == 1 && $v2_count == 1 &&
+if ! { [[ $legacy_count == 1 && $required_count == 1 &&
           $legacy_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" &&
-          $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
-       [[ $legacy_count == 0 && $v2_count == 1 &&
-          $v2_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
-    printf 'configure-merge-gate-ruleset: apply requires legacy+v2 overlap or v2-only Actions context; got legacy=%s/%s v2=%s/%s\n' \
+          $required_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+       [[ $legacy_count == 0 && $required_count == 1 &&
+          $required_integration == "$GITHUB_ACTIONS_INTEGRATION_ID" ]]; }; then
+    printf 'configure-merge-gate-ruleset: apply requires v2+v3 overlap or v3-only Actions context; got v2=%s/%s v3=%s/%s\n' \
         "$legacy_count" "${legacy_integration:-unset}" \
-        "$v2_count" "${v2_integration:-unset}" >&2
+        "$required_count" "${required_integration:-unset}" >&2
     exit 1
 fi
 
@@ -307,12 +289,12 @@ set_variable "$LEGACY_SHIM_VARIABLE" false
 
 # Re-read every server-side input rather than trusting the PUT response.
 updated=$(read_ruleset)
-updated_v2_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
+updated_required_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
 updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
-updated_v2_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
+updated_required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
 if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
-   [[ $updated_v2_count != 1 || $updated_legacy_count != 0 ]] ||
-   [[ $updated_v2_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+   [[ $updated_required_count != 1 || $updated_legacy_count != 0 ]] ||
+   [[ $updated_required_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
    [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$main_blob" ]] ||
    [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != false ]]; then
     printf 'configure-merge-gate-ruleset: GitHub accepted migration but verification failed\n' >&2
