@@ -35,6 +35,28 @@
 
 set -euo pipefail
 
+case "${1:-}" in
+  -h | --help)
+    cat <<'EOF'
+Usage: scripts/core-review-protocol-lint.sh
+
+Enforce the post-facto-human-review core-change review protocol on one PR. All
+inputs come from environment variables, not positional arguments:
+
+  PR_NUMBER  PR number, used only in diagnostics (default: "unknown")
+  PR_LABELS  newline-separated PR labels
+  PR_BODY    PR description body
+  PR_IS_KVM  "true" when the PR touches KVM (default: "false")
+
+Blocks landing when a PR labeled `post-facto-human-review` lacks the required
+dual adversarial review, latest-revision approvals, or PR-body sections.
+
+Exit codes: 0 pass, 1 protocol violation, 2 usage/internal error.
+EOF
+    exit 0
+    ;;
+esac
+
 pr="${PR_NUMBER:-unknown}"
 labels="${PR_LABELS-}"
 body="${PR_BODY-}"

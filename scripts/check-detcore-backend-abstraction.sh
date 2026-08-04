@@ -41,6 +41,22 @@
 
 set -uo pipefail
 
+case "${1:-}" in
+  -h | --help)
+    cat <<'EOF'
+Usage: scripts/check-detcore-backend-abstraction.sh
+
+Enforce the detcore backend-abstraction commandment: the detcore core library
+must depend only on the abstract `reverie` interface, never on a concrete
+backend crate (reverie-ptrace, reverie-dbi, reverie-kvm). Run from anywhere in
+the repository; takes no arguments.
+
+Exit codes: 0 clean, 1 violation found, 2 usage/environment error.
+EOF
+    exit 0
+    ;;
+esac
+
 # Concrete Reverie backends detcore must never depend on. Extend this list if a
 # new backend crate is added to the workspace.
 readonly BACKEND_CRATES=(reverie-ptrace reverie-dbi reverie-kvm)
