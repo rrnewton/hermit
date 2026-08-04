@@ -125,6 +125,13 @@ general-purpose registers, and RFLAGS across the plugin callback. This covers
 CPUID; it does not close the separate RDTSCP or cross-backend clock
 trajectories.
 
+The static-ELF increment restores the guest process name from SaBRe's client
+path rather than the injected loader's arguments. Together with syscall-clobber
+annotations in the freestanding fixture, this qualifies
+`c-programs/hello-nostdlib` and `c-programs/pread64-nostdlib` for SaBRe L2.
+This is evidence for those two static guests, not a claim that every static ELF
+or every unpatched instruction is supported.
+
 At this increment's source tree, the executable plan enables SaBRe for 133/200
 ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
 That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
