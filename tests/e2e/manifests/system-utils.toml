@@ -29,11 +29,12 @@ native = "The date-nanoseconds entry owns the native clock nondeterminism contro
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "liteinst"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Enable after the ptrace baseline for direct C guests is trusted"
 kvm = "Enable after the ptrace baseline for direct C guests is trusted"
 sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
+liteinst = "The guest-only LiteInst Tool does not yet virtualize CPU clocks; CLOCK_PROCESS_CPUTIME_ID returns EOPNOTSUPP"
 
 [test.modes.replay]
 ci = false
@@ -59,11 +60,12 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 ci = true
 args = ["--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"]
 assert = { runs = 5, repeat_identical = true }
-backends_enabled = ["ptrace", "liteinst"]
+backends_enabled = ["ptrace"]
 [test.modes.custom.backends_disabled]
 dbi = "The custom clock matrix baseline is ptrace-only"
 kvm = "The custom clock matrix baseline is ptrace-only"
 sabre = "The custom clock matrix baseline is ptrace-only"
+liteinst = "The guest-only LiteInst Tool does not yet virtualize CPU clocks; CLOCK_PROCESS_CPUTIME_ID returns EOPNOTSUPP"
 [[test]]
 id = "system-utils/date-nanoseconds"
 description = "A valid wall-clock timestamp varies natively and repeats under Hermit"

@@ -372,24 +372,10 @@
       "test": "language-runtimes/rust-hashmap-iteration"
     },
     {
-      "backend": "liteinst",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "custom",
-      "test": "system-utils/clock-determinism"
-    },
-    {
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
       "mode": "custom",
-      "test": "system-utils/clock-determinism"
-    },
-    {
-      "backend": "liteinst",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "verify",
       "test": "system-utils/clock-determinism"
     },
     {
