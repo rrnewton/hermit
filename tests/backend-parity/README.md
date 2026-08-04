@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 24/24 | 100% |
-| DBI | 23/24 | 96% |
-| KVM | 23/24 | 96% |
+| ptrace | 28/28 | 100% |
+| DBI | 27/28 | 96% |
+| KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 24/24 | DETLOG-bitwise | 100% |
-| DBI | 22/24 | DETLOG-bitwise | 92% |
-| KVM | 22/24 | guest-visible only | 92% |
+| ptrace | 28/28 | DETLOG-bitwise | 100% |
+| DBI | 26/28 | DETLOG-bitwise | 93% |
+| KVM | 22/28 | guest-visible only | 79% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -105,7 +105,7 @@ is not reached.
 | `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
 | `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
 | `exit_zero` | pass / detlog | pass / detlog | pass / guest |
-| `exit_status` | pass / detlog | pass / **gap** | pass / guest |
+| `exit_status` | pass / detlog | pass / detlog | pass / guest |
 | `file_read` | pass / detlog | pass / detlog | pass / guest |
 | `file_mutation` | pass / detlog | pass / detlog | pass / guest |
 | `file_metadata` | pass / detlog | pass / detlog | pass / guest |
@@ -126,6 +126,10 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `signal_disposition` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigaction_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigprocmask_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigaltstack_state` | pass / detlog | pass / detlog | **gap** / gap |
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
@@ -162,13 +166,9 @@ witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
-Two contracts hold at L1 but not L2, and both are recorded as L2 `gap`s with
-reasons in `matrix.tsv`:
+One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
+reason in `matrix.tsv`:
 
-- **`exit_status` on DBI.** With `--verify-allow both`, hermit runs the DBI
-  guest only once when the first run exits non-zero — it never performs the
-  second run — so the double-run DETLOG comparison never executes for this
-  non-zero-exit contract. ptrace performs both runs and reaches `detlog` here.
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
   (`No child processes`), so the second run exits non-zero and verification
