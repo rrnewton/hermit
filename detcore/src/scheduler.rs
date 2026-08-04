@@ -1013,7 +1013,17 @@ pub async fn do_a_turn_blocking(
                 "[sched-daemon] woke up on request {}, but fizzling because next thread, {}, exited.",
                 &req, &next_dtid
             );
-            // TODO: check status of next_dtid -- in runqueue (or not)?
+            // The selected thread died while we awaited its request, so this turn
+            // is skipped without reaching step4-6. `step3_peek` opened a
+            // tentative_pop for `next_dtid`; close it here (undo, since the turn
+            // did not commit) before returning. Otherwise the tentative selection
+            // outlives the turn, and the next pass's step2 removal drain calls
+            // `remove_tid` while `tentative_selection` is still `Some`, tripping
+            // the run queue's transaction guard -- the "reconnect panic moved one
+            // pass" defect. The dead thread's buffered removal drains
+            // deterministically on the next pass, once this undo has closed the
+            // window.
+            sched.lock().unwrap().run_queue.undo_tentative_pop();
             return Err(SkipTurn);
         }
         Ok(r) => r,
@@ -1023,14 +1033,19 @@ pub async fn do_a_turn_blocking(
     // Since the scheduler is asynchronous, we need to check our assumptions.  Polling is
     // sufficient here because the thread cannot be racing with us to exit since we know
     // it is *already* parked.
-    if !sched.lock().unwrap().next_turns.contains_key(&next_dtid) {
+    let mut mg = sched.lock().unwrap();
+    if !mg.next_turns.contains_key(&next_dtid) {
         info!(
             "[sched-daemon] thread {} exited, skipping over...",
             &next_dtid
         );
+        // Same tentative-pop hygiene as the `ThreadExited` arm above: the thread
+        // parked (its request resolved `Ok`), but its `next_turns` entry vanished
+        // before we re-acquired the lock, so steps 4-6 -- which would commit the
+        // tentative pop -- are skipped. Undo the still-open selection so the next
+        // pass's step2 removal drain does not hit the `remove_tid` guard.
+        mg.run_queue.undo_tentative_pop();
     } else {
-        let mut mg = sched.lock().unwrap();
-
         // The logical COMMIT point for the turn is during step4:
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
