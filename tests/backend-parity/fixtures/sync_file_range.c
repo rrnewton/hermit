@@ -28,7 +28,7 @@
  *
  * ptrace and DBI drive the full barrier set; if KVM's ElfExecutor does not
  * implement sync_file_range it refuses deterministically with ENOSYS, recorded as
- * a KVM gap in matrix.tsv (mirrors the syncfs gap in fsync_durability).
+ * a KVM gap in the runner catalog (mirrors the syncfs gap in fsync_durability).
  */
 
 #ifndef SYNC_FILE_RANGE_WAIT_BEFORE

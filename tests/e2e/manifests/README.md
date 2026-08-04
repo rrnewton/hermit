@@ -132,15 +132,22 @@ inventory.
 
 ## Inventory and validation
 
-`inventory/test-files.json` classifies every regular file and symlink below
-`tests/` with a disposition, owning runner, and per-file justification. The
-audit compares the inventory byte-for-byte with filesystem discovery, then
-confirms that every manifest program is classified as `manifest-test`. Tests
-retained under Cargo, Buck, integration, QEMU, or suite drivers explain the
-build flags, arguments, expected results, hardware, or shared setup that their
-owner supplies. Each exception names its exact owning runner and the file's
-specific role; generic category-only justifications fail review even when the
-inventory is mechanically complete.
+The complete inventory is regenerated at the checked-out head. Manifest
+documents and their program paths are discovered directly; neither is copied
+into a shared JSON ledger. `inventory/explicit-test-files.json` classifies only the
+remaining regular files and symlinks below `tests/`, with a disposition, owning
+runner, and per-file justification. The audit unions both sources and compares
+the result byte-for-byte with filesystem discovery. Tests retained under Cargo,
+Buck, integration, QEMU, or suite drivers explain the build flags, arguments,
+expected results, hardware, or shared setup that their owner supplies. Each
+exception names its exact owning runner and the file's specific role; generic
+category-only justifications fail review even when the inventory is
+mechanically complete.
+
+Most buckets use one top-level `<bucket>.toml`. High-churn buckets may instead
+use independent `<bucket>/<test>.toml` shards; each shard declares the parent
+directory as its bucket. The planner sorts and validates both forms together,
+so independent test additions do not append to one shared manifest file.
 
 `ci/expected-e2e-plan.json` ratchets the exact blocking cells. Adding, removing,
 or reclassifying a `ci=true` cell fails validation until the expected plan is
@@ -171,7 +178,8 @@ from its selector, or the aggregate selected cells differ from the ratchet.
 1. Put behavior in a focused shell, C, or Rust source file.
 2. Add it to exactly one bucket and declare all five modes.
 3. Enable only combinations proven locally; justify every exclusion.
-4. Add or update its exact entry in `inventory/test-files.json`.
+4. Do not edit the explicit inventory for a manifest program; the audit derives
+   it. Add an `explicit-test-files.json` entry only for a non-manifest file.
 5. Run `./ci/test_harness.sh validate` and the affected cells.
 6. Add a structured DAG node when adding a bucket; validation fails until each
    lane has exactly one node per bucket.

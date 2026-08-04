@@ -14,7 +14,7 @@
  *
  * The ptrace and KVM backends determinize all four. The DBI (DynamoRIO) backend
  * pins release but forwards the *host* nodename, so it deterministically-but-
- * host-dependently fails the nodename check; matrix.tsv records that as a DBI
+ * host-dependently fails the nodename check; the known-gap catalog records a DBI
  * gap. Native Linux honors none of the pinned values, proving these are Hermit
  * determinization choices rather than host coincidences.
  *

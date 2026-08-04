@@ -24,7 +24,7 @@
  *
  * ptrace and DBI drive the full round-trip; KVM's ElfExecutor does not implement
  * the PR_*_THP_DISABLE requests and refuses them with ENOSYS (recorded as a KVM
- * gap in matrix.tsv), so this row runs on ptrace and DBI. The fixture prints
+ * gap in the runner catalog), so this row runs on ptrace and DBI. The fixture prints
  * only a check count.
  */
 

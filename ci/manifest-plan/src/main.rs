@@ -24,7 +24,7 @@ use toml::Value;
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
-const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
+const EXPLICIT_TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/explicit-test-files.json";
 
 #[derive(Debug)]
 struct PlanRow {
@@ -81,14 +81,25 @@ fn main() {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
     let repo_root = script_dir.join("../../..");
 
-    let mut manifests: Vec<PathBuf> = std::fs::read_dir(&script_dir)
-        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", script_dir.display())))
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
+    let mut manifests = Vec::new();
+    let mut directories = vec![script_dir.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| die(format!("cannot read {}: {error}", directory.display())))
+        {
+            let path = entry
+                .unwrap_or_else(|error| die(format!("cannot read directory entry: {error}")))
+                .path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path
+                .extension()
                 .is_some_and(|extension| extension == "toml")
-        })
-        .collect();
+            {
+                manifests.push(path);
+            }
+        }
+    }
     manifests.sort();
     if manifests.is_empty() {
         die(format!(
@@ -108,17 +119,32 @@ fn main() {
         let document: Value = text
             .parse()
             .unwrap_or_else(|error| die(format!("{}: invalid TOML: {error}", path.display())));
-        let location = path.file_name().unwrap().to_string_lossy().to_string();
+        let relative = path
+            .strip_prefix(&script_dir)
+            .unwrap_or_else(|_| die(format!("manifest escaped root: {}", path.display())));
+        let location = relative.display().to_string();
         ensure_keys(&document, &["schema", "bucket", "test"], &location);
 
         if document.get("schema").and_then(Value::as_integer) != Some(2) {
             die(format!("{location}: schema must be 2"));
         }
         let bucket = required_string(&document, "bucket", &location);
-        let stem = path.file_stem().unwrap().to_string_lossy();
-        if bucket != stem {
+        let component_count = relative.components().count();
+        let expected_bucket = if component_count == 1 {
+            path.file_stem().unwrap().to_string_lossy()
+        } else if component_count == 2 {
+            path.parent()
+                .and_then(Path::file_name)
+                .unwrap()
+                .to_string_lossy()
+        } else {
             die(format!(
-                "{location}: bucket `{bucket}` must equal file stem `{stem}`"
+                "{location}: manifest shards must be exactly one directory below manifests/"
+            ));
+        };
+        if bucket != expected_bucket {
+            die(format!(
+                "{location}: bucket `{bucket}` must equal `{expected_bucket}`"
             ));
         }
         let tests = document
@@ -240,7 +266,11 @@ fn backend_private_guest_files(inventory: &JsonValue) -> BTreeSet<String> {
     inventory
         .get("files")
         .and_then(JsonValue::as_array)
-        .unwrap_or_else(|| die(format!("{TEST_INVENTORY}: `files` must be an array")))
+        .unwrap_or_else(|| {
+            die(format!(
+                "{EXPLICIT_TEST_INVENTORY}: `files` must be an array"
+            ))
+        })
         .iter()
         .filter(|entry| {
             entry.get("disposition").and_then(JsonValue::as_str) == Some("guest-fixture")
@@ -350,7 +380,7 @@ fn validate_front_door(repo_root: &Path, documents: &[Value]) {
         MATRIX_SYMMETRY_BASELINE,
     );
 
-    let inventory_path = repo_root.join(TEST_INVENTORY);
+    let inventory_path = repo_root.join(EXPLICIT_TEST_INVENTORY);
     let inventory_text = std::fs::read_to_string(&inventory_path)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", inventory_path.display())));
     let inventory: JsonValue = serde_json::from_str(&inventory_text).unwrap_or_else(|error| {

@@ -9,13 +9,12 @@
 
 Background
 ----------
-The legacy ``tests/backend-parity/matrix.tsv`` side-matrix (driven by the
-standalone ``run_matrix.py`` harness) records parity per backend for freestanding
-C guests, but only ptrace/DBI/KVM ever run it -- it is invisible to the
-mode x backend x test symmetry enforced over ``tests/e2e/manifests/*.toml`` by
-``ci/manifest-plan`` (PR #1518). #1498 removes ``matrix.tsv`` entirely and folds
-its catalog back into ``run_matrix.py``. Dozens of open PRs still add a
-``matrix.tsv`` row + a fixture + a ``run_matrix.py`` edit; none can land as-is.
+The retired ``tests/backend-parity/matrix.tsv`` side-matrix recorded parity per
+backend for freestanding C guests, but only ptrace/DBI/KVM ran it -- it was
+invisible to the mode x backend x test symmetry enforced over
+``tests/e2e/manifests/*.toml`` by ``ci/manifest-plan``. Dozens of open legacy PRs
+still add a matrix row + a fixture + a ``run_matrix.py`` edit; none can land
+as-is.
 
 This tool mechanizes the coverage migration for those PRs. For each source PR it:
 
@@ -23,18 +22,16 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
      schema) and the added fixture ``.c`` file(s);
   2. writes the fixture into the working tree (so the manifest ``program`` path
      exists for the lint) if it is not already present;
-  3. appends a symmetric ``[[test]]`` block to
-     ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
+  3. writes a symmetric, per-test manifest shard below
+     ``tests/e2e/manifests/backend-parity-c/`` -- ptrace established first,
      every backend x mode cell declared, DBI/KVM enabled only where the source
      row's ``--verify`` (L2) witness actually passed, everything else disabled
      with a concrete reason carried over from the matrix row;
-  4. reclassifies the fixture in
-     ``tests/e2e/manifests/inventory/test-files.json`` from the private
-     ``guest-fixture`` disposition to ``manifest-test`` so it leaves the
-     backend-private tripwire that ``ci/manifest-plan`` ratchets.
+  4. relies on the inventory audit to derive the fixture's ``manifest-test``
+     membership directly from the resulting TOML manifest.
 
-It deliberately does NOT touch ``matrix.tsv`` or ``run_matrix.py`` -- those are
-retired by #1498; the source PR's edits to them are simply dropped.
+It deliberately does NOT recreate ``matrix.tsv`` or touch ``run_matrix.py``;
+the source PR's edits to those retired surfaces are simply dropped.
 
 The result passes the #1518 symmetry lint: the new test has a ptrace front-door
 and never enables a backend without ptrace (so it stays out of
@@ -58,15 +55,13 @@ Usage
         --row $'getpriority_identity\tpass\tpass\tpass\t-\t-\tdetlog\tdetlog\tguest\t-\t-' \
         --fixture tests/c/getpriority_identity.c
 
-Idempotent: re-running is a no-op once a test id is present in the manifest and
-its fixture is classified ``manifest-test``.
+Idempotent: re-running is a no-op once a test id is present in the manifest.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
-import json
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -74,8 +69,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.toml"
-INVENTORY = REPO_ROOT / "tests/e2e/manifests/inventory/test-files.json"
+MANIFEST_ROOT = REPO_ROOT / "tests/e2e/manifests"
+MANIFEST_DIR = MANIFEST_ROOT / "backend-parity-c"
 BUCKET = "backend-parity-c"
 REPO = "rrnewton/hermit"
 
@@ -287,40 +282,17 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def manifest_has_id(manifest_text: str, plan: Plan) -> bool:
-    return f'id = "{BUCKET}/{plan.slug}"' in manifest_text
+def manifest_has_id(plan: Plan) -> bool:
+    needle = f'id = "{BUCKET}/{plan.slug}"'
+    return any(needle in path.read_text() for path in MANIFEST_ROOT.rglob("*.toml"))
 
 
-def inventory_entry(program: str) -> dict:
-    return {
-        "path": program,
-        "disposition": "manifest-test",
-        "runner": (
-            "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml "
-            "(explicit mode selection; ci=false)"
-        ),
-        "why": (
-            f"{program} is owned by ci/test_harness.sh via "
-            "tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; "
-            "ci=false): Direct C guest is centrally discoverable with ptrace "
-            "verification enabled for explicit runs; it remains outside blocking "
-            "CI until its standalone build and output contract are calibrated"
-        ),
-    }
+def manifest_path(plan: Plan) -> Path:
+    return MANIFEST_DIR / f"{plan.slug}.toml"
 
 
-def apply_inventory(inv: dict, program: str) -> bool:
-    """Return True if the inventory changed (add or reclassify)."""
-    for entry in inv["files"]:
-        if entry.get("path") == program:
-            if entry.get("disposition") == "manifest-test":
-                return False
-            entry.update(inventory_entry(program))
-            return True
-    # Append only -- the on-disk inventory is not globally sorted, so reordering
-    # would produce spurious churn. The lint does not depend on entry order.
-    inv["files"].append(inventory_entry(program))
-    return True
+def render_manifest(plan: Plan) -> str:
+    return f'schema = 2\nbucket = "{BUCKET}"\n\n{render_test_block(plan).lstrip()}'
 
 
 # --------------------------------------------------------------------------- #
@@ -438,25 +410,14 @@ def plans_from_local(row_str: str, fixture: str) -> tuple:
 # Emit
 # --------------------------------------------------------------------------- #
 def run(plans: list, apply: bool) -> int:
-    manifest_text = MANIFEST.read_text()
-    inv = json.loads(INVENTORY.read_text())
-    new_manifest = manifest_text
     changed_fixtures = []
     converted, skipped_existing = [], []
 
     for plan in plans:
-        if manifest_has_id(new_manifest, plan):
+        if manifest_has_id(plan):
             skipped_existing.append(plan.slug)
             continue
-        new_manifest = new_manifest.rstrip("\n") + "\n" + render_test_block(plan)
         converted.append(plan)
-
-    inv_after = json.loads(json.dumps(inv))
-    inv_changed = False
-    for plan in plans:
-        if apply_inventory(inv_after, plan.program):
-            inv_changed = True
-    new_inv_text = json.dumps(inv_after, indent=2) + "\n"
 
     # Report
     print(f"== retarget: {len(plans)} candidate(s) ==")
@@ -470,26 +431,26 @@ def run(plans: list, apply: bool) -> int:
 
     if not apply:
         print("\n--- DRY RUN (no files written) ---")
-        _print_diff(MANIFEST, manifest_text, new_manifest)
-        if inv_changed:
-            _print_diff(INVENTORY, INVENTORY.read_text(), new_inv_text)
+        for plan in converted:
+            _print_diff(manifest_path(plan), "", render_manifest(plan))
         for plan in converted:
             if plan.fixture_content is not None and not (REPO_ROOT / plan.program).exists():
                 print(f"\n+++ NEW FIXTURE {plan.program} ({len(plan.fixture_content)} bytes)")
         return 0
 
-    if converted:
-        MANIFEST.write_text(new_manifest)
-    if inv_changed:
-        INVENTORY.write_text(new_inv_text)
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    for plan in converted:
+        manifest_path(plan).write_text(render_manifest(plan))
     for plan in converted:
         dest = REPO_ROOT / plan.program
         if plan.fixture_content is not None and not dest.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(plan.fixture_content)
             changed_fixtures.append(plan.program)
-    print(f"\nAPPLIED: {len(converted)} test(s), inventory_changed={inv_changed}, "
-          f"fixtures_written={len(changed_fixtures)}")
+    print(
+        f"\nAPPLIED: {len(converted)} test(s), "
+        f"fixtures_written={len(changed_fixtures)}"
+    )
     return 0
 
 

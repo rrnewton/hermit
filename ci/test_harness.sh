@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
-INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
+EXPLICIT_INVENTORY="$MANIFEST_ROOT/inventory/explicit-test-files.json"
 EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/ignored/e2e}
@@ -24,7 +24,7 @@ else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT EXPLICIT_INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
@@ -153,7 +153,8 @@ function load_tests {
 }
 
 function audit_inventory {
-    [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
+    [[ -f $EXPLICIT_INVENTORY ]] ||
+        die "missing explicit test inventory: ${EXPLICIT_INVENTORY#"$ROOT_DIR/"}"
     jq -e '
         .schema == 2
         and (.files | type == "array" and length > 0)
@@ -165,46 +166,62 @@ function audit_inventory {
             and (.runner | type == "string" and length > 0)
             and (.why | type == "string" and length > 0)
             and (. as $entry | ($entry.why | startswith($entry.path + " is owned by " + $entry.runner + ": ")))))
+        and (all(.files[];
+            .disposition != "manifest-test" and .disposition != "manifest-policy"))
         and ((.files | map(.path) | unique | length) == (.files | length))
-        and ([.files[] | select(.disposition != "manifest-test")
+        and ([.files[]
               | . as $entry
               | ($entry.why | ltrimstr($entry.path + " is owned by " + $entry.runner + ": "))]
              | length == (unique | length))
-        and all(.files[] | select(.disposition != "manifest-test");
+        and all(.files[];
             (. as $entry
              | ($entry.why
                 | ltrimstr($entry.path + " is owned by " + $entry.runner + ": ")
                 | length >= 120)))
-    ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
+    ' "$EXPLICIT_INVENTORY" >/dev/null || die "explicit test inventory schema violation"
 
-    local scratch expected actual
+    local scratch expected actual explicit_paths manifest_programs manifest_documents overlap
     scratch=$(mktemp -d)
     expected="$scratch/expected"
     actual="$scratch/actual"
+    explicit_paths="$scratch/explicit-paths"
+    manifest_programs="$scratch/manifest-programs"
+    manifest_documents="$scratch/manifest-documents"
+    overlap="$scratch/overlap"
     find "$ROOT_DIR/tests" \( -type f -o -type l \) -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
-    jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
-    if ! diff -u "$expected" "$actual"; then
-        rm -rf "$scratch"
-        die "test inventory is stale; every file in tests/ must have an explicit disposition"
-    fi
-
-    local manifest_programs="$scratch/manifest-programs"
-    local inventory_manifest_tests="$scratch/inventory-manifest-tests"
+    jq -r '.files[].path' "$EXPLICIT_INVENTORY" | LC_ALL=C sort >"$explicit_paths"
     local test
     for test in "${TESTS[@]}"; do
         [[ $test != direct:* ]] || continue
         printf '%s\n' "${test#"$ROOT_DIR/"}"
     done | LC_ALL=C sort >"$manifest_programs"
-    jq -r '.files[] | select(.disposition == "manifest-test") | .path' "$INVENTORY" |
-        LC_ALL=C sort >"$inventory_manifest_tests"
-    if ! diff -u "$manifest_programs" "$inventory_manifest_tests"; then
+    find "$MANIFEST_ROOT" -type f -name '*.toml' -printf 'tests/e2e/manifests/%P\n' |
+        LC_ALL=C sort >"$manifest_documents"
+
+    comm -12 "$explicit_paths" "$manifest_programs" >"$overlap"
+    comm -12 "$explicit_paths" "$manifest_documents" >>"$overlap"
+    if [[ -s $overlap ]]; then
+        cat "$overlap" >&2
         rm -rf "$scratch"
-        die "manifest programs and disposition=manifest-test inventory entries differ"
+        die "manifest programs must be derived, not duplicated in the explicit inventory"
     fi
+    LC_ALL=C sort "$explicit_paths" "$manifest_programs" "$manifest_documents" >"$actual"
+    if ! diff -u "$expected" "$actual"; then
+        rm -rf "$scratch"
+        die "derived test inventory is stale; every file must be a current manifest program or explicit exception"
+    fi
+
+    local explicit_count manifest_count manifest_document_count
+    explicit_count=$(wc -l <"$explicit_paths")
+    manifest_count=$(wc -l <"$manifest_programs")
+    manifest_document_count=$(wc -l <"$manifest_documents")
     rm -rf "$scratch"
 
-    jq '{files:(.files|length),by_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
-        "$INVENTORY"
+    jq --argjson derived_manifest_tests "$manifest_count" \
+       --argjson derived_manifest_documents "$manifest_document_count" \
+       --argjson explicit_files "$explicit_count" \
+       '{files:($derived_manifest_tests + $derived_manifest_documents + $explicit_files),derived_manifest_tests:$derived_manifest_tests,derived_manifest_documents:$derived_manifest_documents,explicit_files:$explicit_files,by_explicit_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
+        "$EXPLICIT_INVENTORY"
 }
 
 function audit_test_footprints {

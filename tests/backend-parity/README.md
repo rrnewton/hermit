@@ -1,10 +1,10 @@
-# Hermit backend parity matrix
+# Hermit backend parity runner
 
 This directory tracks executable parity contracts across Hermit's ptrace,
-DynamoRIO (DBI), and KVM backends. `matrix.tsv` is the ratchet: changing a pair
-from `gap` to `pass` (L1) or from `gap` to `detlog`/`guest` (L2) makes
-`run_matrix.py` enforce it on every subsequent run. A `gap` must have a concrete
-implementation reason.
+DynamoRIO (DBI), and KVM backends. The authored case catalog and its small set
+of known gaps live in `run_matrix.py`; new cases are green contracts by default.
+Live results are run artifacts, so a checkout nested in dev-hermit appends them
+to `compat-envelope/scorecard.csv` instead of committing a generated TSV here.
 
 ## Current ratchet
 
@@ -25,7 +25,7 @@ L2 (`hermit run --strict --verify`):
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
 | ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBI | 26/28 | DETLOG-bitwise | 93% |
+| DBI | 27/28 | DETLOG-bitwise | 96% |
 | KVM | 22/28 | guest-visible only | 79% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
@@ -35,10 +35,10 @@ streams — the full syscall and scheduling trace — bitwise-identical.
 declares outright that its internal syscall trace order is not deterministic, so
 `--verify` compares only guest stdout and exit status across the two runs. KVM's
 column is therefore capped at `guest`, never `detlog`. See the L2 subsection
-below for the two contracts that hold at L1 but not L2.
+below for the contract that holds at L1 but not L2.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 27/28 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -94,7 +94,7 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
-## Matrix
+## Cases
 
 Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
 DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
@@ -140,9 +140,10 @@ as a deterministic no-op because it replaces the Linux scheduler with its own,
 so the guest observes an identical, host-independent result across ptrace, DBI,
 and KVM and across the `--verify` double run.
 
-The authoritative reasons live in `matrix.tsv`, next to the status they
-justify. The runner executes each passing pair three times and checks exit
-status, stdout, and (for determinism cases) byte-identical repeated output.
+The authoritative exceptions and their reasons live in `L1_GAPS` and
+`L2_GAPS` in the runner. The runner executes each passing pair three times and
+checks exit status, stdout, and (for determinism cases) byte-identical repeated
+output.
 Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBI
 gate uses this mode.
 The DBI random-source contract also compares the root thread's post-fault
@@ -161,13 +162,12 @@ guest twice and asserts a bitwise-identical result. Because `--verify` diverts
 the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
 stdout the way the L1 path does; instead it enforces that the guest exit status
 matches and that hermit's double-run comparison succeeded at *at least* the
-assurance kind recorded in `matrix.tsv`. The runner keys on two distinct stderr
+assurance kind expected for the backend. The runner keys on two distinct stderr
 witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
-One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
-reason in `matrix.tsv`:
+One contract holds at L1 but not L2 and is recorded as a known L2 gap:
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
@@ -185,7 +185,7 @@ parity.
 
 ## e9patch preprocessing corpus
 
-e9patch is not a backend in this matrix. It is binary-rewriting *preprocessing*
+e9patch is not a backend in this runner. It is binary-rewriting *preprocessing*
 for the ptrace backend: e9tool rewrites the guest ELF ahead of time to pre-trap
 its `SYSCALL` sites, then Detcore runs the rewritten image under ptrace. e9tool
 rewrites only the *main* executable, so the dynamically linked libc guests above
@@ -221,7 +221,7 @@ Use `--check` to validate the corpus contract without prerequisites.
 
 ## Running
 
-Validate the checked-in matrix without backend prerequisites:
+Validate the case catalog and known-gap invariants without backend prerequisites:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --check
@@ -261,6 +261,9 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Use `--output /tmp/backend-parity.tsv` to retain machine-readable observations.
-`BLOCKED` means a required host capability or runtime artifact was absent; it
-does not change the checked-in pass/gap claim.
+Every non-check run auto-discovers an outer dev-hermit checkout and appends
+scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
+to select another outer scorecard, `--no-parent-scorecard` for a deliberately
+side-effect-free run, or `--output /tmp/backend-parity.tsv` for a disposable
+standalone observation TSV. `BLOCKED` means a required host capability or
+runtime artifact was absent; it does not change the checked-in known-gap claim.
