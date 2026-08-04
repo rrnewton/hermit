@@ -582,6 +582,12 @@ fn run_dbi_rejects_unsupported_by_default_and_opt_out_aggregates_them() {
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
+    let opt_out_warning = "a successful exit does not establish complete deterministic execution";
+    assert_eq!(
+        normal_stderr.matches(opt_out_warning).count(),
+        1,
+        "compatibility opt-out warning missing or duplicated:\n{normal_stderr}"
+    );
     let warning = "syscalls restart_syscall used but not yet supported";
     assert_eq!(
         normal_stderr.matches(warning).count(),

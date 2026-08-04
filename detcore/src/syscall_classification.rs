@@ -786,9 +786,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
 
         // ===== UNSUPPORTED SYSCALLS =====
-        // These require a deterministic handler or further investigation. Normal mode
-        // records their use for an aggregate warning and preserves legacy forwarding;
-        // --panic-on-unsupported-syscalls stops at the first use.
+        // These require a deterministic handler or further investigation. Ordinary runs stop at
+        // the first use. The explicit compatibility opt-out records an aggregate warning and
+        // preserves legacy host forwarding.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::restart_syscall
@@ -1211,7 +1211,7 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 /// importantly the DBI copied pre-exec child fast path, which runs on the
 /// DynamoRIO client stack with no Detcore tool) would otherwise reach the host
 /// and leak or mutate the very state the classification is meant to hide. Such a
-/// backend must fail closed for these syscalls in strict mode instead.
+/// backend must fail closed for these syscalls unless compatibility was explicitly requested.
 ///
 /// This is the union of the individual family predicates whose dispatch arm in
 /// `Detcore::handle_syscall_event` returns `Err(Error::Errno(..))` unconditionally
@@ -1221,8 +1221,8 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 /// copied child closed for an emulated syscall would diverge from the ptrace
 /// path rather than match it. Keep this in sync with those dispatch arms.
 pub(crate) const fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
-    // These families preserve native behavior outside strict mode for rr and
-    // application compatibility, but fail closed under strict execution.
+    // These families preserve native behavior only behind the explicit compatibility opt-out;
+    // ordinary execution fails closed.
     matches!(sysno, Sysno::rseq)
         || is_zero_copy_pipe_syscall(sysno)
         || is_kernel_keyring_syscall(sysno)

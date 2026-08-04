@@ -160,8 +160,8 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable fail-closed strict deterministic mode. Deterministic scheduling and I/O are the
-    /// default; this explicit flag additionally rejects unsupported syscalls immediately.
+    /// Require Hermit's deterministic defaults and reject incompatible opt-outs. Unsupported
+    /// syscalls already fail closed in ordinary runs.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
@@ -1064,13 +1064,13 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
 
     let mut compatibility =
         RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
-    compatibility
-        .validate_args_with_perf_support(true)
-        .unwrap();
-    assert!(!compatibility
-        .det_opts
-        .det_config
-        .panic_on_unsupported_syscalls);
+    compatibility.validate_args_with_perf_support(true).unwrap();
+    assert!(
+        !compatibility
+            .det_opts
+            .det_config
+            .panic_on_unsupported_syscalls
+    );
     assert_eq!(
         format!("{}", compatibility),
         " --allow-unsupported-syscalls -- fakeprog"
@@ -1478,8 +1478,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "fail-closed strict deterministic mode",
-        "rejects unsupported syscalls immediately",
+        "Require Hermit's deterministic defaults",
+        "already fail closed in ordinary runs",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -1488,6 +1488,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "optimized partial syscall subscription set",
         "--panic-on-rbc-overshoot",
         "--allow-unsupported-syscalls",
+        "This weakens determinism",
         "--max-timeslice",
         "--preemption-timeout",
         "--target-timeslice",
@@ -1846,6 +1847,12 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
+        if self.allow_unsupported_syscalls {
+            eprintln!(
+                "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
+                 host; a successful exit does not establish complete deterministic execution."
+            );
+        }
         if self.hb_list_events {
             return self.list_happens_before_events();
         }

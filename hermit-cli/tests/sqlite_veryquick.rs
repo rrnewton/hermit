@@ -32,8 +32,8 @@ CREATE INDEX accounts_balance ON accounts(balance);
 SELECT count(*), sum(balance) FROM accounts;
 PRAGMA integrity_check;";
 
-    // Compatibility workloads keep deterministic defaults while normal mode reports any
-    // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
+    // Ordinary runs fail closed on unsupported syscalls. This workload therefore remains in the
+    // applicable ratchet inventory rather than using the compatibility opt-out.
     Command::new(hermit)
         .args(["--log", "off", "run", "--"])
         .arg(sqlite)

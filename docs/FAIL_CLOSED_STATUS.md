@@ -1,62 +1,33 @@
 # Fail-Closed Test Status
 
-Status: fail-closed batches through PID and file-offset handling complete, 2026-07-22
+Status: unsupported syscalls fail closed by default, 2026-08-04
 
-Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
-Detcore into a panic instead of silently passing it through. The integration
-ratchet sets `HERMIT_FAIL_CLOSED=1`; `hermit run` consumes that internal test
-environment variable as if `--panic-on-unsupported-syscalls` had been passed.
-The normal command-line default remains unchanged.
+An unsupported syscall that reaches Detcore terminates an ordinary `hermit run`
+instead of silently passing through to the host. The explicit
+`--allow-unsupported-syscalls` compatibility opt-out restores legacy host
+forwarding, emits a warning, and cannot support a deterministic-execution claim.
+`HERMIT_FAIL_CLOSED=1` remains accepted by the integration ratchet for backward
+compatibility, but it now selects the command-line default.
 
 ## Baseline
 
-The baseline used Hermit revision
-`5d3b2a35870a1d2e1d78a098219cfa7c1929aa33` plus the integration tests present
-in the working branch. Every `hermit-cli/tests/*.rs` target was run serially
-with `HERMIT_FAIL_CLOSED=1`. The raw integration harness result was 37 passed,
-86 failed, and 11 ignored. The policy classification below separates tests
-that actually exercise the `hermit run` fail-closed path from tests for which
-the mode is not applicable.
+The 2026-08-04 runtime inventory lists 657 integration tests: 277 are applicable
+to this policy, 279 are ignored, and 101 exercise modes that do not use
+Detcore's `hermit run` syscall policy. Four applicable exceptions remain for PMU
+or scheduler failures. No valid exception is an unsupported syscall: **0/277
+applicable cells depend on silently forwarding one**. A stale SQLite `fchown`
+row referred to a renamed test and was removed with the default change; the
+current SQLite cell passes fail closed.
 
-Detcore now handles `pread64` deterministically and disables `rseq` by
-returning `ENOSYS`. Batch two adds resource-ordered `lseek` passthrough, fixed
-success for advisory `fadvise64`, and PID-namespace `getpid`/`gettid` results.
-Of the 44 tests blocked on those four calls, 33 now pass and 11 reach later
-unsupported syscalls. The measured applicable pass count is 69/89. Remaining
-blockers are `ioctl` (7 tests), `tgkill` (4), `mkdir` (3), `setitimer` (2),
-`clock_settime` (1), `getrlimit` (1), `kill` (1), and `setsockopt` (1).
-
-| Test target or category | Fail-closed pass | Known failure | Ignored | Mode N/A |
-| --- | ---: | ---: | ---: | ---: |
-| `arbitrary_binaries` | 0 | 1 | 0 | 1 |
-| `cli` | 0 | 0 | 0 | 10 |
-| `clock_determinism` | 1 | 0 | 0 | 0 |
-| `epoll_determinism` | 4 | 1 | 0 | 0 |
-| `hermit_modes` | 49 | 14 | 8 | 0 |
-| `ipc_determinism` | 1 | 0 | 0 | 0 |
-| `mmap_determinism` | 5 | 0 | 0 | 0 |
-| `procfs_determinism` | 6 | 0 | 0 | 0 |
-| `random_determinism` | 1 | 0 | 0 | 0 |
-| `record_replay` | 0 | 0 | 0 | 17 |
-| `signal_determinism` | 1 | 4 | 0 | 0 |
-| `stress_suite` | 0 | 0 | 3 | 0 |
-| `thread_sync_determinism` | 1 | 0 | 0 | 0 |
-| Hermit library and binary unit tests | 0 | 0 | 0 | 33 |
-| **Total** | **69** | **20** | **11** | **61** |
-
-The ratchet now enables 69 fail-closed integration tests. The exact enabled set
-is the applicable inventory not present in either exception manifest; a full
-serial ratchet run verifies all 69.
-
-The complete test-level matrix is represented by the table plus these
-machine-readable exception lists:
+The exact enabled set is the applicable inventory not present in either
+exception manifest. The runner discovers and counts that set at execution time
+rather than relying on a historical hand-maintained table. The exception lists
+are:
 
 - [`fail_closed_known_failures.tsv`](../hermit-cli/tests/fail_closed_known_failures.tsv)
-  records every failing target/test pair and its first observed blocker. The
-  `pread64` and `rseq` batches raised coverage from 3 to 36 tests. Batch two
-  adds 33 more passes and reclassifies 11 tests at their later blockers.
+  records every failing target/test pair and its first observed blocker.
 - [`fail_closed_allowed_ignores.tsv`](../hermit-cli/tests/fail_closed_allowed_ignores.tsv)
-  records the eight PMU-dependent mode tests and three explicit stress tiers.
+  records every ignored applicable test and its concrete environment or runtime prerequisite.
 - Unit tests, `cli`, and `record_replay` do not execute Detcore's `hermit run`
   syscall policy. The record/replay case in `arbitrary_binaries` is also mode
   N/A. They remain covered by regular CI instead of inflating the fail-closed
@@ -108,5 +79,5 @@ missing release entries; see
 
 A future true fail-closed mode must subscribe to all syscalls (or install an
 equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 69/89 to full
-coverage of the currently applicable integration inventory.
+calls that Detcore does observe and provides a visible path to full coverage of
+the currently applicable integration inventory.

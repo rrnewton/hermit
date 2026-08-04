@@ -1608,12 +1608,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
-            // TODO-HUMAN-REVIEW(PR-916): Only fail closed under the strict
-            // (panic-on-unsupported) policy. A non-strict run keeps the pre-848
-            // host pass-through so the guest observes a real working keyring;
-            // this restores the enabled rr `keyctl` compatibility test, whose
-            // guest asserts add_key + keyctl(SETPERM) succeed. Under strict mode
-            // the deterministic ENOSYS boundary is preserved.
+            // TODO-HUMAN-REVIEW(PR-916): Fail closed under the ordinary
+            // panic-on-unsupported policy. The explicit compatibility opt-out
+            // keeps the pre-848 host pass-through for rr workloads whose guest
+            // requires a real working keyring. Otherwise the deterministic
+            // ENOSYS boundary is preserved.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
@@ -1622,11 +1621,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled
+            // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose unmodeled
             // pipe-buffer ownership or vmsplice page pinning. Return ENOSYS so
-            // callers use read/write fallbacks, but preserve the legacy normal-
-            // mode pass-through used by the existing rr splice compatibility
-            // test.
+            // callers use read/write fallbacks. The explicit compatibility
+            // opt-out preserves the legacy pass-through used by the existing
+            // rr splice compatibility test.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
