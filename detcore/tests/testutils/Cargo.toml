@@ -12,8 +12,8 @@ publish = false
 [dependencies]
 detcore = { version = "0.2.0", path = "../.." }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "cb092c6307baa5b39ff761c46b82b3f866840100" }
-reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "cb092c6307baa5b39ff761c46b82b3f866840100" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "591154213a98f35cdd6b14274c42113ccd204266" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "591154213a98f35cdd6b14274c42113ccd204266" }
 test-allocator = { version = "0.2.0", path = "../../../common/test-allocator" }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
