@@ -63,6 +63,8 @@ use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::AdmitIntent;
+use crate::scheduler::AdmitSide;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::ExecReconnect;
@@ -1280,19 +1282,27 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
-            let child_first = self.cfg.sequentialize_threads
-                && !parent_is_kernel_blocked
-                && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
-            let pos = if child_first {
-                sched.runqueue_push_front(child_dettid)
+            // Describe *how* the admission side is chosen, but do not resolve it
+            // (and in particular do not draw the post-fork PRNG) here: this
+            // handler runs on whichever backend worker fielded the RPC, so on an
+            // asynchronous backend (e.g. DBI, where the child self-registers
+            // outside a scheduler turn) resolving the side now would consume the
+            // PRNG draw in host RPC order. `admit_to_run_queue` resolves the
+            // intent at a deterministic point -- immediately under ptrace
+            // (post-commit, in schedule order, unchanged), or at the
+            // `DetTid`-ordered drain if this handler raced the daemon's
+            // tentative-pop window. When threads are not sequentialized, or the
+            // parent is already kernel-blocked (vfork), the child takes the tail
+            // and no PRNG is consumed.
+            let intent = if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
+                AdmitIntent::PostFork(self.cfg.runs_post_fork)
             } else {
-                sched.runqueue_push_back(child_dettid)
+                AdmitIntent::Fixed(AdmitSide::Back)
             };
+            sched.admit_to_run_queue(child_dettid, intent);
             debug!(
-                "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
-                child_dettid,
-                if child_first { "front" } else { "back" },
-                pos,
+                "[detcore] CreateChildThread with dtid {}: admit child via {:?}.",
+                child_dettid, intent,
             );
             sched.started_up.try_put(());
         }
