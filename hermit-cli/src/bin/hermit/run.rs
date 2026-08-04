@@ -2923,6 +2923,15 @@ impl RunOpts {
             BaseEnv::Host => self.merge_from_env_settings(&mut command)?,
         }
 
+        // Supervisor-only: never leak the skid-overshoot witness nonce into the
+        // guest environment. Reverie stamps this value into the overshoot marker
+        // (canonical definition: reverie_ptrace::timer::WITNESS_TOKEN_ENV) so the
+        // skid-retry gate can authenticate a marker as genuinely
+        // supervisor-emitted; a guest that could read the nonce could forge an
+        // authenticated marker. Under `--base-env=host` the guest would otherwise
+        // inherit it, so strip it here for every base-env mode.
+        command.env_remove("HERMIT_SKID_WITNESS_TOKEN");
+
         // Disable sanitizer leak detection in the guest for EVERY backend, so
         // the guest environment is identical regardless of which backend runs
         // it. The ptrace-family backends (ptrace, e9patch, sabre) already force
