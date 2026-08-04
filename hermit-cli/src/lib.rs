@@ -1539,11 +1539,22 @@ async fn run_with_backend_inner(
         let preload = liteinst_runtime_library_path()?;
         let stats_request = backend_stats::request();
         if stats_request.is_enabled() {
-            let (exit_status, mut global_state, instrumentation_stats) =
+            // RESEARCH-ONLY A/B (task liteinst-instrumentation-stats, do NOT land):
+            // default routes to the in-guest path; LITEINST_MEASURE_HOST_HYBRID=1
+            // routes the SAME stats reporter to the legacy host-hybrid
+            // (per-syscall ptrace round-trip) path for side-by-side measurement.
+            let use_host_hybrid = std::env::var_os("LITEINST_MEASURE_HOST_HYBRID").is_some();
+            let (exit_status, mut global_state, instrumentation_stats) = if use_host_hybrid {
+                reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+                    command, config, preload,
+                )
+                .await?
+            } else {
                 reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<Detcore>(
                     command, config, preload,
                 )
-                .await?;
+                .await?
+            };
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
