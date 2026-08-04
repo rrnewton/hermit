@@ -71,20 +71,20 @@ previously disabled C candidates:
 
 | Result | Cells | Meaning |
 | --- | ---: | --- |
-| SaBRe L2 and ptrace exit/stdout parity | 109 | Enabled by this ratchet |
+| SaBRe L2 and ptrace exit/stdout parity | 110 | Enabled by this ratchet |
 | SaBRe L2, but ptrace output differs | 18 | Remains disabled |
-| SaBRe L2 failed or timed out | 30 | Remains disabled |
+| SaBRe L2 failed or timed out | 29 | Remains disabled |
 
-The resulting plan enables SaBRe for 131/194 cells (67.5%): seven blocking CI
-cells and 124 manual cells. This meets the B3 corpus-count threshold (at least
+The resulting plan enables SaBRe for 132/194 cells (68.0%): seven blocking CI
+cells and 125 manual cells. This meets the B3 corpus-count threshold (at least
 50% of the ptrace strict-verify corpus). It does not establish B4, L3 memory
 determinism, L4 stress hardening, or support for every workload in a subsystem.
 
-The 109 newly enabled cells are grouped as follows:
+The 110 newly enabled cells are grouped as follows:
 
 | Manifest bucket | New cells |
 | --- | ---: |
-| `c-programs` | 99 |
+| `c-programs` | 100 |
 | `determinism-stress-c` | 7 |
 | `backend-parity-c` | 1 |
 | `bin-c` | 1 |
@@ -123,6 +123,15 @@ ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
 That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
 the denominator and enabled set have changed since the historical 133/199
 root-process-identity snapshot above.
+
+The incremental `record-replay-file-state` qualification preserves its
+unlinked-source and cloned-file `sendfile` checks while directing the copied
+bytes through a regular-file sink before emitting them with `write`. This keeps
+the workload inside Detcore's reviewed regular-file `sendfile` envelope and
+avoids treating ptrace's legacy dummy stdio type as evidence that potentially
+blocking pipe destinations are supported. The cell passes ptrace and SaBRe L2
+with byte-identical guest output. It does not claim pipe or socket destination
+support for `sendfile`.
 
 ## Known gaps
 
@@ -166,6 +175,7 @@ Separately, the same full scorecard found the already-enabled
 and requires independent requalification; it is not counted as progress here.
 
 The following 28 candidates fail SaBRe strict verification or its timeout and
+The following 29 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
 
 ```text
@@ -183,6 +193,7 @@ c-programs/pread64-nostdlib
 c-programs/pselect6-simulation
 c-programs/racewrite-nostdlib
 c-programs/record-replay-file-state
+c-programs/record-replay-lseek-seek-cur
 c-programs/resource-determinism
 c-programs/signal-determinism
 c-programs/sigpipe-siginfo
