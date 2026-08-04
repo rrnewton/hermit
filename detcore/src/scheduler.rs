@@ -3777,8 +3777,16 @@ mod test {
         // the racing handlers, and whether a tentative window happened to be
         // live when each handler ran.
         let baseline = drained_order([lower, higher], true);
-        assert_eq!(baseline, drained_order([higher, lower], true), "arrival order");
-        assert_eq!(baseline, drained_order([lower, higher], false), "window state");
+        assert_eq!(
+            baseline,
+            drained_order([higher, lower], true),
+            "arrival order"
+        );
+        assert_eq!(
+            baseline,
+            drained_order([lower, higher], false),
+            "window state"
+        );
         assert_eq!(baseline, drained_order([higher, lower], false), "both");
         assert!(baseline.contains(&lower) && baseline.contains(&higher));
     }
@@ -4015,10 +4023,12 @@ mod test {
 
         // (1) Deterministic across identical replays.
         let canonical = split(a, b);
-        assert_eq!(canonical, split(a, b), "identical schedule -> identical result");
-        assert!(
-            canonical.contains(&a) && canonical.contains(&b) && canonical.contains(&anchor)
+        assert_eq!(
+            canonical,
+            split(a, b),
+            "identical schedule -> identical result"
         );
+        assert!(canonical.contains(&a) && canonical.contains(&b) && canonical.contains(&anchor));
 
         // (2) The result binds to schedule-fixed snapshot membership: swapping
         // which child is in drain 1 changes the outcome for this seed.
