@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# hermit-box-run — run ONE ad-hoc command inside the safe-ci-dag-runner box so it can
+# never orphan a setsid/double-fork inner child or leak a burned core / held namespace.
+#
+# WHY THIS EXISTS
+# ---------------
+# An ad-hoc `hermit run …` that hits a long-lived / livelock path forms a TWO-process
+# tree: an OUTER hermit (session leader, pipe-wait, cpu≈0) plus an INNER supervisor in
+# its OWN process group that burns a core / holds a PID namespace and reparents to
+# ppid=1. A launcher `kill -- -<PGID>` (what an agent recycle or a tool wall-cap does)
+# reaches only the OUTER and ORPHANS the inner — the exact reason ad-hoc runs leak while
+# cgroup-scoped safe-ci-dag-runner nodes do not.
+#
+# This wrapper closes that gap WITHOUT new engine code: it emits a ONE-step DAG (with a
+# CPU-TIME budget) and drives it through the canonical safe-ci-dag-runner, reusing verbatim
+#   * boxing ON by default + exit 3 when cgroup-v2/systemd --user scope is unavailable,
+#   * the per-step CPU-time budget kill in scheduler._monitor (reads cgroup cpu.stat
+#     usage_usec — immune to wall-clock slowdown under load), and
+#   * teardown.reap()'s cgroup.kill-first teardown, which SIGKILLs the WHOLE subtree
+#     atomically, including setsid / double-fork escapees a process-group kill misses.
+# No external kill is ever needed; the box tears the whole tree down on budget or on exit.
+#
+# CPU-TIME, NOT WALL: the budget is user+system CPU seconds of the whole subtree, read
+# from the cgroup. Under contention a merely-slow run still completes once it accrues its
+# bounded CPU budget; only a runaway/livelock keeps burning and hits the budget. (A wall
+# timeout cannot tell slow from stuck on a saturated core — see
+# ai_docs/box-requirements-for-verify-hang-repro_20260803.md.)
+#
+# USAGE
+#   hermit-box-run [--cpu-budget SECS] [--cores K] [--label NAME]
+#                  [--perf-dir DIR] [--allow-cgroup-failure] -- CMD [ARGS...]
+#
+#   --cpu-budget SECS  whole-subtree CPU-time budget; the run is reaped when it exceeds
+#                      this. Default 240 (~4x the ~57 CPU-s known-good `hermit run
+#                      --strict --verify` budget B; kill at ~4B). Set per workload.
+#   --cores K          constrain the whole subtree to K least-busy free cores (cgroup
+#                      cpuset, else sched_setaffinity). K=1 forces sequential execution.
+#                      Absent = no core pin.
+#   --label NAME       label used for the DAG step tag (default: box).
+#   --perf-dir DIR     write per-step + whole-run resource-usage CSVs there.
+#   --allow-cgroup-failure  downgrade to a best-effort UNBOXED run instead of exit 3 when
+#                      cgroup boxing cannot be established. NOT recommended (defeats the
+#                      whole point); provided for parity with the underlying runner.
+#
+# EXIT CODES (passthrough from safe-ci-dag-runner)
+#   0  command succeeded within budget
+#   1  command failed OR was reaped for exceeding the CPU-time budget (grep the output for
+#      "CPU-TIMEOUT" to distinguish; a reaped runaway is exactly the leak this prevents)
+#   2  bad usage
+#   3  cgroup boxing required but unavailable (pass --allow-cgroup-failure to run unboxed)
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+RUNNER="$ROOT/agent-utils/bin/safe-ci-dag-runner"
+
+cpu_budget=240
+cores=""
+label="box"
+perf_dir=""
+allow_cgroup_failure=0
+
+die() { echo "hermit-box-run: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cpu-budget) [ $# -ge 2 ] || die "--cpu-budget needs a value"; cpu_budget="$2"; shift 2 ;;
+    --cpu-budget=*) cpu_budget="${1#*=}"; shift ;;
+    --cores)      [ $# -ge 2 ] || die "--cores needs a value"; cores="$2"; shift 2 ;;
+    --cores=*)    cores="${1#*=}"; shift ;;
+    --label)      [ $# -ge 2 ] || die "--label needs a value"; label="$2"; shift 2 ;;
+    --label=*)    label="${1#*=}"; shift ;;
+    --perf-dir)   [ $# -ge 2 ] || die "--perf-dir needs a value"; perf_dir="$2"; shift 2 ;;
+    --perf-dir=*) perf_dir="${1#*=}"; shift ;;
+    --allow-cgroup-failure) allow_cgroup_failure=1; shift ;;
+    -h|--help)    sed -n '2,60p' "$SELF"; exit 0 ;;
+    --)           shift; break ;;
+    -*)           die "unknown option '$1' (put the command after '--')" ;;
+    *)            break ;;
+  esac
+done
+
+[ $# -ge 1 ] || die "no command given (use '-- CMD [ARGS...]')"
+case "$cpu_budget" in ''|*[!0-9]*) die "--cpu-budget must be a positive integer (seconds)";; esac
+[ "$cpu_budget" -gt 0 ] || die "--cpu-budget must be > 0"
+if [ -n "$cores" ]; then case "$cores" in ''|*[!0-9]*) die "--cores must be a positive integer";; esac; fi
+[ -x "$RUNNER" ] || die "runner not found/executable at $RUNNER"
+
+# Build the one-step DAG with correct JSON escaping via python3 (argv passed as $@).
+dag_file="$(mktemp -t hermit-box-run.XXXXXX.dag.json)"
+cleanup() { rm -f "$dag_file"; }
+trap cleanup EXIT
+LABEL="$label" CPU_BUDGET="$cpu_budget" python3 - "$@" > "$dag_file" <<'PY'
+import json, os, shlex, sys
+argv = sys.argv[1:]
+# exec so the boxed step process IS the command (one clean subtree, no extra shell frame).
+cmd = "exec " + " ".join(shlex.quote(a) for a in argv)
+label = os.environ["LABEL"]
+grp, _, job = label.partition(".")
+if not job:
+    grp, job = "box", label
+dag = {"steps": [{
+    "group": grp, "job": job,
+    "desc": "hermit-box-run: " + " ".join(argv),
+    "cmd": cmd,
+    "cpu_timeout": int(os.environ["CPU_BUDGET"]),
+}]}
+json.dump(dag, sys.stdout)
+PY
+
+set -- run --dag "$dag_file" --no-profile
+[ -n "$cores" ] && set -- "$@" --cores "$cores"
+[ -n "$perf_dir" ] && set -- "$@" --perf-dir "$perf_dir"
+[ "$allow_cgroup_failure" -eq 1 ] && set -- "$@" --allow-cgroup-failure
+
+exec "$RUNNER" "$@"
