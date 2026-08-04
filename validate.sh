@@ -527,6 +527,10 @@ readonly VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
 
 checks=0
 failures=0
+# A validate receipt is trustworthy only when this run proved that the recorded
+# Reverie dependency equals the live main tip. cleanup fails closed if any path
+# reaches a nominally successful exit without setting this after the gate.
+REVERIE_PIN_GATE_PASSED=0
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -999,7 +1003,7 @@ function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
-    local commit_anchored_json tree_dirty_json
+    local commit_anchored_json tree_dirty_json reverie_pin_current_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1029,6 +1033,7 @@ function append_validation_ledger {
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+    if ((REVERIE_PIN_GATE_PASSED == 1)); then reverie_pin_current_json=true; else reverie_pin_current_json=false; fi
 
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
     # are additive; the parent ledger aggregator reads via .get() and is
@@ -1043,6 +1048,7 @@ function append_validation_ledger {
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
+    line+="\"reverie_pin_current\":$reverie_pin_current_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
@@ -1117,6 +1123,15 @@ function cleanup {
     local pid
 
     trap - EXIT
+
+    # Receipt production is itself an enforcement path. If a new fast path or
+    # early return accidentally bypasses the pin gate, it must not emit PASS or
+    # return success merely because its selected tests happened to pass.
+    if ((exit_status == 0 && REVERIE_PIN_GATE_PASSED != 1)); then
+        printf "❌ Validation path bypassed the latest-Reverie pin gate; refusing a passing receipt.\n" >&2
+        failures=$((failures + 1))
+        exit_status=1
+    fi
 
     if [[ -n $active_check_pid ]]; then
         kill_process_tree "$active_check_pid" TERM
@@ -4134,6 +4149,16 @@ function run_super_suite {
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
 
+# The archival pin is not a testing exemption: validate always proves it equals
+# the live Reverie main tip before initializing dependencies or running tests.
+run_check "Reverie dependency pin equals latest main" \
+    "$ROOT_DIR/scripts/check-reverie-pin.rs"
+if ((failures != 0)); then
+    print_summary
+    exit 1
+fi
+REVERIE_PIN_GATE_PASSED=1
+
 # Keep direct ./validate.sh invocations as self-sufficient as `make validate`.
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
@@ -4198,7 +4223,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
             "$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            "$ROOT_DIR/target/liteinst-runtime-build-7951770"
+            "$ROOT_DIR/target/liteinst-runtime-build"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \

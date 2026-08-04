@@ -6,6 +6,14 @@
   "default_step_timeout": 120,
   "steps": [
     {
+      "group": "check", "job": "reverie_pin",
+      "desc": "Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main",
+      "cmd": "./scripts/check-reverie-pin.rs",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "build", "job": "privileged_tests",
       "desc": "Build Hermit and the focused test binaries used by the privileged lane",
       "cmd": "cargo build -p hermit --features third-party-backends --bin hermit && cargo test -p detcore --test tests_misc --no-run",

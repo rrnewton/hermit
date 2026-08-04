@@ -319,6 +319,45 @@ function assert_validate_entrypoint {
         die "validate.sh $function_name command diverged from the audited entrypoint"
 }
 
+# Keep the latest-Reverie invariant attached to every testing evidence path.
+# The checker unit tests plant stale/current pins; these structural assertions
+# prove that those same fail-closed semantics cannot be bypassed by selecting a
+# different local, DAG, hosted-CI, merge-gate, or receipt path.
+function assert_reverie_pin_enforcement {
+    local dag
+    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
+        jq -e '
+            [.steps[] | select(
+                .group == "check"
+                and .job == "reverie_pin"
+                and .cmd == "./scripts/check-reverie-pin.rs"
+            )] | length == 1
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
+    done
+
+    [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh must execute the latest-Reverie gate exactly once"
+    [[ $(grep -Fc 'REVERIE_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipt cleanup must fail closed when the pin gate was bypassed"
+    [[ $(grep -Fc '\"reverie_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipts must state whether the latest-Reverie gate passed"
+
+    local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
+    [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one latest-Reverie job"
+    [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
+        die "the authoritative portable aggregate must depend on the Reverie pin job"
+    ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
+        die "portable CI must not retain a stale-Reverie override"
+
+    local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
+    [[ $(grep -Fxc '    name: reverie-pin-is-latest-main' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must check exact PR heads with the trusted pin checker"
+    [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must depend on its exact-head Reverie pin job"
+}
+
 function dag_critical_path_seconds {
     local dag=$1
     jq -r '
@@ -347,6 +386,8 @@ function audit_ci_correspondence {
             and all(.[]; (.cmd | type == "string" and length > 0))
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
+
+    assert_reverie_pin_enforcement
 
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs
     # its small hardware DAG within one job.

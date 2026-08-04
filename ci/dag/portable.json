@@ -6,6 +6,14 @@
   "default_step_timeout": 600,
   "steps": [
     {
+      "group": "check", "job": "reverie_pin",
+      "desc": "Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main",
+      "cmd": "./scripts/check-reverie-pin.rs",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "backend_abstraction",
       "desc": "Detcore backend-abstraction check",
       "cmd": "./scripts/check-detcore-backend-abstraction.sh",
@@ -70,7 +78,7 @@
     {
       "group": "build", "job": "liteinst_runtime_release",
       "desc": "Build and stage the release LiteInst runtime",
-      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-7951770",
+      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build",
       "deps": ["build.dbi_release"],
       "timeout": 900,
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 2147483648,
