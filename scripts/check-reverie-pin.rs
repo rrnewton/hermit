@@ -47,8 +47,8 @@ const MAIN_REF: &str = "refs/heads/main";
 #[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
+    #[cfg(test)]
     remote: Option<String>,
-    main_sha: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
 }
@@ -70,7 +70,6 @@ fn usage() -> &'static str {
      \n\
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
-       --reverie-remote URL                Reverie remote to query\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
        -h, --help                          Show this help\n\
@@ -93,9 +92,6 @@ fn parse_args() -> Result<Config, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
-            "--reverie-remote" => {
-                config.remote = Some(take_value(&args, &mut i, "--reverie-remote")?)
-            }
             "--print-pin" => config.print_pin = true,
             "--update-to-latest" => config.update_to_latest = true,
             "-h" | "--help" => {
@@ -471,14 +467,14 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(1);
     }
 
+    // Production has no CLI/env/recorded-value override for the authority.
+    // Tests substitute only the remote transport, then exercise this same
+    // refs/heads/main dereference rather than injecting a well-shaped SHA.
+    #[cfg(not(test))]
+    let remote = DEFAULT_REMOTE;
+    #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
-    let main_result = match config.main_sha {
-        Some(sha) if is_full_sha(&sha) => Ok(sha),
-        Some(sha) => Err(format!(
-            "test main SHA must be 40 hex characters, got {sha:?}"
-        )),
-        None => query_main(remote),
-    };
+    let main_result = query_main(remote);
 
     let main = match main_result {
         Ok(main) => main,
@@ -606,8 +602,32 @@ mod tests {
     #[test]
     fn exact_latest_pin_passes() {
         let root = temp_path("current");
+        let remote = temp_path("current-reverie");
         init_fixture_repo(&root);
-        let current = "0123456789abcdef0123456789abcdef01234567";
+        init_fixture_repo(&remote);
+        fs::write(remote.join("revision"), "current\n").expect("write Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "current"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let current =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
         fs::write(
             root.join("Cargo.toml"),
             format!(
@@ -623,12 +643,13 @@ mod tests {
         );
         let code = run_with_config(Config {
             repo: Some(root.clone()),
-            main_sha: Some(current.to_string()),
+            remote: Some(remote.to_string_lossy().into_owned()),
             ..Config::default()
         })
         .expect("current pin should be classified");
         assert_eq!(code, 0, "an exact latest-main pin must pass");
         fs::remove_dir_all(root).expect("remove fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
     #[test]
@@ -671,6 +692,13 @@ mod tests {
             String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
                 .trim()
                 .to_string();
+        assert_ne!(old, latest);
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
 
         fs::write(
             root.join("Cargo.toml"),
@@ -688,7 +716,6 @@ mod tests {
         let code = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
-            main_sha: Some(latest),
             ..Config::default()
         })
         .expect("behind pin should be classified");
@@ -727,10 +754,34 @@ mod tests {
     #[test]
     fn tracked_stale_lockfile_fails_the_checker_path() {
         let root = temp_path("stale-lock");
+        let remote = temp_path("stale-lock-reverie");
         let runtime = root.join("runtime");
         init_fixture_repo(&root);
+        init_fixture_repo(&remote);
         fs::create_dir_all(&runtime).expect("create fixture directories");
-        let current = "0123456789abcdef0123456789abcdef01234567";
+        fs::write(remote.join("revision"), "current\n").expect("write Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "current"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let current =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
         let stale = "89abcdef0123456789abcdef0123456789abcdef";
         fs::write(
             root.join("Cargo.toml"),
@@ -762,12 +813,13 @@ mod tests {
         );
         let code = run_with_config(Config {
             repo: Some(root.clone()),
-            main_sha: Some(current.to_string()),
+            remote: Some(remote.to_string_lossy().into_owned()),
             ..Config::default()
         })
         .expect("checker should classify the planted inconsistency");
         assert_eq!(code, 1, "a tracked stale Cargo.lock must fail closed");
 
         fs::remove_dir_all(root).expect("remove fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 }
