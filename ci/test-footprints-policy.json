@@ -40,7 +40,6 @@
   ],
   "package_paths": {
     "detcore": ["detcore/**"],
-    "edit-distance": ["common/edit-distance/**"],
     "hermetic_infra_hermit_flaky-tests": ["flaky-tests/**"],
     "hermit": ["hermit-cli/**"],
     "hermit-install": ["hermit-install/**"]
@@ -52,7 +51,6 @@
         "detcore",
         "detcore-model",
         "detcore-testutils",
-        "edit-distance",
         "hermit",
         "hermit-resources",
         "test-allocator"
