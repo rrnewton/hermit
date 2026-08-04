@@ -302,6 +302,13 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Check out canonical CI authorities
+        uses: actions/checkout@v4
+        with:
+          repository: rrnewton/dev-hermit
+          ref: f9e61247e83bb07c11297541b591606de24a89a8
+          path: .dev-hermit-policy
+          persist-credentials: false
       - name: Require a passed result or re-dispatch a no-result check
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
@@ -319,23 +326,8 @@ jobs:
           set -euo pipefail
 
           classify_check() {
-            if [ -x scripts/classify-required-check.sh ]; then
-              scripts/classify-required-check.sh "$@"
-              return
-            fi
-            # Bootstrap this policy's own PR: the trusted main checkout does not
-            # contain the helper until landing. This table is covered by the
-            # inline assertions below and by check-merge-gate-policy.sh.
-            local status=${1,,} conclusion=${2,,}
-            if [ "$conclusion" = success ] &&
-               { [ "$status" = completed ] || [ -z "$status" ]; }; then
-              echo PASSED
-            elif { [ "$status" = completed ] || [ -z "$status" ]; } &&
-                 [[ " failure timed_out error startup_failure " == *" $conclusion "* ]]; then
-              echo FAILED
-            else
-              echo NO_RESULT
-            fi
+            .dev-hermit-policy/ci-hub/check_outcome.py \
+              --status "$1" --conclusion "$2"
           }
 
           # Prove the exact predicate used by this gate on every invocation.
@@ -507,7 +499,7 @@ jobs:
               if gh api --paginate --slurp \
                    "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
                    >"$comments_file" &&
-                 evidence=$(bash scripts/verify-local-validation-receipt.sh \
+                 evidence=$(bash .dev-hermit-policy/ci-hub/validation/verify_receipt.sh \
                    --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
                 local_pass=true
                 echo "PR #${pr_number} has a dereferenced exact-head receipt: ${evidence}"

@@ -26,13 +26,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Sequence
 from urllib.parse import urlparse
 
-from check_status_outcome import CheckOutcome, classify_check
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-utils" / "py"))
+from ci_hub_check_outcome import classify_check  # noqa: E402
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
@@ -87,12 +89,11 @@ def classify_check_outcome(conclusion: object, status: object) -> str:
     also terminal. Every other shape is NO-RESULT; unknown values fail closed
     without being misreported as product failures.
     """
-    outcome = classify_check(status, conclusion)
     return {
-        CheckOutcome.PASSED: "passed",
-        CheckOutcome.FAILED: "failed",
-        CheckOutcome.NO_RESULT: "no-result",
-    }[outcome]
+        "PASSED": "passed",
+        "FAILED": "failed",
+        "NO_RESULT": "no-result",
+    }[classify_check(status, conclusion)]
 
 
 def classify_ci_rollup(repo: str, checks: object) -> str:

@@ -29,11 +29,14 @@ substitute.
 
 ## Status consumer inventory
 
-`scripts/check_status_outcome.py` is the Hermit check-status authority. The
-workflow's shell entry point, the PR rollup, and the lander/DAG rollup all call
-that one classifier; `scripts/check-merge-gate-policy.sh` rejects a duplicate jq
-table or a consumer that stops delegating to it. The state table is enforced at
-every decision surface:
+Parent `ci-hub/check_outcome.py` is the check-status authority. The gate checks
+out the exact parent authority commit and executes it directly. Hermit's shell,
+PR-status, lander/DAG, and pinned landing-planner entry points share one
+`agent-utils` adapter; it locates and digest-checks the same parent source rather
+than carrying a conclusion table.
+`scripts/check-merge-gate-policy.sh` rejects a duplicate jq table or a consumer
+that bypasses the parent authority. The state table is enforced at every
+decision surface:
 
 - `.github/workflows/merge-gate.yml` classifies portable, privileged, demo,
   review-protocol, and validation-invalidation results before admission.
@@ -85,11 +88,12 @@ admission requirement.
 ## Validation-evidence trail
 
 The label is only a cache of a validation receipt; it cannot create evidence.
-`scripts/verify-local-validation-receipt.sh` is the receipt authority used by
-the gate. It resolves the marker's receipt commit, proves that commit belongs to
-the receipt branch, reads the exact path at that commit, recomputes SHA-256, and
-then validates the exact-head counted ledger row. A well-shaped comment without
-that backing receipt is refused.
+Parent `ci-hub/validation/verify_receipt.sh` is the receipt authority used by
+the gate. The gate executes it from the same exact parent checkout rather than
+running PR-controlled or copied verifier code. It resolves the marker's receipt
+commit, proves that commit belongs to the receipt branch, reads the exact path
+at that commit, recomputes SHA-256, and then validates the exact-head counted
+ledger row. A well-shaped comment without that backing receipt is refused.
 
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:

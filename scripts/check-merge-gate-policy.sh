@@ -19,19 +19,24 @@ fail() {
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
-grep -Fq 'scripts/classify-required-check.sh' "$WORKFLOW" || fail "gate must use the trinary classifier"
-grep -Fq 'check_status_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
-    fail "gate wrapper must delegate to the canonical status classifier"
-grep -Fq 'from check_status_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
-    fail "PR rollup must import the canonical status classifier"
-grep -Fq 'check_status_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
-    fail "lander rollup must call the canonical status classifier"
+grep -Fq 'ref: f9e61247e83bb07c11297541b591606de24a89a8' "$WORKFLOW" ||
+    fail "gate must pin the parent authority commit"
+grep -Fq '.dev-hermit-policy/ci-hub/check_outcome.py' "$WORKFLOW" ||
+    fail "gate must call the parent check-status authority"
+grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
+    fail "local shell adapter must delegate to the parent status authority"
+grep -Fq 'from ci_hub_check_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
+    fail "PR rollup must import the parent-authority adapter"
+grep -Fq 'agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "lander rollup must call the parent-authority adapter"
 [[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||
     fail "duplicate jq status classifier must not exist"
-grep -Fq 'scripts/verify-local-validation-receipt.sh' "$WORKFLOW" ||
-    fail "local alternate leg must dereference the canonical immutable receipt"
-if grep -Fq 'check-local-validation-evidence.sh' "$WORKFLOW"; then
-    fail "gate must not authorize from the legacy prose-only evidence checker"
+[[ ! -e $ROOT_DIR/scripts/check_status_outcome.py ]] ||
+    fail "duplicate Hermit status adapter must not exist"
+grep -Fq '.dev-hermit-policy/ci-hub/validation/verify_receipt.sh' "$WORKFLOW" ||
+    fail "local alternate leg must call the parent receipt verifier"
+if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
+    fail "gate must not call a PR-local validation-evidence verifier"
 fi
 grep -Fq 'NO_RESULT)' "$WORKFLOW" || fail "gate must handle NO_RESULT explicitly"
 grep -Fq 'dispatch_no_result' "$WORKFLOW" || fail "NO_RESULT must re-dispatch"

@@ -13,6 +13,6 @@ if (($# != 2)); then
     exit 2
 fi
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-exec python3 "$script_dir/check_status_outcome.py" \
+root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+exec python3 "$root_dir/agent-utils/py/ci_hub_check_outcome.py" \
     --status "$1" --conclusion "$2"
