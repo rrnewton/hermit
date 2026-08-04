@@ -166,9 +166,9 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 **Inner** — each gate's own box:
 
 - `rss_baseline_bytes` — estimated peak RSS, the input to `-j` sizing.
-- `hard_mem_max_bytes` — explicit inner cgroup `MemoryMax` (applied only under
-  `--cgroups`); a gate that exceeds it is OOM-killed **in isolation** rather
-  than taking down the run.
+- `hard_mem_max_bytes` — explicit inner cgroup `MemoryMax`, enforced by the
+  default cgroup-boxed runner; a gate that exceeds it is OOM-killed **in
+  isolation** rather than taking down the run.
 - `est_duration_s` — orders ready gates longest-first (packing only; never a
   correctness contract).
 - `classification` — `cpu-bound` (compiles, PMU compute), `latency-bound`
