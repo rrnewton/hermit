@@ -71,47 +71,85 @@ function validation_slot_name {
 readonly VALIDATE_EXIT_UNHARNESSED=3
 readonly VALIDATE_EXIT_STALE_REVERIE_PIN=4
 
-# True iff `target` is this process or a live ancestor of it (walks /proc PPid).
+# True iff `target` is a live STRICT-OR-SELF ancestor of this process (walks
+# /proc PPid). PID 1 (init) is NEVER a valid target: it is every process's
+# ancestor, so accepting it would make "descends from the lock owner" vacuously
+# true. Callers additionally require target > 1 before trusting it as an owner.
 function pid_is_ancestor {
     local target=$1 cur=$$ ppid
     [[ $target =~ ^[0-9]+$ ]] || return 1
+    ((target > 1)) || return 1                     # init/target=1 is never an owner
     while ((cur > 1)); do
         [[ $cur == "$target" ]] && return 0
         ppid=$(awk '/^PPid:/{print $2; exit}' "/proc/$cur/status" 2>/dev/null) || return 1
         [[ $ppid =~ ^[0-9]+$ ]] || return 1
         cur=$ppid
     done
-    [[ $cur == "$target" ]]
+    return 1
 }
 
-# Strong proof: this run descends from a live `ci-hub validate-lock run` owner,
-# which exports its PID and owner sidecar into the child env (validate_lock.rs).
-# We confirm the sidecar records that same PID and that it is a live ancestor,
-# so a stale/hand-copied env var alone cannot satisfy it.
-function admitted_via_lock_run {
-    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
-    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
-    [[ -n $owner_pid && -n $owner_file && -r $owner_file ]] || return 1
-    local file_pid
-    file_pid=$(sed -n 's/^pid=//p' "$owner_file")
-    [[ $file_pid == "$owner_pid" ]] || return 1
-    pid_is_ancestor "$owner_pid"
+# Confirm the LIVE /proc identity of `pid` matches the lease owner record from
+# ci-hub, so a reused PID cannot masquerade as the owner. boot_id must equal the
+# current boot (a stale record from before a reboot is rejected) and starttime
+# (field 22 of /proc/<pid>/stat -- the same value ci-hub records as start_ticks)
+# must equal the recorded start_ticks (a recycled PID has a different starttime).
+function proc_identity_matches {
+    local pid=$1 want_boot=$2 want_ticks=$3
+    [[ -n $want_boot && -n $want_ticks ]] || return 1
+    local cur_boot
+    cur_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+    [[ $cur_boot == "$want_boot" ]] || return 1
+    local stat after starttime
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    # comm (field 2) may contain spaces and parens; split after the LAST ')', so
+    # the remainder starts at field 3 (state). starttime is overall field 22,
+    # i.e. field 20 of that remainder -- matching validate_lock.rs
+    # process_start_ticks (fields.get(19), 0-based).
+    after=${stat##*') '}
+    starttime=$(awk '{print $20}' <<<"$after")
+    [[ -n $starttime && $starttime == "$want_ticks" ]]
 }
 
-# General proof: the validate box is actively HELD by a live owner right now.
-# This also covers producers that `validate-lock acquire` and then run
-# validate.sh as a sibling (which get no owner env). It dereferences the lock
-# authority (`validate-lock status`) rather than reimplementing lease liveness.
-# Overridable for tests via HERMIT_VALIDATE_ADMISSION_STATUS_CMD.
-function admission_box_is_held {
+# THE non-forgeable admission proof: this run descends from the process that
+# actually holds the ci-hub validate lease. The owner identity is read ONLY from
+# `ci-hub validate-lock status`, whose HELD record is written under a flock guard
+# by a real lease acquisition -- an agent cannot make it report HELD (with an
+# owner_pid) without genuinely acquiring the box. We then require that owner_pid
+# be a live ancestor of THIS process AND that its live /proc identity match the
+# lease record. No env var and no agent-writable sidecar participates, so the
+# forges that defeated the previous design (exporting CI_HUB_VALIDATE_LOCK_OWNER_*
+# or pointing them at a hand-written file) cannot grant admission.
+#
+# The HERMIT_VALIDATE_ADMISSION_STATUS_CMD stand-in is honored ONLY together with
+# the HERMIT_VALIDATE_ADMISSION_SELFTEST barrier (which runs NO validation and
+# emits NO receipt). On a real run the override is ignored and the authoritative
+# `validate-lock status` is dereferenced, so no test hook can admit a real run.
+function admitted_by_live_lease {
     local parent=$1 status_out
-    if [[ -n ${HERMIT_VALIDATE_ADMISSION_STATUS_CMD:-} ]]; then
+    if [[ -n ${HERMIT_VALIDATE_ADMISSION_SELFTEST:-} \
+        && -n ${HERMIT_VALIDATE_ADMISSION_STATUS_CMD:-} ]]; then
         status_out=$(eval "$HERMIT_VALIDATE_ADMISSION_STATUS_CMD" 2>/dev/null) || return 1
     else
         [[ -x $parent/ci-hub/ci-hub ]] || return 1
-        status_out=$(cd "$parent" && ./ci-hub/ci-hub validate-lock status 2>/dev/null) || return 1
+        # A cold rust-script compile of ci-hub can exceed 120s; bound the call so
+        # the guard can never hang a run. A timeout is treated as "not admitted".
+        status_out=$(cd "$parent" && timeout 300 ./ci-hub/ci-hub validate-lock status 2>/dev/null) || return 1
     fi
-    grep -q '^HELD:' <<<"$status_out"
+
+    grep -q '^HELD:' <<<"$status_out" || return 1
+
+    local owner_pid owner_boot owner_ticks
+    owner_pid=$(sed -n 's/^[[:space:]]*owner_pid=//p' <<<"$status_out" | head -n1)
+    owner_boot=$(sed -n 's/^[[:space:]]*owner_boot_id=//p' <<<"$status_out" | head -n1)
+    owner_ticks=$(sed -n 's/^[[:space:]]*owner_start_ticks=//p' <<<"$status_out" | head -n1)
+
+    [[ $owner_pid =~ ^[0-9]+$ ]] || return 1       # legacy lease w/o identity -> refuse
+    ((owner_pid > 1)) || return 1                  # init is never a valid owner
+
+    # Both must hold: HELD-by-an-ancestor-of-me (not HELD-by-anyone), and the
+    # owner is the same live process incarnation that holds the lease.
+    pid_is_ancestor "$owner_pid" || return 1
+    proc_identity_matches "$owner_pid" "$owner_boot" "$owner_ticks" || return 1
 }
 
 function assert_harnessed_or_admitted {
@@ -119,8 +157,7 @@ function assert_harnessed_or_admitted {
     parent=$(find_dev_hermit_parent) || return 0   # bare/standalone -> RUN
     [[ -d $parent/ci-hub ]] || return 0            # dev-hermit but no gate -> RUN
 
-    admitted_via_lock_run && return 0
-    admission_box_is_held "$parent" && return 0
+    admitted_by_live_lease "$parent" && return 0
 
     cat >&2 <<EOF
 ======================================================================
