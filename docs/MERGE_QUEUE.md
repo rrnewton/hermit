@@ -9,9 +9,8 @@ The required check is `merge-gate`. It passes when either:
 - the authoritative jobs in the latest `.github/workflows/ci-portable.yml` and
   `.github/workflows/ci-privileged.yml` runs for the exact pull request head
   both completed successfully; or
-- the pull request has the `locally-validated` label from a fully green
-  `./validate.sh` run, plus a complete exact-head full-validation evidence
-  comment.
+- the pull request has the `locally-validated` label and an exact-head receipt
+  whose immutable content proves a counted, clean, full `./validate.sh` pass.
 
 Every check reader uses three outcomes:
 
@@ -30,7 +29,11 @@ substitute.
 
 ## Status consumer inventory
 
-The state table is enforced at every decision surface:
+`scripts/check_status_outcome.py` is the Hermit check-status authority. The
+workflow's shell entry point, the PR rollup, and the lander/DAG rollup all call
+that one classifier; `scripts/check-merge-gate-policy.sh` rejects a duplicate jq
+table or a consumer that stops delegating to it. The state table is enforced at
+every decision surface:
 
 - `.github/workflows/merge-gate.yml` classifies portable, privileged, demo,
   review-protocol, and validation-invalidation results before admission.
@@ -81,13 +84,21 @@ admission requirement.
 
 ## Validation-evidence trail
 
+The label is only a cache of a validation receipt; it cannot create evidence.
+`scripts/verify-local-validation-receipt.sh` is the receipt authority used by
+the gate. It resolves the marker's receipt commit, proves that commit belongs to
+the receipt branch, reads the exact path at that commit, recomputes SHA-256, and
+then validates the exact-head counted ledger row. A well-shaped comment without
+that backing receipt is refused.
+
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:
 
-- **Add time.** A green `./validate.sh` posts an evidence comment (commit SHA,
-  profile, results, host, durable log path) ending in a machine-parseable marker
-  `<!-- locally-validated-evidence sha=... -->`. This is the safety net: it
-  survives even if a strip path forgets to comment.
+- **Add time.** The parent `ci-hub apply-local-label` authority requires a
+  qualifying local ledger row, preserves and hashes its log, publishes an
+  immutable receipt, comments with a machine-parseable
+  `<!-- locally-validated-receipt commit=... path=... sha256=... -->` marker,
+  and only then applies the label.
 - **Strip time.** `scripts/label-strip-evidence.sh` posts a comment recording
   the strip (validated SHA, new head, reason, timestamp) and quotes the matching
   add-time evidence comment. It is best-effort and always exits 0, so it can

@@ -503,16 +503,18 @@ jobs:
             fi
             local_pass=false
             if [ "$locally_validated" = true ]; then
-              comments="$(gh api --paginate \
-                "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
-                --jq '.[]' | jq -s '.')"
-              if [ -x scripts/check-local-validation-evidence.sh ] &&
-                 printf '%s\n' "$comments" |
-                   scripts/check-local-validation-evidence.sh "$head_sha"; then
+              comments_file=$(mktemp)
+              if gh api --paginate --slurp \
+                   "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
+                   >"$comments_file" &&
+                 evidence=$(bash scripts/verify-local-validation-receipt.sh \
+                   --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
                 local_pass=true
+                echo "PR #${pr_number} has a dereferenced exact-head receipt: ${evidence}"
               else
-                echo "::warning::locally-validated on PR #${pr_number} has no exact-head full PASS evidence."
+                echo "::warning::locally-validated on PR #${pr_number} has no immutable counted receipt for exact head ${head_sha}."
               fi
+              rm -f -- "$comments_file"
             fi
 
             runs="$(gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100")"

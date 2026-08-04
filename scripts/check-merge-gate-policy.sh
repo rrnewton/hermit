@@ -20,8 +20,19 @@ fail() {
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'scripts/classify-required-check.sh' "$WORKFLOW" || fail "gate must use the trinary classifier"
-grep -Fq 'scripts/check-local-validation-evidence.sh "$head_sha"' "$WORKFLOW" ||
-    fail "local alternate leg must require exact-head evidence"
+grep -Fq 'check_status_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
+    fail "gate wrapper must delegate to the canonical status classifier"
+grep -Fq 'from check_status_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
+    fail "PR rollup must import the canonical status classifier"
+grep -Fq 'check_status_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+    fail "lander rollup must call the canonical status classifier"
+[[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||
+    fail "duplicate jq status classifier must not exist"
+grep -Fq 'scripts/verify-local-validation-receipt.sh' "$WORKFLOW" ||
+    fail "local alternate leg must dereference the canonical immutable receipt"
+if grep -Fq 'check-local-validation-evidence.sh' "$WORKFLOW"; then
+    fail "gate must not authorize from the legacy prose-only evidence checker"
+fi
 grep -Fq 'NO_RESULT)' "$WORKFLOW" || fail "gate must handle NO_RESULT explicitly"
 grep -Fq 'dispatch_no_result' "$WORKFLOW" || fail "NO_RESULT must re-dispatch"
 grep -Fq 'cancel_no_result_gate' "$WORKFLOW" || fail "NO_RESULT must not exit red or green"

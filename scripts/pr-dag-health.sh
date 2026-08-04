@@ -77,6 +77,8 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
     --json number,title,headRefName,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
     || die "gh pr list failed (is the proxy/auth configured?)"
 [ -n "$RAW" ] || die "gh returned no data"
+RAW="$(printf '%s' "$RAW" | python3 "$SCRIPT_DIR/check_status_outcome.py" --annotate-rollups)" \
+    || die "check-status annotation failed"
 
 # ---------------------------------------------------------------------------
 # Enrich each PR and build the dependency DAG (jq). Emits an array of PRs, each
@@ -85,7 +87,6 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
 # class.
 # ---------------------------------------------------------------------------
 ENRICH_JQ='
-include "check_outcome";
 def result: (.conclusion // .state // "NONE");
 def latest_named($rollup; $name):
   ($rollup
@@ -101,7 +102,7 @@ def ci_of($rollup):
       gate: (if $gate==null then "NONE" else ($gate|result) end),
       regular: (if $regular==null then "NONE" else ($regular|result) end),
       hostdep: (if $hostdep==null then "NONE" else ($hostdep|result) end),
-      overall: (if $gate==null then "NO_RESULT" else ($gate|check_outcome) end) };
+      overall: (if $gate==null then "NO_RESULT" else ($gate._checkOutcome // "NO_RESULT") end) };
 
 . as $prs
 | ($prs | map({(.headRefName): .number}) | add // {}) as $byhead
@@ -188,22 +189,22 @@ MAIN_CI="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" \
     --jq '[.check_runs[] | select(.name=="Regular tests (GitHub-managed portable)")] | (.[0].conclusion // "none")' 2>/dev/null)"
 [ -n "$MAIN_SHA" ] || MAIN_SHA="unknown"
 [ -n "$MAIN_CI" ]  || MAIN_CI="unknown"
+MAIN_OUTCOME="$(python3 "$SCRIPT_DIR/check_status_outcome.py" \
+    --status COMPLETED --conclusion "$MAIN_CI")" || die "main check-status classification failed"
 
 # ---------------------------------------------------------------------------
 # Assemble the final JSON model.
 # ---------------------------------------------------------------------------
-MODEL="$(printf '%s' "$ENRICHED" | jq -L "$SCRIPT_DIR" \
+MODEL="$(printf '%s' "$ENRICHED" | jq \
     --arg repo "$REPO" --arg main "$MAIN_BRANCH" \
     --arg mainsha "$MAIN_SHA" --arg mainci "$MAIN_CI" \
-    --argjson commute "$COMMUTE_JSON" '
-  include "check_outcome";
+    --arg mainoutcome "$MAIN_OUTCOME" --argjson commute "$COMMUTE_JSON" '
   map(. + {commutes_to_main: ($commute[(.number|tostring)] // "n/a")}) as $prs
-  | ({status:"COMPLETED", conclusion:$mainci} | check_outcome) as $main_outcome
   | {
       generated_by: "pr-dag-health.sh",
       repo: $repo,
       main: {branch: $main, head: $mainsha, ci_regular: $mainci,
-             outcome: $main_outcome, green: ($main_outcome=="PASSED")},
+             outcome: $mainoutcome, green: ($mainoutcome=="PASSED")},
       summary: {
         total: ($prs | length),
         by_class: ($prs | group_by(.class) | map({key: .[0].class, value: length}) | from_entries),

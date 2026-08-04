@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from typing import Sequence
 from urllib.parse import urlparse
 
+from check_status_outcome import CheckOutcome, classify_check
+
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
 DEFAULT_MAIN_LIMIT = 10
@@ -44,16 +46,6 @@ REQUIRED_CHECKS = {
     "rrnewton/hermit": ("merge-gate",),
     "rrnewton/reverie": ("merge-gate",),
 }
-
-FAILED_CONCLUSIONS = frozenset(
-    (
-        "FAILURE",
-        "TIMED_OUT",
-        "ERROR",
-        "STARTUP_FAILURE",
-    )
-)
-
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -95,14 +87,12 @@ def classify_check_outcome(conclusion: object, status: object) -> str:
     also terminal. Every other shape is NO-RESULT; unknown values fail closed
     without being misreported as product failures.
     """
-    concl = str(conclusion or "").upper()
-    stat = str(status or "").upper()
-    terminal = not stat or stat == "COMPLETED"
-    if terminal and concl == "SUCCESS":
-        return "passed"
-    if terminal and concl in FAILED_CONCLUSIONS:
-        return "failed"
-    return "no-result"
+    outcome = classify_check(status, conclusion)
+    return {
+        CheckOutcome.PASSED: "passed",
+        CheckOutcome.FAILED: "failed",
+        CheckOutcome.NO_RESULT: "no-result",
+    }[outcome]
 
 
 def classify_ci_rollup(repo: str, checks: object) -> str:
