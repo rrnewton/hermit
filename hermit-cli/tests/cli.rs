@@ -551,12 +551,33 @@ fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
 #[test]
-fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
+fn run_dbi_rejects_unsupported_by_default_and_opt_out_aggregates_them() {
     let program = dbi_unsupported_syscall_guest()
         .to_str()
         .expect("DBI unsupported-syscall guest path should be UTF-8");
 
-    let normal_args = ["run", "--backend", "dbi", "--verify", "--", program];
+    let default_args = ["run", "--backend", "dbi", "--", program];
+    let default = hermit(&default_args);
+    assert!(
+        !default.status.success(),
+        "default DBI unexpectedly allowed an unsupported syscall:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("unsupported syscall: restart_syscall"),
+        "default DBI failure omitted unsupported syscall:\n{}",
+        stderr(&default)
+    );
+
+    let normal_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+    ];
     let normal = hermit(&normal_args);
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
@@ -568,7 +589,15 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "expected one aggregate warning:\n{normal_stderr}"
     );
 
-    let tamper_args = ["run", "--backend", "dbi", "--", program, "report-tamper"];
+    let tamper_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--allow-unsupported-syscalls",
+        "--",
+        program,
+        "report-tamper",
+    ];
     let tamper = hermit(&tamper_args);
     assert_success(&tamper, &tamper_args);
     assert_eq!(stdout(&tamper), "dbi-unsupported-report-tamper-ok\n");
@@ -583,6 +612,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbi",
+        "--allow-unsupported-syscalls",
         "--",
         program,
         "fork-report-tamper",
@@ -612,7 +642,16 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "strict DBI failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
-    let normal_fork_args = ["run", "--backend", "dbi", "--verify", "--", program, "fork"];
+    let normal_fork_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+        "fork",
+    ];
     let normal_fork = hermit(&normal_fork_args);
     assert_success(&normal_fork, &normal_fork_args);
     assert_eq!(stdout(&normal_fork), "dbi-unsupported-fork-ok\n");
@@ -627,6 +666,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbi",
+        "--allow-unsupported-syscalls",
         "--verify",
         "--",
         program,

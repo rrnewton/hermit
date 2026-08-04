@@ -168,6 +168,14 @@ pub struct RunOpts {
     )]
     strict: bool,
 
+    /// Permit unsupported syscalls to reach the host kernel. This weakens determinism and exists
+    /// only as an explicit compatibility escape hatch; ordinary runs fail closed by default.
+    #[clap(
+        long,
+        conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"]
+    )]
+    allow_unsupported_syscalls: bool,
+
     /// Disable deterministic sequential thread execution.
     #[clap(long)]
     pub(crate) no_sequentialize_threads: bool,
@@ -519,7 +527,11 @@ impl FromStr for SeedFrom {
 /// Displays as a string which needs only to be prepended with "hermit " to be a runnable command.
 impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let dop = &self.det_opts.det_config;
+        let mut dop = self.det_opts.det_config.clone();
+        // Fail-closed is the default, so only serialize the compatibility opt-out.
+        // Leaving the default `true` in DetConfig's Display would emit a redundant
+        // `--panic-on-unsupported-syscalls` on every normalized command.
+        dop.panic_on_unsupported_syscalls = false;
 
         if let Some(backend) = self.backend {
             write!(f, " --backend={}", backend.as_str())?;
@@ -535,6 +547,9 @@ impl fmt::Display for RunOpts {
             assert!(!dop.deterministic_io)
         } else {
             assert!(dop.deterministic_io)
+        }
+        if self.allow_unsupported_syscalls {
+            write!(f, " --allow-unsupported-syscalls")?;
         }
         if self.network != Default::default() {
             write!(f, " --network={}", self.network)?;
@@ -1032,10 +1047,11 @@ fn display_runopts4() {
 }
 
 #[test]
-fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     normal.validate_args_with_perf_support(true).unwrap();
-    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(format!("{}", normal), " -- fakeprog");
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     strict.validate_args_with_perf_support(true).unwrap();
@@ -1044,9 +1060,20 @@ fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls
     assert!(strict.det_opts.det_config.deterministic_io);
     assert!(!strict.det_opts.det_config.passthru_opt);
     assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(format!("{}", strict), " -- fakeprog");
+
+    let mut compatibility =
+        RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
+    compatibility
+        .validate_args_with_perf_support(true)
+        .unwrap();
+    assert!(!compatibility
+        .det_opts
+        .det_config
+        .panic_on_unsupported_syscalls);
     assert_eq!(
-        format!("{}", strict),
-        " --panic-on-unsupported-syscalls -- fakeprog"
+        format!("{}", compatibility),
+        " --allow-unsupported-syscalls -- fakeprog"
     );
 }
 
@@ -1062,21 +1089,37 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
 }
 
 #[test]
-fn passthru_optimization_requires_explicit_opt_in() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+fn passthru_optimization_requires_explicit_compatibility_opt_out() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--allow-unsupported-syscalls",
+        "--passthru-opt",
+        "fakeprog",
+    ]);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --allow-unsupported-syscalls --passthru-opt -- fakeprog"
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review rejecting optimization that bypasses fail-closed policy.
 #[test]
 fn passthru_optimization_rejects_fail_closed_modes() {
-    for fail_closed in ["--strict", "--panic-on-unsupported-syscalls"] {
-        let mut opts =
-            RunOpts::parse_from(["fakehermit", "--passthru-opt", fail_closed, "fakeprog"]);
+    for arguments in [
+        vec!["fakehermit", "--passthru-opt", "fakeprog"],
+        vec!["fakehermit", "--passthru-opt", "--strict", "fakeprog"],
+        vec![
+            "fakehermit",
+            "--passthru-opt",
+            "--panic-on-unsupported-syscalls",
+            "fakeprog",
+        ],
+    ] {
+        let mut opts = RunOpts::parse_from(arguments);
         let error = opts.validate_args_with_perf_support(true).unwrap_err();
         let message = error.to_string();
         assert!(
@@ -1085,6 +1128,10 @@ fn passthru_optimization_rejects_fail_closed_modes() {
         );
         assert!(
             message.contains("fail-closed"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("--allow-unsupported-syscalls"),
             "unexpected error: {message}"
         );
     }
@@ -1440,6 +1487,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--passthru-opt",
         "optimized partial syscall subscription set",
         "--panic-on-rbc-overshoot",
+        "--allow-unsupported-syscalls",
         "--max-timeslice",
         "--preemption-timeout",
         "--target-timeslice",
@@ -1935,15 +1983,13 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
-        if self.strict {
-            config.panic_on_unsupported_syscalls = true;
-        }
+        // Unsupported host behavior is nondeterministic unless deliberately modeled.
+        // Compatibility pass-through therefore requires an explicit opt-out.
+        config.panic_on_unsupported_syscalls = !self.allow_unsupported_syscalls;
         if config.passthru_opt && config.panic_on_unsupported_syscalls {
             anyhow::bail!(
                 "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
-                 (--strict or --panic-on-unsupported-syscalls)"
+                 (the default; pass --allow-unsupported-syscalls to opt out)"
             );
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
@@ -2956,7 +3002,9 @@ impl RunOpts {
 
     fn effective_det_config(&self) -> DetConfig {
         let mut config = self.det_opts.det_config.clone();
-        if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
+        if !self.allow_unsupported_syscalls
+            && std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1")
+        {
             config.panic_on_unsupported_syscalls = true;
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
