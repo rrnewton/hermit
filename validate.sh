@@ -1073,7 +1073,7 @@ function append_validation_ledger {
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json concurrent_validates_json gates_run
+    local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
     local evidence_helper evidence_json failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local evidence_available=0 failure_origin_json gate_substeps_json
@@ -1092,11 +1092,14 @@ function append_validation_ledger {
     if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
         concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
         [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+        concurrency_proof_json='"process_group_overlap_monitor"'
     elif validate_lock_exclusivity_proven; then
         concurrent_validates_json=0
+        concurrency_proof_json='"validate_lock_owner_ancestry"'
     else
         # A bare run with no observed peer is UNKNOWN, not proven exclusive.
         concurrent_validates_json=null
+        concurrency_proof_json=null
     fi
 
     evidence_helper="$DEV_HERMIT_PARENT/ci-hub/validate/failure_evidence.py"
@@ -1175,6 +1178,7 @@ function append_validation_ledger {
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
+    line+="\"concurrency_proof\":$concurrency_proof_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
