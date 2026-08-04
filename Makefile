@@ -90,6 +90,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 			exit 1; \
 		fi
 	@git diff --check
+	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
 

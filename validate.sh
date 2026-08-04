@@ -529,6 +529,13 @@ readonly VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
 
 checks=0
 failures=0
+VALIDATION_INTERRUPTION_SIGNAL=""
+# A full run has one repository-initialization gate plus two gates for each of
+# the portable and privileged lanes (manifest validation + lane execution).
+# Carry the planned count in the producer so an interrupted 2/5 run can never
+# masquerade as a completed product failure.
+VALIDATION_GATES_EXPECTED=0
+[[ $VALIDATION_PROFILE == full ]] && VALIDATION_GATES_EXPECTED=5
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -1000,9 +1007,10 @@ function json_quote {
 function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
-    local finished_at result gates_json gate_result line
+    local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json
+    local commit_anchored_json tree_dirty_json gates_expected_json=null
+    local interruption_signal_json=null
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1010,9 +1018,15 @@ function append_validation_ledger {
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     if ((exit_status == 0 && failures == 0)); then
-        result=pass
+        raw_result=pass
     else
-        result=fail
+        raw_result=fail
+    fi
+    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]] || \
+       ((VALIDATION_GATES_EXPECTED > 0 && checks < VALIDATION_GATES_EXPECTED)); then
+        result=truncated
+    else
+        result=$raw_result
     fi
 
     gates_json='['
@@ -1032,6 +1046,12 @@ function append_validation_ledger {
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+    if ((VALIDATION_GATES_EXPECTED > 0)); then
+        gates_expected_json=$VALIDATION_GATES_EXPECTED
+    fi
+    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
+        interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
+    fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1045,11 +1065,14 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
-    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
+    # schema_version 4 adds first-class completion and interruption evidence. A
+    # stopped run records result=truncated, never fail; raw_result preserves the
+    # shell outcome without granting it product-verdict authority.
+    # schema_version 3 added commit_anchored/tree_dirty/selection_mode. The fields
     # are additive; the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
@@ -1058,8 +1081,9 @@ function append_validation_ledger {
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
-    line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
-    line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
+    line+="\"checks\":$checks,\"gates_run\":$checks,\"gates_expected\":$gates_expected_json,"
+    line+="\"failures\":$failures,\"interruption_signal\":$interruption_signal_json,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
@@ -1109,7 +1133,9 @@ function print_wall_cpu_summary {
     else
         ratio="n/a"
     fi
-    if ((exit_status == 0 && failures == 0)); then
+    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
+        marker="⏹"
+    elif ((exit_status == 0 && failures == 0)); then
         marker="✅"
     else
         marker="❌"
@@ -1211,12 +1237,35 @@ function cleanup {
 }
 
 function interrupted {
+    local signal=$1
+    VALIDATION_INTERRUPTION_SIGNAL=$signal
     trap - INT TERM
-    printf "❌ Validation interrupted (full log: %s)\n" "$LOG_FILE"
+    trap - HUP
+    printf "⏹ Validation interrupted by %s; recording TRUNCATED, not FAILED (full log: %s)\n" \
+        "$signal" "$LOG_FILE"
     exit 130
 }
 trap cleanup EXIT
-trap interrupted INT TERM
+trap 'interrupted INT' INT
+trap 'interrupted TERM' TERM
+trap 'interrupted HUP' HUP
+
+# Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
+# real traps and ledger writer without starting a product build. The mode cannot
+# produce a pass: it deliberately waits until a test sends a stop signal.
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
+    record_ledger_gate "stop-test completed gate 1" 0 0
+    record_ledger_gate "stop-test completed gate 2" 0 0
+    checks=2
+    if [[ -n ${VALIDATE_STOP_TEST_PID_FILE:-} ]]; then
+        printf "%s\n" "$$" >"$VALIDATE_STOP_TEST_PID_FILE"
+    fi
+    printf "VALIDATE_STOP_TEST_READY pid=%s\n" "$$"
+    if [[ ${VALIDATE_STOP_TEST_EXIT_EARLY:-0} == 1 ]]; then
+        exit 1
+    fi
+    while :; do sleep 1; done
+fi
 
 # Return success (0) when the failed check's log region carries the signature of
 # an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
