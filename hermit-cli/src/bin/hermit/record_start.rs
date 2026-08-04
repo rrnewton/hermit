@@ -399,7 +399,11 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
-        compare_two_runs(
+        // Record/replay divergence is never an RCB skid artifact (replay is a
+        // deterministic re-execution, not a second live PMU-timed run), so no
+        // overshoots are attributed here (0). A divergence therefore stays a
+        // hard `Err`, and a match passes the recording's status through.
+        Ok(compare_two_runs(
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
@@ -414,7 +418,9 @@ impl StartOpts {
                 verbose: false,
                 compare_logs: true,
             },
-        )
+            0,
+        )?
+        .into_exit_status())
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {

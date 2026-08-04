@@ -162,10 +162,6 @@ fn compressed_fixtures() -> &'static [PathBuf; 3] {
     })
 }
 
-fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
-    run_liteinst_with_input(program, args, verify, None, None)
-}
-
 fn run_liteinst_with_input(
     program: &Path,
     args: &[&str],
@@ -270,19 +266,12 @@ fn liteinst_strict_verify_heap_growth_avoids_trampoline_mappings() {
 /// this host — which is itself a defect worth surfacing, not papering over.
 const MAX_SKID_ATTEMPTS: u32 = 3;
 
-/// Env var carrying this harness's per-run witness nonce into reverie's
-/// skid-overshoot marker. Set on the hermit *supervisor* only; hermit strips it
-/// from the guest environment, so the nonce is unknowable and unforgeable by
-/// guest code. A marker is trusted iff it carries `witness=<this exact nonce>`.
+/// Env var still set on the hermit *supervisor* so hermit can stamp the *origin*
+/// of its skid-attributed divergence audit line with a nonce the guest cannot
+/// know (hermit strips it from the guest env). This is human/log evidence only:
+/// the retry decision no longer depends on parsing it — see
+/// [`is_retryable_skid_exit`], which keys purely on the supervisor's exit code.
 const WITNESS_TOKEN_ENV: &str = "HERMIT_SKID_WITNESS_TOKEN";
-
-/// Substring identifying the `--strict --verify` divergence failure class. A
-/// genuine RCB skid overshoot manifests *only* as this class (the single-step
-/// interrupt overshot the target, so the two runs' schedules diverge). Any other
-/// failure that happens to carry a coincident marker is a *different* bug and
-/// must never be retried — that is the "real-failure-plus-marker co-occurrence"
-/// hazard the reviewers named.
-const VERIFY_DIVERGENCE_MARKER: &str = "Mismatch between run 1 and run 2";
 
 /// Optional JSONL ledger path (one object per retry and per exhaustion). Defect
 /// (b): successful retries are invisible in CI because the test passes and
@@ -291,11 +280,14 @@ const VERIFY_DIVERGENCE_MARKER: &str = "Mismatch between run 1 and run 2";
 /// per-run retry count even on a green run.
 const RETRY_LEDGER_ENV: &str = "HERMIT_SKID_RETRY_LEDGER";
 
-/// Generate a unique, unguessable per-run witness nonce. It need not be
-/// cryptographically strong — only unknowable to the guest, which is guaranteed
-/// structurally by hermit stripping [`WITNESS_TOKEN_ENV`] from the guest env.
+/// Generate a unique, unguessable per-run witness nonce exported to the hermit
+/// *supervisor* (never the guest, from which hermit strips [`WITNESS_TOKEN_ENV`]).
+/// It authenticates the *origin* of the supervisor's skid audit line for a human
+/// or the retry ledger; the retry decision does NOT parse it — see
+/// [`is_retryable_skid_exit`], which keys purely on the reserved exit code.
 fn witness_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -305,73 +297,24 @@ fn witness_token() -> String {
     format!("wit-{}-{}-{}", std::process::id(), seq, nanos)
 }
 
-/// Split a candidate marker line into its `key=value` fields, or `None` if the
-/// canonical marker token is absent.
-fn parse_marker_fields(line: &str) -> Option<std::collections::HashMap<&str, &str>> {
-    let (_, rest) = line.split_once(reverie_ptrace::SKID_OVERSHOOT_MARKER)?;
-    let mut fields = std::collections::HashMap::new();
-    for tok in rest.split_whitespace() {
-        if let Some((k, v)) = tok.split_once('=') {
-            fields.insert(k, v);
-        }
-    }
-    Some(fields)
-}
-
-/// True iff `line` is a supervisor-authenticated, strictly-parsed skid-overshoot
-/// record: it carries the canonical marker, a `witness` field exactly equal to
-/// `expected_token` (which the guest cannot know), and well-formed positive
-/// numeric overshoot fields. This is the defect-(a) fix: origin authentication
-/// plus strict field parsing replaces the old spoofable `stderr.contains`.
-fn is_authenticated_overshoot(line: &str, expected_token: &str) -> bool {
-    if expected_token.is_empty() {
-        return false;
-    }
-    let Some(fields) = parse_marker_fields(line) else {
-        return false;
-    };
-    if fields.get("witness").copied() != Some(expected_token) {
-        return false;
-    }
-    let overshoot_positive =
-        matches!(fields.get("overshoot").and_then(|v| v.parse::<u64>().ok()), Some(n) if n > 0);
-    overshoot_positive
-        && fields
-            .get("rcb_actual")
-            .and_then(|v| v.parse::<u64>().ok())
-            .is_some()
-        && fields
-            .get("rcb_target")
-            .and_then(|v| v.parse::<u64>().ok())
-            .is_some()
-}
-
-/// The one retry predicate. Returns true iff a failed run should be retried. A
-/// retry is authorized only when ALL of the following hold, closing the two
-/// review-blocking defects in the original substring gate:
+/// The one retry predicate: a run is retryable iff hermit's supervisor exited
+/// with the reserved [`hermit::SKID_DIVERGENCE_EXIT_CODE`].
 ///
-///  1. the run failed;
-///  2. the failure is the `--strict --verify` divergence class
-///     ([`VERIFY_DIVERGENCE_MARKER`]) — causal binding to the skid symptom, so a
-///     different real bug carrying a coincident marker is never retried; and
-///  3. the supervisor emitted at least one authenticated, strictly-parsed
-///     overshoot record ([`is_authenticated_overshoot`]) carrying this run's
-///     witness nonce — so guest-emitted marker text (which lacks the nonce) can
-///     never trigger a retry.
+/// That code is emitted by hermit's `verify` ONLY when the two `--strict
+/// --verify` runs diverged AND the supervisor recorded an RCB skid overshoot —
+/// an unforgeable, process-global count captured inside the supervisor
+/// (`reverie::take_skid_overshoot_count`), never guest-controlled stderr text.
+/// This typed first-cause signal replaces the old `divergence-string AND
+/// authenticated-marker` predicate that the reviewers flagged for authenticating
+/// a marker's *origin* rather than binding to skid as the *cause*:
 ///
-/// An unmarked divergence is a real determinism bug and returns `false`, so the
-/// caller's assertion surfaces it immediately: a retry can never launder a real
-/// bug into a green result.
-fn is_retryable_skid_failure(success: bool, stderr: &str, expected_token: &str) -> bool {
-    if success {
-        return false;
-    }
-    if !stderr.contains(VERIFY_DIVERGENCE_MARKER) {
-        return false;
-    }
-    stderr
-        .lines()
-        .any(|l| is_authenticated_overshoot(l, expected_token))
+///  * a real determinism bug (divergence with zero overshoots) exits 1, not the
+///    reserved code, so it is never retried — the caller's assertion surfaces it;
+///  * a guest cannot influence the supervisor's exit code, so guest-printed
+///    marker text can never launder a real failure into a retry;
+///  * a signal-killed run (`code() == None`) is not the reserved code either.
+fn is_retryable_skid_exit(exit_code: Option<i32>) -> bool {
+    exit_code == Some(hermit::SKID_DIVERGENCE_EXIT_CODE)
 }
 
 /// Append one JSONL record to the retry ledger if [`RETRY_LEDGER_ENV`] is set.
@@ -384,7 +327,10 @@ fn record_retry_ledger(attempt: u32, max: u32, overshoot_lines: &[&str]) {
         return;
     }
     // Handwritten JSON keeps this test harness free of a serde dependency.
-    let markers = overshoot_lines.join(" | ").replace('\\', "").replace('"', "'");
+    let markers = overshoot_lines
+        .join(" | ")
+        .replace('\\', "")
+        .replace('"', "'");
     let exhausted = attempt >= max;
     let line = format!(
         "{{\"event\":\"skid_retry\",\"attempt\":{attempt},\"max\":{max},\
@@ -410,18 +356,28 @@ fn run_with_skid_gated_retry(mut run: impl FnMut(&str) -> Output) -> Output {
     let mut attempt: u32 = 1;
     loop {
         let output = run(&token);
-        let success = output.status.success();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-        // A pass, or any failure that is NOT an authenticated skid overshoot,
-        // returns immediately. Only the authenticated-skid failure retries.
-        if !is_retryable_skid_failure(success, &stderr, &token) {
+        // The one retry predicate: hermit's supervisor exited with the reserved
+        // skid code, meaning the two `--strict --verify` runs diverged AND the
+        // supervisor recorded an unforgeable RCB skid overshoot. A pass, a real
+        // determinism bug (generic failure, exit 1), and a signal-killed run
+        // (no exit code) all return immediately so the caller's assertion
+        // surfaces them — a retry can never launder a real failure into green.
+        if !is_retryable_skid_exit(output.status.code()) {
             return output;
         }
 
+        // Evidence only (defect b visibility): the supervisor's own audit lines
+        // for this skid-attributed divergence. The retry decision above does not
+        // depend on them; they exist so a green CI run can still show WHY a retry
+        // happened, even though nextest/cargo suppress passing-test output.
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let overshoot_lines: Vec<&str> = stderr
             .lines()
-            .filter(|l| is_authenticated_overshoot(l, &token))
+            .filter(|l| {
+                l.contains(reverie_ptrace::SKID_OVERSHOOT_MARKER)
+                    || l.contains("SKID-ATTRIBUTED DIVERGENCE")
+            })
             .collect();
 
         // Visibility (defect b): record BEFORE the cap assert so an exhaustion is
@@ -430,151 +386,80 @@ fn run_with_skid_gated_retry(mut run: impl FnMut(&str) -> Output) -> Output {
 
         assert!(
             attempt < MAX_SKID_ATTEMPTS,
-            "SKID-RETRY EXHAUSTED after {attempt} attempts: every attempt overshot the RCB \
-             skid margin (authenticated marker present each time). This is not a transient — the \
-             skid tail is systematically exceeding the margin on this host. Overshoot markers:\n{}",
+            "SKID-RETRY EXHAUSTED after {attempt} attempts: every attempt exited with the reserved \
+             skid divergence code ({}). This is not a transient — the skid tail is systematically \
+             exceeding the margin on this host. Audit lines:\n{}",
+            hermit::SKID_DIVERGENCE_EXIT_CODE,
             overshoot_lines.join("\n"),
         );
 
         // Count + report every retry so N-per-run is a legible defect signal,
         // not a silent papering-over.
         eprintln!(
-            "SKID-RETRY attempt={attempt}/{MAX_SKID_ATTEMPTS}: strict-verify run overshot the \
-             skid margin ({} authenticated marker line(s)); retrying. Markers:\n{}",
-            overshoot_lines.len(),
+            "SKID-RETRY attempt={attempt}/{MAX_SKID_ATTEMPTS}: strict-verify diverged with a \
+             recorded RCB skid overshoot (reserved exit code {}); retrying. Audit lines:\n{}",
+            hermit::SKID_DIVERGENCE_EXIT_CODE,
             overshoot_lines.join("\n"),
         );
         attempt += 1;
     }
 }
 
-/// Build a canonical, authenticated marker line for tests.
+/// Predicate causal bracket (both directions, N=5): the reserved skid exit code
+/// is the ONE retryable status, and nothing else is.
+///
+/// POSITIVE (1): the reserved code retries. NEGATIVE (4): success (0), a real
+/// determinism bug (generic failure, 1), any other exit code, and a
+/// signal-killed run (no code) are all non-retryable — so a retry can never
+/// launder a real failure, and a guest (which cannot influence the supervisor's
+/// exit code) can never spoof one.
+#[test]
+fn skid_exit_code_is_the_only_retryable_status() {
+    // POSITIVE.
+    assert!(is_retryable_skid_exit(Some(
+        hermit::SKID_DIVERGENCE_EXIT_CODE
+    )));
+    // NEGATIVE: success, real bug, adjacent code, and signal.
+    assert!(!is_retryable_skid_exit(Some(0)));
+    assert!(!is_retryable_skid_exit(Some(1)));
+    assert!(!is_retryable_skid_exit(Some(
+        hermit::SKID_DIVERGENCE_EXIT_CODE + 1
+    )));
+    assert!(!is_retryable_skid_exit(None));
+}
+
+/// Raw wait status encoding a normal exit with `code` (WIFEXITED path).
 #[cfg(test)]
-fn test_marker_line(token: &str, overshoot: u64) -> String {
-    format!(
-        "{} rcb_actual={} rcb_target=33000 skid_margin=128 overshoot={overshoot} witness={token}",
-        reverie_ptrace::SKID_OVERSHOOT_MARKER,
-        33000 + overshoot,
-    )
+fn exited_raw(code: i32) -> i32 {
+    code << 8
 }
 
+/// Harness POSITIVE: a runner that exits with the reserved skid code once, then
+/// succeeds, retries exactly once and returns the success. Confirms the retry
+/// fires on the typed skid signal and that the per-run witness nonce is threaded
+/// to the closure (so the supervisor can stamp its audit line).
 #[test]
-fn authenticated_divergence_overshoot_retries() {
-    // The one case that retries: divergence class + authenticated overshoot.
-    let tok = "wit-good-1";
-    let stderr = format!(
-        "{VERIFY_DIVERGENCE_MARKER} outputs (logs retained).\n{}\n",
-        test_marker_line(tok, 500)
-    );
-    assert!(is_retryable_skid_failure(false, &stderr, tok));
-}
-
-/// Task 3 NEGATIVE TEST for defect (a): a guest that prints the canonical marker
-/// text without the witness nonce (which it cannot know) must NOT trigger a
-/// retry, even alongside a genuine divergence line. This is the guest-spoofing
-/// case the substring gate failed.
-#[test]
-fn guest_spoofed_marker_without_nonce_does_not_retry() {
-    let tok = "wit-secret-2";
-    // Guest prints the bare marker (no `witness=` field at all).
-    let bare = format!(
-        "{VERIFY_DIVERGENCE_MARKER} outputs (logs retained).\n{} rcb_actual=33500 rcb_target=33000 overshoot=500\n",
-        reverie_ptrace::SKID_OVERSHOOT_MARKER
-    );
-    assert!(!is_retryable_skid_failure(false, &bare, tok));
-    // Guest guesses the field shape but supplies a WRONG nonce.
-    let wrong = format!(
-        "{VERIFY_DIVERGENCE_MARKER} outputs (logs retained).\n{}\n",
-        test_marker_line("wit-WRONG", 500)
-    );
-    assert!(!is_retryable_skid_failure(false, &wrong, tok));
-}
-
-/// Defect-(a) causal binding: an authenticated overshoot marker on a
-/// NON-divergence failure (a different real bug that merely coincides with a
-/// marker) must NOT retry.
-#[test]
-fn authenticated_marker_on_nondivergence_failure_does_not_retry() {
-    let tok = "wit-xyz-3";
-    let stderr = format!(
-        "thread 'main' panicked: index out of bounds\n{}\n",
-        test_marker_line(tok, 500)
-    );
-    assert!(!is_retryable_skid_failure(false, &stderr, tok));
-}
-
-/// A real determinism bug: divergence, no marker at all => never retry.
-#[test]
-fn unmarked_divergence_never_retries() {
-    assert!(!is_retryable_skid_failure(
-        false,
-        "Mismatch between run 1 and run 2 outputs (logs retained).",
-        "wit-4"
-    ));
-}
-
-/// A passing run never retries, authenticated marker present or not.
-#[test]
-fn success_never_retries() {
-    let tok = "wit-5";
-    let stderr = format!(
-        "{VERIFY_DIVERGENCE_MARKER}\n{}\n",
-        test_marker_line(tok, 500)
-    );
-    assert!(!is_retryable_skid_failure(true, &stderr, tok));
-    assert!(!is_retryable_skid_failure(true, "Determinism verified.", tok));
-}
-
-/// Strict parse: a malformed marker (non-numeric or zero overshoot) is rejected
-/// even with the correct nonce and a divergence line.
-#[test]
-fn malformed_marker_fields_rejected() {
-    let tok = "wit-6";
-    let non_numeric = format!(
-        "{VERIFY_DIVERGENCE_MARKER}\n{} rcb_actual=x rcb_target=y overshoot=notnum witness={tok}\n",
-        reverie_ptrace::SKID_OVERSHOOT_MARKER
-    );
-    assert!(!is_retryable_skid_failure(false, &non_numeric, tok));
-    let zero = format!(
-        "{VERIFY_DIVERGENCE_MARKER}\n{}\n",
-        test_marker_line(tok, 0)
-    );
-    assert!(!is_retryable_skid_failure(false, &zero, tok));
-}
-
-/// An empty witness token (authentication disabled) never authenticates any
-/// marker — no accidental retry when the mechanism is off.
-#[test]
-fn empty_token_never_authenticates() {
-    let stderr = format!("{VERIFY_DIVERGENCE_MARKER}\n{}\n", test_marker_line("", 500));
-    assert!(!is_retryable_skid_failure(false, &stderr, ""));
-}
-
-/// F3 fix: exercise `run_with_skid_gated_retry` end-to-end with a fake runner
-/// that fails once with an authenticated overshoot then succeeds. Confirms the
-/// retry fires exactly once, the token is threaded to the closure, and the final
-/// result is the success.
-#[test]
-fn harness_retries_authenticated_overshoot_then_succeeds() {
+fn harness_retries_skid_exit_then_succeeds() {
     use std::cell::Cell;
     use std::os::unix::process::ExitStatusExt;
     let calls = Cell::new(0u32);
+    let saw_token = Cell::new(false);
     let out = run_with_skid_gated_retry(|token| {
+        saw_token.set(saw_token.get() || token.starts_with("wit-"));
         let n = calls.get() + 1;
         calls.set(n);
         if n < 2 {
-            let stderr = format!(
-                "{VERIFY_DIVERGENCE_MARKER} outputs (logs retained).\n{}\n",
-                test_marker_line(token, 7)
-            );
             Output {
-                status: std::process::ExitStatus::from_raw(256),
+                status: std::process::ExitStatus::from_raw(exited_raw(
+                    hermit::SKID_DIVERGENCE_EXIT_CODE,
+                )),
                 stdout: Vec::new(),
-                stderr: stderr.into_bytes(),
+                stderr: b":: SKID-ATTRIBUTED DIVERGENCE: strict-verify runs diverged ...\n"
+                    .to_vec(),
             }
         } else {
             Output {
-                status: std::process::ExitStatus::from_raw(0),
+                status: std::process::ExitStatus::from_raw(exited_raw(0)),
                 stdout: b"ok".to_vec(),
                 stderr: Vec::new(),
             }
@@ -582,24 +467,47 @@ fn harness_retries_authenticated_overshoot_then_succeeds() {
     });
     assert!(out.status.success());
     assert_eq!(calls.get(), 2, "expected exactly one retry then success");
+    assert!(
+        saw_token.get(),
+        "witness nonce must be threaded to the runner"
+    );
 }
 
-/// F3 fix: a runner that overshoots on every attempt exhausts the cap and fails
-/// loud rather than papering over a systematic skid.
+/// Harness NEGATIVE: a real determinism bug (generic failure, exit 1) is NOT
+/// retried — it returns immediately on the first attempt so the caller's
+/// assertion surfaces the bug. This is the anti-laundering guarantee.
+#[test]
+fn harness_does_not_retry_real_failure() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt;
+    let calls = Cell::new(0u32);
+    let out = run_with_skid_gated_retry(|_token| {
+        calls.set(calls.get() + 1);
+        Output {
+            status: std::process::ExitStatus::from_raw(exited_raw(1)),
+            stdout: Vec::new(),
+            stderr: b"Mismatch between run 1 and run 2 outputs (logs retained).\n".to_vec(),
+        }
+    });
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        calls.get(),
+        1,
+        "a real determinism bug must not be retried, even once"
+    );
+}
+
+/// Harness exhaustion: a runner that hits the reserved skid code on every
+/// attempt exhausts the cap and fails loud rather than papering over a
+/// systematic skid.
 #[test]
 #[should_panic(expected = "SKID-RETRY EXHAUSTED")]
 fn harness_exhausts_after_cap() {
     use std::os::unix::process::ExitStatusExt;
-    run_with_skid_gated_retry(|token| {
-        let stderr = format!(
-            "{VERIFY_DIVERGENCE_MARKER} outputs (logs retained).\n{}\n",
-            test_marker_line(token, 7)
-        );
-        Output {
-            status: std::process::ExitStatus::from_raw(256),
-            stdout: Vec::new(),
-            stderr: stderr.into_bytes(),
-        }
+    run_with_skid_gated_retry(|_token| Output {
+        status: std::process::ExitStatus::from_raw(exited_raw(hermit::SKID_DIVERGENCE_EXIT_CODE)),
+        stdout: Vec::new(),
+        stderr: b":: SKID-ATTRIBUTED DIVERGENCE: strict-verify runs diverged ...\n".to_vec(),
     });
 }
 

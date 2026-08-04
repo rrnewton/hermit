@@ -55,6 +55,7 @@ use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
+use super::verify::VerifyOutcome;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
@@ -2634,7 +2635,9 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let mut out1: Output = self.run_verify(log1_file, global)?;
+        let run1 = self.run_verify(log1_file, global)?;
+        let skid_overshoots_run1 = run1.skid_overshoots;
+        let mut out1: Output = run1.output;
         let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
             .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
             .transpose()?;
@@ -2666,7 +2669,9 @@ impl RunOpts {
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let mut out2 = self.run_verify(log2_file, global)?;
+        let run2 = self.run_verify(log2_file, global)?;
+        let skid_overshoots_run2 = run2.skid_overshoots;
+        let mut out2 = run2.output;
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
             let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
@@ -2680,7 +2685,8 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        let status = compare_two_runs(
+        let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
+        let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -2699,7 +2705,32 @@ impl RunOpts {
                 verbose: self.verify_verbose,
                 compare_logs: !kvm_output_only,
             },
+            skid_overshoots,
         )?;
+
+        // A divergence causally attributed to RCB skid: emit a supervisor-
+        // authenticated audit line and return the reserved skid exit code so a
+        // skid-gated retry harness can distinguish it (by exit code alone) from
+        // both success and a real determinism bug. The count is unforgeable
+        // process-global supervisor state; the optional witness nonce, present
+        // only in the supervisor's own environment (hermit strips it from the
+        // guest), authenticates the *origin* of this line for a human reader.
+        if let VerifyOutcome::DivergedSkid = outcome {
+            let witness = std::env::var("HERMIT_SKID_WITNESS_TOKEN").unwrap_or_default();
+            eprintln!(
+                ":: {} run1={} run2={} exit_code={} witness={}",
+                "SKID-ATTRIBUTED DIVERGENCE: strict-verify runs diverged and the supervisor \
+                 recorded an RCB skid overshoot; returning the reserved skid exit code so a retry \
+                 can distinguish this from a real determinism bug."
+                    .yellow()
+                    .bold(),
+                skid_overshoots_run1,
+                skid_overshoots_run2,
+                hermit::SKID_DIVERGENCE_EXIT_CODE,
+                witness,
+            );
+        }
+        let status = outcome.into_exit_status();
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
@@ -2819,7 +2850,7 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
-    pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
+    pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<VerifyRun, Error> {
         if self.no_namespace {
             // Verify initializes a process-global tracing subscriber for each run. Keep a plain
             // child-process boundary between runs, but do not configure any namespaces or mounts.
@@ -3013,7 +3044,7 @@ impl RunOpts {
         &self,
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
-    ) -> Result<Output, Error> {
+    ) -> Result<VerifyRun, Error> {
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
@@ -3032,14 +3063,41 @@ impl RunOpts {
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output_backend(
+        // This runs inside the forked container child; the reverie/detcore
+        // overshoot recorder increments a process-global counter *here*, not in
+        // the parent hermit process. Drain any inherited residue first so the
+        // count reflects only this run, then snapshot it after the run and carry
+        // it back across the container boundary (serialized in `VerifyRun`) so
+        // the parent can causally attribute a divergence to skid.
+        let _ = reverie::take_skid_overshoot_count();
+        let output = hermit::run_with_output_backend(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
-        )
+        )?;
+        let skid_overshoots = reverie::take_skid_overshoot_count();
+        Ok(VerifyRun {
+            output,
+            skid_overshoots,
+        })
     }
+}
+
+/// One `--strict --verify` run's result carried back across the container fork.
+///
+/// The guest and the reverie/detcore supervisor run inside a forked container
+/// child, so the process-global skid-overshoot counter is incremented there and
+/// is invisible to the parent hermit process. Capturing the count inside the
+/// child and serializing it back alongside the guest [`Output`] is what lets the
+/// parent's `verify` classify a divergence as skid-caused from unforgeable
+/// supervisor state rather than from guest-controlled stderr text.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VerifyRun {
+    pub output: Output,
+    /// RCB skid overshoots recorded by the supervisor during this single run.
+    pub skid_overshoots: u64,
 }
 
 /// Represents a tmpfs location. There are different ways to construct `/tmp` for
