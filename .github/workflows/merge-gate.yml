@@ -392,9 +392,14 @@ jobs:
 
           cancel_no_result_gate() {
             echo "NO_RESULT blocks landing but is not a failure; cancelling gate run $GATE_RUN_ID after re-dispatch."
-            gh api --method POST "repos/${REPO}/actions/runs/${GATE_RUN_ID}/cancel" --silent
+            # This job uses `if: always()` so the ordinary /cancel endpoint
+            # deliberately leaves it running. force-cancel is required to make
+            # the required context conclude CANCELLED rather than later timing
+            # out or exiting red.
+            gh api --method POST \
+              "repos/${REPO}/actions/runs/${GATE_RUN_ID}/force-cancel" --silent
             # GitHub terminates this runner asynchronously. Reaching the end of
-            # this loop means cancellation itself failed, which is a gate fault.
+            # this loop means force-cancellation itself failed, a gate fault.
             for _ in {1..60}; do sleep 5; done
             echo "::error::Gate cancellation request did not terminate run $GATE_RUN_ID."
             exit 1
