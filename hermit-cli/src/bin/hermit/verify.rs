@@ -13,10 +13,12 @@ use std::path::PathBuf;
 
 use colored::Colorize;
 use detcore::logdiff;
+use hermit::Context;
 use hermit::Error;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
+use serde::Serialize;
 use tempfile::NamedTempFile;
 use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
@@ -33,6 +35,99 @@ pub(crate) struct ComparisonOptions<'a> {
     pub failure_message: &'a str,
     pub verbose: bool,
     pub compare_logs: bool,
+}
+
+/// The verification verdict: did the two runs match?
+///
+/// This is deliberately distinct from the guest's exit status. The process exit
+/// code of a `--verify` run historically encodes *the guest's* exit status (so
+/// `record start --verify -- prog` behaves like `prog` for the common exit-0
+/// case), which conflates two independent facts: "did the two runs match" and
+/// "what did the guest exit with". A guest that deterministically exits nonzero
+/// (e.g. `/bin/false`) makes a *passing* verification exit nonzero; symmetrically
+/// a guest that exits zero while its runs diverge could only be told apart from a
+/// match by scraping the human-readable banner. Carrying the verdict as its own
+/// typed value removes that inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The two runs matched on every compared dimension (stdout, stderr, exit
+    /// status, and — unless disabled — the internal DETLOG event stream).
+    Matched,
+    /// The two runs diverged; verification failed.
+    Diverged,
+}
+
+/// The full outcome of comparing two runs: the verification [`Verdict`] plus the
+/// guest exit status, so a caller never has to infer either one from the other.
+#[derive(Debug, Clone)]
+pub struct VerificationOutcome {
+    pub verdict: Verdict,
+    /// Exit status of the second (replay / repeat) run, propagated verbatim.
+    pub guest_status: ExitStatus,
+}
+
+impl VerificationOutcome {
+    /// Did verification pass, independent of the guest exit code?
+    pub fn verified(&self) -> bool {
+        self.verdict == Verdict::Matched
+    }
+
+    /// Collapse the outcome to the historical process-exit convention: a match
+    /// propagates the guest exit status; a divergence is an error (nonzero
+    /// exit). Callers that need to separate the verdict from the guest exit
+    /// code must read [`Self::verdict`] / [`Self::verified`] (or the
+    /// `--verify-json` report) *before* calling this.
+    pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
+        match self.verdict {
+            Verdict::Matched => Ok(self.guest_status),
+            Verdict::Diverged => Err(Error::msg(
+                "Mismatch between run 1 and run 2 outputs (logs retained).",
+            )),
+        }
+    }
+}
+
+/// Machine-readable verification report written by `--verify-json`.
+///
+/// Every field carries the condition it describes: `verified`/`verdict` is the
+/// verification result, while `guest_exit_code`/`guest_signal` describe the
+/// guest's own termination. A consumer keys its decision on `verified` alone and
+/// reads the guest status separately, instead of overloading a single exit code.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerificationReport {
+    /// True iff the two runs matched (the verdict as a boolean).
+    pub verified: bool,
+    /// The verdict as a stable string ("matched" / "diverged").
+    pub verdict: Verdict,
+    /// The guest's exit code, if it exited normally.
+    pub guest_exit_code: Option<i32>,
+    /// The guest's terminating signal number, if it was killed by a signal.
+    pub guest_signal: Option<i32>,
+}
+
+impl From<&VerificationOutcome> for VerificationReport {
+    fn from(outcome: &VerificationOutcome) -> Self {
+        VerificationReport {
+            verified: outcome.verified(),
+            verdict: outcome.verdict,
+            guest_exit_code: outcome.guest_status.code(),
+            guest_signal: outcome.guest_status.signal(),
+        }
+    }
+}
+
+/// Write the verification report as a single JSON line to `path`.
+///
+/// This is the exit-code-independent verdict channel: the record it writes is
+/// true or false based on whether verification matched, regardless of what the
+/// guest exited with.
+pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Result<(), Error> {
+    let report = VerificationReport::from(outcome);
+    let json = serde_json::to_string(&report)?;
+    std::fs::write(path, format!("{json}\n"))
+        .with_context(|| format!("writing verification verdict to {}", path.display()))?;
+    Ok(())
 }
 
 /// Reject an explicit log level that would suppress the events verification compares.
@@ -112,7 +207,7 @@ pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
     options: ComparisonOptions<'_>,
-) -> Result<ExitStatus, Error> {
+) -> Result<VerificationOutcome, Error> {
     let ComparedRun {
         output: out1,
         log: log1,
@@ -193,9 +288,15 @@ pub fn compare_two_runs(
         eprintln!(":: {}", options.failure_message.red().bold());
         let _ = log1.keep()?;
         let _ = log2.keep()?;
-        Err(Error::msg(
-            "Mismatch between run 1 and run 2 outputs (logs retained).",
-        ))
+        // Divergence is a verification *verdict*, not an I/O error: return it as
+        // a value carrying the guest exit status. `Err` stays reserved for
+        // genuine failures (e.g. the `.keep()?` above). Callers that want the
+        // historical "divergence -> nonzero process exit" behavior use
+        // `VerificationOutcome::into_exit_status`.
+        Ok(VerificationOutcome {
+            verdict: Verdict::Diverged,
+            guest_status: out2.status,
+        })
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
         let mut unsupported = unsupported_syscalls_from_log(log1.as_ref())?;
@@ -204,7 +305,10 @@ pub fn compare_two_runs(
             eprintln!("WARNING: {message}");
         }
         eprintln!(":: {}", options.success_message.green().bold());
-        Ok(out2.status)
+        Ok(VerificationOutcome {
+            verdict: Verdict::Matched,
+            guest_status: out2.status,
+        })
     }
 }
 
@@ -279,7 +383,7 @@ mod tests {
         left_log: TempPath,
         right: &Output,
         right_log: TempPath,
-    ) -> Result<ExitStatus, Error> {
+    ) -> Result<VerificationOutcome, Error> {
         compare_two_runs(
             ComparedRun {
                 output: left,
@@ -319,10 +423,36 @@ mod tests {
         let right = left.clone();
         let (log1, log2) = empty_logs();
 
-        assert_eq!(
-            compare(&left, log1, &right, log2).unwrap(),
-            ExitStatus::Exited(0)
-        );
+        let outcome = compare(&left, log1, &right, log2).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert!(outcome.verified());
+        assert_eq!(outcome.guest_status, ExitStatus::Exited(0));
+    }
+
+    // Direction 1 of the exit-code/verdict decoupling: a guest that exits
+    // NONZERO but whose two runs match must report VERIFIED. Before the verdict
+    // was separated from the exit code, the propagated `Exited(3)` was the only
+    // signal a caller had, so a passing verification of `/bin/false`-like
+    // programs was indistinguishable from a failure.
+    #[test]
+    fn nonzero_exit_with_matching_outputs_reports_verified() {
+        let left = output(3, b"hello\n", b"oops\n");
+        let right = left.clone();
+        let (log1, log2) = empty_logs();
+
+        let outcome = compare(&left, log1, &right, log2).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert!(outcome.verified());
+        // The guest status is preserved verbatim, carried *beside* the verdict.
+        assert_eq!(outcome.guest_status, ExitStatus::Exited(3));
+        // The structured report a `--verify-json` consumer would read:
+        let report = VerificationReport::from(&outcome);
+        assert!(report.verified);
+        assert_eq!(report.guest_exit_code, Some(3));
+        assert_eq!(report.guest_signal, None);
+        // Collapsing to the legacy exit convention still propagates the guest
+        // code; the verdict channel above is what a caller keys on.
+        assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
     }
 
     #[test]
@@ -333,26 +463,25 @@ mod tests {
         fs::write(&left_log, "DETLOG root event A\n").unwrap();
         fs::write(&right_log, "DETLOG root event B\n").unwrap();
 
-        assert_eq!(
-            compare_two_runs(
-                ComparedRun {
-                    output: &left,
-                    log: left_log,
-                },
-                ComparedRun {
-                    output: &right,
-                    log: right_log,
-                },
-                ComparisonOptions {
-                    success_message: "verified",
-                    failure_message: "failed",
-                    verbose: false,
-                    compare_logs: false,
-                },
-            )
-            .unwrap(),
-            ExitStatus::Exited(0)
-        );
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &left,
+                log: left_log,
+            },
+            ComparedRun {
+                output: &right,
+                log: right_log,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                compare_logs: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(outcome.guest_status, ExitStatus::Exited(0));
     }
 
     #[test]
@@ -369,7 +498,12 @@ mod tests {
             let path1 = log1.to_path_buf();
             let path2 = log2.to_path_buf();
 
-            assert!(compare(&baseline, log1, &mismatch, log2).is_err());
+            let outcome = compare(&baseline, log1, &mismatch, log2).unwrap();
+            assert_eq!(outcome.verdict, Verdict::Diverged);
+            assert!(!outcome.verified());
+            // Collapsing a divergence to the legacy exit convention is an error
+            // (nonzero process exit), preserving the historical behavior.
+            assert!(outcome.into_exit_status().is_err());
 
             let _ = fs::remove_file(path1);
             let _ = fs::remove_file(path2);
