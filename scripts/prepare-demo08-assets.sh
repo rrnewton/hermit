@@ -79,7 +79,14 @@ calibrate_crash_seed() {
   for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
     cp --reflink=auto "$ASSETS/pop-tiny.img" "$image"
     set +e
-    timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
+    # Box the bare hermit run so a livelock/escapee is reaped by cgroup.kill instead of
+    # leaking a burned core (a `timeout` wall-cap only reaches the outer hermit, not a
+    # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
+    # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
+    # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
+    "$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib \
+      --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
+      timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
       --chaos --sched-seed "$seed" --no-virtualize-cpuid \
       -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
     rc=$?
