@@ -24,11 +24,24 @@
 //! Calling `run_dag_boxed_ordered` directly gives us TYPED results
 //! (`RunResult`/`StepOutcome`) instead of scraped text. Every decision this
 //! wrapper makes — process exit code, per-node cost table, ledger `result`, and
-//! failure classification — is derived STRUCTURALLY from typed fields
-//! (`RunResult.ok`, `StepOutcome.ok`/`returncode`/`reason`/`aborted`). We never
-//! grep stdout to decide anything. `StepOutcome.reason` is produced by the
-//! library's own `step_failure_reason`, which already classifies
-//! oom/timeout/cpu_timeout/signal, so classification is not re-implemented here.
+//! retry classification — is derived STRUCTURALLY from typed fields
+//! (`RunResult.ok`, `StepOutcome.ok`/`returncode`/`failure_kind`/`aborted`). We
+//! never grep stdout to decide anything.
+//!
+//! # Retry classification is TYPED, not text-grepped
+//!
+//! `validate.sh` decides whether a failed gate is a retryable environmental block by
+//! grepping the log TEXT through a `tail | sed | grep -q` pipeline under
+//! `set -o pipefail` (`is_environmental_block`, validate.sh:1219-1224). That verdict
+//! depends on which `sed`/`grep` is installed and on pipe-close timing, so it can
+//! misclassify a transient failure as permanent. This wrapper instead reads the typed
+//! `StepOutcome.failure_kind` the library carries WITH each outcome — computed at the
+//! same branch points, with the same precedence, as the human-readable `reason` — and
+//! maps it to a `RetryClass` (see `retry_class`) with ZERO string parsing. The typed
+//! `failure_kind`/`retry_class` travel into the per-node cost table and the ledger
+//! `gates[]`, so a downstream reader never has to re-derive retryability from fragile
+//! text. PHASE 1 REPORTS this classification; wiring the behavioral retry loop for
+//! transient gates is part of the PHASE-2 non-DAG-gate migration.
 //!
 //! # Boxing is the primary purpose — fail closed by default
 //!
@@ -125,6 +138,7 @@ use safe_ci_dag_runner::cgroup::reexec_in_scope;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::io::dag_from_json;
+use safe_ci_dag_runner::model::FailureKind;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
@@ -470,6 +484,11 @@ fn write_ledger_record(
                 "result": if o.ok { "pass" } else { "fail" },
                 "returncode": o.returncode,
                 "reason": o.reason,
+                // Typed classification carried WITH the value (rendered to a stable string
+                // for JSON, not parsed out of `reason`): a downstream reader gets the retry
+                // decision without re-deriving it from fragile text.
+                "failure_kind": failure_kind_label(o.failure_kind),
+                "retry_class": retry_class(o).label(),
                 "aborted": o.aborted,
                 "real_seconds": o.duration_s,
             })
@@ -538,6 +557,91 @@ fn write_ledger_record(
     }
 }
 
+// --------------------------------------------------------------------------- retry classification
+
+/// Whether a failed node is worth retrying — the TYPED replacement for the fragile
+/// `tail | sed | grep -q` environmental-block classifier in `validate.sh`
+/// (`is_environmental_block`, validate.sh:1219-1224).
+///
+/// The shell classifier decides retryability by grepping the log TEXT under
+/// `set -o pipefail`, so its verdict depends on which `sed`/`grep` is installed and on
+/// pipe-close timing (an upstream `SIGPIPE` can flip `pipefail` and silently misclassify
+/// a transient failure as permanent). This enum instead reads the typed
+/// [`FailureKind`] the library now carries WITH each outcome — no pipe, no `pipefail`,
+/// no toolchain-dependent exit status, no string parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryClass {
+    /// Not a failure (or an eager-exit cancellation) — nothing to retry.
+    NotFailure,
+    /// Transient / resource-pressure: a second run may succeed.
+    Transient,
+    /// Genuine, deterministic failure: retrying will not help.
+    Permanent,
+    /// The typed signal is insufficient to decide at the current library surface.
+    /// Reserved for a return code that carries no typed cause (see note below).
+    Indeterminate,
+}
+
+impl RetryClass {
+    /// Stable lowercase label for the ledger / cost table. Rendered FROM a typed value
+    /// (the opposite of parsing a value out of text).
+    fn label(self) -> &'static str {
+        match self {
+            RetryClass::NotFailure => "not-failure",
+            RetryClass::Transient => "transient",
+            RetryClass::Permanent => "permanent",
+            RetryClass::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+/// Stable string label for a typed [`FailureKind`], for the ledger / display. This
+/// RENDERS a typed value to text; it never parses text back into a decision.
+fn failure_kind_label(k: FailureKind) -> String {
+    match k {
+        FailureKind::None => "none".to_string(),
+        FailureKind::Oom => "oom".to_string(),
+        FailureKind::CpuTimeout => "cpu-timeout".to_string(),
+        FailureKind::WallTimeout => "wall-timeout".to_string(),
+        FailureKind::PidsGuard => "pids-guard".to_string(),
+        FailureKind::DetailCaptureFailed => "detail-capture-failed".to_string(),
+        FailureKind::Signal(n) => format!("signal:{n}"),
+        FailureKind::Exit(n) => format!("exit:{n}"),
+        FailureKind::Aborted => "aborted".to_string(),
+        FailureKind::Unknown => "unknown".to_string(),
+    }
+}
+
+/// Map a node's TYPED [`FailureKind`] to a [`RetryClass`], with ZERO string parsing.
+///
+/// * `Oom` / `DetailCaptureFailed` are resource/infra pressure → **Transient** (a retry,
+///   typically at lower concurrency, may succeed).
+/// * `CpuTimeout` / `WallTimeout` / `PidsGuard` / a crash `Signal` / a clean non-zero
+///   `Exit` are deterministic properties of the step → **Permanent**.
+/// * `None` / `Aborted` are not genuine failures of this node → **NotFailure**.
+/// * `Unknown` (no return code, no typed cause) → **Indeterminate**.
+///
+/// Note on the library surface this depends on: an OOM-kill and a wall-timeout-kill BOTH
+/// surface as `returncode == Some(-9)`, so before the library carried a typed
+/// `FailureKind` they were separable only by re-parsing the `reason` string — exactly the
+/// proxy this classifier exists to eliminate. Keying on `FailureKind` is what makes the
+/// OOM (Transient) vs wall-timeout (Permanent) split correct without touching text.
+fn retry_class(o: &StepOutcome) -> RetryClass {
+    if o.ok || o.aborted {
+        return RetryClass::NotFailure;
+    }
+    match o.failure_kind {
+        FailureKind::Oom | FailureKind::DetailCaptureFailed => RetryClass::Transient,
+        FailureKind::CpuTimeout
+        | FailureKind::WallTimeout
+        | FailureKind::PidsGuard
+        | FailureKind::Signal(_)
+        | FailureKind::Exit(_) => RetryClass::Permanent,
+        FailureKind::None | FailureKind::Aborted => RetryClass::NotFailure,
+        FailureKind::Unknown => RetryClass::Indeterminate,
+    }
+}
+
 // --------------------------------------------------------------------------- reporting
 
 /// The headline feature: a readable per-node cost table built entirely from typed
@@ -557,7 +661,7 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
             "FAIL"
         };
         // Prefer the library-derived reason; fall back to the typed returncode.
-        let detail = if !o.reason.is_empty() {
+        let mut detail = if !o.reason.is_empty() {
             o.reason.clone()
         } else if let Some(rc) = o.returncode {
             if rc < 0 {
@@ -568,6 +672,10 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
         } else {
             String::new()
         };
+        // Annotate a genuine failure with its TYPED retry class (never text-grepped).
+        if !o.ok && !o.aborted {
+            detail = format!("{detail}  [retry: {}]", retry_class(o).label());
+        }
         println!("{:<40} {:>10.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
     }
     println!("{}", "-".repeat(80));
@@ -707,5 +815,91 @@ fn main() -> ExitCode {
         result.wall_s
     );
 
+    // Typed retry breakdown of the genuine failures (never text-grepped). PHASE 1 only
+    // REPORTS the classification; the behavioral retry loop for transient/environmental
+    // gates is part of the PHASE-2 non-DAG-gate migration.
+    if failures > 0 {
+        let (mut transient, mut permanent, mut indeterminate) = (0usize, 0usize, 0usize);
+        for o in result.outcomes.iter().filter(|o| !o.ok && !o.aborted) {
+            match retry_class(o) {
+                RetryClass::Transient => transient += 1,
+                RetryClass::Permanent => permanent += 1,
+                RetryClass::Indeterminate => indeterminate += 1,
+                RetryClass::NotFailure => {}
+            }
+        }
+        eprintln!(
+            "validate.rs: retry classification - {transient} transient, {permanent} permanent, \
+             {indeterminate} indeterminate (typed from FailureKind, no log text parsed)"
+        );
+    }
+
     ExitCode::from(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Both-directions verification of the TYPED retry classifier (the replacement for
+    //! `validate.sh`'s `tail | sed | grep -q` `is_environmental_block`). Fixtures are
+    //! built through the library's OWN constructors, so each `failure_kind` is computed
+    //! by `step_failure_kind` exactly as it would be in a real run — the test exercises
+    //! the end-to-end path (library classifies -> validate.rs maps), not a hand-set enum.
+    use super::*;
+
+    /// THE load-bearing case: an OOM-kill and a wall-timeout-kill BOTH surface as
+    /// `returncode == Some(-9)` (SIGKILL). A bare-returncode classifier cannot tell them
+    /// apart; the typed `FailureKind` can. Positive direction (transient -> WOULD retry)
+    /// and negative direction (permanent -> would NOT retry) are asserted on the SAME
+    /// return code, which is the whole point of the rewrite.
+    #[test]
+    fn oom_and_wall_timeout_share_returncode_but_split_on_retry() {
+        let oom =
+            StepOutcome::failed("g.oom".into(), 1.0, String::new(), Some(-9), true, 1, false, 0, false, 0, false);
+        let wall =
+            StepOutcome::failed("g.wall".into(), 1.0, String::new(), Some(-9), false, 0, true, 30, false, 0, false);
+        assert_eq!(oom.returncode, wall.returncode, "precondition: same SIGKILL rc");
+        assert_eq!(retry_class(&oom), RetryClass::Transient, "OOM must be retryable");
+        assert_eq!(retry_class(&wall), RetryClass::Permanent, "wall-timeout must NOT retry");
+    }
+
+    /// N is stated explicitly here: 1 genuinely-transient case DOES retry; 4 genuine
+    /// deterministic failures do NOT retry; 2 non-failures and 1 indeterminate are
+    /// neither. Every assertion keys on the typed `FailureKind`, never on log text.
+    #[test]
+    fn retry_class_both_directions_n_stated() {
+        // --- POSITIVE direction: N_transient = 1 (a genuine transient DOES retry) ---
+        let transient = [StepOutcome::failed(
+            "g.oom".into(), 1.0, String::new(), Some(-9), true, 1, false, 0, false, 0, false,
+        )]; // FailureKind::Oom
+        for o in &transient {
+            assert_eq!(retry_class(o), RetryClass::Transient, "{} should retry", o.tag);
+        }
+        assert_eq!(transient.len(), 1, "N_transient stated = 1");
+
+        // --- NEGATIVE direction: N_permanent = 4 real failures that do NOT retry ---
+        let permanent = [
+            // wall-timeout kill (SIGKILL, rc -9) — same rc as OOM above, opposite verdict.
+            StepOutcome::failed("g.wall".into(), 1.0, String::new(), Some(-9), false, 0, true, 30, false, 0, false),
+            // cpu-time-budget kill.
+            StepOutcome::failed("g.cpu".into(), 1.0, String::new(), Some(-9), false, 0, false, 0, true, 10, false),
+            // crash signal SIGSEGV (rc -11), no typed resource cause.
+            StepOutcome::failed("g.segv".into(), 1.0, String::new(), Some(-11), false, 0, false, 0, false, 0, false),
+            // clean non-zero exit — a deterministic test failure.
+            StepOutcome::failed("g.exit1".into(), 1.0, String::new(), Some(1), false, 0, false, 0, false, 0, false),
+        ];
+        for o in &permanent {
+            assert_eq!(retry_class(o), RetryClass::Permanent, "{} must NOT retry", o.tag);
+        }
+        assert_eq!(permanent.len(), 4, "N_permanent stated = 4");
+
+        // --- Neither direction: 2 non-failures + 1 indeterminate ---
+        let pass = StepOutcome::passed("g.ok".into(), 1.0, String::new(), Some(0));
+        let aborted = StepOutcome::aborted_outcome("g.ab".into(), 1.0, String::new(), None);
+        assert_eq!(retry_class(&pass), RetryClass::NotFailure, "a pass is not a failure");
+        assert_eq!(retry_class(&aborted), RetryClass::NotFailure, "an eager-exit abort is not a failure");
+        // No return code + no typed cause -> Indeterminate (never silently treated as retryable).
+        let unknown =
+            StepOutcome::failed("g.unk".into(), 1.0, String::new(), None, false, 0, false, 0, false, 0, false);
+        assert_eq!(retry_class(&unknown), RetryClass::Indeterminate, "no signal -> indeterminate");
+    }
 }
