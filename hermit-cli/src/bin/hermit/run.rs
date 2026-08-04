@@ -58,6 +58,7 @@ use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
+use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
@@ -326,6 +327,16 @@ pub struct RunOpts {
     #[clap(long, requires = "verify")]
     verify_logs: bool,
 
+    /// With --verify, write the verification verdict as a single JSON line to
+    /// this path: `{"verified":bool,"verdict":"matched"|"diverged",
+    /// "guest_exit_code":int|null,"guest_signal":int|null}`. This is the
+    /// exit-code-independent verdict channel: `verified` reflects whether the two
+    /// runs matched, regardless of what the guest exited with, so a caller need
+    /// not (and must not) infer the verdict from the process exit code, which
+    /// still carries the guest's own status.
+    #[clap(long, requires = "verify", value_name = "PATH")]
+    verify_json: Option<PathBuf>,
+
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
@@ -560,6 +571,10 @@ impl fmt::Display for RunOpts {
         }
         if self.verify_verbose {
             write!(f, " --verify-verbose")?;
+        }
+        if let Some(p) = &self.verify_json {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --verify-json={}", shell_words::quote(s))?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -2691,7 +2706,7 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        let status = compare_two_runs(
+        let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -2711,6 +2726,22 @@ impl RunOpts {
                 compare_logs: !kvm_output_only,
             },
         )?;
+
+        // Emit the machine-readable verdict (if requested) before collapsing the
+        // outcome to the historical exit-code convention. The verdict is recorded
+        // whether or not the runs matched, and independent of the guest's own
+        // exit status.
+        if let Some(path) = &self.verify_json {
+            write_verification_json(path, &outcome)?;
+        }
+
+        // On divergence, preserve the historical behavior: return the error
+        // (nonzero process exit) without emitting the guest's output or backend
+        // banner.
+        if !outcome.verified() {
+            return outcome.into_exit_status();
+        }
+        let status = outcome.guest_status;
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
