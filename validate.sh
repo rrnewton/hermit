@@ -4530,7 +4530,6 @@ if ((RR_COMPAT_ONLY == 1)); then
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Record/replay expected-divergence ratchet (xfail-strict)" \
-            env HERMIT_RR_XFAIL_BINARY="$STRICT_COMPAT_HERMIT_BIN" \
             cargo test -p hermit --test record_replay_xfail_strict -- --test-threads=1
     fi
     print_summary
