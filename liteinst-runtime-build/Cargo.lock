@@ -930,6 +930,7 @@ dependencies = [
  "reverie-preload",
  "reverie-ptrace",
  "reverie-rpc-transport",
+ "serde",
  "tempfile",
  "tokio",
 ]
