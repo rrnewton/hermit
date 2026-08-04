@@ -118,6 +118,13 @@ cookies. This qualifies `c-programs/socket-cookie-tcp`,
 `c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` at SaBRe L2
 with byte-identical ptrace output under the portable profile.
 
+The `backend-parity-c/cpuid-probe` qualification routes SaBRe CPUID
+instructions through Detcore's shared fixed table. The loader preserves the
+architectural EAX/ECX inputs, EAX/EBX/ECX/EDX outputs, all other
+general-purpose registers, and RFLAGS across the plugin callback. This covers
+CPUID; it does not close the separate RDTSCP or cross-backend clock
+trajectories.
+
 At this increment's source tree, the executable plan enables SaBRe for 133/200
 ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
 That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
