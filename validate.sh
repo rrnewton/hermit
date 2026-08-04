@@ -487,13 +487,31 @@ fi
 CI_DAG_JOBS_DEFAULT=$((host_cpus / 8))
 ((CI_DAG_JOBS_DEFAULT < 2)) && CI_DAG_JOBS_DEFAULT=2
 ((CI_DAG_JOBS_DEFAULT > 16)) && CI_DAG_JOBS_DEFAULT=16
+VALIDATION_DAG_JOBS=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
+if [[ ! $VALIDATION_DAG_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: CI_DAG_JOBS must be a positive integer" >&2
+    exit 2
+fi
+
+# Gate-count obligation for landing-eligible full runs. A full run is init plus
+# two independently recorded gates (manifest check + lane execution) for each of
+# portable and privileged. Partial/custom profiles are deliberately `null` until
+# their dynamic plans carry an equally strong declaration; they cannot certify a
+# full landing receipt anyway. The shared outcome authority uses run < expected
+# as TRUNCATED, never FAILED.
+if [[ $VALIDATION_PROFILE == full ]]; then
+    VALIDATION_GATES_EXPECTED_JSON=5
+else
+    VALIDATION_GATES_EXPECTED_JSON=null
+fi
 
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
     exit 2
 fi
-readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT VALIDATION_DAG_JOBS
+readonly VALIDATION_GATES_EXPECTED_JSON
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -547,6 +565,7 @@ declare -a background_duration_files=()
 declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
+VALIDATION_CONCURRENCY_MONITOR_PID=""
 
 mkdir -p "$ROOT_DIR/target/validation"
 VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
@@ -555,6 +574,8 @@ if [[ -z $VALIDATION_TMP_DIR ]]; then
     exit 1
 fi
 readonly VALIDATION_TMP_DIR
+VALIDATION_CONCURRENT_MARKER="$VALIDATION_TMP_DIR/concurrent-validate-observed"
+readonly VALIDATION_CONCURRENT_MARKER
 export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
@@ -993,6 +1014,33 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Observe overlapping top-level validate process groups for the whole run. A
+# point-in-time count at start or finish misses a validate that starts and ends
+# in the middle; the one-second monitor leaves a durable marker for this receipt.
+# Subshells of this validate share its process group and are excluded, so a gate
+# invoking another validate.sh internally cannot forge concurrency.
+function start_validation_concurrency_monitor {
+    local root_pid=$$ root_pgid
+    root_pgid=$(ps -o pgid= -p "$root_pid" 2>/dev/null | tr -d ' ')
+    [[ $root_pgid =~ ^[0-9]+$ ]] || return 0
+    if [[ ${CI_HUB_VALIDATE_CONCURRENT:-} == true ]]; then
+        : >"$VALIDATION_CONCURRENT_MARKER"
+    fi
+    (
+        while kill -0 "$root_pid" 2>/dev/null; do
+            if ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
+                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { found=1 }
+                END { exit !found }
+            '; then
+                : >"$VALIDATION_CONCURRENT_MARKER"
+                exit 0
+            fi
+            sleep 1
+        done
+    ) &
+    VALIDATION_CONCURRENCY_MONITOR_PID=$!
+}
+
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
 # are computed once by the caller (cleanup) in the top-level shell so they match
 # the human summary exactly and so the `times` builtin sees the accumulated child
@@ -1000,9 +1048,10 @@ function json_quote {
 function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
-    local finished_at result gates_json gate_result line
+    local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json
+    local commit_anchored_json tree_dirty_json concurrent_json gates_run
+    local outcome_helper classified_line
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1010,9 +1059,14 @@ function append_validation_ledger {
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     if ((exit_status == 0 && failures == 0)); then
+        raw_result=pass
         result=pass
     else
-        result=fail
+        raw_result=fail
+        # A raw nonzero exit is not yet an earned product failure. If the shared
+        # classifier is unavailable, retain it as NO_RESULT rather than forging a
+        # permanent FAILED row from conditions this writer could not interpret.
+        result=no_result
     fi
 
     gates_json='['
@@ -1029,9 +1083,11 @@ function append_validation_ledger {
         gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
     done
     gates_json+=']'
+    gates_run=${#ledger_gate_names[@]}
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+    if [[ -e $VALIDATION_CONCURRENT_MARKER ]]; then concurrent_json=true; else concurrent_json=false; fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1058,11 +1114,27 @@ function append_validation_ledger {
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
-    line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
+    line+="\"raw_result\":\"$raw_result\",\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validate\":$concurrent_json,"
+    line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
+
+    outcome_helper="$DEV_HERMIT_PARENT/ci-hub/validation/record_outcome.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $outcome_helper ]] && command -v python3 >/dev/null 2>&1; then
+        if classified_line=$(printf '%s\n' "$line" | python3 "$outcome_helper" \
+            --log "$LOG_FILE" --ledger "$VALIDATION_LEDGER_FILE" 2>>"$LOG_FILE"); then
+            line=$classified_line
+        else
+            printf "validate.sh: outcome classifier failed; recording NO_RESULT, never FAILED\n" \
+                >>"$LOG_FILE"
+        fi
+    elif [[ $raw_result != pass ]]; then
+        printf "validate.sh: shared outcome classifier unavailable; recording NO_RESULT, never FAILED\n" \
+            >>"$LOG_FILE"
+    fi
 
     if ! mkdir -p "$(dirname -- "$VALIDATION_LEDGER_FILE")"; then
         printf "⚠️  unable to create validation ledger directory for %s\n" \
@@ -1164,6 +1236,11 @@ function cleanup {
 
     trap - EXIT
 
+    if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
+        kill "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+    fi
+
     if [[ -n $active_check_pid ]]; then
         kill_process_tree "$active_check_pid" TERM
     fi
@@ -1217,6 +1294,7 @@ function interrupted {
 }
 trap cleanup EXIT
 trap interrupted INT TERM
+start_validation_concurrency_monitor
 
 # Return success (0) when the failed check's log region carries the signature of
 # an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
@@ -3717,11 +3795,10 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
-        ./ci/run-dag.sh "$lane" -j "$jobs" -v
+        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v
 }
 
 function run_portable_only_suite {
@@ -3831,7 +3908,7 @@ function run_selective_suite {
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
                 "portable CI DAG (selective subset)" \
-                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
+                ./ci/run-dag.sh portable -j "$VALIDATION_DAG_JOBS" -v
             rc=$?
             unset RUN_DAG_FILE_OVERRIDE
             print_summary
