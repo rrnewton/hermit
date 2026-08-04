@@ -12,6 +12,7 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use core::fmt::Result;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -43,6 +44,23 @@ pub struct LogDiffOpts {
     /// so is cheating. It is only for non-parity diagnostic localization.
     #[clap(long = "unsafe-strip-lines")]
     pub strip_lines: bool,
+
+    /// Canonicalize host memory addresses before comparison WITHOUT erasing them.
+    ///
+    /// Each distinct `0x...` address is rewritten to an ordinal placeholder
+    /// `<addr{N}>` assigned by order of first appearance within a single run
+    /// (see [`canonicalize_addresses_in_line`]). Unlike [`Self::strip_lines`],
+    /// this discards ONLY the host-specific raw pointer value: it preserves
+    /// identity (same address -> same ordinal), ordering (introduction
+    /// sequence), and aliasing (two names for one address collapse to one
+    /// ordinal), and it leaves every other byte -- virtual-time timestamps,
+    /// syscall argument/result values, counts, sizes, flags -- untouched for an
+    /// exact comparison. This is the tier-2 normalization of the `Canonical`
+    /// parity policy: canonicalizing preserves the ability to DETECT a
+    /// difference (allocation-order or aliasing changes still diverge), which
+    /// wholesale stripping throws away.
+    #[clap(skip)]
+    pub canonicalize_addresses: bool,
 
     /// The internal message set to compare.
     #[clap(skip)]
@@ -207,6 +225,49 @@ pub fn strip_log_entry(log: &str) -> String {
     let log = RE1.replace_all(&log, "<NUM>");
     let log = RE2.replace_all(&log, "/tmp/<somewhere>");
     String::from(log)
+}
+
+/// Rewrite each host memory address (`0x...`) in `line` to an ordinal
+/// placeholder `<addr{N}>`, numbered by order of first appearance within a
+/// single run. `map`/`next` carry the per-run assignment state threaded across
+/// all of that run's lines, so `next` should start at 1 and the same `map`/`next`
+/// must be reused for every line of one run (and a FRESH pair used for the other
+/// run).
+///
+/// This is the tier-2 CANONICALIZE step (as opposed to tier-1 STRIP of the
+/// wall-clock prefix and tier-3 EXACT comparison of everything else). It differs
+/// from [`strip_log_entry`]'s `<ADDR>` erasure in one decisive way: erasure maps
+/// every address to a single token, so two runs that allocate in a DIFFERENT
+/// ORDER, or that ALIAS differently (one address printed twice vs. two distinct
+/// addresses), compare EQUAL -- the exact defect parity exists to catch. An
+/// ordinal assigned by first appearance keeps identity, order, and aliasing, so
+/// those cases still diverge while a pure ASLR-shift (same structure, different
+/// raw values) compares equal. Only `0x`-prefixed hex is canonicalized; decimal
+/// values (virtual-time timestamps, counts, sizes) are left for exact comparison.
+fn canonicalize_addresses_in_line(
+    line: &str,
+    map: &mut HashMap<String, usize>,
+    next: &mut usize,
+) -> String {
+    // Same shape as `strip_log_entry`'s RE0: an `0x`/`0X` hex literal.
+    static RE_ADDR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap());
+
+    RE_ADDR
+        .replace_all(line, |caps: &regex::Captures| {
+            let addr = &caps[0];
+            let ord = match map.get(addr) {
+                Some(existing) => *existing,
+                None => {
+                    let assigned = *next;
+                    *next += 1;
+                    map.insert(addr.to_string(), assigned);
+                    assigned
+                }
+            };
+            format!("<addr{ord}>")
+        })
+        .into_owned()
 }
 
 /// Separate a full, continuous log into discrete (possibly-multiline) log messages,
@@ -458,10 +519,36 @@ fn diff_vecs(
         return Ok(false);
     }
 
+    // Canonicalize addresses in a full pre-pass, per run, BEFORE the compare
+    // loop: the ordinal-by-first-appearance numbering must reflect the whole
+    // ordered message list, not be truncated when the loop breaks at `limit`.
+    // Each run gets its own fresh map/counter so the two numberings are
+    // independent (an ASLR shift compares equal) yet order- and alias-sensitive.
+    let (canon_left, canon_right): (Vec<String>, Vec<String>) = if opts.canonicalize_addresses {
+        let mut left_map = HashMap::new();
+        let mut left_next = 1usize;
+        let mut right_map = HashMap::new();
+        let mut right_next = 1usize;
+        (
+            v1.iter()
+                .map(|(_, s)| canonicalize_addresses_in_line(s, &mut left_map, &mut left_next))
+                .collect(),
+            v2.iter()
+                .map(|(_, s)| canonicalize_addresses_in_line(s, &mut right_map, &mut right_next))
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let mut diff_count = 0;
-    for ((left_index, left), (right_index, right)) in v1.iter().zip(v2.iter()) {
+    for (position, ((left_index, left), (right_index, right))) in
+        v1.iter().zip(v2.iter()).enumerate()
+    {
         let (left_compared, right_compared) = if opts.strip_lines {
             (strip_log_entry(left), strip_log_entry(right))
+        } else if opts.canonicalize_addresses {
+            (canon_left[position].clone(), canon_right[position].clone())
         } else {
             (left.to_string(), right.to_string())
         };
@@ -483,7 +570,7 @@ fn diff_vecs(
             "({which}) Mismatch at log messages {left_index} (run 1) and {right_index} (run 2): {}",
             Comparison::new(opts.no_color, &left_compared, &right_compared)
         )?;
-        if opts.strip_lines {
+        if opts.strip_lines || opts.canonicalize_addresses {
             write!(
                 w,
                 "({which}) Original entries before normalization: {}",
@@ -646,6 +733,11 @@ fn log_diff_from_strs(
             w,
             "Normalizing known nondeterministic numerical data before comparison..."
         )?;
+    } else if opts.canonicalize_addresses {
+        writeln!(
+            w,
+            "Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly..."
+        )?;
     }
 
     let (which, compared_a, compared_b) = match opts.comparison {
@@ -754,6 +846,7 @@ mod test {
             &super::LogDiffOpts {
                 limit: 1,
                 strip_lines: false,
+                canonicalize_addresses: false,
                 comparison: super::LogComparisonMode::Deterministic,
                 syscall_history: 5,
                 no_color: false,
@@ -1080,6 +1173,155 @@ mod test {
         Ok(())
     }
 
+    /// Canonical parity, tier 2 positive: two runs that differ ONLY in their raw
+    /// host addresses -- same structure, same introduction order, same aliasing
+    /// (a pure ASLR shift) -- compare EQUAL after canonicalization. The same
+    /// inputs compared RAW (neither stripped nor canonicalized) diverge, proving
+    /// canonicalization is doing real work and is not just the identity.
+    #[test]
+    fn canonical_address_only_difference_compares_equal() -> std::io::Result<()> {
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=0x1111 q=0x2222
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] use 0x1111 then 0x2222";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] p=0xaaaa q=0xbbbb
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] use 0xaaaa then 0xbbbb";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            !super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "address-only (ASLR-shift) difference must compare EQUAL under canonicalization"
+        );
+
+        // Positive control: raw comparison (no strip, no canonicalize) diverges on
+        // the very same inputs, so the equality above is not vacuous.
+        let raw = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: false,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            super::log_diff_from_strs(run_a, run_b, &raw, &mut Vec::new())?,
+            "raw comparison must still see the differing addresses"
+        );
+        Ok(())
+    }
+
+    /// Canonical parity, tier 2 negative (allocation order): two runs whose only
+    /// difference is the ORDER in which two addresses are introduced must compare
+    /// UNEQUAL. This is exactly the divergence wholesale stripping hides -- it is
+    /// the positive control that canonicalization preserves distinguishability.
+    #[test]
+    fn canonical_allocation_order_difference_compares_unequal() -> std::io::Result<()> {
+        // Both runs: alloc, alloc, then a line pairing the two addresses. In run_b
+        // the two addresses are introduced in the opposite order, so the ordinals
+        // on the shared "pair" line are swapped.
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc 0x1111
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc 0x2222
+2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair 0x1111 0x2222";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] alloc 0xbbbb
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] alloc 0xaaaa
+2022-09-06T14:15:49.000000Z  INFO detcore: [t] pair 0xaaaa 0xbbbb";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "an allocation-order difference must compare UNEQUAL under canonicalization"
+        );
+
+        // And wholesale stripping DOES hide it (documents the defect the tier-2
+        // policy fixes): both addresses collapse to a single <ADDR> token.
+        let stripped = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            strip_lines: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            !super::log_diff_from_strs(run_a, run_b, &stripped, &mut Vec::new())?,
+            "wholesale stripping erases the allocation-order difference (the defect)"
+        );
+        Ok(())
+    }
+
+    /// Canonical parity, tier 2 negative (aliasing): a run that prints ONE address
+    /// twice (aliased) must not match a run that prints TWO distinct addresses in
+    /// the same positions. `<addr1>,<addr1>` vs `<addr1>,<addr2>` diverges.
+    #[test]
+    fn canonical_aliasing_difference_compares_unequal() -> std::io::Result<()> {
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two 0x1111 0x1111";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] two 0xaaaa 0xbbbb";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "an aliasing difference (1,1 vs 1,2) must compare UNEQUAL"
+        );
+        Ok(())
+    }
+
+    /// Canonical parity, tier 3: a single virtual-time timestamp difference (a
+    /// decimal value, NOT a `0x` address) must compare UNEQUAL -- canonicalization
+    /// touches only host addresses and leaves every other byte for exact
+    /// comparison. This is the sharp edge: virtual time is compared exactly even
+    /// though the wall-clock PREFIX is stripped.
+    #[test]
+    fn canonical_virtual_time_difference_compares_unequal() -> std::io::Result<()> {
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: COMMIT turn 5 at time 100";
+        let run_b = "2022-09-06T14:15:47.000000Z  INFO detcore: COMMIT turn 5 at time 200";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "a virtual-time (decimal) difference must compare UNEQUAL under canonicalization"
+        );
+        Ok(())
+    }
+
+    /// Canonical parity, tier 1: runs that differ ONLY in the real wall-clock
+    /// timestamp PREFIX compare EQUAL -- the prefix is stripped by
+    /// `extract_log_messages` before any comparison, so nothing else needs to see
+    /// it. This is the one genuinely-irreproducible datum the policy discards.
+    #[test]
+    fn canonical_wall_clock_prefix_difference_compares_equal() -> std::io::Result<()> {
+        let run_a = "2022-09-06T14:15:47.000000Z  INFO detcore: [t] use 0x1111
+2022-09-06T14:15:48.000000Z  INFO detcore: [t] use 0x1111";
+        // Same message bodies, entirely different wall-clock prefixes (and format).
+        let run_b = "Apr 09 06:08:03.100  INFO detcore: [t] use 0x1111
+Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
+
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(
+            !super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
+            "a wall-clock-prefix-only difference must compare EQUAL"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_filter_infos() {
         let v = super::filter_infos(&[
@@ -1119,6 +1361,29 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
             eprintln!("{:?}", x);
         }
         assert_eq!(v.len(), 5);
+    }
+
+    #[test]
+    fn test_canonicalize_addresses_in_line() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let mut next = 1usize;
+        // First appearance numbers by order; a repeated address reuses its ordinal
+        // (identity + aliasing); decimal values are left untouched (tier 3).
+        assert_eq!(
+            super::canonicalize_addresses_in_line(
+                "a=0x1111 b=0x2222 c=0x1111 n=42",
+                &mut map,
+                &mut next
+            ),
+            "a=<addr1> b=<addr2> c=<addr1> n=42"
+        );
+        // State threads across lines within one run: a known address keeps its
+        // ordinal, a new one continues the count.
+        assert_eq!(
+            super::canonicalize_addresses_in_line("use 0x2222 then 0x3333", &mut map, &mut next),
+            "use <addr2> then <addr3>"
+        );
     }
 
     #[test]

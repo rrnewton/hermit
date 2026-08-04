@@ -51,28 +51,73 @@ pub(crate) struct ComparisonOptions<'a> {
 /// How strictly two runs' internal logs are compared — the condition a
 /// [`Verdict`] rests on.
 ///
-/// A bare "matched" verdict is meaningless without this: a [`Self::Stripped`]
-/// comparison normalizes away numeric values, addresses, tmp paths, and — most
-/// importantly — the virtual-time timestamps and syscall argument/result values
-/// that bitwise parity exists to check, so a `Matched` verdict under `Stripped`
-/// asserts only "matched after normalizing known-nondeterministic data", NOT
-/// bitwise identity. A [`Self::Bitwise`] comparison keeps every byte and
-/// compares the full captured trace, so a `Matched` verdict there is a genuine
-/// bitwise-parity claim. Carrying the strictness beside the verdict is the same
-/// discipline as recording the `-j` a byte count was measured at: the value is
-/// uninterpretable without the condition that produced it.
+/// A bare "matched" verdict is meaningless without this. The two modes sit at
+/// opposite ends of a three-tier treatment of log data:
+///
+/// - [`Self::Stripped`] normalizes away numeric values, addresses, tmp paths,
+///   and — most importantly — the virtual-time timestamps and syscall
+///   argument/result values that parity exists to check, so a `Matched` verdict
+///   under `Stripped` asserts only "matched after normalizing known-
+///   nondeterministic data", NOT parity. STRIPPING DESTROYS THE ABILITY TO
+///   DETECT A DIFFERENCE.
+/// - [`Self::Canonical`] is the parity mode. It applies exactly three tiers:
+///   (1) STRIP the real wall-clock timestamp PREFIX only (genuinely
+///   irreproducible; done by `extract_log_messages`); (2) CANONICALIZE host
+///   memory addresses to an ordinal by first appearance (1, 2, 3…), preserving
+///   identity, ordering, and aliasing while discarding only the host-specific
+///   raw pointer; (3) COMPARE EXACTLY everything else — virtual-time timestamps,
+///   syscall inputs/results, counts, sizes, flags. CANONICALIZING PRESERVES the
+///   ability to detect a difference (allocation-order and aliasing changes still
+///   diverge), which is the whole point.
+///
+/// Carrying the strictness beside the verdict is the same discipline as
+/// recording the `-j` a byte count was measured at: the value is uninterpretable
+/// without the condition that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogCompareStrictness {
     /// `strip_lines = true`, comparing the deterministic Detcore/scheduler
     /// message subset. Tolerant of limited nondeterminism (numbers, addresses,
-    /// tmp paths, and timestamps are normalized before diffing).
+    /// tmp paths, and timestamps are normalized before diffing). NOT a parity
+    /// claim.
     Stripped,
-    /// `strip_lines = false`, comparing the full captured trace. Every byte of
-    /// every log message must match, including virtual-time timestamps and raw
-    /// syscall argument/result values.
-    Bitwise,
+    /// The parity mode (`BitwiseInfoV1`): `strip_lines = false` and
+    /// `canonicalize_addresses = true`, comparing the full captured INFO trace.
+    /// Only the real wall-clock timestamp prefix is stripped and host addresses
+    /// are canonicalized to first-appearance ordinals; every other byte —
+    /// virtual-time timestamps, raw syscall argument/result values, counts,
+    /// sizes, flags — must match exactly.
+    Canonical,
 }
+
+/// Versioned policy token: the only strippable datum is the real wall-clock
+/// timestamp PREFIX. Recorded in [`ComparisonSpec::stripped_prefixes`] so a
+/// consumer sees exactly which prefixes were removed, not a bare boolean.
+pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
+
+/// Versioned policy token: host memory addresses are canonicalized to an ordinal
+/// by first appearance (identity/order/aliasing preserved). Recorded in
+/// [`ComparisonSpec::canonicalizations`].
+pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+
+/// Versioned policy token marking the lossy wholesale normalization the
+/// [`LogCompareStrictness::Stripped`] mode applies (numbers, addresses, tmp
+/// paths, and timestamps erased). Its presence in a spec is disqualifying for
+/// parity: it is recorded so a consumer can see WHY a stripped spec is not
+/// parity rather than having to infer it.
+pub const STRIP_UNSAFE_NORMALIZATION_V1: &str = "unsafe-numeric-address-and-path-normalization/v1";
+
+/// The exact set of stripped-prefix tokens the parity ([`Canonical`]) policy
+/// permits: the wall-clock prefix, and nothing else.
+///
+/// [`Canonical`]: LogCompareStrictness::Canonical
+const PARITY_STRIPPED_PREFIXES: &[&str] = &[STRIP_WALL_CLOCK_PREFIX_V1];
+
+/// The exact set of canonicalization tokens the parity ([`Canonical`]) policy
+/// requires: address-to-ordinal, and nothing else.
+///
+/// [`Canonical`]: LogCompareStrictness::Canonical
+const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
 
 /// The exact comparison that produced a [`Verdict`], carried beside it so a bare
 /// "verified" can always say *which* comparison certified it.
@@ -91,11 +136,32 @@ pub struct ComparisonSpec {
     /// run — a consumer must not read such a verdict as bitwise log parity.
     pub compare_logs: bool,
     /// Concrete: were numeric values, addresses, tmp paths, and timestamps
-    /// normalized away before diffing?
+    /// normalized away wholesale before diffing (the lossy [`Stripped`] path)?
+    ///
+    /// [`Stripped`]: LogCompareStrictness::Stripped
     pub strip_lines: bool,
+    /// Concrete: were host memory addresses canonicalized to first-appearance
+    /// ordinals (the tier-2 step of the parity policy) before diffing? Unlike
+    /// [`Self::strip_lines`] this is lossless for parity: it discards only the
+    /// raw pointer value, keeping identity, order, and aliasing.
+    pub canonicalize_addresses: bool,
     /// Concrete: was the full captured trace compared (vs. the deterministic
     /// subset)?
     pub full_trace: bool,
+    /// Concrete: was everything OTHER than the stripped prefix and the
+    /// canonicalized addresses compared exactly (virtual-time timestamps,
+    /// syscall inputs/results, counts, sizes, flags)? True for the parity policy;
+    /// false whenever a lossy normalization (e.g. [`Self::strip_lines`]) ran.
+    pub exact_remainder: bool,
+    /// Versioned tokens for every prefix STRIPPED before comparison. The parity
+    /// policy permits exactly `["real-wall-clock-prefix/v1"]`; a lossy stripped
+    /// comparison additionally lists the wholesale-normalization token. Recorded
+    /// (not inferred) so a consumer can see precisely what was discarded.
+    pub stripped_prefixes: &'static [&'static str],
+    /// Versioned tokens for every CANONICALIZATION applied before comparison. The
+    /// parity policy requires exactly
+    /// `["host-address-to-first-appearance-ordinal/v1"]`.
+    pub canonicalizations: &'static [&'static str],
     /// Concrete: were any `--ignore-lines` substring filters applied, dropping
     /// matching log lines before the comparison? Bitwise parity requires none.
     pub ignore_lines: bool,
@@ -114,21 +180,41 @@ impl ComparisonSpec {
     /// so the flags the diff engine sees and the flags the verdict reports can
     /// never drift apart.
     pub fn new(strictness: LogCompareStrictness, compare_logs: bool) -> Self {
-        let (strip_lines, full_trace) = match strictness {
-            LogCompareStrictness::Stripped => (true, false),
-            LogCompareStrictness::Bitwise => (false, true),
+        // Map the strictness label onto the concrete diff flags AND the versioned
+        // policy tokens in one place, so the flags the engine sees, the tokens
+        // the verdict reports, and the strictness label can never drift apart.
+        let (strip_lines, canonicalize_addresses, full_trace, exact_remainder) = match strictness {
+            // Lossy wholesale normalization: numbers/addresses/paths/timestamps
+            // erased; the remainder is NOT compared exactly.
+            LogCompareStrictness::Stripped => (true, false, false, false),
+            // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
+            // canonicalize addresses, compare the full-trace remainder exactly.
+            LogCompareStrictness::Canonical => (false, true, true, true),
+        };
+        let (stripped_prefixes, canonicalizations): (&[&str], &[&str]) = match strictness {
+            LogCompareStrictness::Stripped => (
+                &[STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1],
+                // Under stripping, addresses are ERASED (to a single `<ADDR>`
+                // token), not canonicalized; there is no ordinal preserved.
+                &[],
+            ),
+            LogCompareStrictness::Canonical => (PARITY_STRIPPED_PREFIXES, PARITY_CANONICALIZATIONS),
         };
         ComparisonSpec {
             strictness,
             compare_logs,
             strip_lines,
+            canonicalize_addresses,
             full_trace,
+            exact_remainder,
+            stripped_prefixes,
+            canonicalizations,
             // The `--verify` code paths never expose the diff engine's line
             // filters, so the comparison they produce applies none. These are
-            // recorded (not merely assumed) so a bitwise consumer can *require*
+            // recorded (not merely assumed) so a parity consumer can *require*
             // their absence rather than trust that no CLI surface enables them;
-            // `diff_options_apply_no_line_filters` binds these values to the
-            // actual `LogDiffOpts` the engine sees.
+            // `default_log_diff_opts_apply_no_line_filters` binds these values to
+            // the actual `LogDiffOpts` the engine sees.
             ignore_lines: false,
             skip_commit: false,
             skip_detlog: false,
@@ -144,29 +230,41 @@ impl ComparisonSpec {
         }
     }
 
-    /// Does this comparison satisfy the bitwise INFO-parity contract a
+    /// Does this comparison satisfy the `BitwiseInfoV1` parity contract a
     /// determinism / record-replay ratchet must require before it may read a
-    /// `Matched` verdict as *true bitwise parity*? A bare `verified` is not
-    /// enough: `verified` can rest on a stripped compare, a filtered subset, or
-    /// an output-only fallback, all of which normalize or omit exactly the data
+    /// `Matched` verdict as *true parity*? A bare `verified` is not enough:
+    /// `verified` can rest on a stripped compare, a filtered subset, or an
+    /// output-only fallback, all of which normalize or omit exactly the data
     /// (virtual-time timestamps, raw syscall argument/result values, whole event
-    /// classes) that bitwise parity exists to check.
+    /// classes) that parity exists to check.
     ///
-    /// All clauses must hold:
+    /// This requires the EXACT `BitwiseInfoV1` policy shape, not merely
+    /// "not stripped": a generic `strip_lines = false` is inadmissible on its
+    /// own. All clauses must hold:
     /// - the full INFO event stream was compared ([`Self::full_trace`]), which is
     ///   what carries exact virtual timestamps and syscall argument/result values;
-    /// - no line-stripping normalization ran (`!strip_lines`);
+    /// - no lossy wholesale normalization ran (`!strip_lines`) and the remainder
+    ///   was compared exactly ([`Self::exact_remainder`]);
+    /// - addresses were CANONICALIZED, not erased ([`Self::canonicalize_addresses`]),
+    ///   so allocation-order and aliasing differences are still detectable;
+    /// - the versioned policy tokens are exactly the parity set — only the
+    ///   wall-clock prefix stripped, only address-ordinal canonicalization
+    ///   applied — so a future extra strip/canonicalization cannot silently pass;
     /// - no ignore/skip filter dropped any line or event class
     ///   (`!ignore_lines && !skip_commit && !skip_detlog`);
     /// - the internal log stream was actually compared, not skipped for an
     ///   output-only fallback ([`Self::compare_logs`]).
     ///
-    /// A consumer asking for bitwise parity must reject `Matched` under every
-    /// weaker comparison; this predicate is that single acceptance rule.
+    /// A consumer asking for parity must reject `Matched` under every weaker
+    /// comparison; this predicate is that single acceptance rule.
     pub fn is_bitwise_parity(&self) -> bool {
         self.compare_logs
             && self.full_trace
             && !self.strip_lines
+            && self.canonicalize_addresses
+            && self.exact_remainder
+            && self.stripped_prefixes == PARITY_STRIPPED_PREFIXES
+            && self.canonicalizations == PARITY_CANONICALIZATIONS
             && !self.ignore_lines
             && !self.skip_commit
             && !self.skip_detlog
@@ -419,6 +517,12 @@ pub fn compare_two_runs(
         // loudest — decoupling them lets a quiet run be bitwise-strict.
         let diff_options = logdiff::LogDiffOpts {
             strip_lines: spec.strip_lines,
+            // Thread the tier-2 canonicalization from the spec so the parity
+            // (`Canonical`) policy actually rewrites host addresses to ordinals
+            // in the engine; without this the verdict would REPORT
+            // `canonicalize_addresses = true` while the diff ran with the raw
+            // addresses — the exact proxy/binding drift the spec exists to close.
+            canonicalize_addresses: spec.canonicalize_addresses,
             comparison: spec.log_comparison_mode(),
             syscall_history: if options.verbose { 10 } else { 5 },
             // Thread the filter facts from the spec so what the verdict *reports*
@@ -736,10 +840,15 @@ mod tests {
             LogComparisonMode::Deterministic
         );
 
-        let bitwise = ComparisonSpec::new(LogCompareStrictness::Bitwise, true);
-        assert!(!bitwise.strip_lines);
-        assert!(bitwise.full_trace);
-        assert_eq!(bitwise.log_comparison_mode(), LogComparisonMode::FullTrace);
+        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true);
+        assert!(!canonical.strip_lines);
+        assert!(canonical.canonicalize_addresses);
+        assert!(canonical.exact_remainder);
+        assert!(canonical.full_trace);
+        assert_eq!(
+            canonical.log_comparison_mode(),
+            LogComparisonMode::FullTrace
+        );
     }
 
     // The core of the strip-lines/verdict decoupling: two runs whose logs differ
@@ -764,26 +873,31 @@ mod tests {
         assert!(stripped.comparison.strip_lines);
         assert!(!stripped.comparison.full_trace);
 
-        // Bitwise: the same inputs, but every byte compared -> Diverged. The
-        // verdict flips on the comparison mode alone, and the outcome records it.
+        // Canonical: the same inputs, but every byte compared (a decimal value,
+        // untouched by address canonicalization) -> Diverged. The verdict flips
+        // on the comparison mode alone, and the outcome records it.
         let (log1, log2) = empty_logs();
         let path1 = log1.to_path_buf();
         let path2 = log2.to_path_buf();
         fs::write(&path1, detlog_with_value(100)).unwrap();
         fs::write(&path2, detlog_with_value(200)).unwrap();
-        let bitwise = compare_with(&out, log1, &out, log2, LogCompareStrictness::Bitwise).unwrap();
-        assert_eq!(bitwise.verdict, Verdict::Diverged);
-        assert!(!bitwise.verified());
-        assert_eq!(bitwise.comparison.strictness, LogCompareStrictness::Bitwise);
-        assert!(!bitwise.comparison.strip_lines);
-        assert!(bitwise.comparison.full_trace);
+        let canonical =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+        assert_eq!(canonical.verdict, Verdict::Diverged);
+        assert!(!canonical.verified());
+        assert_eq!(
+            canonical.comparison.strictness,
+            LogCompareStrictness::Canonical
+        );
+        assert!(!canonical.comparison.strip_lines);
+        assert!(canonical.comparison.full_trace);
         // A `--verify-json` consumer reads the strictness from the report and so
-        // can refuse to treat a stripped match as bitwise parity.
-        let report = VerificationReport::from(&bitwise);
+        // can refuse to treat a stripped match as parity.
+        let report = VerificationReport::from(&canonical);
         assert!(!report.verified);
         assert!(!report.comparison.strip_lines);
 
-        // Diverged bitwise runs retain their logs (`.keep()`); clean them up.
+        // Diverged canonical runs retain their logs (`.keep()`); clean them up.
         let _ = fs::remove_file(path1);
         let _ = fs::remove_file(path2);
     }
@@ -794,7 +908,8 @@ mod tests {
     fn verification_report_json_carries_the_comparison() {
         let out = output(0, b"hello\n", b"");
         let (log1, log2) = empty_logs();
-        let outcome = compare_with(&out, log1, &out, log2, LogCompareStrictness::Bitwise).unwrap();
+        let outcome =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
 
         let json = serde_json::to_string(&VerificationReport::from(&outcome)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -805,7 +920,7 @@ mod tests {
         assert_eq!(parsed["bitwise_parity"], serde_json::json!(true));
         assert_eq!(
             parsed["comparison"]["strictness"],
-            serde_json::json!("bitwise")
+            serde_json::json!("canonical")
         );
         assert_eq!(
             parsed["comparison"]["strip_lines"],
@@ -843,7 +958,7 @@ mod tests {
     fn bitwise_parity_contract_accepts_only_full_unfiltered_comparison() {
         // Positive: the exact qualifying comparison the `--verify-strict` path
         // produces.
-        let full = ComparisonSpec::new(LogCompareStrictness::Bitwise, true);
+        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true);
         assert!(
             full.is_bitwise_parity(),
             "a full-INFO unstripped unfiltered comparison must qualify"

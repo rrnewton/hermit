@@ -316,14 +316,18 @@ pub struct RunOpts {
     #[clap(long, requires = "verify")]
     verify_verbose: bool,
 
-    /// Compare the internal logs BITWISE: every byte of the full captured trace
-    /// must match, including virtual-time timestamps and raw syscall
-    /// argument/result values. Without this (and without --verify-verbose) the
-    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
-    /// timestamps before comparing, so a "verified" result asserts only stripped
-    /// parity, not bitwise identity. Unlike --verify-verbose this stays quiet: it
-    /// changes only the comparison, not the diff output volume, so a determinism
-    /// ratchet can require bitwise parity without drowning in trace logs.
+    /// Compare the internal logs under the CANONICAL parity policy: strip only
+    /// the real wall-clock timestamp prefix (genuinely irreproducible),
+    /// canonicalize host memory addresses to first-appearance ordinals (so an
+    /// ASLR shift is tolerated but allocation-order and aliasing changes still
+    /// diverge), and compare everything else — virtual-time timestamps, raw
+    /// syscall argument/result values, counts, sizes, flags — exactly. Without
+    /// this (and without --verify-verbose) the default `--verify` normalizes away
+    /// numbers, addresses, tmp paths, and timestamps before comparing, so a
+    /// "verified" result asserts only stripped parity, not bitwise identity.
+    /// Unlike --verify-verbose this stays quiet: it changes only the comparison,
+    /// not the diff output volume, so a determinism ratchet can require parity
+    /// without drowning in trace logs.
     #[clap(long, requires = "verify")]
     verify_strict: bool,
 
@@ -344,16 +348,20 @@ pub struct RunOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"bitwise","compare_logs":bool,"strip_lines":bool,
-    /// "full_trace":bool,"ignore_lines":bool,"skip_commit":bool,
-    /// "skip_detlog":bool},"guest_exit_code":int|null,"guest_signal":int|null}`.
-    /// This is the exit-code-independent verdict channel: `verified` reflects
-    /// whether the two runs matched, regardless of what the guest exited with, so
-    /// a caller need not (and must not) infer the verdict from the process exit
-    /// code. A determinism / record-replay parity ratchet must key on
-    /// `bitwise_parity`, NOT `verified`: `bitwise_parity` is true only when the
-    /// match rests on a full-INFO, unstripped, unfiltered log comparison (see
-    /// --verify-strict), so it cannot be silently weakened to a stripped compare.
+    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
+    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
+    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
+    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// channel: `verified` reflects whether the two runs matched, regardless of
+    /// what the guest exited with, so a caller need not (and must not) infer the
+    /// verdict from the process exit code. A determinism / record-replay parity
+    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
+    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
+    /// comparison that strips only the real wall-clock prefix, canonicalizes host
+    /// addresses to first-appearance ordinals, and compares everything else
+    /// exactly (see --verify-strict) — so it cannot be silently weakened to a
+    /// stripped compare.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -2750,7 +2758,7 @@ impl RunOpts {
                 // flipped strip_lines off + FullTrace on); preserve that, and let
                 // --verify-strict select the same bitwise comparison quietly.
                 strictness: if self.verify_verbose || self.verify_strict {
-                    LogCompareStrictness::Bitwise
+                    LogCompareStrictness::Canonical
                 } else {
                     LogCompareStrictness::Stripped
                 },

@@ -200,26 +200,32 @@ pub struct StartOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"bitwise","compare_logs":bool,"strip_lines":bool,
-    /// "full_trace":bool,"ignore_lines":bool,"skip_commit":bool,
-    /// "skip_detlog":bool},"guest_exit_code":int|null,"guest_signal":int|null}`.
-    /// This is the exit-code-independent verdict channel: `verified` reflects
-    /// whether the record and replay runs matched, regardless of what the guest
-    /// exited with, so a caller need not (and must not) infer the verdict from the
-    /// process exit code. A record/replay parity ratchet must key on
-    /// `bitwise_parity`, NOT `verified`: `bitwise_parity` is true only when the
-    /// match rests on a full-INFO, unstripped, unfiltered log comparison (see
-    /// --verify-strict) rather than a stripped match.
+    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
+    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
+    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
+    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// channel: `verified` reflects whether the record and replay runs matched,
+    /// regardless of what the guest exited with, so a caller need not (and must
+    /// not) infer the verdict from the process exit code. A record/replay parity
+    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
+    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
+    /// comparison that strips only the real wall-clock prefix, canonicalizes host
+    /// addresses to first-appearance ordinals, and compares everything else
+    /// exactly (see --verify-strict) — rather than a stripped match.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
-    /// With --verify, compare the record and replay logs BITWISE: every byte of
-    /// the full captured trace must match, including virtual-time timestamps and
-    /// raw syscall argument/result values. Without this the default `--verify`
-    /// normalizes away numbers, addresses, tmp paths, and timestamps before
-    /// comparing, so a "verified" result asserts only stripped parity, not
-    /// bitwise identity. A record/replay determinism ratchet keying on the
-    /// verdict should set this so it cannot be silently weakened to a stripped
+    /// With --verify, compare the record and replay logs under the CANONICAL
+    /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
+    /// host memory addresses to first-appearance ordinals (tolerating an ASLR
+    /// shift while still diverging on allocation-order or aliasing changes), and
+    /// compare everything else — virtual-time timestamps, raw syscall
+    /// argument/result values, counts, sizes, flags — exactly. Without this the
+    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
+    /// timestamps before comparing, so a "verified" result asserts only stripped
+    /// parity, not bitwise identity. A record/replay determinism ratchet keying on
+    /// the verdict should set this so it cannot be silently weakened to a stripped
     /// comparison.
     #[clap(long, requires = "verify")]
     verify_strict: bool,
@@ -442,7 +448,7 @@ impl StartOpts {
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
                 strictness: if self.verify_strict {
-                    LogCompareStrictness::Bitwise
+                    LogCompareStrictness::Canonical
                 } else {
                     LogCompareStrictness::Stripped
                 },
