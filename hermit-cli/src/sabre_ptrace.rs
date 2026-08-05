@@ -141,10 +141,6 @@ struct MappingCache {
     entries: HashMap<(AddressSpaceId, usize), MappingClassification>,
     /// Which address space each tracee currently runs in.
     spaces: HashMap<Pid, AddressSpaceId>,
-    /// Whether the clone-family syscall in flight on this tracee will give its
-    /// child the caller's address space. Recorded at the syscall ENTRY stop and
-    /// consumed by `admit_child` at the `PTRACE_EVENT_*` stop.
-    pending_clone_shares_mm: HashMap<Pid, bool>,
     next: u64,
 }
 
@@ -153,7 +149,6 @@ impl MappingCache {
         Self {
             entries: HashMap::new(),
             spaces: HashMap::from([(root, AddressSpaceId(0))]),
-            pending_clone_shares_mm: HashMap::new(),
             next: 1,
         }
     }
@@ -214,7 +209,6 @@ impl MappingCache {
     /// `pid` exited. Its cached pages stay valid for any sibling still sharing
     /// the mm, so they are dropped only once the last user is gone.
     fn forget(&mut self, pid: Pid) {
-        self.pending_clone_shares_mm.remove(&pid);
         let Some(space) = self.spaces.remove(&pid) else {
             return;
         };
@@ -223,31 +217,21 @@ impl MappingCache {
         }
     }
 
-    /// Record, at the clone-family syscall ENTRY stop, whether the child about
-    /// to be created will share the caller's address space.
+    /// Place a newly announced `child` in the right address space.
     ///
-    /// `flags` is `None` when they could not be recovered; that fails SAFE to
-    /// sharing, because over-eviction costs one re-read of `/proc/<pid>/maps`
-    /// while under-eviction leaves a stale trusted verdict a raw syscall can
-    /// hide behind.
-    ///
-    /// This lives here, rather than in the caller, so that the supervisor's
-    /// event handler carries NO decision of its own and both the production
-    /// path and the tests exercise this one implementation.
-    fn record_clone_intent(&mut self, pid: Pid, nr: u64, flags: Option<u64>) {
-        let shares = flags.is_none_or(|flags| clone_flags_share_mm(nr, flags));
-        self.pending_clone_shares_mm.insert(pid, shares);
-    }
-
-    /// Place a newly announced `child` in the right address space, consuming the
-    /// intent recorded at the clone entry. A missing intent (the entry stop was
-    /// never observed) fails SAFE to sharing, as above.
-    fn admit_child(&mut self, parent: Pid, child: Pid) {
-        let shares_mm = self.pending_clone_shares_mm.remove(&parent).unwrap_or(true);
-        if shares_mm {
-            self.share_address_space(parent, child);
-        } else {
-            self.new_address_space(child);
+    /// `shares_mm` is an OBSERVATION of the child that now exists -- see
+    /// `mm_sharing` -- not a prediction from the clone arguments. An earlier
+    /// revision read `CLONE_VM` out of the tracee's `clone_args` at the clone3
+    /// syscall-entry stop, which is before the kernel copies that buffer: a
+    /// concurrently runnable sibling thread could rewrite it in the window and
+    /// the recorded intent then disagreed with the child the kernel actually
+    /// made, in both directions. Demonstrated with a tracer that rewrites the
+    /// buffer after the entry read; `kcmp(KCMP_VM)` at this stop reported the
+    /// opposite of the entry value each time.
+    fn admit_child(&mut self, parent: Pid, child: Pid, shares_mm: MmSharing) {
+        match shares_mm {
+            MmSharing::Shared => self.share_address_space(parent, child),
+            MmSharing::Private => self.new_address_space(child),
         }
     }
 }
@@ -532,16 +516,6 @@ impl Supervisor {
                     .ok_or_else(|| anyhow!("invalid syscall RIP {:#x} in tracee {pid}", regs.rip))?
                     as usize;
                 let bytes = read_two_bytes(pid, site)?;
-                // Record mm-sharing NOW, while the clone flags are still in
-                // registers. The `PTRACE_EVENT_*` stop that announces the child
-                // reports only the event kind, which is chosen by the exit
-                // signal and cannot distinguish a `CLONE_VM` child from a
-                // private-mm one -- see `clone_flags_share_mm`.
-                if is_clone_family(regs.orig_rax) {
-                    let flags = clone_flags_at_entry(pid, &regs);
-                    self.mapping_cache
-                        .record_clone_intent(pid, regs.orig_rax, flags);
-                }
                 let fallback_ready = self.fallback_ready()?;
                 if pid != self.root {
                     tracing::trace!(
@@ -617,21 +591,12 @@ impl Supervisor {
             let child = Pid::from_raw(ptrace::getevent(pid)? as i32);
             self.tracees.insert(child);
             self.states.entry(child).or_default();
-            // Record whether the child SHARES the parent's address space, so a
-            // later mutation evicts every task that can observe it.
-            //
-            // This is decided by the CLONE_VM flag captured at the clone
-            // syscall entry, NOT by the event kind. The event kind is chosen by
-            // the exit signal, so `clone(CLONE_VM|SIGCHLD)` shares the mm and
-            // still arrives here as PTRACE_EVENT_FORK; keying off the event
-            // would hand that child a private address space and reopen the
-            // stale-classification bypass. See `clone_flags_share_mm`.
-            //
-            // The decision itself lives in `MappingCache::admit_child`, which is
-            // the same call the tests drive; this handler deliberately carries
-            // no branch of its own, so a mutation of the rule cannot pass the
-            // suite by hiding in un-exercised wiring.
-            self.mapping_cache.admit_child(pid, child);
+            // Ask the kernel whether the child it just made shares this mm.
+            // Both tasks are alive at THIS stop and nowhere later, which is the
+            // only window in which the question can be answered by observation
+            // rather than predicted from the clone arguments.
+            let shares_mm = mm_sharing(pid, child);
+            self.mapping_cache.admit_child(pid, child, shares_mm);
         } else if event == libc::PTRACE_EVENT_EXEC {
             // exec installs a brand-new mm and tears down the old one.
             self.mapping_cache.replace_address_space(pid);
@@ -832,47 +797,68 @@ fn mutates_address_space(nr: u64) -> bool {
     ADDRESS_SPACE_MUTATORS.contains(&nr)
 }
 
-/// True when `nr` creates a task, i.e. when a `PTRACE_EVENT_CLONE`/`_FORK`/
-/// `_VFORK` stop is about to announce a child.
-fn is_clone_family(nr: u64) -> bool {
-    nr == libc::SYS_clone as u64
-        || nr == libc::SYS_clone3 as u64
-        || nr == libc::SYS_fork as u64
-        || nr == libc::SYS_vfork as u64
+/// Whether two tasks share one address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MmSharing {
+    Shared,
+    Private,
 }
 
-/// Whether the child of this clone-family syscall will SHARE the caller's
-/// address space, decided from the clone flags themselves.
+/// `kcmp(2)`'s "compare address spaces" selector. `KCMP_FILE` is 0 and
+/// `KCMP_VM` is 1; getting that backwards silently compares file descriptor 0,
+/// which two related tasks almost always share, so every answer comes back
+/// "shared".
+const KCMP_VM: libc::c_int = 1;
+
+/// Ask the KERNEL whether `child` shares `parent`'s address space.
 ///
-/// The ptrace event kind cannot answer this. `kernel_clone()` picks
-/// `PTRACE_EVENT_VFORK` when `CLONE_VFORK` is set, `PTRACE_EVENT_CLONE` when
-/// `exit_signal != SIGCHLD`, and `PTRACE_EVENT_FORK` otherwise -- so the event
-/// is chosen by the *exit signal*, not by `CLONE_VM`. `clone(CLONE_VM|SIGCHLD)`
-/// therefore shares the caller's mm and is reported as `PTRACE_EVENT_FORK`.
-/// Measured on Linux 6.18.39 with a minimal `PTRACE_O_TRACE{CLONE,FORK,VFORK}`
-/// tracer:
+/// This is an observation of the tasks that now exist, taken at the
+/// `PTRACE_EVENT_*` stop where both are alive. It deliberately replaces the
+/// earlier approach of predicting the answer from clone arguments:
 ///
-/// ```text
-/// clone(SIGCHLD)                            -> PTRACE_EVENT_FORK   (private mm)
-/// clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND) -> PTRACE_EVENT_CLONE  (shared mm)
-/// clone(CLONE_VM|CLONE_VFORK|SIGCHLD)        -> PTRACE_EVENT_VFORK  (shared mm)
-/// clone(CLONE_VM|SIGCHLD)                    -> PTRACE_EVENT_FORK   (SHARED mm)
-/// ```
+///   * `clone(2)` carries its flags in a register, which a sibling cannot
+///     change while the caller is stopped -- that read was sound, and
+///   * `clone3(2)` carries them in a USER BUFFER that the kernel copies AFTER
+///     the syscall-entry stop. Sibling threads stay runnable across that stop,
+///     so the buffer can change in the window and the prediction can be wrong
+///     in either direction. Measured with a tracer that rewrites the buffer
+///     after the entry read: pre-copy flags said SHARED where the child was
+///     private, and said private where the child was SHARED.
 ///
-/// Keying mm-sharing off the event kind therefore misses that last shape, and a
-/// missed sharing case is exactly the stale-classification bypass the
-/// address-space cache exists to close. Read `CLONE_VM` instead: it is the fact,
-/// the event kind is only a correlate of it.
-fn clone_flags_share_mm(nr: u64, flags: u64) -> bool {
-    if nr == libc::SYS_fork as u64 {
-        // fork(2) is clone(SIGCHLD): never shares.
-        return false;
+/// Rather than keep two rules with different trust properties, every clone
+/// shape is now answered the same way, by the kernel, after the fact.
+///
+/// `kcmp` needs both tasks alive: called after either exits it fails with
+/// `ESRCH`. Any failure -- including a kernel built without
+/// `CONFIG_CHECKPOINT_RESTORE`, where the syscall is `ENOSYS` -- falls back to
+/// `Shared`, which over-evicts. Over-eviction costs one re-read of
+/// `/proc/<pid>/maps`; under-eviction leaves a stale trusted verdict that a raw
+/// syscall can hide behind.
+fn mm_sharing(parent: Pid, child: Pid) -> MmSharing {
+    // SAFETY: kcmp takes only scalars and returns a scalar.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            parent.as_raw() as libc::c_long,
+            child.as_raw() as libc::c_long,
+            KCMP_VM as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    interpret_kcmp_vm(result)
+}
+
+/// `kcmp` returns 0 when the two address spaces are the SAME, an ordering
+/// value (1/2/3) when they differ, and -1 on error. Split out so the mapping --
+/// including the fail-safe on error -- is testable without spawning tasks.
+fn interpret_kcmp_vm(result: libc::c_long) -> MmSharing {
+    match result {
+        0 => MmSharing::Shared,
+        r if r > 0 => MmSharing::Private,
+        // Errors fail SAFE: assume sharing rather than risk a stale verdict.
+        _ => MmSharing::Shared,
     }
-    if nr == libc::SYS_vfork as u64 {
-        // vfork(2) is clone(CLONE_VM|CLONE_VFORK|SIGCHLD): shares by definition.
-        return true;
-    }
-    flags & libc::CLONE_VM as u64 != 0
 }
 
 /// Kernel-supplied mappings whose raw syscall sites are causally identified as
@@ -938,47 +924,6 @@ fn classify_mapping(
         trusted: trusted_shared_object.is_some(),
         trusted_shared_object,
     }
-}
-
-/// Whether a `clone3` argument block can hold the flags word we read from it.
-///
-/// Split out of `clone_flags_at_entry` so the refusal is testable WITHOUT a live
-/// tracee. Inline, a missing guard is indistinguishable from a `ptrace::read`
-/// that failed for unrelated reasons -- both yield `None` -- so a test could not
-/// tell a present guard from an absent one.
-fn clone3_flags_readable(uargs: usize, size: u64) -> bool {
-    uargs != 0 && (size as usize) >= std::mem::size_of::<u64>()
-}
-
-/// The clone flags of the clone-family syscall stopped at its ENTRY, read from
-/// the registers (and, for `clone3`, from the `struct clone_args` they point
-/// at, whose first field is `__u64 flags`).
-///
-/// Returns `None` when the flags cannot be recovered; the caller must then fail
-/// SAFE by assuming the child SHARES the address space. Over-eviction only
-/// costs a re-read of `/proc/<pid>/maps`, whereas under-eviction leaves a stale
-/// trusted verdict that a raw syscall can hide behind.
-fn clone_flags_at_entry(pid: Pid, regs: &libc::user_regs_struct) -> Option<u64> {
-    let nr = regs.orig_rax;
-    if nr == libc::SYS_fork as u64 || nr == libc::SYS_vfork as u64 {
-        // No flags register; `clone_flags_share_mm` decides from `nr` alone.
-        return Some(0);
-    }
-    if nr == libc::SYS_clone as u64 {
-        // x86-64 clone(2): flags in the first argument register.
-        return Some(regs.rdi);
-    }
-    if nr == libc::SYS_clone3 as u64 {
-        // clone3(struct clone_args *uargs, size_t size); `flags` is at offset 0.
-        let uargs = regs.rdi as usize;
-        if !clone3_flags_readable(uargs, regs.rsi) {
-            return None;
-        }
-        return ptrace::read(pid, uargs as ptrace::AddressType)
-            .ok()
-            .map(|word| word as u64);
-    }
-    None
 }
 
 fn read_two_bytes(pid: Pid, address: usize) -> Result<[u8; 2], Error> {
@@ -1586,299 +1531,231 @@ mod tests {
         );
     }
 
-    /// Replay the supervisor's clone sequence THROUGH THE PRODUCTION CALLS.
-    ///
-    /// This is deliberately not a re-implementation of the rule: it makes the
-    /// same two calls, in the same order, that `handle_syscall_stop` and
-    /// `handle_ptrace_event` make -- `record_clone_intent` at the syscall entry
-    /// and `admit_child` at the event. An earlier revision of these tests
-    /// mirrored the decision locally instead, so mutating the production rule
-    /// left them green; that is why the decision now lives in `MappingCache`
-    /// and the supervisor's handler carries no branch.
-    fn clone_via_supervisor_path(
-        cache: &mut MappingCache,
-        parent: Pid,
-        child: Pid,
-        nr: u64,
-        flags: Option<u64>,
-    ) {
-        cache.record_clone_intent(parent, nr, flags);
-        cache.admit_child(parent, child);
-    }
-
-    /// The whole point of binding to `CLONE_VM` instead of the event kind.
-    ///
-    /// `clone(CLONE_VM|SIGCHLD)` shares the caller's mm but is reported as
-    /// `PTRACE_EVENT_FORK`, because `kernel_clone()` selects the event from the
-    /// exit signal. Deciding from the event would give this child a private
-    /// address space; deciding from the flag keeps it in the parent's.
-    #[test]
-    fn clone_vm_with_sigchld_shares_the_mm_although_it_reports_a_fork_event() {
-        const CLONE: u64 = libc::SYS_clone as u64;
-        let vm_sigchld = libc::CLONE_VM as u64 | libc::SIGCHLD as u64;
-
-        assert!(
-            clone_flags_share_mm(CLONE, vm_sigchld),
-            "CLONE_VM shares the address space no matter which exit signal, and \
-             therefore no matter which ptrace event kind, the kernel reports"
-        );
-        // The three shapes whose event kind would have answered correctly, so
-        // the new rule is not a regression for them.
-        assert!(clone_flags_share_mm(
-            CLONE,
-            libc::CLONE_VM as u64 | libc::CLONE_THREAD as u64 | libc::CLONE_SIGHAND as u64
-        ));
-        assert!(clone_flags_share_mm(
-            CLONE,
-            libc::CLONE_VM as u64 | libc::CLONE_VFORK as u64 | libc::SIGCHLD as u64
-        ));
-        assert!(!clone_flags_share_mm(CLONE, libc::SIGCHLD as u64));
-        // The flagless syscalls are decided by number alone.
-        assert!(!clone_flags_share_mm(libc::SYS_fork as u64, 0));
-        assert!(clone_flags_share_mm(libc::SYS_vfork as u64, 0));
-    }
-
-    /// The bypass itself, through the real decision: a `CLONE_VM|SIGCHLD` child
-    /// -- the shape a FORK-event rule would have split off -- must lose its
-    /// cached verdict when the parent mutates the shared mm. Without this, a raw
-    /// syscall at that page escapes both redirection and accounting.
-    #[test]
-    fn a_clone_vm_child_reported_as_fork_cannot_serve_a_stale_classification() {
-        const PAGE: usize = 0x5000;
-        let parent = Pid::from_raw(100);
-        let child = Pid::from_raw(101);
-        let mut cache = MappingCache::new(parent);
-
-        clone_via_supervisor_path(
-            &mut cache,
-            parent,
-            child,
-            libc::SYS_clone as u64,
-            Some(libc::CLONE_VM as u64 | libc::SIGCHLD as u64),
-        );
-
-        cache.insert(child, PAGE, trusted());
-        assert!(
-            cache.get(child, PAGE).is_some(),
-            "precondition: the child has a cached verdict, so the eviction is not vacuous"
-        );
-
-        cache.invalidate_address_space(parent);
-
-        assert!(
-            cache.get(child, PAGE).is_none(),
-            "a CLONE_VM child shares the mm the parent just mutated, however the \
-             ptrace event was reported, so its cached verdict must be dropped"
-        );
-    }
-
-    /// The matching control on the same path: a child from a clone WITHOUT
-    /// CLONE_VM keeps its cache, so binding to the flag did not collapse into
-    /// "always share".
-    #[test]
-    fn a_clone_without_clone_vm_keeps_its_own_address_space() {
-        const PAGE: usize = 0x6000;
-        let parent = Pid::from_raw(100);
-        let child = Pid::from_raw(101);
-        let mut cache = MappingCache::new(parent);
-
-        clone_via_supervisor_path(
-            &mut cache,
-            parent,
-            child,
-            libc::SYS_clone as u64,
-            Some(libc::SIGCHLD as u64),
-        );
-
-        cache.insert(child, PAGE, trusted());
-        cache.invalidate_address_space(parent);
-
-        assert!(
-            cache.get(child, PAGE).is_some(),
-            "without CLONE_VM the child has its own mm; the parent's mutation cannot reach it"
-        );
-    }
-
-    /// Unrecoverable clone flags must fail SAFE to sharing, and an event with no
-    /// recorded entry at all must do the same. Both are the direction that
-    /// over-evicts; the opposite default would hide a raw syscall behind a
-    /// stale verdict.
-    #[test]
-    fn an_undetermined_clone_fails_safe_to_sharing() {
-        const PAGE: usize = 0x7000;
-        for (label, recorded) in [
-            ("flags could not be read at the entry stop", true),
-            ("the entry stop was never observed", false),
-        ] {
-            let parent = Pid::from_raw(100);
-            let child = Pid::from_raw(101);
-            let mut cache = MappingCache::new(parent);
-
-            if recorded {
-                // `clone_flags_at_entry` returned None.
-                cache.record_clone_intent(parent, libc::SYS_clone as u64, None);
+    /// Fork a child of the requested shape, run `check` while it is alive, then
+    /// reap it. Real tasks, because the property under test is what the KERNEL
+    /// did -- a hand-built pid pair would test nothing.
+    fn with_child<F: FnOnce(Pid, Pid)>(share_mm: bool, check: F) {
+        const STACK: usize = 1 << 20;
+        let mut stack = vec![0u8; STACK];
+        let child = if share_mm {
+            // CLONE_VM|SIGCHLD: shares the mm AND is reported as
+            // PTRACE_EVENT_FORK, the shape that defeats an event-kind rule.
+            let top = unsafe { stack.as_mut_ptr().add(STACK) } as *mut libc::c_void;
+            extern "C" fn sleeper(_: *mut libc::c_void) -> libc::c_int {
+                unsafe { libc::pause() };
+                0
             }
-            cache.admit_child(parent, child);
+            unsafe {
+                libc::clone(
+                    sleeper,
+                    top,
+                    libc::CLONE_VM | libc::SIGCHLD,
+                    std::ptr::null_mut(),
+                )
+            }
+        } else {
+            match unsafe { libc::fork() } {
+                0 => unsafe {
+                    libc::pause();
+                    libc::_exit(0)
+                },
+                pid => pid,
+            }
+        };
+        assert!(child > 0, "failed to create the {share_mm} child");
+        let parent = Pid::from_raw(unsafe { libc::getpid() });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(parent, Pid::from_raw(child))
+        }));
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), libc::__WALL);
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// The oracle itself, against real tasks, both ways.
+    ///
+    /// This is the whole reason the clone arguments are no longer consulted: a
+    /// `CLONE_VM` child is reported as `PTRACE_EVENT_FORK` when its exit signal
+    /// is `SIGCHLD`, so the event kind cannot tell these two apart -- but the
+    /// kernel can, and does.
+    #[test]
+    fn the_kernel_distinguishes_a_shared_mm_from_a_private_one() {
+        with_child(true, |parent, child| {
+            assert_eq!(
+                mm_sharing(parent, child),
+                MmSharing::Shared,
+                "a CLONE_VM child shares the caller's address space"
+            );
+        });
+        with_child(false, |parent, child| {
+            assert_eq!(
+                mm_sharing(parent, child),
+                MmSharing::Private,
+                "a forked child gets its own address space"
+            );
+        });
+    }
+
+    /// A `CLONE_VM` child must lose a cached verdict when the parent mutates the
+    /// shared mm -- driven end to end from the real child through the real
+    /// oracle into the real cache, with no hand-supplied sharing answer.
+    #[test]
+    fn a_clone_vm_child_cannot_serve_a_stale_classification() {
+        const PAGE: usize = 0x5000;
+        with_child(true, |parent, child| {
+            let mut cache = MappingCache::new(parent);
+            cache.admit_child(parent, child, mm_sharing(parent, child));
+
+            cache.insert(child, PAGE, trusted());
+            assert!(
+                cache.get(child, PAGE).is_some(),
+                "precondition: the child has a cached verdict, so the eviction is not vacuous"
+            );
+
+            cache.invalidate_address_space(parent);
+
+            assert!(
+                cache.get(child, PAGE).is_none(),
+                "the child shares the mm the parent just mutated, so its cached \
+                 verdict must be dropped"
+            );
+        });
+    }
+
+    /// The control on the same end-to-end path: a child with its OWN mm keeps
+    /// its cache, so the oracle did not collapse into "always share".
+    #[test]
+    fn a_private_mm_child_keeps_its_own_address_space() {
+        const PAGE: usize = 0x6000;
+        with_child(false, |parent, child| {
+            let mut cache = MappingCache::new(parent);
+            cache.admit_child(parent, child, mm_sharing(parent, child));
 
             cache.insert(child, PAGE, trusted());
             cache.invalidate_address_space(parent);
 
             assert!(
-                cache.get(child, PAGE).is_none(),
-                "{label}: an undetermined clone must be treated as SHARING, so the \
-                 child's verdict is dropped with the parent's"
+                cache.get(child, PAGE).is_some(),
+                "a private mm cannot be reached by the parent's mutation"
+            );
+        });
+    }
+
+    /// `clone3(2)` specifically, with the buffer CLOBBERED after the call --
+    /// the regression test for the race that motivated this design.
+    ///
+    /// `clone3` passes its flags in a user buffer that the kernel copies after
+    /// the syscall-entry ptrace stop, so any implementation that reads that
+    /// buffer is reading something a concurrently runnable sibling can still
+    /// change. Here the parent overwrites `flags` immediately after the call,
+    /// which is what such a sibling would do: a buffer-reading implementation
+    /// then sees `0` and concludes "private", while the child the kernel
+    /// actually created shares the mm. The kernel oracle is unaffected because
+    /// it inspects the child, not the request.
+    #[test]
+    fn clone3_sharing_is_read_from_the_child_not_from_a_clobberable_buffer() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct CloneArgs {
+            flags: u64,
+            pidfd: u64,
+            child_tid: u64,
+            parent_tid: u64,
+            exit_signal: u64,
+            stack: u64,
+            stack_size: u64,
+            tls: u64,
+        }
+        const STACK: usize = 1 << 20;
+        let mut stack = vec![0u8; STACK];
+        let mut args = CloneArgs {
+            flags: libc::CLONE_VM as u64,
+            exit_signal: libc::SIGCHLD as u64,
+            stack: stack.as_mut_ptr() as u64,
+            stack_size: STACK as u64,
+            ..Default::default()
+        };
+        let child = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                &mut args as *mut CloneArgs,
+                std::mem::size_of::<CloneArgs>(),
+            )
+        };
+        if child == 0 {
+            // In the child, on the supplied stack: do nothing that could unwind.
+            unsafe {
+                libc::pause();
+                libc::_exit(0)
+            };
+        }
+        assert!(
+            child > 0,
+            "clone3 failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // The racing write. Any implementation that consults the request rather
+        // than the child now has CLONE_VM erased under it.
+        args.flags = 0;
+        assert_eq!(
+            args.flags & libc::CLONE_VM as u64,
+            0,
+            "the request now reads private"
+        );
+
+        let parent = Pid::from_raw(unsafe { libc::getpid() });
+        let child = Pid::from_raw(child as i32);
+        let observed = mm_sharing(parent, child);
+
+        unsafe {
+            libc::kill(child.as_raw(), libc::SIGKILL);
+            libc::waitpid(child.as_raw(), std::ptr::null_mut(), libc::__WALL);
+        }
+
+        assert_eq!(
+            observed,
+            MmSharing::Shared,
+            "the child shares the mm; reading the clobbered request would have said private"
+        );
+    }
+
+    /// The kcmp result mapping, including the fail-safe. A dead task, a kernel
+    /// without CONFIG_CHECKPOINT_RESTORE, or any other error must resolve to
+    /// SHARED: over-eviction costs a `/proc/<pid>/maps` re-read, under-eviction
+    /// leaves a stale verdict a raw syscall can hide behind.
+    #[test]
+    fn an_unanswerable_kcmp_fails_safe_to_shared() {
+        assert_eq!(interpret_kcmp_vm(0), MmSharing::Shared, "0 means same mm");
+        for ordered in [1, 2, 3] {
+            assert_eq!(
+                interpret_kcmp_vm(ordered),
+                MmSharing::Private,
+                "a nonzero ordering value means the address spaces differ"
             );
         }
-    }
-
-    /// One clone's intent must not leak into the next event. A clone that fails
-    /// raises no event, so its recorded intent has to be overwritten by the next
-    /// clone rather than consumed by it.
-    #[test]
-    fn a_stale_clone_intent_does_not_decide_a_later_child() {
-        const PAGE: usize = 0x7100;
-        let parent = Pid::from_raw(100);
-        let child = Pid::from_raw(101);
-        let mut cache = MappingCache::new(parent);
-
-        // A CLONE_VM clone that never produced an event (it failed).
-        cache.record_clone_intent(
-            parent,
-            libc::SYS_clone as u64,
-            Some(libc::CLONE_VM as u64 | libc::SIGCHLD as u64),
-        );
-        // The next clone genuinely has no CLONE_VM; its own intent must win.
-        clone_via_supervisor_path(
-            &mut cache,
-            parent,
-            child,
-            libc::SYS_clone as u64,
-            Some(libc::SIGCHLD as u64),
-        );
-
-        cache.insert(child, PAGE, trusted());
-        cache.invalidate_address_space(parent);
-
-        assert!(
-            cache.get(child, PAGE).is_some(),
-            "the second clone's own flags decide its child, not the abandoned intent \
-             left by a clone that raised no event"
-        );
-    }
-
-    /// A tracee that exits with an unconsumed intent must not leave it behind
-    /// for a later tracee that reuses the pid. `forget` clears it, so the next
-    /// task starts from the safe default rather than from a dead task's flags.
-    #[test]
-    fn an_exiting_tracee_does_not_leave_its_clone_intent_behind() {
-        const PAGE: usize = 0x7200;
-        let pid = Pid::from_raw(100);
-        let child = Pid::from_raw(101);
-        let mut cache = MappingCache::new(pid);
-
-        // A no-CLONE_VM intent that never produced an event before the tracee died.
-        cache.record_clone_intent(pid, libc::SYS_clone as u64, Some(libc::SIGCHLD as u64));
-        cache.forget(pid);
-
-        // The pid is live again and clones without our seeing the entry stop.
-        cache.admit_child(pid, child);
-        cache.insert(child, PAGE, trusted());
-        cache.invalidate_address_space(pid);
-
-        assert!(
-            cache.get(child, PAGE).is_none(),
-            "a dead tracee's leftover split intent must not decide a later child;              an unobserved clone falls back to SHARING"
-        );
-    }
-
-    /// The gate that decides whether an intent is recorded at all: miss a
-    /// clone-family number here and the child silently falls back to the
-    /// share-by-default path.
-    #[test]
-    fn clone_family_gate_covers_every_task_creating_syscall() {
-        for nr in [
-            libc::SYS_clone as u64,
-            libc::SYS_clone3 as u64,
-            libc::SYS_fork as u64,
-            libc::SYS_vfork as u64,
-        ] {
-            assert!(is_clone_family(nr), "syscall {nr} creates a task");
-        }
-        for nr in [
-            libc::SYS_mmap as u64,
-            libc::SYS_execve as u64,
-            libc::SYS_exit as u64,
-            libc::SYS_write as u64,
-        ] {
-            assert!(!is_clone_family(nr), "syscall {nr} creates no task");
-        }
-    }
-
-    /// Register decoding for the paths that need no live tracee: `clone(2)`
-    /// carries its flags in `rdi`, `fork`/`vfork` carry none, and a `clone3`
-    /// whose `struct clone_args` cannot hold a flags word is refused rather
-    /// than read.
-    #[test]
-    fn clone_flags_are_decoded_from_the_entry_registers() {
-        let pid = Pid::from_raw(1);
-        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-
-        regs.orig_rax = libc::SYS_clone as u64;
-        regs.rdi = libc::CLONE_VM as u64 | libc::SIGCHLD as u64;
         assert_eq!(
-            clone_flags_at_entry(pid, &regs),
-            Some(libc::CLONE_VM as u64 | libc::SIGCHLD as u64),
-            "clone(2) flags live in rdi"
+            interpret_kcmp_vm(-1),
+            MmSharing::Shared,
+            "an error must fail safe to sharing, never to private"
         );
-
-        regs.orig_rax = libc::SYS_fork as u64;
-        regs.rdi = 0xdead_beef;
-        assert_eq!(
-            clone_flags_at_entry(pid, &regs),
-            Some(0),
-            "fork carries no flags register; rdi must not be mistaken for one"
-        );
-
-        regs.orig_rax = libc::SYS_vfork as u64;
-        assert_eq!(clone_flags_at_entry(pid, &regs), Some(0));
-
-        // clone3 with a null or too-small clone_args is refused before any
-        // guest memory is touched, so the caller fails safe to sharing.
-        regs.orig_rax = libc::SYS_clone3 as u64;
-        regs.rdi = 0;
-        regs.rsi = 64;
-        assert_eq!(clone_flags_at_entry(pid, &regs), None);
-        regs.rdi = 0x1000;
-        regs.rsi = 4;
-        assert_eq!(clone_flags_at_entry(pid, &regs), None);
     }
 
-    /// The `clone3` guard, tested directly.
-    ///
-    /// Asserting only that `clone_flags_at_entry` returns `None` cannot pin this
-    /// down: with the guard removed the call falls through to a `ptrace::read`
-    /// that also fails, so the observable result is the same either way. A
-    /// mutation-test of the guard survives that assertion and dies against this
-    /// one.
+    /// And the same fail-safe through the live path: asking about a pid that
+    /// cannot be compared must not report `Private`.
     #[test]
-    fn clone3_refuses_an_argument_block_that_cannot_hold_the_flags() {
-        assert!(
-            clone3_flags_readable(0x1000, std::mem::size_of::<u64>() as u64),
-            "a block at least a flags-word long is readable"
+    fn mm_sharing_of_an_unavailable_task_fails_safe_to_shared() {
+        // A pid that is not ours to inspect; kcmp refuses rather than answering.
+        let parent = Pid::from_raw(unsafe { libc::getpid() });
+        assert_eq!(
+            mm_sharing(parent, Pid::from_raw(-1)),
+            MmSharing::Shared,
+            "an unanswerable comparison must over-evict, not under-evict"
         );
-        assert!(
-            clone3_flags_readable(0x1000, 88),
-            "the usual full clone_args"
-        );
-        assert!(
-            !clone3_flags_readable(0, 88),
-            "a null clone_args pointer must be refused, not dereferenced"
-        );
-        assert!(
-            !clone3_flags_readable(0x1000, 4),
-            "a block too short to contain the flags word must be refused"
-        );
-        assert!(!clone3_flags_readable(0x1000, 0));
     }
 
     /// fork does NOT share the mm, so a forked child must not be evicted by its
