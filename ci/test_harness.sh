@@ -716,9 +716,10 @@ EOF
     grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
         die "merge-gate must run the canonical live-query checker on the exact PR head"
 
-    # The trusted target resolver is the only identity authority for this job.
-    # Exercise its positive and negative brackets with a PATH that provably
-    # lacks gh, then reject workflow drift that reintroduces the executable.
+    # Bootstrap the future trusted resolver and production loader without
+    # cutting the workflow over in this PR. The executable test calls the real
+    # loader for both the canonical helper and a planted altered-helper refusal,
+    # under a PATH that provably lacks gh.
     (
         local node_bin isolated_node_path
         node_bin=$(command -v node)
@@ -732,22 +733,12 @@ EOF
             "$node_bin" "$ROOT_DIR/ci/test-resolve-reverie-pin-targets.cjs"
     )
 
-    local reverie_pin_job
-    reverie_pin_job=$(sed -n '/^  reverie-pin:/,/^  merge-gate:/p' "$merge_workflow")
-    ! grep -Eq '(^|[[:space:]])gh([[:space:]]|$)' <<<"$reverie_pin_job" ||
-        die "reverie-pin merge-gate job must not depend on the gh executable"
-    [[ $(grep -Fxc '        uses: actions/github-script@v7' <<<"$reverie_pin_job") == 1 ]] ||
-        die "reverie-pin job must use one authenticated GitHub-script resolver"
-    grep -Fq 'resolver-source/ci/resolve-reverie-pin-targets.cjs' <<<"$reverie_pin_job" ||
-        die "reverie-pin job must load the exact resolver source as data"
     local resolver_digest
     resolver_digest=$(sha256sum "$ROOT_DIR/ci/resolve-reverie-pin-targets.cjs" | cut -d' ' -f1)
-    grep -Fq "const expectedDigest = '$resolver_digest';" <<<"$reverie_pin_job" ||
-        die "reverie-pin workflow must bind the exact resolver source digest"
-    grep -Fq 'loaded._compile(source, resolverPath);' <<<"$reverie_pin_job" ||
-        die "reverie-pin workflow must execute the same resolver bytes it hashed"
-    grep -Fq "done < <(jq -r '.[] | [.number, .headSha] | @tsv'" <<<"$reverie_pin_job" ||
-        die "reverie-pin job must inspect every resolver-bound exact head"
+    grep -Fq "  '$resolver_digest';" "$ROOT_DIR/ci/load-reverie-pin-targets.cjs" ||
+        die "production loader must bind the exact resolver source digest"
+    ! grep -Fq 'resolve-reverie-pin-targets' "$merge_workflow" ||
+        die "bootstrap PR must not execute the not-yet-trusted resolver from the workflow"
 }
 
 function dag_critical_path_seconds {
