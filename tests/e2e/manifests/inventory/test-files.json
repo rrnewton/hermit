@@ -1856,12 +1856,6 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/e2e/language-runtimes/python-hashseed.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
-      "why": "tests/e2e/language-runtimes/python-hashseed.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/python-io-subprocess-time.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
       "why": "tests/e2e/language-runtimes/python-io-subprocess-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Python file I/O, subprocess capture, hashing, and virtual time under strict verification"
@@ -2911,6 +2905,24 @@
       "why": "tests/backend-parity/fixtures/fadvise_hints.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/append_pwrite.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/append_pwrite.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/pipe_ipc.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/pipe_ipc.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/poll_readiness.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/poll_readiness.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/sendfile_copy.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -2923,16 +2935,10 @@
       "why": "tests/e2e/data-handling/sqlite-query-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
-      "path": "tests/backend-parity/fixtures/poll_readiness.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/poll_readiness.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/append_pwrite.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/append_pwrite.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "path": "tests/e2e/language-runtimes/python-hashseed.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/python-hashseed.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     }
   ],
   "schema": 2
