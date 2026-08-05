@@ -1288,10 +1288,15 @@ impl GlobalState {
             // asynchronous backend (e.g. DBI, where the child self-registers
             // outside a scheduler turn) resolving the side now would consume the
             // PRNG draw in host RPC order. `admit_to_run_queue` resolves the
-            // intent at a deterministic point -- immediately under ptrace
-            // (post-commit, in schedule order, unchanged), or at the
-            // `DetTid`-ordered drain if this handler raced the daemon's
-            // tentative-pop window. When threads are not sequentialized, or the
+            // intent at the step2 drain -- which under ptrace is post-commit, in
+            // schedule order, unchanged. Read its "What this does and does not
+            // make deterministic" section before relying on that word: the drain
+            // is a deterministic *point* and resolution within one drain is
+            // `DetTid`-ordered, but on an asynchronous backend which drain a
+            // given admission lands in is not itself schedule-determined unless
+            // that admission is anchored (ordinary clone is, via the parent's
+            // `ParentContinue`; vfork is, via `step2a`'s barrier). When threads
+            // are not sequentialized, or the
             // parent is already kernel-blocked (vfork), the child takes the tail
             // and no PRNG is consumed.
             let intent = if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {

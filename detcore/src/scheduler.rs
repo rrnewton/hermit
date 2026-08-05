@@ -1602,6 +1602,15 @@ impl Scheduler {
         // tentative-safe buffer rather than pushing directly. Under ptrace this
         // runs post-commit and admits immediately, unchanged.
         //
+        // KNOWN LIMITATION, deliberately recorded at the site rather than only
+        // in the general doc: this is the one admission that is NOT anchored to
+        // the deterministic schedule. Unlike ordinary clone (causally gated by
+        // the parent's `ParentContinue`) and vfork (barriered on `step2a`), the
+        // replacement leader carries no originating-turn tag and no barrier, so
+        // on an asynchronous backend whether it joins this turn's drain or the
+        // next is host mutex timing. See `admit_to_run_queue` for the anchors
+        // that would close it.
+        //
         // The *removals* in this handler (`logically_kill_thread` ->
         // `run_queue.remove_tid`, for the exec caller and its siblings, above
         // and below) are likewise tentative-safe: `logically_kill_thread` now
@@ -3205,28 +3214,44 @@ impl Scheduler {
     /// selection sequence and the same one-draw-per-fork PRNG order as an
     /// immediate push.
     ///
-    /// **Asynchronous backends (DBI): the order *within* a drain is canonical,
-    /// but *which* drain an admission lands in is still host-timed.** A child
-    /// that self-registers outside a scheduler turn (see the `CreateChildThread`
-    /// handler) records its intent whenever its backend worker wins the scheduler
-    /// mutex. Winning just before `step2` takes the lock puts it in this turn's
-    /// drain; just after puts it in the next one. Nothing carries an originating
-    /// committed turn, and a `BTreeMap` only canonicalizes items already in the
-    /// same snapshot — so two admissions can still be split across adjacent
-    /// drains differently across otherwise-identical runs, changing both the
-    /// resulting queue order and, under `RunsPostFork::Random`, which draw each
-    /// child receives.
+    /// **Asynchronous backends: the order *within* a drain is always canonical;
+    /// *which* drain an admission lands in is anchored for two of the three
+    /// admission sites and not for the third.** A handler that runs off-turn
+    /// records its intent whenever its backend worker wins the scheduler mutex,
+    /// so winning just before `step2` takes the lock puts it in this turn's
+    /// drain and just after puts it in the next one. A `BTreeMap` only
+    /// canonicalizes items already in the same snapshot, so wherever that split
+    /// is host-timed it changes the resulting queue order and, under
+    /// `RunsPostFork::Random`, which draw each child receives. Per site:
     ///
-    /// Deferral is therefore a strict improvement over pushing directly — it
-    /// removes the arbitrary interleaving of concurrent pushes and the
-    /// host-RPC-ordered PRNG draw — but it does **not** make async admission a
-    /// pure function of deterministic scheduler state, and this comment
-    /// previously claimed that it did. Closing the residue needs an anchor the
-    /// deterministic schedule owns: either an originating committed turn carried
-    /// on the intent and drained only once that turn has committed, or a
-    /// child-registration barrier of the kind `vfork_barriers` /
-    /// `step2a_wait_for_vfork_barrier` already implements for `vfork`,
-    /// generalized to ordinary clone on backends that defer child registration.
+    /// * **Ordinary clone — anchored, causally.** `CreateChildThread` issues the
+    ///   parent's `ParentContinue` request only *after* buffering the child's
+    ///   admission, so no thread can run between the two and the admission
+    ///   cannot straddle a drain boundary.
+    /// * **`vfork` — anchored, by barrier.** `vfork_barriers` /
+    ///   [`Scheduler::step2a_wait_for_vfork_barrier`] hold the parent until the
+    ///   child has registered, which fixes the drain.
+    /// * **Multi-threaded exec reconnect — NOT anchored.** The replacement
+    ///   leader is buffered from the reconnect handler (see the
+    ///   `admit_to_run_queue` call in
+    ///   [`Scheduler::reconnect_after_exec`]) with no originating-turn tag, no
+    ///   drain-generation stamp, and no barrier. If the handler takes the mutex
+    ///   before `step2` the new leader joins that turn's drain; if after, another
+    ///   runnable thread executes first. This one really can differ across
+    ///   otherwise-identical runs.
+    ///
+    /// So deferral is a strict improvement over pushing directly — it removes
+    /// the arbitrary interleaving of concurrent pushes and the host-RPC-ordered
+    /// PRNG draw, and it makes clone and vfork exact — but it does **not** make
+    /// *every* async admission a pure function of deterministic scheduler state,
+    /// and an earlier revision of this comment claimed that it did. The exec
+    /// reconnect residue is a known limitation, not a solved case. Closing it
+    /// needs an anchor the deterministic schedule owns: an originating committed
+    /// turn carried on the intent and drained only once that turn has committed,
+    /// or a registration barrier of the kind `vfork_barriers` /
+    /// `step2a_wait_for_vfork_barrier` already implements for `vfork`, plus a
+    /// test that forces the handler to both sides of `step2` and shows identical
+    /// drain membership either way.
     pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, intent: AdmitIntent) {
         let prev = self.pending_run_queue_admissions.insert(dtid, intent);
         debug_assert!(
@@ -3237,9 +3262,18 @@ impl Scheduler {
     }
 
     /// Resolve an [`AdmitIntent`] to a concrete [`AdmitSide`], consuming the
-    /// post-fork PRNG draw for `RunsPostFork::Random`. Called at the point of
-    /// admission (immediate or drain) so the draw's ordering is a function of
-    /// deterministic scheduler state, never of host RPC / lock timing.
+    /// post-fork PRNG draw for `RunsPostFork::Random`.
+    ///
+    /// Called at the drain rather than in the handler, so the draw is never
+    /// consumed in host *RPC arrival* order, and the draws taken within one
+    /// drain follow canonical `DetTid` order. That is the whole of the
+    /// improvement, and it is less than "never host-timed": the draw a given
+    /// child receives also depends on *which* drain resolves it, and for an
+    /// admission that is not anchored to the deterministic schedule that
+    /// membership is still host-timed. See
+    /// [`Scheduler::admit_to_run_queue`] for which admissions are anchored
+    /// (ordinary clone and vfork) and which is not (exec reconnect), and do not
+    /// read this function as making the draw order schedule-pure on its own.
     fn resolve_admit_intent(&mut self, intent: AdmitIntent) -> AdmitSide {
         match intent {
             AdmitIntent::Fixed(side) => side,
