@@ -292,7 +292,7 @@ fn build_liteinst_runtime(
     // canonical Reverie rev; drift here is caught by scripts/check-reverie-pin.rs
     // (hook + validate.sh + CI). This was stale at `d973a85` after the pin
     // advanced to 79517704….
-    let target = build_root.join("liteinst-runtime-7951770");
+    let target = build_root.join("liteinst-runtime-55f6876");
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
