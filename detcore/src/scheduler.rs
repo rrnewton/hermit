@@ -1034,42 +1034,15 @@ pub async fn do_a_turn_blocking(
     // sufficient here because the thread cannot be racing with us to exit since we know
     // it is *already* parked.
     let mut mg = sched.lock().unwrap();
-    if !mg.next_turns.contains_key(&next_dtid) {
-        info!(
-            "[sched-daemon] thread {} exited, skipping over...",
-            &next_dtid
-        );
-        // Same tentative-pop hygiene as the `ThreadExited` arm above: the thread
-        // parked (its request resolved `Ok`), but its `next_turns` entry vanished
-        // before we re-acquired the lock, so steps 4-6 -- which would commit the
-        // tentative pop -- are skipped. Undo the still-open selection so the next
-        // pass's step2 removal drain does not hit the `remove_tid` guard.
-        mg.run_queue.undo_tentative_pop();
-        // ...and report the turn as SKIPPED, exactly like that arm, because this
-        // branch commits nothing: steps 4-7 are bypassed, so no resource is
-        // blocked, no guest is unblocked, and nothing is re-enqueued.
-        //
-        // Falling through to `Ok(rsrcs)` used to tell the next pass that a turn
-        // had completed. `bump_global_time` suppresses its advance only when
-        // `last_turn.is_err()` ("if the last turn was a skip, it shouldn't really
-        // have time-bumped"), so a non-committing turn reported as `Ok` advanced
-        // scheduler virtual time -- a DETLOG-visible tick -- for work that never
-        // happened. Worse, reaching this branch at all depends on whether
-        // teardown cleared `next_turns` during the host-timed window between
-        // `req.get().await` resolving and re-acquiring the lock above, so the
-        // same logical execution could gain that tick in one run and not the
-        // next. Reporting `SkipTurn` keeps virtual time a function of committed
-        // turns only.
-        return Err(SkipTurn);
-    } else {
-        // The logical COMMIT point for the turn is during step4:
-        mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
-        mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-        mg.step6_reenquue(next_dtid, sched_yield);
-        if let Some(call) = rsrcs.as_exit_syscall() {
-            mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
-        }
+    mg.abort_turn_if_thread_vanished(next_dtid)?;
+
+    // The logical COMMIT point for the turn is during step4:
+    mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
+    mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
+    let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+    mg.step6_reenquue(next_dtid, sched_yield);
+    if let Some(call) = rsrcs.as_exit_syscall() {
+        mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
     }
     Ok(rsrcs)
 }
@@ -2506,6 +2479,38 @@ impl Scheduler {
             dettid, &self.run_queue
         );
         self.skip_turn()
+    }
+
+    /// Post-await re-check: the selected thread parked (its request resolved
+    /// `Ok`), but did its `next_turns` entry survive until the daemon got the
+    /// lock back? If not, the turn must be abandoned.
+    ///
+    /// Returns `Err(SkipTurn)` for the abandoned case, after closing the
+    /// tentative window `step3_peek` opened. Two things hang on that `Err`:
+    ///
+    /// * The tentative pop is undone rather than committed, so the selection
+    ///   does not outlive the turn and the next pass's step2 removal drain does
+    ///   not call `remove_tid` against a live `tentative_selection` (the same
+    ///   hygiene the `Err(ThreadExited)` arm needs).
+    /// * The caller reports a SKIP, not a completed turn. This branch bypasses
+    ///   steps 4-7, so nothing is blocked, unblocked or re-enqueued -- yet
+    ///   `bump_global_time` suppresses its advance only on `last_turn.is_err()`
+    ///   ("if the last turn was a skip, it shouldn't really have time-bumped").
+    ///   Reporting `Ok` here therefore added a DETLOG-visible virtual-time tick
+    ///   for work that never happened, and whether this branch is reached at all
+    ///   depends on whether teardown cleared `next_turns` inside the host-timed
+    ///   gap between the await resolving and the re-lock -- so the same logical
+    ///   execution could gain that tick in one run and not the next.
+    fn abort_turn_if_thread_vanished(&mut self, next_dtid: DetTid) -> Result<(), SkipTurn> {
+        if self.next_turns.contains_key(&next_dtid) {
+            return Ok(());
+        }
+        info!(
+            "[sched-daemon] thread {} exited, skipping over...",
+            &next_dtid
+        );
+        self.run_queue.undo_tentative_pop();
+        Err(SkipTurn)
     }
 
     /// Simply advance the turn. This does NOT remove any threads from the
@@ -3956,78 +3961,85 @@ mod test {
         }
     }
 
-    /// F8 (non-committing fizzle must not advance virtual time). The sibling of
-    /// F6, for the *other* fizzle arm: `req.get()` resolved `Ok`, but the
-    /// thread's `next_turns` entry vanished before the daemon re-acquired the
-    /// lock, so steps 4-7 are skipped and nothing commits.
+    /// F8 (non-committing fizzle), part 1: the branch itself, both ways.
     ///
-    /// That arm used to fall through to `Ok(rsrcs)`. `bump_global_time`
-    /// suppresses its advance only on `last_turn.is_err()`, so reporting success
-    /// for a turn that committed nothing advanced scheduler virtual time by a
-    /// DETLOG-visible tick. Reaching the arm at all depends on whether teardown
-    /// clears `next_turns` inside the host-timed window between the await
-    /// resolving and the re-lock, so the same logical execution could gain that
-    /// tick in one run and not the next.
-    ///
-    /// The race is constructed deterministically rather than hoped for: the test
-    /// waits until `tentative_pop_in_progress()` reads true under its OWN lock --
-    /// which means `step3_peek` has run and released the lock -- and removes the
-    /// `next_turns` entry while still holding that lock, so the daemon cannot
-    /// have passed the re-lock check yet and always observes the entry gone.
-    #[tokio::test]
-    async fn noncommitting_fizzle_reports_skipturn_rather_than_a_completed_turn() {
+    /// NEGATIVE -- the defect. A selected thread whose `next_turns` entry
+    /// vanished during the daemon's post-await window must abandon the turn:
+    /// report `SkipTurn` (it commits nothing -- steps 4-7 are bypassed) AND
+    /// close the tentative window `step3_peek` opened. Before the fix this
+    /// branch fell through to `Ok(rsrcs)`, which `bump_global_time` reads as a
+    /// completed turn and answers with a virtual-time advance.
+    /// POSITIVE -- not inert. A thread that is still registered proceeds: `Ok`,
+    /// with its tentative selection left open for step4 to commit. Without this
+    /// side an `abort_turn_if_thread_vanished` that simply always skipped would
+    /// pass the negative and silently stall the scheduler.
+    #[test]
+    fn a_vanished_thread_aborts_its_turn_and_a_live_one_does_not() {
         let config = Config::default();
-        let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
-        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let vanishing = DetTid::from_raw(11);
-        {
-            let mut s = sched.lock().unwrap();
-            s.priorities.insert(vanishing, DEFAULT_PRIORITY);
-            s.next_turns.insert(
-                vanishing,
-                ThreadNextTurn {
-                    dettid: vanishing,
-                    child_tid_addr: 0,
-                    // Resolved `Ok`: the thread really did park. That is what
-                    // separates this arm from F6's `Err(ThreadExited)`.
-                    req: Ivar::full(Ok(Resources::new(vanishing))),
-                    resp: Ivar::new(),
-                },
-            );
-            s.runqueue_push_back(vanishing);
-        }
+        let live = DetTid::from_raw(13);
 
-        let turn = tokio::spawn({
-            let sched = sched.clone();
-            let global_time = global_time.clone();
-            async move { do_a_turn_blocking(sched, global_time, &Err(SkipTurn)).await }
-        });
+        let mut sched = Scheduler::new(&config);
+        register_known_thread(&mut sched, vanishing);
+        register_known_thread(&mut sched, live);
+        sched.runqueue_push_back(vanishing);
+        sched.runqueue_push_back(live);
 
-        loop {
-            {
-                let mut s = sched.lock().unwrap();
-                if s.run_queue.tentative_pop_in_progress() {
-                    s.next_turns.remove(&vanishing);
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-
-        let result = turn.await.expect("scheduler turn task panicked");
+        // NEGATIVE: retire `vanishing` after its selection was tentatively
+        // popped, exactly as teardown does inside the post-await window.
+        assert_eq!(
+            sched.run_queue.tentative_pop_tid(vanishing),
+            Some(vanishing)
+        );
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        sched.next_turns.remove(&vanishing);
         assert!(
-            result.is_err(),
-            "a turn that skipped steps 4-7 must report SkipTurn, not success"
+            sched.abort_turn_if_thread_vanished(vanishing).is_err(),
+            "a turn that bypasses steps 4-7 must report SkipTurn, never success: \
+             reporting Ok lets bump_global_time advance virtual time for a turn \
+             that committed nothing"
         );
         assert!(
-            !sched.lock().unwrap().run_queue.tentative_pop_in_progress(),
-            "the non-committing arm must also close its tentative window"
+            !sched.run_queue.tentative_pop_in_progress(),
+            "the abandoned turn must also close its tentative window"
+        );
+
+        // POSITIVE: a still-registered thread is untouched and proceeds to
+        // step4 with its selection still open to commit.
+        assert_eq!(sched.run_queue.tentative_pop_tid(live), Some(live));
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        assert!(
+            sched.abort_turn_if_thread_vanished(live).is_ok(),
+            "a live thread's turn must proceed"
+        );
+        assert!(
+            sched.run_queue.tentative_pop_in_progress(),
+            "a proceeding turn must keep its tentative selection open for step4"
         );
     }
 
-    /// Both sides of the consequence F8 exists to prevent, stated directly
-    /// against `bump_global_time` -- the code that turns the returned `Result`
-    /// into a virtual-time decision.
+    /// F8 (non-committing fizzle must not advance virtual time): both sides of
+    /// the consequence, stated directly against `bump_global_time` -- the code
+    /// that turns a turn's returned `Result` into a virtual-time decision.
+    ///
+    /// The defect: the fizzle arm where `req.get()` resolved `Ok` but the
+    /// thread's `next_turns` entry vanished before the daemon re-acquired the
+    /// lock skips steps 4-7, commits nothing, and used to fall through to
+    /// `Ok(rsrcs)` -- landing in the advancing branch below and adding a
+    /// DETLOG-visible tick for work that never happened. It now reports
+    /// `Err(SkipTurn)` like its `ThreadExited` sibling, so this pair of
+    /// assertions is what that fix buys.
+    ///
+    /// Deliberately NOT an end-to-end test of that arm. Reaching it requires
+    /// teardown to clear `next_turns` inside the host-scheduling gap between the
+    /// await resolving and the re-lock, and that gap is not constructible from a
+    /// test: `step1_check_quiescence` only proceeds once every thread's request
+    /// is already filled, so `req.get()` never suspends and there is no window a
+    /// test can hold open. An attempt to win the lock in that gap is a genuine
+    /// race that would usually lose (and deadlocks outright on a current-thread
+    /// runtime, where the daemon's blocking `sched.lock()` stalls the whole
+    /// executor). F6's `reconnect_fizzle_closes_window_so_next_removal_drain_is_
+    /// safe` does drive the real `do_a_turn_blocking` for the sibling arm.
     ///
     /// NEGATIVE: a skipped turn leaves virtual time exactly where it was. That is
     /// what the F8 fix buys; before it, the non-committing arm reported `Ok` and
