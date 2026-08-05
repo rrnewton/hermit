@@ -565,15 +565,22 @@ jobs:
           test -f target/debug/deps/libdetcore_dbi.so
           test -f target/install_pkg/rsrcs/libdetcore_dbi.so
           test -x target/ci/bin/cargo-nextest
-      # Prepend the staged binary rather than trusting ~/.cargo/bin: on a
-      # rust-cache miss that directory has no cargo-nextest at all, which is the
-      # failure this staging exists to remove. Prepending also pins the shard to
-      # the exact binary build-debug validated, instead of whatever version an
-      # older cache happens to hold.
-      - name: Put the prebuilt cargo-nextest on PATH
+      # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
+      # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
+      # `cargo-<subcommand>`, so a PATH entry loses to whatever the rust-cache
+      # restored and would silently run a stale cached cargo-nextest on a cache
+      # HIT. Installing here covers both cases with one rule — on a miss the
+      # directory holds no cargo-nextest at all (the bug this fixes), and on a
+      # hit this overwrites the cached copy with the exact binary build-debug
+      # validated. `cargo nextest --version` then asserts resolution up front,
+      # so a provisioning problem fails here, named, instead of surfacing later
+      # as an opaque node error.
+      - name: Install the prebuilt cargo-nextest
         run: |
           set -euo pipefail
-          echo "$PWD/target/ci/bin" >>"$GITHUB_PATH"
+          install -Dm755 target/ci/bin/cargo-nextest \
+            "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
+          cargo nextest --version
       - name: Unpack dbi install package
         if: needs.build-release.result == 'success'
         run: |
