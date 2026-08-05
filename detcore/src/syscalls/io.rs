@@ -543,11 +543,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
-            // A zero timeout IS a readiness query. Transfer only if it succeeded.
-            let result = guest.inject(call).await?;
-            self.timerfd_hand_back_all(guest, "pselect6 (zero-timeout probe)")
+            // A zero timeout IS a readiness query, so the answer must be computed
+            // against the host arming the guest will actually observe: transfer
+            // FIRST, revocably, so a rejected call still leaves timer ownership
+            // untouched. Identical in shape to the `select` site below.
+            let handover = self
+                .timerfd_hand_back_all_revocable(guest, "pselect6 (zero-timeout probe)")
                 .await?;
-            return Ok(result);
+            match guest.inject(call).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    self.timerfd_revoke_handover(
+                        guest,
+                        handover,
+                        "pselect6 (zero-timeout probe rejected)",
+                    )
+                    .await?;
+                    return Err(err.into());
+                }
+            }
         }
 
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
@@ -1901,5 +1915,60 @@ mod tests {
         assert_eq!((first.tv_sec, first.tv_nsec), (0, 0));
         assert_eq!((second.tv_sec, second.tv_nsec), (2, 345_678_901));
         assert_eq!((third.tv_sec, third.tv_nsec), (2, 345_678_901));
+    }
+
+    /// Every raw readiness path must transfer timer ownership BEFORE it probes,
+    /// and revoke that transfer if the probe fails.
+    ///
+    /// A SOURCE-level assertion on purpose. The defect it catches is not a wrong
+    /// answer in one branch -- it is a branch that was never converted. Round 5
+    /// converted three of these four sites and left `pselect6`'s zero-timeout
+    /// branch in the old probe-then-transfer form; every behavioural test still
+    /// passed, because the three converted sites were fine. A count plus a shape
+    /// check is what fails when a site is missed or a fifth is added without the
+    /// pattern.
+    ///
+    /// Needles are COMPOSED at runtime, never written as literals: this file
+    /// includes its own source, so a literal needle would match itself and the
+    /// test would be measuring its own text instead of the call sites.
+    #[test]
+    fn every_raw_readiness_site_transfers_before_it_probes() {
+        let source = include_str!("io.rs");
+        let transfer = format!(".{}(guest,", "timerfd_hand_back_all_revocable");
+        let revoke = format!("self.{}(", "timerfd_revoke_handover");
+        let plain = format!("self.{}(guest, ", "timerfd_hand_back_all");
+
+        assert_eq!(
+            source.matches(transfer.as_str()).count(),
+            4,
+            "expected exactly four revocable transfers -- pselect6 and select, \
+             each for the zero-timeout probe and the kernel-owned fd set"
+        );
+        assert_eq!(
+            source.matches(revoke.as_str()).count(),
+            4,
+            "every revocable transfer needs a matching revoke on its failure arm"
+        );
+
+        // The plain transfer survives ONLY where it is already correctly ordered:
+        // the deterministic-poll fallbacks (after all guest-memory validation,
+        // ahead of the first live probe) and the non-enumerable descriptor sets.
+        let plain_sites: Vec<String> = source
+            .match_indices(plain.as_str())
+            .map(|(i, _)| {
+                let rest = &source[i..];
+                rest[..rest.find(')').map_or(rest.len(), |j| j + 1)].to_string()
+            })
+            .collect();
+        for site in &plain_sites {
+            assert!(
+                site.contains("readiness probe") || site.contains("not enumerable"),
+                "plain (non-revocable) transfer at a raw readiness site: {site}"
+            );
+        }
+        assert!(
+            plain_sites.len() >= 2,
+            "the deterministic-poll fallbacks must keep transferring ahead of their probes"
+        );
     }
 }
