@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -129,8 +128,11 @@ struct Supervisor {
     tracees: HashSet<Pid>,
     states: HashMap<Pid, TraceeState>,
     mapping_cache: HashMap<(Pid, usize), MappingClassification>,
-    sabre: PathBuf,
-    plugin: PathBuf,
+    /// Identity (dev+inode) of the launched SaBRe loader and plugin. Resolved
+    /// once at construction so the exemption binds to the objects this
+    /// supervisor actually started, not to whatever a mapping calls itself.
+    sabre_id: Option<FileId>,
+    plugin_id: Option<FileId>,
     readiness: Arc<AtomicBool>,
     ready_observed: bool,
     patched_sites: HashSet<(Pid, usize)>,
@@ -153,9 +155,9 @@ impl Supervisor {
             tracees: HashSet::from([root]),
             states: HashMap::from([(root, TraceeState::default())]),
             mapping_cache: HashMap::new(),
-            sabre,
+            sabre_id: launched_file_id(&sabre),
+            plugin_id: launched_file_id(&plugin),
             readiness,
-            plugin,
             ready_observed: false,
             patched_sites: HashSet::new(),
             trusted_shared_object_sites: HashSet::new(),
@@ -435,8 +437,22 @@ impl Supervisor {
                 }
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
+                // A cached (pid, page) verdict describes the mapping that
+                // occupied that page when it was classified. mmap/munmap/
+                // mremap/mprotect/brk can replace or re-permission that page
+                // in-process, so a page previously classified as trusted can
+                // come to host a completely different raw-syscall site. Drop
+                // this tracee's cache whenever it mutates its address space;
+                // the next site there is reclassified against live
+                // /proc/<pid>/maps. Per-pid is coarse but correct -- per-page
+                // would be an optimisation, not a correctness requirement.
+                let exit_regs = ptrace::getregs(pid)?;
+                if mutates_address_space(exit_regs.orig_rax) {
+                    self.mapping_cache
+                        .retain(|(cached_pid, _), _| *cached_pid != pid);
+                }
                 if let Some(pending) = self.states.entry(pid).or_default().pending_patch.take() {
-                    let mut regs = ptrace::getregs(pid)?;
+                    let mut regs = exit_regs;
                     regs.rax = pending.syscall;
                     regs.orig_rax = pending.syscall;
                     regs.rip = pending.site as u64;
@@ -492,12 +508,12 @@ impl Supervisor {
             return Ok(classification.clone());
         }
         let maps = fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))?;
-        let classification = mapping_path(&maps, address).map_or(
+        let classification = mapping_entry(&maps, address).map_or(
             MappingClassification {
                 trusted: false,
                 trusted_shared_object: None,
             },
-            |path| classify_mapping(path, &self.sabre, &self.plugin),
+            |entry| classify_mapping(&entry, self.sabre_id.as_ref(), self.plugin_id.as_ref()),
         );
         self.mapping_cache
             .insert((pid, page), classification.clone());
@@ -549,14 +565,69 @@ fn mapping_line(maps: &str, address: usize) -> Option<&str> {
     })
 }
 
-fn mapping_path(maps: &str, address: usize) -> Option<&str> {
+/// Identity of a mapped file: the `dev` and `inode` columns of
+/// `/proc/<pid>/maps`, which name the object itself rather than a path that
+/// anyone can reproduce with the same basename. `dev` is kept as the literal
+/// `major:minor` text the kernel prints so no format assumption is needed on
+/// the maps side; the launched-object side is rendered into the same form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileId {
+    dev: String,
+    inode: u64,
+}
+
+/// One parsed `/proc/<pid>/maps` row: `range perms offset dev inode path`.
+struct MappingEntry<'a> {
+    dev: &'a str,
+    inode: Option<u64>,
+    path: &'a str,
+}
+
+impl MappingEntry<'_> {
+    /// `None` for anonymous or pseudo mappings (inode 0), which have no file
+    /// identity to bind to and therefore can never match a launched object.
+    fn file_id(&self) -> Option<FileId> {
+        match self.inode {
+            Some(inode) if inode != 0 => Some(FileId {
+                dev: self.dev.to_owned(),
+                inode,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Render a `stat(2)` device number in the `major:minor` hex form used by
+/// `/proc/<pid>/maps`, so a launched object can be compared to a mapping row.
+fn maps_dev_string(dev: u64) -> String {
+    let (major, minor) = (libc::major(dev), libc::minor(dev));
+    format!("{major:02x}:{minor:02x}")
+}
+
+/// Identity of a path this supervisor launched. `None` when the file cannot be
+/// stat'ed, which fails CLOSED: an unknown identity matches no mapping, so the
+/// exemption is withheld rather than granted.
+fn launched_file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileId {
+        dev: maps_dev_string(metadata.dev()),
+        inode: metadata.ino(),
+    })
+}
+
+fn mapping_entry(maps: &str, address: usize) -> Option<MappingEntry<'_>> {
     let mut fields = mapping_line(maps, address)?.split_whitespace();
-    fields.next()?;
-    fields.next()?;
-    fields.next()?;
-    fields.next()?;
-    fields.next()?;
-    Some(fields.next().unwrap_or(""))
+    fields.next()?; // range
+    fields.next()?; // perms
+    fields.next()?; // offset
+    let dev = fields.next()?;
+    let inode = fields.next()?;
+    Some(MappingEntry {
+        dev,
+        inode: inode.parse::<u64>().ok(),
+        path: fields.next().unwrap_or(""),
+    })
 }
 
 fn mapping_diagnostic(maps: &str, address: usize) -> Option<MappingDiagnostic> {
@@ -574,18 +645,69 @@ fn mapping_diagnostic(maps: &str, address: usize) -> Option<MappingDiagnostic> {
     })
 }
 
-fn classify_mapping(path: &str, sabre: &Path, plugin: &Path) -> MappingClassification {
+/// Syscalls that can replace, move, unmap or re-permission a page in the
+/// tracee's address space. A cached page classification is only valid until one
+/// of these runs, so observing any of them invalidates that tracee's cache.
+const ADDRESS_SPACE_MUTATORS: [u64; 6] = [
+    libc::SYS_mmap as u64,
+    libc::SYS_munmap as u64,
+    libc::SYS_mremap as u64,
+    libc::SYS_mprotect as u64,
+    libc::SYS_brk as u64,
+    libc::SYS_shmat as u64,
+];
+
+/// True when `nr` is an address-space mutator. On x86-64 the syscall number
+/// remains in `orig_rax` at the syscall-exit stop, which is where the cache is
+/// invalidated -- after the mapping change has actually taken effect.
+fn mutates_address_space(nr: u64) -> bool {
+    ADDRESS_SPACE_MUTATORS.contains(&nr)
+}
+
+/// Kernel-supplied mappings whose raw syscall sites are causally identified as
+/// infrastructure the guest cannot have rewritten. `[vdso]` and `[vsyscall]`
+/// are mapped by the kernel and are not writable, so SaBRe cannot expand a
+/// syscall site inside them and the supervisor must not try to patch one.
+///
+/// They are exempt from REDIRECTION only — never from ACCOUNTING. A raw syscall
+/// executed here did not traverse the measured in-guest SaBRe handler, so it is
+/// still recorded as a trusted-native site and still makes the cell ineligible.
+/// Exempting a mapping from both redirection and counting is the one
+/// combination that makes a real raw syscall disappear from the evidence.
+const CAUSAL_KERNEL_MAPPINGS: [&str; 2] = ["[vdso]", "[vsyscall]"];
+
+fn classify_mapping(
+    entry: &MappingEntry<'_>,
+    sabre: Option<&FileId>,
+    plugin: Option<&FileId>,
+) -> MappingClassification {
+    let path = entry.path;
     if path.starts_with('[') {
+        // Only the causally identified kernel mappings above are exempt from
+        // redirection, and even those are counted. Every other bracket-named
+        // mapping -- `[stack]`, `[heap]`, or any future kernel name -- is NOT
+        // infrastructure: fall through to `trusted: false` so the site is
+        // redirected through the SaBRe handler and counted as a fallback site.
+        if CAUSAL_KERNEL_MAPPINGS.contains(&path) {
+            return MappingClassification {
+                trusted: true,
+                trusted_shared_object: Some(PathBuf::from(path)),
+            };
+        }
         return MappingClassification {
-            trusted: true,
+            trusted: false,
             trusted_shared_object: None,
         };
     }
     let path = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path));
-    let infrastructure = path == sabre
-        || path == plugin
-        || same_file_name(path, sabre)
-        || same_file_name(path, plugin);
+    // Bind the infrastructure exemption to the identity of the objects this
+    // supervisor actually launched (device + inode from the same
+    // `/proc/<pid>/maps` line), not to their basenames. A basename match would
+    // exempt any unrelated mapping that happens to be called `sabre` or
+    // `libdetcore_sabre.so`.
+    let mapped = entry.file_id();
+    let infrastructure = matches!((mapped.as_ref(), sabre), (Some(seen), Some(known)) if seen == known)
+        || matches!((mapped.as_ref(), plugin), (Some(seen), Some(known)) if seen == known);
     if infrastructure {
         return MappingClassification {
             trusted: true,
@@ -604,12 +726,6 @@ fn classify_mapping(path: &str, sabre: &Path, plugin: &Path) -> MappingClassific
         trusted: trusted_shared_object.is_some(),
         trusted_shared_object,
     }
-}
-
-fn same_file_name(left: &Path, right: &Path) -> bool {
-    left.file_name()
-        .zip(right.file_name())
-        .is_some_and(|(left, right)| left == right && left != OsStr::new(""))
 }
 
 fn read_two_bytes(pid: Pid, address: usize) -> Result<[u8; 2], Error> {
@@ -850,9 +966,15 @@ mod tests {
             "1000-2000 r-xp 00002000 00:00 0 /tmp/sabre\n",
             "3000-4000 rwxp 00000000 00:00 0 \n",
         );
-        assert_eq!(mapping_path(maps, 0x1234), Some("/tmp/sabre"));
-        assert_eq!(mapping_path(maps, 0x3456), Some(""));
-        assert_eq!(mapping_path(maps, 0x2500), None);
+        assert_eq!(
+            mapping_entry(maps, 0x1234).map(|entry| entry.path),
+            Some("/tmp/sabre")
+        );
+        assert_eq!(
+            mapping_entry(maps, 0x3456).map(|entry| entry.path),
+            Some("")
+        );
+        assert!(mapping_entry(maps, 0x2500).is_none());
         let diagnostic = mapping_diagnostic(maps, 0x1234).unwrap();
         assert_eq!(diagnostic.relative_offset, 0x234);
         assert_eq!(diagnostic.file_offset, 0x2234);
@@ -862,37 +984,205 @@ mod tests {
         );
     }
 
+    // Rewritten for the identity-based contract. The previous version of this
+    // test asserted the two defects codex found: it required a different-root
+    // `libdetcore_sabre.so` and `[vdso]` to be `trusted` with NO counted site --
+    // the one combination that makes a real raw syscall vanish from evidence.
     #[test]
     fn classifies_runtime_mapping_attribution() {
-        let sabre = Path::new("/opt/sabre/bin/sabre");
-        let plugin = Path::new("/opt/hermit/libdetcore_sabre.so");
-        for path in [
-            "/opt/sabre/bin/sabre",
-            "/different/root/libdetcore_sabre.so (deleted)",
-            "[vdso]",
-        ] {
+        let sabre = file_id("fd:01", 1001);
+        let plugin = file_id("fd:01", 1002);
+
+        // The launched objects themselves: exempt and uncounted, because they
+        // ARE the measured interception path.
+        for (inode, path) in [(1001, "/opt/sabre/bin/sabre"), (1002, "/opt/hermit/x.so")] {
+            let maps = maps_row("1000-2000", "fd:01", inode, path);
+            let entry = mapping_entry(&maps, 0x1234).unwrap();
             assert_eq!(
-                classify_mapping(path, sabre, plugin),
+                classify_mapping(&entry, Some(&sabre), Some(&plugin)),
                 MappingClassification {
                     trusted: true,
                     trusted_shared_object: None
-                }
+                },
+                "{path} is a launched object and must be exempt"
             );
         }
+
+        // A DIFFERENT object wearing the plugin's basename is refused, even
+        // with the ` (deleted)` suffix the old test used.
+        let maps = maps_row(
+            "1000-2000",
+            "fd:01",
+            7777,
+            "/different/root/libdetcore_sabre.so (deleted)",
+        );
+        let entry = mapping_entry(&maps, 0x1234).unwrap();
         assert_eq!(
-            classify_mapping("/usr/lib/libc.so.6", sabre, plugin),
+            classify_mapping(&entry, Some(&sabre), Some(&plugin)),
+            MappingClassification {
+                trusted: true,
+                trusted_shared_object: Some(PathBuf::from("/different/root/libdetcore_sabre.so")),
+            },
+            "a basename impostor must be counted as a trusted-native site, not exempted"
+        );
+
+        // Ordinary shared object: trusted for runtime safety, counted for
+        // accounting. Unchanged contract.
+        let maps = maps_row("1000-2000", "fd:01", 55, "/usr/lib/libc.so.6");
+        let entry = mapping_entry(&maps, 0x1234).unwrap();
+        assert_eq!(
+            classify_mapping(&entry, Some(&sabre), Some(&plugin)),
             MappingClassification {
                 trusted: true,
                 trusted_shared_object: Some(PathBuf::from("/usr/lib/libc.so.6")),
             }
         );
-        for path in ["/usr/bin/echo", ""] {
+
+        // Non-library and anonymous mappings are redirected and counted as
+        // fallback sites. Unchanged contract.
+        for (inode, path) in [(66, "/usr/bin/echo"), (0, "")] {
+            let maps = maps_row("1000-2000", "fd:01", inode, path);
+            let entry = mapping_entry(&maps, 0x1234).unwrap();
             assert_eq!(
-                classify_mapping(path, sabre, plugin),
+                classify_mapping(&entry, Some(&sabre), Some(&plugin)),
                 MappingClassification {
                     trusted: false,
                     trusted_shared_object: None
                 }
+            );
+        }
+    }
+
+    /// One synthetic `/proc/<pid>/maps` row. Columns are exactly what the
+    /// kernel prints: `range perms offset dev inode path`.
+    fn maps_row(range: &str, dev: &str, inode: u64, path: &str) -> String {
+        format!("{range} r-xp 00000000 {dev} {inode} {path}\n")
+    }
+
+    fn classify(maps: &str, address: usize, sabre: Option<&FileId>) -> MappingClassification {
+        let entry = mapping_entry(maps, address).expect("mapping row must parse");
+        classify_mapping(&entry, sabre, None)
+    }
+
+    fn file_id(dev: &str, inode: u64) -> FileId {
+        FileId {
+            dev: dev.to_owned(),
+            inode,
+        }
+    }
+
+    // FINDING 1 -- bracketed mappings.
+    //
+    // POSITIVE: a raw syscall in the kernel-supplied [vdso] is exempt from
+    // REDIRECTION (it is not writable, so it cannot be patched) but is still
+    // COUNTED, so the cell cannot be silently credited to SaBRe.
+    #[test]
+    fn vdso_raw_syscall_is_counted_not_silently_trusted() {
+        let maps = maps_row("7ffff7fc9000-7ffff7fcb000", "00:00", 0, "[vdso]");
+        let classification = classify(&maps, 0x7ffff7fc9010, None);
+        assert!(
+            classification.trusted,
+            "[vdso] is not writable, so it must not be redirected"
+        );
+        assert_eq!(
+            classification.trusted_shared_object,
+            Some(PathBuf::from("[vdso]")),
+            "a [vdso] raw syscall did not traverse the SaBRe handler and must be counted"
+        );
+    }
+
+    // NEGATIVE: any other bracket-named mapping is NOT causally identified
+    // infrastructure. An executable [stack] hosting a raw syscall must be
+    // redirected and counted as a fallback site, never silently exempted.
+    #[test]
+    fn non_infrastructure_bracket_mapping_is_refused() {
+        for name in ["[stack]", "[heap]", "[anon:jit]"] {
+            let maps = maps_row("7ffffffde000-7ffffffff000", "00:00", 0, name);
+            let classification = classify(&maps, 0x7ffffffde010, None);
+            assert!(
+                !classification.trusted,
+                "{name} must be redirected through the SaBRe handler, not exempted"
+            );
+        }
+    }
+
+    // FINDING 2 -- infrastructure identity.
+    //
+    // POSITIVE: the launched loader is recognised by its own dev+inode and is
+    // exempt without being counted, because it IS the measured path.
+    #[test]
+    fn launched_sabre_object_is_recognised_by_identity() {
+        let maps = maps_row("400000-401000", "fd:01", 4242, "/opt/hermit/rsrcs/sabre");
+        let classification = classify(&maps, 0x400010, Some(&file_id("fd:01", 4242)));
+        assert!(classification.trusted);
+        assert_eq!(classification.trusted_shared_object, None);
+    }
+
+    // NEGATIVE: an impostor with the SAME BASENAME but a different object
+    // identity must NOT inherit the exemption. This is the planted bypass.
+    #[test]
+    fn same_basename_different_object_is_refused() {
+        let maps = maps_row("500000-501000", "fd:01", 9999, "/tmp/attacker/sabre");
+        let classification = classify(&maps, 0x500010, Some(&file_id("fd:01", 4242)));
+        assert!(
+            !classification.trusted,
+            "basename `sabre` must not exempt a different object"
+        );
+        assert_eq!(classification.trusted_shared_object, None);
+    }
+
+    // NEGATIVE: an unstat-able launched path yields no identity, and a missing
+    // identity must withhold the exemption (fail closed) rather than grant it.
+    #[test]
+    fn unknown_launched_identity_grants_no_exemption() {
+        let maps = maps_row("400000-401000", "fd:01", 4242, "/opt/hermit/rsrcs/sabre");
+        let classification = classify(&maps, 0x400010, None);
+        assert!(
+            !classification.trusted,
+            "an unresolved launched identity must not exempt anything"
+        );
+    }
+
+    // A shared object that is neither infrastructure nor kernel mapping stays
+    // trusted-for-safety but counted, which is the pre-existing contract this
+    // change must not weaken.
+    #[test]
+    fn other_shared_object_remains_counted() {
+        let maps = maps_row(
+            "7f0000000000-7f0000001000",
+            "fd:01",
+            77,
+            "/usr/lib64/libc.so.6",
+        );
+        let classification = classify(&maps, 0x7f0000000010, Some(&file_id("fd:01", 4242)));
+        assert!(classification.trusted);
+        assert_eq!(
+            classification.trusted_shared_object,
+            Some(PathBuf::from("/usr/lib64/libc.so.6"))
+        );
+    }
+
+    // FINDING 3 -- cache invalidation. Both sides of the predicate that decides
+    // whether a tracee's cached page verdicts survive a syscall.
+    #[test]
+    fn address_space_mutators_invalidate_and_others_do_not() {
+        for nr in [
+            libc::SYS_mmap,
+            libc::SYS_munmap,
+            libc::SYS_mremap,
+            libc::SYS_mprotect,
+            libc::SYS_brk,
+            libc::SYS_shmat,
+        ] {
+            assert!(
+                mutates_address_space(nr as u64),
+                "syscall {nr} changes the address space and must invalidate the cache"
+            );
+        }
+        for nr in [libc::SYS_read, libc::SYS_write, libc::SYS_getpid] {
+            assert!(
+                !mutates_address_space(nr as u64),
+                "syscall {nr} cannot change a mapping and must not invalidate the cache"
             );
         }
     }

@@ -767,8 +767,14 @@ function observation_hash {
     } | sha256sum | cut -d' ' -f1
 }
 
+# $1 is the number of guest executions the mode is contracted to perform.
+# `complete` and `eligible` are bound to that obligation: a run that produced
+# fewer records than executions is a SHORTFALL, not a pass. Reporting the count
+# without enforcing it lets one surviving record authorize a two-execution cell.
 function summarize_sabre_path_evidence {
-    jq -s '
+    local expected=$1
+    shift
+    jq -s --argjson expected "$expected" '
         if all(.[];
             .schema == 1
             and (.guest_rpc_observed | type == "boolean")
@@ -777,13 +783,14 @@ function summarize_sabre_path_evidence {
             and (.trusted_shared_objects | type == "array"))
         then {
             schema: 1,
-            complete: (length > 0),
+            expected_execution_count: $expected,
+            complete: (length == $expected),
             execution_count: length,
             guest_rpc_observed: (length > 0 and all(.[]; .guest_rpc_observed)),
             ptrace_fallback_sites: (map(.ptrace_fallback_sites) | add // 0),
             trusted_shared_object_sites: (map(.trusted_shared_object_sites) | add // 0),
             trusted_shared_objects: (map(.trusted_shared_objects) | add // [] | unique),
-            eligible: (length > 0 and all(.[];
+            eligible: (length == $expected and length > 0 and all(.[];
                 .guest_rpc_observed
                 and .ptrace_fallback_sites == 0
                 and .trusted_shared_object_sites == 0)),
@@ -796,37 +803,59 @@ function summarize_sabre_path_evidence {
 
 function collect_sabre_path_evidence {
     local cell_dir=$1
+    local expected=$2
     local -a files=()
     shopt -s nullglob
     files=("$cell_dir"/captures/*.sabre-path.jsonl)
     shopt -u nullglob
     if ((${#files[@]} == 0)); then
-        jq -cn '{schema:1,complete:false,execution_count:0,guest_rpc_observed:false,
+        jq -cn --argjson expected "$expected" '{schema:1,
+            expected_execution_count:$expected,complete:false,execution_count:0,
+            guest_rpc_observed:false,
             ptrace_fallback_sites:0,trusted_shared_object_sites:0,
             trusted_shared_objects:[],eligible:false,executions:[]}'
         return
     fi
-    summarize_sabre_path_evidence "${files[@]}"
+    summarize_sabre_path_evidence "$expected" "${files[@]}"
+}
+
+# Hermit's built-in verification executes the guest twice (see the guest_tmpdir
+# comment in prepare_test); every other mode executes it once. The decision
+# point must know this number, not merely report whatever arrived.
+function expected_sabre_execution_count {
+    case $1 in
+    verify | replay) echo 2 ;;
+    *) echo 1 ;;
+    esac
 }
 
 function audit_sabre_path_evidence_contract {
-    local eligible fallback trusted
+    local eligible fallback trusted shortfall
     eligible=$(printf '%s\n' \
         '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
         '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
-        summarize_sabre_path_evidence)
+        summarize_sabre_path_evidence 2)
     fallback=$(printf '%s\n' \
         '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
-        summarize_sabre_path_evidence)
+        summarize_sabre_path_evidence 1)
     trusted=$(printf '%s\n' \
         '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
-        summarize_sabre_path_evidence)
+        summarize_sabre_path_evidence 1)
+    # PLANTED NEGATIVE for the execution-count obligation: one otherwise-clean
+    # record where the mode contracts for two. Every per-record predicate here
+    # passes, so this is refused only if the count itself is enforced.
+    shortfall=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 2)
     jq -e '.eligible and .complete and .execution_count == 2' <<<"$eligible" >/dev/null ||
         die "legitimate SaBRe path evidence must remain eligible"
     jq -e '(.eligible | not) and .ptrace_fallback_sites == 1' <<<"$fallback" >/dev/null ||
         die "ptrace-installed SaBRe markers must be classified as fallback"
     jq -e '(.eligible | not) and .trusted_shared_object_sites == 1' <<<"$trusted" >/dev/null ||
         die "trusted shared-object native execution must be ineligible"
+    jq -e '(.eligible | not) and (.complete | not)
+        and .execution_count == 1 and .expected_execution_count == 2' <<<"$shortfall" >/dev/null ||
+        die "an execution-count shortfall must be ineligible even when every record is clean"
 }
 
 function prepare_test {
@@ -1178,7 +1207,8 @@ function run_cell {
     fi
 
     if [[ $backend == sabre ]]; then
-        path_evidence=$(collect_sabre_path_evidence "$cell_dir") || {
+        path_evidence=$(collect_sabre_path_evidence "$cell_dir" \
+            "$(expected_sabre_execution_count "$mode")") || {
             outcome=ERROR
             reason="invalid SaBRe path evidence"
             path_evidence=null
@@ -1186,7 +1216,8 @@ function run_cell {
         if [[ $outcome == PASS && $(jq -r '.eligible // false' <<<"$path_evidence") != true ]]; then
             outcome=FAIL
             reason=$(jq -r '
-                "SaBRe path ineligible: guest_rpc_observed=\(.guest_rpc_observed), "
+                "SaBRe path ineligible: executions=\(.execution_count)/\(.expected_execution_count), "
+                + "guest_rpc_observed=\(.guest_rpc_observed), "
                 + "ptrace_fallback_sites=\(.ptrace_fallback_sites), "
                 + "trusted_shared_object_sites=\(.trusted_shared_object_sites), "
                 + "trusted_shared_objects=\(.trusted_shared_objects | join(","))"
