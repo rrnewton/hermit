@@ -127,6 +127,7 @@ function select_validation_level {
 }
 STRICT_COMPAT_ONLY=0
 PORTABLE_STRICT_COMPAT_ONLY=0
+STRICT_COMPAT_SCALE_WIDTHS=""
 PORTABLE_STRICT_PROBE_ARGS=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
@@ -175,6 +176,17 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
+        # Measurement-only: sweep strict-compat inner fan-out width(s). Reuses
+        # the portable strict-compat build + probe corpus; runs the benchmark
+        # instead of the gate. Accepts one width or a comma list, e.g.
+        #   ./validate.sh --strict-compat-jobs 1        # serial absolute anchor
+        #   ./validate.sh --strict-compat-jobs 1,2,4,8,16,32,64   # full curve
+        --strict-compat-jobs)
+            STRICT_COMPAT_SCALE_WIDTHS=${2:-}
+            [[ -n $STRICT_COMPAT_SCALE_WIDTHS ]] || {
+                echo "validate.sh: --strict-compat-jobs needs WIDTH[,WIDTH...]" >&2; exit 2; }
+            STRICT_COMPAT_ONLY=1; PORTABLE_STRICT_COMPAT_ONLY=1
+            shift 2 ;;
         # TODO-HUMAN-REVIEW(#719): Review the focused portable compatibility CLI.
         --portable-strict-compat-only)
             STRICT_COMPAT_ONLY=1; PORTABLE_STRICT_COMPAT_ONLY=1; shift ;;
@@ -2991,6 +3003,22 @@ function strict_compatibility_probe {
         fi
     fi
 
+    # Measurement-only enumeration. When STRICT_COMPAT_ENUMERATE is set, do NOT
+    # execute the probe; instead record the exact hermit invocation (label,
+    # per-probe timeout, and full argv) so the strict-compat inner-scaling
+    # benchmark can fan the identical probes out at a chosen width. This reuses
+    # the production probe definitions as the single source of truth. When the
+    # variable is unset (every normal/gate run) this branch is inert and the
+    # blocking L2 gate path below is byte-for-byte unchanged.
+    if [[ -n ${STRICT_COMPAT_ENUMERATE:-} ]]; then
+        {
+            printf '%s\t%s\t' "$label" "$probe_timeout"
+            printf '%q ' "${run_args[@]}" "$@"
+            printf '\n'
+        } >>"$STRICT_COMPAT_MANIFEST"
+        return 0
+    fi
+
     {
         printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
         printf "Command: timeout %s %q" \
@@ -4040,6 +4068,140 @@ function run_compatibility_corpus {
     return 1
 }
 
+# --- Strict-compat inner-scaling benchmark (measurement-only; NOT a gate) -----
+# Motivation: every parallelism figure this project holds is OUTER-DAG (e.g.
+# TOTAL_WORK/CRITICAL_PATH = 4.24x). The test.strict_compat node runs its
+# STRICT_COMPAT_TOTAL independent `hermit run --strict --verify` probes SERIALLY
+# and has no inner-width knob. This mode harvests the exact production probe set
+# (via STRICT_COMPAT_ENUMERATE) and re-runs the identical probes at a chosen
+# fan-out width so the inner-parallelism curve has ABSOLUTE anchors (wall + CPU
+# seconds at each width), not a ratio. The blocking gate keeps width 1; this is
+# for measurement only. Task: headline-inner-step-scaling-curves-cargo-and-strict-compat.
+function strict_compat_scale_load1 { cut -d' ' -f1 /proc/loadavg; }
+
+# Run every enumerated probe once at fan-out WIDTH; emit one CSV data row.
+function strict_compat_scale_run_width {
+    local width=$1 manifest=$2 hermit=$3
+    local tmp; tmp=$(mktemp -d)
+    local start end i=0 head=0 label probe_timeout argvq
+    # Track our OWN probe PIDs and wait only on them (FIFO pool). validate.sh
+    # runs a persistent VALIDATION_CONCURRENCY_MONITOR background job, so a bare
+    # `wait`/`wait -n` here would block on that never-exiting monitor and hang
+    # the sweep. Waiting on explicit PIDs confines us to the probes.
+    local -a pids=()
+    local load1; load1=$(strict_compat_scale_load1)
+    start=$(date +%s.%N)
+    while IFS=$'\t' read -r label probe_timeout argvq; do
+        [[ -n $label ]] || continue
+        local -a argv=()
+        eval "argv=($argvq)"
+        {
+            /usr/bin/time -o "$tmp/t.$i" -f "%U %S %x" \
+                timeout "$probe_timeout" "$hermit" "${argv[@]}" \
+                </dev/null >/dev/null 2>&1
+            echo $? >"$tmp/rc.$i"
+        } &
+        pids+=("$!")
+        # Bound in-flight probes to WIDTH by reaping the oldest launched probe
+        # once WIDTH are outstanding (FIFO pool; only our probe PIDs).
+        if ((${#pids[@]} - head >= width)); then
+            wait "${pids[head]}" 2>/dev/null
+            ((++head))
+        fi
+        ((++i))
+    done <"$manifest"
+    # Drain the remaining outstanding probes (explicit PIDs only).
+    while ((head < ${#pids[@]})); do
+        wait "${pids[head]}" 2>/dev/null
+        ((++head))
+    done
+    end=$(date +%s.%N)
+
+    local probes=$i user=0 sys=0 fails=0 segv=0 rc u s j
+    for ((j = 0; j < probes; j++)); do
+        rc=$(<"$tmp/rc.$j" 2>/dev/null || echo 1)
+        ((rc != 0)) && ((fails++))
+        ((rc == 139)) && ((segv++))
+        if [[ -s $tmp/t.$j ]]; then
+            read -r u s _ <"$tmp/t.$j"
+            user=$(awk -v a="$user" -v b="$u" 'BEGIN{printf "%.2f", a+b}')
+            sys=$(awk -v a="$sys" -v b="$s" 'BEGIN{printf "%.2f", a+b}')
+        fi
+    done
+    rm -rf "$tmp"
+    local makespan cpw thr
+    makespan=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
+    # cpu_per_wall == achieved cores == sum(my cpu-s)/makespan: background load
+    # can only DEFLATE it, so it is a lower bound on a contended box (curve-3).
+    cpw=$(awk -v u="$user" -v s="$sys" -v m="$makespan" 'BEGIN{printf "%.2f", (m>0)?(u+s)/m:0}')
+    thr=$(awk -v c="$probes" -v m="$makespan" 'BEGIN{printf "%.2f", (m>0)?c/m:0}')
+    printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+        "$width" "$probes" "$makespan" "$user" "$sys" "$cpw" "$thr" "$fails" "$segv" "$load1"
+}
+
+# Harvest the real probe corpus, then sweep the requested fan-out width(s).
+function run_strict_compat_scale_bench {
+    local widths=${1//,/ }
+    local hermit=$STRICT_COMPAT_HERMIT_BIN
+    if [[ ! -x $hermit ]]; then
+        printf "strict-compat scale: hermit binary not executable: %s\n" "$hermit" >&2
+        return 1
+    fi
+    # Probes reference repo-relative fixtures (README.md, prepared compat
+    # fixtures); run from the repository root exactly like the gate path.
+    cd "$ROOT_DIR" || return 1
+    if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
+        "$REAL_COMPAT_FIXTURES" >/dev/null 2>&1; then
+        printf "strict-compat scale: unable to prepare functional compat fixtures\n" >&2
+        return 1
+    fi
+
+    local manifest; manifest=$(mktemp)
+    # Enumerate the identical corpus the gate runs, in the same (portable)
+    # profile; discard its normal output — we only want the probe manifest.
+    STRICT_COMPAT_ENUMERATE=1 STRICT_COMPAT_MANIFEST=$manifest COMPATIBILITY_MODE=strict \
+        run_compatibility_corpus >/dev/null 2>&1 || true
+    local total; total=$(wc -l <"$manifest")
+    if ((total == 0)); then
+        printf "strict-compat scale: enumerated 0 probes (manifest empty)\n" >&2
+        rm -f "$manifest"; return 1
+    fi
+
+    # Optional: cap the corpus to the first N enumerated probes. Use this for a
+    # quick, low-load MECHANISM PROOF (width>1 wall < width=1 wall) without
+    # paying the full STRICT_COMPAT_TOTAL-probe serial cost at width 1. It does
+    # NOT yield the representative absolute anchor of the whole node -- that
+    # needs the full corpus on a quiet box. 0 (default) = full corpus.
+    local limit=${STRICT_COMPAT_SCALE_LIMIT:-0}
+    if ((limit > 0)) && ((limit < total)); then
+        head -n "$limit" "$manifest" >"$manifest.lim" && mv "$manifest.lim" "$manifest"
+        total=$(wc -l <"$manifest")
+    fi
+
+    local max_load=${STRICT_COMPAT_SCALE_MAX_LOAD:-16}
+    local allow_contended=${STRICT_COMPAT_SCALE_ALLOW_CONTENDED:-0}
+    printf "# strict_compat inner-scaling: %s probes/width; hermit=%s; widths=%s; loadavg1=%s\n" \
+        "$total" "$hermit" "$widths" "$(strict_compat_scale_load1)" >&2
+    printf "width,probes,makespan_s,user_cpu_s,sys_cpu_s,cpu_per_wall,throughput_probes_per_s,fails,segv,loadavg1\n"
+
+    local w load1
+    for w in $widths; do
+        load1=$(strict_compat_scale_load1)
+        # A scaling SWEEP on a contended box calibrates a constant on
+        # contention; refuse unless quiet. A one-sided width>1 < width=1
+        # speedup PROOF survives contention (load only shrinks speedup), so
+        # STRICT_COMPAT_SCALE_ALLOW_CONTENDED=1 permits it explicitly.
+        if ((allow_contended == 0)) &&
+            awk -v l="$load1" -v m="$max_load" 'BEGIN{exit !(l+0 >= m+0)}'; then
+            printf "# REFUSE width=%s: loadavg1=%s >= %s (box not quiet). Set STRICT_COMPAT_SCALE_ALLOW_CONTENDED=1 to force a one-sided proof.\n" \
+                "$w" "$load1" "$max_load" >&2
+            continue
+        fi
+        strict_compat_scale_run_width "$w" "$manifest" "$hermit"
+    done
+    rm -f "$manifest"
+}
+
 function run_strict_compatibility_envelope {
     if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
         "$REAL_COMPAT_FIXTURES" >>"$LOG_FILE" 2>&1; then
@@ -4792,6 +4954,10 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         printf "Configured strict compatibility Hermit is not executable: %s\n" \
             "$STRICT_COMPAT_HERMIT_BIN" >&2
         exit 1
+    fi
+    if [[ -n $STRICT_COMPAT_SCALE_WIDTHS ]]; then
+        run_strict_compat_scale_bench "$STRICT_COMPAT_SCALE_WIDTHS"
+        exit $?
     fi
     run_strict_compatibility_envelope
     exit $?
