@@ -3424,6 +3424,7 @@ mod test {
 mod timerfd_gate_test {
     use detcore_model::time::LogicalTime;
 
+    use super::timerfd_accrued_expirations;
     use super::timerfd_hand_back_it_value_ns;
     use super::timerfd_rearm_needs_host_retarget;
 
@@ -3488,5 +3489,55 @@ mod timerfd_gate_test {
     #[test]
     fn a_pending_deadline_is_handed_over_unchanged() {
         assert_eq!(timerfd_hand_back_it_value_ns(500_000, Some(at(1))), 500_000);
+    }
+
+    /// Fires: the reviewer's worked example. A 10ms period armed at virtual
+    /// 10ms with no `read()` yet owes the guest THREE expirations at virtual
+    /// 35ms (10, 20, 30). `timerfd_settime` resets the kernel's counter, so a
+    /// handover that did not carry this count would deliver zero of them and the
+    /// next read would report the kernel's later count instead of Linux's
+    /// accumulated one.
+    #[test]
+    fn an_overdue_periodic_timer_accrues_one_expiration_per_elapsed_period() {
+        assert_eq!(
+            timerfd_accrued_expirations(Some(at(10_000_000)), 10_000_000, at(35_000_000)),
+            3
+        );
+        // Exactly on a period boundary: 10, 20, 30 have all fired at 30ms.
+        assert_eq!(
+            timerfd_accrued_expirations(Some(at(10_000_000)), 10_000_000, at(30_000_000)),
+            3
+        );
+        // Just due, first tick only.
+        assert_eq!(
+            timerfd_accrued_expirations(Some(at(10_000_000)), 10_000_000, at(10_000_000)),
+            1
+        );
+    }
+
+    /// Fires: an overdue one-shot owes exactly one expiration, however long ago
+    /// it fired — it does not accumulate.
+    #[test]
+    fn an_overdue_one_shot_accrues_exactly_one_expiration() {
+        assert_eq!(
+            timerfd_accrued_expirations(Some(at(1)), 0, at(9_999_999)),
+            1
+        );
+    }
+
+    /// Refuses: nothing is owed by a timer that has not fired yet, or by a
+    /// disarmed one. Without this side the carry would invent expirations at
+    /// every handover and the guest would see phantom ticks.
+    #[test]
+    fn a_pending_or_disarmed_timer_accrues_nothing() {
+        // Armed, not yet due.
+        assert_eq!(
+            timerfd_accrued_expirations(Some(at(20_000_000)), 10_000_000, at(15_000_000)),
+            0
+        );
+        // Disarmed, periodic interval irrelevant.
+        assert_eq!(timerfd_accrued_expirations(None, 10_000_000, at(99)), 0);
+        // Disarmed one-shot.
+        assert_eq!(timerfd_accrued_expirations(None, 0, at(99)), 0);
     }
 }
