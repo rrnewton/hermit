@@ -171,7 +171,13 @@ jobs:
     # is no determinism reason to pin this lane to one serialized box. `pmu`
     # already selects a PMU+CPUID+/dev/kvm-capable host.
     runs-on: [Linux, X64, hermit, pmu]
-    timeout-minutes: 360
+    # Provisional headroom: every prior weekly run hit the old 360-minute wall at
+    # exactly 6h and was CANCELLED before finishing, so super has never once
+    # completed and its true duration is only known to exceed 6h. 720 lets it run
+    # to completion at least once so we can measure the real cost and then
+    # right-size (trim SUPER_REPETITIONS or split). The super-cancel-alert job
+    # below makes any future timeout LOUD instead of silent regardless.
+    timeout-minutes: 720
     env:
       DETCORE_TEST_RUST_LOG: "off"
       SUPER_REPETITIONS: "20"
@@ -206,3 +212,27 @@ jobs:
       - name: Repeated and long-form privileged validation
         # No flock: retired with the disproven PMU counter-exhaustion premise.
         run: ./validate.sh super --no-label-pr
+
+  super-cancel-alert:
+    name: Alert on silently-cancelled super validation
+    # A job killed by timeout-minutes (or otherwise cancelled) concludes
+    # `cancelled` — grey and silent, indistinguishable from a run that did
+    # nothing. This downstream job runs even when `super` was cancelled
+    # (if: always()) and fails LOUDLY (red) so a cancelled weekly stress run can
+    # never again pass unnoticed. It is skipped only when `super` legitimately
+    # did not run (e.g. merge_group events), so it never fires on normal
+    # completion.
+    needs: super
+    if: ${{ always() && needs.super.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile cancellation alerter
+        run: rustc --edition=2021 scripts/super_cancel_alert.rs -o "$RUNNER_TEMP/super-cancel-alert"
+      - name: Evaluate super validation outcome
+        run: >-
+          "$RUNNER_TEMP/super-cancel-alert"
+          --result '${{ needs.super.result }}'
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          --timeout-minutes 720
