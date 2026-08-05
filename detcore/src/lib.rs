@@ -787,6 +787,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// syscall-commit boundary), after any clobber canonicalization, so that the
     /// hook's own register rewrites are never sampled.
     async fn detlog_registers<G: Guest<Self>>(&self, guest: &mut G) {
+        // Backends that do not present a deterministic register file at the
+        // syscall boundary (e.g. SaBRe leaves %rdx run-to-run varying) would emit
+        // a spuriously-diverging digest; suppress the emitter rather than strip
+        // the offending register, which would hide a genuine backend defect.
+        if self.cfg.registers_nondeterministic_at_syscall_boundary {
+            return;
+        }
         // Zero-cost unless someone is actually consuming the INFO determinism
         // stream (a local INFO subscriber, or an out-of-process backend's
         // forwarder). Mirrors the guest-env digest gating.

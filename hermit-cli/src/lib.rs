@@ -1554,6 +1554,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
+    config.registers_nondeterministic_at_syscall_boundary = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
