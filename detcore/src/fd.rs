@@ -158,6 +158,17 @@ struct OpenFileDescription {
     // TODO-HUMAN-REVIEW(#1169)
     #[serde(default)]
     timerfd: Option<TimerfdState>,
+    /// Latched once Detcore observes this `timerfd` being used outside the one
+    /// access pattern virtual-time expiration is proven for. See
+    /// [`DetFd::timerfd_host_owned`].
+    #[serde(default)]
+    timerfd_host_owned: bool,
+    /// The single thread whose blocking reads are served from virtual time.
+    #[serde(default)]
+    timerfd_virtual_reader: Option<DetTid>,
+    /// Virtual deadline a reader is parked on right now, if any.
+    #[serde(default)]
+    timerfd_parked_deadline: Option<LogicalTime>,
 }
 
 impl PartialEq for DetFd {
@@ -203,6 +214,9 @@ impl DetFd {
                 sock_diag: false,
                 loopback_peer: false,
                 timerfd: None,
+                timerfd_host_owned: false,
+                timerfd_virtual_reader: None,
+                timerfd_parked_deadline: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -508,6 +522,66 @@ impl DetFd {
     pub(crate) fn set_timerfd_state(&self, state: TimerfdState) {
         self.description().timerfd = Some(state);
     }
+
+    /// Whether this descriptor is a modeled `timerfd` still served from virtual
+    /// time. Cheap enough to scan a whole descriptor table with.
+    pub(crate) fn is_virtualizable_timerfd(&self) -> bool {
+        let description = self.description();
+        description.timerfd.is_some() && !description.timerfd_host_owned
+    }
+
+    /// Whether the kernel — not Detcore's virtual clock — owns this `timerfd`.
+    ///
+    /// Virtual-time expiration is only proven for one access pattern: a single
+    /// thread doing blocking `read()`s on an armed timer (GHC's RTS ticker).
+    /// Every other pattern splits one Linux timer between host-driven readiness
+    /// and virtual-time consumption, which breaks contracts the kernel does
+    /// honor. Rather than model those patterns, Detcore hands the descriptor
+    /// back to the kernel the first time it sees one, and never takes it back:
+    /// the latch is monotonic, so a descriptor cannot oscillate between two
+    /// sources of truth mid-run.
+    pub(crate) fn timerfd_host_owned(&self) -> bool {
+        self.description().timerfd_host_owned
+    }
+
+    /// Latch this `timerfd` as host-owned. Idempotent; returns `true` only for
+    /// the transition, so the caller can perform the one-time host handover.
+    pub(crate) fn set_timerfd_host_owned(&self) -> bool {
+        let mut description = self.description();
+        if description.timerfd_host_owned {
+            return false;
+        }
+        description.timerfd_host_owned = true;
+        description.timerfd_virtual_reader = None;
+        description.timerfd_parked_deadline = None;
+        true
+    }
+
+    /// Claim this `timerfd` for `dettid` as its single virtual-time reader.
+    ///
+    /// Returns `false` when another thread already holds the claim, which makes
+    /// this a multi-reader descriptor and therefore host-owned.
+    pub(crate) fn claim_timerfd_virtual_reader(&self, dettid: DetTid) -> bool {
+        let mut description = self.description();
+        match description.timerfd_virtual_reader {
+            Some(owner) => owner == dettid,
+            None => {
+                description.timerfd_virtual_reader = Some(dettid);
+                true
+            }
+        }
+    }
+
+    /// Record that the virtual reader is parked until `deadline` (or, with
+    /// `None`, that it has resumed).
+    pub(crate) fn set_timerfd_parked_deadline(&self, deadline: Option<LogicalTime>) {
+        self.description().timerfd_parked_deadline = deadline;
+    }
+
+    /// The deadline a virtual reader is parked on right now, if any.
+    pub(crate) fn timerfd_parked_deadline(&self) -> Option<LogicalTime> {
+        self.description().timerfd_parked_deadline
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -519,6 +593,92 @@ impl fmt::Display for DetFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timerfd(fd: RawFd) -> DetFd {
+        let owner = DetTid::from_raw(10);
+        let detfd = DetFd::new(
+            fd,
+            OFlag::empty(),
+            FdType::Timerfd,
+            OpenFileId::new(owner, 0),
+        );
+        detfd.init_timerfd(libc::CLOCK_MONOTONIC);
+        detfd
+    }
+
+    /// Fires: a freshly created timerfd is eligible for virtual-time expiration
+    /// and one thread can claim it. Without this side, a latch that refused
+    /// everything would look correct while disabling the feature entirely.
+    #[test]
+    fn a_fresh_timerfd_is_virtualizable_by_one_reader() {
+        let detfd = timerfd(3);
+        assert!(!detfd.timerfd_host_owned());
+        assert!(detfd.timerfd_state().is_some());
+
+        let reader = DetTid::from_raw(11);
+        assert!(detfd.claim_timerfd_virtual_reader(reader));
+        // The same thread reading again is the normal case, not a second reader.
+        assert!(detfd.claim_timerfd_virtual_reader(reader));
+    }
+
+    /// Refuses: a second reader thread is not the pattern virtual expiration is
+    /// modelled for.
+    #[test]
+    fn a_second_reader_thread_is_refused() {
+        let detfd = timerfd(3);
+        assert!(detfd.claim_timerfd_virtual_reader(DetTid::from_raw(11)));
+        assert!(!detfd.claim_timerfd_virtual_reader(DetTid::from_raw(12)));
+    }
+
+    /// The latch is one-way and clears the virtual-read bookkeeping, so a
+    /// descriptor cannot drift back to virtual time mid-run.
+    #[test]
+    fn host_ownership_latches_once_and_is_permanent() {
+        let detfd = timerfd(3);
+        detfd.set_timerfd_parked_deadline(Some(LogicalTime::from_nanos(500)));
+        assert!(detfd.claim_timerfd_virtual_reader(DetTid::from_raw(11)));
+
+        assert!(
+            detfd.set_timerfd_host_owned(),
+            "first latch is the transition"
+        );
+        assert!(detfd.timerfd_host_owned());
+        assert_eq!(detfd.timerfd_parked_deadline(), None);
+        assert!(
+            !detfd.set_timerfd_host_owned(),
+            "re-latching must not report a second handover"
+        );
+        assert!(detfd.timerfd_host_owned());
+    }
+
+    /// Host ownership follows the open file description, so a `dup` alias — or
+    /// the same description reached from another thread — cannot keep reading
+    /// from virtual time after the original was handed over.
+    #[test]
+    fn host_ownership_is_shared_by_dup_aliases() {
+        let original = timerfd(3);
+        let duplicate = original.clone().with_fd(4);
+        assert!(!duplicate.timerfd_host_owned());
+
+        original.set_timerfd_host_owned();
+        assert!(duplicate.timerfd_host_owned());
+    }
+
+    /// The parked deadline is observable state, not a fire-and-forget flag:
+    /// `timerfd_settime` reads it to decide whether a nearer re-arm needs the
+    /// kernel.
+    #[test]
+    fn the_parked_deadline_round_trips() {
+        let detfd = timerfd(3);
+        assert_eq!(detfd.timerfd_parked_deadline(), None);
+        detfd.set_timerfd_parked_deadline(Some(LogicalTime::from_nanos(42)));
+        assert_eq!(
+            detfd.timerfd_parked_deadline(),
+            Some(LogicalTime::from_nanos(42))
+        );
+        detfd.set_timerfd_parked_deadline(None);
+        assert_eq!(detfd.timerfd_parked_deadline(), None);
+    }
 
     #[test]
     fn dup_shares_open_file_state_but_not_slot_flags() {
