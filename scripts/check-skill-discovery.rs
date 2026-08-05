@@ -33,7 +33,6 @@ const PACKAGED_SKILLS: &[&str] = &[
     "determinism-regression-debugging",
     "fabler",
     "hermit-debugging",
-    "human-review-first",
     "post-facto-review",
     "progress-rubric",
     "test-shrink-optimization",
@@ -95,8 +94,65 @@ fn frontmatter<'a>(contents: &'a str, path: &Path) -> Result<&'a str, String> {
     Ok(&contents[..4 + closing + 5])
 }
 
+fn checked_frontmatter<'a>(
+    contents: &'a str,
+    path: &Path,
+    expected_name: &str,
+) -> Result<&'a str, String> {
+    let metadata = frontmatter(contents, path)?;
+    let name = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("name:"))
+        .map(str::trim)
+        .ok_or_else(|| format!("{} frontmatter lacks name", path.display()))?;
+    if name != expected_name {
+        return Err(format!(
+            "{} declares name {:?}, expected {:?}",
+            path.display(),
+            name,
+            expected_name
+        ));
+    }
+    let description = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("description:"))
+        .map(str::trim)
+        .ok_or_else(|| format!("{} frontmatter lacks description", path.display()))?;
+    if description.is_empty() || description == "\"\"" || description == "''" {
+        return Err(format!(
+            "{} frontmatter has an empty description",
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+fn require_real_dir(path: &Path, purpose: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} must be a real {purpose} directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_regular_file(path: &Path, purpose: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} must be a regular {purpose} file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn expected_wrapper(name: &str, canonical: &str, path: &Path) -> Result<String, String> {
-    let metadata = frontmatter(canonical, path)?;
+    let metadata = checked_frontmatter(canonical, path, name)?;
     Ok(format!(
         "{metadata}\n# Codex discovery entrypoint\n\n\
          Read and follow [the canonical `{name}` skill](../../../.claude/skills/{name}.md) \
@@ -118,17 +174,11 @@ fn entry_names(path: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 fn check(root: &Path) -> Result<(), String> {
+    require_symlink(&root.join("CLAUDE.md"), Path::new("AGENTS.md"))?;
     require_symlink(&root.join(".llms/skills"), Path::new("../.claude/skills"))?;
 
     let codex_root = root.join(".agents/skills");
-    let codex_metadata = fs::symlink_metadata(&codex_root)
-        .map_err(|error| format!("cannot inspect {}: {error}", codex_root.display()))?;
-    if !codex_metadata.is_dir() || codex_metadata.file_type().is_symlink() {
-        return Err(format!(
-            "{} must be a real directory so flat skills can use SKILL.md entrypoints",
-            codex_root.display()
-        ));
-    }
+    require_real_dir(&codex_root, "stock-Codex skill")?;
 
     let mut expected_entries = BTreeSet::from(["README.md".to_owned()]);
     expected_entries.extend(FLAT_SKILLS.iter().map(|name| (*name).to_owned()));
@@ -144,6 +194,7 @@ fn check(root: &Path) -> Result<(), String> {
     expected_canonical.extend(FLAT_SKILLS.iter().map(|name| format!("{name}.md")));
     expected_canonical.extend(PACKAGED_SKILLS.iter().map(|name| (*name).to_owned()));
     let canonical_root = root.join(".claude/skills");
+    require_real_dir(&canonical_root, "canonical skill")?;
     let actual_canonical = entry_names(&canonical_root)?;
     if actual_canonical != expected_canonical {
         return Err(format!(
@@ -153,6 +204,7 @@ fn check(root: &Path) -> Result<(), String> {
 
     for name in FLAT_SKILLS {
         let canonical_path = canonical_root.join(format!("{name}.md"));
+        require_regular_file(&canonical_path, "canonical skill")?;
         let canonical = fs::read_to_string(&canonical_path)
             .map_err(|error| format!("cannot read {}: {error}", canonical_path.display()))?;
         let wrapper_dir = codex_root.join(name);
@@ -171,6 +223,7 @@ fn check(root: &Path) -> Result<(), String> {
             ));
         }
         let wrapper_path = wrapper_dir.join("SKILL.md");
+        require_regular_file(&wrapper_path, "Codex wrapper")?;
         let wrapper = fs::read_to_string(&wrapper_path)
             .map_err(|error| format!("cannot read {}: {error}", wrapper_path.display()))?;
         let expected = expected_wrapper(name, &canonical, &canonical_path)?;
@@ -184,18 +237,20 @@ fn check(root: &Path) -> Result<(), String> {
     }
 
     for name in PACKAGED_SKILLS {
+        let canonical_dir = canonical_root.join(name);
+        require_real_dir(&canonical_dir, "canonical packaged skill")?;
+        let canonical_skill = canonical_dir.join("SKILL.md");
+        require_regular_file(&canonical_skill, "canonical packaged skill")?;
+        let contents = fs::read_to_string(&canonical_skill)
+            .map_err(|error| format!("cannot read {}: {error}", canonical_skill.display()))?;
+        checked_frontmatter(&contents, &canonical_skill, name)?;
+
         let entry = codex_root.join(name);
         require_symlink(
             &entry,
             &PathBuf::from(format!("../../.claude/skills/{name}")),
         )?;
-        let skill_file = entry.join("SKILL.md");
-        if !skill_file.is_file() {
-            return Err(format!(
-                "{} does not resolve to a file",
-                skill_file.display()
-            ));
-        }
+        require_regular_file(&entry.join("SKILL.md"), "resolved packaged skill")?;
     }
 
     for name in PARENT_ONLY_ROLES {

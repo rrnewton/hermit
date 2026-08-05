@@ -185,10 +185,12 @@ flags. For preprocessing and prototype results, say what executed underneath;
 for example, "e9patch preprocessing with the ptrace backend" rather than
 "e9patch backend".
 
-A feature is **done** only when the exact test produces bitwise-identical output
-across **all backends**. A pass on one backend is evidence for that backend
-only, not a project-wide completion claim. If a backend cannot run the test,
-report that gap explicitly instead of weakening the definition of done.
+A feature is **done** only when the exact test meets its declared assurance
+level across **all in-scope backends**. A pass on one backend is evidence for
+that backend only, not a project-wide completion claim. KVM currently compares
+only exit status/stdout/stderr during `--verify`; it cannot claim full L2 INFO
+parity until internal log comparison exists. Report that gap explicitly instead
+of weakening the definition of done.
 
 Start investigations in these locations:
 
@@ -214,8 +216,8 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` compares exit status, stdout, stderr, and the complete INFO log byte-for-byte |
-| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
+| L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
 A claim that a run "passes" is meaningless without a level. Write, for example,
@@ -228,9 +230,15 @@ A claim that a run "passes" is meaningless without a level. Write, for example,
   none. A non-strict result is not a determinism guarantee; label the relaxation
   and do not present it as one.
 
-Do not normalize, redact, or strip changing numbers such as retired-branch
-counts or timing values from INFO logs to manufacture an L2 result. Those
-values are part of the observable determinism claim.
+Default `--verify` uses the lossy `Stripped` comparator and cannot establish
+L2. `--verify-strict` compares exit status/stdout/stderr byte-for-byte and INFO
+events under the repository's `BitwiseInfoV1` policy: it removes only the real
+wall-clock prefix, ordinalizes host addresses while preserving identity/order/
+aliasing, and compares the full remainder exactly. Virtual time,
+retired-branch counts, syscall values, sizes, flags, and other numeric payloads
+must not be stripped. State this canonical envelope rather than calling the raw
+log files literally byte-identical. KVM's output-only fallback reports
+`bitwise_parity: false` and is not L2.
 
 ## Debugging
 
@@ -240,9 +248,11 @@ before reading source:
 - Raise the log level to see the event stream and Detcore's decisions:
   `hermit --log info run -- <program>` (or `debug` / `trace` for more detail).
   The `DETLOG` lines record syscalls, scheduling, and virtualized time.
-- Reproduce nondeterminism with `hermit run --strict --verify`, which runs the
-  guest twice and reports the first divergence.
-- For record/replay problems use `hermit record start --verify -- <program>`,
+- Reproduce nondeterminism with `hermit run --strict --verify --verify-strict`,
+  which runs the guest twice under the L2 comparison policy and reports the
+  first divergence.
+- For record/replay problems use
+  `hermit record start --verify --verify-strict -- <program>`,
   which records then replays and diffs the two logs; a divergence names the
   thread and syscall event where the runs parted.
 - Use `hermit-verify` for stress, trace, schedule, and replay checks, and the
@@ -396,10 +406,10 @@ are mandatory for every implementation and review agent.
    tags when recording the transition and evidence:
 
    ```bash
-   tg update <task> --tags <existing-tags>,implemented
    tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
      | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
      | validation: <exact commands + results, assurance level, backend>"
+   tg update <task> --tags <existing-tags>,implemented
    ```
 
    The PR link and the exact tested SHA are required, not optional. A branch
