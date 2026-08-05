@@ -72,8 +72,16 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
 # against validate.sh and merely COPIES it to a file named `validate` instead of
 # running validation. .PHONY + this recipe overrides that implicit rule.
-validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
-	./validate.sh $(ARGS)
+#
+# `make validate` now runs the Rust driver's `full` profile, which subsumes
+# validate.sh's run_full_suite (the two preflight gates + centralized manifest +
+# BOTH the portable and privileged CI DAG lanes) by calling safe-ci-dag-runner as
+# a library, and self-tees a durable receipt log so the receipt path is
+# independent of the launch path. validate.sh is retained (NOT deleted): the
+# per-backend compat-only targets below still invoke it, and DAG nodes call back
+# into it for the compat corpora. Pass extra flags via ARGS (e.g. ARGS="-j 8").
+validate: check-submodules ## Run the full validation suite via the Rust driver (subsumes validate.sh run_full_suite; pass flags via ARGS)
+	./scripts/validate.rs full $(ARGS)
 
 # `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
 # reproduce every lint failure locally before pushing. Cheap checks run first for
