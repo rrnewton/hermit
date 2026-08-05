@@ -35,6 +35,38 @@ pub(crate) struct ComparisonOptions<'a> {
     pub compare_logs: bool,
 }
 
+/// The typed outcome of comparing two `--strict --verify` runs.
+///
+/// This is the classification site (the supervisor), not the harness: the
+/// distinction between a skid-caused divergence and a real determinism bug is
+/// made here, from process-global overshoot state a guest cannot forge, and
+/// crosses to any retry harness as a single typed value (a reserved exit code) —
+/// never as a stderr string a downstream must re-parse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerifyOutcome {
+    /// The two runs matched. Carries the exit status to propagate.
+    Verified(ExitStatus),
+    /// The two runs diverged AND at least one of them recorded an RCB skid
+    /// overshoot (see [`hermit::SKID_DIVERGENCE_EXIT_CODE`]). Because the
+    /// overshoot count is unforgeable, supervisor-side, process-global state,
+    /// this is *causally* attributable to skid and is safe to retry. A real
+    /// determinism bug (divergence with zero overshoots) is returned as an
+    /// `Err` instead and is never retried.
+    DivergedSkid,
+}
+
+impl VerifyOutcome {
+    /// Collapse to the process exit status: a verified run keeps the guest's own
+    /// status; a skid-attributed divergence yields the reserved skid code so a
+    /// retry harness can distinguish it from both success and a real bug.
+    pub(crate) fn into_exit_status(self) -> ExitStatus {
+        match self {
+            VerifyOutcome::Verified(status) => status,
+            VerifyOutcome::DivergedSkid => ExitStatus::Exited(hermit::SKID_DIVERGENCE_EXIT_CODE),
+        }
+    }
+}
+
 /// Reject an explicit log level that would suppress the events verification compares.
 ///
 /// With no explicit level, the verification paths select `DEBUG` internally.
@@ -108,11 +140,17 @@ fn unsupported_syscalls_from_log(path: &Path) -> io::Result<BTreeSet<String>> {
     Ok(syscalls)
 }
 
-pub fn compare_two_runs(
+pub(crate) fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
     options: ComparisonOptions<'_>,
-) -> Result<ExitStatus, Error> {
+    // Total RCB skid overshoots recorded by the supervisor across the two runs
+    // being compared (from `reverie::take_skid_overshoot_count`, snapshotted per
+    // run and summed). A guest cannot forge this count, so it is what makes a
+    // "divergence caused by skid" classification causally bound rather than a
+    // mere co-occurrence of two independent facts.
+    skid_overshoots: u64,
+) -> Result<VerifyOutcome, Error> {
     let ComparedRun {
         output: out1,
         log: log1,
@@ -193,9 +231,17 @@ pub fn compare_two_runs(
         eprintln!(":: {}", options.failure_message.red().bold());
         let _ = log1.keep()?;
         let _ = log2.keep()?;
-        Err(Error::msg(
-            "Mismatch between run 1 and run 2 outputs (logs retained).",
-        ))
+        // Causal classification: the runs diverged. Attribute the divergence to
+        // RCB skid only when the supervisor actually recorded an overshoot in
+        // one of these two runs. With zero overshoots this is a real
+        // determinism bug and stays a hard failure (never retried).
+        if skid_overshoots > 0 {
+            Ok(VerifyOutcome::DivergedSkid)
+        } else {
+            Err(Error::msg(
+                "Mismatch between run 1 and run 2 outputs (logs retained).",
+            ))
+        }
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
         let mut unsupported = unsupported_syscalls_from_log(log1.as_ref())?;
@@ -204,7 +250,7 @@ pub fn compare_two_runs(
             eprintln!("WARNING: {message}");
         }
         eprintln!(":: {}", options.success_message.green().bold());
-        Ok(out2.status)
+        Ok(VerifyOutcome::Verified(out2.status))
     }
 }
 
@@ -279,7 +325,17 @@ mod tests {
         left_log: TempPath,
         right: &Output,
         right_log: TempPath,
-    ) -> Result<ExitStatus, Error> {
+    ) -> Result<VerifyOutcome, Error> {
+        compare_with_skid(left, left_log, right, right_log, 0)
+    }
+
+    fn compare_with_skid(
+        left: &Output,
+        left_log: TempPath,
+        right: &Output,
+        right_log: TempPath,
+        skid_overshoots: u64,
+    ) -> Result<VerifyOutcome, Error> {
         compare_two_runs(
             ComparedRun {
                 output: left,
@@ -295,6 +351,7 @@ mod tests {
                 verbose: false,
                 compare_logs: true,
             },
+            skid_overshoots,
         )
     }
 
@@ -321,7 +378,7 @@ mod tests {
 
         assert_eq!(
             compare(&left, log1, &right, log2).unwrap(),
-            ExitStatus::Exited(0)
+            VerifyOutcome::Verified(ExitStatus::Exited(0))
         );
     }
 
@@ -349,9 +406,10 @@ mod tests {
                     verbose: false,
                     compare_logs: false,
                 },
+                0,
             )
             .unwrap(),
-            ExitStatus::Exited(0)
+            VerifyOutcome::Verified(ExitStatus::Exited(0))
         );
     }
 
@@ -364,6 +422,8 @@ mod tests {
             output(1, b"hello\n", b""),
         ];
 
+        // With zero recorded overshoots every divergence is a real determinism
+        // bug: a hard `Err`, never the retryable skid outcome.
         for mismatch in mismatches {
             let (log1, log2) = empty_logs();
             let path1 = log1.to_path_buf();
@@ -374,5 +434,45 @@ mod tests {
             let _ = fs::remove_file(path1);
             let _ = fs::remove_file(path2);
         }
+    }
+
+    #[test]
+    fn divergence_with_recorded_overshoot_classifies_as_skid() {
+        // The positive causal case: the same divergence, but the supervisor
+        // recorded an overshoot in one of the runs, so it is attributed to skid
+        // and reported as the retryable typed outcome (reserved exit code) —
+        // NOT as a hard `Err`. This is the classification the retry harness keys
+        // on.
+        let baseline = output(0, b"hello\n", b"");
+        let diverged = output(0, b"different\n", b"");
+        let (log1, log2) = empty_logs();
+        let path1 = log1.to_path_buf();
+        let path2 = log2.to_path_buf();
+
+        let outcome = compare_with_skid(&baseline, log1, &diverged, log2, 1)
+            .expect("recorded overshoot must classify divergence as skid, not error");
+        assert_eq!(outcome, VerifyOutcome::DivergedSkid);
+        assert_eq!(
+            outcome.into_exit_status(),
+            ExitStatus::Exited(hermit::SKID_DIVERGENCE_EXIT_CODE)
+        );
+
+        let _ = fs::remove_file(path1);
+        let _ = fs::remove_file(path2);
+    }
+
+    #[test]
+    fn matching_runs_ignore_recorded_overshoot() {
+        // An overshoot that did NOT cause a divergence (runs still matched) is
+        // not a failure: the verified status passes through unchanged. Skid only
+        // matters when it actually diverged the outputs.
+        let left = output(0, b"hello\n", b"");
+        let right = left.clone();
+        let (log1, log2) = empty_logs();
+
+        assert_eq!(
+            compare_with_skid(&left, log1, &right, log2, 5).unwrap(),
+            VerifyOutcome::Verified(ExitStatus::Exited(0))
+        );
     }
 }

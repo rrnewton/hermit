@@ -220,6 +220,39 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+/// Formats the single canonical [`reverie::SKID_OVERSHOOT_MARKER`] line for the
+/// detcore RCB-overshoot guard. Split out from [`report_rcb_overshoot`] so a test
+/// can assert the exact shape — including the optional origin nonce — without
+/// capturing the supervisor's stderr, mirroring the reverie-ptrace guard's own
+/// `format_skid_overshoot_marker`.
+///
+/// `witness` carries the supervisor-only `HERMIT_SKID_WITNESS_TOKEN`. It is
+/// appended as a ` witness=<token>` field iff present and non-empty, so an absent
+/// or empty token yields no witness field at all. This is evidence only: the
+/// skid-gated retry keys on the process-global overshoot counter, never this text.
+fn format_skid_overshoot_marker(
+    delta_rcbs: u64,
+    last_timer: u64,
+    clock_value: u64,
+    witness: Option<&str>,
+) -> String {
+    let mut marker = format!(
+        "{} rcb_actual={} rcb_target={} overshoot={} clock_value={}",
+        reverie::SKID_OVERSHOOT_MARKER,
+        delta_rcbs,
+        last_timer,
+        delta_rcbs.saturating_sub(last_timer),
+        clock_value,
+    );
+    if let Some(token) = witness
+        && !token.is_empty()
+    {
+        marker.push_str(" witness=");
+        marker.push_str(token);
+    }
+    marker
+}
+
 #[cold]
 fn report_rcb_overshoot(
     panic_on_rcb_overshoot: bool,
@@ -231,6 +264,35 @@ fn report_rcb_overshoot(
         "prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
         clock_value, delta_rcbs, last_timer
     );
+    // Emit the single canonical skid-overshoot marker to stderr on BOTH the
+    // panic and the (default) log-and-continue path, so this higher-level guard
+    // carries the same greppable token as the reverie-ptrace precise single-step
+    // guard. This is the one shape a skid-gated retry harness keys on: it may
+    // retry a --strict --verify divergence iff the same run emitted this marker.
+    // The default here is log-and-continue, which is precisely the path that
+    // silently diverges the schedule under load; making it machine-classifiable
+    // is what lets a retry distinguish skid from a real determinism bug.
+    // Origin nonce, evidence only. `HERMIT_SKID_WITNESS_TOKEN` lives solely in
+    // the supervisor's own environment (hermit strips it from the guest env), so
+    // stamping it here lets a human or the retry ledger attribute this line's
+    // origin and correlate it with the reverie-ptrace single-step guard's marker
+    // (which carries the same field) and hermit's SKID-ATTRIBUTED audit line.
+    // The skid-gated retry does NOT parse this: it keys on the reserved exit code
+    // fed by `record_skid_overshoot` below (an unforgeable process-global count),
+    // so a guest that cannot know the nonce also cannot launder a real bug into a
+    // retry by printing this text.
+    let witness = std::env::var("HERMIT_SKID_WITNESS_TOKEN").ok();
+    let marker =
+        format_skid_overshoot_marker(delta_rcbs, last_timer, clock_value, witness.as_deref());
+    eprintln!("{marker}");
+    // Structural, in-process signal alongside the greppable stderr marker. The
+    // marker is written to the supervisor's own stderr and is invisible to
+    // hermit's in-process `verify` classifier; this counter is not. A guest
+    // cannot forge it, so a supervisor-side "divergence caused by skid"
+    // classification built on it is causally bound. This is the default
+    // log-and-continue path — precisely the silent-divergence flake — so
+    // recording it here is what lets the skid-gated retry fire on it.
+    reverie::record_skid_overshoot();
     if panic_on_rcb_overshoot {
         panic!("{}", message);
     }
@@ -2449,8 +2511,27 @@ mod rcb_overshoot_tests {
     use tracing::span::Record;
     use tracing::subscriber::with_default;
 
+    use super::format_skid_overshoot_marker;
     use super::rcb_timer_overshot;
     use super::report_rcb_overshoot;
+
+    /// Serializes every test in this module that invokes `report_rcb_overshoot`
+    /// or reads the process-global skid-overshoot counter. That counter is a
+    /// single `AtomicU64` shared across the whole test binary, and
+    /// `report_rcb_overshoot` now increments it, so without this lock a sibling
+    /// test's increment could land between another test's drain and its
+    /// exact-count assertion. Poison-tolerant (see [`lock_skid_counter`]) because
+    /// `opt_in_overshoot_policy_panics` deliberately panics while holding it.
+    static SKID_COUNTER_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Acquire [`SKID_COUNTER_GUARD`], recovering from a poisoned lock left by the
+    /// deliberate panic in `opt_in_overshoot_policy_panics`. The guarded state is
+    /// `()`, so a poisoned inner value carries no meaning to salvage.
+    fn lock_skid_counter() -> std::sync::MutexGuard<'static, ()> {
+        SKID_COUNTER_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct ErrorSubscriber(Arc<Mutex<Option<String>>>);
 
@@ -2490,6 +2571,10 @@ mod rcb_overshoot_tests {
 
     #[test]
     fn default_overshoot_policy_emits_error_and_returns() {
+        // Holds the counter guard: report_rcb_overshoot now increments the
+        // process-global skid counter, so this must not race the exact-count
+        // assertions in the pos/neg tests below.
+        let _guard = lock_skid_counter();
         let error = Arc::new(Mutex::new(None));
         with_default(ErrorSubscriber(error.clone()), || {
             report_rcb_overshoot(false, 16_249, 139, 100);
@@ -2512,7 +2597,99 @@ mod rcb_overshoot_tests {
     #[test]
     #[should_panic(expected = "PMU RCB overshoot")]
     fn opt_in_overshoot_policy_panics() {
+        // Holds the counter guard (poison-tolerant on the reader side) since the
+        // panic path still increments the counter before panicking.
+        let _guard = lock_skid_counter();
         report_rcb_overshoot(true, 16_249, 139, 100);
+    }
+
+    /// POSITIVE control (plant a genuine overshoot, N=1). Forcing the qualifying
+    /// condition — delta_rcbs > last_timer, which the production gate
+    /// `rcb_timer_overshot` at the call site agrees is an overshoot — must:
+    ///   (a) increment the process-global counter the skid-gated retry actually
+    ///       keys on (`reverie::take_skid_overshoot_count`) exactly once, and
+    ///   (b) stamp the origin nonce onto the evidence marker as ` witness=<tok>`.
+    ///
+    /// (a) is the load-bearing binding: before this fix the detcore
+    /// log-and-continue path emitted the stderr marker but never touched the
+    /// counter, so a real detcore-level RCB overshoot could never raise the
+    /// reserved skid exit code and the retry was dead w.r.t. this path. (b) is the
+    /// human/ledger evidence path that was previously blind to detcore markers.
+    #[test]
+    fn planted_overshoot_fires_retry_counter_and_stamps_witness() {
+        let _guard = lock_skid_counter();
+
+        let clock_value = 16_249u64;
+        let delta_rcbs = 139u64;
+        let last_timer = 100u64;
+
+        // The production gate agrees this planted case is a real overshoot.
+        assert!(
+            rcb_timer_overshot(delta_rcbs, last_timer),
+            "test precondition: planted case must be a genuine overshoot",
+        );
+
+        // (b) The evidence marker carries the witness nonce when the supervisor
+        // token is present. Asserted via the split-out formatter so the exact
+        // shape is checked without capturing the supervisor's stderr.
+        let marker = format_skid_overshoot_marker(
+            delta_rcbs,
+            last_timer,
+            clock_value,
+            Some("wit-forced-nonce"),
+        );
+        assert!(marker.contains(reverie::SKID_OVERSHOOT_MARKER), "{marker}");
+        assert!(marker.contains("rcb_actual=139"), "{marker}");
+        assert!(marker.contains("rcb_target=100"), "{marker}");
+        assert!(marker.contains("overshoot=39"), "{marker}");
+        assert!(marker.contains("clock_value=16249"), "{marker}");
+        assert!(marker.contains("witness=wit-forced-nonce"), "{marker}");
+
+        // (a) The retry-authenticating counter fires exactly once per detected
+        // overshoot. Drain residue first so the assertion is order-independent.
+        let _ = reverie::take_skid_overshoot_count();
+        report_rcb_overshoot(false, clock_value, delta_rcbs, last_timer);
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            1,
+            "a planted detcore overshoot must increment the retry-authenticating \
+             counter exactly once",
+        );
+    }
+
+    /// NEGATIVE control (plant a non-overshoot). When delta_rcbs <= last_timer the
+    /// production gate `rcb_timer_overshot` is false, so the call site never
+    /// invokes `report_rcb_overshoot`; mirroring that here, the counter must stay
+    /// 0 (no reserved exit code -> the retry cannot fire), and absent a supervisor
+    /// token the marker carries no witness field. This brackets the guard from the
+    /// other side: it proves the mechanism is not inert-firing on non-overshoots.
+    #[test]
+    fn planted_non_overshoot_neither_fires_counter_nor_stamps_witness() {
+        let _guard = lock_skid_counter();
+
+        let delta_rcbs = 100u64;
+        let last_timer = 100u64;
+
+        // The gate refuses: an exact hit is not an overshoot, so production does
+        // NOT call report_rcb_overshoot on this path.
+        assert!(
+            !rcb_timer_overshot(delta_rcbs, last_timer),
+            "test precondition: planted case must NOT be an overshoot",
+        );
+
+        // Because the gate is false, report_rcb_overshoot is intentionally NOT
+        // invoked here (calling it would plant the wrong condition). The counter
+        // therefore stays 0 and no retry can be authenticated.
+        let _ = reverie::take_skid_overshoot_count();
+        assert_eq!(
+            reverie::take_skid_overshoot_count(),
+            0,
+            "no overshoot -> counter stays 0 -> the skid-gated retry cannot fire",
+        );
+
+        // And with no supervisor token, even the marker text carries no witness.
+        let marker = format_skid_overshoot_marker(delta_rcbs, last_timer, 16_249, None);
+        assert!(!marker.contains("witness="), "{marker}");
     }
 }
 
