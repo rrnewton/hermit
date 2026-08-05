@@ -141,6 +141,8 @@ SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
+IGNORE_CACHE=0
+[[ ${VALIDATE_IGNORE_CACHE:-0} == 1 ]] && IGNORE_CACHE=1
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -189,6 +191,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ONLY_MODE=1; shift 3 ;;
         --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
+        --ignore-cache) IGNORE_CACHE=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -240,6 +243,12 @@ Other options:
                    the `locally-validated` label.
   --label-pr       Publish a receipt and label the PR after a full green (default).
   --no-label-pr    Disable the non-fatal receipt publication and label update.
+  --ignore-cache   Force a real run even when the run-ledger already holds a clean
+                   PASS for this exact TREE (commit content, submodule pins) on
+                   this host+toolchain. By default such a run is announced as a
+                   CACHE HIT and skipped -- the fastest validate is the one you do
+                   not run. The key is the tree, not the commit SHA, so a rebase
+                   or amend that leaves file content identical still hits.
   -h, --help       Show this help and exit.
 
 Environment:
@@ -251,6 +260,7 @@ Environment:
   CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
+  VALIDATE_IGNORE_CACHE=1                        Same as --ignore-cache (force a real run).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -375,6 +385,20 @@ if [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
     VALIDATION_LEDGER_FILE="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
 fi
 VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf "unknown")
+# Content-addressed identity of exactly what validate builds and tests: the root
+# tree object. It hashes the tracked file content AND the submodule gitlink SHAs
+# (gitlinks are tree entries), so a reverie/liteinst2 pin change still changes the
+# tree. It does NOT vary with commit metadata (message, author/committer,
+# timestamp, parent), so a rebase or amend that leaves file content byte-identical
+# yields the SAME tree. This -- not the commit SHA -- is the result-cache key,
+# because a SHA key would miss exactly during a drain when the lander re-anchors
+# or rebases a commit whose tree never changed. The commit is still recorded (the
+# lander's landing predicate joins on it), but the cache dereferences the tree.
+VALIDATION_TREE=$(git rev-parse "HEAD^{tree}" 2>/dev/null || printf "unknown")
+# Record the Rust toolchain so a cache hit keyed on the TREE can also require a
+# matching build environment. The tree pins source and submodules, but not the
+# compiler; a result produced by a different rustc is not safely reusable.
+VALIDATION_TOOLCHAIN=$(rustc --version 2>/dev/null || printf "unknown")
 VALIDATION_GIT_DEPTH=$(git rev-list --count HEAD 2>/dev/null || printf "0")
 VALIDATION_GIT_AHEAD=0
 VALIDATION_GIT_BEHIND=0
@@ -429,7 +453,8 @@ else
     VALIDATION_SELECTION_MODE=full
 fi
 readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
-readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
+readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_TREE
+readonly VALIDATION_TOOLCHAIN VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
 readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
 readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
@@ -455,6 +480,122 @@ if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
         git status --short 2>/dev/null | sed 's/^/    /'
     } >&2
     exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Tree-keyed result cache. The run-ledger written by append_validation_ledger is
+# the single source of truth: this reads exactly what validate writes and what
+# the lander consumes -- one store, never a second. A clean, commit-anchored,
+# FULL run whose exact TREE already has a PASS record on THIS host+toolchain is
+# reused -- announced LOUDLY (never a silent skip that could be mistaken for a
+# fresh pass) and exited 0 without running a single gate. --ignore-cache /
+# VALIDATE_IGNORE_CACHE=1 forces a real run.
+#
+# Why the key is the TREE, not the commit SHA:
+#   The tree is the content-addressed identity of what actually gets built and
+#   tested (tracked files + submodule gitlink SHAs). The commit SHA additionally
+#   varies with metadata that does not affect the build -- committer timestamp,
+#   message, parent. During a drain the lander re-anchors/rebases commits whose
+#   tree never changed; a SHA key would MISS on byte-identical content and pay a
+#   full run, which is exactly when caching matters most. A tree key hits.
+#
+# Why a hit is SOUND (each condition is checked against the stored record, not
+# assumed -- this is what the first cut of this feature got wrong: it reused a
+# bare PASS without confirming the run had actually executed anything):
+#   tree match            -> the built+tested content is identical.
+#   commit_anchored,
+#     tree not dirty      -> the record described a real HEAD, not a WIP tree.
+#   result == pass,
+#     failures == 0       -> nothing failed.
+#   executed_tests > 0    -> a green must carry a NONZERO executed-test count; a
+#                            "test result: ok" with zero executed tests is a
+#                            no-result and must never satisfy a run.
+#   gates_run >=
+#     gates_expected      -> full gate coverage, not a partial run.
+#   selection_mode == full-> a selective/only record covered only a subset.
+#   host + toolchain      -> the tree pins neither the compiler nor the box.
+# Because old (pre-tree) records carry no `tree` field they can never hit, so the
+# cache warms forward and never serves a result from an unverifiable environment.
+# A prior FAIL for the tree does NOT skip: it may be flaky/environmental, and only
+# a PASS satisfies the landing predicate, so we note it and run. This gate runs
+# before the tmp dir and EXIT trap (like the dirty-tree gate above), so a hit
+# leaves no partial state and appends no derived record.
+function human_hms {
+    local s=$1 h m
+    [[ $s =~ ^[0-9]+$ ]] || s=0
+    h=$((s / 3600)); m=$(((s % 3600) / 60))
+    if ((h > 0)); then printf '%dh%02dm%02ds' "$h" "$m" "$((s % 60))"
+    else printf '%dm%02ds' "$m" "$((s % 60))"; fi
+}
+
+# Emit the newest fully-qualifying ledger record with result==$1 for the current
+# TREE/profile/host/toolchain as TSV
+# "finished_at<TAB>real_seconds<TAB>cpu_seconds<TAB>executed_tests<TAB>commit",
+# or nothing. Bounded by a pre-grep on the tree hash so the whole ledger is not
+# slurped. Fail-open (prints nothing) when jq or the ledger is unavailable, so a
+# missing tool can never manufacture a false hit. For a pass, every reuse
+# condition -- including a nonzero executed-test count and full gate coverage --
+# is verified here; a record that does not carry them is not a hit.
+function cache_lookup_record {
+    local want_result=$1 ledger=$VALIDATION_LEDGER_FILE
+    [[ -n $ledger && -f $ledger ]] || return 0
+    [[ $VALIDATION_TREE != unknown ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    grep -F "\"tree\":\"$VALIDATION_TREE\"" "$ledger" 2>/dev/null \
+        | jq -rs --arg tree "$VALIDATION_TREE" --arg prof "$VALIDATION_PROFILE" \
+              --arg host "$VALIDATION_HOST" --arg tc "$VALIDATION_TOOLCHAIN" \
+              --arg res "$want_result" '
+            map(select(
+                (.tree // "") == $tree
+                and .commit_anchored == true and (.tree_dirty | not)
+                and .result == $res and .profile == $prof
+                and .selection_mode == "full"
+                and .host == $host and (.toolchain // "") == $tc
+                and (
+                    $res != "pass"
+                    or (
+                        (.failures == 0)
+                        and (.executed_tests != null) and (.executed_tests > 0)
+                        and (.gates_expected == null
+                             or (.gates_run != null and .gates_run >= .gates_expected))
+                    )
+                )))
+            | sort_by(.finished_at) | last
+            | if . == null then empty
+              else [ .finished_at,
+                     (.real_seconds // 0 | tostring),
+                     ((.user_seconds // 0) + (.sys_seconds // 0) | tostring),
+                     (.executed_tests // 0 | tostring),
+                     (.commit // "unknown")
+                   ] | @tsv
+              end' 2>/dev/null
+}
+
+if ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
+   && [[ $VALIDATION_SELECTION_MODE == full && $VALIDATION_TREE != unknown ]]; then
+    cache_hit_tsv=$(cache_lookup_record pass)
+    if [[ -n $cache_hit_tsv ]]; then
+        IFS=$'\t' read -r hit_when hit_wall hit_cpu hit_tests hit_commit <<<"$cache_hit_tsv"
+        printf '# ============================================================\n'
+        printf '# validate CACHE HIT for tree %s\n' "$VALIDATION_TREE"
+        printf '#   (commit %s)\n' "$VALIDATION_COMMIT"
+        printf '#   passed %s (wall %s, CPU %s, %s tests executed)\n' \
+            "$hit_when" "$(human_hms "${hit_wall:-0}")" "$(human_hms "${hit_cpu:-0}")" "${hit_tests:-0}"
+        printf '#   from a run of commit %s -- use --ignore-cache to force a real run\n' "${hit_commit:-unknown}"
+        printf '#   profile=%s host=%s toolchain=%s\n' \
+            "$VALIDATION_PROFILE" "$VALIDATION_HOST" "$VALIDATION_TOOLCHAIN"
+        printf '#   NO gates ran this invocation; reused a clean, commit-anchored\n'
+        printf '#   passing record (>0 executed tests, full gate coverage) from the\n'
+        printf '#   run-ledger (%s).\n' "$VALIDATION_LEDGER_FILE"
+        printf '# ============================================================\n'
+        exit 0
+    fi
+    cache_fail_tsv=$(cache_lookup_record fail)
+    if [[ -n $cache_fail_tsv ]]; then
+        IFS=$'\t' read -r fail_when _ _ _ _ <<<"$cache_fail_tsv"
+        printf '# validate: tree %s has a prior FAIL record (%s) on this host+toolchain; running anyway (a fail may be flaky/environmental). Only a PASS satisfies the landing predicate.\n' \
+            "$VALIDATION_TREE" "$fail_when" >&2
+    fi
 fi
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -487,13 +628,50 @@ fi
 CI_DAG_JOBS_DEFAULT=$((host_cpus / 8))
 ((CI_DAG_JOBS_DEFAULT < 2)) && CI_DAG_JOBS_DEFAULT=2
 ((CI_DAG_JOBS_DEFAULT > 16)) && CI_DAG_JOBS_DEFAULT=16
+VALIDATION_DAG_JOBS=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
+if [[ ! $VALIDATION_DAG_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: CI_DAG_JOBS must be a positive integer" >&2
+    exit 2
+fi
+
+# Gate-count obligation for landing-eligible `full` runs, DERIVED from what the
+# run actually executed rather than a hardcoded number, so it can never go stale
+# as gates are added or removed. `run_check` is not fail-fast: a `full` run that
+# reaches the end of `run_full_suite` has recorded EVERY gate in its plan exactly
+# once (the preflight submodule + Reverie-pin checks, then the portable and
+# privileged manifest lanes). We therefore DEFER the expected count to
+# ledger-write time and set it to the observed `gates_run` -- but ONLY once
+# VALIDATION_SUITE_COMPLETE proves the whole plan ran. An incomplete `full` run
+# (e.g. a preflight abort) leaves the flag 0 and the count `null`, so the outcome
+# authority applies no completeness check and can never misread a partial run as a
+# complete FAILED one.
+#
+# The prior literal `5` predated the unconditional "Reverie pin consistency"
+# preflight gate: every complete full run then recorded 6 gates while declaring 5,
+# so the shared authority read gates_run(6) != expected(5) as TRUNCATED. A genuine
+# full red could never be recorded as FAILED, and a genuine full green was
+# discarded from the qualified population. A magic `6` would drift again on the
+# next gate change (which is exactly how the `5` went stale); deriving from the
+# executed set removes the drift class entirely.
+#
+# Partial/custom profiles stay `null`: they carry no full-landing contract (a
+# single constant cannot be correct for `full` and, e.g.,
+# `portable-strict-compat-only`, whose plans have different gate counts -- that
+# divergence is itself the proof the value must be derived, not hardcoded). The
+# authority treats gates_run < expected (and, in the classifier, run != expected)
+# as TRUNCATED, never FAILED.
+VALIDATION_SUITE_COMPLETE=0
+VALIDATION_GATES_EXPECTED_JSON=null
 
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
     exit 2
 fi
-readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT VALIDATION_DAG_JOBS
+# VALIDATION_GATES_EXPECTED_JSON / VALIDATION_SUITE_COMPLETE are intentionally NOT
+# readonly here: the expected count is derived at ledger-write time from the
+# gates actually executed, and the completion flag is set by run_full_suite.
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -529,13 +707,9 @@ readonly VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
 
 checks=0
 failures=0
+# The signal trap sets this before EXIT cleanup writes the ledger. An explicit
+# operator stop is a NO-RESULT regardless of how many gates happened to finish.
 VALIDATION_INTERRUPTION_SIGNAL=""
-# A full run has one repository-initialization gate plus two gates for each of
-# the portable and privileged lanes (manifest validation + lane execution).
-# Carry the planned count in the producer so an interrupted 2/5 run can never
-# masquerade as a completed product failure.
-VALIDATION_GATES_EXPECTED=0
-[[ $VALIDATION_PROFILE == full ]] && VALIDATION_GATES_EXPECTED=5
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -554,6 +728,7 @@ declare -a background_duration_files=()
 declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
+VALIDATION_CONCURRENCY_MONITOR_PID=""
 
 mkdir -p "$ROOT_DIR/target/validation"
 VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
@@ -562,6 +737,8 @@ if [[ -z $VALIDATION_TMP_DIR ]]; then
     exit 1
 fi
 readonly VALIDATION_TMP_DIR
+VALIDATION_CONCURRENT_MARKER="$VALIDATION_TMP_DIR/concurrent-validate-observed"
+readonly VALIDATION_CONCURRENT_MARKER
 export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
@@ -1000,6 +1177,56 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Observe overlapping top-level validate process groups for the whole run. A
+# point-in-time count at start or finish misses a validate that starts and ends
+# in the middle; the one-second monitor leaves a durable marker for this receipt.
+# Subshells of this validate share its process group and are excluded, so a gate
+# invoking another validate.sh internally cannot forge concurrency.
+function start_validation_concurrency_monitor {
+    local root_pid=$$ root_pgid
+    root_pgid=$(ps -o pgid= -p "$root_pid" 2>/dev/null | tr -d ' ')
+    [[ $root_pgid =~ ^[0-9]+$ ]] || return 0
+    if [[ ${CI_HUB_VALIDATE_CONCURRENT:-} == true ]]; then
+        printf '1\n' >"$VALIDATION_CONCURRENT_MARKER"
+    fi
+    (
+        while kill -0 "$root_pid" 2>/dev/null; do
+            local count previous=0
+            count=$(ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
+                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { seen[$1]=1 }
+                END { print length(seen) }
+            ')
+            [[ $count =~ ^[0-9]+$ ]] || count=0
+            if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+                previous=$(<"$VALIDATION_CONCURRENT_MARKER")
+                [[ $previous =~ ^[0-9]+$ ]] || previous=0
+            fi
+            if ((count > previous)); then
+                printf '%s\n' "$count" >"$VALIDATION_CONCURRENT_MARKER"
+            fi
+            sleep 1
+        done
+    ) &
+    VALIDATION_CONCURRENCY_MONITOR_PID=$!
+}
+
+# Prove that this shell is a descendant of the live process-bound validate-lock
+# owner. Merely setting an environment variable is not enough: the owner sidecar
+# must name the same PID, and that PID must occur in this process's ancestry.
+function validate_lock_exclusivity_proven {
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
+    local recorded_pid current=$$
+    [[ $owner_pid =~ ^[1-9][0-9]*$ && -r $owner_file ]] || return 1
+    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
+    [[ $recorded_pid == "$owner_pid" ]] || return 1
+    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
+        [[ $current == "$owner_pid" ]] && return 0
+        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
+    done
+    return 1
+}
+
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
 # are computed once by the caller (cleanup) in the top-level shell so they match
 # the human summary exactly and so the `times` builtin sees the accumulated child
@@ -1009,7 +1236,11 @@ function append_validation_ledger {
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json gates_expected_json=null
+    local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
+    local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
+    local known_flaky_failure_json=null solo_rerun_confirmation_json=false
+    local solo_rerun_of_json=null
+    local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
     local i
 
@@ -1022,11 +1253,41 @@ function append_validation_ledger {
     else
         raw_result=fail
     fi
-    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]] || \
-       ((VALIDATION_GATES_EXPECTED > 0 && checks < VALIDATION_GATES_EXPECTED)); then
-        result=truncated
+    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
+        # An operator stop learned nothing about the product. Preserve the raw
+        # shell result for forensics, but never mint a FAILED product verdict.
+        result=no_result
     else
         result=$raw_result
+    fi
+
+    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
+        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+        concurrency_proof_json='"process_group_overlap_monitor"'
+    elif validate_lock_exclusivity_proven; then
+        concurrent_validates_json=0
+        concurrency_proof_json='"validate_lock_owner_ancestry"'
+    else
+        # A bare run with no observed peer is UNKNOWN, not proven exclusive.
+        concurrent_validates_json=null
+        concurrency_proof_json=null
+    fi
+
+    evidence_helper="$DEV_HERMIT_PARENT/ci-hub/validate/failure_evidence.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $evidence_helper ]] \
+        && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        if evidence_json=$(python3 "$evidence_helper" --log "$LOG_FILE" \
+            --ledger "$VALIDATION_LEDGER_FILE" --commit "$VALIDATION_COMMIT" \
+            --dag-jobs "$VALIDATION_DAG_JOBS" \
+            --concurrent-validates "$concurrent_validates_json" 2>>"$LOG_FILE"); then
+            failed_substeps_json=$(jq -c '.failed_substeps' <<<"$evidence_json")
+            flaky_failed_substeps_json=$(jq -c '.flaky_failed_substeps' <<<"$evidence_json")
+            known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
+            solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
+            solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
+            evidence_available=1
+        fi
     fi
 
     gates_json='['
@@ -1040,15 +1301,38 @@ function append_validation_ledger {
         gates_json+="{\"name\":$(json_quote "${ledger_gate_names[i]}"),"
         gates_json+="\"result\":\"$gate_result\","
         gates_json+="\"exit_code\":${ledger_gate_statuses[i]},"
-        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
+        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}"
+        if ((ledger_gate_statuses[i] != 0)); then
+            failure_origin_json=null
+            gate_substeps_json='[]'
+            if ((evidence_available == 1)); then
+                if [[ ${ledger_gate_names[i]} == *" CI DAG lane" && $failed_substeps_json != '[]' ]]; then
+                    failure_origin_json='"lane_substep"'
+                    gate_substeps_json=$failed_substeps_json
+                else
+                    failure_origin_json='"outer_gate"'
+                fi
+            fi
+            gates_json+=",\"failure_origin\":$failure_origin_json,"
+            gates_json+="\"failed_substeps\":$gate_substeps_json"
+        fi
+        gates_json+='}'
     done
     gates_json+=']'
+    gates_run=${#ledger_gate_names[@]}
+
+    # Derive the full-run gate obligation from what actually executed (see the
+    # VALIDATION_SUITE_COMPLETE comment near the config block): a completed full
+    # plan recorded every gate exactly once, so gates_run IS the expected full
+    # coverage. This stays correct automatically as gates are added or removed,
+    # unlike the former hardcoded literal. Incomplete full runs and all partial
+    # profiles keep expected `null`, so no false completeness check is applied.
+    if [[ $VALIDATION_PROFILE == full ]] && ((VALIDATION_SUITE_COMPLETE == 1)); then
+        VALIDATION_GATES_EXPECTED_JSON=$gates_run
+    fi
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
-    if ((VALIDATION_GATES_EXPECTED > 0)); then
-        gates_expected_json=$VALIDATION_GATES_EXPECTED
-    fi
     if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
         interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
     fi
@@ -1065,25 +1349,36 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
-    # schema_version 4 adds first-class completion and interruption evidence. A
-    # stopped run records result=truncated, never fail; raw_result preserves the
-    # shell outcome without granting it product-verdict authority.
-    # schema_version 3 added commit_anchored/tree_dirty/selection_mode. The fields
-    # are additive; the parent ledger aggregator reads via .get() and is
+    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
+    # 4 adds `tree` (the content-addressed build+test identity, the result-cache
+    # key), `toolchain` (the rustc build environment the cache must match), and
+    # first-class interruption evidence. A stopped run records result=no_result,
+    # never fail; raw_result preserves the shell outcome without granting it
+    # product-verdict authority. The fields are additive; the parent ledger
+    # aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
     line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
+    line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
     line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
     line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
-    line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
+    line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"tree\":$(json_quote "$VALIDATION_TREE"),"
+    line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
-    line+="\"checks\":$checks,\"gates_run\":$checks,\"gates_expected\":$gates_expected_json,"
-    line+="\"failures\":$failures,\"interruption_signal\":$interruption_signal_json,"
+    line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
+    line+="\"concurrency_proof\":$concurrency_proof_json,"
+    line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
+    line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
+    line+="\"solo_rerun_of\":$solo_rerun_of_json,"
+    line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
+    line+="\"interruption_signal\":$interruption_signal_json,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
@@ -1190,6 +1485,11 @@ function cleanup {
 
     trap - EXIT
 
+    if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
+        kill "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+    fi
+
     if [[ -n $active_check_pid ]]; then
         kill_process_tree "$active_check_pid" TERM
     fi
@@ -1241,7 +1541,7 @@ function interrupted {
     VALIDATION_INTERRUPTION_SIGNAL=$signal
     trap - INT TERM
     trap - HUP
-    printf "⏹ Validation interrupted by %s; recording TRUNCATED, not FAILED (full log: %s)\n" \
+    printf "⏹ Validation interrupted by %s; recording NO-RESULT, not FAILED (full log: %s)\n" \
         "$signal" "$LOG_FILE"
     exit 130
 }
@@ -1249,6 +1549,7 @@ trap cleanup EXIT
 trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
+start_validation_concurrency_monitor
 
 # Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
 # real traps and ledger writer without starting a product build. The mode cannot
@@ -1549,6 +1850,53 @@ function initialize_repository_submodules {
         printf "validate.sh: rr submodule is missing\n" >&2
         return 1
     }
+}
+
+# Independent enforcement of the Reverie dependency pin. `git commit --no-verify`
+# bypasses the pre-commit hook, so validate.sh (and therefore every CI profile
+# that runs it) must catch a drifted or orphaned pin on its own. The check is
+# cheap: check-reverie-pin.rs scans tracked Cargo.toml/Cargo.lock and confirms
+# the pin is a real commit on rrnewton/reverie:main history. When the nested
+# lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
+# runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
+#
+# Run one of those checkers WITHOUT requiring the `rust-script` interpreter on
+# PATH. CI's portable shard runners install the Rust toolchain but not
+# rust-script, so invoking the checker through its `#!/usr/bin/env rust-script`
+# shebang aborts with "/usr/bin/env: 'rust-script': No such file or directory"
+# before the gate can execute at all — the gate reports FAILED having verified
+# nothing, which is a no-result masquerading as a result. Both checkers are
+# single-file, dependency-free programs whose only module is a `#[path]` include
+# under scripts/lib, so plain rustc compiles them; that is exactly what the
+# `reverie-pin` job in .github/workflows/ci-portable.yml already does for these
+# same two files. Prefer the interpreter when it is installed (the normal
+# developer path), else compile once into VALIDATION_TMP_DIR and reuse.
+function run_repo_rust_script {
+    local script=$1
+    shift
+    local -a proxy=()
+    if command -v with-proxy >/dev/null 2>&1; then
+        proxy=(with-proxy)
+    fi
+    if command -v rust-script >/dev/null 2>&1; then
+        "${proxy[@]}" "$script" "$@"
+        return
+    fi
+    local name binary
+    name=$(basename -- "$script" .rs)
+    binary="$VALIDATION_TMP_DIR/rust-script-$name"
+    if [[ ! -x $binary ]]; then
+        printf 'rust-script is not on PATH; compiling %s with rustc instead.\n' "$script"
+        rustc --edition=2021 "$script" -o "$binary" || return 1
+    fi
+    "${proxy[@]}" "$binary" "$@"
+}
+
+function validate_reverie_pin_consistency {
+    run_repo_rust_script ./scripts/check-reverie-pin.rs || return 1
+    if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
+        run_repo_rust_script ./scripts/check-nested-lockfiles.rs || return 1
+    fi
 }
 
 function start_check {
@@ -3766,11 +4114,10 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
-    run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
-        ./ci/run-dag.sh "$lane" -j "$jobs" -v
+    run_check_with_timeout "$timeout_seconds" "$lane CI DAG lane" \
+        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v
 }
 
 function run_portable_only_suite {
@@ -3880,7 +4227,7 @@ function run_selective_suite {
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
                 "portable CI DAG (selective subset)" \
-                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
+                ./ci/run-dag.sh portable -j "$VALIDATION_DAG_JOBS" -v
             rc=$?
             unset RUN_DAG_FILE_OVERRIDE
             print_summary
@@ -3992,6 +4339,10 @@ function run_quick_suite {
 function run_full_suite {
     run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
+    # Both lanes ran to completion, so every gate in the full plan has been
+    # recorded (run_check is not fail-fast). This authorizes deriving the
+    # expected gate count from the observed gates_run at ledger-write time.
+    VALIDATION_SUITE_COMPLETE=1
 }
 
 function run_portable_slow_strict_diagnostics {
@@ -4120,6 +4471,9 @@ function run_super_suite {
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
 run_check "Initialize repository submodules" initialize_repository_submodules
+# Fail fast on Reverie pin drift before any heavy build/test work. Independent of
+# the pre-commit hook, which git commit --no-verify can bypass.
+run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
     exit 1

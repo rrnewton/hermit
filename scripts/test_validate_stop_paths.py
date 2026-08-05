@@ -61,10 +61,9 @@ def run_signal(sig: signal.Signals, expect_record: bool) -> None:
         assert rc == 130, (sig.name, rc, log.read_text(errors="replace"))
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
-        assert row["result"] == "truncated", row
+        assert row["result"] == "no_result", row
         assert row["raw_result"] == "fail", row
         assert row["gates_run"] == row["checks"] == 2, row
-        assert row["gates_expected"] == 5, row
         assert row["failures"] == 0, row
         assert row["interruption_signal"] == sig.name.removeprefix("SIG"), row
 
@@ -93,8 +92,10 @@ def run_incomplete_exit() -> None:
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert len(rows) == 1, rows
         row = rows[0]
-        assert row["result"] == "truncated", row
-        assert row["gates_run"] == 2 and row["gates_expected"] == 5, row
+        # An ordinary early exit is not an operator stop. It remains a raw
+        # failure unless the producer carries an explicit interruption signal.
+        assert row["result"] == "fail", row
+        assert row["gates_run"] == 2 and row["gates_expected"] is None, row
         assert row["interruption_signal"] is None, row
 
 
@@ -103,7 +104,7 @@ def main() -> None:
         run_signal(sig, expect_record=True)
     run_signal(signal.SIGKILL, expect_record=False)
     run_incomplete_exit()
-    print("PASS: TERM/INT/HUP/incomplete-exit => TRUNCATED; KILL => no record")
+    print("PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; early exit stays fail")
 
 
 if __name__ == "__main__":
