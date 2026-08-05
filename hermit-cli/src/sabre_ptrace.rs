@@ -128,7 +128,8 @@ struct Supervisor {
     tracees: HashSet<Pid>,
     states: HashMap<Pid, TraceeState>,
     mapping_cache: HashMap<(Pid, usize), MappingClassification>,
-    /// Identity (dev+inode) of the launched SaBRe loader and plugin. Resolved
+    /// Identity (inode + canonical path) of the launched SaBRe loader and
+    /// plugin. Resolved
     /// once at construction so the exemption binds to the objects this
     /// supervisor actually started, not to whatever a mapping calls itself.
     sabre_id: Option<FileId>,
@@ -565,15 +566,26 @@ fn mapping_line(maps: &str, address: usize) -> Option<&str> {
     })
 }
 
-/// Identity of a mapped file: the `dev` and `inode` columns of
-/// `/proc/<pid>/maps`, which name the object itself rather than a path that
-/// anyone can reproduce with the same basename. `dev` is kept as the literal
-/// `major:minor` text the kernel prints so no format assumption is needed on
-/// the maps side; the launched-object side is rendered into the same form.
+/// Identity of a mapped file: its `inode` plus the canonicalized path the
+/// object resolves to. This names the object itself rather than a path anyone
+/// can reproduce with the same basename.
+///
+/// `dev` is deliberately NOT part of the identity. It looks like the obvious
+/// second component and it is the one that does not survive the comparison:
+/// `stat(2)` reports the filesystem's `st_dev`, while `/proc/<pid>/maps` prints
+/// the SUPERBLOCK device, and on btrfs those differ because every subvolume
+/// gets its own anonymous `st_dev`. Measured on one file on a btrfs developer
+/// box: `stat()` gives `st_dev = 46` (rendered `00:2e`) while the maps row for
+/// the very same mapping of that very same inode prints `00:2d`. Comparing
+/// them made the SaBRe loader unrecognisable as infrastructure, so the
+/// supervisor patched a UD0 marker into the loader's own text and the guest
+/// died with SIGSEGV. `inode` is the discriminating component and it agrees;
+/// the canonicalized path is what rules out an inode collision across
+/// filesystems, which is the only way two distinct files can share one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileId {
-    dev: String,
     inode: u64,
+    path: PathBuf,
 }
 
 /// One parsed `/proc/<pid>/maps` row: `range perms offset dev inode path`.
@@ -588,20 +600,18 @@ impl MappingEntry<'_> {
     /// identity to bind to and therefore can never match a launched object.
     fn file_id(&self) -> Option<FileId> {
         match self.inode {
-            Some(inode) if inode != 0 => Some(FileId {
-                dev: self.dev.to_owned(),
-                inode,
-            }),
+            Some(inode) if inode != 0 => {
+                // The kernel already prints an absolute, resolved path here;
+                // canonicalizing anyway keeps both sides of the comparison in
+                // the same form. A path that no longer resolves (a deleted or
+                // replaced file) yields `None`, which fails CLOSED: no identity
+                // means no match and therefore no exemption.
+                let path = fs::canonicalize(Path::new(self.path)).ok()?;
+                Some(FileId { inode, path })
+            }
             _ => None,
         }
     }
-}
-
-/// Render a `stat(2)` device number in the `major:minor` hex form used by
-/// `/proc/<pid>/maps`, so a launched object can be compared to a mapping row.
-fn maps_dev_string(dev: u64) -> String {
-    let (major, minor) = (libc::major(dev), libc::minor(dev));
-    format!("{major:02x}:{minor:02x}")
 }
 
 /// Identity of a path this supervisor launched. `None` when the file cannot be
@@ -610,9 +620,10 @@ fn maps_dev_string(dev: u64) -> String {
 fn launched_file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path).ok()?;
+    let canonical = fs::canonicalize(path).ok()?;
     Some(FileId {
-        dev: maps_dev_string(metadata.dev()),
         inode: metadata.ino(),
+        path: canonical,
     })
 }
 
@@ -701,8 +712,9 @@ fn classify_mapping(
     }
     let path = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path));
     // Bind the infrastructure exemption to the identity of the objects this
-    // supervisor actually launched (device + inode from the same
-    // `/proc/<pid>/maps` line), not to their basenames. A basename match would
+    // supervisor actually launched (inode plus canonical path, both resolved
+    // from the same `/proc/<pid>/maps` line), not to their basenames. A
+    // basename match would
     // exempt any unrelated mapping that happens to be called `sabre` or
     // `libdetcore_sabre.so`.
     let mapped = entry.file_id();
@@ -990,13 +1002,18 @@ mod tests {
     // the one combination that makes a real raw syscall vanish from evidence.
     #[test]
     fn classifies_runtime_mapping_attribution() {
-        let sabre = file_id("fd:01", 1001);
-        let plugin = file_id("fd:01", 1002);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sabre_path, sabre) = real_file(dir.path(), "sabre");
+        let (plugin_path, plugin) = real_file(dir.path(), "libdetcore_sabre.so");
 
         // The launched objects themselves: exempt and uncounted, because they
-        // ARE the measured interception path.
-        for (inode, path) in [(1001, "/opt/sabre/bin/sabre"), (1002, "/opt/hermit/x.so")] {
-            let maps = maps_row("1000-2000", "fd:01", inode, path);
+        // ARE the measured interception path. Real files, and the maps rows
+        // carry a dev that does NOT match stat() -- see the regression test.
+        for (inode, path) in [
+            (sabre.inode, sabre_path.to_str().expect("utf8")),
+            (plugin.inode, plugin_path.to_str().expect("utf8")),
+        ] {
+            let maps = maps_row("1000-2000", "00:2d", inode, path);
             let entry = mapping_entry(&maps, 0x1234).unwrap();
             assert_eq!(
                 classify_mapping(&entry, Some(&sabre), Some(&plugin)),
@@ -1064,11 +1081,14 @@ mod tests {
         classify_mapping(&entry, sabre, None)
     }
 
-    fn file_id(dev: &str, inode: u64) -> FileId {
-        FileId {
-            dev: dev.to_owned(),
-            inode,
-        }
+    /// A real file on disk, plus its identity. The synthetic-row tests below
+    /// must use REAL paths: identity is now (inode, canonicalized path), and a
+    /// fabricated path resolves to nothing and therefore matches nothing.
+    fn real_file(dir: &std::path::Path, name: &str) -> (PathBuf, FileId) {
+        let path = dir.join(name);
+        fs::write(&path, b"object").expect("write fixture");
+        let id = launched_file_id(&path).expect("fixture must have an identity");
+        (path, id)
     }
 
     // FINDING 1 -- bracketed mappings.
@@ -1106,15 +1126,89 @@ mod tests {
         }
     }
 
+    // FINDING 2, THE REAL-MAPPING TEST. The reviewer's closing requirement was
+    // "a test that would have failed today -- one exercising the real launched
+    // loader rather than a synthetic maps row", and the reason is exact: every
+    // other test here builds BOTH halves of the comparison itself, so dev and
+    // inode agree by construction and the btrfs disagreement is invisible to
+    // them by design. This one fabricates neither half. It mmaps a real file,
+    // finds the kernel's own row for that mapping in /proc/self/maps, and
+    // requires the identity derived from the maps row to equal the identity
+    // derived from stat() on the same path.
+    //
+    // On btrfs at the previous head this FAILS: stat() reports the subvolume's
+    // anonymous st_dev while maps prints the superblock's, so the two FileIds
+    // differ in `dev` despite naming one object. It passes iff identity is
+    // built from components that actually agree.
+    #[test]
+    fn a_real_mapping_and_stat_agree_on_the_same_object() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        file.write_all(&[0u8; 4096]).expect("write");
+        file.flush().expect("flush");
+        let path = file.path().to_path_buf();
+
+        // Map it, so the kernel prints a row for this exact object.
+        let fd = fs::File::open(&path).expect("open");
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED, "mmap of the fixture failed");
+        let address = mapping as usize;
+
+        let maps = fs::read_to_string("/proc/self/maps").expect("read own maps");
+        let entry = mapping_entry(&maps, address).expect("our own mapping must have a row");
+        let from_maps = entry
+            .file_id()
+            .expect("a file-backed mapping has an identity");
+        let from_stat = launched_file_id(&path).expect("the fixture must stat");
+
+        // SAFETY: `mapping` is the address mmap just returned for this length.
+        unsafe { libc::munmap(mapping, 4096) };
+
+        assert_eq!(
+            from_maps, from_stat,
+            "the identity of one object must not depend on which side of the \
+             kernel it is observed from; a mismatch here is what patched the \
+             SaBRe loader's own text and SIGSEGV'd the guest"
+        );
+    }
+
     // FINDING 2 -- infrastructure identity.
     //
-    // POSITIVE: the launched loader is recognised by its own dev+inode and is
-    // exempt without being counted, because it IS the measured path.
+    // POSITIVE, and this is the REGRESSION TEST: the launched loader is
+    // recognised even when the maps `dev` column disagrees with `stat()`.
+    // The row below deliberately carries a WRONG dev (`00:2d` against a
+    // `stat()` that will report something else), which is exactly what btrfs
+    // produces for a real file: same inode, different device, because each
+    // subvolume gets its own anonymous `st_dev` while maps prints the
+    // superblock's. Under the previous dev+inode identity this assertion
+    // FAILS -- the loader is not recognised, its text is patched with UD0, and
+    // the guest SIGSEGVs. That is the defect this test exists to catch.
     #[test]
-    fn launched_sabre_object_is_recognised_by_identity() {
-        let maps = maps_row("400000-401000", "fd:01", 4242, "/opt/hermit/rsrcs/sabre");
-        let classification = classify(&maps, 0x400010, Some(&file_id("fd:01", 4242)));
-        assert!(classification.trusted);
+    fn launched_sabre_object_is_recognised_despite_a_disagreeing_dev_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, id) = real_file(dir.path(), "sabre");
+        let maps = maps_row(
+            "400000-401000",
+            "00:2d",
+            id.inode,
+            path.to_str().expect("utf8 path"),
+        );
+        let classification = classify(&maps, 0x400010, Some(&id));
+        assert!(
+            classification.trusted,
+            "the launched loader must stay infrastructure even when the maps dev \
+             column disagrees with stat() (btrfs subvolume anon dev)"
+        );
         assert_eq!(classification.trusted_shared_object, None);
     }
 
@@ -1122,8 +1216,22 @@ mod tests {
     // identity must NOT inherit the exemption. This is the planted bypass.
     #[test]
     fn same_basename_different_object_is_refused() {
-        let maps = maps_row("500000-501000", "fd:01", 9999, "/tmp/attacker/sabre");
-        let classification = classify(&maps, 0x500010, Some(&file_id("fd:01", 4242)));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, known) = real_file(dir.path(), "sabre");
+        let attacker = dir.path().join("attacker");
+        fs::create_dir(&attacker).expect("mkdir");
+        let (impostor_path, impostor) = real_file(&attacker, "sabre");
+        assert_ne!(
+            known.inode, impostor.inode,
+            "fixtures must be distinct files"
+        );
+        let maps = maps_row(
+            "500000-501000",
+            "fd:01",
+            impostor.inode,
+            impostor_path.to_str().expect("utf8 path"),
+        );
+        let classification = classify(&maps, 0x500010, Some(&known));
         assert!(
             !classification.trusted,
             "basename `sabre` must not exempt a different object"
@@ -1135,7 +1243,14 @@ mod tests {
     // identity must withhold the exemption (fail closed) rather than grant it.
     #[test]
     fn unknown_launched_identity_grants_no_exemption() {
-        let maps = maps_row("400000-401000", "fd:01", 4242, "/opt/hermit/rsrcs/sabre");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, id) = real_file(dir.path(), "sabre");
+        let maps = maps_row(
+            "400000-401000",
+            "fd:01",
+            id.inode,
+            path.to_str().expect("utf8 path"),
+        );
         let classification = classify(&maps, 0x400010, None);
         assert!(
             !classification.trusted,
@@ -1154,7 +1269,9 @@ mod tests {
             77,
             "/usr/lib64/libc.so.6",
         );
-        let classification = classify(&maps, 0x7f0000000010, Some(&file_id("fd:01", 4242)));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, known) = real_file(dir.path(), "sabre");
+        let classification = classify(&maps, 0x7f0000000010, Some(&known));
         assert!(classification.trusted);
         assert_eq!(
             classification.trusted_shared_object,
