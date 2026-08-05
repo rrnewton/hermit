@@ -634,6 +634,39 @@ EOF
         die "merge-gate must inspect the exact PR head"
     grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
         die "merge-gate must run the canonical live-query checker on the exact PR head"
+
+    # The trusted target resolver is the only identity authority for this job.
+    # Exercise its positive and negative brackets with a PATH that provably
+    # lacks gh, then reject workflow drift that reintroduces the executable.
+    (
+        local node_bin isolated_node_path
+        node_bin=$(command -v node)
+        isolated_node_path=$(mktemp -d)
+        trap 'rm -rf -- "$isolated_node_path"' EXIT
+        ln -s "$node_bin" "$isolated_node_path/node"
+        if PATH="$isolated_node_path:/usr/bin:/bin" command -v gh >/dev/null 2>&1; then
+            die "isolated target-resolver PATH unexpectedly contains gh"
+        fi
+        EXPECT_GH_ABSENT=1 PATH="$isolated_node_path:/usr/bin:/bin" \
+            "$node_bin" "$ROOT_DIR/ci/test-resolve-reverie-pin-targets.cjs"
+    )
+
+    local reverie_pin_job
+    reverie_pin_job=$(sed -n '/^  reverie-pin:/,/^  merge-gate:/p' "$merge_workflow")
+    ! grep -Eq '(^|[[:space:]])gh([[:space:]]|$)' <<<"$reverie_pin_job" ||
+        die "reverie-pin merge-gate job must not depend on the gh executable"
+    [[ $(grep -Fxc '        uses: actions/github-script@v7' <<<"$reverie_pin_job") == 1 ]] ||
+        die "reverie-pin job must use one authenticated GitHub-script resolver"
+    grep -Fq 'resolver-source/ci/resolve-reverie-pin-targets.cjs' <<<"$reverie_pin_job" ||
+        die "reverie-pin job must load the exact resolver source as data"
+    local resolver_digest
+    resolver_digest=$(sha256sum "$ROOT_DIR/ci/resolve-reverie-pin-targets.cjs" | cut -d' ' -f1)
+    grep -Fq "const expectedDigest = '$resolver_digest';" <<<"$reverie_pin_job" ||
+        die "reverie-pin workflow must bind the exact resolver source digest"
+    grep -Fq 'loaded._compile(source, resolverPath);' <<<"$reverie_pin_job" ||
+        die "reverie-pin workflow must execute the same resolver bytes it hashed"
+    grep -Fq "done < <(jq -r '.[] | [.number, .headSha] | @tsv'" <<<"$reverie_pin_job" ||
+        die "reverie-pin job must inspect every resolver-bound exact head"
 }
 
 function dag_critical_path_seconds {
