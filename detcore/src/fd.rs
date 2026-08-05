@@ -99,6 +99,21 @@ pub struct TimerfdState {
     pub pending_expirations: u64,
 }
 
+/// Snapshot of the virtualization fields [`DetFd::set_timerfd_host_owned`]
+/// destroys.
+///
+/// A handover happens BEFORE the authoritative readiness probe, so the answer
+/// the guest receives is computed against the host arming it will actually
+/// observe. A probe that then FAILS must therefore not leave the descriptor
+/// permanently host-owned: Linux does not change timer ownership because a
+/// `select` returned `EBADF`. This is what is needed to put it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimerfdVirtualization {
+    state: Option<TimerfdState>,
+    virtual_reader: Option<DetTid>,
+    parked_deadline: Option<LogicalTime>,
+}
+
 /// Deterministic file descriptor
 ///
 /// Notice `statbuf` can be cached here, this is because
@@ -568,6 +583,26 @@ impl DetFd {
         true
     }
 
+    /// Capture the virtualization state so a failed probe can restore it.
+    pub(crate) fn timerfd_virtualization(&self) -> TimerfdVirtualization {
+        let description = self.description();
+        TimerfdVirtualization {
+            state: description.timerfd,
+            virtual_reader: description.timerfd_virtual_reader,
+            parked_deadline: description.timerfd_parked_deadline,
+        }
+    }
+
+    /// Undo a handover: return the descriptor to virtual-time service with the
+    /// exact state it had before. The caller owns the paired host-side disarm.
+    pub(crate) fn restore_timerfd_virtualization(&self, saved: &TimerfdVirtualization) {
+        let mut description = self.description();
+        description.timerfd_host_owned = false;
+        description.timerfd = saved.state;
+        description.timerfd_virtual_reader = saved.virtual_reader;
+        description.timerfd_parked_deadline = saved.parked_deadline;
+    }
+
     /// Claim this `timerfd` for `dettid` as its single virtual-time reader.
     ///
     /// Returns `false` when another thread already holds the claim, which makes
@@ -633,6 +668,77 @@ mod tests {
         );
         detfd.init_timerfd(libc::CLOCK_MONOTONIC);
         detfd
+    }
+
+    /// FIRES: a revoked handover restores EXACTLY the virtualization state the
+    /// transfer destroyed, so a rejected `select` leaves timer ownership as it
+    /// found it -- Linux does not re-own a timer because a syscall returned
+    /// `EBADF`.
+    #[test]
+    fn a_revoked_handover_restores_virtual_ownership() {
+        let detfd = timerfd(9);
+        let owner = DetTid::from_raw(10);
+        let state = detfd.timerfd_state().expect("modeled timerfd");
+        detfd.set_timerfd_state(TimerfdState {
+            pending_expirations: 2,
+            interval_ns: 1_000,
+            ..state
+        });
+        assert!(detfd.claim_timerfd_virtual_reader(owner));
+        detfd.set_timerfd_parked_deadline(Some(LogicalTime::from_nanos(4_242)));
+
+        let before = detfd.timerfd_virtualization();
+        assert!(
+            detfd.set_timerfd_host_owned(),
+            "precondition: transfer fires"
+        );
+        assert!(detfd.timerfd_host_owned());
+        assert_eq!(
+            detfd.timerfd_virtualization().virtual_reader,
+            None,
+            "precondition: the transfer really did destroy the reader claim, so \
+             the restore below is not vacuous"
+        );
+
+        detfd.restore_timerfd_virtualization(&before);
+
+        assert!(
+            !detfd.timerfd_host_owned(),
+            "a revoked handover must return the descriptor to virtual service"
+        );
+        assert_eq!(
+            detfd.timerfd_virtualization(),
+            before,
+            "every field the transfer destroyed must come back, not just the flag"
+        );
+        assert_eq!(
+            detfd.timerfd_state().map(|st| st.pending_expirations),
+            Some(2),
+            "owed expirations survive a rejected call"
+        );
+    }
+
+    /// REFUSES: a handover that is NOT revoked stays in force. Without this the
+    /// test above would pass against an implementation that simply never
+    /// transfers, which would defeat the ordering fix it exists to protect.
+    #[test]
+    fn a_committed_handover_is_not_silently_undone() {
+        let detfd = timerfd(9);
+        assert!(detfd.claim_timerfd_virtual_reader(DetTid::from_raw(10)));
+
+        let _before = detfd.timerfd_virtualization();
+        assert!(detfd.set_timerfd_host_owned());
+
+        assert!(
+            detfd.timerfd_host_owned(),
+            "a successful probe keeps the descriptor host-owned; only an \
+             explicit revoke may put it back"
+        );
+        assert_eq!(
+            detfd.timerfd_virtualization().virtual_reader,
+            None,
+            "the reader claim stays cleared while the host owns the timer"
+        );
     }
 
     /// FIRES then REFUSES, on real descriptor state: a carried expiration count
@@ -709,8 +815,16 @@ mod tests {
         assert!(!detfd.claim_timerfd_virtual_reader(DetTid::from_raw(12)));
     }
 
-    /// The latch is one-way and clears the virtual-read bookkeeping, so a
-    /// descriptor cannot drift back to virtual time mid-run.
+    /// The latch is one-way with respect to DRIFT: nothing in ordinary
+    /// operation returns a descriptor to virtual time, and the transfer clears
+    /// the virtual-read bookkeeping as it goes.
+    ///
+    /// The single exception is an explicit revoke of a handover whose probe
+    /// then failed (`restore_timerfd_virtualization`), which exists so a
+    /// REJECTED syscall does not permanently change timer ownership. That is a
+    /// deliberate undo of a transfer that should never have been observed, not
+    /// drift, and it is bracketed by `a_revoked_handover_restores_virtual_ownership`
+    /// and `a_committed_handover_is_not_silently_undone`.
     #[test]
     fn host_ownership_latches_once_and_is_permanent() {
         let detfd = timerfd(3);

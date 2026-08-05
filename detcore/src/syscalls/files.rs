@@ -152,6 +152,14 @@ fn timerfd_hand_back_it_value_ns(remaining_ns: u64, deadline: Option<LogicalTime
 /// a scatter list.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#1169)
+/// A timerfd handover that can still be undone.
+///
+/// Empty when nothing was transferred, which is the overwhelmingly common case
+/// and costs nothing to carry.
+pub(super) struct TimerfdHandover {
+    saved: Vec<(RawFd, crate::fd::TimerfdVirtualization)>,
+}
+
 fn read_first_iovec<'a, G, T>(
     guest: &mut G,
     call: &syscalls::Readv,
@@ -2698,6 +2706,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// once no matter which syscall drains it.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#1169)
+    /// Read the owed expiration count WITHOUT consuming it.
+    ///
+    /// Consumption must be committed only after a successful copyout: a call
+    /// rejected for a short buffer or a faulting destination has to leave the
+    /// debt owed to the next reader, exactly as Linux does.
+    fn timerfd_peek_pending_expirations<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<u64, Error> {
+        Ok(guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.timerfd_state().map_or(0, |st| st.pending_expirations)
+        })?)
+    }
+
     fn timerfd_take_pending_expirations<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2706,6 +2729,77 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.take_timerfd_pending_expirations())?)
+    }
+
+    /// Hand back every virtual-time descriptor BEFORE an operation that will
+    /// either observe readiness or fail, keeping enough state to undo it.
+    ///
+    /// Ordering matters and is the whole point. The readiness a probe returns
+    /// must be computed against the host arming the guest will actually
+    /// observe, so the transfer has to precede the probe -- a re-arm afterwards
+    /// cannot retro-correct an answer already computed and returned. But a
+    /// probe that FAILS must not change timer ownership, because Linux does not
+    /// re-own a timer just because `select` returned `EBADF`. Those two
+    /// requirements are only jointly satisfiable if the transfer is revocable,
+    /// which is what this returns.
+    pub(super) async fn timerfd_hand_back_all_revocable<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: &str,
+    ) -> Result<TimerfdHandover, Error> {
+        if !self.timerfd_mode_virtualized() || !guest.thread_state().has_virtualizable_timerfd() {
+            return Ok(TimerfdHandover { saved: Vec::new() });
+        }
+        let fds = guest.thread_state().virtualizable_timerfds();
+        let mut saved = Vec::with_capacity(fds.len());
+        for fd in &fds {
+            // Snapshot BEFORE the transfer mutates the description.
+            if let Ok(before) = guest
+                .thread_state()
+                .with_detfd(*fd, |detfd| detfd.timerfd_virtualization())
+            {
+                saved.push((*fd, before));
+            }
+        }
+        self.timerfd_hand_back_polled_fds(guest, &fds, reason)
+            .await?;
+        Ok(TimerfdHandover { saved })
+    }
+
+    /// Undo a revocable handover after the operation it preceded failed.
+    ///
+    /// Disarms each host timer and restores the virtual state captured before
+    /// the transfer, so a rejected syscall leaves timer semantics exactly as it
+    /// found them.
+    pub(super) async fn timerfd_revoke_handover<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        handover: TimerfdHandover,
+        reason: &str,
+    ) -> Result<(), Error> {
+        for (fd, saved) in &handover.saved {
+            // A zeroed `itimerspec` is Linux's spelling of "disarm"; the
+            // descriptor goes back to being driven by virtual time, and the
+            // kernel's expiration counter (which the transfer had reset to
+            // zero) is discarded along with the arming. No expiration is lost:
+            // the restored state still carries everything accrued up to now,
+            // and no guest code ran in between to observe the host arming.
+            let disarm = libc::itimerspec {
+                it_interval: ns_to_timerfd_timespec(0),
+                it_value: ns_to_timerfd_timespec(0),
+            };
+            self.timerfd_settime_on_host(guest, *fd, &disarm).await?;
+            guest
+                .thread_state()
+                .with_detfd(*fd, |detfd| detfd.restore_timerfd_virtualization(saved))?;
+            detlog!(
+                "[dtid {}] timerfd fd={} handover REVOKED ({}); the failed call left ownership unchanged",
+                guest.thread_state().dettid,
+                fd,
+                reason,
+            );
+        }
+        Ok(())
     }
 
     /// Hand back every descriptor still served from virtual time.
@@ -3005,13 +3099,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             // older than anything the kernel has counted since — and only then
             // defer to the host. No double counting: the kernel started from
             // zero at the handover.
-            let owed = self.timerfd_take_pending_expirations(guest, call.fd())?;
+            // PEEK, do not take: the count must survive a rejected call. Taking
+            // first meant `read(fd, buf, 4)` returned EINVAL having already
+            // discarded the owed expirations, so the guest lost them with no
+            // way to observe that it had. Mirrors the readv path below, which
+            // commits only once the destination is known good.
+            let owed = self.timerfd_peek_pending_expirations(guest, call.fd())?;
             if owed > 0 {
                 if call.len() < EXPIRATION_BYTES {
                     return Err(Errno::EINVAL.into());
                 }
                 let buf = call.buf().ok_or(Errno::EFAULT)?;
                 guest.memory().write_exact(buf, &owed.to_ne_bytes())?;
+                // Copyout committed; only now is the debt actually consumed.
+                let taken = self.timerfd_take_pending_expirations(guest, call.fd())?;
+                debug_assert_eq!(
+                    taken, owed,
+                    "no guest code runs between the peek and the take, so the debt cannot move"
+                );
                 detlog!(
                     "[dtid {}] timerfd read(fd={}) => {} expiration(s) carried across the host handover",
                     guest.thread_state().dettid,

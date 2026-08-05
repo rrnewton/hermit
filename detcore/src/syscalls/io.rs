@@ -555,12 +555,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         // require fewer bytes than a userspace calculation predicts. Keep those calls
         // under kernel ownership rather than over-reading the guest bitmap.
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
-            let result = self
+            // The kernel owns the wait, so it must own the timers before that
+            // wait starts: a blocking wake decided by the pre-handoff host
+            // arming cannot be corrected by re-arming after it returns.
+            let handover = self
+                .timerfd_hand_back_all_revocable(guest, "pselect6 (kernel-owned fd set)")
+                .await?;
+            match self
                 .record_or_replay_blocking(guest, Syscall::Pselect6(call))
-                .await?;
-            self.timerfd_hand_back_all(guest, "pselect6 (kernel-owned fd set)")
-                .await?;
-            return Ok(result);
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    self.timerfd_revoke_handover(
+                        guest,
+                        handover,
+                        "pselect6 (kernel-owned fd set rejected)",
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
@@ -788,22 +803,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_usec == 0) {
             // A zero timeout is a pure non-blocking poll; the kernel can service
-            // it directly. It IS a readiness query, so transfer once it succeeds.
-            let result = guest.inject(call).await?;
-            self.timerfd_hand_back_all(guest, "select (zero-timeout probe)")
+            // it directly. It IS a readiness query, so the answer must be
+            // computed against the host arming the guest will actually observe:
+            // transfer FIRST, revocably, so a rejected call still leaves timer
+            // ownership untouched.
+            let handover = self
+                .timerfd_hand_back_all_revocable(guest, "select (zero-timeout probe)")
                 .await?;
-            return Ok(result);
+            match guest.inject(call).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    self.timerfd_revoke_handover(
+                        guest,
+                        handover,
+                        "select (zero-timeout probe rejected)",
+                    )
+                    .await?;
+                    return Err(err.into());
+                }
+            }
         }
 
         // Mirror pselect6: keep large fd tables under kernel ownership rather than
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
-            let result = self
+            // The kernel owns the wait, so it must own the timers before that
+            // wait starts: a blocking wake decided by the pre-handoff host
+            // arming cannot be corrected by re-arming after it returns.
+            let handover = self
+                .timerfd_hand_back_all_revocable(guest, "select (kernel-owned fd set)")
+                .await?;
+            match self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
-                .await?;
-            self.timerfd_hand_back_all(guest, "select (kernel-owned fd set)")
-                .await?;
-            return Ok(result);
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    self.timerfd_revoke_handover(
+                        guest,
+                        handover,
+                        "select (kernel-owned fd set rejected)",
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
         }
 
         let timeout = raw_timeout.map(select_timeout_duration).transpose()?;
