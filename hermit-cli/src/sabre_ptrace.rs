@@ -123,11 +123,106 @@ fn final_physical_exit(status: &WaitStatus) -> Option<(Pid, ExitStatus)> {
     }
 }
 
+/// Identity of one address space (`mm`). Assigned by this supervisor rather
+/// than read from the kernel, which exposes no stable mm identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+struct AddressSpaceId(u64);
+
+/// Page-classification cache, keyed by ADDRESS SPACE rather than by tracee.
+///
+/// The classification of a page is a property of the mm that maps it, not of
+/// the thread that happened to fault on it. Keying by `Pid` was unsound: under
+/// `CLONE_VM` every thread in a group shares one mm, so a mutation observed on
+/// thread A evicted only A's entries and a sibling B kept serving the
+/// pre-mutation verdict for the same page -- letting a raw syscall at a page
+/// that is no longer trusted bypass both redirection and accounting, which is
+/// exactly the invisible-site class this evidence exists to close.
+struct MappingCache {
+    entries: HashMap<(AddressSpaceId, usize), MappingClassification>,
+    /// Which address space each tracee currently runs in.
+    spaces: HashMap<Pid, AddressSpaceId>,
+    next: u64,
+}
+
+impl MappingCache {
+    fn new(root: Pid) -> Self {
+        Self {
+            entries: HashMap::new(),
+            spaces: HashMap::from([(root, AddressSpaceId(0))]),
+            next: 1,
+        }
+    }
+
+    fn fresh(&mut self) -> AddressSpaceId {
+        let id = AddressSpaceId(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// The address space `pid` runs in. An unknown tracee gets a fresh space:
+    /// we have never cached anything for it, so it can hold nothing stale.
+    fn space_of(&mut self, pid: Pid) -> AddressSpaceId {
+        if let Some(id) = self.spaces.get(&pid) {
+            return *id;
+        }
+        let id = self.fresh();
+        self.spaces.insert(pid, id);
+        id
+    }
+
+    fn get(&mut self, pid: Pid, page: usize) -> Option<&MappingClassification> {
+        let space = self.space_of(pid);
+        self.entries.get(&(space, page))
+    }
+
+    fn insert(&mut self, pid: Pid, page: usize, classification: MappingClassification) {
+        let space = self.space_of(pid);
+        self.entries.insert((space, page), classification);
+    }
+
+    /// Drop every cached page of the address space `pid` runs in -- including
+    /// entries cached while a SIBLING thread was executing.
+    fn invalidate_address_space(&mut self, pid: Pid) {
+        let space = self.space_of(pid);
+        self.entries.retain(|(cached, _), _| *cached != space);
+    }
+
+    /// `child` shares `parent`'s address space (CLONE_VM / vfork).
+    fn share_address_space(&mut self, parent: Pid, child: Pid) {
+        let space = self.space_of(parent);
+        self.spaces.insert(child, space);
+    }
+
+    /// `child` gets its own address space (fork).
+    fn new_address_space(&mut self, child: Pid) {
+        let space = self.fresh();
+        self.spaces.insert(child, space);
+    }
+
+    /// `pid` exec'd: the old mm is gone, so discard it and start a fresh one.
+    fn replace_address_space(&mut self, pid: Pid) {
+        self.invalidate_address_space(pid);
+        let space = self.fresh();
+        self.spaces.insert(pid, space);
+    }
+
+    /// `pid` exited. Its cached pages stay valid for any sibling still sharing
+    /// the mm, so they are dropped only once the last user is gone.
+    fn forget(&mut self, pid: Pid) {
+        let Some(space) = self.spaces.remove(&pid) else {
+            return;
+        };
+        if !self.spaces.values().any(|other| *other == space) {
+            self.entries.retain(|(cached, _), _| *cached != space);
+        }
+    }
+}
+
 struct Supervisor {
     root: Pid,
     tracees: HashSet<Pid>,
     states: HashMap<Pid, TraceeState>,
-    mapping_cache: HashMap<(Pid, usize), MappingClassification>,
+    mapping_cache: MappingCache,
     /// Identity (inode + canonical path) of the launched SaBRe loader and
     /// plugin. Resolved
     /// once at construction so the exemption binds to the objects this
@@ -155,7 +250,7 @@ impl Supervisor {
             root,
             tracees: HashSet::from([root]),
             states: HashMap::from([(root, TraceeState::default())]),
-            mapping_cache: HashMap::new(),
+            mapping_cache: MappingCache::new(root),
             sabre_id: launched_file_id(&sabre),
             plugin_id: launched_file_id(&plugin),
             readiness,
@@ -449,8 +544,11 @@ impl Supervisor {
                 // would be an optimisation, not a correctness requirement.
                 let exit_regs = ptrace::getregs(pid)?;
                 if mutates_address_space(exit_regs.orig_rax) {
-                    self.mapping_cache
-                        .retain(|(cached_pid, _), _| *cached_pid != pid);
+                    // Evict the whole ADDRESS SPACE, not just this thread's
+                    // entries: CLONE_VM siblings share one mm, so a sibling
+                    // would otherwise keep serving a pre-mutation verdict for
+                    // the very page this syscall just replaced.
+                    self.mapping_cache.invalidate_address_space(pid);
                 }
                 if let Some(pending) = self.states.entry(pid).or_default().pending_patch.take() {
                     let mut regs = exit_regs;
@@ -474,9 +572,24 @@ impl Supervisor {
             let child = Pid::from_raw(ptrace::getevent(pid)? as i32);
             self.tracees.insert(child);
             self.states.entry(child).or_default();
+            // Record whether the child SHARES the parent's address space, so a
+            // later mutation evicts every task that can observe it.
+            //
+            // The event kind is a SOUND discriminator here, in one direction:
+            // a clone carrying CLONE_VM always reports PTRACE_EVENT_CLONE
+            // (PTRACE_EVENT_FORK is raised only for the SIGCHLD-style fork,
+            // which never shares an mm), and vfork shares the mm by
+            // definition. Treating CLONE/VFORK as sharing therefore cannot MISS
+            // a sharing case; a clone without CLONE_VM is merely grouped with
+            // its parent, which over-evicts and is safe.
+            if event == libc::PTRACE_EVENT_FORK {
+                self.mapping_cache.new_address_space(child);
+            } else {
+                self.mapping_cache.share_address_space(pid, child);
+            }
         } else if event == libc::PTRACE_EVENT_EXEC {
-            self.mapping_cache
-                .retain(|(cached_pid, _), _| *cached_pid != pid);
+            // exec installs a brand-new mm and tears down the old one.
+            self.mapping_cache.replace_address_space(pid);
             self.states.insert(pid, TraceeState::default());
             self.signal_diagnostics.remove(&pid);
         }
@@ -505,7 +618,7 @@ impl Supervisor {
         address: usize,
     ) -> Result<MappingClassification, Error> {
         let page = address & !4095usize;
-        if let Some(classification) = self.mapping_cache.get(&(pid, page)) {
+        if let Some(classification) = self.mapping_cache.get(pid, page) {
             return Ok(classification.clone());
         }
         let maps = fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))?;
@@ -516,16 +629,14 @@ impl Supervisor {
             },
             |entry| classify_mapping(&entry, self.sabre_id.as_ref(), self.plugin_id.as_ref()),
         );
-        self.mapping_cache
-            .insert((pid, page), classification.clone());
+        self.mapping_cache.insert(pid, page, classification.clone());
         Ok(classification)
     }
 
     fn remove_tracee(&mut self, pid: Pid) {
         self.tracees.remove(&pid);
         self.states.remove(&pid);
-        self.mapping_cache
-            .retain(|(cached_pid, _), _| *cached_pid != pid);
+        self.mapping_cache.forget(pid);
         self.signal_diagnostics.remove(&pid);
     }
 }
@@ -1282,6 +1393,130 @@ mod tests {
 
     // FINDING 3 -- cache invalidation. Both sides of the predicate that decides
     // whether a tracee's cached page verdicts survive a syscall.
+    fn trusted() -> MappingClassification {
+        MappingClassification {
+            trusted: true,
+            trusted_shared_object: None,
+        }
+    }
+
+    /// FINDING 2, the unsound case. Threads A and B share one address space
+    /// (`CLONE_VM`). B caches a page as trusted; A then mutates the address
+    /// space. B MUST NOT keep serving the pre-mutation verdict for that page --
+    /// under the old `(Pid, page)` keying only A's entries were evicted, so B
+    /// went on treating a page that may no longer be trusted as trusted, and a
+    /// raw syscall there bypassed both redirection and accounting.
+    #[test]
+    fn sibling_thread_cannot_serve_a_stale_classification_after_a_shared_mm_mutation() {
+        const PAGE: usize = 0x1000;
+        let a = Pid::from_raw(100);
+        let b = Pid::from_raw(101);
+        let mut cache = MappingCache::new(a);
+        cache.share_address_space(a, b);
+
+        // B observes the page and caches it.
+        cache.insert(b, PAGE, trusted());
+        assert!(
+            cache.get(b, PAGE).is_some(),
+            "precondition: B has a cached verdict, so the eviction below is not vacuous"
+        );
+
+        // A mutates the SHARED address space.
+        cache.invalidate_address_space(a);
+
+        assert!(
+            cache.get(b, PAGE).is_none(),
+            "a sibling sharing the mm must lose its cached verdict when ANY thread \
+             in that mm mutates the address space"
+        );
+    }
+
+    /// The matching control: eviction must be scoped to the address space that
+    /// actually changed, not global. A task in an UNRELATED mm keeps its cache,
+    /// so the fix is a re-keying rather than a blanket flush.
+    #[test]
+    fn unrelated_address_space_is_not_over_evicted() {
+        const PAGE: usize = 0x1000;
+        let a = Pid::from_raw(100);
+        let b = Pid::from_raw(101);
+        let unrelated = Pid::from_raw(200);
+        let mut cache = MappingCache::new(a);
+        cache.share_address_space(a, b);
+        cache.new_address_space(unrelated);
+
+        cache.insert(b, PAGE, trusted());
+        cache.insert(unrelated, PAGE, trusted());
+
+        cache.invalidate_address_space(a);
+
+        assert!(cache.get(b, PAGE).is_none(), "the mutated mm is evicted");
+        assert!(
+            cache.get(unrelated, PAGE).is_some(),
+            "a different address space maps a different page at the same address \
+             and must keep its verdict"
+        );
+    }
+
+    /// fork does NOT share the mm, so a forked child must not be evicted by its
+    /// parent's mutations -- the other direction of the same scoping property.
+    #[test]
+    fn forked_child_gets_its_own_address_space() {
+        const PAGE: usize = 0x2000;
+        let parent = Pid::from_raw(100);
+        let child = Pid::from_raw(101);
+        let mut cache = MappingCache::new(parent);
+        cache.new_address_space(child);
+
+        cache.insert(child, PAGE, trusted());
+        cache.invalidate_address_space(parent);
+
+        assert!(
+            cache.get(child, PAGE).is_some(),
+            "fork installs a separate mm; the parent's mutation cannot reach it"
+        );
+    }
+
+    /// exec replaces the mm outright, so nothing cached against the old one may
+    /// survive for the exec'ing task.
+    #[test]
+    fn exec_discards_the_previous_address_space() {
+        const PAGE: usize = 0x3000;
+        let pid = Pid::from_raw(100);
+        let mut cache = MappingCache::new(pid);
+        cache.insert(pid, PAGE, trusted());
+
+        cache.replace_address_space(pid);
+
+        assert!(
+            cache.get(pid, PAGE).is_none(),
+            "exec installs a new mm; the old classification describes a dead address space"
+        );
+    }
+
+    /// A thread exiting must not evict pages its siblings still rely on, but the
+    /// last user leaving must free them.
+    #[test]
+    fn cached_pages_outlive_one_thread_but_not_the_whole_group() {
+        const PAGE: usize = 0x4000;
+        let a = Pid::from_raw(100);
+        let b = Pid::from_raw(101);
+        let mut cache = MappingCache::new(a);
+        cache.share_address_space(a, b);
+        cache.insert(a, PAGE, trusted());
+
+        cache.forget(b);
+        assert!(
+            cache.get(a, PAGE).is_some(),
+            "a sibling exiting does not invalidate the surviving thread's view"
+        );
+
+        cache.forget(a);
+        assert!(
+            cache.entries.is_empty(),
+            "the last user of an address space releases its cached pages"
+        );
+    }
+
     #[test]
     fn address_space_mutators_invalidate_and_others_do_not() {
         for nr in [
