@@ -218,12 +218,6 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/backend-parity/fixtures/file_backed_mmap.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/file_backed_mmap.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/flock_lifecycle.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/flock_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1790,12 +1784,6 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/e2e/language-runtimes/bash-random.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
-      "why": "tests/e2e/language-runtimes/bash-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It proves Bash $RANDOM varies natively yet repeats bitwise under strict verification via Hermit's PID and time virtualization"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/cpp-stl-determinism.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
       "why": "tests/e2e/language-runtimes/cpp-stl-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It compiles a small C++17 STL program in --prepare and execs it under Hermit, exercising std::random_device entropy through std::set/std::map/std::unordered_map/std::sort/std::string plus a file-I/O roundtrip and std::chrono timestamp under strict verification"
@@ -1813,22 +1801,10 @@
       "why": "tests/e2e/language-runtimes/javascript.js is owned by tests/e2e/lib/language-runtimes/run.sh: The `javascript.js` source is the js runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
     },
     {
-      "path": "tests/e2e/language-runtimes/lua-random.sh",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
-      "why": "tests/e2e/language-runtimes/lua-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Lua 5.4 math.random entropy determinization under strict verification"
-    },
-    {
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "path": "tests/e2e/language-runtimes/perl-hash-order.sh",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
-      "why": "tests/e2e/language-runtimes/perl-hash-order.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Perl's per-process randomized hash key iteration order varies natively and repeats under strict verification"
     },
     {
       "disposition": "manifest-test",
@@ -1865,12 +1841,6 @@
       "path": "tests/e2e/language-runtimes/python.py",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
       "why": "tests/e2e/language-runtimes/python.py is owned by tests/e2e/lib/language-runtimes/run.sh: The `python.py` source is the py runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/e2e/language-runtimes/ruby-random.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/language-runtimes/ruby-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "guest-fixture",
@@ -2216,21 +2186,9 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/mcookie-random.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/mcookie-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/mktemp-name.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/mktemp-name.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/openssl-enc.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/openssl-enc.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "manifest-test",
@@ -2257,12 +2215,6 @@
       "why": "tests/e2e/system-utils/openssl-x509.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
-      "path": "tests/e2e/system-utils/proc-random-uuid.sh",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/proc-random-uuid.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
       "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/proc-uptime.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
@@ -2285,12 +2237,6 @@
       "path": "tests/e2e/system-utils/sort-random.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/sort-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/ssh-keygen-ed25519.sh",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/ssh-keygen-ed25519.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "manifest-test",
@@ -2917,6 +2863,12 @@
       "why": "tests/backend-parity/fixtures/fd_duplication.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/file_backed_mmap.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/file_backed_mmap.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/ftruncate_sparse.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -2983,6 +2935,12 @@
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/split_asymmetric_pr.py",
+      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
+      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+    },
+    {
       "path": "tests/c/getcpu_identity.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -3025,6 +2983,24 @@
       "why": "tests/e2e/data-handling/sqlite-query-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/bash-random.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/bash-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It proves Bash $RANDOM varies natively yet repeats bitwise under strict verification via Hermit's PID and time virtualization"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/lua-random.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/lua-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Lua 5.4 math.random entropy determinization under strict verification"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/perl-hash-order.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/perl-hash-order.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Perl's per-process randomized hash key iteration order varies natively and repeats under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/python-dict-hash-iteration.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
@@ -3037,10 +3013,40 @@
       "why": "tests/e2e/language-runtimes/python-hashseed.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/ruby-random.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/language-runtimes/ruby-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "path": "tests/e2e/language-runtimes/tcl-rand-clock.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/language-runtimes/tcl-rand-clock.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/mcookie-random.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/mcookie-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/openssl-enc.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/openssl-enc.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/system-utils/proc-random-uuid.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/proc-random-uuid.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/ssh-keygen-ed25519.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/ssh-keygen-ed25519.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     }
   ],
   "schema": 2
