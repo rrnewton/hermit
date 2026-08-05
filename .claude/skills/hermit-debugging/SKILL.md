@@ -134,10 +134,12 @@ grep -oE 'detcore[a-z_:]*'      /tmp/h.log | sort | uniq -c | sort -rn    # subs
 ## 2. Finding a nondeterminism / divergence point
 
 When `hermit run --strict --verify` reports "nondeterministic", hermit already
-ran twice and compared the deterministic trace. To localize the divergence
-yourself, capture two runs and use the **built-in log differ** — it is far
-smarter than plain `diff` because it normalizes known-nondeterministic noise
-(hex pointers, tmp paths, `/proc/<pid>/`, elapsed-time fields).
+ran twice and compared the required observable outputs. To localize the
+divergence yourself, capture two runs and use the **built-in log differ**. Its
+normalization of known-nondeterministic noise (hex pointers, tmp paths,
+`/proc/<pid>/`, elapsed-time fields) makes it a diagnostic aid only: it cannot
+establish verification or cross-backend parity. The final fix must pass the
+unmodified byte-for-byte comparison.
 
 ```bash
 hermit --log info run -- <program> 2>/tmp/a.log

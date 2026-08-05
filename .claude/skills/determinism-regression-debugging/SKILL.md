@@ -81,7 +81,10 @@ to make a failing parity diff pass is cheating.
 When the two logs come from different binaries/versions and `log-diff` can't
 pair them, fall back to canonicalizing (strip timestamps/PIDs/pointers) and
 plain `diff`, then read **only the first divergence** — everything after it is
-downstream noise. Anchor on the last matching `COMMIT turn`/`inbound syscall`
+downstream noise. This is only a localization aid: a canonicalized comparison
+is never verification or parity evidence, and the eventual fix must pass an
+unmodified byte-for-byte comparison of every required output and INFO log.
+Anchor on the last matching `COMMIT turn`/`inbound syscall`
 and the first line that differs: a diverging `(turn, dettid)` is a *schedule*
 divergence; matching COMMITs with a differing DETLOG value is an *unvirtualized
 source*. This is exactly how the demo5 boot wedge was localized — a good boot

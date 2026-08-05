@@ -1,148 +1,91 @@
 ---
 name: ci-debugging
-description: "Debug and fix red Hermit/Reverie CI with TIGHT, FOCUSED iteration: reproduce and iterate on the single failing shard locally via ci/run-node.sh (or validate.sh --only) instead of re-running the whole 40-50 min DAG per cycle. Use whenever a CI lane is red and you are about to push a fix — especially before pushing more than once."
+description: "Debug Hermit/Reverie validation failures from exact-SHA receipts: inspect the failed DAG node, iterate on only that node, then obtain one clean full-profile receipt at the final head. Use whenever local validation or supplemental GitHub CI is red."
 ---
 
-# Debugging CI with tight, focused iteration
+# Debug validation from exact evidence
 
-> **The failure mode this skill exists to prevent:** a `push -> wait 34-50 min
-> full-DAG -> read one red shard -> push again` loop, often with cancelled
-> in-flight runs. That loop burns hours of wall-clock for minutes of signal. The
-> CI lanes are already factored into ~45 independent DAG nodes; iterate on the
-> ONE that failed.**
+## Establish the authority first
 
-The portable and privileged lanes are defined as DAG files (`ci/dag/portable.json`,
-`ci/dag/privileged.json`). Each node (`group.job`, e.g. `test.sabre_examples`,
-`e2e.manifest_backend_parity_c`) is an independently boxed step with its exact
-command. `validate.sh` and GitHub Actions both consume these same files, so a node
-run locally is the same command CI runs.
-
-## 1. Iterate on the SINGLE failing shard locally
-
-When a lane is red, find the failing node(s), then run just those against your
-already-built tree — dependencies are assumed present, so this is seconds-to-minutes,
-not the whole lane:
+Inside the dev-hermit harness, query the current PR head through the parent's
+semantic verifier:
 
 ```bash
-# Identify which job(s) failed in the red run:
-with-proxy gh run view <run-id> -R rrnewton/hermit --json jobs \
-  | jq -r '.jobs[] | select(.conclusion=="failure") | .name'
-
-# Build the tree ONCE, then loop on the failing node only:
-ci/run-dag.sh portable                          # one full build (or cargo build --workspace)
-ci/run-node.sh portable test.sabre_examples     # re-run just this shard, no deps
-ci/run-node.sh portable e2e.manifest_backend_parity_c,test.dbi_parity   # comma-list
+./ci-hub/ci-hub validate-status <40-hex-head-SHA>
 ```
 
-`ci/run-node.sh <lane> <group.job>[,...]` runs exactly the listed nodes' commands
-from `ci/dag/<lane>.json`, in order, stopping at the first failure. It needs `jq`
-and the `safe-ci-dag-runner` (already in `agent-utils/`).
+Run that command from the dev-hermit root. A clean, counted, full-profile
+receipt for the exact head is the local landing authority. A
+`locally-validated` label, copied comment, raw command exit, or receipt for an
+earlier SHA is only a cache. GitHub workflows are delayed supplemental signal:
+inspect a genuine failure, but do not wait for them merely to duplicate a
+qualifying local receipt.
 
-## 2. Use `validate.sh --only` as the first-class entrypoint
+Record the exact SHA, profile, discovered/selected/executed/filtered/failure
+counts, failing node names, and durable log path. A green with zero executed
+tests or incomplete declared coverage is a no-result.
 
-`validate.sh --only <lane> <group.job>[,...]` is the canonical wrapper — it
-delegates straight to `ci/run-node.sh` and skips the full harness:
+## Reproduce only the failing node
+
+The portable and privileged lanes are DAGs under `ci/dag/`. Each `group.job`
+tag names one independently runnable command. Use the receipt or DAG-runner log
+to identify the failing tag, build prerequisites once, and then iterate only on
+that tag:
 
 ```bash
 ./validate.sh --only portable test.sabre_examples
+ci/run-node.sh portable test.sabre_examples
+ci/run-node.sh portable e2e.manifest_backend_parity_c,test.dbi_parity
 ```
 
-This exists precisely so single-shard iteration is one command. Do NOT reach for
-`./validate.sh --portable-only` (whole lane, ~34-50 min) while iterating on one
-shard.
+Prefer `validate.sh --only` as the user-facing entrypoint. `ci/run-node.sh` is
+useful when debugging the node runner itself. Do not rerun the full profile for
+every edit, and do not claim a focused node pass as full validation.
 
-## 3. Batch changes; do not cancel runs; rerun only what failed
+If the failure appeared only in supplemental GitHub CI, retrieve the exact job
+log and map it back to its current DAG node. Reproduce locally when the command
+and required capability exist. Hardware, kernel, or runner-only failures must
+be reported as such; they are not permission to weaken assertions.
 
-- **Batch** independent fixes into one commit -> one CI cycle. N separate fixes as
-  N pushes is N full cycles.
-- **Never push over an in-flight run you care about.** A new push cancels the
-  previous run, wasting the runner-minutes already spent and yielding zero signal.
-  Let a run you're waiting on finish.
-- **Re-test only the failed job** on GitHub when no code change is needed (e.g.
-  confirming a flake cleared) — do not re-fire the whole workflow:
+## Classify before changing code
 
-  ```bash
-  with-proxy gh run rerun <run-id> -R rrnewton/hermit --failed
-  with-proxy gh run rerun -R rrnewton/hermit --job <job-id>
-  ```
+- A deterministic assertion, compile error, manifest check, or stable node
+  failure is normally a product or test defect. Reproduce it at the same SHA.
+- A timeout needs load and duration evidence before it is called a product
+  regression. Compare the same node under a quiet admitted run; never erase a
+  correctness check to accommodate contention.
+- A failure shared across many PRs should be fixed once at its common source.
+  Do not create per-PR churn without proving each branch contributes.
+- A stale receipt, dirty worktree, wrong profile, skipped node, or zero-test run
+  is an evidence defect. Repair the run rather than relabeling it green.
 
-## 4. ~50% of failures are locally reproducible — only the env-only half needs GitHub
+For determinism or parity failures, compare exit status, stdout, stderr, and the
+complete INFO logs byte-for-byte. Normalized or stripped logs may localize the
+first divergence, but they can never establish verification or parity.
 
-Before assuming a fix requires a GitHub round-trip, classify the failure:
+## Requalify the final head once
 
-- **Locally reproducible (iterate with `--only` / `run-node.sh`):** unit/integration
-  tests, build/link errors, manifest/inventory checks, version-provenance, most
-  `cargo` and `e2e.manifest_*` node failures. This is roughly half of real red-CI
-  work — do NOT round-trip to GitHub for these.
-- **GitHub-runner-environment only (round-trip unavoidable):** mixed-kernel runner
-  tooling (e.g. `bpftool`), hosted parallelism / core-count tuning, cross-job
-  artifact packaging in the fan-out topology, runner user-namespace availability,
-  load-sensitive privileged timing. Local single-shard runs CANNOT reproduce these;
-  batch them and use `rerun --failed`.
+After focused tests pass, commit the fix and request one full run through the
+dev-hermit parent's current `ci-hub validate-lock` admission path. The admitted
+command must run in the registered clean worktree at the exact branch head.
+Do not bypass the fleet lock with a private detached launcher.
 
-Be honest about which half a given failure is in — do not blame tooling for an
-env-only failure, and do not waste a 40-min cycle on a locally-reproducible one.
+When the run finishes:
 
-## 5. Read EARLY signals; do not serial-wait
+1. Query `ci-hub validate-status` again for the full 40-hex head SHA.
+2. Verify nonzero execution, complete profile coverage, zero failures, a clean
+   tree, and the durable log/receipt linkage.
+3. Update the PR with exact commands and results. Treat labels as derived cache.
+4. If the head changes for any reason, invalidate the evidence and requalify.
 
-- A red job usually fails early (build/lint/first test). Watch the failing job's
-  live log and act on the first failure instead of waiting for the whole lane to
-  finish and report.
-- `merge-gate` is a re-fire placeholder that is **red-by-design until the portable
-  lane completes** — it is not a diagnostic. Read the portable rollup's per-job
-  results, not merge-gate.
-- After the CI split, the authoritative hermit gate is
-  `Regular tests (GitHub-managed portable)`; `Privileged capability and E2E tests`
-  is non-blocking. Reverie's gates are `Regular tests` + `Host-dependent tests`.
-  A queued/stale/cancelled check is not green — and a single serialized PMU
-  privileged runner means queueing is expected, not failure.
+The PR author owns this loop through landing: fix review findings, rebase when
+needed, validate the new head, and prove the landed commit on freshly fetched
+`main`.
 
-## 6. Runner-queue contention vs a code regression
+## Related skills
 
-The privileged/PMU lane runs on a **single serialized (flock'd) self-hosted
-runner**. During a landing burst, superseded runs are cancelled mid-build and
-concurrent builds stack on that one host, so wall-clock-sensitive buckets can
-**time out from contention, not correctness**. Before blaming the commit:
-
-- A **timeout** (not an assertion failure) on the single privileged runner during
-  a burst is a **load/queue artifact** until proven otherwise. Real example: the
-  KVM `applications` bucket ran 38s on a quiet runner and 120s (TIMEOUT) 27s later
-  on the same runner under a ~7-commit landing burst — the failing commit only
-  touched an unrelated proc-fd fixture.
-- Check for concurrent/cancelled runs and the **same bucket's baseline timing on a
-  quiet runner** before calling it a regression.
-- A timeout in a bucket **unrelated to the commit's changed category** is a strong
-  contention signal.
-- Fix-forward with `gh run rerun <id> --failed` on a quiet runner; escalate the
-  systemic wall to **load-relative timeouts** — never weaken the correctness
-  assertion to make a loaded runner green.
-- Structurally: **throttle** what fires at the serialized runner. Rebasing in
-  parallel is fine; firing CI at the single runner from N agents is the
-  mass-parallel-drain cancellation cascade.
-
-## 7. Common red cause vs per-PR rebase churn
-
-When main or many PRs are red, do **not** reflexively rebase/re-run every PR.
-First classify **shared-cause vs per-PR-cause**:
-
-- Count which PRs actually touch the failing surface: `gh pr list -R rrnewton/hermit`
-  plus a path grep. Example: across 224 open PRs, only 3 touched `.github/workflows/*`
-  and **0** touched `run-dag.sh`/`safe-ci-dag` — so a CI-DAG fix lands **once** and
-  ~222 product PRs inherit it on their normal rebase.
-- A stale-pin / freshness gate flaps **every** PR red from **one** cause; one
-  product pin-bump clears them all. Chasing it per-PR is O(N) waste for an O(1)
-  root fix.
-- Fix a shared infra/config cause **once at the root**; reserve individual rebases
-  for genuine per-PR content conflicts.
-- Land shared CI/infra refactors **before** a big landing sprint so the fleet
-  inherits them conflict-free.
-
-## Related
-
-- [hermit-ci](hermit-ci.md) — the CI health & improvement role that uses this skill.
-- [hermit-debugging](hermit-debugging/SKILL.md),
-  [deadlock-debugging](deadlock-debugging.md),
-  [determinism-regression-debugging](determinism-regression-debugging/SKILL.md) —
-  for debugging the *guest* failure a red shard exposes, once you can reproduce it
-  locally.
-- [repo-cleanliness](repo-cleanliness.md), [hermit-coord](hermit-coord.md).
+- [hermit-debugging](hermit-debugging/SKILL.md) for guest execution failures.
+- [deadlock-debugging](deadlock-debugging.md) for hangs and no-progress states.
+- [determinism-regression-debugging](determinism-regression-debugging/SKILL.md)
+  for a regression with a known-good reference.
+- [repo-cleanliness](repo-cleanliness.md) before committing the fix.

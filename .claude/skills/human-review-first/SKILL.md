@@ -77,8 +77,8 @@ order:
 3. **Land.** Only after 1 and 2, land the PR (squash), then rebase dependents
    (see PR DAG below).
 
-Never reorder these. Under human-review-first, "CI is green" is necessary but
-**not sufficient** — human approval is the gate.
+Never reorder these. Under human-review-first, a current exact-head validation
+receipt is necessary but **not sufficient** — human approval is the gate.
 
 ## Frontier branch: speculative integration
 
