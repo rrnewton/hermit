@@ -106,6 +106,24 @@ const DETERMINISTIC_NETNS_COOKIE: u64 = 1;
 // Above Linux's PID range and below the high-bit IDs used by kernel autobind.
 const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 
+/// The path the kernel resolved an open descriptor to, read from the guest's
+/// own `/proc/<pid>/fd/<fd>` link. This is the evidence authority for "which
+/// object was opened": it is produced by the kernel from the descriptor itself,
+/// so it is independent of the pathname spelling the guest used.
+///
+/// Used ONLY as a fallback for a pathname that does not classify on its own
+/// (see the call site): a spelling that already classifies must keep its own
+/// classification, because `/proc/self/...` and `/proc/thread-self/...` are
+/// defined by the spelling and resolve to a different numeric path.
+///
+/// `None` when the link cannot be read (the descriptor is gone, or procfs is
+/// unavailable), in which case the lexical result stands unchanged.
+fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
+    let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    // A deleted or anonymous target is not a stable object name.
+    link.is_absolute().then_some(link)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
@@ -190,6 +208,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let path = call.path().ok_or(Errno::EFAULT)?;
         let path: PathBuf = path.read(&guest.memory())?;
+        // A relative spelling is not the object. `chdir("/sys/module/kvm");
+        // open("refcnt")` and an absolute open name the SAME kernel object, so
+        // classifying the unresolved lexical pathname lets one spelling bypass
+        // normalization and expose the host value. Absolute paths are already
+        // bound; a dirfd supplies its own prefix; AT_FDCWD-relative spellings
+        // were the gap and are resolved below against the opened object.
         let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
             path.clone()
         } else {
@@ -216,7 +240,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
-                let mut procfs = ProcfsFile::from_path(&observed_path);
+                // Classify the spelling the guest used FIRST. Several kinds are
+                // defined by that spelling and MUST keep it: `/proc/self/...`,
+                // `/proc/thread-self/...` and the mountinfo aliases all resolve
+                // through `/proc/<pid>/fd/<fd>` to a numeric `/proc/<pid>/...`
+                // path, which is a DIFFERENT (or absent) classification. So
+                // resolution must never overwrite a spelling that already
+                // classifies.
+                //
+                // Only when the spelling yields nothing do we ask the kernel
+                // what the descriptor actually names. That is exactly the
+                // AT_FDCWD/alias gap -- `chdir("/sys/module/kvm"); open("refcnt")`
+                // classifies as nothing lexically -- and scoping it this way
+                // makes the fallback MONOTONE: it can only add a classification
+                // where there was none, never change one that already existed.
+                let mut procfs = ProcfsFile::from_path(&observed_path).or_else(|| {
+                    resolved_open_path(guest.pid().as_raw(), fd)
+                        .filter(|resolved| resolved != &observed_path)
+                        .and_then(|resolved| ProcfsFile::from_path(&resolved))
+                });
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)

@@ -10,6 +10,7 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+mod backend_stats;
 mod chroot;
 mod consts;
 mod desync;
@@ -1566,6 +1567,7 @@ async fn run_with_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1574,6 +1576,7 @@ async fn run_with_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await; // Before it's dropped by this function.
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
 
@@ -1680,6 +1683,7 @@ async fn run_with_output_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1691,6 +1695,7 @@ async fn run_with_output_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
 
