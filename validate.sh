@@ -139,6 +139,16 @@ ONLY_LANE=""
 ONLY_NODES=""
 SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
+# --shallow-select: force the selective baseline to HEAD~1 (footprint of the most
+# recent commit only, trusting the parent as green). Additive over --selective.
+SHALLOW_SELECT=0
+# --all / --full-run / VALIDATE_FORCE_FULL=1: assert the COMPLETE suite. A no-op
+# on top of the default full level today (plain ./validate.sh is already full),
+# but an explicit, recordable force-everything intent that rejects every non-full
+# level and every focused/selective mode — and a forward guard should the default
+# ever flip to smart selection.
+FORCE_FULL=0
+[[ ${VALIDATE_FORCE_FULL:-0} == 1 ]] && FORCE_FULL=1
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 IGNORE_CACHE=0
@@ -178,6 +188,8 @@ while [[ $# -gt 0 ]]; do
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --shallow-select) SELECTIVE_MODE=1; SHALLOW_SELECT=1; shift ;;
+        --all|--full-run) FORCE_FULL=1; shift ;;
         --baseline)
             SELECTIVE_BASELINE=${2:-}
             [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
@@ -229,8 +241,16 @@ Focused gates (run one matrix/lane and exit):
   --selective, --since-green    Run only the portable DAG nodes affected by changes
                                 since the last known-green baseline (fail-safe: any
                                 doubt or no trustworthy baseline runs the full lane).
+  --shallow-select              Like --selective but pin the baseline to HEAD~1:
+                                validate only the footprint of the most recent
+                                commit, trusting its parent as green. Upper-bound
+                                reduction; still fail-safe (unknown path/no HEAD~1
+                                runs the full lane). Cannot be combined with --baseline.
   --baseline <sha>              Known-green baseline commit for --selective (else
                                 $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
+  --all, --full-run             Assert the COMPLETE suite explicitly. Refuses to be
+                                combined with a non-full level or any focused/selective
+                                mode. (Equivalent to VALIDATE_FORCE_FULL=1.)
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -276,25 +296,86 @@ USAGE
     esac
 done
 
+function force_full_policy_allows {
+    local force_full=$1 level=$2 focused_mode=$3
+    ((force_full == 0)) || [[ $level == full && -z $focused_mode ]]
+}
+
+# Exercise the exact predicate used below. These inert brackets cannot launch a
+# validation run or authorize a receipt: they only prove that every selectable
+# non-full level and every focused/selective CLI mode is refused under FORCE_FULL,
+# while the one qualifying full/unfocused case is accepted.
+function force_full_policy_self_test {
+    local level mode
+    local -a non_full_levels=(quick portable-only super)
+    local -a focused_modes=(
+        envelope-only envelope-compare strict-compat-only
+        portable-strict-compat-only rr-compat-only sabre-compat-only
+        e9patch-compat-only liteinst-compat-only qemu-l2-only privileged-only
+        only selective shallow-select
+    )
+
+    force_full_policy_allows 1 full "" || return 1
+    force_full_policy_allows 0 quick rr-compat-only || return 1
+    for level in "${non_full_levels[@]}"; do
+        ! force_full_policy_allows 1 "$level" "" || return 1
+    done
+    for mode in "${focused_modes[@]}"; do
+        ! force_full_policy_allows 1 full "$mode" || return 1
+    done
+}
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#553)
-only_modes=0
-[[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
-((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
-((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
-((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
-((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
-((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
-((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
-((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
-((ONLY_MODE == 1)) && ((only_modes += 1))
-((SELECTIVE_MODE == 1)) && ((only_modes += 1))
+declare -a active_focused_modes=()
+if [[ $ENVELOPE_MODE == only ]]; then
+    if [[ -n $ENVELOPE_BASELINE ]]; then
+        active_focused_modes+=(envelope-compare)
+    else
+        active_focused_modes+=(envelope-only)
+    fi
+fi
+if ((STRICT_COMPAT_ONLY == 1)); then
+    if ((PORTABLE_STRICT_COMPAT_ONLY == 1)); then
+        active_focused_modes+=(portable-strict-compat-only)
+    else
+        active_focused_modes+=(strict-compat-only)
+    fi
+fi
+((RR_COMPAT_ONLY == 1)) && active_focused_modes+=(rr-compat-only)
+((SABRE_COMPAT_ONLY == 1)) && active_focused_modes+=(sabre-compat-only)
+((E9PATCH_COMPAT_ONLY == 1)) && active_focused_modes+=(e9patch-compat-only)
+((LITEINST_COMPAT_ONLY == 1)) && active_focused_modes+=(liteinst-compat-only)
+((QEMU_L2_ONLY == 1)) && active_focused_modes+=(qemu-l2-only)
+((PRIVILEGED_ONLY == 1)) && active_focused_modes+=(privileged-only)
+((ONLY_MODE == 1)) && active_focused_modes+=(only)
+if ((SELECTIVE_MODE == 1)); then
+    if ((SHALLOW_SELECT == 1)); then
+        active_focused_modes+=(shallow-select)
+    else
+        active_focused_modes+=(selective)
+    fi
+fi
+only_modes=${#active_focused_modes[@]}
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
 fi
 if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
     echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+if ! force_full_policy_self_test; then
+    echo "validate.sh: internal force-full policy brackets failed" >&2
+    exit 2
+fi
+if ! force_full_policy_allows "$FORCE_FULL" "$VALIDATION_LEVEL" \
+    "${active_focused_modes[0]:-}"; then
+    echo "validate.sh: --all/--full-run requires level full and forbids every focused or selective mode" >&2
+    exit 2
+fi
+if ((SHALLOW_SELECT == 1)) && [[ -n $SELECTIVE_BASELINE ]]; then
+    echo "validate.sh: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline" >&2
     exit 2
 fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
@@ -710,6 +791,10 @@ failures=0
 # The signal trap sets this before EXIT cleanup writes the ledger. An explicit
 # operator stop is a NO-RESULT unless a completed gate already proved a failure.
 VALIDATION_INTERRUPTION_SIGNAL=""
+# A validate receipt is trustworthy only when this run proved that the recorded
+# Reverie dependency equals the live main tip. cleanup fails closed if any path
+# reaches a nominally successful exit without setting this after the gate.
+REVERIE_PIN_GATE_PASSED=0
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -1287,8 +1372,10 @@ function append_validation_ledger {
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
+    local first_error_line_json=null failed_substep_classes_json='[]'
     local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
+    local reverie_pin_current_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1334,6 +1421,14 @@ function append_validation_ledger {
             known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
             solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
             solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
+            # DURABLE ATTRIBUTION: the per-node fault verdict and the verbatim
+            # headline fault line are computed by failure_evidence.py; inline them
+            # into the row so a red is attributable to WHICH bug (infra vs code,
+            # first_error_line) from the row ALONE — after the /tmp log is evicted.
+            # The read side (ci-hub/validate/attribute_reds.py) prefers these
+            # row-carried classes over dereferencing the ephemeral log_file.
+            first_error_line_json=$(jq -c '.first_error_line' <<<"$evidence_json")
+            failed_substep_classes_json=$(jq -c '.failed_substep_classes' <<<"$evidence_json")
             evidence_available=1
         fi
     fi
@@ -1384,6 +1479,7 @@ function append_validation_ledger {
     if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
         interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
     fi
+    if ((REVERIE_PIN_GATE_PASSED == 1)); then reverie_pin_current_json=true; else reverie_pin_current_json=false; fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1418,11 +1514,14 @@ function append_validation_ledger {
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
+    line+="\"reverie_pin_current\":$reverie_pin_current_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"first_error_line\":$first_error_line_json,"
+    line+="\"failed_substep_classes\":$failed_substep_classes_json,"
     line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"solo_rerun_of\":$solo_rerun_of_json,"
@@ -1544,6 +1643,15 @@ function cleanup {
 
     if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
         terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    fi
+
+    # Receipt production is itself an enforcement path. If a new fast path or
+    # early return accidentally bypasses the pin gate, it must not emit PASS or
+    # return success merely because its selected tests happened to pass.
+    if ((exit_status == 0 && REVERIE_PIN_GATE_PASSED != 1)); then
+        printf "❌ Validation path bypassed the latest-Reverie pin gate; refusing a passing receipt.\n" >&2
+        failures=$((failures + 1))
+        exit_status=1
     fi
 
     if [[ -n $active_check_pid ]]; then
@@ -2098,31 +2206,12 @@ function hermit_run_smoke {
     fi
 }
 
-function hermit_determinism_check {
-    local first_output
-    local second_output
-    local status
-
-    first_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    second_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    if [[ "$first_output" != "$second_output" ]]; then
-        echo "Hermit stdout differed between identical runs:" >&2
-        diff -u \
-            <(printf "%s\n" "$first_output") \
-            <(printf "%s\n" "$second_output") >&2 || true
-        return 1
-    fi
-}
+# NOTE: a former `hermit_determinism_check` reimplemented determinism checking in
+# bash (run the guest twice, string-compare stdout). That duplicated the shipped
+# `hermit run --verify` path and only compared stdout, so it could pass while the
+# product's own verifier (which also compares stderr, the DETLOG event stream, and
+# exit status) diverged. It was removed; `hermit_verify_smoke` below is the
+# product-backed determinism check for the same echo workload.
 
 function hermit_verify_smoke {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
@@ -2131,21 +2220,14 @@ function hermit_verify_smoke {
 }
 
 function hermit_record_replay_smoke {
-    local case_dir="$VALIDATION_TMP_DIR/record-smoke"
-    local data_dir="$case_dir/recording"
-    local record_stdout="$case_dir/record.stdout"
-    local replay_stdout="$case_dir/replay.stdout"
-
-    rm -rf "$case_dir"
-    mkdir -p "$case_dir"
+    # Delegate to the shipped record/replay verifier instead of reimplementing it
+    # in bash. `record start --verify` records the guest, replays the recording,
+    # and diffs stdout, stderr, the DETLOG event stream, and exit status, failing
+    # nonzero on any divergence. The former bash version only recorded (without
+    # --verify), replayed with --autopilot, and `cmp`-ed stdout, so it exercised a
+    # strictly weaker check than the product actually ships.
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" record start --data-dir "$data_dir" -- \
-        /bin/echo "$SMOKE_MARKER" >"$record_stdout" || return
-    timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" replay --autopilot --data-dir "$data_dir" \
-        >"$replay_stdout" || return
-    grep -Fxq "$SMOKE_MARKER" "$record_stdout" &&
-        cmp -s "$record_stdout" "$replay_stdout"
+        "$HERMIT_BIN" record start --verify -- /bin/echo "$SMOKE_MARKER"
 }
 
 function kvm_backend_available {
@@ -2630,6 +2712,62 @@ function run_rr_compatibility_phase {
     return "$status"
 }
 
+# The product report is the typed verdict channel. The wrapper exit may instead
+# be the deterministic guest's nonzero exit, so it is diagnostic only; parity is
+# true exactly when the producer's boolean `bitwise_parity` field is typed true.
+function rr_report_has_bitwise_parity {
+    local report=$1
+    [[ -s $report ]] || return 1
+    jq -e '
+        type == "object"
+        and (.bitwise_parity | type == "boolean")
+        and .bitwise_parity == true
+    ' "$report" >/dev/null 2>&1
+}
+
+# Bracket that load-bearing consumer with producer-shaped reports. In
+# particular, verified=true is insufficient for stripped or zero-evidence
+# comparisons, while a matched parity report remains authoritative when the
+# guest (and therefore the wrapper) exits nonzero.
+function rr_report_consumer_self_test {
+    local fixture_dir="$VALIDATION_TMP_DIR/rr-report-consumer-self-test"
+    local simulated_wrapper_status=3
+    mkdir -p "$fixture_dir"
+
+    ! rr_report_has_bitwise_parity "$fixture_dir/missing.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}' \
+        >"$fixture_dir/no-result.json"
+    ! rr_report_has_bitwise_parity "$fixture_dir/no-result.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
+        >"$fixture_dir/diverged.json"
+    ! rr_report_has_bitwise_parity "$fixture_dir/diverged.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":true},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
+        >"$fixture_dir/stripped.json"
+    ! rr_report_has_bitwise_parity "$fixture_dir/stripped.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}' \
+        >"$fixture_dir/zero-counts.json"
+    ! rr_report_has_bitwise_parity "$fixture_dir/zero-counts.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
+        >"$fixture_dir/matched.json"
+    rr_report_has_bitwise_parity "$fixture_dir/matched.json" || return 1
+
+    printf '%s\n' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":3,"guest_signal":null}' \
+        >"$fixture_dir/nonzero-guest.json"
+    ((simulated_wrapper_status != 0)) || return 1
+    rr_report_has_bitwise_parity "$fixture_dir/nonzero-guest.json" || return 1
+}
+
 function rr_compatibility_probe {
     local label=$1
     shift
@@ -2644,22 +2782,20 @@ function rr_compatibility_probe {
     fi
 
     local case_dir="$VALIDATION_TMP_DIR/rr-$label"
-    local data_dir="$case_dir/recording"
     local started_at=$SECONDS
     local output_start
-    local record_status
-    local replay_status=125
-    local stdout_equal=no
+    local verify_status
     local summary
+    local verify_report="$case_dir/verify.json"
 
     RR_COMPAT_TOTAL=$((RR_COMPAT_TOTAL + 1))
     mkdir -p "$case_dir"
     {
         printf "=== R/R compatibility: %s ===\n" "$label"
-        printf "Record:"
-        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-        printf "\nReplay: %q replay --autopilot --data-dir %q\n" \
-            "$STRICT_COMPAT_HERMIT_BIN" "$data_dir"
+        printf "Verify:"
+        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --verify \
+            --verify-strict --verify-json "$verify_report" -- "$@"
+        printf "\n"
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
@@ -2667,25 +2803,20 @@ function rr_compatibility_probe {
         printf "  R/R compatibility probe: %s\n" "$label"
     fi
 
-    run_rr_compatibility_phase "$case_dir/record.stdout" "$case_dir/record.stderr" \
-        "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-    record_status=$?
-    if ((record_status == 0)); then
-        run_rr_compatibility_phase "$case_dir/replay.stdout" "$case_dir/replay.stderr" \
-            "$STRICT_COMPAT_HERMIT_BIN" replay --autopilot --data-dir "$data_dir"
-        replay_status=$?
-        if cmp -s "$case_dir/record.stdout" "$case_dir/replay.stdout"; then
-            stdout_equal=yes
-        else
-            diff -u "$case_dir/record.stdout" "$case_dir/replay.stdout" \
-                >"$case_dir/stdout.diff" || true
-        fi
-    fi
+    # Use the shipped strict record/replay verifier as the single source of
+    # truth. The JSON artifact binds the verdict to the exact comparison and
+    # nonzero evidence counts; wrapper status is not the verdict because a
+    # deterministic guest may itself exit nonzero.
+    run_rr_compatibility_phase "$case_dir/verify.stdout" "$case_dir/verify.stderr" \
+        "$STRICT_COMPAT_HERMIT_BIN" record start --verify --verify-strict \
+        --verify-json "$verify_report" -- "$@"
+    verify_status=$?
 
-    if ((record_status == 0 && replay_status == 0)) && [[ $stdout_equal == yes ]]; then
+    if rr_report_has_bitwise_parity "$verify_report"; then
         RR_COMPAT_PASSED=$((RR_COMPAT_PASSED + 1))
         printf "  ✅ %-12s PASS R/R (%ss)\n" "$label" "$((SECONDS - started_at))"
-        printf "Record exit: 0\nReplay exit: 0\nStdout equal: yes\n\n" >>"$LOG_FILE"
+        printf "Verify exit (diagnostic): %s; typed bitwise_parity: true\n\n" \
+            "$verify_status" >>"$LOG_FILE"
         rm -rf "$case_dir"
         return 0
     fi
@@ -2697,25 +2828,25 @@ function rr_compatibility_probe {
         printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
     fi
     {
-        printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
-            "$record_status" "$replay_status" "$stdout_equal"
-        if [[ -s $case_dir/record.stderr ]]; then
-            printf '%s\n' "--- record stderr ---"
-            tail -n 120 "$case_dir/record.stderr"
+        printf "Verify exit (diagnostic): %s; typed bitwise_parity: false\n" \
+            "$verify_status"
+        if [[ -s $verify_report ]]; then
+            printf '%s\n' "--- verify report ---"
+            cat "$verify_report"
         fi
-        if [[ -s $case_dir/replay.stderr ]]; then
-            printf '%s\n' "--- replay stderr ---"
-            tail -n 120 "$case_dir/replay.stderr"
+        if [[ -s $case_dir/verify.stdout ]]; then
+            printf '%s\n' "--- verify stdout ---"
+            tail -n 120 "$case_dir/verify.stdout"
         fi
-        if [[ -s $case_dir/stdout.diff ]]; then
-            printf '%s\n' "--- stdout diff ---"
-            sed -n '1,120p' "$case_dir/stdout.diff"
+        if [[ -s $case_dir/verify.stderr ]]; then
+            printf '%s\n' "--- verify stderr ---"
+            tail -n 120 "$case_dir/verify.stderr"
         fi
         printf "\n"
     } >>"$LOG_FILE"
     summary=$(failure_summary "$output_start")
-    printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
-        "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
+    printf "  ❌ %-12s FAIL R/R (verify %s: %s)\n" \
+        "$label" "$verify_status" "$summary"
     return 0
 }
 
@@ -4193,6 +4324,14 @@ function run_portable_only_suite {
 # the full lane. Never fail-open on a stale or missing baseline.
 function resolve_selective_baseline {
     local sha=""
+    # --shallow-select pins the baseline to HEAD~1 (footprint of the newest commit
+    # only). If HEAD has no parent (root commit) we emit nothing, so selection
+    # fails safe to the full lane.
+    if ((SHALLOW_SELECT == 1)); then
+        sha=$(git rev-parse --verify HEAD~1 2>/dev/null) || return 0
+        [[ -n $sha ]] && printf '%s\n' "$sha"
+        return 0
+    fi
     if [[ -n ${SELECTIVE_BASELINE:-} ]]; then
         sha=$SELECTIVE_BASELINE
     elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
@@ -4258,6 +4397,24 @@ function run_selective_suite {
     fi
     decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
     total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
+    # Transparent coverage report: select-tests.rs --format human enumerates the
+    # baseline/evidence, every changed path, the selector reason, and every
+    # SKIPPED portable node / test shard / e2e cell. Inability to produce that
+    # report is treated as doubt and runs the FULL lane — a subset must never run
+    # without a human-auditable account of what it dropped and why.
+    local -a human_args=(--since-green --format human)
+    [[ -n $baseline ]] && human_args=(--since-green --baseline "$baseline" --format human)
+    local coverage_report
+    if ! coverage_report=$("$ROOT_DIR/ci/select-tests.rs" "${human_args[@]}" 2>>"$LOG_FILE") \
+        || [[ -z $coverage_report ]]; then
+        printf "Selective validation: could not produce the coverage report; running the FULL portable lane.\n"
+        run_portable_only_suite
+        return $?
+    fi
+    printf -- '----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----\n'
+    printf '%s\n' "$coverage_report"
+    printf -- '-------------------------------------------------------------------------------\n'
 
     case "$decision" in
         skip)
@@ -4391,7 +4548,6 @@ function run_quick_suite {
         ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
-    run_check "Hermit output determinism" hermit_determinism_check
     run_check "Hermit verify-mode smoke test" hermit_verify_smoke
     run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
 }
@@ -4527,6 +4683,23 @@ function run_super_suite {
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
 
+# Run both semantic policy brackets before any authority-bearing validation
+# gate. They are inert fixtures and cannot publish a receipt themselves.
+if ! rr_report_consumer_self_test; then
+    printf "validate.sh: record/replay report consumer brackets failed\n" >&2
+    exit 2
+fi
+
+# The archival pin is not a testing exemption: validate always proves it equals
+# the live Reverie main tip before initializing dependencies or running tests.
+run_check "Reverie dependency pin equals latest main" \
+    "$ROOT_DIR/scripts/check-reverie-pin.rs"
+if ((failures != 0)); then
+    print_summary
+    exit 1
+fi
+REVERIE_PIN_GATE_PASSED=1
+
 # Keep direct ./validate.sh invocations as self-sufficient as `make validate`.
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
@@ -4594,7 +4767,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
             "$ROOT_DIR/target/release/libreverie_liteinst.so" \
-            "$ROOT_DIR/target/liteinst-runtime-build-7951770"
+            "$ROOT_DIR/target/liteinst-runtime-build"
     fi
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \

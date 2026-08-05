@@ -323,6 +323,61 @@ function assert_validate_entrypoint {
         die "validate.sh $function_name command diverged from the audited entrypoint"
 }
 
+# Keep the latest-Reverie invariant attached to every testing evidence path.
+# The checker unit tests plant stale/current pins; these structural assertions
+# prove that those same fail-closed semantics cannot be bypassed by selecting a
+# different local, DAG, hosted-CI, merge-gate, or receipt path.
+function assert_reverie_pin_enforcement {
+    local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
+    grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
+        die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
+    ! grep -Fq 'main_sha' "$checker" ||
+        die "latest-Reverie checker must not accept a pre-recorded main SHA"
+    ! grep -Fq -- '--reverie-remote' "$checker" ||
+        die "production callers must not redirect the latest-Reverie authority"
+
+    local dag
+    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
+        jq -e '
+            [.steps[] | select(
+                .group == "check"
+                and .job == "reverie_pin"
+                and .cmd == "./scripts/check-reverie-pin.rs"
+            )] | length == 1
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
+    done
+
+    [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh must execute the latest-Reverie gate exactly once"
+    [[ $(grep -Fc 'REVERIE_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipt cleanup must fail closed when the pin gate was bypassed"
+    [[ $(grep -Fc '\"reverie_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipts must state whether the latest-Reverie gate passed"
+
+    local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
+    [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one latest-Reverie job"
+    [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
+        die "the authoritative portable aggregate must depend on the Reverie pin job"
+    [[ $(grep -Fxc '          "$checker"' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical live-query checker"
+    ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
+        die "portable CI must not retain a stale-Reverie override"
+
+    local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
+    [[ $(grep -Fxc '    name: reverie-pin-is-latest-main' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must check exact PR heads with the trusted pin checker"
+    [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must depend on its exact-head Reverie pin job"
+    grep -Fq 'trusted/scripts/check-reverie-pin.rs -o "$checker"' "$merge_workflow" ||
+        die "merge-gate must compile the checker from trusted main"
+    grep -Fq 'git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"' "$merge_workflow" ||
+        die "merge-gate must inspect the exact PR head"
+    grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
+        die "merge-gate must run the canonical live-query checker on the exact PR head"
+}
+
 function dag_critical_path_seconds {
     local dag=$1
     jq -r '
@@ -372,6 +427,8 @@ function audit_ci_correspondence {
             and all(.[]; (.cmd | type == "string" and length > 0))
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
+
+    assert_reverie_pin_enforcement
 
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs
     # its small hardware DAG within one job.
@@ -767,6 +824,97 @@ function observation_hash {
     } | sha256sum | cut -d' ' -f1
 }
 
+# $1 is the number of guest executions the mode is contracted to perform.
+# `complete` and `eligible` are bound to that obligation: a run that produced
+# fewer records than executions is a SHORTFALL, not a pass. Reporting the count
+# without enforcing it lets one surviving record authorize a two-execution cell.
+function summarize_sabre_path_evidence {
+    local expected=$1
+    shift
+    jq -s --argjson expected "$expected" '
+        if all(.[];
+            .schema == 1
+            and (.guest_rpc_observed | type == "boolean")
+            and (.ptrace_fallback_sites | type == "number")
+            and (.trusted_shared_object_sites | type == "number")
+            and (.trusted_shared_objects | type == "array"))
+        then {
+            schema: 1,
+            expected_execution_count: $expected,
+            complete: (length == $expected),
+            execution_count: length,
+            guest_rpc_observed: (length > 0 and all(.[]; .guest_rpc_observed)),
+            ptrace_fallback_sites: (map(.ptrace_fallback_sites) | add // 0),
+            trusted_shared_object_sites: (map(.trusted_shared_object_sites) | add // 0),
+            trusted_shared_objects: (map(.trusted_shared_objects) | add // [] | unique),
+            eligible: (length == $expected and length > 0 and all(.[];
+                .guest_rpc_observed
+                and .ptrace_fallback_sites == 0
+                and .trusted_shared_object_sites == 0)),
+            executions: .
+        }
+        else error("invalid SaBRe path-evidence record")
+        end
+    ' "$@"
+}
+
+function collect_sabre_path_evidence {
+    local cell_dir=$1
+    local expected=$2
+    local -a files=()
+    shopt -s nullglob
+    files=("$cell_dir"/captures/*.sabre-path.jsonl)
+    shopt -u nullglob
+    if ((${#files[@]} == 0)); then
+        jq -cn --argjson expected "$expected" '{schema:1,
+            expected_execution_count:$expected,complete:false,execution_count:0,
+            guest_rpc_observed:false,
+            ptrace_fallback_sites:0,trusted_shared_object_sites:0,
+            trusted_shared_objects:[],eligible:false,executions:[]}'
+        return
+    fi
+    summarize_sabre_path_evidence "$expected" "${files[@]}"
+}
+
+# Hermit's built-in verification executes the guest twice (see the guest_tmpdir
+# comment in prepare_test); every other mode executes it once. The decision
+# point must know this number, not merely report whatever arrived.
+function expected_sabre_execution_count {
+    case $1 in
+    verify | replay) echo 2 ;;
+    *) echo 1 ;;
+    esac
+}
+
+function audit_sabre_path_evidence_contract {
+    local eligible fallback trusted shortfall
+    eligible=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 2)
+    fallback=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
+    trusted=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
+        summarize_sabre_path_evidence 1)
+    # PLANTED NEGATIVE for the execution-count obligation: one otherwise-clean
+    # record where the mode contracts for two. Every per-record predicate here
+    # passes, so this is refused only if the count itself is enforced.
+    shortfall=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 2)
+    jq -e '.eligible and .complete and .execution_count == 2' <<<"$eligible" >/dev/null ||
+        die "legitimate SaBRe path evidence must remain eligible"
+    jq -e '(.eligible | not) and .ptrace_fallback_sites == 1' <<<"$fallback" >/dev/null ||
+        die "ptrace-installed SaBRe markers must be classified as fallback"
+    jq -e '(.eligible | not) and .trusted_shared_object_sites == 1' <<<"$trusted" >/dev/null ||
+        die "trusted shared-object native execution must be ineligible"
+    jq -e '(.eligible | not) and (.complete | not)
+        and .execution_count == 1 and .expected_execution_count == 2' <<<"$shortfall" >/dev/null ||
+        die "an execution-count shortfall must be ineligible even when every record is clean"
+}
+
 function prepare_test {
     local test=$1
     local cell_dir=$2
@@ -835,7 +983,7 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
-    local timeout_seconds stdout_file stderr_file guest_tmpdir kind guest_backend
+    local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
@@ -861,6 +1009,11 @@ function execute_attempt {
         E2E_TMPDIR="$guest_tmpdir"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
+    if [[ $backend == sabre ]]; then
+        path_evidence_file="$cell_dir/captures/${mode}-${attempt}.sabre-path.jsonl"
+        : >"$path_evidence_file"
+        env_args+=(HERMIT_SABRE_PATH_EVIDENCE="$path_evidence_file")
+    fi
     local -a command guest_command profile run_args guest_args custom_args
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     mapfile -t guest_args < <(
@@ -929,6 +1082,7 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
+    local path_evidence=$9
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -1000,14 +1154,15 @@ function append_result {
         --argjson effective_args "$effective_args" \
         --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
-        '{schema:1,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
+        --argjson path_evidence "$path_evidence" \
+        '{schema:2,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
           outcome:$outcome,duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
-          relaxations:$relaxations,preprocessor:null,
+          relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -1023,7 +1178,7 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason=
+    local outcome=PASS reason='' path_evidence=null
     if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
@@ -1108,9 +1263,28 @@ function run_cell {
         fi
     fi
 
+    if [[ $backend == sabre ]]; then
+        path_evidence=$(collect_sabre_path_evidence "$cell_dir" \
+            "$(expected_sabre_execution_count "$mode")") || {
+            outcome=ERROR
+            reason="invalid SaBRe path evidence"
+            path_evidence=null
+        }
+        if [[ $outcome == PASS && $(jq -r '.eligible // false' <<<"$path_evidence") != true ]]; then
+            outcome=FAIL
+            reason=$(jq -r '
+                "SaBRe path ineligible: executions=\(.execution_count)/\(.expected_execution_count), "
+                + "guest_rpc_observed=\(.guest_rpc_observed), "
+                + "ptrace_fallback_sites=\(.ptrace_fallback_sites), "
+                + "trusted_shared_object_sites=\(.trusted_shared_object_sites), "
+                + "trusted_shared_objects=\(.trusted_shared_objects | join(","))"
+            ' <<<"$path_evidence")
+        fi
+    fi
+
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -1203,7 +1377,9 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_sabre_path_evidence_contract
         audit_test_footprints
+        python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
