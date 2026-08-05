@@ -1342,6 +1342,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
+        // `execve` installed a new image, so drop the state that belonged to
+        // the old one. Unlike `clone` — where `copy_thread` carries the
+        // parent's segment bases into the child, which is why the shadow is
+        // propagated there — the kernel resets those bases for a new image, so
+        // keeping the shadow would make the new image's first `ARCH_GET_GS`
+        // report the *previous* image's base instead of 0.
+        guest.thread_state_mut().reset_for_exec();
+
         if let Some(ptr) = guest.auxv().at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.

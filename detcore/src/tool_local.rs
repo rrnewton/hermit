@@ -1770,6 +1770,24 @@ impl<T> ThreadState<T> {
         self.open_file_creator = Some(creator);
     }
 
+    /// Drop the thread state that belongs to the *image* rather than the
+    /// thread, because `execve` has just replaced that image.
+    ///
+    /// This is deliberately separate from the `clone` path, which does the
+    /// opposite and *carries* state into the child: on x86-64 `copy_thread()`
+    /// copies the parent's segment bases, so a cloned child inherits them,
+    /// whereas `execve` resets them for the new program. State that models a
+    /// register or mapping owned by the image must be listed here, or the new
+    /// image observes the previous one's values. Anything identifying the
+    /// *thread* (`dettid`, `detpid`, pedigree, and the
+    /// `past_global_first_execve` marker the caller has just set) survives
+    /// `execve` on Linux and must NOT be cleared.
+    pub(crate) fn reset_for_exec(&mut self) {
+        // The kernel resets the GS base for the new image; the shadow models a
+        // base a backend cannot expose, so it has to follow.
+        self.arch_prctl_gs_shadow = None;
+    }
+
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and
     /// run mutable function `f` on it (`&mut DetFd`).
     pub fn with_detfd<F, U>(&self, fd: RawFd, f: F) -> Result<U, Errno>
@@ -2253,6 +2271,73 @@ mod timeslice_tests {
 
         assert!(!state.recover_process_mm_id(detpid));
         assert_eq!(state.mm_id, inherited_mm);
+    }
+
+    /// The whole sequence the defect showed up in: a backend that cannot expose
+    /// GS records a shadow before `execve`, and the new image must NOT see it.
+    ///
+    /// `ARCH_GET_GS` serves the shadow when it is `Some` and otherwise falls
+    /// through to the kernel, so clearing it here is exactly what makes the new
+    /// image read the kernel's post-`exec` base (0) instead of the previous
+    /// image's.
+    #[test]
+    fn execve_drops_a_gs_shadow_so_the_new_image_does_not_read_the_old_base() {
+        let mut state = ThreadState::new(DetTid::from_raw(7), &Config::default(), ());
+
+        // Pre-exec: a backend that could not observe the set records a shadow.
+        state.arch_prctl_gs_shadow = Some(0xdead_beef);
+        assert_eq!(state.arch_prctl_gs_shadow, Some(0xdead_beef));
+
+        state.reset_for_exec();
+
+        assert_eq!(
+            state.arch_prctl_gs_shadow, None,
+            "the new image must fall through to the kernel base, not the old image's shadow"
+        );
+    }
+
+    /// The other side: the reset must be targeted, not a blanket wipe.
+    ///
+    /// Without this, a `reset_for_exec` that cleared everything would satisfy
+    /// the test above while destroying thread identity that Linux preserves
+    /// across `execve` — the thread keeps its tid, and the caller has just set
+    /// `past_global_first_execve`, which must survive the very call that
+    /// follows it.
+    #[test]
+    fn execve_reset_keeps_state_that_belongs_to_the_thread_not_the_image() {
+        let dettid = DetTid::from_raw(7);
+        let detpid = DetPid::from_raw(4);
+        let mut state = ThreadState::new(dettid, &Config::default(), ());
+        state.detpid = Some(detpid);
+        state.past_global_first_execve = true;
+        // The exec path assigns the post-exec memory identity itself, in
+        // `handle_execveat`; the reset must not stomp what its caller owns.
+        let post_exec_mm = MmId::initial(detpid).for_exec(detpid);
+        state.mm_id = post_exec_mm;
+
+        state.reset_for_exec();
+
+        assert_eq!(state.dettid, dettid);
+        assert_eq!(state.detpid, Some(detpid));
+        assert!(
+            state.past_global_first_execve,
+            "handle_post_exec sets this immediately before the reset; clearing it would undo the caller"
+        );
+        assert_eq!(
+            state.mm_id, post_exec_mm,
+            "the exec path owns the post-exec memory identity"
+        );
+    }
+
+    /// A thread that never armed a shadow is unaffected — the reset is not a
+    /// state *change* on the common path, so it cannot perturb ptrace, where
+    /// the shadow is always `None` because the kernel really does set GS.
+    #[test]
+    fn execve_reset_is_a_no_op_when_no_shadow_was_armed() {
+        let mut state = ThreadState::new(DetTid::from_raw(7), &Config::default(), ());
+        assert_eq!(state.arch_prctl_gs_shadow, None);
+        state.reset_for_exec();
+        assert_eq!(state.arch_prctl_gs_shadow, None);
     }
 
     #[test]
