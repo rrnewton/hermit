@@ -139,6 +139,16 @@ ONLY_LANE=""
 ONLY_NODES=""
 SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
+# --shallow-select: force the selective baseline to HEAD~1 (footprint of the most
+# recent commit only, trusting the parent as green). Additive over --selective.
+SHALLOW_SELECT=0
+# --all / --full-run / VALIDATE_FORCE_FULL=1: assert the COMPLETE suite. A no-op
+# on top of the default full level today (plain ./validate.sh is already full),
+# but an explicit, recordable force-everything intent that refuses to be combined
+# with any focused/selective mode — and a forward guard should the default ever
+# flip to smart selection.
+FORCE_FULL=0
+[[ ${VALIDATE_FORCE_FULL:-0} == 1 ]] && FORCE_FULL=1
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 IGNORE_CACHE=0
@@ -178,6 +188,8 @@ while [[ $# -gt 0 ]]; do
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --shallow-select) SELECTIVE_MODE=1; SHALLOW_SELECT=1; shift ;;
+        --all|--full-run) FORCE_FULL=1; shift ;;
         --baseline)
             SELECTIVE_BASELINE=${2:-}
             [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
@@ -229,8 +241,16 @@ Focused gates (run one matrix/lane and exit):
   --selective, --since-green    Run only the portable DAG nodes affected by changes
                                 since the last known-green baseline (fail-safe: any
                                 doubt or no trustworthy baseline runs the full lane).
+  --shallow-select              Like --selective but pin the baseline to HEAD~1:
+                                validate only the footprint of the most recent
+                                commit, trusting its parent as green. Upper-bound
+                                reduction; still fail-safe (unknown path/no HEAD~1
+                                runs the full lane). Cannot be combined with --baseline.
   --baseline <sha>              Known-green baseline commit for --selective (else
                                 $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
+  --all, --full-run             Assert the COMPLETE suite explicitly. Refuses to be
+                                combined with any focused/selective mode. (Equivalent
+                                to VALIDATE_FORCE_FULL=1.)
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -295,6 +315,14 @@ if ((only_modes > 1)); then
 fi
 if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
     echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+if ((FORCE_FULL == 1 && only_modes > 0)); then
+    echo "validate.sh: --all/--full-run forces the complete suite and cannot be combined with a focused or selective mode" >&2
+    exit 2
+fi
+if ((SHALLOW_SELECT == 1)) && [[ -n $SELECTIVE_BASELINE ]]; then
+    echo "validate.sh: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline" >&2
     exit 2
 fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
@@ -4032,6 +4060,14 @@ function run_portable_only_suite {
 # the full lane. Never fail-open on a stale or missing baseline.
 function resolve_selective_baseline {
     local sha=""
+    # --shallow-select pins the baseline to HEAD~1 (footprint of the newest commit
+    # only). If HEAD has no parent (root commit) we emit nothing, so selection
+    # fails safe to the full lane.
+    if ((SHALLOW_SELECT == 1)); then
+        sha=$(git rev-parse --verify HEAD~1 2>/dev/null) || return 0
+        [[ -n $sha ]] && printf '%s\n' "$sha"
+        return 0
+    fi
     if [[ -n ${SELECTIVE_BASELINE:-} ]]; then
         sha=$SELECTIVE_BASELINE
     elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
@@ -4097,6 +4133,24 @@ function run_selective_suite {
     fi
     decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
     total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
+    # Transparent coverage report: select-tests.rs --format human enumerates the
+    # baseline/evidence, every changed path, the selector reason, and every
+    # SKIPPED portable node / test shard / e2e cell. Inability to produce that
+    # report is treated as doubt and runs the FULL lane — a subset must never run
+    # without a human-auditable account of what it dropped and why.
+    local -a human_args=(--since-green --format human)
+    [[ -n $baseline ]] && human_args=(--since-green --baseline "$baseline" --format human)
+    local coverage_report
+    if ! coverage_report=$("$ROOT_DIR/ci/select-tests.rs" "${human_args[@]}" 2>>"$LOG_FILE") \
+        || [[ -z $coverage_report ]]; then
+        printf "Selective validation: could not produce the coverage report; running the FULL portable lane.\n"
+        run_portable_only_suite
+        return $?
+    fi
+    printf -- '----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----\n'
+    printf '%s\n' "$coverage_report"
+    printf -- '-------------------------------------------------------------------------------\n'
 
     case "$decision" in
         skip)
