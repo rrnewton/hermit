@@ -589,6 +589,24 @@ impl DetFd {
         self.description().timerfd_parked_deadline = deadline;
     }
 
+    /// Take, and clear, the expirations carried across a handover to the
+    /// kernel. Returns 0 when nothing is owed.
+    ///
+    /// Read-and-clear is one step precisely so the count is delivered EXACTLY
+    /// once regardless of which syscall drains the descriptor. `read` and
+    /// `readv` both consume expirations as far as the guest is concerned, so a
+    /// drain path that does not come through here leaves the count owed: a
+    /// one-shot can then be delivered a second time, and a periodic timer reads
+    /// late or `EAGAIN`s while the kernel counts from the zero the handover
+    /// re-arm left it at.
+    pub(crate) fn take_timerfd_pending_expirations(&self) -> u64 {
+        let mut description = self.description();
+        match description.timerfd.as_mut() {
+            Some(state) => std::mem::take(&mut state.pending_expirations),
+            None => 0,
+        }
+    }
+
     /// The deadline a virtual reader is parked on right now, if any.
     pub(crate) fn timerfd_parked_deadline(&self) -> Option<LogicalTime> {
         self.description().timerfd_parked_deadline
@@ -615,6 +633,56 @@ mod tests {
         );
         detfd.init_timerfd(libc::CLOCK_MONOTONIC);
         detfd
+    }
+
+    /// FIRES then REFUSES, on real descriptor state: a carried expiration count
+    /// is delivered in full to the first drain and is GONE for the second.
+    ///
+    /// This is the invariant the `readv` bypass broke. `readv` went straight to
+    /// the host without coming through the take, so the carried count was never
+    /// delivered and never cleared -- a one-shot could be delivered again by a
+    /// later scalar `read`, and a periodic timer read late or `EAGAIN`d because
+    /// the kernel had been re-armed from zero at the handover.
+    #[test]
+    fn a_carried_expiration_count_is_taken_exactly_once() {
+        let detfd = timerfd(9);
+        let state = detfd.timerfd_state().expect("modeled timerfd");
+        detfd.set_timerfd_state(TimerfdState {
+            pending_expirations: 3,
+            ..state
+        });
+
+        assert_eq!(
+            detfd.take_timerfd_pending_expirations(),
+            3,
+            "the first drain must receive every carried tick"
+        );
+        assert_eq!(
+            detfd.take_timerfd_pending_expirations(),
+            0,
+            "a carried count must not be delivered twice"
+        );
+        assert_eq!(
+            detfd
+                .timerfd_state()
+                .expect("state survives the take")
+                .pending_expirations,
+            0,
+            "the take must clear the stored count, not just report it"
+        );
+    }
+
+    /// REFUSES: a descriptor with no modeled timer owes nothing, so the take
+    /// cannot invent expirations for a non-timerfd or an unmodeled one.
+    #[test]
+    fn an_unmodeled_descriptor_owes_no_expirations() {
+        let detfd = DetFd::new(
+            11,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(10), 1),
+        );
+        assert_eq!(detfd.take_timerfd_pending_expirations(), 0);
     }
 
     /// Fires: a freshly created timerfd is eligible for virtual-time expiration

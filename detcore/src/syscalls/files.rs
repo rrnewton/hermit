@@ -143,6 +143,36 @@ fn timerfd_hand_back_it_value_ns(remaining_ns: u64, deadline: Option<LogicalTime
     }
 }
 
+/// The base address and length of a `readv` iovec's first entry, or `None` when
+/// the vector is empty. `Err` when the iovec array itself cannot be read.
+///
+/// Only the FIRST entry is inspected: an 8-byte timerfd expiration count is
+/// delivered whole into the first buffer that can hold it, which is exactly
+/// where Linux puts it, and Detcore does not model splitting that count across
+/// a scatter list.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+fn read_first_iovec<'a, G, T>(
+    guest: &mut G,
+    call: &syscalls::Readv,
+) -> Result<Option<(AddrMut<'a, u8>, usize)>, Error>
+where
+    G: Guest<T>,
+    T: RecordOrReplay,
+{
+    if call.len() == 0 {
+        return Ok(None);
+    }
+    let Some(vec) = call.iov() else {
+        return Err(Errno::EFAULT.into());
+    };
+    let entry: libc::iovec = guest.memory().read_value(vec.cast())?;
+    let Some(base) = AddrMut::from_raw(entry.iov_base as usize) else {
+        return Err(Errno::EFAULT.into());
+    };
+    Ok(Some((base, entry.iov_len)))
+}
+
 /// Expirations that have accrued in virtual time but have not yet been drained
 /// by `read()`, and therefore must survive a handover to the kernel.
 ///
@@ -1241,9 +1271,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         // logical expiration. Detcore does not model scatter delivery of the
         // 8-byte count, so hand the descriptor to the kernel first and let one
         // clock own both the wait and the expiration that ends it.
-        if fd_type == FdType::Timerfd && self.timerfd_fd_virtualized(guest, call.fd()) {
-            self.timerfd_hand_back_to_host(guest, call.fd(), "readv")
-                .await?;
+        if fd_type == FdType::Timerfd {
+            if self.timerfd_fd_virtualized(guest, call.fd()) {
+                self.timerfd_hand_back_to_host(guest, call.fd(), "readv")
+                    .await?;
+            }
+            // ...and then drain what that handover carried. `readv` consumes an
+            // expiration exactly as `read` does, so it must go through the one
+            // `pending_expirations` consumer rather than straight to the host.
+            // Skipping it does not merely lose an optimisation: the carried
+            // count is never delivered and the guest gets whatever the kernel
+            // has counted since the handover re-armed it from zero — a late or
+            // `EAGAIN` delivery for a periodic timer, and for a one-shot the
+            // carried expiration is still owed afterwards and can be delivered
+            // a second time.
+            //
+            // Deliver into the first iovec entry large enough to hold the count,
+            // which is where Linux would place it. Validation order mirrors the
+            // scalar path: `EINVAL` for a too-small destination before any
+            // state is consumed, then `EFAULT` only on the copy out.
+            const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
+            let owed = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.timerfd_state().map_or(0, |st| st.pending_expirations)
+            })?;
+            if owed > 0 {
+                let iov = read_first_iovec(guest, &call)?;
+                match iov {
+                    Some((base, len)) if len >= EXPIRATION_BYTES => {
+                        // Take only once the destination is known good, so a
+                        // rejected call cannot swallow the count.
+                        let owed = self.timerfd_take_pending_expirations(guest, call.fd())?;
+                        guest.memory().write_exact(base, &owed.to_ne_bytes())?;
+                        detlog!(
+                            "[dtid {}] timerfd readv(fd={}) => {} expiration(s) carried across the host handover",
+                            guest.thread_state().dettid,
+                            call.fd(),
+                            owed,
+                        );
+                        return Ok(EXPIRATION_BYTES as i64);
+                    }
+                    // No usable destination: the kernel rejects with EINVAL and
+                    // the count stays owed for the next reader.
+                    _ => return Err(Errno::EINVAL.into()),
+                }
+            }
         }
 
         if let Some(resource) = resource {
@@ -2610,6 +2681,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// Take, and clear, the expirations the virtual model still owes this
+    /// descriptor after a handover. Returns 0 when nothing is owed.
+    ///
+    /// This is the ONLY consumer of `pending_expirations`, and every syscall
+    /// that can drain a timerfd must go through it. `read` and `readv` both
+    /// consume expirations as far as the guest is concerned, so a path that
+    /// skips this helper does not merely miss an optimisation: the carried
+    /// count is never delivered, and the caller instead gets whatever the
+    /// kernel has counted since the handover re-armed it from zero. For a
+    /// periodic timer that shows up as a late or `EAGAIN` delivery; for a
+    /// one-shot the carried expiration is still owed afterwards and can be
+    /// delivered a second time.
+    ///
+    /// Clearing is unconditional on the take, so the count is delivered exactly
+    /// once no matter which syscall drains it.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    fn timerfd_take_pending_expirations<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<u64, Error> {
+        Ok(guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.take_timerfd_pending_expirations())?)
+    }
+
     /// Hand back every descriptor still served from virtual time.
     ///
     /// The fail-safe used when a readiness syscall's descriptor set cannot be
@@ -2907,22 +3005,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // older than anything the kernel has counted since — and only then
             // defer to the host. No double counting: the kernel started from
             // zero at the handover.
-            let owed = guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.timerfd_state().map_or(0, |st| st.pending_expirations)
-            })?;
+            let owed = self.timerfd_take_pending_expirations(guest, call.fd())?;
             if owed > 0 {
                 if call.len() < EXPIRATION_BYTES {
                     return Err(Errno::EINVAL.into());
                 }
                 let buf = call.buf().ok_or(Errno::EFAULT)?;
-                guest.thread_state().with_detfd(call.fd(), |detfd| {
-                    if let Some(st) = detfd.timerfd_state() {
-                        detfd.set_timerfd_state(TimerfdState {
-                            pending_expirations: 0,
-                            ..st
-                        });
-                    }
-                })?;
                 guest.memory().write_exact(buf, &owed.to_ne_bytes())?;
                 detlog!(
                     "[dtid {}] timerfd read(fd={}) => {} expiration(s) carried across the host handover",

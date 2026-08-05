@@ -510,18 +510,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
-        // `select`/`pselect6` ask the KERNEL for readiness — including via the
-        // live zero-timeout probe on the internal path — so any descriptor they
-        // name must be host-owned first, exactly as for `poll`/`epoll`. Detcore
-        // does not decode `fd_set` membership, and several paths below hand the
-        // raw call straight to the kernel (nfds past the internal bound, a zero
-        // timeout), so the complete and auditable answer is to hand back every
-        // virtualized timerfd rather than guess which bits are set. The
-        // `has_virtualizable_timerfd` pre-check inside keeps this off the hot
-        // path for the overwhelming majority of processes, which have none.
-        self.timerfd_hand_back_all(guest, "pselect6").await?;
-
+        // OWNERSHIP TRANSFER IS ORDERED AFTER VALIDATION, NOT BEFORE.
+        //
+        // `select`/`pselect6` ask the KERNEL for readiness, so a descriptor whose
+        // readiness they report must be host-owned — otherwise the kernel answers
+        // on host time while `read()` answers on virtual time. But the latch is
+        // MONOTONIC and irreversible: transferring up front, before the call is
+        // known to be valid, permanently moves a timer to the host on the
+        // strength of a syscall that then fails EINVAL/EFAULT and reports no
+        // readiness at all. That is split authority bought for nothing, and it
+        // cannot be rolled back without breaking the monotonicity the latch
+        // relies on.
+        //
+        // The ordering below is therefore: validate, then query, then transfer —
+        // and for the paths that hand the raw call to the kernel, transfer only
+        // once the call has SUCCEEDED. That is safe because Detcore serializes
+        // threads: no guest code runs between the kernel's readiness answer and
+        // the transfer, so the answer cannot be observed against a still-virtual
+        // timer. It is the same argument `epoll_ctl` uses for latching after the
+        // kernel accepts.
         if call.nfds() < 0 {
+            // Pure argument validation; the kernel rejects before probing
+            // anything, so no readiness is reported and no transfer is owed.
             return Ok(guest.inject(call).await?);
         }
 
@@ -533,7 +543,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
-            return Ok(guest.inject(call).await?);
+            // A zero timeout IS a readiness query. Transfer only if it succeeded.
+            let result = guest.inject(call).await?;
+            self.timerfd_hand_back_all(guest, "pselect6 (zero-timeout probe)")
+                .await?;
+            return Ok(result);
         }
 
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
@@ -541,9 +555,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // require fewer bytes than a userspace calculation predicts. Keep those calls
         // under kernel ownership rather than over-reading the guest bitmap.
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
-            return self
+            let result = self
                 .record_or_replay_blocking(guest, Syscall::Pselect6(call))
-                .await;
+                .await?;
+            self.timerfd_hand_back_all(guest, "pselect6 (kernel-owned fd set)")
+                .await?;
+            return Ok(result);
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
@@ -612,6 +629,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Err(error);
             }
         };
+
+        // Every guest-memory argument has now validated, and the next thing this
+        // function does is issue LIVE zero-timeout kernel readiness probes. This
+        // is the last point at which the transfer is still ahead of any kernel
+        // readiness answer and behind every way this call can still fail with
+        // EFAULT/EINVAL, so it is where authority moves.
+        self.timerfd_hand_back_all(guest, "pselect6 (readiness probe)")
+            .await?;
 
         let mut stack = guest.stack().await;
         let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
@@ -748,17 +773,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
-        // `select`/`pselect6` ask the KERNEL for readiness — including via the
-        // live zero-timeout probe on the internal path — so any descriptor they
-        // name must be host-owned first, exactly as for `poll`/`epoll`. Detcore
-        // does not decode `fd_set` membership, and several paths below hand the
-        // raw call straight to the kernel (nfds past the internal bound, a zero
-        // timeout), so the complete and auditable answer is to hand back every
-        // virtualized timerfd rather than guess which bits are set. The
-        // `has_virtualizable_timerfd` pre-check inside keeps this off the hot
-        // path for the overwhelming majority of processes, which have none.
-        self.timerfd_hand_back_all(guest, "select").await?;
-
+        // Ownership transfer is ordered after validation; see `handle_pselect6`
+        // for why an irreversible latch must not fire on a call that then fails.
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
         }
@@ -771,16 +787,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_usec == 0) {
-            // A zero timeout is a pure non-blocking poll; the kernel can service it directly.
-            return Ok(guest.inject(call).await?);
+            // A zero timeout is a pure non-blocking poll; the kernel can service
+            // it directly. It IS a readiness query, so transfer once it succeeds.
+            let result = guest.inject(call).await?;
+            self.timerfd_hand_back_all(guest, "select (zero-timeout probe)")
+                .await?;
+            return Ok(result);
         }
 
         // Mirror pselect6: keep large fd tables under kernel ownership rather than
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
-            return self
+            let result = self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
-                .await;
+                .await?;
+            self.timerfd_hand_back_all(guest, "select (kernel-owned fd set)")
+                .await?;
+            return Ok(result);
         }
 
         let timeout = raw_timeout.map(select_timeout_duration).transpose()?;
@@ -819,6 +842,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Err(error);
             }
         };
+
+        // Every guest-memory argument has now validated, and the next thing this
+        // function does is issue LIVE zero-timeout kernel readiness probes. This
+        // is the last point at which the transfer is still ahead of any kernel
+        // readiness answer and behind every way this call can still fail with
+        // EFAULT/EINVAL, so it is where authority moves.
+        self.timerfd_hand_back_all(guest, "select (readiness probe)")
+            .await?;
 
         let mut stack = guest.stack().await;
         let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
