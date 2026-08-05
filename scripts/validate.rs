@@ -113,6 +113,7 @@
 //! [dependencies]
 //! safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }
 //! serde_json = "1"
+//! libc = "0.2"
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
@@ -130,7 +131,6 @@ use safe_ci_dag_runner::cgroup::reexec_in_scope;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::io::dag_from_json;
-use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
@@ -174,6 +174,44 @@ const DAG_FILE_OVERRIDE_ENV: &str = "RUN_DAG_FILE_OVERRIDE";
 
 /// Profile-store dir env, mirroring the runner's own default resolution.
 const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
+
+/// The meta-profile that subsumes the GitHub-authoritative validation surface:
+/// bootstrap preflight + the manifest gate + BOTH the portable and privileged
+/// DAG lanes in one boxed, self-teed run. See `run_full_profile`.
+const FULL_PROFILE: &str = "full";
+
+// --------------------------------------------------------------------------- unified gate outcome
+
+/// A single gate outcome, unified across the two kinds of work a `full` run does:
+///   * an out-of-process preflight/bootstrap gate (submodule init, reverie pin,
+///     manifest) run as a subprocess, and
+///   * an in-process DAG NODE executed by `safe-ci-dag-runner` (a `StepOutcome`).
+///
+/// Collapsing both into one type lets the ledger, the cost table, and the verdict
+/// treat every gate identically and STRUCTURALLY (never by scraping text), so a
+/// silently-dropped gate cannot hide behind a different code path.
+#[derive(Clone)]
+struct GateOutcome {
+    tag: String,
+    ok: bool,
+    returncode: Option<i64>,
+    reason: String,
+    aborted: bool,
+    duration_s: f64,
+}
+
+impl From<&StepOutcome> for GateOutcome {
+    fn from(o: &StepOutcome) -> Self {
+        GateOutcome {
+            tag: o.tag.clone(),
+            ok: o.ok,
+            returncode: o.returncode,
+            reason: o.reason.clone(),
+            aborted: o.aborted,
+            duration_s: o.duration_s,
+        }
+    }
+}
 
 // --------------------------------------------------------------------------- args
 
@@ -392,6 +430,317 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
     Err(3)
 }
 
+// --------------------------------------------------------------------------- durable log (self-tee)
+
+/// A live self-tee: everything this process writes to fd 1 / fd 2 is duplicated
+/// into a durable, absolute log file AND still shown on the original terminal.
+///
+/// WHY validate.rs tees ITS OWN log (owner directive, "option C"): the
+/// authoritative counted+coverage receipt is minted by `finalize_receipt.py
+/// --scan`, which reads the `log_file` recorded in the ledger row and parses the
+/// libtest banners out of it. A STANDALONE `./scripts/validate.rs` launched with
+/// no `ci-hub validate-run` systemd unit around it has NO durable sink — it would
+/// run, pass, and leave no receipt, which is indistinguishable from never having
+/// run (the same defect class as `--cgroups` silently running nothing). Teeing
+/// here makes the RECEIPT PATH INDEPENDENT OF THE LAUNCH PATH: the log exists
+/// whether the run was launched by `validate-run`, by `make validate`, or by a
+/// bare `./scripts/validate.rs`. It is deliberately NOT deferred to the runner
+/// library or to `start_unit.py`, either of which would leave the standalone case
+/// broken.
+struct DurableLog {
+    path: PathBuf,
+    tee: std::process::Child,
+    orig_stdout: i32,
+    orig_stderr: i32,
+}
+
+impl DurableLog {
+    /// Flush our buffered output, restore the original fds so any later message
+    /// goes to the terminal, close the tee's write ends, and reap it.
+    fn finish(mut self) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // Restoring fds 1 and 2 replaces the pipe write-ends, dropping the last
+        // references to the pipe so `tee` observes EOF and exits.
+        unsafe {
+            libc::dup2(self.orig_stdout, 1);
+            libc::dup2(self.orig_stderr, 2);
+            libc::close(self.orig_stdout);
+            libc::close(self.orig_stderr);
+        }
+        let _ = self.tee.wait();
+    }
+}
+
+/// Resolve the durable log path: `<parent|repo-root>/ignored/validate/` holds
+/// machine-local run logs (an ignored dir, never committed). The name carries the
+/// profile, a short SHA, and a timestamp so concurrent runs never collide. The
+/// path is ALWAYS ABSOLUTE — `verify_receipt.sh` (the merge gate) requires the
+/// recorded `durable_log_file` to start with `/`.
+fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
+    let dir = if let Ok(parent) = std::env::var(PARENT_ENV) {
+        if !parent.is_empty() {
+            PathBuf::from(parent).join("ignored").join("validate")
+        } else {
+            root.join("ignored").join("validate")
+        }
+    } else {
+        root.join("ignored").join("validate")
+    };
+    let sha12: String = sha.chars().take(12).collect();
+    let ts = utc_now().replace([':', '-'], "");
+    dir.join(format!("validate-rs-{profile}-{sha12}-{ts}.log"))
+}
+
+/// Establish the self-tee. FAIL-CLOSED: on any failure to create the directory,
+/// spawn `tee`, or redirect the fds, returns `Err(exit_code)` so the caller exits
+/// LOUDLY rather than running without a durable receipt. Must be called AFTER
+/// `resolve_cgroups` (which re-execs on the default path), so the tee is set up
+/// exactly once, in the final boxed process — never inherited across the re-exec.
+fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog, u8> {
+    use std::os::unix::io::AsRawFd;
+    let path = durable_log_path(root, profile, sha);
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!(
+                "validate.rs: ERROR: cannot create durable-log dir {}: {e}. A run with no \
+                 durable receipt is a silent no-result; refusing to proceed.",
+                dir.display()
+            );
+            return Err(4);
+        }
+    }
+    // Spawn `tee -a <log>` BEFORE redirecting our fds so tee inherits the real
+    // terminal as its stdout (output still shows live), and appends to the file.
+    let mut tee = match Command::new("tee")
+        .arg("-a")
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "validate.rs: ERROR: cannot spawn `tee` for the durable log {}: {e}. \
+                 Refusing to run without a durable receipt.",
+                path.display()
+            );
+            return Err(4);
+        }
+    };
+    // Save the originals, then point fd 1 and fd 2 at the tee's stdin pipe.
+    let (orig_stdout, orig_stderr, ok) = unsafe {
+        let so = libc::dup(1);
+        let se = libc::dup(2);
+        let pipe_fd = tee.stdin.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+        let ok = so >= 0 && se >= 0 && pipe_fd >= 0 && libc::dup2(pipe_fd, 1) >= 0 && libc::dup2(pipe_fd, 2) >= 0;
+        (so, se, ok)
+    };
+    if !ok {
+        eprintln!("validate.rs: ERROR: could not redirect stdout/stderr into the durable log.");
+        let _ = tee.kill();
+        return Err(4);
+    }
+    // dup2 gave fds 1 and 2 independent duplicates of the pipe write-end; drop the
+    // ChildStdin so the pipe has exactly two write-ends (fd 1 and fd 2), which
+    // `finish` closes to signal EOF to tee.
+    drop(tee.stdin.take());
+    eprintln!("validate.rs: durable log: {}", path.display());
+    Ok(DurableLog {
+        path,
+        tee,
+        orig_stdout,
+        orig_stderr,
+    })
+}
+
+// --------------------------------------------------------------------------- subprocess gates
+
+/// Run one out-of-process preflight/bootstrap gate (submodule init, reverie pin,
+/// manifest) as a subprocess, inheriting our (teed, boxed) fds so its output
+/// lands in the durable log. The verdict is STRUCTURAL: `ok` is the exit status,
+/// `returncode` the raw code, mirroring how the library classifies a `StepOutcome`
+/// so both gate kinds flow through one ledger/cost path.
+fn run_subprocess_gate(tag: &str, cwd: &Path, program: &str, args: &[&str]) -> GateOutcome {
+    eprintln!("\n[{tag}] $ {program} {}", args.join(" "));
+    let start = std::time::Instant::now();
+    let status = Command::new(program).args(args).current_dir(cwd).status();
+    let duration_s = start.elapsed().as_secs_f64();
+    match status {
+        Ok(st) => {
+            let rc = st.code().map(|c| c as i64).or_else(|| {
+                use std::os::unix::process::ExitStatusExt;
+                st.signal().map(|s| -(s as i64))
+            });
+            let ok = st.success();
+            let reason = if ok {
+                String::new()
+            } else if let Some(c) = st.code() {
+                format!("exit {c}")
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                format!("signal {}", st.signal().unwrap_or(0))
+            };
+            eprintln!("[{tag}] {} ({:.1}s)", if ok { "PASS" } else { "FAIL" }, duration_s);
+            GateOutcome {
+                tag: tag.to_string(),
+                ok,
+                returncode: rc,
+                reason,
+                aborted: false,
+                duration_s,
+            }
+        }
+        Err(e) => {
+            eprintln!("[{tag}] FAIL could not spawn {program:?}: {e}");
+            GateOutcome {
+                tag: tag.to_string(),
+                ok: false,
+                returncode: None,
+                reason: format!("spawn error: {e}"),
+                aborted: false,
+                duration_s,
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- full meta-profile
+
+/// Run ONE DAG lane in-process via the library and return its gates as the
+/// unified `GateOutcome`, the skipped node names, wall seconds, and the library's
+/// own structural `RunResult.ok` verdict. Node tags are lane-prefixed so the
+/// ledger and cost table stay unambiguous across the two lanes.
+fn run_dag_lane(
+    root: &Path,
+    lane: &str,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+) -> Result<(Vec<GateOutcome>, Vec<String>, f64, bool), u8> {
+    let dag_path = root.join("ci").join("dag").join(format!("{lane}.json"));
+    let dag_text = std::fs::read_to_string(&dag_path).map_err(|e| {
+        eprintln!("validate.rs: cannot read {}: {e}", dag_path.display());
+        2u8
+    })?;
+    let cfg = dag_from_json(&dag_text).map_err(|e| {
+        eprintln!("validate.rs: invalid DAG {}: {e}", dag_path.display());
+        2u8
+    })?;
+    eprintln!("\n[{lane} CI DAG lane] $ safe-ci-dag-runner {} -j {jobs}", dag_path.display());
+    let result = run_dag_boxed_ordered(&cfg, jobs, keep_going, verbosity, cgroups, None, None);
+    let gates: Vec<GateOutcome> = result
+        .outcomes
+        .iter()
+        .map(|o| {
+            let mut g = GateOutcome::from(o);
+            g.tag = format!("{lane}:{}", o.tag);
+            g
+        })
+        .collect();
+    let skipped: Vec<String> = result.skipped.iter().map(|s| format!("{lane}:{s}")).collect();
+    Ok((gates, skipped, result.wall_s, result.ok))
+}
+
+/// The `full` meta-profile: the honest Rust subsumption of validate.sh's
+/// `run_full_suite` (its 6 `run_check` gates). Runs the two always-on preflight
+/// gates (fail-fast, mirroring validate.sh:4537), the centralized manifest gate,
+/// then BOTH the portable and privileged DAG lanes in-process. Verbosity is
+/// forced to >=2 so the runner streams each node's `[tag]`-prefixed output and
+/// terminal PASS/FAIL into the (teed) log, which `finalize_receipt.py --scan`
+/// parses to mint the counted+coverage schema-5 receipt.
+///
+/// Returns (all gates, all skipped, total wall seconds, overall_ok).
+fn run_full_profile(
+    root: &Path,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+) -> (Vec<GateOutcome>, Vec<String>, f64, bool) {
+    let verbosity = verbosity.max(2);
+    let with_proxy = has_cmd("with-proxy");
+    let mut gates: Vec<GateOutcome> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut wall = 0.0_f64;
+
+    // Preflight gate 1: submodule init (validate.sh:4533 / initialize_repository_submodules).
+    let g = if with_proxy {
+        run_subprocess_gate(
+            "Initialize repository submodules",
+            root,
+            "with-proxy",
+            &["git", "submodule", "update", "--init", "--recursive"],
+        )
+    } else {
+        run_subprocess_gate(
+            "Initialize repository submodules",
+            root,
+            "git",
+            &["submodule", "update", "--init", "--recursive"],
+        )
+    };
+    wall += g.duration_s;
+    let pre1_ok = g.ok;
+    gates.push(g);
+
+    // Preflight gate 2: reverie pin consistency (validate.sh:4536).
+    let pin = "./scripts/check-reverie-pin.rs";
+    let g = if with_proxy {
+        run_subprocess_gate("Reverie pin consistency", root, "with-proxy", &[pin])
+    } else {
+        run_subprocess_gate("Reverie pin consistency", root, pin, &[])
+    };
+    wall += g.duration_s;
+    let pre2_ok = g.ok;
+    gates.push(g);
+
+    // Fail-fast: do NOT run heavy lanes if preflight failed (validate.sh:4537).
+    if !pre1_ok || !pre2_ok {
+        eprintln!("validate.rs: preflight gate failed; skipping DAG lanes (matches validate.sh fail-fast).");
+        return (gates, skipped, wall, false);
+    }
+
+    // Manifest gate (validate.sh:4178). Runs once (validate.sh runs the identical
+    // command per lane; deduped here — the gate runs, it is not dropped).
+    let g = run_subprocess_gate(
+        "Centralized test manifest and inventory",
+        root,
+        "./ci/test_harness.sh",
+        &["validate"],
+    );
+    wall += g.duration_s;
+    let manifest_ok = g.ok;
+    gates.push(g);
+
+    let mut overall_ok = manifest_ok;
+    for lane in ["portable", "privileged"] {
+        match run_dag_lane(root, lane, jobs, keep_going, verbosity, cgroups.clone()) {
+            Ok((lg, ls, lw, lok)) => {
+                gates.extend(lg);
+                skipped.extend(ls);
+                wall += lw;
+                overall_ok = overall_ok && lok;
+            }
+            Err(_) => {
+                overall_ok = false;
+            }
+        }
+    }
+    (gates, skipped, wall, overall_ok)
+}
+
+/// Mirror validate.sh's `command -v <name>` availability probe.
+fn has_cmd(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // --------------------------------------------------------------------------- git / ledger
 
 fn git_sha() -> String {
@@ -527,7 +876,11 @@ fn write_ledger_record(
     started_at: &str,
     finished_at: &str,
     profile: &str,
-    result: &RunResult,
+    gates: &[GateOutcome],
+    skipped: &[String],
+    wall_s: f64,
+    overall_ok: bool,
+    log_file: Option<&str>,
     exit_code: u8,
     commit: &str,
     tree_is_dirty: bool,
@@ -539,16 +892,12 @@ fn write_ledger_record(
     //   skipped_nodes  = DAG nodes skipped because a dependency failed.
     // They are deliberately NOT named executed_tests/filtered_tests, so a
     // schema<5 consumer never mistakes a node count for a libtest test count.
-    let executed_nodes = result.outcomes.len();
-    let skipped_nodes = result.skipped.len();
+    let executed_nodes = gates.len();
+    let skipped_nodes = skipped.len();
     // Genuine, non-aborted failures — the honest failure count.
-    let failures = result
-        .outcomes
-        .iter()
-        .filter(|o| !o.ok && !o.aborted)
-        .count();
+    let failures = gates.iter().filter(|o| !o.ok && !o.aborted).count();
     let commit_anchored = commit != "unknown" && !tree_is_dirty;
-    let overall = if result.ok && failures == 0 {
+    let overall = if overall_ok && failures == 0 {
         "pass"
     } else {
         "fail"
@@ -563,8 +912,7 @@ fn write_ledger_record(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let gates: Vec<serde_json::Value> = result
-        .outcomes
+    let gates_json: Vec<serde_json::Value> = gates
         .iter()
         .map(|o| {
             serde_json::json!({
@@ -609,8 +957,12 @@ fn write_ledger_record(
         "result": overall,
         "exit_code": exit_code,
         "failures": failures,
-        "real_seconds": result.wall_s,
-        "gates": gates,
+        "real_seconds": wall_s,
+        // Absolute path to this run's durable self-teed log. finalize_receipt.py
+        // --scan reads this to mint the counted schema-5 receipt; verify_receipt.sh
+        // (merge gate) requires it to exist and start with '/'.
+        "log_file": log_file,
+        "gates": gates_json,
     });
 
     if let Some(dir) = ledger.parent() {
@@ -654,7 +1006,7 @@ fn write_ledger_record(
 
 /// The headline feature: a readable per-node cost table built entirely from typed
 /// `StepOutcome` fields (never scraped text).
-fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
+fn print_cost_table(outcomes: &[GateOutcome], skipped: &[String]) {
     println!("\n=== per-node cost (safe-ci-dag-runner) ===");
     println!("{:<40} {:>10}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
     println!("{}", "-".repeat(80));
@@ -706,32 +1058,43 @@ fn main() -> ExitCode {
 
     let root = repo_root();
 
-    // Resolve the DAG file: explicit --dag-file / RUN_DAG_FILE_OVERRIDE wins,
-    // else ci/dag/<profile>.json.
-    let dag_path: PathBuf = match &args.dag_file {
-        Some(p) => PathBuf::from(p),
-        None => root.join("ci").join("dag").join(format!("{}.json", args.profile)),
-    };
-    if !dag_path.is_file() {
-        eprintln!(
-            "validate.rs: no such DAG file: {} (profile {:?})",
-            dag_path.display(),
-            args.profile
-        );
-        return ExitCode::from(2);
-    }
-    let dag_text = match std::fs::read_to_string(&dag_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("validate.rs: cannot read {}: {e}", dag_path.display());
+    // The `full` meta-profile is NOT a single DAG file: it subsumes validate.sh's
+    // run_full_suite (preflight gates + manifest + BOTH the portable and privileged
+    // DAG lanes). Any other profile — or an explicit --dag-file override — resolves
+    // to a single ci/dag/<name>.json and runs the runner once.
+    let is_full = args.profile == FULL_PROFILE && args.dag_file.is_none();
+
+    // Resolve/validate the single DAG file up front (only for the single-lane path);
+    // for `full` there is no ci/dag/full.json and this would spuriously error.
+    let cfg = if is_full {
+        None
+    } else {
+        // explicit --dag-file / RUN_DAG_FILE_OVERRIDE wins, else ci/dag/<profile>.json.
+        let dag_path: PathBuf = match &args.dag_file {
+            Some(p) => PathBuf::from(p),
+            None => root.join("ci").join("dag").join(format!("{}.json", args.profile)),
+        };
+        if !dag_path.is_file() {
+            eprintln!(
+                "validate.rs: no such DAG file: {} (profile {:?})",
+                dag_path.display(),
+                args.profile
+            );
             return ExitCode::from(2);
         }
-    };
-    let cfg = match dag_from_json(&dag_text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("validate.rs: invalid DAG {}: {e}", dag_path.display());
-            return ExitCode::from(2);
+        let dag_text = match std::fs::read_to_string(&dag_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("validate.rs: cannot read {}: {e}", dag_path.display());
+                return ExitCode::from(2);
+            }
+        };
+        match dag_from_json(&dag_text) {
+            Ok(c) => Some((c, dag_path)),
+            Err(e) => {
+                eprintln!("validate.rs: invalid DAG {}: {e}", dag_path.display());
+                return ExitCode::from(2);
+            }
         }
     };
 
@@ -743,68 +1106,99 @@ fn main() -> ExitCode {
         Err(code) => return ExitCode::from(code),
     };
 
+    // Self-tee a durable log AFTER the boxing re-exec, so a standalone
+    // `./scripts/validate.rs` (no systemd unit, no ci-hub launcher) still leaves a
+    // receipt-quality log on disk. The RECEIPT PATH is thus independent of the
+    // LAUNCH PATH: without this, a green standalone run leaves no trace, which is
+    // indistinguishable from never having run. Fail-closed: exits 4 on any failure.
+    let durable = match setup_durable_log(&root, &args.profile, &git_sha()) {
+        Ok(d) => d,
+        Err(code) => return ExitCode::from(code),
+    };
+
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
-    eprintln!(
-        "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
-        args.profile,
-        dag_path.display()
-    );
 
-    let result = run_dag_boxed_ordered(
-        &cfg,
-        jobs,
-        args.keep_going,
-        args.verbosity,
-        cgroups,
-        None,
-        None,
-    );
+    // Run the gates. `full` fans out to the subsumption; everything else runs the
+    // single resolved DAG once (and forwards per-step perf rows, which only the
+    // single-lane path produces via the typed RunResult).
+    let (gates, skipped, wall, ok, selection_mode): (Vec<GateOutcome>, Vec<String>, f64, bool, &str) =
+        if is_full {
+            eprintln!("validate.rs: running profile \"full\" (subsumes run_full_suite) at -j {jobs}");
+            let (g, s, w, o) =
+                run_full_profile(&root, jobs, args.keep_going, args.verbosity, cgroups);
+            (g, s, w, o, "full")
+        } else {
+            let (cfg, dag_path) = cfg.expect("single-lane path always resolves a cfg");
+            eprintln!(
+                "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
+                args.profile,
+                dag_path.display()
+            );
+            let result = run_dag_boxed_ordered(
+                &cfg,
+                jobs,
+                args.keep_going,
+                args.verbosity,
+                cgroups,
+                None,
+                None,
+            );
+
+            // Forward per-step profile rows only when a profile dir is configured
+            // (--perf-dir or the env), mirroring the runner's own opt-in.
+            let profile_dir = args
+                .perf_dir
+                .clone()
+                .or_else(|| std::env::var(PROFILE_DIR_ENV).ok().filter(|s| !s.is_empty()));
+            if let Some(dir) = profile_dir {
+                let sha = git_sha();
+                append_step_profiles(
+                    Path::new(&dir),
+                    &result.step_profile_rows,
+                    &sha,
+                    jobs,
+                    None,
+                    "unverified",
+                    LEDGER_PRODUCER,
+                );
+                eprintln!(
+                    "validate.rs: forwarded {} step profile row(s) to {dir}",
+                    result.step_profile_rows.len()
+                );
+            }
+
+            let gates: Vec<GateOutcome> =
+                result.outcomes.iter().map(GateOutcome::from).collect();
+            let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
+            (gates, result.skipped.clone(), result.wall_s, result.ok, selection_mode)
+        };
 
     let finished_at = utc_now();
 
-    // Structural verdict — never text-grep. `RunResult.ok` is the library's own
-    // "no genuine, non-aborted failure occurred" verdict.
-    let failures = result
-        .outcomes
-        .iter()
-        .filter(|o| !o.ok && !o.aborted)
-        .count();
-    let exit_code: u8 = if result.ok && failures == 0 { 0 } else { 1 };
+    // Structural verdict — never text-grep. A genuine, non-aborted failing gate is
+    // the honest failure; `ok` is the library/subsumption's own no-failure verdict.
+    let failures = gates.iter().filter(|o| !o.ok && !o.aborted).count();
+    let exit_code: u8 = if ok && failures == 0 { 0 } else { 1 };
 
-    print_cost_table(&result.outcomes, &result.skipped);
+    print_cost_table(&gates, &skipped);
 
-    // Forward per-step profile rows only when a profile dir is configured
-    // (--perf-dir or the env), mirroring the runner's own opt-in.
-    let profile_dir = args
-        .perf_dir
-        .clone()
-        .or_else(|| std::env::var(PROFILE_DIR_ENV).ok().filter(|s| !s.is_empty()));
-    if let Some(dir) = profile_dir {
-        let sha = git_sha();
-        append_step_profiles(
-            Path::new(&dir),
-            &result.step_profile_rows,
-            &sha,
-            jobs,
-            None,
-            "unverified",
-            LEDGER_PRODUCER,
-        );
-        eprintln!("validate.rs: forwarded {} step profile row(s) to {dir}", result.step_profile_rows.len());
-    }
-
-    // Ledger — always writes (checkout-local default when no env override), at
-    // the single write point that carries every qualification with the value.
+    // Ledger — always writes (checkout-local default when no env override), at the
+    // single write point that carries every qualification with the value, including
+    // the absolute durable log path for finalize_receipt.py --scan / verify_receipt.sh.
     let commit = git_sha();
     let dirty = tree_dirty();
-    let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
+    let log_path = durable.path.clone();
     write_ledger_record(
         &ledger_path(&root),
         &started_at,
         &finished_at,
         &args.profile,
-        &result,
+        &gates,
+        &skipped,
+        wall,
+        ok,
+        log_path.to_str(),
         exit_code,
         &commit,
         dirty,
@@ -814,10 +1208,14 @@ fn main() -> ExitCode {
     let verdict = if exit_code == 0 { "PASS" } else { "FAIL" };
     eprintln!(
         "validate.rs: {verdict} - {} executed, {failures} failed, {} skipped in {:.1}s",
-        result.outcomes.len(),
-        result.skipped.len(),
-        result.wall_s
+        gates.len(),
+        skipped.len(),
+        wall
     );
+
+    // Flush + restore fds + reap the tee BEFORE returning, so the durable log is
+    // complete on disk when the process exits.
+    durable.finish();
 
     ExitCode::from(exit_code)
 }
