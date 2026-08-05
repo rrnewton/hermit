@@ -62,14 +62,18 @@ repository:
 - **DBI/DynamoRIO:** build the client in release mode; debug frames can overflow
   DynamoRIO's roughly 56 KiB client stack. A Rust panic in a handler aborts the
   process, so `catch_unwind` is not a recovery path. DynamoRIO follows
-  fork/exec children by default (`-follow_children`).
+  fork/exec children by default (`-follow_children`). The selected Reverie
+  `Tool` is compiled into `client.so`; there is no runtime tool-selection path,
+  so a different tool requires a different client build.
 - **KVM:** the hypercall return register is only 32 bits; obtain full-width
   results from the shared frame rather than trusting the truncated return
   register.
 - **LiteInst preload:** random instrumentation applies to dynamically linked
   ELF guests. Fully static binaries, including typical Go binaries, are outside
   that preload path and must be reported as unsupported rather than a false
-  runtime regression.
+  runtime regression. Preserve callback isolation across process lifecycle
+  transitions: instrumentation callback state must not leak across `fork` or
+  `exec`.
 - **SaBRe:** preserve example-tool selection across `fork`; losing the selected
   tool in children is a known regression class.
 
