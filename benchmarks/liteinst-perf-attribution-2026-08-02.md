@@ -90,7 +90,7 @@ microbenchmarks. Ratios use alternating backend order in the same run.
 with-proxy cargo build --release --locked -p hermit --bin hermit
 with-proxy scripts/stage-liteinst-runtime.sh release \
   target/release/libreverie_liteinst.so \
-  target/liteinst-runtime-build-d3ed343e
+  target/liteinst-runtime-build-7951770
 with-proxy ./benchmarks/targeted.py --skip-build \
   --hermit target/release/hermit \
   --backends native,ptrace,liteinst \
