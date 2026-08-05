@@ -682,6 +682,7 @@ fn run_once_with_terminal_input(
     Ok(output)
 }
 
+#[cfg(feature = "dbi")]
 fn run_status(
     runtime: &tokio::runtime::Runtime,
     runner: &DbiRunner,
@@ -696,6 +697,7 @@ fn run_status(
     Ok(status)
 }
 
+#[cfg(feature = "dbi")]
 fn clean_up_dbi_global(
     runtime: &tokio::runtime::Runtime,
     status: &std::process::ExitStatus,
