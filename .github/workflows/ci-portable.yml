@@ -190,6 +190,9 @@ jobs:
         run: |
           set -euo pipefail
           checker="$RUNNER_TEMP/check-reverie-pin"
+          checker_tests="$RUNNER_TEMP/check-reverie-pin-tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-reverie-pin.rs -o "$checker_tests"
+          "$checker_tests"
           RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-reverie-pin.rs -o "$checker"
 
           reason="$({
@@ -202,6 +205,15 @@ jobs:
             args+=(--allow-stale-reverie-pin "$reason")
           fi
           "$checker" "${args[@]}"
+      - name: Reject a stale nested-workspace Cargo.lock before the opaque --locked build failure
+        run: |
+          set -euo pipefail
+          checker="$RUNNER_TEMP/check-nested-lockfiles"
+          checker_tests="$RUNNER_TEMP/check-nested-lockfiles-tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-nested-lockfiles.rs -o "$checker_tests"
+          "$checker_tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$checker"
+          "$checker"
 
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
@@ -446,6 +458,7 @@ jobs:
             --exclude='target/release/.fingerprint' \
             --exclude='target/release/examples' \
             target/release \
+            target/ci \
             target/install_pkg
           ls -lh "$RELEASE_TARBALL"
       - name: Upload DBI install package (debug shards)
@@ -531,6 +544,7 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
+          test -x target/ci/hermit-strict
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
       - name: Run shard nodes (${{ matrix.slug }})

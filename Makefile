@@ -14,7 +14,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core prune-stale-release help checkout-all check-build-tools \
+.PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
@@ -28,9 +28,16 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
+install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbi -p detcore-sabre -p hermit-install
+
+# Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
+# fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
+# step. core.hooksPath is per-repo local config (not tracked), so it must be set
+# once per checkout; wiring it into install-deps is that step.
+install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
@@ -78,7 +85,11 @@ validate: check-submodules ## Run the full multi-backend validation suite (pass 
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+	./scripts/test-required-check-outcomes.sh
+	./scripts/test-check-status-outcome.sh
+	./scripts/check-merge-gate-policy.sh
+	python3 ./scripts/test_pr_status.py
 	$(CARGO) fmt --all -- --check
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
@@ -92,6 +103,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	@git diff --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
+	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)

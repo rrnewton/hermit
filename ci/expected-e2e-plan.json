@@ -205,6 +205,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/sqlite-query-determinism"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "chaos",
@@ -342,6 +349,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/python-hash-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-hashseed"
     },
     {
       "backend": "ptrace",
