@@ -102,7 +102,7 @@
       "group": "build",
       "job": "liteinst_runtime_release",
       "desc": "Build and stage the release LiteInst runtime",
-      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-55f6876",
+      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-7951770",
       "deps": [
         "build.runtime_release"
       ],
