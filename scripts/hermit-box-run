@@ -27,12 +27,23 @@
 # ai_docs/box-requirements-for-verify-hang-repro_20260803.md.)
 #
 # USAGE
-#   hermit-box-run [--cpu-budget SECS] [--cores K] [--label NAME]
-#                  [--perf-dir DIR] [--allow-cgroup-failure] -- CMD [ARGS...]
+#   hermit-box-run [--cpu-budget SECS] [--wall SECS] [--mem SIZE] [--cores K]
+#                  [--label NAME] [--perf-dir DIR] [--allow-cgroup-failure] -- CMD [ARGS...]
 #
-#   --cpu-budget SECS  whole-subtree CPU-time budget; the run is reaped when it exceeds
-#                      this. Default 240 (~4x the ~57 CPU-s known-good `hermit run
-#                      --strict --verify` budget B; kill at ~4B). Set per workload.
+#   THREE INDEPENDENT CGROUP LIMITS (set any combination; each fires its own clean kill):
+#   --cpu-budget SECS  whole-subtree CPU-TIME budget (user+system CPU-s, cgroup cpu.stat);
+#                      the run is reaped cgroup.kill-first when it exceeds this. Immune to
+#                      machine load — a merely-slow run still finishes; only a runaway hits
+#                      it. Default 240 (~4x the ~57 CPU-s known-good `hermit run --strict
+#                      --verify` budget B; kill at ~4B). Set per workload.
+#   --wall SECS        whole-subtree WALL-CLOCK ceiling (real time). Backstop for a step
+#                      that BLOCKS/hangs without burning CPU (a busy loop is caught by
+#                      --cpu-budget; a deadlock/sleep is caught here). Reaped cgroup.kill-first
+#                      on breach. Unset = the runner default (1800s).
+#   --mem SIZE         whole-subtree MEMORY cap -> inner cgroup memory.max. The kernel
+#                      OOM-kills the step at its cap (attributed via memory.events oom_kill).
+#                      SIZE is a byte count or a suffixed size: 512M, 2G (SI), 1Gi (binary).
+#                      Unset = no per-step memory cap (only the outer safe-ci.slice cap).
 #   --cores K          constrain the whole subtree to K least-busy free cores (cgroup
 #                      cpuset, else sched_setaffinity). K=1 forces sequential execution.
 #                      Absent = no core pin.
@@ -60,9 +71,10 @@
 #
 # EXIT CODES
 #   default (capture) mode — passthrough from safe-ci-dag-runner:
-#     0  command succeeded within budget
-#     1  command failed OR was reaped for exceeding the CPU-time budget (grep the output for
-#        "CPU-TIMEOUT" to distinguish; a reaped runaway is exactly the leak this prevents)
+#     0  command succeeded within all limits
+#     1  command failed OR was reaped for exceeding a limit — grep the step line to
+#        distinguish: "CPU-TIMEOUT" (--cpu-budget), "TIMEOUT"/wall (--wall), or an OOM kill
+#        (--mem, memory.max). A reaped runaway/leak is exactly what this prevents.
 #     2  bad usage
 #     3  cgroup boxing required but unavailable (pass --allow-cgroup-failure to run unboxed)
 #   --passthrough mode — the child's REAL exit status is propagated verbatim (0 on success, the
@@ -75,6 +87,8 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 RUNNER="$ROOT/agent-utils/bin/safe-ci-dag-runner"
 
 cpu_budget=240
+wall=""
+mem=""
 cores=""
 label="box"
 perf_dir=""
@@ -89,6 +103,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --cpu-budget) [ $# -ge 2 ] || die "--cpu-budget needs a value"; cpu_budget="$2"; shift 2 ;;
     --cpu-budget=*) cpu_budget="${1#*=}"; shift ;;
+    --wall)       [ $# -ge 2 ] || die "--wall needs a value"; wall="$2"; shift 2 ;;
+    --wall=*)     wall="${1#*=}"; shift ;;
+    --mem)        [ $# -ge 2 ] || die "--mem needs a value"; mem="$2"; shift 2 ;;
+    --mem=*)      mem="${1#*=}"; shift ;;
     --cores)      [ $# -ge 2 ] || die "--cores needs a value"; cores="$2"; shift 2 ;;
     --cores=*)    cores="${1#*=}"; shift ;;
     --label)      [ $# -ge 2 ] || die "--label needs a value"; label="$2"; shift 2 ;;
@@ -101,7 +119,7 @@ while [ $# -gt 0 ]; do
     --diag-fd=*)  diag_fd="${1#*=}"; shift ;;
     --diag-log)   [ $# -ge 2 ] || die "--diag-log needs a value"; diag_log="$2"; shift 2 ;;
     --diag-log=*) diag_log="${1#*=}"; shift ;;
-    -h|--help)    sed -n '2,80p' "$SELF"; exit 0 ;;
+    -h|--help)    sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/d;p}' "$SELF"; exit 0 ;;
     --)           shift; break ;;
     -*)           die "unknown option '$1' (put the command after '--')" ;;
     *)            break ;;
@@ -111,7 +129,35 @@ done
 [ $# -ge 1 ] || die "no command given (use '-- CMD [ARGS...]')"
 case "$cpu_budget" in ''|*[!0-9]*) die "--cpu-budget must be a positive integer (seconds)";; esac
 [ "$cpu_budget" -gt 0 ] || die "--cpu-budget must be > 0"
+if [ -n "$wall" ]; then
+  case "$wall" in ''|*[!0-9]*) die "--wall must be a positive integer (seconds)";; esac
+  [ "$wall" -gt 0 ] || die "--wall must be > 0"
+fi
 if [ -n "$cores" ]; then case "$cores" in ''|*[!0-9]*) die "--cores must be a positive integer";; esac; fi
+
+# --mem: accept a byte count or a suffixed size (512M/2G SI, 1Gi binary) -> bytes. Validate
+# up front so a bad size is a usage error (exit 2), not a late runner failure.
+mem_bytes=""
+if [ -n "$mem" ]; then
+  mem_bytes="$(python3 - "$mem" <<'PY'
+import re, sys
+s = sys.argv[1].strip()
+m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([KMGT]i?B?|B)?', s, re.IGNORECASE)
+if not m:
+    sys.exit(1)
+val = float(m.group(1))
+unit = (m.group(2) or "").upper().rstrip("B")
+mult = {"": 1, "K": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4,
+        "KI": 1024, "MI": 1024**2, "GI": 1024**3, "TI": 1024**4}
+if unit not in mult:
+    sys.exit(1)
+b = int(val * mult[unit])
+if b <= 0:
+    sys.exit(1)
+print(b)
+PY
+)" || die "--mem must be a size like 512M, 2G, 1Gi, or a positive byte count"
+fi
 if [ -n "$diag_fd" ]; then case "$diag_fd" in ''|*[!0-9]*) die "--diag-fd must be a file descriptor number";; esac; fi
 if [ "$passthrough" -eq 0 ]; then
   [ -z "$diag_fd" ]  || die "--diag-fd is only valid with --passthrough"
@@ -194,7 +240,10 @@ PY
   local -a sr=(systemd-run --user --scope --quiet --unit="$unit"
                --description="hermit-box-run passthrough: $*")
   [ -n "$allowed_cpus" ] && sr+=(-p "AllowedCPUs=$allowed_cpus")
-  diag "scope=$unit cpu-budget=${cpu_budget}s cmd: $*"
+  # Memory cap -> cgroup memory.max with swap disabled, so the kernel HARD-OOM-kills the
+  # subtree at the cap instead of swapping past it (matches the outer safe-ci.slice policy).
+  [ -n "$mem_bytes" ] && sr+=(-p "MemoryMax=$mem_bytes" -p "MemorySwapMax=0")
+  diag "scope=$unit cpu-budget=${cpu_budget}s wall=${wall:-none} mem=${mem_bytes:-none} cmd: $*"
 
   # Preserve BYTE-IDENTICAL passthrough: the boxed CHILD must own the caller's REAL fd1/fd2,
   # while the wrapper shell's OWN output — including bash async job notifications like
@@ -244,11 +293,21 @@ PY
     fi
   else
     diag "cgroup=$cgpath"
-    # Monitor loop: poll CPU-time usage; reap cgroup.kill-first on budget overrun.
+    # Wall deadline (real-clock backstop for a blocked/hung child that burns no CPU). The
+    # memory cap needs no polling: the kernel OOM-kills the subtree at memory.max directly.
+    local wall_deadline=0
+    [ -n "$wall" ] && wall_deadline=$(( $(date +%s) + wall ))
+    # Monitor loop: poll CPU-time usage + wall deadline; reap cgroup.kill-first on overrun.
     while kill -0 "$runner_pid" 2>/dev/null; do
       last_usage="$(awk '/^usage_usec/{print $2}' "$cgpath/cpu.stat" 2>/dev/null || echo "$last_usage")"
       if [ "${last_usage:-0}" -gt "$budget_usec" ]; then
         diag "CPU-TIMEOUT: usage_usec=$last_usage exceeded budget=${budget_usec} (${cpu_budget}s) — reaping via cgroup.kill"
+        echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+        reaped=1
+        break
+      fi
+      if [ "$wall_deadline" -gt 0 ] && [ "$(date +%s)" -ge "$wall_deadline" ]; then
+        diag "WALL-TIMEOUT: exceeded ${wall}s wall-clock — reaping via cgroup.kill"
         echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
         reaped=1
         break
@@ -286,7 +345,7 @@ fi
 dag_file="$(mktemp -t hermit-box-run.XXXXXX.dag.json)"
 cleanup() { rm -f "$dag_file"; }
 trap cleanup EXIT
-LABEL="$label" CPU_BUDGET="$cpu_budget" python3 - "$@" > "$dag_file" <<'PY'
+LABEL="$label" CPU_BUDGET="$cpu_budget" WALL="$wall" MEM_BYTES="$mem_bytes" python3 - "$@" > "$dag_file" <<'PY'
 import json, os, shlex, sys
 argv = sys.argv[1:]
 # exec so the boxed step process IS the command (one clean subtree, no extra shell frame).
@@ -295,13 +354,19 @@ label = os.environ["LABEL"]
 grp, _, job = label.partition(".")
 if not job:
     grp, job = "box", label
-dag = {"steps": [{
+step = {
     "group": grp, "job": job,
     "desc": "hermit-box-run: " + " ".join(argv),
     "cmd": cmd,
-    "cpu_timeout": int(os.environ["CPU_BUDGET"]),
-}]}
-json.dump(dag, sys.stdout)
+    "cpu_timeout": int(os.environ["CPU_BUDGET"]),  # CPU-time budget (cgroup cpu.stat)
+}
+wall = os.environ.get("WALL", "")
+if wall:  # wall-clock ceiling -> step `timeout` (backstop for a blocked/hung step)
+    step["timeout"] = int(wall)
+mem = os.environ.get("MEM_BYTES", "")
+if mem:  # memory cap -> inner cgroup memory.max (kernel OOM-kills the step at its cap)
+    step["hint"] = {"hard_mem_max_bytes": int(mem)}
+json.dump({"steps": [step]}, sys.stdout)
 PY
 
 set -- run --dag "$dag_file" --no-profile
@@ -309,4 +374,11 @@ set -- run --dag "$dag_file" --no-profile
 [ -n "$perf_dir" ] && set -- "$@" --perf-dir "$perf_dir"
 [ "$allow_cgroup_failure" -eq 1 ] && set -- "$@" --allow-cgroup-failure
 
-exec "$RUNNER" "$@"
+# Run the runner as a CHILD (not `exec`) so the EXIT trap fires and the temp DAG is
+# DISCARDED — the task's "generate temp JSON, run once, discard" contract. `exec` would
+# replace this shell and skip the trap, leaking one dag.json per invocation. The runner
+# re-execs itself into its own transient systemd scope, so keeping this thin parent frame
+# alive to wait + clean up does not weaken the boxing. Propagate the runner's exit verbatim.
+rc=0
+"$RUNNER" "$@" || rc=$?
+exit "$rc"
