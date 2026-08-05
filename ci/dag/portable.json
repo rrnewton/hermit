@@ -75,6 +75,7 @@
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
       "timeout": 60,
+      "cpu_timeout": 44,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
@@ -84,6 +85,7 @@
       "cmd": "./ci/test_harness.sh build --lane portable --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 600,
+      "cpu_timeout": 49,
       "hint": {"est_duration_s": 90, "rss_baseline_bytes": 1073741824,
                "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
     },
@@ -94,6 +96,7 @@
       "cmd": "./ci/test_harness.sh run --lane portable --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/applications/results.jsonl --junit ignored/e2e/portable/applications/junit.xml",
       "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
       "timeout": 600,
+      "cpu_timeout": 40,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
