@@ -119,6 +119,30 @@ fn timerfd_remaining_ns(deadline: Option<LogicalTime>, interval_ns: u64, now: Lo
     }
 }
 
+/// The `it_value` to arm the host timer with when handing a `timerfd` back.
+///
+/// `timerfd_remaining_ns` reports zero for two states that must not be handed
+/// over the same way. A *disarmed* timer has no deadline, and arming the host
+/// with zero correctly disarms it. An *expired one-shot* also reports zero —
+/// `timerfd_gettime` shows it as disarmed while its single expiration is still
+/// waiting to be read — and arming the host with zero would disarm the timer
+/// and destroy that pending expiration, so the guest would spin forever on a
+/// timer that already fired. Arm the shortest positive interval instead: the
+/// kernel fires immediately and delivers the expiration the virtual model was
+/// still holding.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+fn timerfd_hand_back_it_value_ns(remaining_ns: u64, deadline: Option<LogicalTime>) -> u64 {
+    match deadline {
+        // Genuinely disarmed: hand the kernel a disarmed timer.
+        None => 0,
+        // Armed. A zero remaining means the expiration is already pending, and
+        // `it_value == 0` is Linux's spelling of "disarm", so it cannot be used
+        // to express "fire now".
+        Some(_) => remaining_ns.max(1),
+    }
+}
+
 /// Whether re-arming a `timerfd` to `new_deadline` needs a retarget of a reader
 /// already parked until `parked_deadline` — something the scheduler cannot do,
 /// so the descriptor must be handed to the kernel, which can.
@@ -2434,7 +2458,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let now = thread_observe_time(guest).await;
-        let remaining_ns = timerfd_remaining_ns(state.deadline, state.interval_ns, now);
+        let remaining_ns = timerfd_hand_back_it_value_ns(
+            timerfd_remaining_ns(state.deadline, state.interval_ns, now),
+            state.deadline,
+        );
         let new_value = libc::itimerspec {
             it_interval: ns_to_timerfd_timespec(state.interval_ns),
             it_value: ns_to_timerfd_timespec(remaining_ns),
@@ -2458,19 +2485,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd: RawFd,
         new_value: &libc::itimerspec,
     ) -> Result<(), Error> {
-        let new_ptr: AddrMut<libc::itimerspec> = {
-            let mut stack = guest.stack().await;
-            let ptr = stack.reserve();
-            guest.memory().write_value(ptr, new_value)?;
-            stack.commit()?;
-            ptr
-        };
+        let mut stack = guest.stack().await;
+        // `push` stages the value with the allocation, so `commit` writes the
+        // bytes into the guest. Reserving and then writing through
+        // `guest.memory()` does not survive the commit: the kernel would read a
+        // zeroed `itimerspec`, which is Linux's spelling of "disarm", and the
+        // handover would silently destroy the timer instead of transferring it.
+        let new_ptr: Addr<libc::itimerspec> = stack.push(*new_value);
+        // The commit guard owns the scratch allocation: it has to outlive the
+        // syscall that reads through `new_ptr`, or the guest's stack is restored
+        // before the kernel ever sees the `itimerspec`.
+        let scratch_guard = stack.commit()?;
         let call = syscalls::TimerfdSettime::new()
             .with_fd(fd)
             .with_flags(0)
-            .with_new_value(Some(new_ptr.into()))
+            .with_new_value(Some(new_ptr))
             .with_old_value(None);
-        self.notification_fd_control(guest, call.into()).await?;
+        let result = self.notification_fd_control(guest, call.into()).await;
+        drop(scratch_guard);
+        result?;
         Ok(())
     }
 
@@ -3270,6 +3303,7 @@ mod test {
 mod timerfd_gate_test {
     use detcore_model::time::LogicalTime;
 
+    use super::timerfd_hand_back_it_value_ns;
     use super::timerfd_rearm_needs_host_retarget;
 
     fn at(ns: u64) -> LogicalTime {
@@ -3310,5 +3344,28 @@ mod timerfd_gate_test {
         // Nobody parked: any arming is fine, including a disarm.
         assert!(!timerfd_rearm_needs_host_retarget(None, Some(at(1))));
         assert!(!timerfd_rearm_needs_host_retarget(None, None));
+    }
+
+    /// Fires: an armed timer whose expiration is already pending must reach the
+    /// kernel as "fire now", not as "disarmed". `timerfd_remaining_ns` reports
+    /// zero for an expired one-shot, and `it_value == 0` is Linux's spelling of
+    /// disarm, so handing that zero straight over destroys the expiration and
+    /// the guest spins on a timer that already fired.
+    #[test]
+    fn an_expired_one_shot_is_handed_over_as_fire_now() {
+        assert_eq!(timerfd_hand_back_it_value_ns(0, Some(at(123))), 1);
+    }
+
+    /// Refuses: a genuinely disarmed timer must stay disarmed. Without this
+    /// side, the rule above would resurrect timers the guest turned off.
+    #[test]
+    fn a_disarmed_timer_is_handed_over_disarmed() {
+        assert_eq!(timerfd_hand_back_it_value_ns(0, None), 0);
+    }
+
+    /// A real remaining time is passed through untouched.
+    #[test]
+    fn a_pending_deadline_is_handed_over_unchanged() {
+        assert_eq!(timerfd_hand_back_it_value_ns(500_000, Some(at(1))), 500_000);
     }
 }
