@@ -3887,9 +3887,7 @@ mod tests {
 
         // Collect every armed deterministic child-exit `SIGCHLD`
         // (deadline, exiting-child pid, reaping-parent pid, target thread).
-        fn child_exit_events(
-            state: &GlobalState,
-        ) -> Vec<(LogicalTime, DetPid, DetPid, DetTid)> {
+        fn child_exit_events(state: &GlobalState) -> Vec<(LogicalTime, DetPid, DetPid, DetTid)> {
             let sched = state.sched.lock().unwrap();
             sched
                 .blocked
@@ -3954,7 +3952,10 @@ mod tests {
             events,
         );
         let (deadline, evt_child, evt_parent, evt_tid) = events[0];
-        assert_eq!(evt_child, child_pid, "SIGCHLD keyed on the exiting child pid");
+        assert_eq!(
+            evt_child, child_pid,
+            "SIGCHLD keyed on the exiting child pid"
+        );
         assert_eq!(
             evt_parent, parent_pid,
             "SIGCHLD delivered to the reaping parent process",
