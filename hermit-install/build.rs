@@ -291,8 +291,9 @@ fn build_liteinst_runtime(
     // the staged runtime rebuilds when the pin moves. Keep it a prefix of the
     // canonical Reverie rev; drift here is caught by scripts/check-reverie-pin.rs
     // (hook + validate.sh + CI). This was stale at `d973a85` after the pin
-    // advanced to 79517704…, and again at `7951770` after the pin advanced to 9e7af7d….
-    let target = build_root.join("liteinst-runtime-9e7af7d");
+    // advanced to 79517704…, at `7951770` after the pin advanced to 9e7af7d…,
+    // and at `9e7af7d` after the pin advanced to 025d3780….
+    let target = build_root.join("liteinst-runtime-025d378");
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
