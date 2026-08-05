@@ -169,7 +169,11 @@
     {
       "_why": "Legacy DBI parity fixtures are outside Cargo targets.",
       "paths": ["tests/backend-parity/**"],
-      "nodes": ["e2e.manifest_backend_parity_c", "test.dbi_parity"],
+      "nodes": [
+        "check.backend_parity_mutation",
+        "e2e.manifest_backend_parity_c",
+        "test.dbi_parity"
+      ],
       "e2e_backends": ["dbi"]
     },
     {
