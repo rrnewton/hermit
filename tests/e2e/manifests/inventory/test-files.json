@@ -2947,6 +2947,12 @@
       "why": "tests/e2e/data-handling/sqlite-query-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/language-runtimes/python-dict-hash-iteration.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/python-dict-hash-iteration.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Python string-hash randomization (set/dict iteration order and hash(str)) plus file I/O and subprocess capture under strict verification"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/python-hashseed.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
