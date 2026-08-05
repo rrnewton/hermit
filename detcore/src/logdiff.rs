@@ -700,7 +700,43 @@ fn git_diff(
 // TODO: we should replace this with a diff algorithm that can handle insertions while maintaining
 // alignment. There's also no reason we can't output the stripped relevant lines and use a separate
 // diff tool.
+/// What a log comparison actually compared, alongside whether it differed.
+///
+/// A bare "no difference found" boolean cannot distinguish *"the two message
+/// streams were compared and matched"* from *"there were no messages to
+/// compare"*. Both selected lists being empty is a NO-RESULT, not a match, so
+/// the counts travel with the verdict and a parity consumer can require nonzero
+/// execution before believing a green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogDiffSummary {
+    /// True if a substantive difference was found between the two runs.
+    pub diff_found: bool,
+    /// Number of messages actually selected for comparison from the first run.
+    pub compared_left: usize,
+    /// Number of messages actually selected for comparison from the second run.
+    pub compared_right: usize,
+}
+
+impl LogDiffSummary {
+    /// True only when the comparison both ran on a nonempty selection *and*
+    /// found no difference. An empty-vs-empty comparison is never a match.
+    pub fn matched_with_evidence(&self) -> bool {
+        !self.diff_found && self.compared_left > 0 && self.compared_right > 0
+    }
+}
+
+/// Compare two log files, reporting only whether they differ.
+///
+/// See [`log_diff_detailed`] when the caller must also know how many messages
+/// were actually compared; a bare `false` here cannot distinguish a match from
+/// an empty comparison.
 pub fn log_diff(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> bool {
+    log_diff_detailed(file_a, file_b, opts).diff_found
+}
+
+/// Like [`log_diff`], but returns the counted comparison evidence rather than a
+/// bare boolean.
+pub fn log_diff_detailed(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> LogDiffSummary {
     // For now the log-diff mode reads both logs fully into memory. This could be
     // modified in the future for a streaming solution, at least for scrolling through
     // the identical prefixes of very large logs.
@@ -708,16 +744,28 @@ pub fn log_diff(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> bool {
     let vec_b = std::fs::read(file_b).expect("Could not open second input file.");
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
-    log_diff_from_strs(str_a, str_b, opts, &mut std::io::stderr())
+    log_diff_summary_from_strs(str_a, str_b, opts, &mut std::io::stderr())
         .expect("should write succesfully")
 }
 
+/// Boolean-only wrapper retained for tests that only ask "did it differ?".
+/// Prefer [`log_diff_summary_from_strs`] where the counts matter.
+#[cfg(test)]
 fn log_diff_from_strs(
     file_a_str: impl AsRef<str>,
     file_b_str: impl AsRef<str>,
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<bool> {
+    Ok(log_diff_summary_from_strs(file_a_str, file_b_str, opts, w)?.diff_found)
+}
+
+fn log_diff_summary_from_strs(
+    file_a_str: impl AsRef<str>,
+    file_b_str: impl AsRef<str>,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<LogDiffSummary> {
     let all_a = filter_ignored(
         extract_log_messages(file_a_str.as_ref()),
         &opts.ignore_lines,
@@ -800,12 +848,31 @@ fn log_diff_from_strs(
         )?
     };
 
+    let summary = LogDiffSummary {
+        diff_found,
+        compared_left: compared_a.len(),
+        compared_right: compared_b.len(),
+    };
+
     if diff_found {
         writeln!(w, "Done processing logs, differences found.")?;
+    } else if summary.compared_left == 0 && summary.compared_right == 0 {
+        // Say this plainly rather than letting "no differences" stand in for
+        // "nothing was compared": a caller that treats the two alike turns a
+        // no-result into a green.
+        writeln!(
+            w,
+            "Done processing logs, but ZERO {which} messages were selected on either side: \
+             nothing was compared (no-result, not a match)."
+        )?;
     } else {
-        writeln!(w, "Done processing logs, no substantive differences found.")?;
+        writeln!(
+            w,
+            "Done processing logs, no substantive differences found ({} | {} {which} messages compared).",
+            summary.compared_left, summary.compared_right,
+        )?;
     }
-    Ok(diff_found)
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -1391,6 +1458,53 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
         assert!(
             !super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
             "a wall-clock-prefix-only difference must compare EQUAL"
+        );
+        Ok(())
+    }
+
+    /// NEGATIVE: two logs with nothing to compare must NOT be reported as a
+    /// match with evidence. `diff_found` is legitimately false (there is no
+    /// difference between two empty selections), but the counts are zero, so
+    /// `matched_with_evidence()` must refuse. This is the "green with zero
+    /// executed work" no-result, and it is the reason the counts exist.
+    #[test]
+    fn empty_selection_is_a_no_result_not_a_match() -> std::io::Result<()> {
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let summary = super::log_diff_summary_from_strs("", "", &canonical, &mut Vec::new())?;
+        assert!(!summary.diff_found, "two empty logs do not differ");
+        assert_eq!(summary.compared_left, 0);
+        assert_eq!(summary.compared_right, 0);
+        assert!(
+            !summary.matched_with_evidence(),
+            "zero compared messages must never count as a verified match"
+        );
+        Ok(())
+    }
+
+    /// POSITIVE: the same predicate must still FIRE on a real comparison, so the
+    /// guard is not merely refusing everything.
+    #[test]
+    fn nonempty_identical_selection_is_a_match_with_evidence() -> std::io::Result<()> {
+        let run = "Apr 09 06:08:03.100  INFO detcore: [t] finish syscall: close(2) = Ok(0)
+Apr 09 06:08:03.200  INFO detcore: [t] finish syscall: exit_group(0)";
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let summary = super::log_diff_summary_from_strs(run, run, &canonical, &mut Vec::new())?;
+        assert!(!summary.diff_found);
+        assert_eq!(summary.compared_left, 2);
+        assert_eq!(summary.compared_right, 2);
+        assert!(
+            summary.matched_with_evidence(),
+            "a real, nonempty, identical comparison must count as a match"
         );
         Ok(())
     }
