@@ -1,10 +1,11 @@
-# Hermit backend parity matrix
+# Hermit backend parity runner
 
 This directory tracks executable parity contracts across Hermit's ptrace,
-DynamoRIO (DBI), and KVM backends. `matrix.tsv` is the ratchet: changing a pair
-from `gap` to `pass` (L1) or from `gap` to `detlog`/`guest` (L2) makes
-`run_matrix.py` enforce it on every subsequent run. A `gap` must have a concrete
-implementation reason.
+DynamoRIO (DBI), and KVM backends. The case catalog and its small set of known
+gaps live in `run_matrix.py`; new cases are green contracts by default. Live
+results are compatibility measurement state, so when Hermit is checked out
+inside dev-hermit the runner appends them to the outer
+`compat-envelope/scorecard.csv` instead of maintaining a generated TSV here.
 
 ## Current ratchet
 
@@ -17,7 +18,7 @@ L1 (`hermit run --strict`):
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
-| DBI | 27/28 | 96% |
+| DBI | 26/28 | 93% |
 | KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
@@ -42,8 +43,9 @@ measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
-file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+file-mutation contracts, plus deterministic memory-advice and
+memory-layout behavior. It is an explicit gap on the file-metadata row (see
+below). It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -67,7 +69,14 @@ links, reads, and removes temporary files without exposing backend-specific meta
 The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
-policy failures for extended attributes but not an unimplemented syscall.
+policy failures for extended attributes but not an unimplemented syscall. DBI is
+an explicit gap on this row: it forwards `fchown` to the real kernel, so once
+credential queries are determinized to virtual-root identity `0` (PR #1549) the
+guest's `fchown(fd, 0, 0)` becomes an unprivileged chown-to-root and returns
+`EPERM`, while ptrace remaps it through the user namespace. `fchown` is not
+correctly implemented under DBI, and asserting against a half-implemented syscall
+could pass by accident and prove nothing, so the DBI cell is a declared gap until
+DBI determinizes `fchown`.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -94,7 +103,7 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
-## Matrix
+## Cases
 
 Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
 DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
@@ -108,7 +117,7 @@ is not reached.
 | `exit_status` | pass / detlog | pass / detlog | pass / guest |
 | `file_read` | pass / detlog | pass / detlog | pass / guest |
 | `file_mutation` | pass / detlog | pass / detlog | pass / guest |
-| `file_metadata` | pass / detlog | pass / detlog | pass / guest |
+| `file_metadata` | pass / detlog | gap / gap | pass / guest |
 | `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
 | `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
 | `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
@@ -140,9 +149,9 @@ as a deterministic no-op because it replaces the Linux scheduler with its own,
 so the guest observes an identical, host-independent result across ptrace, DBI,
 and KVM and across the `--verify` double run.
 
-The authoritative reasons live in `matrix.tsv`, next to the status they
-justify. The runner executes each passing pair three times and checks exit
-status, stdout, and (for determinism cases) byte-identical repeated output.
+The authoritative exceptions and their reasons live in `L1_GAPS` and
+`L2_GAPS` in the runner. The runner executes each passing pair three times and
+checks exit status, stdout, and (for determinism cases) byte-identical repeated output.
 Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBI
 gate uses this mode.
 The DBI random-source contract also compares the root thread's post-fault
@@ -161,13 +170,13 @@ guest twice and asserts a bitwise-identical result. Because `--verify` diverts
 the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
 stdout the way the L1 path does; instead it enforces that the guest exit status
 matches and that hermit's double-run comparison succeeded at *at least* the
-assurance kind recorded in `matrix.tsv`. The runner keys on two distinct stderr
+assurance kind expected for the backend. The runner keys on two distinct stderr
 witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
 One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
-reason in `matrix.tsv`:
+reason in the runner:
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
@@ -221,7 +230,7 @@ Use `--check` to validate the corpus contract without prerequisites.
 
 ## Running
 
-Validate the checked-in matrix without backend prerequisites:
+Validate the case catalog and known-gap invariants without backend prerequisites:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --check
@@ -261,6 +270,9 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Use `--output /tmp/backend-parity.tsv` to retain machine-readable observations.
-`BLOCKED` means a required host capability or runtime artifact was absent; it
-does not change the checked-in pass/gap claim.
+Every non-check run auto-discovers an outer dev-hermit checkout and appends
+scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
+to select another outer scorecard, `--no-parent-scorecard` for a deliberately
+side-effect-free run, or `--output /tmp/backend-parity.tsv` for the legacy
+standalone observation TSV. `BLOCKED` means a required host capability or
+runtime artifact was absent; it does not change the known-gap contract.

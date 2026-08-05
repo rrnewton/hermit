@@ -11,6 +11,11 @@ pr-dag-health.json
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
 
+# validate.rs checkout-local validation ledger (used when neither
+# HERMIT_VALIDATE_LEDGER nor DEV_HERMIT_PARENT is set). Disposable per-checkout
+# receipts, regenerated on every run.
+.hermit-validate-ledger.jsonl
+
 # Local backup and Python cache files.
 *.orig
 **/__pycache__/
@@ -19,3 +24,6 @@ envelope.json
 # Generated validation/e2e output. Everything under ignored/ is disposable and
 # must not taint source provenance or the version string.
 /ignored/
+
+# Backend-parity observations belong to the outer dev-hermit compat scorecard.
+/tests/backend-parity/matrix.tsv

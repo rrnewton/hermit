@@ -10,6 +10,7 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+mod backend_stats;
 mod chroot;
 mod consts;
 mod desync;
@@ -799,6 +800,7 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
 struct StagedSabreProgram {
@@ -998,6 +1000,7 @@ async fn run_sabre(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    let path_evidence_file = std::env::var_os(SABRE_PATH_EVIDENCE_ENV).map(PathBuf::from);
     let sabre = resolve_sabre_binary()?;
     let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
@@ -1034,6 +1037,7 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    command.env_remove(SABRE_PATH_EVIDENCE_ENV);
     command.env_remove(SABRE_DETLOG_FORWARD_ENV);
     if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
         command.env(SABRE_DETLOG_FORWARD_ENV, "1");
@@ -1077,9 +1081,26 @@ async fn run_sabre(
     }
     tracing::info!(
         target: "hermit::sabre::fallback",
-        patched_sites = supervised.patched_sites,
+        ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
+        trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
+        guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
+    if let Some(path) = path_evidence_file {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                anyhow!(
+                    "failed to open SaBRe path evidence {}: {error}",
+                    path.display()
+                )
+            })?;
+        serde_json::to_writer(&mut file, &supervised.path_evidence)?;
+        writeln!(file)?;
+    }
     let output = Output {
         status: supervised.status.into(),
         stdout: supervised.stdout,
@@ -1546,6 +1567,7 @@ async fn run_with_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -1554,6 +1576,7 @@ async fn run_with_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await; // Before it's dropped by this function.
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
 
@@ -1660,6 +1683,7 @@ async fn run_with_output_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
+    let stats_request = backend_stats::request();
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1671,6 +1695,7 @@ async fn run_with_output_backend_inner(
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
 
