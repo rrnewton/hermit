@@ -510,6 +510,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/python-hashseed"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/tcl-rand-clock"
     }
   ],
   "schema": 1
