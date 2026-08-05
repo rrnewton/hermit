@@ -14,11 +14,11 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all check-build-tools \
+.PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
-build: install-deps ## Build the development Hermit binary with every backend
+build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
 		-p hermit --features third-party-backends
 
@@ -28,12 +28,45 @@ build: install-deps ## Build the development Hermit binary with every backend
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
+install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbi -p detcore-sabre -p hermit-install
 
+# Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
+# fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
+# step. core.hooksPath is per-repo local config (not tracked), so it must be set
+# once per checkout; wiring it into install-deps is that step.
+install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+	@./scripts/setup-hooks.sh
+
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
+
+# `make build` produces target/debug/hermit but never rebuilds an existing
+# target/release/hermit. A release binary left over from an earlier
+# `make release-core` (or from a different commit) is then STALE: the documented
+# release smoke commands (README, docs/QEMU_BOOT.md, docs/SABRE_COMPATIBILITY.md)
+# run `./target/release/hermit`, which exits 0 while silently testing old code.
+# To make that impossible, `build` depends on this target, which REMOVES a stale
+# release binary (rebuild-or-remove: rebuild explicitly with `make release-core`).
+# "Current" means the embedded --version SHA equals HEAD's `git rev-parse
+# --short=12` on a clean worktree with no `-dirty` marker, matching how
+# hermit-cli/build.rs stamps the binary. A dirty worktree can't be verified, so
+# any existing release binary is treated as stale and removed.
+prune-stale-release: ## Remove target/release/hermit if stale (not built from current HEAD/worktree)
+	@bin=target/release/hermit; \
+	[ -x "$$bin" ] || exit 0; \
+	head=$$(git rev-parse --short=12 HEAD 2>/dev/null || true); \
+	ver=$$("$$bin" --version 2>/dev/null || true); \
+	if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
+		reason="worktree has uncommitted changes"; \
+	elif [ -n "$$head" ] && printf '%s' "$$ver" | grep -q "$$head" && ! printf '%s' "$$ver" | grep -q -- '-dirty'; then \
+		exit 0; \
+	else \
+		reason="built from '$$ver', HEAD is g$$head"; \
+	fi; \
+	rm -f "$$bin"; \
+	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
 # NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
@@ -52,7 +85,11 @@ validate: check-submodules ## Run the full multi-backend validation suite (pass 
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+	./scripts/test-required-check-outcomes.sh
+	./scripts/test-check-status-outcome.sh
+	./scripts/check-merge-gate-policy.sh
+	python3 ./scripts/test_pr_status.py
 	$(CARGO) fmt --all -- --check
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
@@ -66,6 +103,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	@git diff --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
+	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)

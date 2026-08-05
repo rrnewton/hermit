@@ -64,6 +64,118 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+id = "language-runtimes/bash-random"
+description = "Bash $RANDOM varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","bash"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/bash-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI Bash qualification is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst Bash qualification is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The Bash workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "language-runtimes/cpp-stl-determinism"
+description = "C++17 STL containers over std::random_device entropy, file I/O, and std::chrono repeat under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cxx"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/cpp-stl-determinism.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI C++ qualification is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst C++ qualification is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The C++ workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
 id = "language-runtimes/example-python-random"
 description = "The user-facing Python random example repeats deterministically under each applicable backend"
 lane = "portable"
@@ -114,6 +226,116 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
+[[test]]
+id = "language-runtimes/gawk-random"
+description = "GNU awk rand() output varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","gawk"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/gawk-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI awk support is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst awk support is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The awk workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "language-runtimes/m4-macro-mkstemp"
+description = "m4 mkstemp temp-name varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","m4"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/m4-macro-mkstemp.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI m4 qualification is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst m4 qualification is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The m4 workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
 [[test]]
 id = "language-runtimes/perl-io-subprocess-time"
 description = "Perl file I/O, subprocess pipes, hashing, and time repeat under Hermit"
@@ -169,6 +391,61 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
+[[test]]
+id = "language-runtimes/perl-random"
+description = "Perl rand output varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","perl"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/perl-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI Perl support is tracked by backend compatibility"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst Perl support is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The Perl PRNG probe is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
 [[test]]
 id = "language-runtimes/python-hash-determinism"
 description = "Python hash-seed order varies natively and repeats under Hermit"
@@ -337,13 +614,13 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
-id = "language-runtimes/gawk-random"
-description = "GNU awk rand() output varies natively and repeats under Hermit"
+id = "language-runtimes/rust-hashmap-iteration"
+description = "Rust HashMap/HashSet iteration order varies natively and repeats under Hermit"
 lane = "portable"
-requires = ["linux","x86_64","userns","ptrace","gawk"]
+requires = ["linux","x86_64","userns","ptrace","rustc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/e2e/language-runtimes/gawk-random.sh"
+program = "tests/e2e/language-runtimes/rust-hashmap-iteration.rs"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.naked]
@@ -357,10 +634,10 @@ backends_enabled = ["native"]
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "DBI awk support is tracked by backend compatibility"
+dbi = "DBI Rust qualification is tracked by backend compatibility"
 kvm = "KVM interpreter coverage requires separate privileged qualification"
 sabre = "SaBRe requires its external runtime"
-liteinst = "LiteInst awk support is tracked by backend compatibility"
+liteinst = "LiteInst Rust qualification is tracked by backend compatibility"
 
 [test.modes.replay]
 ci = false
@@ -376,7 +653,233 @@ liteinst = "Record/replay is unsupported by LiteInst"
 ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
-ptrace = "The awk workload is single-threaded"
+ptrace = "The Rust workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+
+[[test]]
+id = "language-runtimes/ruby-random"
+description = "Ruby random output varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","ruby"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/ruby-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI Ruby support is tracked by backend compatibility"
+kvm = "KVM Ruby coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst Ruby support is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The Ruby example is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "language-runtimes/perl-hash-order"
+description = "Perl hash key iteration order varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","perl"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/perl-hash-order.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI perl support is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst perl support is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The perl workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "language-runtimes/lua-random"
+description = "Lua 5.4 math.random varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","lua5.4"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/lua-random.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI Lua qualification is tracked by backend compatibility"
+kvm = "KVM interpreter coverage requires separate privileged qualification"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst Lua qualification is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The Lua workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+
+[[test]]
+id = "language-runtimes/python-hashseed"
+description = "Python string hash and set iteration order vary natively and repeat under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","python3"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/language-runtimes/python-hashseed.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI Python support is tracked by backend compatibility"
+kvm = "KVM Python coverage is in the privileged applications bucket"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst Python support is tracked by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The hash-seed probe is single-threaded"
 dbi = "Chaos scheduling is unsupported by DBI"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
