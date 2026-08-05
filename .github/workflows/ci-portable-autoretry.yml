@@ -1,23 +1,38 @@
 name: Portable auto-retry on cancellation
 
-# Companion to "CI (GitHub-managed portable)". When a PR's portable run is
-# CANCELLED — concurrency supersede (ci-portable.yml `cancel-in-progress` on a
-# new pull_request event) or a hosted-runner queue eviction under load — the
+# Companion to "CI (GitHub-managed portable)". When a portable run is CANCELLED
+# — concurrency supersede or a hosted-runner queue eviction under load — the
 # run's `if: always()` aggregators (`Reduce e2e parity archives` and
 # `Regular tests (GitHub-managed portable)`) still execute and fail closed on
 # the incomplete inputs, so the cancelled run is reported as a hard FAILURE.
-# With no completing successor for the current head, the PR stays permanently
+# With no completing successor for the current head, that head stays permanently
 # red until a human re-fires it. This job re-runs such a run exactly once (up to
 # attempt 3) so the recurrence self-heals.
+#
+# This covers BOTH lanes ci-portable.yml actually runs on:
+#   * pull_request-triggered runs (historical case), and
+#   * push-to-`main` runs. ci-portable.yml has no `pull_request` trigger — it
+#     was removed 2026-08-03 so the ~34-min hosted build would stop flooding
+#     GitHub's shared public runner pool — so a `pull_request`-only guard made
+#     this workflow inert for every run the portable lane actually produces. A
+#     cancelled main run therefore had no retry path at all and stuck as a
+#     red-looking no-result on that commit forever.
 #
 # GitHub's `concurrency:` block cannot express a retry, so this is implemented as
 # the standard workflow_run companion. Several guards keep it from storming the
 # scarce hosted-runner queue, re-running a stale head, or fighting a deliberate
 # local-validation fallback:
 #   * it fires ONLY on conclusion == cancelled (never on genuine failure or
-#     success), and only for pull_request-triggered runs; and
-#   * it re-runs ONLY when the cancelled run's head is still the PR's current
-#     head — if the head moved, a newer run already owns the PR and this exits.
+#     success);
+#   * it fires ONLY for pull_request runs and pushes to `main` (no other branch
+#     pushes, no merge_group — a merge_group run already gets its own per-head
+#     concurrency group and a fresh successor); and
+#   * it re-runs ONLY when the cancelled run's head is still the head that the
+#     lane is responsible for — the PR's current head, or `main`'s current tip.
+#     If the head moved, a newer run already owns that lane and this exits.
+#     That freshness check is deliberately strict: retrying a superseded main
+#     commit would spend a ~52-minute hosted build on a commit nobody is waiting
+#     on, which is exactly the pool pressure the 2026-08-03 directive prevents.
 # run_attempt < 3 caps the retries so a pathologically re-cancelled run cannot
 # loop forever.
 #
@@ -48,26 +63,43 @@ jobs:
     name: Re-run cancelled portable run
     if: >-
       github.event.workflow_run.conclusion == 'cancelled' &&
-      github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.run_attempt < 3 &&
-      vars.CI_MODE != 'constrained'
+      vars.CI_MODE != 'constrained' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Re-run only if the cancelled head is still the PR head
+      - name: Re-run only if the cancelled head still owns its lane
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
           PRS_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
         run: |
           set -euo pipefail
 
-          # workflow_run usually lists the associated PR(s); fall back to a
-          # head-branch lookup when the association is empty (can happen for
-          # cross-repo or timing edge cases).
+          if [[ "$RUN_EVENT" == "push" ]]; then
+            # main lane: the lane head is main's current tip. If main advanced,
+            # the newer commit's own portable run already owns main and this
+            # cancelled run is for a superseded commit nobody is waiting on.
+            cur=$(gh api "repos/$REPO/commits/main" --jq '.sha')
+            if [[ "$cur" != "$RUN_HEAD" ]]; then
+              echo "main moved ($RUN_HEAD -> $cur); a newer run owns main. Skip."
+              exit 0
+            fi
+            echo "main still at $RUN_HEAD; re-running cancelled portable run $RUN_ID."
+            gh run rerun "$RUN_ID" -R "$REPO"
+            exit 0
+          fi
+
+          # PR lane. workflow_run usually lists the associated PR(s); fall back
+          # to a head-branch lookup when the association is empty (can happen
+          # for cross-repo or timing edge cases).
           num=$(jq -r '.[0].number // empty' <<<"$PRS_JSON")
           if [[ -z "$num" ]]; then
             num=$(gh pr list -R "$REPO" --head "$RUN_BRANCH" --state open \
