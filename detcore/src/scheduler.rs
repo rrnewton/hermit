@@ -1045,6 +1045,22 @@ pub async fn do_a_turn_blocking(
         // tentative pop -- are skipped. Undo the still-open selection so the next
         // pass's step2 removal drain does not hit the `remove_tid` guard.
         mg.run_queue.undo_tentative_pop();
+        // ...and report the turn as SKIPPED, exactly like that arm, because this
+        // branch commits nothing: steps 4-7 are bypassed, so no resource is
+        // blocked, no guest is unblocked, and nothing is re-enqueued.
+        //
+        // Falling through to `Ok(rsrcs)` used to tell the next pass that a turn
+        // had completed. `bump_global_time` suppresses its advance only when
+        // `last_turn.is_err()` ("if the last turn was a skip, it shouldn't really
+        // have time-bumped"), so a non-committing turn reported as `Ok` advanced
+        // scheduler virtual time -- a DETLOG-visible tick -- for work that never
+        // happened. Worse, reaching this branch at all depends on whether
+        // teardown cleared `next_turns` during the host-timed window between
+        // `req.get().await` resolving and re-acquiring the lock above, so the
+        // same logical execution could gain that tick in one run and not the
+        // next. Reporting `SkipTurn` keeps virtual time a function of committed
+        // turns only.
+        return Err(SkipTurn);
     } else {
         // The logical COMMIT point for the turn is during step4:
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
@@ -3172,14 +3188,40 @@ impl Scheduler {
     /// only record the unresolved [`AdmitIntent`]; the daemon resolves the side
     /// (drawing any `RunsPostFork::Random` value) and pushes the run queue at the
     /// single `step2` drain, in canonical `DetTid` order, before `step3` opens a
-    /// tentative window. Both the admission order and the chosen side are thus
-    /// pure functions of deterministic scheduler state. This is byte-identical to
-    /// the pre-deferral behavior on synchronous backends (ptrace), where handlers
-    /// run post-commit one per turn: at most one admission is buffered per turn,
-    /// so it drains at the next `step2` — before that turn's `step3` selection —
-    /// yielding the same selection sequence and the same one-draw-per-fork PRNG
-    /// order as an immediate push. Draining is also the only place `remove_tid`'s
-    /// tentative guard is guaranteed to hold.
+    /// tentative window. Draining is also the only place `remove_tid`'s tentative
+    /// guard is guaranteed to hold.
+    ///
+    /// # What this does and does not make deterministic
+    ///
+    /// **Synchronous backends (ptrace): fully deterministic, and byte-identical
+    /// to the pre-deferral behavior.** Handlers run post-commit, one per turn, so
+    /// at most one admission is buffered per turn and it drains at the next
+    /// `step2` — before that turn's `step3` selection — yielding the same
+    /// selection sequence and the same one-draw-per-fork PRNG order as an
+    /// immediate push.
+    ///
+    /// **Asynchronous backends (DBI): the order *within* a drain is canonical,
+    /// but *which* drain an admission lands in is still host-timed.** A child
+    /// that self-registers outside a scheduler turn (see the `CreateChildThread`
+    /// handler) records its intent whenever its backend worker wins the scheduler
+    /// mutex. Winning just before `step2` takes the lock puts it in this turn's
+    /// drain; just after puts it in the next one. Nothing carries an originating
+    /// committed turn, and a `BTreeMap` only canonicalizes items already in the
+    /// same snapshot — so two admissions can still be split across adjacent
+    /// drains differently across otherwise-identical runs, changing both the
+    /// resulting queue order and, under `RunsPostFork::Random`, which draw each
+    /// child receives.
+    ///
+    /// Deferral is therefore a strict improvement over pushing directly — it
+    /// removes the arbitrary interleaving of concurrent pushes and the
+    /// host-RPC-ordered PRNG draw — but it does **not** make async admission a
+    /// pure function of deterministic scheduler state, and this comment
+    /// previously claimed that it did. Closing the residue needs an anchor the
+    /// deterministic schedule owns: either an originating committed turn carried
+    /// on the intent and drained only once that turn has committed, or a
+    /// child-registration barrier of the kind `vfork_barriers` /
+    /// `step2a_wait_for_vfork_barrier` already implements for `vfork`,
+    /// generalized to ordinary clone on backends that defer child registration.
     pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, intent: AdmitIntent) {
         let prev = self.pending_run_queue_admissions.insert(dtid, intent);
         debug_assert!(
@@ -3914,6 +3956,117 @@ mod test {
         }
     }
 
+    /// F8 (non-committing fizzle must not advance virtual time). The sibling of
+    /// F6, for the *other* fizzle arm: `req.get()` resolved `Ok`, but the
+    /// thread's `next_turns` entry vanished before the daemon re-acquired the
+    /// lock, so steps 4-7 are skipped and nothing commits.
+    ///
+    /// That arm used to fall through to `Ok(rsrcs)`. `bump_global_time`
+    /// suppresses its advance only on `last_turn.is_err()`, so reporting success
+    /// for a turn that committed nothing advanced scheduler virtual time by a
+    /// DETLOG-visible tick. Reaching the arm at all depends on whether teardown
+    /// clears `next_turns` inside the host-timed window between the await
+    /// resolving and the re-lock, so the same logical execution could gain that
+    /// tick in one run and not the next.
+    ///
+    /// The race is constructed deterministically rather than hoped for: the test
+    /// waits until `tentative_pop_in_progress()` reads true under its OWN lock --
+    /// which means `step3_peek` has run and released the lock -- and removes the
+    /// `next_turns` entry while still holding that lock, so the daemon cannot
+    /// have passed the re-lock check yet and always observes the entry gone.
+    #[tokio::test]
+    async fn noncommitting_fizzle_reports_skipturn_rather_than_a_completed_turn() {
+        let config = Config::default();
+        let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let vanishing = DetTid::from_raw(11);
+        {
+            let mut s = sched.lock().unwrap();
+            s.priorities.insert(vanishing, DEFAULT_PRIORITY);
+            s.next_turns.insert(
+                vanishing,
+                ThreadNextTurn {
+                    dettid: vanishing,
+                    child_tid_addr: 0,
+                    // Resolved `Ok`: the thread really did park. That is what
+                    // separates this arm from F6's `Err(ThreadExited)`.
+                    req: Ivar::full(Ok(Resources::new(vanishing))),
+                    resp: Ivar::new(),
+                },
+            );
+            s.runqueue_push_back(vanishing);
+        }
+
+        let turn = tokio::spawn({
+            let sched = sched.clone();
+            let global_time = global_time.clone();
+            async move { do_a_turn_blocking(sched, global_time, &Err(SkipTurn)).await }
+        });
+
+        loop {
+            {
+                let mut s = sched.lock().unwrap();
+                if s.run_queue.tentative_pop_in_progress() {
+                    s.next_turns.remove(&vanishing);
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = turn.await.expect("scheduler turn task panicked");
+        assert!(
+            result.is_err(),
+            "a turn that skipped steps 4-7 must report SkipTurn, not success"
+        );
+        assert!(
+            !sched.lock().unwrap().run_queue.tentative_pop_in_progress(),
+            "the non-committing arm must also close its tentative window"
+        );
+    }
+
+    /// Both sides of the consequence F8 exists to prevent, stated directly
+    /// against `bump_global_time` -- the code that turns the returned `Result`
+    /// into a virtual-time decision.
+    ///
+    /// NEGATIVE: a skipped turn leaves virtual time exactly where it was. That is
+    /// what the F8 fix buys; before it, the non-committing arm reported `Ok` and
+    /// landed in the advancing branch.
+    /// POSITIVE: a committed, non-internal turn *does* advance it. Without this
+    /// side the negative would pass vacuously for a `bump_global_time` that had
+    /// simply stopped advancing time at all.
+    #[test]
+    fn virtual_time_advances_for_a_committed_turn_and_not_for_a_skipped_one() {
+        let config = Config::default();
+        let runnable = DetTid::from_raw(13);
+
+        // A non-empty run queue keeps the "only waiting on external events"
+        // guard from suppressing the advance for an unrelated reason.
+        let mut advancing = Scheduler::new(&config);
+        advancing.priorities.insert(runnable, DEFAULT_PRIORITY);
+        advancing.runqueue_push_back(runnable);
+        let advancing_time = Mutex::new(GlobalTime::new(&config));
+        let before_commit = advancing_time.lock().unwrap().as_nanos();
+        advancing.bump_global_time(&advancing_time, &Ok(Resources::new(runnable)));
+        let after_commit = advancing_time.lock().unwrap().as_nanos();
+        assert!(
+            after_commit > before_commit,
+            "a committed turn must advance virtual time ({before_commit:?} -> {after_commit:?})"
+        );
+
+        let mut skipping = Scheduler::new(&config);
+        skipping.priorities.insert(runnable, DEFAULT_PRIORITY);
+        skipping.runqueue_push_back(runnable);
+        let skipping_time = Mutex::new(GlobalTime::new(&config));
+        let before_skip = skipping_time.lock().unwrap().as_nanos();
+        skipping.bump_global_time(&skipping_time, &Err(SkipTurn));
+        let after_skip = skipping_time.lock().unwrap().as_nanos();
+        assert_eq!(
+            after_skip, before_skip,
+            "a skipped turn must not advance virtual time"
+        );
+    }
+
     /// Liveness (negative control) for the F6 fix above: proves the guard the
     /// fizzle arm protects is real, so the positive test is not vacuous. If a
     /// fizzled turn does NOT undo its tentative pop (the pre-fix behavior), the
@@ -3941,21 +4094,31 @@ mod test {
 
     /// F7 (adjacent-snapshot straddle): Codex asked whether host timing could
     /// split two off-turn admissions across two ADJACENT step2 drains and
-    /// thereby choose which one draws the `post_fork` PRNG first. Structurally it
-    /// cannot -- under `sequentialize_threads` at most one guest thread runs per
-    /// turn, so at most one thread issues admission RPCs between two consecutive
-    /// drains, and step2 drains the WHOLE buffer every turn before step3 reopens
-    /// a window -- so which drain snapshot an admission lands in is fixed by the
-    /// schedule, not by host mutex timing. `deferred_admission_side_is_arrival_
-    /// order_independent` already pins the WITHIN-one-drain canonicalization;
-    /// this test pins the CROSS-drain consequences:
+    /// thereby choose which one draws the `post_fork` PRNG first.
+    ///
+    /// An earlier revision of this comment answered "structurally it cannot",
+    /// arguing that under `sequentialize_threads` at most one guest thread runs
+    /// per turn, so at most one thread issues admission RPCs between consecutive
+    /// drains. **That argument is wrong**, and the `CreateChildThread` handler in
+    /// `tool_global.rs` says why in its own comment: on an asynchronous backend
+    /// the child *self-registers outside a scheduler turn*, so the admitting
+    /// thread is not the one guest thread running this turn. Two children cloned
+    /// on consecutive turns can therefore both register before one drain, or
+    /// split across two, by host scheduling alone. See
+    /// `Scheduler::admit_to_run_queue` for the guarantee that actually holds
+    /// (exact on ptrace; within-drain-canonical only on async backends) and for
+    /// the two anchors that would close the residue.
+    ///
+    /// So this test does **not** show that snapshot membership is deterministic.
+    /// It shows the two things it can actually observe, and is kept because both
+    /// remain load-bearing however the residue is eventually closed:
     ///   (1) POSITIVE/determinism: replaying the identical split (child `a` in
     ///       drain 1, child `b` in drain 2) at a fixed seed is byte-identical
-    ///       (2/2 runs equal).
-    ///   (2) LIVENESS: the outcome genuinely binds to schedule-fixed snapshot
-    ///       membership -- swapping which child occupies drain 1 changes the
-    ///       resolved run-queue order -- so IF host timing could pick the
-    ///       snapshot (the defect Codex feared), it would be observable here.
+    ///       (2/2 runs equal) -- within-drain resolution is reproducible.
+    ///   (2) SENSITIVITY: the outcome genuinely depends on snapshot membership --
+    ///       swapping which child occupies drain 1 changes the resolved
+    ///       run-queue order. Read correctly, (2) is the *reason* membership must
+    ///       be made deterministic, not evidence that it already is.
     #[test]
     fn deferred_admission_binds_to_snapshot_membership_across_adjacent_drains() {
         let config = Config {
