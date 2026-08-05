@@ -1275,6 +1275,7 @@ function append_validation_ledger {
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
+    local first_error_line_json=null failed_substep_classes_json='[]'
     local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
     local i
@@ -1322,6 +1323,14 @@ function append_validation_ledger {
             known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
             solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
             solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
+            # DURABLE ATTRIBUTION: the per-node fault verdict and the verbatim
+            # headline fault line are computed by failure_evidence.py; inline them
+            # into the row so a red is attributable to WHICH bug (infra vs code,
+            # first_error_line) from the row ALONE — after the /tmp log is evicted.
+            # The read side (ci-hub/validate/attribute_reds.py) prefers these
+            # row-carried classes over dereferencing the ephemeral log_file.
+            first_error_line_json=$(jq -c '.first_error_line' <<<"$evidence_json")
+            failed_substep_classes_json=$(jq -c '.failed_substep_classes' <<<"$evidence_json")
             evidence_available=1
         fi
     fi
@@ -1411,6 +1420,8 @@ function append_validation_ledger {
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"first_error_line\":$first_error_line_json,"
+    line+="\"failed_substep_classes\":$failed_substep_classes_json,"
     line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"solo_rerun_of\":$solo_rerun_of_json,"
