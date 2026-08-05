@@ -32,6 +32,7 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
+use serde::Serialize;
 
 const SYSCALL_INSN: [u8; 2] = [0x0f, 0x05];
 // SaBRe's SIGILL handler recognizes this reserved two-byte instruction as a
@@ -43,7 +44,22 @@ pub struct Output {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub patched_sites: usize,
+    pub path_evidence: PathEvidence,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PathEvidence {
+    pub schema: u8,
+    pub guest_rpc_observed: bool,
+    pub ptrace_fallback_sites: usize,
+    pub trusted_shared_object_sites: usize,
+    pub trusted_shared_objects: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MappingClassification {
+    trusted: bool,
+    trusted_shared_object: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -112,12 +128,14 @@ struct Supervisor {
     root: Pid,
     tracees: HashSet<Pid>,
     states: HashMap<Pid, TraceeState>,
-    mapping_cache: HashMap<(Pid, usize), bool>,
+    mapping_cache: HashMap<(Pid, usize), MappingClassification>,
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     ready_observed: bool,
     patched_sites: HashSet<(Pid, usize)>,
+    trusted_shared_object_sites: HashSet<(Pid, usize)>,
+    trusted_shared_objects: HashSet<PathBuf>,
     signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
 }
@@ -140,12 +158,14 @@ impl Supervisor {
             plugin,
             ready_observed: false,
             patched_sites: HashSet::new(),
+            trusted_shared_object_sites: HashSet::new(),
+            trusted_shared_objects: HashSet::new(),
             signal_diagnostics: HashMap::new(),
             physical_exit_observer,
         }
     }
 
-    fn run(mut self) -> Result<(ExitStatus, usize), Error> {
+    fn run(mut self) -> Result<(ExitStatus, PathEvidence), Error> {
         ptrace::attach(self.root).context("failed to attach SaBRe supervisor worker")?;
         match waitpid(self.root, Some(WaitPidFlag::__WALL))? {
             WaitStatus::Stopped(pid, Signal::SIGSTOP) if pid == self.root => {}
@@ -331,7 +351,22 @@ impl Supervisor {
         }
 
         let status = root_status.ok_or_else(|| anyhow!("SaBRe root tracee disappeared"))?;
-        Ok((status, self.patched_sites.len()))
+        let mut trusted_shared_objects = self
+            .trusted_shared_objects
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        trusted_shared_objects.sort();
+        Ok((
+            status,
+            PathEvidence {
+                schema: 1,
+                guest_rpc_observed: self.readiness.load(Ordering::Acquire),
+                ptrace_fallback_sites: self.patched_sites.len(),
+                trusted_shared_object_sites: self.trusted_shared_object_sites.len(),
+                trusted_shared_objects,
+            },
+        ))
     }
 
     fn set_options(&self, pid: Pid) -> Result<(), Error> {
@@ -376,20 +411,27 @@ impl Supervisor {
                         "child syscall entry",
                     );
                 }
-                if bytes == SYSCALL_INSN && fallback_ready && !self.is_trusted_mapping(pid, site)? {
-                    write_two_bytes(pid, site, SABRE_SYSCALL_MARKER)?;
-                    let syscall = regs.orig_rax;
-                    regs.orig_rax = u64::MAX;
-                    ptrace::setregs(pid, regs)?;
-                    self.states.entry(pid).or_default().pending_patch =
-                        Some(PendingPatch { site, syscall });
-                    self.patched_sites.insert((pid, site));
-                    tracing::debug!(
-                        target: "hermit::sabre::fallback",
-                        tid = pid.as_raw(),
-                        address = site,
-                        "redirecting raw syscall instruction through the SaBRe handler",
-                    );
+                if bytes == SYSCALL_INSN && fallback_ready {
+                    let mapping = self.classify_mapping(pid, site)?;
+                    if let Some(path) = mapping.trusted_shared_object {
+                        self.trusted_shared_object_sites.insert((pid, site));
+                        self.trusted_shared_objects.insert(path);
+                    }
+                    if !mapping.trusted {
+                        write_two_bytes(pid, site, SABRE_SYSCALL_MARKER)?;
+                        let syscall = regs.orig_rax;
+                        regs.orig_rax = u64::MAX;
+                        ptrace::setregs(pid, regs)?;
+                        self.states.entry(pid).or_default().pending_patch =
+                            Some(PendingPatch { site, syscall });
+                        self.patched_sites.insert((pid, site));
+                        tracing::debug!(
+                            target: "hermit::sabre::fallback",
+                            tid = pid.as_raw(),
+                            address = site,
+                            "redirecting raw syscall instruction through the SaBRe handler",
+                        );
+                    }
                 }
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
@@ -440,16 +482,26 @@ impl Supervisor {
         Ok(ready)
     }
 
-    fn is_trusted_mapping(&mut self, pid: Pid, address: usize) -> Result<bool, Error> {
+    fn classify_mapping(
+        &mut self,
+        pid: Pid,
+        address: usize,
+    ) -> Result<MappingClassification, Error> {
         let page = address & !4095usize;
-        if let Some(trusted) = self.mapping_cache.get(&(pid, page)) {
-            return Ok(*trusted);
+        if let Some(classification) = self.mapping_cache.get(&(pid, page)) {
+            return Ok(classification.clone());
         }
         let maps = fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))?;
-        let trusted = mapping_path(&maps, address)
-            .is_some_and(|path| mapping_is_trusted(path, &self.sabre, &self.plugin));
-        self.mapping_cache.insert((pid, page), trusted);
-        Ok(trusted)
+        let classification = mapping_path(&maps, address).map_or(
+            MappingClassification {
+                trusted: false,
+                trusted_shared_object: None,
+            },
+            |path| classify_mapping(path, &self.sabre, &self.plugin),
+        );
+        self.mapping_cache
+            .insert((pid, page), classification.clone());
+        Ok(classification)
     }
 
     fn remove_tracee(&mut self, pid: Pid) {
@@ -522,19 +574,36 @@ fn mapping_diagnostic(maps: &str, address: usize) -> Option<MappingDiagnostic> {
     })
 }
 
-fn mapping_is_trusted(path: &str, sabre: &Path, plugin: &Path) -> bool {
+fn classify_mapping(path: &str, sabre: &Path, plugin: &Path) -> MappingClassification {
     if path.starts_with('[') {
-        return true;
+        return MappingClassification {
+            trusted: true,
+            trusted_shared_object: None,
+        };
     }
     let path = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path));
-    path == sabre
+    let infrastructure = path == sabre
         || path == plugin
         || same_file_name(path, sabre)
-        || same_file_name(path, plugin)
-        // SaBRe owns its loader and shared-library rewriting. Patching a raw
-        // libc site while the in-guest tool is active would recurse into the
-        // tool's own RPC transport through SaBRe's guest-only UD marker ABI.
-        || path.file_name().is_some_and(|name| name.to_string_lossy().contains(".so"))
+        || same_file_name(path, plugin);
+    if infrastructure {
+        return MappingClassification {
+            trusted: true,
+            trusted_shared_object: None,
+        };
+    }
+    // SaBRe owns shared-library rewriting. A raw syscall that still reaches the
+    // supervisor from another shared object ran outside the measured in-guest
+    // interception path. Keep trusting it for runtime safety, but report it so
+    // compatibility accounting cannot credit the cell to SaBRe.
+    let trusted_shared_object = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(".so"))
+        .then(|| path.to_path_buf());
+    MappingClassification {
+        trusted: trusted_shared_object.is_some(),
+        trusted_shared_object,
+    }
 }
 
 fn same_file_name(left: &Path, right: &Path) -> bool {
@@ -677,12 +746,12 @@ fn run_blocking(
     let stderr = stderr_thread
         .join()
         .map_err(|_| anyhow!("SaBRe stderr reader panicked"))??;
-    let (status, patched_sites) = supervised?;
+    let (status, path_evidence) = supervised?;
     Ok(Output {
         status,
         stdout,
         stderr,
-        patched_sites,
+        path_evidence,
     })
 }
 
@@ -794,18 +863,37 @@ mod tests {
     }
 
     #[test]
-    fn trusts_only_runtime_mappings() {
+    fn classifies_runtime_mapping_attribution() {
         let sabre = Path::new("/opt/sabre/bin/sabre");
         let plugin = Path::new("/opt/hermit/libdetcore_sabre.so");
-        assert!(mapping_is_trusted("/opt/sabre/bin/sabre", sabre, plugin));
-        assert!(mapping_is_trusted(
+        for path in [
+            "/opt/sabre/bin/sabre",
             "/different/root/libdetcore_sabre.so (deleted)",
-            sabre,
-            plugin
-        ));
-        assert!(mapping_is_trusted("[vdso]", sabre, plugin));
-        assert!(mapping_is_trusted("/usr/lib/libc.so.6", sabre, plugin));
-        assert!(!mapping_is_trusted("/usr/bin/echo", sabre, plugin));
-        assert!(!mapping_is_trusted("", sabre, plugin));
+            "[vdso]",
+        ] {
+            assert_eq!(
+                classify_mapping(path, sabre, plugin),
+                MappingClassification {
+                    trusted: true,
+                    trusted_shared_object: None
+                }
+            );
+        }
+        assert_eq!(
+            classify_mapping("/usr/lib/libc.so.6", sabre, plugin),
+            MappingClassification {
+                trusted: true,
+                trusted_shared_object: Some(PathBuf::from("/usr/lib/libc.so.6")),
+            }
+        );
+        for path in ["/usr/bin/echo", ""] {
+            assert_eq!(
+                classify_mapping(path, sabre, plugin),
+                MappingClassification {
+                    trusted: false,
+                    trusted_shared_object: None
+                }
+            );
+        }
     }
 }
