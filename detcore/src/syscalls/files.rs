@@ -143,6 +143,37 @@ fn timerfd_hand_back_it_value_ns(remaining_ns: u64, deadline: Option<LogicalTime
     }
 }
 
+/// Expirations that have accrued in virtual time but have not yet been drained
+/// by `read()`, and therefore must survive a handover to the kernel.
+///
+/// `timerfd_settime` RESETS the kernel's expiration counter, so the re-arm that
+/// hands a descriptor back necessarily starts the kernel at zero. Anything the
+/// virtual model was already holding would simply vanish: with a 10ms period
+/// armed at virtual 10ms and no `read()` yet, virtual 35ms has THREE expirations
+/// pending and Linux would report `3` on the next read. Detcore carries that
+/// count across the handover in [`TimerfdState::pending_expirations`] and
+/// delivers it before deferring to the kernel's own count.
+///
+/// An overdue one-shot contributes exactly one. A not-yet-due or disarmed timer
+/// contributes none.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+fn timerfd_accrued_expirations(
+    deadline: Option<LogicalTime>,
+    interval_ns: u64,
+    now: LogicalTime,
+) -> u64 {
+    match deadline {
+        Some(d) if d > now => 0,
+        Some(d) if interval_ns > 0 => {
+            let elapsed = now.as_nanos().saturating_sub(d.as_nanos());
+            1u64.saturating_add(elapsed / interval_ns)
+        }
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
 /// Whether re-arming a `timerfd` to `new_deadline` needs a retarget of a reader
 /// already parked until `parked_deadline` — something the scheduler cannot do,
 /// so the descriptor must be handed to the kernel, which can.
@@ -1181,6 +1212,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.resource(),
                 )
             })?;
+
+        // A vectored read consumes a timerfd expiration exactly as a scalar
+        // `read` does, but this handler runs the generic record/replay path
+        // against the HOST descriptor. On a still-virtualized timerfd that
+        // silently consumes a kernel expiration while `TimerfdState` keeps
+        // believing it is unread, so a later scalar `read` re-delivers the same
+        // logical expiration. Detcore does not model scatter delivery of the
+        // 8-byte count, so hand the descriptor to the kernel first and let one
+        // clock own both the wait and the expiration that ends it.
+        if fd_type == FdType::Timerfd && self.timerfd_fd_virtualized(guest, call.fd()) {
+            self.timerfd_hand_back_to_host(guest, call.fd(), "readv")
+                .await?;
+        }
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::R);
@@ -2458,6 +2502,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let now = thread_observe_time(guest).await;
+        // Carry anything the virtual model already owes the guest across the
+        // re-arm below, which resets the kernel's own expiration counter to
+        // zero. Without this the handover silently swallows every expiration
+        // that accrued before the first `read()`.
+        let accrued = timerfd_accrued_expirations(state.deadline, state.interval_ns, now);
+        if accrued > 0 {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_timerfd_state(TimerfdState {
+                    pending_expirations: state.pending_expirations.saturating_add(accrued),
+                    ..state
+                });
+            })?;
+        }
         let remaining_ns = timerfd_hand_back_it_value_ns(
             timerfd_remaining_ns(state.deadline, state.interval_ns, now),
             state.deadline,
@@ -2531,6 +2588,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         Ok(())
+    }
+
+    /// Hand back every descriptor still served from virtual time.
+    ///
+    /// The fail-safe used when a readiness syscall's descriptor set cannot be
+    /// enumerated: an fd array past the scan budget, a faulting scan, or an
+    /// `fd_set`, whose membership Detcore does not decode. Over-handing back
+    /// costs only the virtualization of timers this process was about to expose
+    /// to the kernel anyway; under-handing back reintroduces the split-authority
+    /// incoherence the scan exists to prevent.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    pub(super) async fn timerfd_hand_back_all<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: &str,
+    ) -> Result<(), Error> {
+        if !self.timerfd_mode_virtualized() || !guest.thread_state().has_virtualizable_timerfd() {
+            // One in-memory scan of this thread's own descriptor table; no guest
+            // memory is read. Nearly every process stops here.
+            return Ok(());
+        }
+        let fds = guest.thread_state().virtualizable_timerfds();
+        self.timerfd_hand_back_polled_fds(guest, &fds, reason).await
     }
 
     /// Create and register a timer notification descriptor.
@@ -2669,6 +2750,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 clockid,
                 deadline,
                 interval_ns,
+                // Linux resets the expiration counter on every `timerfd_settime`.
+                pending_expirations: 0,
             });
         })?;
 
@@ -2771,13 +2854,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Read,
         logically_nonblocking: bool,
     ) -> Result<i64, Error> {
+        const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
+
         if !self.timerfd_fd_virtualized(guest, call.fd()) {
-            // Mode forbids virtualization, or this descriptor is host-owned: the
-            // host timer is armed, so defer to the ordinary host-timed path.
+            // Mode forbids virtualization, or this descriptor is host-owned.
+            //
+            // Host-owned is not the same as "the virtual model owes nothing".
+            // A handover re-arms the kernel with `timerfd_settime`, which zeroes
+            // the kernel's expiration counter, so any expirations that accrued
+            // in virtual time before the handover exist ONLY in
+            // `pending_expirations`. Deliver those first — they are strictly
+            // older than anything the kernel has counted since — and only then
+            // defer to the host. No double counting: the kernel started from
+            // zero at the handover.
+            let owed = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.timerfd_state().map_or(0, |st| st.pending_expirations)
+            })?;
+            if owed > 0 {
+                if call.len() < EXPIRATION_BYTES {
+                    return Err(Errno::EINVAL.into());
+                }
+                let buf = call.buf().ok_or(Errno::EFAULT)?;
+                guest.thread_state().with_detfd(call.fd(), |detfd| {
+                    if let Some(st) = detfd.timerfd_state() {
+                        detfd.set_timerfd_state(TimerfdState {
+                            pending_expirations: 0,
+                            ..st
+                        });
+                    }
+                })?;
+                guest.memory().write_exact(buf, &owed.to_ne_bytes())?;
+                detlog!(
+                    "[dtid {}] timerfd read(fd={}) => {} expiration(s) carried across the host handover",
+                    guest.thread_state().dettid,
+                    call.fd(),
+                    owed,
+                );
+                return Ok(EXPIRATION_BYTES as i64);
+            }
+            // The host timer is armed, so defer to the ordinary host-timed path.
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
 
-        const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
         if call.len() < EXPIRATION_BYTES {
             // The kernel requires a buffer large enough for the u64 count, and
             // checks that before anything else.
@@ -2876,6 +2994,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.thread_state().with_detfd(call.fd(), |detfd| {
                     detfd.set_timerfd_state(TimerfdState {
                         deadline: next_deadline,
+                        // A read drains everything outstanding, including any
+                        // count carried across an earlier handover.
+                        pending_expirations: 0,
                         ..state
                     });
                 })?;

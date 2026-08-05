@@ -376,6 +376,23 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     mask & !(1_u64 << signal_bit)
 }
 
+/// Outcome of trying to enumerate the descriptors a readiness syscall names.
+///
+/// The distinction is load-bearing. A readiness syscall asks the KERNEL when a
+/// descriptor fires, while a virtualized timerfd answers `read()` from the
+/// VIRTUAL clock. Detcore reconciles that by handing the descriptor back before
+/// the kernel is consulted — which only works if Detcore knows which
+/// descriptors are named. When it cannot know, the safe answer is "assume every
+/// virtualized timerfd is in there", never "assume none is".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolledFds {
+    /// The descriptor set was fully enumerated; these are its descriptors.
+    Scanned(Vec<RawFd>),
+    /// The set could not be fully enumerated. Callers must fall back to every
+    /// virtualized timerfd in the fd table.
+    Incomplete,
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// The descriptors named by a `poll`/`ppoll` fd array.
     ///
@@ -391,23 +408,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fds: Option<AddrMut<P>>,
         nfds: libc::nfds_t,
-    ) -> Result<Vec<RawFd>, Error> {
-        /// Guards against walking a bogus `nfds` out of guest memory. Linux caps
-        /// `poll` at `RLIMIT_NOFILE` anyway; anything past this is not a timerfd
-        /// pattern we model.
+    ) -> Result<PolledFds, Error> {
+        /// Budget for one scan of the guest's `pollfd` array. This is a cost
+        /// bound, NOT a claim about what a legal `poll` may contain: this same
+        /// build models `RLIMIT_NOFILE` as 1,048,576 (see `tool_local.rs`), so a
+        /// longer array is perfectly legal and may name a virtualized timerfd
+        /// past the cut. Truncating silently would leave that descriptor probed
+        /// by the kernel but never handed back — exactly the split-authority bug
+        /// this scan exists to prevent — so an over-budget or faulting scan
+        /// fails SAFE by reporting `Incomplete`.
         const MAX_SCANNED_POLL_FDS: libc::nfds_t = 1024;
 
         if !self.timerfd_mode_virtualized() || !guest.thread_state().has_virtualizable_timerfd() {
-            return Ok(Vec::new());
+            return Ok(PolledFds::Scanned(Vec::new()));
         }
         let Some(fds) = fds else {
-            return Ok(Vec::new());
+            return Ok(PolledFds::Scanned(Vec::new()));
         };
-        let count = nfds.min(MAX_SCANNED_POLL_FDS);
+        if nfds > MAX_SCANNED_POLL_FDS {
+            // Cannot prove the tail does not name a virtualized timerfd.
+            return Ok(PolledFds::Incomplete);
+        }
         let fds: AddrMut<libc::pollfd> = fds.cast();
         let memory = guest.memory();
         let mut polled = Vec::new();
-        for i in 0..count {
+        for i in 0..nfds {
             // SAFETY: this only computes a guest address, and `i < count <=
             // MAX_SCANNED_POLL_FDS` keeps the offset inside a plausible array.
             // Nothing is dereferenced here; `read_value` below does the actual
@@ -415,14 +440,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             // rather than trusting the pointer.
             let entry = unsafe { fds.add(i as usize) };
             let Ok(entry) = memory.read_value(entry) else {
-                // A faulting array is the syscall's problem to report, not ours.
-                break;
+                // A faulting array is the syscall's problem to REPORT, but from
+                // our point of view the scan is incomplete: entries we never
+                // reached may name a virtualized timerfd. Fail safe.
+                return Ok(PolledFds::Incomplete);
             };
             if entry.fd >= 0 {
                 polled.push(entry.fd);
             }
         }
-        Ok(polled)
+        Ok(PolledFds::Scanned(polled))
     }
 
     /// poll syscall (MAYHANG)
@@ -433,9 +460,16 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        let polled = self.read_polled_fds(guest, call.fds(), call.nfds())?;
-        self.timerfd_hand_back_polled_fds(guest, &polled, "poll")
-            .await?;
+        match self.read_polled_fds(guest, call.fds(), call.nfds())? {
+            PolledFds::Scanned(polled) => {
+                self.timerfd_hand_back_polled_fds(guest, &polled, "poll")
+                    .await?;
+            }
+            PolledFds::Incomplete => {
+                self.timerfd_hand_back_all(guest, "poll (descriptor set not enumerable)")
+                    .await?;
+            }
+        }
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
@@ -475,6 +509,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             // live-kernel behavior without adding BlockingExternalIO scheduler events.
             return Ok(guest.inject(call).await?);
         }
+
+        // `select`/`pselect6` ask the KERNEL for readiness — including via the
+        // live zero-timeout probe on the internal path — so any descriptor they
+        // name must be host-owned first, exactly as for `poll`/`epoll`. Detcore
+        // does not decode `fd_set` membership, and several paths below hand the
+        // raw call straight to the kernel (nfds past the internal bound, a zero
+        // timeout), so the complete and auditable answer is to hand back every
+        // virtualized timerfd rather than guess which bits are set. The
+        // `has_virtualizable_timerfd` pre-check inside keeps this off the hot
+        // path for the overwhelming majority of processes, which have none.
+        self.timerfd_hand_back_all(guest, "pselect6").await?;
 
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
@@ -703,6 +748,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
+        // `select`/`pselect6` ask the KERNEL for readiness — including via the
+        // live zero-timeout probe on the internal path — so any descriptor they
+        // name must be host-owned first, exactly as for `poll`/`epoll`. Detcore
+        // does not decode `fd_set` membership, and several paths below hand the
+        // raw call straight to the kernel (nfds past the internal bound, a zero
+        // timeout), so the complete and auditable answer is to hand back every
+        // virtualized timerfd rather than guess which bits are set. The
+        // `has_virtualizable_timerfd` pre-check inside keeps this off the hot
+        // path for the overwhelming majority of processes, which have none.
+        self.timerfd_hand_back_all(guest, "select").await?;
+
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
         }
@@ -872,9 +928,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
-        let polled = self.read_polled_fds(guest, call.fds(), call.nfds())?;
-        self.timerfd_hand_back_polled_fds(guest, &polled, "ppoll")
-            .await?;
+        match self.read_polled_fds(guest, call.fds(), call.nfds())? {
+            PolledFds::Scanned(polled) => {
+                self.timerfd_hand_back_polled_fds(guest, &polled, "ppoll")
+                    .await?;
+            }
+            PolledFds::Incomplete => {
+                self.timerfd_hand_back_all(guest, "ppoll (descriptor set not enumerable)")
+                    .await?;
+            }
+        }
 
         let timeout_address = call.timeout();
         let timeout = match timeout_address {
@@ -1112,16 +1175,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::EpollCtl,
     ) -> Result<i64, Error> {
         // Registering a timerfd for epoll readiness means the kernel, not the
-        // virtual clock, is about to be asked when it fires. Hand it over before
-        // the interest list can be consulted, so readiness and consumption keep
-        // answering from the same clock.
-        if call.op() == libc::EPOLL_CTL_ADD || call.op() == libc::EPOLL_CTL_MOD {
+        // virtual clock, is about to be asked when it fires, so the descriptor
+        // must become host-owned. Do that only AFTER the kernel ACCEPTS the
+        // registration: the latch is monotonic and irreversible, so latching on
+        // an operation the kernel then REJECTS (EBADF, ENOENT on MOD, EEXIST on
+        // ADD, a non-epoll epfd, EPERM on a non-pollable target) would change
+        // the timer's semantics for the rest of the run on the strength of a
+        // call that did nothing. The ordering is safe: the interest list this
+        // registration builds can only be consulted by a LATER `epoll_wait`, and
+        // Detcore serializes threads, so no guest code observes the descriptor
+        // between the kernel's accept and the handover.
+        let registers_for_readiness =
+            call.op() == libc::EPOLL_CTL_ADD || call.op() == libc::EPOLL_CTL_MOD;
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await; // empty request
+        let res = self.record_or_replay(guest, call).await?;
+        if registers_for_readiness {
             self.timerfd_hand_back_polled_fds(guest, &[call.fd()], "epoll_ctl")
                 .await?;
         }
-        let dettid = guest.thread_state().dettid;
-        resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        Ok(res)
     }
 
     /// epoll_pwait syscall (MAYHANG)

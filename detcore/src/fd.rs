@@ -87,6 +87,16 @@ pub struct TimerfdState {
     pub deadline: Option<LogicalTime>,
     /// Periodic reload interval in nanoseconds; `0` for a one-shot timer.
     pub interval_ns: u64,
+    /// Expirations that accrued in virtual time and were carried across a
+    /// handover to the kernel, still owed to the guest.
+    ///
+    /// `timerfd_settime` RESETS the kernel's expiration counter, so the re-arm
+    /// that performs a handover necessarily starts the kernel at zero; anything
+    /// the virtual model had accumulated but not yet delivered would simply
+    /// vanish. The next `read()` returns this count and clears it, after which
+    /// the kernel's own count takes over. Zero on every ordinary path.
+    #[serde(default)]
+    pub pending_expirations: u64,
 }
 
 /// Deterministic file descriptor
@@ -505,6 +515,7 @@ impl DetFd {
             clockid,
             deadline: None,
             interval_ns: 0,
+            pending_expirations: 0,
         });
     }
 

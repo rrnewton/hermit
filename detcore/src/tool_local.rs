@@ -352,6 +352,21 @@ impl FileMetadata {
             .any(DetFd::is_virtualizable_timerfd)
     }
 
+    /// Every descriptor still served from virtual time.
+    ///
+    /// The fail-safe companion to [`Self::has_virtualizable_timerfd`]: when a
+    /// readiness syscall cannot be proven *not* to name a virtualized timerfd —
+    /// an fd array longer than the scan budget, a faulting scan, or an `fd_set`
+    /// whose membership Detcore does not decode — the caller hands *all* of
+    /// these back rather than guessing.
+    fn virtualizable_timerfds(&self) -> Vec<RawFd> {
+        self.file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.is_virtualizable_timerfd())
+            .map(|(fd, _)| *fd)
+            .collect()
+    }
+
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         Self {
             files_id: FilesId::forked(child),
@@ -1796,6 +1811,12 @@ impl<T> ThreadState<T> {
     /// per-entry guest-memory read on a hot path.
     pub(crate) fn has_virtualizable_timerfd(&self) -> bool {
         self.metadata().has_virtualizable_timerfd()
+    }
+
+    /// Every descriptor still served from virtual time; see
+    /// `FdTableMetadata::virtualizable_timerfds`.
+    pub(crate) fn virtualizable_timerfds(&self) -> Vec<RawFd> {
+        self.metadata().virtualizable_timerfds()
     }
 
     /// remove a rawfd
