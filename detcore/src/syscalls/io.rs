@@ -377,6 +377,54 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// The descriptors named by a `poll`/`ppoll` fd array.
+    ///
+    /// Only used to spot descriptors whose readiness the kernel is about to be
+    /// asked about, so it stays out of the way when there is nothing to spot:
+    /// the array is read only when the run's mode could be virtualizing a
+    /// timerfd in the first place, and an unreadable or absurd array is left for
+    /// the syscall itself to reject rather than diagnosed here.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    fn read_polled_fds<G: Guest<Self>, P>(
+        &self,
+        guest: &mut G,
+        fds: Option<AddrMut<P>>,
+        nfds: libc::nfds_t,
+    ) -> Result<Vec<RawFd>, Error> {
+        /// Guards against walking a bogus `nfds` out of guest memory. Linux caps
+        /// `poll` at `RLIMIT_NOFILE` anyway; anything past this is not a timerfd
+        /// pattern we model.
+        const MAX_SCANNED_POLL_FDS: libc::nfds_t = 1024;
+
+        if !self.timerfd_mode_virtualized() || !guest.thread_state().has_virtualizable_timerfd() {
+            return Ok(Vec::new());
+        }
+        let Some(fds) = fds else {
+            return Ok(Vec::new());
+        };
+        let count = nfds.min(MAX_SCANNED_POLL_FDS);
+        let fds: AddrMut<libc::pollfd> = fds.cast();
+        let memory = guest.memory();
+        let mut polled = Vec::new();
+        for i in 0..count {
+            // SAFETY: this only computes a guest address, and `i < count <=
+            // MAX_SCANNED_POLL_FDS` keeps the offset inside a plausible array.
+            // Nothing is dereferenced here; `read_value` below does the actual
+            // access through the checked guest-memory API and reports a fault
+            // rather than trusting the pointer.
+            let entry = unsafe { fds.add(i as usize) };
+            let Ok(entry) = memory.read_value(entry) else {
+                // A faulting array is the syscall's problem to report, not ours.
+                break;
+            };
+            if entry.fd >= 0 {
+                polled.push(entry.fd);
+            }
+        }
+        Ok(polled)
+    }
+
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     pub async fn handle_poll<G: Guest<Self>>(
@@ -385,6 +433,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
+        let polled = self.read_polled_fds(guest, call.fds(), call.nfds())?;
+        self.timerfd_hand_back_polled_fds(guest, &polled, "poll")
+            .await?;
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
@@ -821,6 +872,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
+        let polled = self.read_polled_fds(guest, call.fds(), call.nfds())?;
+        self.timerfd_hand_back_polled_fds(guest, &polled, "ppoll")
+            .await?;
+
         let timeout_address = call.timeout();
         let timeout = match timeout_address {
             Some(timeout) => Some(ppoll_timeout_duration(guest.memory().read_value(timeout)?)?),
@@ -1056,6 +1111,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollCtl,
     ) -> Result<i64, Error> {
+        // Registering a timerfd for epoll readiness means the kernel, not the
+        // virtual clock, is about to be asked when it fires. Hand it over before
+        // the interest list can be consulted, so readiness and consumption keep
+        // answering from the same clock.
+        if call.op() == libc::EPOLL_CTL_ADD || call.op() == libc::EPOLL_CTL_MOD {
+            self.timerfd_hand_back_polled_fds(guest, &[call.fd()], "epoll_ctl")
+                .await?;
+        }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         Ok(self.record_or_replay(guest, call).await?)

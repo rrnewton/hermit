@@ -22,6 +22,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
+use reverie::syscalls::FromToRaw;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ReadAddr;
@@ -37,6 +38,7 @@ use tracing::warn;
 
 use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
+use crate::detlog;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::procfs::ProcfsFile;
@@ -70,6 +72,97 @@ fn should_tag_sabre_internal_pipe_io(
         && fd_type == FdType::Pipe
         && physically_nonblocking
         && !logically_nonblocking
+}
+
+/// Flatten a `timespec` to nanoseconds, clamping negatives to zero. The timerfd
+/// syscalls reject negative fields with `EINVAL` at the host; Detcore's virtual
+/// arming only needs a well-defined non-negative magnitude.
+fn timerfd_timespec_to_ns(ts: libc::timespec) -> u64 {
+    let secs = ts.tv_sec.max(0) as u64;
+    let nsec = ts.tv_nsec.max(0) as u64;
+    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+/// Inverse of [`timerfd_timespec_to_ns`].
+fn ns_to_timerfd_timespec(ns: u64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
+}
+
+/// Virtual-time nanoseconds until the timer's *next* expiration, matching the
+/// `it_value` that Linux's `timerfd_gettime` reports.
+///
+/// For a still-pending timer this is `deadline - now`. For a **periodic** timer
+/// that is already overdue (one or more expirations have accrued but have not
+/// yet been drained by `read()`), Linux reports the time until the *upcoming*
+/// tick, not zero: the stored `deadline` only advances on `read()`, so we must
+/// project it forward across the periods already crossed. Returns zero for a
+/// disarmed timer or an expired one-shot (whose single pending expiration is
+/// reported by `read()`, while `gettime` shows it as disarmed).
+fn timerfd_remaining_ns(deadline: Option<LogicalTime>, interval_ns: u64, now: LogicalTime) -> u64 {
+    match deadline {
+        Some(d) if d > now => d.as_nanos().saturating_sub(now.as_nanos()),
+        // Overdue periodic timer: advance to the first expiration strictly after
+        // `now`. `elapsed / interval + 1` is the number of whole periods to the
+        // next boundary (also correct at `d == now`, giving a full interval).
+        Some(d) if interval_ns > 0 => {
+            let elapsed = now.as_nanos().saturating_sub(d.as_nanos());
+            let periods = (elapsed / interval_ns).saturating_add(1);
+            let next = d
+                .as_nanos()
+                .saturating_add(periods.saturating_mul(interval_ns));
+            next.saturating_sub(now.as_nanos())
+        }
+        _ => 0,
+    }
+}
+
+/// The `it_value` to arm the host timer with when handing a `timerfd` back.
+///
+/// `timerfd_remaining_ns` reports zero for two states that must not be handed
+/// over the same way. A *disarmed* timer has no deadline, and arming the host
+/// with zero correctly disarms it. An *expired one-shot* also reports zero —
+/// `timerfd_gettime` shows it as disarmed while its single expiration is still
+/// waiting to be read — and arming the host with zero would disarm the timer
+/// and destroy that pending expiration, so the guest would spin forever on a
+/// timer that already fired. Arm the shortest positive interval instead: the
+/// kernel fires immediately and delivers the expiration the virtual model was
+/// still holding.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+fn timerfd_hand_back_it_value_ns(remaining_ns: u64, deadline: Option<LogicalTime>) -> u64 {
+    match deadline {
+        // Genuinely disarmed: hand the kernel a disarmed timer.
+        None => 0,
+        // Armed. A zero remaining means the expiration is already pending, and
+        // `it_value == 0` is Linux's spelling of "disarm", so it cannot be used
+        // to express "fire now".
+        Some(_) => remaining_ns.max(1),
+    }
+}
+
+/// Whether re-arming a `timerfd` to `new_deadline` needs a retarget of a reader
+/// already parked until `parked_deadline` — something the scheduler cannot do,
+/// so the descriptor must be handed to the kernel, which can.
+///
+/// Only a *nearer* deadline is a problem. The read loop re-evaluates on every
+/// wake, so pushing the deadline out simply parks again on the new one, which is
+/// already what Linux does. Disarming counts as nearer-or-worse: Linux would
+/// leave the reader blocked indefinitely, whereas the parked waiter still wakes
+/// at the deadline it registered.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1169)
+fn timerfd_rearm_needs_host_retarget(
+    parked_deadline: Option<LogicalTime>,
+    new_deadline: Option<LogicalTime>,
+) -> bool {
+    match (parked_deadline, new_deadline) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(parked), Some(new)) => new < parked,
+    }
 }
 
 fn unix_autobind_addrlen() -> i32 {
@@ -510,7 +603,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Timerfd => {
+                trace!(
+                    "Read call on timerfd {}, virtualizing expiration",
+                    call.fd()
+                );
+                // Fully handled against virtual time; do not fall through to the
+                // host read or the trailing resource_release_all below.
+                return self
+                    .handle_timerfd_read(guest, call, logically_nonblocking)
+                    .await;
+            }
+            FdType::Signalfd | FdType::Eventfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -2270,15 +2374,178 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(signalfd as i64)
     }
 
+    /// Whether the run's *mode* permits virtualizing timerfd expiration against
+    /// detcore's virtual clock rather than the host timer.
+    ///
+    /// This is only the mode precondition — threads serialized onto one virtual
+    /// CPU, time virtualized, and not record/replay (where reads are replayed
+    /// from the recorded log). It says nothing about whether any particular
+    /// descriptor is eligible; ask [`Self::timerfd_fd_virtualized`] for that.
+    pub(super) fn timerfd_mode_virtualized(&self) -> bool {
+        self.cfg.sequentialize_threads && self.cfg.virtualize_time && !self.cfg.recordreplay_modes
+    }
+
+    /// Whether *this descriptor* is served from virtual time right now.
+    ///
+    /// Mode permission is necessary but not sufficient. Virtual-time expiration
+    /// is proven for exactly one access pattern — a single thread doing
+    /// blocking `read()`s on an armed timer, the shape of GHC's RTS
+    /// context-switch ticker — and gating on mode alone silently applied it to
+    /// every other pattern too. Those patterns split one Linux timer between a
+    /// host-armed readiness signal and virtual-time consumption, which breaks
+    /// three contracts the kernel does honor even though timerfd timing itself
+    /// was never deterministic under `--strict`:
+    ///
+    /// 1. `poll`/`epoll_wait` readiness and `read()` consumption are coherent:
+    ///    a descriptor reported ready does not then return `EAGAIN` or block.
+    /// 2. A one-shot expiration is delivered exactly once.
+    /// 3. Re-arming to an earlier deadline retargets a reader already blocked
+    ///    in `read()`.
+    ///
+    /// So eligibility is a per-open-file-description property, latched off (see
+    /// [`DetFd::timerfd_host_owned`]) the first time Detcore observes a pattern
+    /// it cannot honor. A non-`timerfd`, or one that has never been modeled, is
+    /// never virtualized.
+    pub(super) fn timerfd_fd_virtualized<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+        if !self.timerfd_mode_virtualized() {
+            return false;
+        }
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                detfd.timerfd_state().is_some() && !detfd.timerfd_host_owned()
+            })
+            .unwrap_or(false)
+    }
+
+    /// Hand `fd` back to the kernel and keep the two views coherent.
+    ///
+    /// This is the one-way transition out of virtual-time expiration. The host
+    /// timer has been armed all along (for `poll`/`epoll` readiness), but its
+    /// pending-expiration counter has been accumulating unread while virtual
+    /// reads consumed the virtual model — so simply switching paths would
+    /// re-deliver expirations the guest already saw. Re-arming the host timer
+    /// from the *current* virtual arming fixes both halves at once: Linux
+    /// resets a timerfd's expiration counter on `timerfd_settime`, so the stale
+    /// count is discarded, and the kernel resumes from the remaining time the
+    /// guest last observed through `timerfd_gettime`.
+    ///
+    /// Determinism: this does not blunt virtual time. The clock keeps advancing
+    /// exactly as before at full nanosecond resolution; only the question of
+    /// *which* descriptors read expirations from it changes, and only in the
+    /// direction of the pre-existing host behavior. Descriptors that reach this
+    /// path were host-timed (and `XFAIL` under `--strict`) before timerfd
+    /// virtualization existed, so handing them back restores that baseline
+    /// rather than degrading a working one.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    async fn timerfd_hand_back_to_host<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        reason: &str,
+    ) -> Result<(), Error> {
+        let state = guest.thread_state().with_detfd(fd, |detfd| {
+            if detfd.set_timerfd_host_owned() {
+                detfd.timerfd_state()
+            } else {
+                None
+            }
+        })?;
+        let Some(state) = state else {
+            // Already host-owned, or not a modeled timerfd: nothing to hand over.
+            return Ok(());
+        };
+
+        let now = thread_observe_time(guest).await;
+        let remaining_ns = timerfd_hand_back_it_value_ns(
+            timerfd_remaining_ns(state.deadline, state.interval_ns, now),
+            state.deadline,
+        );
+        let new_value = libc::itimerspec {
+            it_interval: ns_to_timerfd_timespec(state.interval_ns),
+            it_value: ns_to_timerfd_timespec(remaining_ns),
+        };
+        detlog!(
+            "[dtid {}] timerfd fd={} handed back to the host ({}); re-armed at remaining_ns={} interval_ns={}",
+            guest.thread_state().dettid,
+            fd,
+            reason,
+            remaining_ns,
+            state.interval_ns,
+        );
+        self.timerfd_settime_on_host(guest, fd, &new_value).await
+    }
+
+    /// Issue a `timerfd_settime` against the host timer using a Detcore-owned
+    /// buffer, without disturbing guest memory.
+    async fn timerfd_settime_on_host<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        new_value: &libc::itimerspec,
+    ) -> Result<(), Error> {
+        let mut stack = guest.stack().await;
+        // `push` stages the value with the allocation, so `commit` writes the
+        // bytes into the guest. Reserving and then writing through
+        // `guest.memory()` does not survive the commit: the kernel would read a
+        // zeroed `itimerspec`, which is Linux's spelling of "disarm", and the
+        // handover would silently destroy the timer instead of transferring it.
+        let new_ptr: Addr<libc::itimerspec> = stack.push(*new_value);
+        // The commit guard owns the scratch allocation: it has to outlive the
+        // syscall that reads through `new_ptr`, or the guest's stack is restored
+        // before the kernel ever sees the `itimerspec`.
+        let scratch_guard = stack.commit()?;
+        let call = syscalls::TimerfdSettime::new()
+            .with_fd(fd)
+            .with_flags(0)
+            .with_new_value(Some(new_ptr))
+            .with_old_value(None);
+        let result = self.notification_fd_control(guest, call.into()).await;
+        drop(scratch_guard);
+        result?;
+        Ok(())
+    }
+
+    /// Hand every modeled, still-virtualized `timerfd` in `fds` back to the
+    /// host because the guest is about to ask the kernel whether it is ready.
+    ///
+    /// `poll`/`ppoll`/`epoll_wait` probe the kernel directly, so a descriptor
+    /// that reaches one of them must be host-owned *before* the probe runs —
+    /// otherwise the kernel answers on host time while `read()` answers on
+    /// virtual time, and the guest sees the incoherence.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    pub(super) async fn timerfd_hand_back_polled_fds<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds: &[RawFd],
+        reason: &str,
+    ) -> Result<(), Error> {
+        if !self.timerfd_mode_virtualized() {
+            return Ok(());
+        }
+        for fd in fds {
+            if self.timerfd_fd_virtualized(guest, *fd) {
+                self.timerfd_hand_back_to_host(guest, *fd, reason).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Create and register a timer notification descriptor.
     ///
     /// Determinism: strict execution serializes creation, which exposes only kernel validation,
     /// guest-visible flags, and a descriptor number; this operation does not read the clock.
+    /// The descriptor's virtual-time arming state (`TimerfdState`) starts disarmed.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdCreate,
     ) -> Result<i64, Error> {
+        let clockid = call.clockid().into_raw() as i32;
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         self.add_fd(
             guest,
@@ -2289,6 +2556,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Timerfd,
         )
         .await?;
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.init_timerfd(clockid))?;
         Ok(fd as i64)
     }
 
@@ -2303,22 +2573,352 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// timerfd_settime system call.
+    /// `timerfd_settime`: arm or disarm the timer against Detcore's virtual
+    /// clock so that a subsequent `read()` reports expirations as a function of
+    /// the deterministic schedule rather than host wall-clock.
+    ///
+    /// The virtual arming (`TimerfdState`) is what `read()` and `gettime`
+    /// consult. The host timer is still armed (with `old_value` cleared so it
+    /// cannot overwrite guest memory) to keep `poll`/`epoll` readiness working
+    /// for consumers that wait that way; Detcore never itself reads the host
+    /// timerfd. `old_value`, when requested, is reported from the prior virtual
+    /// arming, keeping the whole operation deterministic.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        if !self.timerfd_fd_virtualized(guest, call.fd()) {
+            // Mode forbids virtualization, this descriptor has been handed back
+            // to the kernel, or it is not a modeled timerfd at all: preserve the
+            // original host-timed behavior, letting the kernel own arming and
+            // old_value.
+            return self.notification_fd_control(guest, call.into()).await;
+        }
+
+        // Only a *modeled* timerfd is virtualized. A `timerfd_settime` targeting
+        // any other descriptor (a regular fd, socket, ...) is not: defer to the
+        // host, which rejects it (`EINVAL`) or handles it, without ever
+        // installing spurious virtual `TimerfdState`. `with_detfd` propagates
+        // `EBADF` for an unknown fd, matching Linux.
+        let prior = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?;
+        let Some(prior) = prior else {
+            return self.notification_fd_control(guest, call.into()).await;
+        };
+
+        let new_ptr = call.new_value().ok_or(Errno::EFAULT)?;
+        let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
+        let interval_ns = timerfd_timespec_to_ns(new.it_interval);
+        let value_ns = timerfd_timespec_to_ns(new.it_value);
+        let abstime = call.flags() & libc::TFD_TIMER_ABSTIME != 0;
+
+        let now = thread_observe_time(guest).await;
+
+        // Validate the arming against the kernel BEFORE committing any virtual
+        // state: mirror it to the host timer (for poll/epoll readiness) and let
+        // the host reject invalid `tv_nsec`/`tv_sec`/flags with `EINVAL`. Do not
+        // let the host write the guest's old_value buffer. On host error we
+        // return here, leaving the prior virtual arming untouched — so an invalid
+        // `settime` neither installs nor clobbers a `TimerfdState`, and a later
+        // `gettime` still reflects reality.
+        let host_call = call.with_old_value(None);
+        self.notification_fd_control(guest, host_call.into())
+            .await?;
+
+        // Host accepted the arming: capture old_value from the prior virtual
+        // arming, then compute and commit the new one.
+        let old_remaining_ns = timerfd_remaining_ns(prior.deadline, prior.interval_ns, now);
+        let old_interval_ns = prior.interval_ns;
+        let clockid = prior.clockid;
+
+        let deadline = if value_ns == 0 {
+            // Disarm.
+            None
+        } else if abstime {
+            // Absolute expiration is interpreted against the same virtual clock.
+            Some(LogicalTime::from_nanos(value_ns))
+        } else {
+            // Saturate rather than overflow on an extreme (but host-accepted)
+            // relative value such as `tv_sec == i64::MAX`.
+            Some(LogicalTime::from_nanos(
+                now.as_nanos().saturating_add(value_ns),
+            ))
+        };
+
+        // Linux retargets a `read()` that is already blocked when the timer is
+        // re-armed nearer. Detcore's reader is parked as a `SleepUntil` timed
+        // waiter on the deadline it captured, and the scheduler has no way to
+        // move an existing waiter earlier (that is part of #1560), so an earlier
+        // re-arm would wake it late and coalesce expirations. Rather than model
+        // it wrong, hand the descriptor back to the kernel, which does retarget.
+        //
+        // Only an *earlier* deadline is a problem: the read loop re-evaluates
+        // after every wake, so a later re-arm simply parks again on the new
+        // deadline, which is already correct.
+        let parked = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_parked_deadline())?;
+        let retargets_parked_reader = timerfd_rearm_needs_host_retarget(parked, deadline);
+
+        guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.set_timerfd_state(TimerfdState {
+                clockid,
+                deadline,
+                interval_ns,
+            });
+        })?;
+
+        if let Some(old_ptr) = call.old_value() {
+            let old_spec = libc::itimerspec {
+                it_interval: ns_to_timerfd_timespec(old_interval_ns),
+                it_value: ns_to_timerfd_timespec(old_remaining_ns),
+            };
+            guest.memory().write_value(old_ptr, &old_spec)?;
+        }
+
+        if retargets_parked_reader {
+            // The host timer was just armed with the guest's exact request
+            // (`host_call` above), including its `TFD_TIMER_ABSTIME` flag, so it
+            // already holds the arming the guest asked for and its expiration
+            // counter was reset by that same call. Latch host ownership without
+            // re-arming; re-deriving the arming from the virtual deadline here
+            // would be strictly less faithful.
+            let latched = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_timerfd_host_owned())?;
+            if latched {
+                detlog!(
+                    "[dtid {}] timerfd fd={} handed back to the host (re-armed nearer than a parked reader's deadline {:?}); host arming is the guest's own request",
+                    guest.thread_state().dettid,
+                    call.fd(),
+                    parked,
+                );
+            }
+            return Ok(0);
+        }
+
+        detlog!(
+            "[dtid {}] timerfd_settime(fd={}, interval_ns={}, value_ns={}, abstime={}) armed against virtual clock, deadline={:?}",
+            guest.thread_state().dettid,
+            call.fd(),
+            interval_ns,
+            value_ns,
+            abstime,
+            deadline,
+        );
+        Ok(0)
     }
 
-    /// timerfd_gettime system call.
+    /// `timerfd_gettime`: report the time remaining until the next expiration and
+    /// the reload interval, both computed from the virtual clock.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        if !self.timerfd_fd_virtualized(guest, call.fd()) {
+            return self.notification_fd_control(guest, call.into()).await;
+        }
+        let value_ptr = call.value().ok_or(Errno::EFAULT)?;
+        let state = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?;
+        match state {
+            Some(st) => {
+                let now = thread_observe_time(guest).await;
+                let spec = libc::itimerspec {
+                    it_interval: ns_to_timerfd_timespec(st.interval_ns),
+                    it_value: ns_to_timerfd_timespec(timerfd_remaining_ns(
+                        st.deadline,
+                        st.interval_ns,
+                        now,
+                    )),
+                };
+                guest.memory().write_value(value_ptr, &spec)?;
+                Ok(0)
+            }
+            // Not a modeled timerfd; defer to the host view.
+            None => self.notification_fd_control(guest, call.into()).await,
+        }
+    }
+
+    /// Serve a `read()` on a `timerfd` from Detcore's virtual clock.
+    ///
+    /// Determinism: the number of expirations returned is a pure function of the
+    /// virtual arming ([`TimerfdState`]) and the current virtual time. When the
+    /// next expiration has not yet been reached the caller is descheduled as a
+    /// timed waiter until the virtual deadline (the same `SleepUntil` mechanism
+    /// `nanosleep` uses), so the read resumes at a deterministic point in the
+    /// schedule rather than on host wall-clock.
+    ///
+    /// Only the pattern that behaviour is proven for reaches this path: one
+    /// thread, blocking reads, timer already armed. Each of the three
+    /// alternatives hands the descriptor back to the kernel first — see
+    /// [`Self::timerfd_fd_virtualized`] for why, and note that all three were
+    /// host-timed before timerfd virtualization existed, so the fallback is the
+    /// pre-existing behaviour rather than a new limitation.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1169)
+    async fn handle_timerfd_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        logically_nonblocking: bool,
+    ) -> Result<i64, Error> {
+        if !self.timerfd_fd_virtualized(guest, call.fd()) {
+            // Mode forbids virtualization, or this descriptor is host-owned: the
+            // host timer is armed, so defer to the ordinary host-timed path.
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
+        if call.len() < EXPIRATION_BYTES {
+            // The kernel requires a buffer large enough for the u64 count, and
+            // checks that before anything else.
+            return Err(Errno::EINVAL.into());
+        }
+        // NB: the buffer pointer is validated only once we are about to copy out
+        // an expiration count, mirroring the kernel's order of checks (EINVAL on
+        // short length, then only EFAULT on the final copy-to-user).
+
+        // A nonblocking read reports readiness rather than waiting for it, and
+        // Detcore cannot make the kernel's readiness answer agree with virtual
+        // time. Serving `EAGAIN` from virtual time while `poll`/`epoll_wait`
+        // reports the same descriptor ready on host time turns the standard
+        // nonblocking event-loop idiom into a spin. Hand it to the kernel, which
+        // answers both questions from one clock.
+        if logically_nonblocking {
+            self.timerfd_hand_back_to_host(guest, call.fd(), "nonblocking read")
+                .await?;
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        // A read on a timer that is not armed cannot be served from the virtual
+        // deadline, because there isn't one. It must block until some other
+        // thread arms the timer — but the host read that implements that
+        // blocking consumes a *kernel* expiration, which the virtual model would
+        // not know about and would then deliver a second time. Hand the
+        // descriptor over instead, so one clock owns both the wait and the
+        // expiration that ends it.
+        let armed = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.timerfd_state().and_then(|st| st.deadline).is_some()
+        })?;
+        if !armed {
+            self.timerfd_hand_back_to_host(guest, call.fd(), "read on a disarmed timer")
+                .await?;
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        // Virtual expiration is modelled for a single reader. A second thread
+        // reading the same open file description would race for expirations
+        // that only one `TimerfdState` accounts for.
+        let dettid = guest.thread_state().dettid;
+        let sole_reader = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.claim_timerfd_virtual_reader(dettid)
+        })?;
+        if !sole_reader {
+            self.timerfd_hand_back_to_host(guest, call.fd(), "second reader thread")
+                .await?;
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        loop {
+            let state = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?;
+            let deadline = match state.and_then(|st| st.deadline) {
+                Some(deadline) => deadline,
+                // Disarmed while we were parked. Same reasoning as the
+                // never-armed case above: hand it over rather than mix clocks.
+                None => {
+                    self.timerfd_hand_back_to_host(
+                        guest,
+                        call.fd(),
+                        "disarmed while a reader was parked",
+                    )
+                    .await?;
+                    return self.execute_nonblockable_fd_syscall(guest, call).await;
+                }
+            };
+            // Safe to unwrap: `deadline` came from `state`.
+            let state = state.expect("timerfd state present");
+
+            let now = thread_observe_time(guest).await;
+            if now >= deadline {
+                let deadline_ns = deadline.as_nanos();
+                let now_ns = now.as_nanos();
+                let (count, next_deadline) = match now_ns
+                    .saturating_sub(deadline_ns)
+                    .checked_div(state.interval_ns)
+                {
+                    // Periodic (interval_ns > 0): coalesce every period boundary
+                    // crossed, matching the kernel's expiration-count semantics.
+                    // Saturating arithmetic keeps a far-future/extreme virtual
+                    // time from overflowing the count or the next deadline.
+                    Some(extra) => {
+                        let count = 1u64.saturating_add(extra);
+                        let advanced =
+                            deadline_ns.saturating_add(count.saturating_mul(state.interval_ns));
+                        (count, Some(LogicalTime::from_nanos(advanced)))
+                    }
+                    // One-shot (interval_ns == 0): a single expiration, then disarmed.
+                    None => (1u64, None),
+                };
+                // Validate the destination buffer only now that we have an
+                // expiration to deliver (kernel EFAULT-on-copy ordering).
+                let buf = call.buf().ok_or(Errno::EFAULT)?;
+                guest.thread_state().with_detfd(call.fd(), |detfd| {
+                    detfd.set_timerfd_state(TimerfdState {
+                        deadline: next_deadline,
+                        ..state
+                    });
+                })?;
+                guest.memory().write_exact(buf, &count.to_ne_bytes())?;
+                detlog!(
+                    "[dtid {}] timerfd read(fd={}) => {} expiration(s), next deadline={:?}",
+                    guest.thread_state().dettid,
+                    call.fd(),
+                    count,
+                    next_deadline,
+                );
+                return Ok(EXPIRATION_BYTES as i64);
+            }
+
+            // Deschedule as a timed waiter until the virtual deadline, then
+            // re-evaluate: additional periods may have elapsed, or the timer may
+            // have been re-armed by another thread while we slept.
+            //
+            // Publish the deadline we are about to park on so `timerfd_settime`
+            // can see that moving the timer nearer would need a retarget this
+            // scheduler cannot perform, and hand the descriptor to the kernel
+            // instead of waking us late.
+            let request = Self::sleep_request_abs(guest, deadline).await;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.set_timerfd_parked_deadline(Some(deadline))
+            })?;
+            let resumed = resource_request(guest, request).await;
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_timerfd_parked_deadline(None))?;
+            match resumed {
+                ResumeStatus::Normal => {
+                    if !self.timerfd_fd_virtualized(guest, call.fd()) {
+                        // A `settime` handed the descriptor to the kernel while
+                        // we were parked. The host timer carries the arming that
+                        // caused the handover, so finish this read there.
+                        return self.execute_nonblockable_fd_syscall(guest, call).await;
+                    }
+                    continue;
+                }
+                ResumeStatus::Signaled => return Err(Errno::EINTR.into()),
+            }
+        }
     }
 
     /// inotify_init1 system call.
@@ -2696,5 +3296,76 @@ mod test {
         for len in 0..8 {
             canonicalize_tcp_info(&mut [0xff; 8][..len]);
         }
+    }
+}
+
+#[cfg(test)]
+mod timerfd_gate_test {
+    use detcore_model::time::LogicalTime;
+
+    use super::timerfd_hand_back_it_value_ns;
+    use super::timerfd_rearm_needs_host_retarget;
+
+    fn at(ns: u64) -> LogicalTime {
+        LogicalTime::from_nanos(ns)
+    }
+
+    /// Fires: an already-parked reader plus a nearer deadline is exactly the
+    /// case the scheduler cannot express, so it must reach the host.
+    #[test]
+    fn rearming_nearer_than_a_parked_reader_needs_the_host() {
+        assert!(timerfd_rearm_needs_host_retarget(
+            Some(at(1_000_000)),
+            Some(at(999_999))
+        ));
+        assert!(timerfd_rearm_needs_host_retarget(
+            Some(at(1_000_000)),
+            Some(at(0))
+        ));
+        // Disarming under a parked reader is worse, not better.
+        assert!(timerfd_rearm_needs_host_retarget(Some(at(1_000_000)), None));
+    }
+
+    /// Refuses: everything the virtual read loop already handles correctly must
+    /// stay on the virtual path, or the narrowing would disable the feature it
+    /// exists to preserve.
+    #[test]
+    fn rearming_no_nearer_or_with_no_parked_reader_stays_virtual() {
+        // Later: the reader wakes at the old deadline and simply parks again.
+        assert!(!timerfd_rearm_needs_host_retarget(
+            Some(at(1_000_000)),
+            Some(at(1_000_001))
+        ));
+        // Equal: the reader wakes at exactly the right time.
+        assert!(!timerfd_rearm_needs_host_retarget(
+            Some(at(1_000_000)),
+            Some(at(1_000_000))
+        ));
+        // Nobody parked: any arming is fine, including a disarm.
+        assert!(!timerfd_rearm_needs_host_retarget(None, Some(at(1))));
+        assert!(!timerfd_rearm_needs_host_retarget(None, None));
+    }
+
+    /// Fires: an armed timer whose expiration is already pending must reach the
+    /// kernel as "fire now", not as "disarmed". `timerfd_remaining_ns` reports
+    /// zero for an expired one-shot, and `it_value == 0` is Linux's spelling of
+    /// disarm, so handing that zero straight over destroys the expiration and
+    /// the guest spins on a timer that already fired.
+    #[test]
+    fn an_expired_one_shot_is_handed_over_as_fire_now() {
+        assert_eq!(timerfd_hand_back_it_value_ns(0, Some(at(123))), 1);
+    }
+
+    /// Refuses: a genuinely disarmed timer must stay disarmed. Without this
+    /// side, the rule above would resurrect timers the guest turned off.
+    #[test]
+    fn a_disarmed_timer_is_handed_over_disarmed() {
+        assert_eq!(timerfd_hand_back_it_value_ns(0, None), 0);
+    }
+
+    /// A real remaining time is passed through untouched.
+    #[test]
+    fn a_pending_deadline_is_handed_over_unchanged() {
+        assert_eq!(timerfd_hand_back_it_value_ns(500_000, Some(at(1))), 500_000);
     }
 }

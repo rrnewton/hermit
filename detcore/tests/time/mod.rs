@@ -392,3 +392,436 @@ fn rdtsc_deltas() {
         true,
     );
 }
+
+// A periodic timerfd is armed and read against detcore's virtual clock (not host
+// wall-clock) when threads are sequentialized and time is virtualized. This is
+// the mechanism that determinizes GHC's RTS context-switch ticker, which is a
+// periodic timerfd whose blocking read() on a dedicated thread drives green-
+// thread preemption. gettime must reflect the virtual arming, and each blocking
+// read must report at least one expiration and return the 8-byte count.
+#[test]
+fn timerfd_periodic_virtual_time() {
+    const PERIOD_NS: i64 = 10_000_000; // 10ms
+
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+            assert!(fd >= 0, "timerfd_create failed: {}", unsafe {
+                *libc::__errno_location()
+            });
+
+            // Arm as a 10ms periodic timer (relative initial expiration).
+            let new = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+            };
+            let rc = unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) };
+            assert_eq!(rc, 0, "timerfd_settime failed");
+
+            // gettime reflects the virtual arming: interval preserved, remaining
+            // in (0, PERIOD].
+            let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+            let rc = unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) };
+            assert_eq!(rc, 0, "timerfd_gettime failed");
+            let cur = unsafe { cur.assume_init() };
+            assert_eq!(cur.it_interval.tv_sec, 0);
+            assert_eq!(cur.it_interval.tv_nsec, PERIOD_NS);
+            let remaining = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
+            assert!(
+                remaining > 0 && remaining <= PERIOD_NS,
+                "unexpected remaining ns: {}",
+                remaining
+            );
+
+            // Three back-to-back blocking reads: each is descheduled as a timed
+            // waiter and woken at *exactly* the virtual deadline, so each read
+            // observes exactly one elapsed period and reports exactly one
+            // expiration. This exact count (not merely `>= 1`) is the load-immune
+            // determinism guarantee: it is a pure function of the virtual arming
+            // and virtual time, independent of host wall-clock or scheduling.
+            for i in 0..3 {
+                let mut expirations: u64 = 0;
+                let n = unsafe {
+                    libc::read(
+                        fd,
+                        &mut expirations as *mut u64 as *mut libc::c_void,
+                        std::mem::size_of::<u64>(),
+                    )
+                };
+                assert_eq!(n, 8, "timerfd read #{} returned {} bytes", i, n);
+                assert_eq!(
+                    expirations, 1,
+                    "timerfd read #{} reported {} expirations (expected exactly 1)",
+                    i, expirations
+                );
+            }
+
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
+// Guest body for the cross-run determinism test: arm a periodic timerfd and emit
+// the exact (expiration-count, remaining-ns) pair after each of several blocking
+// reads. Every value printed is a pure function of the virtual arming and the
+// virtual clock, so the whole stdout stream must be byte-identical across runs.
+fn timerfd_periodic_sequence_guest() {
+    const PERIOD_NS: i64 = 10_000_000; // 10ms
+
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+    assert!(fd >= 0, "timerfd_create failed: {}", unsafe {
+        *libc::__errno_location()
+    });
+    let new = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: PERIOD_NS,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: PERIOD_NS,
+        },
+    };
+    assert_eq!(
+        unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) },
+        0,
+        "timerfd_settime failed"
+    );
+
+    for _ in 0..5 {
+        let mut expirations: u64 = 0;
+        let n = unsafe {
+            libc::read(
+                fd,
+                &mut expirations as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(n, 8, "timerfd read returned {} bytes", n);
+
+        let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+        assert_eq!(
+            unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) },
+            0,
+            "timerfd_gettime failed"
+        );
+        let cur = unsafe { cur.assume_init() };
+        let remaining = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
+        // Fold both the delivered count and the virtual clock into stdout.
+        println!("expirations={} remaining={}", expirations, remaining);
+    }
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+}
+
+// L2-style determinism: the full (expiration-count, remaining-ns) sequence a
+// periodic timerfd produces must be byte-for-byte identical across independent
+// runs. This is the load-immune bitwise check finding #8 asked for; the single
+// `check_fn_with_config` run above establishes functional correctness, and this
+// establishes cross-run reproducibility. Mirrors the `run_five_times` harness in
+// tests/misc/notification_fds.rs.
+#[test]
+fn timerfd_periodic_sequence_is_deterministic_across_runs() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let mut expected: Option<Vec<u8>> = None;
+    for run in 1..=5 {
+        let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+            timerfd_periodic_sequence_guest,
+            config.clone(),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("timerfd guest run {run} failed: {error:#}"));
+        assert_eq!(
+            output.status,
+            reverie::ExitStatus::Exited(0),
+            "timerfd guest run {run} did not exit cleanly: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "timerfd guest run {run} produced no stdout"
+        );
+        match &expected {
+            Some(exp) => assert_eq!(
+                &output.stdout, exp,
+                "timerfd expiration/remaining sequence diverged on run {run}"
+            ),
+            None => expected = Some(output.stdout),
+        }
+    }
+}
+
+// Finding #5 regression: once a periodic timer is overdue (now >= deadline) but
+// its expirations have not been read, gettime must project the *next* future
+// expiration rather than reporting zero. Advance the virtual clock past several
+// periods via nanosleep without reading, then require a strictly-positive
+// remaining in (0, PERIOD].
+#[test]
+fn timerfd_overdue_periodic_gettime_reports_next_expiration() {
+    const PERIOD_NS: i64 = 10_000_000; // 10ms
+
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+            assert!(fd >= 0);
+            let new = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: PERIOD_NS,
+                },
+            };
+            assert_eq!(
+                unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) },
+                0,
+                "timerfd_settime failed"
+            );
+
+            // Sleep 3.5 periods on the virtual clock without reading the timer.
+            let req = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 35 * PERIOD_NS / 10,
+            };
+            assert_eq!(
+                unsafe { libc::nanosleep(&req, ptr::null_mut()) },
+                0,
+                "nanosleep failed"
+            );
+
+            let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+            assert_eq!(
+                unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) },
+                0,
+                "timerfd_gettime failed"
+            );
+            let cur = unsafe { cur.assume_init() };
+            let remaining = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
+            assert!(
+                remaining > 0 && remaining <= PERIOD_NS,
+                "overdue periodic gettime reported {} ns (expected next expiration in (0, PERIOD])",
+                remaining
+            );
+            assert_eq!(
+                cur.it_interval.tv_nsec, PERIOD_NS,
+                "interval must survive overdue gettime"
+            );
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
+// Finding #6 regression: a TFD_NONBLOCK timerfd whose next expiration has not
+// been reached must return EAGAIN on read (never EFAULT, never block), matching
+// the kernel's EINVAL -> EAGAIN -> EFAULT ordering. A null buffer must not turn
+// the unexpired-nonblocking case into EFAULT.
+#[test]
+fn timerfd_nonblocking_unexpired_returns_eagain() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK) };
+            assert!(fd >= 0);
+            // Armed one second out, so it is unexpired at the immediate read.
+            let new = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                },
+            };
+            assert_eq!(
+                unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) },
+                0,
+                "timerfd_settime failed"
+            );
+
+            let mut expirations: u64 = 0;
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    &mut expirations as *mut u64 as *mut libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            assert_eq!(n, -1, "unexpired nonblocking read should fail");
+            assert_eq!(
+                unsafe { *libc::__errno_location() },
+                libc::EAGAIN,
+                "unexpired nonblocking read must return EAGAIN"
+            );
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
+// Guest body for the readiness-registration tests. Arms a one-shot timer
+// `ARM_NS` out, optionally registers it with epoll first, burns `SLEEP_NS` of
+// *virtual* time, and returns the remaining nanoseconds `timerfd_gettime`
+// reports.
+//
+// The two clocks are what make this a discriminator. `nanosleep` advances
+// virtual time by the full `SLEEP_NS` while consuming almost no wall-clock, so
+// a timer owned by the virtual clock has nearly `ARM_NS - SLEEP_NS` left, while
+// one owned by the kernel has nearly all of `ARM_NS` left. The gap is hundreds
+// of milliseconds, far outside any measurement noise.
+fn timerfd_remaining_after_virtual_sleep(register_with_epoll: bool) -> i64 {
+    const ARM_NS: i64 = 500_000_000;
+    const SLEEP_NS: i64 = 400_000_000;
+
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+    assert!(fd >= 0, "timerfd_create failed");
+
+    let epfd = if register_with_epoll {
+        let epfd = unsafe { libc::epoll_create1(0) };
+        assert!(epfd >= 0, "epoll_create1 failed");
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        assert_eq!(
+            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut event) },
+            0,
+            "epoll_ctl(ADD) failed"
+        );
+        Some(epfd)
+    } else {
+        None
+    };
+
+    let new = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: ARM_NS,
+        },
+    };
+    assert_eq!(
+        unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) },
+        0,
+        "timerfd_settime failed"
+    );
+
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: SLEEP_NS,
+    };
+    assert_eq!(
+        unsafe { libc::nanosleep(&pause, ptr::null_mut()) },
+        0,
+        "nanosleep failed"
+    );
+
+    let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+    assert_eq!(
+        unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) },
+        0,
+        "timerfd_gettime failed"
+    );
+    let cur = unsafe { cur.assume_init() };
+
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    if let Some(epfd) = epfd {
+        assert_eq!(unsafe { libc::close(epfd) }, 0);
+    }
+    cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec
+}
+
+// Refuses: registering a timerfd for epoll readiness hands it to the kernel
+// (#1213 review finding #1).
+//
+// `epoll_wait` probes the kernel, so from that moment the kernel is the only
+// authority that can answer "is it ready" consistently with "read it". While
+// the gate keyed on mode alone, registration changed nothing and `read()` kept
+// answering from virtual time — so `epoll_wait` could report ready and the next
+// read return `EAGAIN` or block. Observing ownership directly: after 400ms of
+// virtual time against a 500ms timer, a kernel-owned timer still has nearly all
+// of its 500ms left, because virtual sleeps cost the host almost nothing.
+#[test]
+fn epoll_registration_hands_the_timerfd_to_the_kernel() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let remaining = timerfd_remaining_after_virtual_sleep(true);
+            assert!(
+                remaining > 450_000_000,
+                "after epoll registration the timerfd must be kernel-owned, but 400ms of \
+                 *virtual* sleep consumed it down to {remaining}ns of a 500ms arming; that is \
+                 the virtual clock still answering for a descriptor whose readiness the kernel \
+                 reports"
+            );
+        },
+        config,
+        true,
+    );
+}
+
+// Fires: an unregistered timerfd is still served from virtual time.
+//
+// This is the other half of the bracket. The narrowing above would look correct
+// while being useless if it simply disabled virtual-time expiration everywhere,
+// so pin the pattern the feature exists for — GHC's RTS ticker shape, no
+// readiness registration — to the virtual clock: 400ms of virtual sleep must
+// consume 400ms of the 500ms arming.
+#[test]
+fn an_unregistered_timerfd_is_still_served_from_virtual_time() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let remaining = timerfd_remaining_after_virtual_sleep(false);
+            assert!(
+                remaining > 0 && remaining <= 100_000_000,
+                "without a readiness registration the timerfd must follow virtual time: 400ms of \
+                 virtual sleep against a 500ms arming should leave at most 100ms, but \
+                 {remaining}ns remain"
+            );
+        },
+        config,
+        true,
+    );
+}
