@@ -425,7 +425,9 @@ jobs:
     name: reverie-pin-is-latest-main
     if: >-
       github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
+      (github.event_name == 'pull_request' ||
+       github.event_name == 'merge_group' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     permissions:
@@ -441,14 +443,54 @@ jobs:
           path: trusted
           fetch-depth: 1
           persist-credentials: false
+      - name: Check out the exact resolver source as inert data
+        uses: actions/checkout@v4
+        with:
+          # The workflow SHA carries the helper even while this infrastructure
+          # PR is bootstrapping. The registered workflow blob binds the digest
+          # checked below, and the same verified bytes are compiled in memory.
+          ref: ${{ github.sha }}
+          path: resolver-source
+          sparse-checkout: ci/resolve-reverie-pin-targets.cjs
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Resolve exact pull-request heads without an ambient GitHub CLI
+        id: targets
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const crypto = require('node:crypto');
+            const fs = require('node:fs');
+            const Module = require('node:module');
+            const path = require('node:path');
+            const resolverPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              'resolver-source/ci/resolve-reverie-pin-targets.cjs'
+            );
+            const source = fs.readFileSync(resolverPath, 'utf8');
+            const actualDigest = crypto.createHash('sha256').update(source).digest('hex');
+            const expectedDigest = 'f8d58ef89bbd31fcea3f6e326fd15e3819231f5dc6131079e34ca988df4f2d69';
+            if (actualDigest !== expectedDigest) {
+              throw new Error(
+                `resolver digest ${actualDigest} does not match registered ${expectedDigest}`
+              );
+            }
+            const loaded = new Module(resolverPath);
+            loaded.filename = resolverPath;
+            loaded.paths = Module._nodeModulePaths(path.dirname(resolverPath));
+            loaded._compile(source, resolverPath);
+            const resolver = loaded.exports;
+            const targets = await resolver.resolveTargets({
+              github,
+              context,
+              expectedRepository: 'rrnewton/hermit',
+            });
+            core.setOutput('json', JSON.stringify(targets));
       - name: Require every exact PR head to pin latest Reverie main
         env:
-          BASE_REF: ${{ github.event.merge_group.base_ref }}
-          EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          TARGETS_JSON: ${{ steps.targets.outputs.json }}
         run: |
           set -euo pipefail
           # Self-hosted gate runners use Actions' minimal PATH; Rust lives in
@@ -459,47 +501,17 @@ jobs:
             exit 1
           }
 
-          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
-            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
-              echo "::error::workflow_dispatch requires a pr_number input."
-              exit 1
-            fi
-            pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
-              jq -r 'select(.base.ref == "main") | .number')"
-          else
-            owner="${REPO%%/*}"
-            name="${REPO#*/}"
-            base_branch="${BASE_REF#refs/heads/}"
-            pr_numbers="$(
-              gh api graphql \
-                -f owner="$owner" \
-                -f name="$name" \
-                -f branch="$base_branch" \
-                -f query='query($owner: String!, $name: String!, $branch: String!) {
-                repository(owner: $owner, name: $name) {
-                  mergeQueue(branch: $branch) {
-                    entries(first: 100) {
-                      nodes {
-                        headCommit { oid }
-                        pullRequest { number baseRefName }
-                      }
-                    }
-                  }
-                }
-              }' | jq -r --arg sha "$SHA" --arg base "$base_branch" '
-                .data.repository.mergeQueue.entries.nodes
-                | map(select(
-                    .headCommit.oid == $sha
-                    and .pullRequest.baseRefName == $base
-                  ) | .pullRequest.number)
-                | .[]
-              ')"
-          fi
-
-          if [ -z "$pr_numbers" ]; then
-            echo "No main-branch pull request is associated with $SHA; merge-gate will reject it."
-            exit 0
-          fi
+          jq -e '
+            type == "array" and length > 0 and
+            all(.[];
+              (.number | type) == "number" and
+              (.headSha | type) == "string" and
+              (.headSha | test("^[0-9a-f]{40}$")) and
+              .baseRef == "main")
+          ' <<<"$TARGETS_JSON" >/dev/null || {
+            echo "::error::trusted target resolver returned malformed or empty output"
+            exit 1
+          }
 
           checker="$RUNNER_TEMP/check-reverie-pin"
           RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
@@ -514,9 +526,8 @@ jobs:
           }
           trap cleanup EXIT
 
-          while read -r pr_number; do
-            [ -n "$pr_number" ] || continue
-            head_sha="$(gh api "repos/${REPO}/pulls/${pr_number}" --jq '.head.sha')"
+          while IFS=$'\t' read -r pr_number head_sha; do
+            [ -n "$pr_number" ] && [ -n "$head_sha" ] || continue
             checkout="$scratch/pr-${pr_number}"
             git -C trusted fetch --quiet --no-tags origin "$head_sha"
             git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"
@@ -526,7 +537,7 @@ jobs:
             else
               "$checker" --repo "$checkout"
             fi
-          done <<< "$pr_numbers"
+          done < <(jq -r '.[] | [.number, .headSha] | @tsv' <<<"$TARGETS_JSON")
 
   merge-gate:
     name: merge-gate-v4
