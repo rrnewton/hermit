@@ -2262,6 +2262,18 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64)>) -> Vec<u8
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
 fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    fn page_accounting_value(field: &str) -> Option<&str> {
+        let (name, value) = field.split_once('=')?;
+        let fixed_counter = matches!(
+            name,
+            "active" | "anon" | "dirty" | "mapped" | "mapmax" | "swapcache" | "writeback"
+        );
+        let node_counter = name
+            .strip_prefix('N')
+            .is_some_and(|node| !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()));
+        (fixed_counter || node_counter).then_some(value)
+    }
+
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -2278,10 +2290,7 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
 
         let mut kept = Vec::with_capacity(fields.len());
         for field in fields {
-            if let Some(value) = field
-                .strip_prefix("active=")
-                .or_else(|| field.strip_prefix("mapmax="))
-            {
+            if let Some(value) = page_accounting_value(field) {
                 if value.parse::<u64>().is_err() {
                     return contents.to_vec();
                 }
@@ -4451,14 +4460,14 @@ THPeligible:    0\n"
     }
 
     #[test]
-    fn numa_maps_hides_host_page_aging_and_sharing_maxima() {
-        let contents = b"71000000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
-7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 kernelpagesize_kB=4\n";
+    fn numa_maps_hides_host_page_accounting() {
+        let contents = b"71000000 default heap anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 swapcache=2 writeback=3 kernelpagesize_kB=4\n";
 
         assert_eq!(
             sanitize_numa_maps(contents),
-            b"71000000 default anon=1 dirty=1 N0=1 kernelpagesize_kB=4\n\
-7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 N0=41 kernelpagesize_kB=4\n"
+            b"71000000 default heap kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 kernelpagesize_kB=4\n"
         );
     }
 
