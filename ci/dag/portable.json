@@ -412,8 +412,8 @@
     },
     {
       "group": "test", "job": "ignored_syscall_regressions",
-      "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
+      "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization, register_file_hashing)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization --test register_file_hashing -- --ignored --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
