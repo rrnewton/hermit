@@ -730,8 +730,12 @@ declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
 VALIDATION_CONCURRENCY_MONITOR_PID=""
 
-mkdir -p "$ROOT_DIR/target/validation"
-VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
+VALIDATION_TMP_PARENT="$ROOT_DIR/target/validation"
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 && -n ${VALIDATE_STOP_TEST_TMP_ROOT:-} ]]; then
+    VALIDATION_TMP_PARENT=$VALIDATE_STOP_TEST_TMP_ROOT
+fi
+mkdir -p "$VALIDATION_TMP_PARENT"
+VALIDATION_TMP_DIR=$(mktemp -d "$VALIDATION_TMP_PARENT/hermit-validate.XXXXXX")
 if [[ -z $VALIDATION_TMP_DIR ]]; then
     echo "Unable to create validation workspace." >&2
     exit 1

@@ -14,6 +14,21 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATE = ROOT / "validate.sh"
+TEST_ROOTS: list[Path] = []
+
+
+def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
+    TEST_ROOTS.append(tmpdir)
+    env = os.environ.copy()
+    env.update(
+        HERMIT_VALIDATE_STOP_TEST_MODE="1",
+        HERMIT_VALIDATE_LEDGER=str(ledger),
+        DEV_HERMIT_PARENT=str(ROOT.parent),
+        VALIDATE_RUN_ON_DIRTY_TREE="1",
+        VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+        TMPDIR=str(tmpdir),
+    )
+    return env
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
@@ -34,12 +49,8 @@ def run_signal(
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
-        env = os.environ.copy()
+        env = stop_test_env(tmpdir, ledger)
         env.update(
-            HERMIT_VALIDATE_STOP_TEST_MODE="1",
-            HERMIT_VALIDATE_LEDGER=str(ledger),
-            DEV_HERMIT_PARENT=str(ROOT.parent),
-            VALIDATE_RUN_ON_DIRTY_TREE="1",
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
         with log.open("wb") as output:
@@ -75,13 +86,9 @@ def run_incomplete_exit() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-incomplete-") as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
-        env = os.environ.copy()
+        env = stop_test_env(tmpdir, ledger)
         env.update(
-            HERMIT_VALIDATE_STOP_TEST_MODE="1",
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
-            HERMIT_VALIDATE_LEDGER=str(ledger),
-            DEV_HERMIT_PARENT=str(ROOT.parent),
-            VALIDATE_RUN_ON_DIRTY_TREE="1",
         )
         process = subprocess.run(
             [str(VALIDATE), "full"],
@@ -108,15 +115,11 @@ def run_cleanup_signal_race() -> None:
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
         cleanup_ready = tmpdir / "cleanup-ready"
-        env = os.environ.copy()
+        env = stop_test_env(tmpdir, ledger)
         env.update(
-            HERMIT_VALIDATE_STOP_TEST_MODE="1",
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
             VALIDATE_STOP_TEST_CLEANUP_READY_FILE=str(cleanup_ready),
             VALIDATE_STOP_TEST_CLEANUP_DELAY_SECONDS="1",
-            HERMIT_VALIDATE_LEDGER=str(ledger),
-            DEV_HERMIT_PARENT=str(ROOT.parent),
-            VALIDATE_RUN_ON_DIRTY_TREE="1",
         )
         with log.open("wb") as output:
             process = subprocess.Popen(
@@ -154,6 +157,8 @@ def main() -> None:
     run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
     run_incomplete_exit()
     run_cleanup_signal_race()
+    leaked = [path for path in TEST_ROOTS if path.exists()]
+    assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; cleanup is signal-atomic"
