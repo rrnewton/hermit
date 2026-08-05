@@ -796,6 +796,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// feeds guest-visible state, so it cannot affect determinism.
     async fn detlog_guest_env<G: Guest<Self>>(&self, guest: &mut G) {
         let dettid = guest.thread_state().dettid;
+        // Some backends do not expose the initial process stack at this hook
+        // (see `Config::initial_stack_unavailable_at_post_exec`). Reading
+        // argv/envp from `%rsp` there would fault under the in-process memory
+        // accessor or hash unrelated stack contents, so report the environment
+        // as unavailable rather than attempting the read.
+        if self.cfg.initial_stack_unavailable_at_post_exec {
+            detlog!(
+                "[env, dtid {}] unavailable (backend cannot read initial stack)",
+                dettid
+            );
+            return;
+        }
         match Self::hash_guest_env(guest).await {
             Ok(env) => detlog!(
                 "[env, dtid {}] count={} hash={} keys_hash={} keys={}",
