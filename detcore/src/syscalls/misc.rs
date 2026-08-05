@@ -15,6 +15,7 @@ use std::hash::Hasher;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::ArchPrctlCmd;
@@ -272,8 +273,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// Decide whether `ARCH_GET_GS` needs a shadow, given the base the kernel
+    /// actually reports after the set.
+    ///
+    /// `observed` MUST come from an authoritative read of the live GS base (an
+    /// injected `ARCH_GET_GS`), never from a hook register frame: see
+    /// [`Self::authoritative_gs_base`].
     fn arch_prctl_gs_shadow(requested: u64, observed: u64) -> Option<u64> {
         (requested != observed).then_some(requested)
+    }
+
+    /// The GS base the kernel will actually report to the guest, read by
+    /// injecting `ARCH_GET_GS` into guest scratch.
+    ///
+    /// This must NOT be read from `guest.regs().gs_base`. The pinned Reverie
+    /// hook register frame ZERO-INITIALIZES `gs_base` and never populates it on
+    /// the non-ptrace backends, so that field is a constant 0 regardless of the
+    /// real base. Comparing `requested != 0` is then not a test of "did the
+    /// backend honour the set" at all: it arms the shadow for every nonzero
+    /// request even when the backend honoured it, and — worse — never arms for
+    /// `ARCH_SET_GS(0)` even when the backend dropped it. The register frame is
+    /// a proxy for the base; `ARCH_GET_GS` is the base.
+    ///
+    /// Returns `None` when the authoritative read is unavailable, and callers
+    /// FAIL CLOSED by arming the shadow: reporting back the value the guest
+    /// asked for is the answer a correct kernel would give, so an unreadable
+    /// base costs virtualization coverage, never correctness.
+    async fn authoritative_gs_base<G: Guest<Self>>(&self, guest: &mut G) -> Option<u64> {
+        let (slot, guard) = {
+            let mut stack = guest.stack().await;
+            let slot = stack.push(0u64);
+            let guard = stack.commit().ok()?;
+            (slot, guard)
+        };
+        let probe = syscalls::ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_GET_GS(Some(slot)));
+        let result = guest.inject(probe).await;
+        let base = match result {
+            Ok(_) => guest.memory().read_value(slot).ok(),
+            Err(_) => None,
+        };
+        drop(guard);
+        base
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -293,9 +333,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             ArchPrctlCmd::ARCH_SET_GS(requested) => {
                 let result = guest.inject(call).await?;
-                let observed = guest.regs().await.gs_base;
+                // Ask the kernel what the base actually is; do NOT read
+                // `guest.regs().gs_base`, which the hook frame zero-initializes.
                 guest.thread_state_mut().arch_prctl_gs_shadow =
-                    Self::arch_prctl_gs_shadow(requested, observed);
+                    match self.authoritative_gs_base(guest).await {
+                        Some(observed) => Self::arch_prctl_gs_shadow(requested, observed),
+                        // Fail closed: an unreadable base means we cannot prove
+                        // the backend honoured the set, so shadow it.
+                        None => Some(requested),
+                    };
                 Ok(result)
             }
             ArchPrctlCmd::ARCH_GET_GS(addr) => {
@@ -818,6 +864,52 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The zero-init hook frame is NOT an acceptable source for `observed`.
+    ///
+    /// The pinned Reverie register frame zero-initializes `gs_base` and never
+    /// populates it on the non-ptrace backends, so feeding that constant 0 into
+    /// the decision produces the wrong answer in BOTH directions. This pins the
+    /// two wrong answers so a regression to `guest.regs().gs_base` fails here
+    /// rather than silently mis-arming the shadow in production.
+    #[test]
+    fn a_zero_init_register_frame_is_not_a_usable_gs_base() {
+        const ZERO_INIT_FRAME: u64 = 0;
+        type D = Detcore<crate::record_or_replay::NoopTool>;
+
+        // WRONG DIRECTION 1 -- false arm. The backend DID honour the set (the
+        // real base equals the request), but a zero-init frame reports 0, so the
+        // decision arms a shadow that is not needed.
+        let real_base = 0x7f00_0000u64;
+        assert_eq!(
+            D::arch_prctl_gs_shadow(real_base, real_base),
+            None,
+            "with the REAL base the shadow is correctly not armed"
+        );
+        assert_eq!(
+            D::arch_prctl_gs_shadow(real_base, ZERO_INIT_FRAME),
+            Some(real_base),
+            "with the zero-init frame the same set spuriously arms -- \
+             this is why `observed` must come from ARCH_GET_GS"
+        );
+
+        // WRONG DIRECTION 2 -- and the more dangerous one: false NO-arm. The
+        // guest asked for base 0 and the backend DROPPED it (real base still
+        // nonzero), so a shadow IS needed -- but a zero-init frame reports 0,
+        // the comparison sees 0 == 0, and no shadow is armed. The guest then
+        // reads back a base it never set.
+        let stale_base = 0x7f00_0000u64;
+        assert_eq!(
+            D::arch_prctl_gs_shadow(0, stale_base),
+            Some(0),
+            "with the REAL base a dropped ARCH_SET_GS(0) correctly arms"
+        );
+        assert_eq!(
+            D::arch_prctl_gs_shadow(0, ZERO_INIT_FRAME),
+            None,
+            "with the zero-init frame a dropped ARCH_SET_GS(0) silently does NOT arm"
+        );
+    }
 
     #[test]
     fn gs_shadow_is_only_needed_when_backend_cannot_observe_the_set() {
