@@ -2,7 +2,18 @@
 
 const assert = require('node:assert/strict');
 const {spawnSync} = require('node:child_process');
-const {resolveTargets} = require('./resolve-reverie-pin-targets.cjs');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  EXPECTED_RESOLVER_SHA256,
+  ResolverIntegrityError,
+  loadResolver,
+} = require('./load-reverie-pin-targets.cjs');
+
+const RESOLVER_PATH = path.join(__dirname, 'resolve-reverie-pin-targets.cjs');
+const {resolveTargets} = loadResolver(RESOLVER_PATH);
 
 const EXPECTED_REPOSITORY = 'rrnewton/hermit';
 const HEAD = '1111111111111111111111111111111111111111';
@@ -57,6 +68,38 @@ const tests = [];
 function test(name, operation) {
   tests.push({name, operation});
 }
+
+test('production loader accepts and executes the canonical resolver bytes', async () => {
+  const bytes = fs.readFileSync(RESOLVER_PATH);
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  assert.equal(digest, EXPECTED_RESOLVER_SHA256);
+  assert.equal(typeof resolveTargets, 'function');
+});
+
+test('production loader refuses an altered helper before executing it', async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'reverie-pin-loader-'));
+  const alteredPath = path.join(scratch, 'altered-resolver.cjs');
+  const executionMarker = '__HERMIT_ALTERED_RESOLVER_EXECUTED__';
+  try {
+    const canonical = fs.readFileSync(RESOLVER_PATH, 'utf8');
+    fs.writeFileSync(
+      alteredPath,
+      `globalThis.${executionMarker} = true;\n${canonical}`,
+      'utf8',
+    );
+    delete globalThis[executionMarker];
+    assert.throws(
+      () => loadResolver(alteredPath),
+      (error) =>
+        error instanceof ResolverIntegrityError &&
+        /resolver digest .* does not match trusted/.test(error.message),
+    );
+    assert.equal(globalThis[executionMarker], undefined);
+  } finally {
+    delete globalThis[executionMarker];
+    fs.rmSync(scratch, {recursive: true, force: true});
+  }
+});
 
 test('pull_request payload resolves its exact head without an API lookup', async () => {
   const result = await resolveTargets({
