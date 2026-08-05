@@ -3934,6 +3934,64 @@ mod test {
         assert!(sched.pending_run_queue_removals.is_empty());
     }
 
+    /// A successful nonleader exec retires the old process leader and reuses
+    /// its raw TID for the caller's replacement image.  The old-leader removal
+    /// and replacement-leader admission therefore share a `DetTid`, but they do
+    /// not name the same thread incarnation: the drain must remove the former
+    /// without cancelling the latter.
+    #[test]
+    fn nonleader_exec_removal_preserves_replacement_admission() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let detpid = DetPid::from_raw(leader.as_raw());
+        let pre_exec_mm = MmId::initial(detpid);
+
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, caller, false);
+        register_known_thread(&mut sched, leader);
+        register_known_thread(&mut sched, caller);
+        sched.runqueue_push_back(leader);
+        sched.runqueue_push_back(caller);
+
+        let old_leader_request = sched.next_turns.get(&leader).unwrap().req.clone();
+        let retired = sched.reconnect_after_exec(ExecReconnect {
+            caller,
+            new_leader: leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+
+        assert_eq!(retired, vec![leader, caller]);
+        assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
+        assert!(sched.pending_run_queue_removals.contains(&leader));
+        assert!(sched.pending_run_queue_admissions.contains_key(&leader));
+
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+
+        assert_eq!(
+            sched
+                .run_queue
+                .tids()
+                .filter(|dettid| **dettid == leader)
+                .count(),
+            1,
+            "the first eligible drain must contain exactly one replacement leader"
+        );
+        assert!(!sched.run_queue.contains_tid(caller));
+        assert!(sched.next_turns.contains_key(&leader));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
     /// F6 (real-path regression): when the thread `step3_peek` tentatively
     /// selected dies while the daemon awaits its request, `do_a_turn_blocking`
     /// takes the `Err(ThreadExited)` fizzle arm. That arm MUST undo the tentative
