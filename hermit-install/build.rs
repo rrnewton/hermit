@@ -352,7 +352,11 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    for library in ["libdetcore_dbi.so", "libdetcore_sabre.so"] {
+    for library in [
+        "libdetcore_dbi.so",
+        "libdetcore_sabre.so",
+        "libdetcore_e9patch.so",
+    ] {
         replace_symlink(
             &resources.join(library),
             &Path::new("../../release").join(library),
