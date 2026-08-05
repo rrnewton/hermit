@@ -1498,10 +1498,24 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     // the parent kernel-blocked until the child registers, so this stays false there.
     config.backend_defers_vfork_child_registration = backend == Backend::Kvm;
     if backend == Backend::Liteinst {
-        // LiteInst has no RCB timer delivery yet. Do not let Detcore believe a
-        // max or target timeslice was armed by the backend's coarse boundary.
+        // LiteInst has no RCB timer delivery yet, so it must not claim a
+        // PMU-backed deadline: `use_rcb_time()` is `max_timeslice.is_some() &&
+        // !no_rcb_time`, and `update_logical_time_rcbs` — gated on that — reads
+        // the RCB clock and panics if it is entered without one. Clearing
+        // `max_timeslice` also qualifies LiteInst for the no-timer
+        // `sched_yield` starvation mitigation (GH #81), which is keyed on
+        // `max_timeslice.is_none()`.
+        //
+        // `target_timeslice` is deliberately LEFT INTACT. It is a logical
+        // deadline, not a PMU one: every intercepted syscall advances
+        // `thread_logical_time` via `add_syscall_with_cost` regardless of
+        // `use_rcb_time()`, so the deadline stays productive without an RCB
+        // timer. `next_timeslice` derives `end_of_timeslice` from
+        // `target_timeslice.or(max_timeslice)`, and `target_only_mode_does_not
+        // _create_a_pmu_deadline` covers exactly this max=None/target=Some
+        // pairing. Clearing it too would silently drop syscall-boundary
+        // preemption and ignore an explicit `--target-timeslice`.
         config.max_timeslice = None;
-        config.target_timeslice = None;
     }
     config
 }
@@ -2004,13 +2018,31 @@ mod tests {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         let liteinst = prepare_backend_config(config.clone(), Backend::Liteinst);
+        // The PMU-backed deadline goes away: LiteInst has no RCB timer.
         assert!(liteinst.max_timeslice.is_none());
-        assert!(liteinst.target_timeslice.is_none());
         assert!(
             prepare_backend_config(config, Backend::Ptrace)
                 .max_timeslice
                 .is_some()
         );
+    }
+
+    /// The logical deadline must SURVIVE the LiteInst adjustment. It is checked
+    /// at syscall boundaries against `thread_logical_time`, which every
+    /// intercepted syscall advances irrespective of `use_rcb_time()`, so it does
+    /// not depend on the RCB timer that LiteInst lacks. Clearing it alongside
+    /// `max_timeslice` would leave `target_timeslice.or(max_timeslice)` — the
+    /// expression `next_timeslice` uses — as `None`, silently removing
+    /// syscall-boundary preemption and ignoring an explicit `--target-timeslice`.
+    #[test]
+    fn liteinst_backend_preserves_the_logical_target_timeslice() {
+        let config = super::DetConfig {
+            target_timeslice: std::num::NonZeroU64::new(20_000),
+            ..Default::default()
+        };
+        let liteinst = prepare_backend_config(config, Backend::Liteinst);
+        assert!(liteinst.max_timeslice.is_none());
+        assert_eq!(liteinst.target_timeslice, std::num::NonZeroU64::new(20_000));
     }
 
     #[test]
