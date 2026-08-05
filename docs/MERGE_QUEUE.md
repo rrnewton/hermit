@@ -84,11 +84,14 @@ Replace `REPOSITORY` with `hermit` or `reverie`.
 
 ## Local validation
 
-A full green `./validate.sh` run writes its local ledger row on exit and then
-delegates to the parent `ci-hub apply-local-label`. The applier requires that
-exact head to have a clean, commit-anchored, full-selection PASS with a nonzero
-executed-test count, hashes the referenced log, and publishes the selected row
-on `rrnewton/dev-hermit:validation-receipts`. Only after that immutable receipt
+A full green `./validate.sh` run writes its original local ledger row on exit,
+then invokes the parent schema-6 finalizer for that exact SHA. The finalizer
+recomputes per-node coverage and the source-log digest from the row's own
+absolute `log_file`, verifies the exact Hermit/Reverie binding, and appends a
+qualified schema-6 clone. Only then does validation delegate to parent
+`ci-hub apply-local-label`. The applier independently re-verifies the exact head,
+hashes the referenced log, and publishes the selected row on
+`rrnewton/dev-hermit:validation-receipts`. Only after that immutable receipt
 exists does it post the binding comment and apply `locally-validated`.
 Publication or GitHub failures fail closed; the command can be run manually to
 backfill a validated head.
@@ -104,12 +107,15 @@ privileged jobs to pass. A hosted failure is never overridden by local evidence.
 ## Validation-evidence trail
 
 The label is only a cache of a validation receipt; it cannot create evidence.
-Parent `ci-hub/validation/verify_receipt.sh` is the receipt authority used by
-the gate. The gate fetches it from the exact parent authority commit and verifies
-its digest rather than running PR-controlled verifier code. It resolves the marker's receipt
-commit, proves that commit belongs to the receipt branch, reads the exact path
-at that commit, recomputes SHA-256, and then validates the exact-head counted
-ledger row. A well-shaped comment without that backing receipt is refused.
+The parent-tree `ci-hub/validation/verify_receipt_bundle.sh` entrypoint is the
+receipt authority used by the gate. The gate fetches one exact parent authority
+commit and runs the complete bundle from that tree rather than downloading one
+standalone script or executing PR-controlled verifier code. The bundle acquires
+the exact target commit in the explicitly trusted repository, resolves the
+marker's receipt commit, proves that commit belongs to the receipt branch,
+reads the exact path at that commit, recomputes the receipt and durable-log
+digests, and invokes the parent's one semantic verifier on the embedded row. A
+well-shaped comment without that backing receipt is refused.
 
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:

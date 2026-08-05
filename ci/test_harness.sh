@@ -916,6 +916,7 @@ function audit_ci_correspondence {
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
+    "$ROOT_DIR/ci/test-finalize-validation-receipt.sh" >/dev/null
     assert_reverie_pin_enforcement
 
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs

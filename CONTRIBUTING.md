@@ -61,12 +61,15 @@ Protocol for every PR:
    owning CI workflow in the same PR so they stay in lockstep, and update the
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
-3. A full green `validate.sh` delegates to `ci-hub apply-local-label` after its
-   ledger row is written. Do not add **`locally-validated`** by hand: the applier
-   re-reads the counted exact-head row, hashes its log, publishes an immutable
-   receipt, and only then comments and labels. The command can also be run
-   manually to backfill a validated head. Re-run validation after any subsequent
-   push; the push invalidates both the prior receipt and label.
+3. A full green `validate.sh` first delegates to the parent schema-6 finalizer
+   after its original ledger row is written. The finalizer re-reads that row's
+   durable log, derives per-node coverage, and binds the exact Hermit commit to
+   freshly resolved Reverie main. Only after that succeeds does validation call
+   `ci-hub apply-local-label`. Do not add **`locally-validated`** by hand: the
+   applier independently re-reads the qualified exact-head row, hashes its log,
+   publishes an immutable receipt, and only then comments and labels. Re-run
+   validation after any subsequent push; the push invalidates both the prior
+   receipt and label.
 
 A PR that changes code but is missing the `locally-validated` label — or whose
 description does not account for any check that could not run locally — is not

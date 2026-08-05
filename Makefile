@@ -93,6 +93,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	./scripts/check-merge-gate-policy.sh
+	./ci/test-finalize-validation-receipt.sh
 	python3 ./scripts/test_pr_status.py
 	$(CARGO) fmt --all -- --check
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \

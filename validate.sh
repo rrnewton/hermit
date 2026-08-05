@@ -278,6 +278,7 @@ Environment:
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
   VALIDATE_LABEL_PR=0                            Disable receipt publication/labeling.
   CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
+  CI_HUB_FINALIZE_RECEIPT=PATH                   Override the parent schema-6 receipt finalizer.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   VALIDATE_IGNORE_CACHE=1                        Same as --ignore-cache (force a real run).
@@ -1597,16 +1598,22 @@ function print_wall_cpu_summary {
         "$ratio" "$host_cpus" "$hint"
 }
 
-function publish_receipt_backed_label {
+function finalize_and_publish_receipt_backed_label {
     local pr=${PR_NUMBER:-}
     local ci_hub=${CI_HUB_APPLY_LOCAL_LABEL:-}
+    local finalizer=${CI_HUB_FINALIZE_RECEIPT:-}
+    local handoff="$ROOT_DIR/ci/finalize-validation-receipt.sh"
     local -a gh_cmd=(gh)
 
     if [[ -z $ci_hub && -n $DEV_HERMIT_PARENT ]]; then
         ci_hub="$DEV_HERMIT_PARENT/ci-hub/ci-hub"
     fi
-    if [[ -z $ci_hub || ! -x $ci_hub ]]; then
-        printf "⚠️  counted validation recorded, but the ci-hub receipt publisher is unavailable; not applying locally-validated\n" >&2
+    if [[ -z $finalizer && -n $DEV_HERMIT_PARENT ]]; then
+        finalizer="$DEV_HERMIT_PARENT/ci-hub/validate/finalize_receipt.py"
+    fi
+    if [[ ! -x $handoff || -z $ci_hub || ! -x $ci_hub || \
+          -z $finalizer || ! -r $finalizer ]]; then
+        printf "⚠️  counted validation recorded, but the schema-6 receipt authority is unavailable; not applying locally-validated\n" >&2
         return 0
     fi
     if [[ -z $pr ]] && command -v gh >/dev/null 2>&1; then
@@ -1620,9 +1627,15 @@ function publish_receipt_backed_label {
         printf "⚠️  counted validation recorded, but no PR was found; not applying locally-validated\n" >&2
         return 0
     fi
-    if ! "$ci_hub" apply-local-label --pr "$pr" --repo rrnewton/hermit \
-        --ledger "$VALIDATION_LEDGER_FILE"; then
-        printf "⚠️  receipt publication failed for PR #%s; locally-validated was not authorized\n" \
+    if ! "$handoff" \
+        --repo rrnewton/hermit \
+        --sha "$VALIDATION_COMMIT" \
+        --ledger "$VALIDATION_LEDGER_FILE" \
+        --hermit-checkout "$ROOT_DIR" \
+        --pr "$pr" \
+        --finalizer "$finalizer" \
+        --ci-hub "$ci_hub"; then
+        printf "⚠️  schema-6 finalization or receipt publication failed for PR #%s; locally-validated was not authorized\n" \
             "$pr" >&2
     fi
 }
@@ -1690,7 +1703,7 @@ function cleanup {
     if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
         VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
        [[ $VALIDATION_LEVEL == full ]]; then
-        publish_receipt_backed_label
+        finalize_and_publish_receipt_backed_label
     fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
