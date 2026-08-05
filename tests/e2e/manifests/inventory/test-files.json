@@ -1160,6 +1160,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/register_marker.c",
+      "runner": "hermit-cli/tests/register_file_hashing.rs",
+      "why": "tests/c/register_marker.c is owned by hermit-cli/tests/register_file_hashing.rs: The Rust integration test compiles this guest and runs it under hermit --verify to prove the register-file digest catches a register-only divergence; it pins a marker value into %r15 across a getpid boundary so stdout and exit status stay identical while exactly one general-purpose register differs, a contract a generic manifest cell cannot express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/relaxed_flag_matrix.c",
       "runner": "hermit-cli/tests/relaxed_flag_matrix.rs",
       "why": "tests/c/relaxed_flag_matrix.c is owned by hermit-cli/tests/relaxed_flag_matrix.rs: The Rust integration test compiles this observation guest and runs it across the exhaustive strict/relaxed flag matrix with bounded execution and exact result classification; a generic manifest cell cannot express the matrix-wide flag cross-product or ratcheted expected-failure contract."
