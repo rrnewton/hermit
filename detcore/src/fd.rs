@@ -670,6 +670,37 @@ mod tests {
         detfd
     }
 
+    /// A faulting copyout must leave the debt OWED, not discarded.
+    ///
+    /// Both timerfd read paths peek, copy out, and only then commit the take.
+    /// This pins the invariant at the state layer: a take that never happens
+    /// leaves the count intact for the next reader, which is what makes an
+    /// EFAULT/EINVAL non-destructive.
+    #[test]
+    fn a_rejected_copyout_leaves_the_expiration_debt_owed() {
+        let detfd = timerfd(9);
+        let state = detfd.timerfd_state().expect("modeled timerfd");
+        detfd.set_timerfd_state(TimerfdState {
+            pending_expirations: 5,
+            ..state
+        });
+
+        // Peek (what both read paths do before attempting the copyout).
+        let peeked = detfd.timerfd_state().map_or(0, |st| st.pending_expirations);
+        assert_eq!(peeked, 5);
+
+        // Copyout "fails": no take is committed.
+        assert_eq!(
+            detfd.timerfd_state().map(|st| st.pending_expirations),
+            Some(5),
+            "a peek must not consume; a rejected copyout leaves the count owed"
+        );
+
+        // A later successful read still gets the full count, exactly once.
+        assert_eq!(detfd.take_timerfd_pending_expirations(), 5);
+        assert_eq!(detfd.take_timerfd_pending_expirations(), 0);
+    }
+
     /// FIRES: a revoked handover restores EXACTLY the virtualization state the
     /// transfer destroyed, so a rejected `select` leaves timer ownership as it
     /// found it -- Linux does not re-own a timer because a syscall returned

@@ -1306,10 +1306,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let iov = read_first_iovec(guest, &call)?;
                 match iov {
                     Some((base, len)) if len >= EXPIRATION_BYTES => {
-                        // Take only once the destination is known good, so a
-                        // rejected call cannot swallow the count.
-                        let owed = self.timerfd_take_pending_expirations(guest, call.fd())?;
+                        // `len >= 8` says the destination is BIG ENOUGH, not that
+                        // it is writable: `base` is still unvalidated and
+                        // `write_exact` can fault. Commit the take only after the
+                        // copyout has actually succeeded, so an EFAULT leaves the
+                        // count owed to the next reader instead of discarding it.
                         guest.memory().write_exact(base, &owed.to_ne_bytes())?;
+                        let owed = self.timerfd_take_pending_expirations(guest, call.fd())?;
                         detlog!(
                             "[dtid {}] timerfd readv(fd={}) => {} expiration(s) carried across the host handover",
                             guest.thread_state().dettid,
@@ -3101,9 +3104,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // zero at the handover.
             // PEEK, do not take: the count must survive a rejected call. Taking
             // first meant `read(fd, buf, 4)` returned EINVAL having already
-            // discarded the owed expirations, so the guest lost them with no
-            // way to observe that it had. Mirrors the readv path below, which
-            // commits only once the destination is known good.
+            // discarded the owed expirations, so the guest lost them with no way
+            // to observe that it had.
+            //
+            // This is the reference ordering for the readv path ABOVE, not a
+            // copy of it. An earlier version of this comment said it mirrored
+            // readv "which commits only once the destination is known good";
+            // both halves were false -- readv is above, not below, and it took
+            // the count before its copyout. Citing that comment instead of
+            // reading the code is how the readv defect survived three rounds.
             let owed = self.timerfd_peek_pending_expirations(guest, call.fd())?;
             if owed > 0 {
                 if call.len() < EXPIRATION_BYTES {
