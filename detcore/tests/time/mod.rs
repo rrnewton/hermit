@@ -688,3 +688,140 @@ fn timerfd_nonblocking_unexpired_returns_eagain() {
         true,
     );
 }
+
+// Guest body for the readiness-registration tests. Arms a one-shot timer
+// `ARM_NS` out, optionally registers it with epoll first, burns `SLEEP_NS` of
+// *virtual* time, and returns the remaining nanoseconds `timerfd_gettime`
+// reports.
+//
+// The two clocks are what make this a discriminator. `nanosleep` advances
+// virtual time by the full `SLEEP_NS` while consuming almost no wall-clock, so
+// a timer owned by the virtual clock has nearly `ARM_NS - SLEEP_NS` left, while
+// one owned by the kernel has nearly all of `ARM_NS` left. The gap is hundreds
+// of milliseconds, far outside any measurement noise.
+fn timerfd_remaining_after_virtual_sleep(register_with_epoll: bool) -> i64 {
+    const ARM_NS: i64 = 500_000_000;
+    const SLEEP_NS: i64 = 400_000_000;
+
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+    assert!(fd >= 0, "timerfd_create failed");
+
+    let epfd = if register_with_epoll {
+        let epfd = unsafe { libc::epoll_create1(0) };
+        assert!(epfd >= 0, "epoll_create1 failed");
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        assert_eq!(
+            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut event) },
+            0,
+            "epoll_ctl(ADD) failed"
+        );
+        Some(epfd)
+    } else {
+        None
+    };
+
+    let new = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: ARM_NS,
+        },
+    };
+    assert_eq!(
+        unsafe { libc::timerfd_settime(fd, 0, &new, ptr::null_mut()) },
+        0,
+        "timerfd_settime failed"
+    );
+
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: SLEEP_NS,
+    };
+    assert_eq!(
+        unsafe { libc::nanosleep(&pause, ptr::null_mut()) },
+        0,
+        "nanosleep failed"
+    );
+
+    let mut cur = MaybeUninit::<libc::itimerspec>::zeroed();
+    assert_eq!(
+        unsafe { libc::timerfd_gettime(fd, cur.as_mut_ptr()) },
+        0,
+        "timerfd_gettime failed"
+    );
+    let cur = unsafe { cur.assume_init() };
+
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    if let Some(epfd) = epfd {
+        assert_eq!(unsafe { libc::close(epfd) }, 0);
+    }
+    cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec
+}
+
+// Refuses: registering a timerfd for epoll readiness hands it to the kernel
+// (#1213 review finding #1).
+//
+// `epoll_wait` probes the kernel, so from that moment the kernel is the only
+// authority that can answer "is it ready" consistently with "read it". While
+// the gate keyed on mode alone, registration changed nothing and `read()` kept
+// answering from virtual time — so `epoll_wait` could report ready and the next
+// read return `EAGAIN` or block. Observing ownership directly: after 400ms of
+// virtual time against a 500ms timer, a kernel-owned timer still has nearly all
+// of its 500ms left, because virtual sleeps cost the host almost nothing.
+#[test]
+fn epoll_registration_hands_the_timerfd_to_the_kernel() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let remaining = timerfd_remaining_after_virtual_sleep(true);
+            assert!(
+                remaining > 450_000_000,
+                "after epoll registration the timerfd must be kernel-owned, but 400ms of \
+                 *virtual* sleep consumed it down to {remaining}ns of a 500ms arming; that is \
+                 the virtual clock still answering for a descriptor whose readiness the kernel \
+                 reports"
+            );
+        },
+        config,
+        true,
+    );
+}
+
+// Fires: an unregistered timerfd is still served from virtual time.
+//
+// This is the other half of the bracket. The narrowing above would look correct
+// while being useless if it simply disabled virtual-time expiration everywhere,
+// so pin the pattern the feature exists for — GHC's RTS ticker shape, no
+// readiness registration — to the virtual clock: 400ms of virtual sleep must
+// consume 400ms of the 500ms arming.
+#[test]
+fn an_unregistered_timerfd_is_still_served_from_virtual_time() {
+    let config = detcore::Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let remaining = timerfd_remaining_after_virtual_sleep(false);
+            assert!(
+                remaining > 0 && remaining <= 100_000_000,
+                "without a readiness registration the timerfd must follow virtual time: 400ms of \
+                 virtual sleep against a 500ms arming should leave at most 100ms, but \
+                 {remaining}ns remain"
+            );
+        },
+        config,
+        true,
+    );
+}

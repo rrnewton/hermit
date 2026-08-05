@@ -346,6 +346,12 @@ impl FileMetadata {
         self.file_handles.values().any(DetFd::is_loopback_peer)
     }
 
+    fn has_virtualizable_timerfd(&self) -> bool {
+        self.file_handles
+            .values()
+            .any(DetFd::is_virtualizable_timerfd)
+    }
+
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         Self {
             files_id: FilesId::forked(child),
@@ -1780,6 +1786,16 @@ impl<T> ThreadState<T> {
     /// Whether this task owns a socket that attempted a loopback connection.
     pub(crate) fn has_loopback_peer(&self) -> bool {
         self.metadata().has_loopback_peer()
+    }
+
+    /// Whether this task owns any `timerfd` still served from virtual time.
+    ///
+    /// `poll`/`ppoll` consult this before reading their descriptor array out of
+    /// guest memory, so a process with no such timer — nearly every process —
+    /// pays one in-memory scan of its own descriptor table instead of a
+    /// per-entry guest-memory read on a hot path.
+    pub(crate) fn has_virtualizable_timerfd(&self) -> bool {
+        self.metadata().has_virtualizable_timerfd()
     }
 
     /// remove a rawfd
