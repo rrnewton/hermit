@@ -16,7 +16,7 @@
 #   ci/run-dag.sh <lane> [runner-args...]
 #     <lane>            portable | privileged  (selects ci/dag/<lane>.json)
 #     runner-args       forwarded verbatim to `safe-ci-dag-runner run`
-#                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf, --cgroups,
+#                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf,
 #                        -k/--keep-going, -v, -q)
 #
 # Examples:
@@ -36,6 +36,9 @@ set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
+
+# shellcheck source=ci/configure-build-jobs.sh
+source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?
 
 if (($# < 1)); then
     echo "usage: ci/run-dag.sh <portable|privileged> [runner-args...]" >&2
@@ -114,5 +117,5 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-echo "run-dag.sh: lane=$lane runner=$runner verb=$verb" >&2
+echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS" >&2
 exec "$runner" "$verb" --dag "$dag" "$@"
