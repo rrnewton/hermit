@@ -82,6 +82,14 @@ pub struct Config {
     #[clap(skip)]
     pub syscall_clobbers_virtualized_by_backend: bool,
 
+    /// The execution backend does not present a deterministic register file at the
+    /// syscall boundary (e.g. SaBRe leaves scratch registers like %rdx carrying
+    /// run-to-run varying values), so the `[regs]` determinism digest must not be
+    /// emitted for it. Set per-backend in `prepare_backend_config`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub registers_nondeterministic_at_syscall_boundary: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
     /// Logically killed guest threads need an explicit scheduler response because the backend

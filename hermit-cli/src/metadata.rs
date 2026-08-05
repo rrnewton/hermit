@@ -168,6 +168,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         use_thread_local_clock_reads: false,
         detect_host_clock_futex_timeouts: false,
         syscall_clobbers_virtualized_by_backend: false,
+        registers_nondeterministic_at_syscall_boundary: false,
         cancel_killed_thread_rpcs: false,
         backend_reports_physical_process_exits: false,
         backend_serializes_fork_children: false,
