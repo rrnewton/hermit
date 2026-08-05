@@ -3064,7 +3064,7 @@ mod tests {
         assert_eq!(duplicate_create, (None, GlobalResponse::ThreadExited));
 
         {
-            let mut scheduler = state.sched.lock().unwrap();
+            let scheduler = state.sched.lock().unwrap();
             assert!(!scheduler.thread_is_logically_killed(leader));
             assert!(scheduler.thread_is_logically_killed(worker));
             assert!(scheduler.thread_is_logically_killed(sibling));
@@ -3080,10 +3080,19 @@ mod tests {
                 scheduler
                     .child_tid_was_cleared(FutexID::private(old_mm, 0x5678), sibling.as_raw(),)
             );
-            scheduler.next_turns.get_mut(&leader).unwrap().resp =
-                Ivar::full(SchedResponse::Go(None));
         }
 
+        // Drive the real daemon through step2 rather than manually pre-filling
+        // the replacement's response. This drains the destroyed leader's
+        // physical removal and the same-raw-TID replacement admission before
+        // StartNewThread supplies the fresh image's first request.
+        let turn_sched = state.sched.clone();
+        let turn_time = state.global_time.clone();
+        let turn = tokio::spawn(async move {
+            let last: Result<Resources, crate::scheduler::SkipTurn> =
+                Err(crate::scheduler::SkipTurn);
+            crate::scheduler::do_a_turn_blocking(turn_sched, turn_time, &last).await
+        });
         let start_response = state
             .receive_rpc(
                 reverie::Tid::from_raw(leader.as_raw()),
@@ -3094,6 +3103,12 @@ mod tests {
                 ),
             )
             .await;
+        assert!(
+            turn.await
+                .expect("replacement scheduler turn panicked")
+                .is_ok(),
+            "replacement leader did not survive the first step2 drain"
+        );
         assert_eq!(
             start_response,
             (
@@ -3101,6 +3116,19 @@ mod tests {
                 GlobalResponse::StartNewThread(None)
             )
         );
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert_eq!(
+                scheduler
+                    .run_queue
+                    .tids()
+                    .filter(|dettid| **dettid == leader)
+                    .count(),
+                1
+            );
+            assert!(!scheduler.run_queue.contains_tid(worker));
+            assert!(!scheduler.run_queue.contains_tid(sibling));
+        }
         {
             let global_time = state.global_time.lock().unwrap();
             assert_eq!(global_time.as_nanos(), total_before);

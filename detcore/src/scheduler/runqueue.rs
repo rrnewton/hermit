@@ -404,6 +404,13 @@ impl RunQueue {
         if self.yielded_skip == Some(tid) {
             self.yielded_skip = None;
         }
+        // A successful nonleader exec can remove one thread incarnation and
+        // admit its replacement under the same raw TID in a single scheduler
+        // drain. Do not let the replacement inherit the destroyed leader's
+        // sticky-random selection.
+        if self.sticky_random_selection == Some(tid) {
+            self.sticky_random_selection = None;
+        }
         !kept_all
     }
 
@@ -729,5 +736,27 @@ mod tests {
         assert!(queue.tentative_pop_in_progress());
         queue.undo_tentative_pop();
         assert!(!queue.tentative_pop_in_progress());
+    }
+
+    #[test]
+    fn removal_clears_per_incarnation_selection_state_before_tid_reuse() {
+        let tid = DetTid::from_raw(7);
+        let mut queue = RunQueue::new(SchedHeuristic::StickyRandom, 0x5107, 1.0);
+        queue.push_back(tid, DEFAULT_PRIORITY);
+
+        assert_eq!(queue.tentative_pop_next(), Some(tid));
+        queue.undo_tentative_pop();
+        assert_eq!(queue.sticky_random_selection, Some(tid));
+        // Model an earlier explicit yield by the old incarnation. Both caches
+        // are keyed only by raw TID and therefore must be cleared together.
+        queue.yielded_skip = Some(tid);
+
+        assert!(queue.remove_tid(tid));
+        assert_eq!(queue.sticky_random_selection, None);
+        assert_eq!(queue.yielded_skip, None);
+
+        queue.push_back(tid, DEFAULT_PRIORITY);
+        assert_eq!(queue.sticky_random_selection, None);
+        assert_eq!(queue.yielded_skip, None);
     }
 }
