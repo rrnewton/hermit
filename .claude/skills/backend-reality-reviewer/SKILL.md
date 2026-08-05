@@ -1,6 +1,6 @@
 ---
 name: backend-reality-reviewer
-description: Audit Hermit backend completion claims against real CLI execution, Reverie Backend implementation, Detcore Tool integration, arbitrary-program support, and hermit-cli linkage. Use whenever a backend agent reports progress or completion, or when hermit-coord evaluates whether a backend claim is real.
+description: "Audit Hermit backend completion claims against real CLI execution, Reverie Backend implementation, Detcore Tool integration, arbitrary-program support, and hermit-cli linkage. Use whenever a backend agent reports progress or completion, or when hermit-coord evaluates whether a backend claim is real."
 ---
 
 # Backend Reality Reviewer

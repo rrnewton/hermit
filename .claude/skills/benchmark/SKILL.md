@@ -6,7 +6,7 @@ description: "Run and publish focused, reproducible Hermit benchmarks with cgrou
 # Benchmark
 
 Use this protocol for performance work. Also load
-[presenting-quantitative-data](presenting-quantitative-data.md) and apply its
+[presenting-quantitative-data](../presenting-quantitative-data/SKILL.md) and apply its
 ratio, precision, source-linking, and reader-audit rules.
 
 ## Experimental Shape

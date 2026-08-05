@@ -289,7 +289,7 @@ limitations, not necessarily product bugs.
 build config, and minimal curated documentation only. Experiments, bulk AI
 research notes, binaries, and vendored clones do **not** belong here — they live
 in the `dev-hermit` parent workspace. The `repo-cleanliness` skill
-(`.claude/skills/repo-cleanliness.md`, also surfaced to Claude via
+(`.claude/skills/repo-cleanliness/SKILL.md`, also surfaced to Claude via
 `.llms/skills` and to stock Codex via
 `.agents/skills/repo-cleanliness/SKILL.md`) is the full standing rule; this
 section is the mandatory pre-commit gate.

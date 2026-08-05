@@ -76,21 +76,21 @@ results. Reference external code by URL + commit SHA — never by vendoring it.
 
 ## Cross-client skill layout
 
-Skills are written **once** as real files and shared via directory symlinks, so
-there is a single source of truth:
+Skills are written **once** as real packages and shared via directory symlinks,
+so there is a single source of truth:
 
-- `.claude/skills/` holds the **real** skill files (a flat `<name>.md`, or a
-  `<name>/SKILL.md` directory for larger skills).
+- `.claude/skills/<name>/` holds each **real** skill package, including its
+  canonical `SKILL.md` and any package-local resources.
 - `.llms/skills` is a directory symlink to `../.claude/skills` for the existing
   Claude/LLMS hook.
-- `.agents/skills/<name>/SKILL.md` is stock Codex's discovery shape. A flat
-  canonical skill has a small metadata-and-link entrypoint; an already packaged
-  canonical skill uses a directory symlink back to `.claude/skills/<name>`.
+- `.agents/skills/<name>` is a whole-package symlink to the matching canonical
+  directory. Stock Codex discovers the shared `SKILL.md` through that link.
 - `CLAUDE.md` is a symlink to `AGENTS.md` for the same reason.
 
 Keep instruction bodies canonical under `.claude/skills/`; never copy the body
-into an adapter. Run `scripts/check-skill-discovery.rs` after changes. Parent
-coordinator roles belong in dev-hermit, not this product repository.
+into an adapter or link only the `SKILL.md` file. Run
+`scripts/check-skill-discovery.rs` after changes. Parent coordinator roles
+belong in dev-hermit, not this product repository.
 
 ## Pre-commit protocol
 

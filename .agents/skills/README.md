@@ -1,9 +1,9 @@
 # Codex skill entrypoints
 
-Stock Codex discovers the product skills in this directory. Flat canonical
-Claude skills use small `SKILL.md` entrypoints; already packaged skills are
-directory symlinks back to `.claude/skills/`. The canonical bodies remain in
-one place, and `.llms/skills` remains the Claude/LLMS compatibility link.
+Stock Codex discovers the product skills in this directory. Every entry is a
+whole-package symlink back to `.claude/skills/<name>/`; `.llms/skills` links to
+the same canonical package root. Claude, Codex, and `.llms` consumers therefore
+read one `SKILL.md` plus the same bundled resources.
 
 Run `scripts/check-skill-discovery.rs` after changing product skills. Parent
 coordinator roles do not belong in this product repository.

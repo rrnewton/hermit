@@ -88,8 +88,8 @@ needed, validate the new head, and prove the landed commit on freshly fetched
 
 ## Related skills
 
-- [hermit-debugging](hermit-debugging/SKILL.md) for guest execution failures.
-- [deadlock-debugging](deadlock-debugging.md) for hangs and no-progress states.
-- [determinism-regression-debugging](determinism-regression-debugging/SKILL.md)
+- [hermit-debugging](../hermit-debugging/SKILL.md) for guest execution failures.
+- [deadlock-debugging](../deadlock-debugging/SKILL.md) for hangs and no-progress states.
+- [determinism-regression-debugging](../determinism-regression-debugging/SKILL.md)
   for a regression with a known-good reference.
-- [repo-cleanliness](repo-cleanliness.md) before committing the fix.
+- [repo-cleanliness](../repo-cleanliness/SKILL.md) before committing the fix.

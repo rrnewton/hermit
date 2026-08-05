@@ -170,7 +170,7 @@ relaxations) bound to the fixed SHA — see the ladder in
   reading, `log-diff`, assurance ladder (the mechanics this skill builds on).
 - [`continuous-virtual-time-is-sacred`](../continuous-virtual-time-is-sacred/SKILL.md)
   — the full sacred-time anti-pattern catalogue and reviewer checklist.
-- [`deadlock-debugging`](../deadlock-debugging.md) — when the regression is a
+- [`deadlock-debugging`](../deadlock-debugging/SKILL.md) — when the regression is a
   hang/wedge rather than a value divergence.
 - Case study: `ai_docs/demo5-good-vs-broken-trace-diff-divergence_20260731.md`
   (in the `dev-hermit` parent) — the demo5 boot-wedge trace-diff that localized
