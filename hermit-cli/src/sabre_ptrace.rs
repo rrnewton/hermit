@@ -590,7 +590,6 @@ struct FileId {
 
 /// One parsed `/proc/<pid>/maps` row: `range perms offset dev inode path`.
 struct MappingEntry<'a> {
-    dev: &'a str,
     inode: Option<u64>,
     path: &'a str,
 }
@@ -632,10 +631,12 @@ fn mapping_entry(maps: &str, address: usize) -> Option<MappingEntry<'_>> {
     fields.next()?; // range
     fields.next()?; // perms
     fields.next()?; // offset
-    let dev = fields.next()?;
+    // dev: the superblock device column is parsed past but deliberately NOT
+    // stored — it is not part of file identity, because btrfs disagrees with
+    // stat's `st_dev` for the same inode (see the `FileId` doc above).
+    fields.next()?; // dev
     let inode = fields.next()?;
     Some(MappingEntry {
-        dev,
         inode: inode.parse::<u64>().ok(),
         path: fields.next().unwrap_or(""),
     })
