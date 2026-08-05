@@ -3558,11 +3558,13 @@ mod tests {
         let input = b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
 38 37 0:42 / /run/user/30015 rw - tmpfs tmpfs rw\n\
 39 38 0:43 / /run/user/30015/doc rw - fuse.portal portal rw\n\
-40 37 0:44 / /run/user/shared rw - tmpfs tmpfs rw\n";
+40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
+41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n";
         assert_eq!(
             sanitize_mountinfo(input),
             b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
-40 37 0:44 / /run/user/shared rw - tmpfs tmpfs rw\n"
+40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
+41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n"
         );
     }
 
@@ -4461,7 +4463,7 @@ THPeligible:    0\n"
 
     #[test]
     fn numa_maps_hides_host_page_accounting() {
-        let contents = b"71000000 default heap anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
+        let contents = b"71000000 default heap anon=1 dirty=1 active=0 N12=1 kernelpagesize_kB=4\n\
 7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 swapcache=2 writeback=3 kernelpagesize_kB=4\n";
 
         assert_eq!(
