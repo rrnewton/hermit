@@ -59,6 +59,7 @@ use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
+use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
@@ -2683,6 +2684,15 @@ impl RunOpts {
 
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Stamp an explicit no-result BEFORE any fallible work. Several exits
+        // below (a run that fails to start, a rejected first-run status, a SaBRe
+        // capture with zero DETLOG) return early without ever reaching
+        // `write_verification_json`; without this, reusing a --verify-json path
+        // would leave the PREVIOUS invocation's record -- possibly a green -- to
+        // be read as this invocation's result.
+        if let Some(path) = &self.verify_json {
+            write_pending_verification_json(path)?;
+        }
         let (log1, log2) =
             temp_log_files("run1", "run2").context("Failed to create temporary log files")?;
 

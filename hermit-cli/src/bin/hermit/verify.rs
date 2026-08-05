@@ -290,6 +290,37 @@ pub enum Verdict {
     Matched,
     /// The two runs diverged; verification failed.
     Diverged,
+    /// Verification did not reach a verdict: the invocation aborted before the
+    /// two runs could be compared (a run failed to start, the first run's exit
+    /// status was rejected, SaBRe captured no DETLOG, recording failed, ...).
+    ///
+    /// This is NOT a synonym for `Diverged`. It exists so the `--verify-json`
+    /// artifact always describes *this* invocation: without an explicit
+    /// no-result state, an early abort would leave whatever the file previously
+    /// contained -- including an older `{verified: true}` -- readable as though
+    /// it described the run that just failed.
+    NoResult,
+}
+
+/// How much log evidence the comparison actually consumed.
+///
+/// A configured-strict comparison proves nothing if it had no data: two empty
+/// selections "match" trivially. Carrying the counts with the verdict is what
+/// lets a parity consumer require nonzero executed work, exactly as a test
+/// result must carry its executed count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ComparedLogCounts {
+    /// Messages selected for comparison from the first run.
+    pub left: usize,
+    /// Messages selected for comparison from the second run.
+    pub right: usize,
+}
+
+impl ComparedLogCounts {
+    /// True when both sides actually contributed messages to the comparison.
+    pub fn is_nonzero(&self) -> bool {
+        self.left > 0 && self.right > 0
+    }
 }
 
 /// The full outcome of comparing two runs: the verification [`Verdict`] plus the
@@ -302,6 +333,10 @@ pub struct VerificationOutcome {
     /// The exact comparison that produced [`Self::verdict`], carried so a
     /// consumer never has to assume which comparison a "matched" rests on.
     pub comparison: ComparisonSpec,
+    /// How many log messages the comparison actually compared, or `None` when
+    /// the log comparison was not run at all (output-only fallback). `None` and
+    /// `Some(0/0)` are both "no log evidence" and neither can support parity.
+    pub compared_log_messages: Option<ComparedLogCounts>,
 }
 
 impl VerificationOutcome {
@@ -320,6 +355,13 @@ impl VerificationOutcome {
             Verdict::Matched => Ok(self.guest_status),
             Verdict::Diverged => Err(Error::msg(
                 "Mismatch between run 1 and run 2 outputs (logs retained).",
+            )),
+            // Unreachable in practice: `compare_two_runs` only ever yields
+            // Matched/Diverged, and the no-result state is published directly to
+            // the JSON artifact rather than carried in an outcome. Fail closed
+            // rather than mapping "no verdict" onto a guest exit status.
+            Verdict::NoResult => Err(Error::msg(
+                "Verification did not reach a verdict (no comparison was performed).",
             )),
         }
     }
@@ -350,12 +392,34 @@ pub struct VerificationReport {
     /// The verdict as a stable string ("matched" / "diverged").
     pub verdict: Verdict,
     /// The comparison that produced the verdict. Without this a bitwise-parity
-    /// consumer cannot distinguish a stripped match from a bitwise one.
-    pub comparison: ComparisonSpec,
+    /// consumer cannot distinguish a stripped match from a bitwise one. `null`
+    /// when no verdict was reached (see [`Verdict::NoResult`]).
+    pub comparison: Option<ComparisonSpec>,
+    /// How many log messages were actually compared. `null` means the log
+    /// comparison did not run. A strict *configuration* is not proof that the
+    /// configured comparison had data, so this count is what makes
+    /// [`Self::bitwise_parity`] falsifiable.
+    pub compared_log_messages: Option<ComparedLogCounts>,
     /// The guest's exit code, if it exited normally.
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
     pub guest_signal: Option<i32>,
+}
+
+impl VerificationReport {
+    /// The record stamped before verification runs: no verdict has been reached
+    /// yet, so nothing may read as verified or as parity.
+    pub fn no_result() -> Self {
+        VerificationReport {
+            verified: false,
+            bitwise_parity: false,
+            verdict: Verdict::NoResult,
+            comparison: None,
+            compared_log_messages: None,
+            guest_exit_code: None,
+            guest_signal: None,
+        }
+    }
 }
 
 impl From<&VerificationOutcome> for VerificationReport {
@@ -365,9 +429,21 @@ impl From<&VerificationOutcome> for VerificationReport {
             // Bitwise parity is a conjunction: the runs matched AND the
             // comparison was strict enough for the match to *mean* bitwise
             // identity. A `Diverged` verdict is never bitwise parity.
-            bitwise_parity: outcome.verified() && outcome.comparison.is_bitwise_parity(),
+            // Three-way conjunction: the runs matched, the comparison was
+            // strict enough for the match to *mean* bitwise identity, AND that
+            // comparison actually consumed log evidence. The third conjunct is
+            // not redundant: an empty-vs-empty log comparison reports "no
+            // difference" under the strictest possible spec, so without a
+            // nonzero count a run that produced no DETLOG at all would certify
+            // as bitwise parity.
+            bitwise_parity: outcome.verified()
+                && outcome.comparison.is_bitwise_parity()
+                && outcome
+                    .compared_log_messages
+                    .is_some_and(|counts| counts.is_nonzero()),
             verdict: outcome.verdict,
-            comparison: outcome.comparison,
+            comparison: Some(outcome.comparison),
+            compared_log_messages: outcome.compared_log_messages,
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
         }
@@ -380,10 +456,45 @@ impl From<&VerificationOutcome> for VerificationReport {
 /// true or false based on whether verification matched, regardless of what the
 /// guest exited with.
 pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Result<(), Error> {
-    let report = VerificationReport::from(outcome);
-    let json = serde_json::to_string(&report)?;
-    std::fs::write(path, format!("{json}\n"))
-        .with_context(|| format!("writing verification verdict to {}", path.display()))?;
+    write_report_json(path, &VerificationReport::from(outcome))
+}
+
+/// Publish an explicit NO-RESULT record to `path` *before* verification starts.
+///
+/// This is what makes the artifact invocation-bound. `write_verification_json`
+/// can only run once a verdict exists, but a `--verify-json` run has several
+/// earlier exits (a run that fails to start, a rejected first-run status, a
+/// SaBRe capture with zero DETLOG, a failed recording). If the caller reuses a
+/// path, every one of those exits would otherwise leave the PREVIOUS
+/// invocation's record -- possibly `{"verified":true,"bitwise_parity":true}` --
+/// sitting there, readable as if it described the invocation that just failed.
+/// Stamping a no-result first means the file always describes *this* run: it is
+/// either the terminal verdict or an honest "no verdict reached".
+pub fn write_pending_verification_json(path: &Path) -> Result<(), Error> {
+    write_report_json(path, &VerificationReport::no_result())
+}
+
+/// Write `report` to `path` atomically: a reader concurrent with the write sees
+/// either the old contents or the complete new record, never a truncated one.
+fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
+    use std::io::Write as _;
+
+    let json = serde_json::to_string(report)?;
+    let directory = path.parent().filter(|p| !p.as_os_str().is_empty());
+    // Same directory as the target so the rename below stays within one
+    // filesystem and is therefore atomic.
+    let mut temp = match directory {
+        Some(dir) => NamedTempFile::new_in(dir),
+        None => NamedTempFile::new(),
+    }
+    .with_context(|| format!("creating a temporary file beside {}", path.display()))?;
+    writeln!(temp, "{json}")
+        .with_context(|| format!("writing verification verdict for {}", path.display()))?;
+    temp.flush()
+        .with_context(|| format!("flushing verification verdict for {}", path.display()))?;
+    temp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("publishing verification verdict to {}", path.display()))?;
     Ok(())
 }
 
@@ -474,6 +585,10 @@ pub fn compare_two_runs(
         log: log2,
     } = second;
     let mut failed = false;
+    // None until the log comparison actually runs; stays None on the
+    // output-only (KVM concurrent) fallback so the report can distinguish
+    // "compared nothing" from "compared and matched".
+    let mut compared_log_messages: Option<ComparedLogCounts> = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -540,7 +655,12 @@ pub fn compare_two_runs(
             "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
         );
 
-        if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
+        let summary = logdiff::log_diff_detailed(log1.as_ref(), log2.as_ref(), &diff_options);
+        compared_log_messages = Some(ComparedLogCounts {
+            left: summary.compared_left,
+            right: summary.compared_right,
+        });
+        if summary.diff_found {
             failed = true;
             eprintln!(":: {}", "Log differences found between runs.".red().bold());
             eprintln!(
@@ -577,6 +697,7 @@ pub fn compare_two_runs(
             verdict: Verdict::Diverged,
             guest_status: out2.status,
             comparison: spec,
+            compared_log_messages,
         })
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
@@ -590,6 +711,7 @@ pub fn compare_two_runs(
             verdict: Verdict::Matched,
             guest_status: out2.status,
             comparison: spec,
+            compared_log_messages,
         })
     }
 }
@@ -627,6 +749,19 @@ mod tests {
     fn empty_logs() -> (TempPath, TempPath) {
         let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
         (left.into_temp_path(), right.into_temp_path())
+    }
+
+    /// Two logs carrying identical, NONEMPTY comparable content. Distinct from
+    /// [`empty_logs`]: an empty-vs-empty comparison is a no-result, so any test
+    /// asserting a *parity* green must use this.
+    fn logs_with_identical_detlog() -> (TempPath, TempPath) {
+        let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
+        let left_path = left.into_temp_path();
+        let right_path = right.into_temp_path();
+        let body = format!("{}{}", detlog_with_value(1), detlog_with_value(2));
+        fs::write(&left_path, body.as_bytes()).unwrap();
+        fs::write(&right_path, body.as_bytes()).unwrap();
+        (left_path, right_path)
     }
 
     fn global_with_log(log: Option<LevelFilter>) -> GlobalOpts {
@@ -765,7 +900,10 @@ mod tests {
         assert_eq!(report.guest_exit_code, Some(3));
         assert_eq!(report.guest_signal, None);
         // The report also carries the comparison that produced the verdict.
-        assert_eq!(report.comparison.strictness, LogCompareStrictness::Stripped);
+        assert_eq!(
+            report.comparison.unwrap().strictness,
+            LogCompareStrictness::Stripped
+        );
         // Collapsing to the legacy exit convention still propagates the guest
         // code; the verdict channel above is what a caller keys on.
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
@@ -895,7 +1033,7 @@ mod tests {
         // can refuse to treat a stripped match as parity.
         let report = VerificationReport::from(&canonical);
         assert!(!report.verified);
-        assert!(!report.comparison.strip_lines);
+        assert!(!report.comparison.unwrap().strip_lines);
 
         // Diverged canonical runs retain their logs (`.keep()`); clean them up.
         let _ = fs::remove_file(path1);
@@ -904,10 +1042,95 @@ mod tests {
 
     // The `--verify-json` payload names the comparison in the JSON itself, so a
     // downstream ratchet can gate on bitwise parity without out-of-band knowledge.
+    /// FINDING 2, NEGATIVE BRACKET. A comparison that consumed ZERO log
+    /// messages must never certify bitwise parity, even though every
+    /// configuration field qualifies and the runs "matched": `diff_vecs`
+    /// returns "no difference" for two empty selections, so configuration
+    /// strictness alone would hand back a green over no work at all.
+    #[test]
+    fn empty_log_comparison_matches_but_is_never_parity() {
+        let out = output(0, b"hello\n", b"");
+        let (log1, log2) = empty_logs();
+        let outcome =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+
+        // The verdict itself is legitimately Matched: stdout, stderr and exit
+        // status all agree. Only the PARITY claim is refused.
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(
+            outcome.compared_log_messages,
+            Some(ComparedLogCounts { left: 0, right: 0 })
+        );
+        // The spec still reports a fully-qualifying policy...
+        assert!(outcome.comparison.is_bitwise_parity());
+        // ...and that is exactly why the count is load-bearing.
+        let report = VerificationReport::from(&outcome);
+        assert!(report.verified);
+        assert!(
+            !report.bitwise_parity,
+            "zero compared log messages must never certify bitwise parity"
+        );
+    }
+
+    /// FINDING 1. Every early exit must leave an invocation-bound record: the
+    /// pending stamp overwrites a previous invocation's green, so a stale
+    /// `{verified:true}` can never be read as this run's result.
+    #[test]
+    fn pending_stamp_overwrites_a_previous_green_verdict() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        // A previous, successful invocation left a green record at this path.
+        let out = output(0, b"hello\n", b"");
+        let (log1, log2) = logs_with_identical_detlog();
+        let good = compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+        write_verification_json(&path, &good).unwrap();
+        let previous: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(previous["verified"], serde_json::json!(true));
+        assert_eq!(previous["bitwise_parity"], serde_json::json!(true));
+
+        // A new invocation begins and will abort before reaching a verdict.
+        write_pending_verification_json(&path).unwrap();
+
+        let now: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(now["verdict"], serde_json::json!("no_result"));
+        assert_eq!(now["verified"], serde_json::json!(false));
+        assert_eq!(now["bitwise_parity"], serde_json::json!(false));
+        assert_eq!(now["comparison"], serde_json::Value::Null);
+        assert_eq!(now["compared_log_messages"], serde_json::Value::Null);
+    }
+
+    /// The positive side of FINDING 1: the pending stamp is not a dead end --
+    /// a real verdict still publishes over it.
+    #[test]
+    fn terminal_verdict_replaces_the_pending_stamp() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        write_pending_verification_json(&path).unwrap();
+        let out = output(0, b"hello\n", b"");
+        let (log1, log2) = logs_with_identical_detlog();
+        let outcome =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+        write_verification_json(&path, &outcome).unwrap();
+
+        let published: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(published["verdict"], serde_json::json!("matched"));
+        assert_eq!(published["verified"], serde_json::json!(true));
+        assert_eq!(published["bitwise_parity"], serde_json::json!(true));
+    }
+
     #[test]
     fn verification_report_json_carries_the_comparison() {
         let out = output(0, b"hello\n", b"");
-        let (log1, log2) = empty_logs();
+        // NONEMPTY logs: parity may only be claimed when the comparison had
+        // data. This test previously used `empty_logs()` and asserted
+        // bitwise_parity = true, which codified a green over ZERO compared
+        // events -- see `empty_log_comparison_matches_but_is_never_parity`.
+        let (log1, log2) = logs_with_identical_detlog();
         let outcome =
             compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
 
@@ -915,6 +1138,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["verified"], serde_json::json!(true));
         assert_eq!(parsed["verdict"], serde_json::json!("matched"));
+        // The executed-work evidence travels with the verdict.
+        assert!(parsed["compared_log_messages"]["left"].as_u64().unwrap() > 0);
+        assert!(parsed["compared_log_messages"]["right"].as_u64().unwrap() > 0);
         // The single boolean a parity ratchet keys on: a matched, full-INFO,
         // unstripped, unfiltered comparison.
         assert_eq!(parsed["bitwise_parity"], serde_json::json!(true));
@@ -1012,6 +1238,7 @@ mod tests {
             verdict: Verdict::Diverged,
             guest_status: ExitStatus::Exited(0),
             comparison: full,
+            compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }

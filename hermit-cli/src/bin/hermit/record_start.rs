@@ -47,6 +47,7 @@ use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
+use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
 
 #[derive(Debug)]
@@ -396,6 +397,13 @@ impl StartOpts {
 
     /// This is called when `--verify` is passed to the command line.
     fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Stamp an explicit no-result BEFORE any fallible work: the record and
+        // replay steps below can fail long before a verdict exists, and a reused
+        // --verify-json path must never keep showing a previous invocation's
+        // green as though it described this one.
+        if let Some(path) = &self.verify_json {
+            write_pending_verification_json(path)?;
+        }
         let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
         let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;

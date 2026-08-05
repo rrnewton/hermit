@@ -688,18 +688,6 @@ fn git_diff(
     }
 }
 
-/// Process log messages from two files.  Log messages look like this:
-///     "Apr 09 06:08:03.100  INFO detcore: [detcore, dtid 2]  finish syscall: close(2) = Ok(0)"
-///
-/// With some complexities:
-///  * Some entries are multi-line (contain newlines).
-///  * Some stripping of nondeterministic information is needed for direct comparability.
-///  * Certain lines are intended to be deterministic/comparable, in their contents,
-///    and others in their *presence* but not their details.
-//
-// TODO: we should replace this with a diff algorithm that can handle insertions while maintaining
-// alignment. There's also no reason we can't output the stripped relevant lines and use a separate
-// diff tool.
 /// What a log comparison actually compared, alongside whether it differed.
 ///
 /// A bare "no difference found" boolean cannot distinguish *"the two message
@@ -725,11 +713,22 @@ impl LogDiffSummary {
     }
 }
 
-/// Compare two log files, reporting only whether they differ.
+/// Process log messages from two files.  Log messages look like this:
+///     "Apr 09 06:08:03.100  INFO detcore: [detcore, dtid 2]  finish syscall: close(2) = Ok(0)"
 ///
-/// See [`log_diff_detailed`] when the caller must also know how many messages
-/// were actually compared; a bare `false` here cannot distinguish a match from
-/// an empty comparison.
+/// With some complexities:
+///  * Some entries are multi-line (contain newlines).
+///  * Some stripping of nondeterministic information is needed for direct comparability.
+///  * Certain lines are intended to be deterministic/comparable, in their contents,
+///    and others in their *presence* but not their details.
+///
+/// Reports only whether the two files differ. See [`log_diff_detailed`] when the
+/// caller must also know how many messages were actually compared; a bare
+/// `false` here cannot distinguish a match from an empty comparison.
+//
+// TODO: we should replace this with a diff algorithm that can handle insertions while maintaining
+// alignment. There's also no reason we can't output the stripped relevant lines and use a separate
+// diff tool.
 pub fn log_diff(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> bool {
     log_diff_detailed(file_a, file_b, opts).diff_found
 }
