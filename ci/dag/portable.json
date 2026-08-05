@@ -918,6 +918,19 @@
         "classification": "cpu-bound",
         "preferred_inner_jobs": 32
       }
+    },
+    {
+      "group": "check",
+      "job": "skill_discovery",
+      "desc": "Verify Claude and stock Codex discover the same safe product skills",
+      "cmd": "mkdir -p target/ci && RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-skill-discovery.rs -o target/ci/check-skill-discovery && target/ci/check-skill-discovery",
+      "timeout": 60,
+      "hint": {
+        "est_duration_s": 3,
+        "rss_baseline_bytes": 67108864,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light"
+      }
     }
   ]
 }
