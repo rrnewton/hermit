@@ -90,12 +90,17 @@ microbenchmarks. Ratios use alternating backend order in the same run.
 with-proxy cargo build --release --locked -p hermit --bin hermit
 with-proxy scripts/stage-liteinst-runtime.sh release \
   target/release/libreverie_liteinst.so \
-  target/liteinst-runtime-build-7951770
+  target/liteinst-runtime-build-9e7af7d
 with-proxy ./benchmarks/targeted.py --skip-build \
   --hermit target/release/hermit \
   --backends native,ptrace,liteinst \
   --benchmarks syscall_heavy --iterations 5 --warmups 1
 ```
+
+The staged-runtime cache key above tracks the pinned Reverie revision, so it reads
+`9e7af7d` after the pin moved from `7951770`. The numbers in this report were
+measured at the earlier pin; the commands are kept runnable against the current
+one rather than frozen at the revision that produced them.
 
 The fixture retains its 100,000-call default and now accepts an optional count
 for startup/slope measurements, for example
