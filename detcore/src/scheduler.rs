@@ -4519,33 +4519,20 @@ mod test {
         sched.drain_pending_run_queue_removals();
     }
 
-    /// F7 (adjacent-snapshot straddle): Codex asked whether host timing could
-    /// split two off-turn admissions across two ADJACENT step2 drains and
-    /// thereby choose which one draws the `post_fork` PRNG first.
+    /// F7 (adjacent-snapshot sensitivity): this fixture directly places two
+    /// admissions in adjacent step2 drains; it does not model a production
+    /// handler protocol. Every current asynchronous admission site separately
+    /// fixes snapshot membership: ordinary clone buffers before the parent's
+    /// `ParentContinue`, `vfork` uses its registration barrier, and exec
+    /// reconnect buffers before retiring and resolving the caller request. See
+    /// [`Scheduler::admit_to_run_queue`] for those causal bindings.
     ///
-    /// An earlier revision of this comment answered "structurally it cannot",
-    /// arguing that under `sequentialize_threads` at most one guest thread runs
-    /// per turn, so at most one thread issues admission RPCs between consecutive
-    /// drains. **That argument is wrong**, and the `CreateChildThread` handler in
-    /// `tool_global.rs` says why in its own comment: on an asynchronous backend
-    /// the child *self-registers outside a scheduler turn*, so the admitting
-    /// thread is not the one guest thread running this turn. Two children cloned
-    /// on consecutive turns can therefore both register before one drain, or
-    /// split across two, by host scheduling alone. See
-    /// `Scheduler::admit_to_run_queue` for the guarantee that actually holds
-    /// (exact on ptrace; within-drain-canonical only on async backends) and for
-    /// the two anchors that would close the residue.
-    ///
-    /// So this test does **not** show that snapshot membership is deterministic.
-    /// It shows the two things it can actually observe, and is kept because both
-    /// remain load-bearing however the residue is eventually closed:
-    ///   (1) POSITIVE/determinism: replaying the identical split (child `a` in
-    ///       drain 1, child `b` in drain 2) at a fixed seed is byte-identical
-    ///       (2/2 runs equal) -- within-drain resolution is reproducible.
-    ///   (2) SENSITIVITY: the outcome genuinely depends on snapshot membership --
-    ///       swapping which child occupies drain 1 changes the resolved
-    ///       run-queue order. Read correctly, (2) is the *reason* membership must
-    ///       be made deterministic, not evidence that it already is.
+    /// The synthetic split remains a negative/sensitivity bracket for that
+    /// requirement. Replaying one fixed split at one seed is reproducible, but
+    /// swapping which child occupies the first drain changes the resolved queue
+    /// order. Thus a future unanchored admission site would make host-selected
+    /// membership observable; this test must not be read as evidence that any
+    /// current production site is unanchored.
     #[test]
     fn deferred_admission_binds_to_snapshot_membership_across_adjacent_drains() {
         let config = Config {
@@ -4575,7 +4562,7 @@ mod test {
             sched.run_queue.tids().copied().collect()
         };
 
-        // (1) Deterministic across identical replays.
+        // Fixed synthetic membership is deterministic across identical replays.
         let canonical = split(a, b);
         assert_eq!(
             canonical,
@@ -4584,8 +4571,9 @@ mod test {
         );
         assert!(canonical.contains(&a) && canonical.contains(&b) && canonical.contains(&anchor));
 
-        // (2) The result binds to schedule-fixed snapshot membership: swapping
-        // which child is in drain 1 changes the outcome for this seed.
+        // Sensitivity control: changing synthetic snapshot membership changes
+        // the outcome for this seed, so a missing production anchor would be
+        // observable rather than inert.
         assert_ne!(
             split(a, b),
             split(b, a),
