@@ -174,6 +174,26 @@ fn timerfd_accrued_expirations(
     }
 }
 
+/// KNOWN GAP, tracked as rrnewton/hermit#1560 and deliberately NOT built here.
+///
+/// Linux retargets a `read()` that is already blocked when the timer is re-armed
+/// nearer. Detcore's reader is parked as a `SleepUntil` timed waiter, and waking
+/// it early would mean removing it from the scheduler's `timed_waiters` and
+/// returning it to the run queue — a core DetCore scheduling change with no
+/// existing RPC to carry it, and one both review lanes deferred to #1560.
+///
+/// #1213 is COHERENT with that deferral rather than merely tolerant of it,
+/// because the gap is closed by *withdrawal* rather than by approximation: when
+/// a re-arm would need a retarget this code cannot perform, the descriptor is
+/// handed to the kernel, which does perform it. Detcore never models the case
+/// wrongly; it declines to model it. The residual is a latency artifact in one
+/// narrow window — a reader ALREADY parked when the first cross-thread nearer
+/// re-arm lands wakes at the old virtual deadline that once, because the handoff
+/// cannot reach back and move a waiter already registered. Everything after that
+/// instant is host-owned and therefore correct. Closing the residual needs the
+/// #1560 wake/retarget primitive; nothing in this PR depends on it, and no path
+/// here silently produces a wrong wake time in its absence.
+///
 /// Whether re-arming a `timerfd` to `new_deadline` needs a retarget of a reader
 /// already parked until `parked_deadline` — something the scheduler cannot do,
 /// so the descriptor must be handed to the kernel, which can.
@@ -2764,23 +2784,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if retargets_parked_reader {
-            // The host timer was just armed with the guest's exact request
-            // (`host_call` above), including its `TFD_TIMER_ABSTIME` flag, so it
-            // already holds the arming the guest asked for and its expiration
-            // counter was reset by that same call. Latch host ownership without
-            // re-arming; re-deriving the arming from the virtual deadline here
-            // would be strictly less faithful.
-            let latched = guest
-                .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.set_timerfd_host_owned())?;
-            if latched {
-                detlog!(
-                    "[dtid {}] timerfd fd={} handed back to the host (re-armed nearer than a parked reader's deadline {:?}); host arming is the guest's own request",
-                    guest.thread_state().dettid,
-                    call.fd(),
-                    parked,
-                );
-            }
+            // Hand over through the ONE handoff path, which re-arms the host
+            // from the virtual deadline as a RELATIVE `it_value`.
+            //
+            // This used to latch ownership without re-arming, on the reasoning
+            // that `host_call` above had already given the kernel "the guest's
+            // exact request, including its TFD_TIMER_ABSTIME flag". That
+            // reasoning is inverted for exactly the ABSTIME case. Under
+            // `TFD_TIMER_ABSTIME` the guest's `it_value` is an absolute instant
+            // it computed from Detcore's VIRTUAL clock, and virtual time bears
+            // no relation to the host's CLOCK_MONOTONIC/CLOCK_REALTIME. Leaving
+            // that value installed hands the kernel an absolute deadline on the
+            // wrong timeline: it fires immediately when virtual time trails the
+            // host, or effectively never when it runs ahead. The guest's request
+            // is faithful only in the frame it was expressed in.
+            //
+            // `timerfd_hand_back_to_host` re-derives the arming as a duration
+            // (`deadline - now` in virtual time, which is the quantity the guest
+            // actually asked for) and arms the host relatively, with no ABSTIME
+            // flag and therefore no timeline confusion. It also carries any
+            // accrued-but-unread expirations across the re-arm that resets the
+            // kernel's counter. Routing this case through it means every
+            // handoff -- poll, epoll, select, pselect6, readv, nonblocking read,
+            // disarmed read, second reader, and this nearer-rearm retarget --
+            // transfers authority the same way, so there is exactly one
+            // conversion between the two clocks in the whole path.
+            self.timerfd_hand_back_to_host(
+                guest,
+                call.fd(),
+                "re-armed nearer than a parked reader's deadline",
+            )
+            .await?;
+            detlog!(
+                "[dtid {}] timerfd fd={} handed to the host after a nearer re-arm (parked reader was at {:?}); host re-armed relatively from the virtual deadline",
+                guest.thread_state().dettid,
+                call.fd(),
+                parked,
+            );
             return Ok(0);
         }
 
@@ -3427,6 +3467,7 @@ mod timerfd_gate_test {
     use super::timerfd_accrued_expirations;
     use super::timerfd_hand_back_it_value_ns;
     use super::timerfd_rearm_needs_host_retarget;
+    use super::timerfd_remaining_ns;
 
     fn at(ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(ns)
@@ -3483,6 +3524,32 @@ mod timerfd_gate_test {
     #[test]
     fn a_disarmed_timer_is_handed_over_disarmed() {
         assert_eq!(timerfd_hand_back_it_value_ns(0, None), 0);
+    }
+
+    /// Fires: the ABSTIME defect, expressed on the pure helper the handoff now
+    /// uses. Under `TFD_TIMER_ABSTIME` the guest's `it_value` is an absolute
+    /// instant on the VIRTUAL clock. The handoff must arm the host with the
+    /// remaining DURATION, never with that absolute number: virtual 5s with a
+    /// virtual now of 4.9s is 100ms of waiting, not "5 seconds after the host
+    /// booted". Replaying the absolute value fires immediately when virtual time
+    /// trails the host and effectively never when it runs ahead.
+    #[test]
+    fn an_absolute_virtual_deadline_hands_over_as_a_relative_duration() {
+        let deadline = at(5_000_000_000);
+        let now = at(4_900_000_000);
+        let remaining = timerfd_remaining_ns(Some(deadline), 0, now);
+        assert_eq!(remaining, 100_000_000, "the guest is waiting 100ms, not 5s");
+        assert_eq!(
+            timerfd_hand_back_it_value_ns(remaining, Some(deadline)),
+            100_000_000,
+            "the host must be armed relatively; handing it the absolute 5e9 puts \
+             the deadline on a clock the guest never consulted"
+        );
+        assert_ne!(
+            timerfd_hand_back_it_value_ns(remaining, Some(deadline)),
+            deadline.as_nanos(),
+            "the absolute virtual instant must never reach the host as it_value"
+        );
     }
 
     /// A real remaining time is passed through untouched.
