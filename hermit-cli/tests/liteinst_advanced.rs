@@ -179,7 +179,7 @@ fn run_liteinst_with_input(
     let mut command = Command::new(liteinst_runtime::hermit_binary());
     command.args(["--log=info", "run", "--backend", "liteinst", "--strict"]);
     if verify {
-        command.arg("--verify");
+        command.args(["--verify", "--verify-strict"]);
     }
     command
         .arg(format!("--env=HOME={}", home.path().display()))
