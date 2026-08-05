@@ -500,12 +500,6 @@
     },
     {
       "disposition": "special-driver",
-      "path": "tests/backend-parity/split_asymmetric_pr.py",
-      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
-      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
-    },
-    {
-      "disposition": "special-driver",
       "path": "tests/backend-parity/run_matrix.py",
       "runner": "portable and privileged backend-parity partitions",
       "why": "tests/backend-parity/run_matrix.py is owned by portable and privileged backend-parity partitions: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation."
@@ -2941,6 +2935,12 @@
       "why": "tests/backend-parity/fixtures/cpu_virtualization.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/cwd_roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/cwd_roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/dup_shared_offset.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -2957,6 +2957,12 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/fchmodat2_flags.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/fcntl_owner.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/fcntl_owner.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/fixtures/fd_duplication.c",
@@ -2977,10 +2983,28 @@
       "why": "tests/backend-parity/fixtures/lseek_positioning.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/membarrier_query.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/membarrier_query.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/o_tmpfile_anon.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/o_tmpfile_anon.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/openat_flags.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/openat_flags.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/personality_domain.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
     },
     {
       "path": "tests/backend-parity/fixtures/pidfd_open_self.c",
@@ -2989,10 +3013,22 @@
       "why": "tests/backend-parity/fixtures/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/pipe_capacity.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/pipe_capacity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/pipe_ipc.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/pipe_ipc.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/record_lock.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/record_lock.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/fixtures/socketpair_flags.c",
@@ -3013,6 +3049,12 @@
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/split_asymmetric_pr.py",
+      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
+      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+    },
+    {
       "path": "tests/c/getcpu_identity.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -3023,6 +3065,12 @@
       "path": "tests/c/prctl_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/c/prctl_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/register_marker.c",
+      "runner": "hermit-cli/tests/register_file_hashing.rs",
+      "why": "tests/c/register_marker.c is owned by hermit-cli/tests/register_file_hashing.rs: The Rust integration test compiles this guest and runs it under hermit --verify to prove the register-file digest catches a register-only divergence; it pins a marker value into %r15 across a getpid boundary so stdout and exit status stay identical while exactly one general-purpose register differs, a contract a generic manifest cell cannot express."
     },
     {
       "path": "tests/c/rlimit_identity.c",
@@ -3047,48 +3095,6 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/language-runtimes/tcl-rand-clock.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/pipe_capacity.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/pipe_capacity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/record_lock.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/record_lock.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/cwd_roundtrip.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/cwd_roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/o_tmpfile_anon.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/o_tmpfile_anon.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/fcntl_owner.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/fcntl_owner.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/membarrier_query.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/membarrier_query.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/personality_domain.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
-      "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
     }
   ],
   "schema": 2
