@@ -215,6 +215,44 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
+fn assert_liteinst_strict_verify_fails_closed(
+    program: &Path,
+    args: &[&str],
+    expected_guest_stderr: &str,
+) {
+    let output = run_liteinst(program, args, true);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.stdout.is_empty(), "stdout={:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "liteinst in-guest] activation verified (traps=1, hooks=32); Detcore Tool active in guest with coordinator GlobalTool RPC"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains(":: Run1..."), "{stderr}");
+    assert!(stderr.contains(expected_guest_stderr), "{stderr}");
+    assert!(
+        stderr.contains("First run errored during --verify, not continuing to a second"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Error: First run during --verify exited in error"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Success: deterministic. Determinism verified."),
+        "a rejected guest was reported as verified:\n{stderr}"
+    );
+}
+
 fn assert_liteinst_virtual_time_is_continuous() {
     const EPOCH_SECONDS: u64 = 1_767_225_600;
     const MAX_STARTUP_SECONDS: u64 = 60;
@@ -654,11 +692,10 @@ fn liteinst_strict_verify_round3_encoding_and_compression_utilities() {
         b"l\0i\0t\0e\0i\0n\0s\0t\0 \0c\0o\0m\0p\0a\0t\0i\0b\0i\0l\0i\0t\0y\0 \0f\0i\0x\0t\0u\0r\0e\0\n\0",
     );
 
-    let [gzip_fixture, bzip2_fixture, xz_fixture] = compressed_fixtures();
+    let [gzip_fixture, bzip2_fixture, _xz_fixture] = compressed_fixtures();
     for (program, compressed_fixture) in [
         ("/usr/bin/gzip", gzip_fixture),
         ("/usr/bin/bzip2", bzip2_fixture),
-        ("/usr/bin/xz", xz_fixture),
     ] {
         assert_liteinst_strict_verify(
             Path::new(program),
@@ -671,6 +708,26 @@ fn liteinst_strict_verify_round3_encoding_and_compression_utilities() {
             COMPAT_FIXTURE_CONTENT,
         );
     }
+}
+
+/// LiteInst deliberately rejects callable guest signal handlers while its
+/// SIGSYS callback owns process signal state. `xz` installs such handlers, so
+/// it is not yet a compatible utility. Keep the executable in coverage and
+/// require an explicit first-run refusal; a successful determinism banner here
+/// would be a false compatibility claim.
+#[test]
+fn liteinst_strict_verify_xz_signal_handlers_fail_closed() {
+    let [_gzip_fixture, _bzip2_fixture, xz_fixture] = compressed_fixtures();
+    assert_liteinst_strict_verify_fails_closed(
+        Path::new("/usr/bin/xz"),
+        &[
+            "-cd",
+            xz_fixture
+                .to_str()
+                .expect("compressed fixture path should be UTF-8"),
+        ],
+        "/usr/bin/xz: Cannot establish signal handlers",
+    );
 }
 
 #[test]

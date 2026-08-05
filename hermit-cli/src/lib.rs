@@ -2093,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_public_dispatch_runs_ptrace_host_hybrid() {
+    fn liteinst_public_dispatch_runs_in_guest_tool() {
         if Backend::Liteinst.ensure_available().is_err() {
             return;
         }
@@ -2107,7 +2107,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
+        .expect("run /bin/echo through the in-guest LiteInst Tool");
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
 
@@ -2118,7 +2118,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/true through the ptrace-hosted LiteInst hybrid");
+        .expect("run /bin/true through the in-guest LiteInst Tool");
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
