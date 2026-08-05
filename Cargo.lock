@@ -513,6 +513,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-e9patch"
+version = "0.2.0"
+dependencies = [
+ "detcore",
+ "libc",
+ "reverie-e9patch",
+]
+
+[[package]]
 name = "detcore-model"
 version = "0.2.0"
 dependencies = [
@@ -966,6 +975,7 @@ dependencies = [
  "regex",
  "reverie-core",
  "reverie-dbi",
+ "reverie-e9patch",
  "reverie-kvm",
  "reverie-liteinst",
  "reverie-ptrace",
@@ -1719,6 +1729,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "reverie-e9patch"
+version = "0.2.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6#dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6"
+dependencies = [
+ "anyhow",
+ "goblin",
+ "libc",
+ "reverie-core",
+ "reverie-preload",
+ "reverie-ptrace",
+ "reverie-rpc-transport",
+ "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

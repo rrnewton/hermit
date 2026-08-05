@@ -22,7 +22,7 @@ crate-type = ["rlib", "cdylib"]
 default = []
 dbi = ["dep:detcore-dbi", "dep:reverie-dbi"]
 sabre = []
-e9patch = []
+e9patch = ["dep:reverie-e9patch"]
 third-party-backends = ["dbi", "sabre", "e9patch"]
 
 [dependencies]
@@ -52,6 +52,10 @@ regex = "1.13.1"
 # sync across all crates and bump it via docs/updating-reverie.md.
 reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6" }
 reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6", default-features = false, optional = true }
+# `default-features = false` omits reverie-e9patch's in-guest preload constructor
+# from the host `hermit` binary; the direct-tool launcher API it exposes drives
+# the ptrace-free e9patch backend and injects the detcore-e9patch DSO instead.
+reverie-e9patch = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6", default-features = false, optional = true }
 reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6" }
 reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6" }
 reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6", default-features = false }

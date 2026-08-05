@@ -6,6 +6,7 @@ members = [
   "detcore-model",
   "detcore-dbi",
   "detcore-sabre",
+  "detcore-e9patch",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",

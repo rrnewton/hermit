@@ -692,10 +692,23 @@ fn sabre_unavailable_reason() -> Option<String> {
 
 #[cfg(feature = "e9patch")]
 fn e9patch_unavailable_reason() -> Option<String> {
-    validate_tracing_environment()
+    // The ptrace-free e9patch backend rewrites the guest in-process using the
+    // e9tool bundled inside reverie-e9patch and hosts Detcore in-guest through
+    // the detcore-e9patch preload DSO. Availability therefore depends on that
+    // DSO being staged beside the binary, not on an external e9tool in PATH.
+    if let Err(error) = validate_tracing_environment() {
+        return Some(error.to_string());
+    }
+    if let Err(error) = e9patch_runtime_library_path() {
+        return Some(format!(
+            "the Detcore e9patch plugin is unavailable: {error}; build detcore-e9patch and hermit in the same target directory"
+        ));
+    }
+    // The launcher rewrites the guest ELF with the bundled e9tool/e9patch
+    // backend, so the run fails closed unless both are resolvable now.
+    crate::e9patch::resolve_reverie_tool_paths()
         .err()
         .map(|error| error.to_string())
-        .or_else(e9patch::unavailable_reason)
 }
 
 #[cfg(not(feature = "e9patch"))]
@@ -893,6 +906,67 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+/// Returns the Detcore e9patch preload DSO staged beside the running binary.
+///
+/// Mirrors [`sabre_runtime_library_path`]: the direct-tool e9patch launcher
+/// injects this DSO through `LD_PRELOAD`, and its `.init_array` constructor
+/// hosts Detcore in-guest.
+#[cfg(feature = "e9patch")]
+fn e9patch_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = hermit_resources::resource("libdetcore_e9patch.so")?
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    [
+        directory.join("libdetcore_e9patch.so"),
+        directory.join("deps/libdetcore_e9patch.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "libdetcore_e9patch.so was not built beside {}",
+                executable.display()
+            ),
+        )
+    })
+}
+
+/// Exports the bundled e9patch tool paths for reverie's direct-tool launcher.
+///
+/// The ptrace-free e9patch launcher rewrites the guest ELF ahead of time inside
+/// [`E9patchBackend::run_direct_with_preload`] by reading `REVERIE_E9TOOL` and
+/// `REVERIE_E9PATCH_BACKEND` through `E9patchRewriter::from_env()`. Hermit
+/// resolves the same staged e9patch artifacts it uses for its offline
+/// instruction-map path and publishes them here so no external `e9tool` has to
+/// be on `PATH`.
+///
+/// [`E9patchBackend::run_direct_with_preload`]: reverie_e9patch::E9patchBackend::run_direct_with_preload
+#[cfg(feature = "e9patch")]
+fn export_e9patch_tool_env() -> Result<(), Error> {
+    let (e9tool, e9patch_backend) = crate::e9patch::resolve_reverie_tool_paths()?;
+    // SAFETY: called during backend dispatch, before the guest process is
+    // spawned and before the reverie launcher reads these variables through
+    // `E9patchRewriter::from_env()`. No other thread mutates the environment at
+    // this point in startup.
+    unsafe {
+        std::env::set_var(reverie_e9patch::E9TOOL_ENV, &e9tool);
+        std::env::set_var(reverie_e9patch::E9PATCH_BACKEND_ENV, &e9patch_backend);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "sabre")]
 fn sabre_runtime_unavailable_reason() -> Option<String> {
     if let Err(error) = resolve_sabre_binary() {
@@ -974,14 +1048,9 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     if backend == Backend::Ptrace {
         return Ok(());
     }
-    if backend == Backend::E9patch {
-        return Err(anyhow!(
-            "backend `e9patch` requires CLI preprocessing; library callers must use \
-             e9patch::prepare and then select `ptrace`"
-        ));
-    }
-    // KVM and DBI have dedicated dispatches (`run_kvm` and `run_dbi`); neither
-    // must reach this generic rejection path.
+    // KVM, DBI, and E9patch have dedicated dispatches (`run_kvm`, `run_dbi`, and
+    // the direct-tool e9patch launcher); none must reach this generic rejection
+    // path when its feature is enabled.
     backend.ensure_available()?;
     Err(anyhow!(
         "backend `{}` has no Hermit dispatch implementation",
@@ -1500,8 +1569,11 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config
 }
 
-// TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
-fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
+// TODO-HUMAN-REVIEW(PR-736): Review reserved preload-backend runtime failure
+// statuses. Shared by the LiteInst and ptrace-free e9patch backends, which both
+// host the tool in-guest over the reverie-preload coordinator/RPC seam and can
+// leave the coordinator scheduler awaiting RPCs when the runtime dies.
+fn preload_backend_requires_forced_shutdown(status: ExitStatus) -> bool {
     matches!(
         status,
         ExitStatus::Exited(122..=127) | ExitStatus::Signaled(_, _)
@@ -1556,7 +1628,7 @@ async fn run_with_backend_inner(
                 command, config, preload,
             )
             .await?;
-        if liteinst_requires_forced_shutdown(exit_status) {
+        if preload_backend_requires_forced_shutdown(exit_status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
         }
@@ -1564,6 +1636,31 @@ async fn run_with_backend_inner(
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
         return Ok(exit_status);
+    }
+    if backend == Backend::E9patch {
+        #[cfg(feature = "e9patch")]
+        {
+            let preload = e9patch_runtime_library_path()?;
+            export_e9patch_tool_env()?;
+            let (exit_status, mut global_state) =
+                reverie_e9patch::E9patchBackend::run_direct_with_preload::<Detcore>(
+                    command, config, preload,
+                )
+                .await?;
+            if preload_backend_requires_forced_shutdown(exit_status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            return Ok(exit_status);
+        }
+        #[cfg(not(feature = "e9patch"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("e9patch availability must fail when the feature is disabled");
+        }
     }
     ensure_backend_dispatch(backend)?;
 
@@ -1668,7 +1765,7 @@ async fn run_with_output_backend_inner(
             )
             .await?;
         let status = output.status;
-        if liteinst_requires_forced_shutdown(status) {
+        if preload_backend_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
         }
@@ -1680,6 +1777,37 @@ async fn run_with_output_backend_inner(
             stdout: output.stdout,
             stderr: output.stderr,
         });
+    }
+    if backend == Backend::E9patch {
+        #[cfg(feature = "e9patch")]
+        {
+            command.stdin(output_backend_stdin()?);
+            let preload = e9patch_runtime_library_path()?;
+            export_e9patch_tool_env()?;
+            let (output, mut global_state) =
+                reverie_e9patch::E9patchBackend::run_direct_with_output_and_preload::<Detcore>(
+                    command, config, preload,
+                )
+                .await?;
+            let status = output.status;
+            if preload_backend_requires_forced_shutdown(status) {
+                global_state.force_shutdown_with_error();
+                global_state.cancel_internal_scheduler().await;
+            }
+            global_state
+                .clean_up(print_summary, print_summary_to_json_file)
+                .await;
+            return Ok(Output {
+                status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        #[cfg(not(feature = "e9patch"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("e9patch availability must fail when the feature is disabled");
+        }
     }
     ensure_backend_dispatch(backend)?;
 
@@ -1928,10 +2056,10 @@ mod tests {
     #[cfg(feature = "dbi")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
-    use super::liteinst_requires_forced_shutdown;
     #[cfg(feature = "dbi")]
     use super::liteinst_runtime_unavailable_reason;
     use super::output_backend_stdin_file;
+    use super::preload_backend_requires_forced_shutdown;
     use super::prepare_backend_config;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
@@ -1985,12 +2113,16 @@ mod tests {
     #[test]
     fn liteinst_reserved_failures_require_scheduler_cancellation() {
         for status in 122..=127 {
-            assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(
-                status
-            )));
+            assert!(preload_backend_requires_forced_shutdown(
+                ExitStatus::Exited(status)
+            ));
         }
-        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
-        assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+        assert!(!preload_backend_requires_forced_shutdown(
+            ExitStatus::Exited(121)
+        ));
+        assert!(!preload_backend_requires_forced_shutdown(
+            ExitStatus::Exited(128)
+        ));
     }
 
     #[test]
@@ -2342,12 +2474,18 @@ mod tests {
     }
 
     #[test]
-    fn public_backend_dispatch_rejects_unprepared_e9patch() {
-        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
-        assert!(
-            error.to_string().contains("requires CLI preprocessing"),
-            "unexpected error: {error}"
-        );
+    fn public_backend_dispatch_no_longer_rejects_e9patch_as_preprocessing() {
+        // The ptrace-free e9patch backend now has a dedicated in-guest dispatch
+        // (`run_direct_with_preload::<Detcore>`) and is handled before the
+        // generic `ensure_backend_dispatch` fallback. The obsolete
+        // "requires CLI preprocessing" rejection — which routed e9patch onto the
+        // ptrace runtime — must never reappear.
+        if let Err(error) = ensure_backend_dispatch(Backend::E9patch) {
+            assert!(
+                !error.to_string().contains("requires CLI preprocessing"),
+                "e9patch must not be rejected as ptrace preprocessing: {error}"
+            );
+        }
     }
 
     #[test]

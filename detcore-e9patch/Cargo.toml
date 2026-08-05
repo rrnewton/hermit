@@ -1,0 +1,25 @@
+[package]
+name = "detcore-e9patch"
+description = "e9patch backend glue for Detcore, the Hermit deterministic execution engine."
+version = "0.2.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+# Mirrors detcore-sabre: this crate is the tool-specific preload DSO injected
+# into the guest for the ptrace-free e9patch backend. Its `.init_array`
+# constructor reads the coordinator socket from `reverie_e9patch::COORDINATOR_ENV`
+# and hosts the concrete `Detcore` tool in-guest via
+# `reverie_e9patch::install_tool::<Detcore>`. The rlib crate-type keeps the
+# tool's unit tests buildable without loading the constructor.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+detcore = { version = "0.2.0", path = "../detcore" }
+libc = "0.2.186"
+# `default-features = false` disables reverie-e9patch's own `preload-constructor`
+# `.init_array` entry: this crate supplies its own Detcore-embedding constructor,
+# so the generic reverie constructor must not also be linked into the DSO.
+reverie-e9patch = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6", default-features = false }

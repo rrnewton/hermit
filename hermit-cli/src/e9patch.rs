@@ -1070,6 +1070,21 @@ fn resolve_e9patch_backend(e9tool: &Path) -> Result<PathBuf, Error> {
         })
 }
 
+/// Resolves the bundled `e9tool` and `e9patch` backend executables for the
+/// in-guest e9patch runtime.
+///
+/// The ptrace-free e9patch backend drives reverie's direct-tool launcher, which
+/// rewrites the guest ELF ahead of time by reading `REVERIE_E9TOOL` and
+/// `REVERIE_E9PATCH_BACKEND` from the environment. Hermit stages the same
+/// e9patch artifacts it uses for its offline instruction-map path, so the run
+/// dispatch resolves them here (packaged resource, `HERMIT_E9TOOL`/
+/// `HERMIT_E9PATCH_BACKEND` override, or `PATH`) and exports them to reverie.
+pub fn resolve_reverie_tool_paths() -> Result<(PathBuf, PathBuf), Error> {
+    let e9tool = resolve_e9tool()?;
+    let e9patch_backend = resolve_e9patch_backend(&e9tool)?;
+    Ok((e9tool, e9patch_backend))
+}
+
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
