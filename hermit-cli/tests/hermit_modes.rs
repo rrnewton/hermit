@@ -1065,6 +1065,68 @@ fn verify_verbose_compares_the_full_trace() {
 }
 
 #[test]
+fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
+    let _guard = hermit_run_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let tmp = tempfile::Builder::new()
+        .prefix("verify-strict-info-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create strict verification directory");
+    let guest = tmp.path().join("hello_nostdlib");
+    compile_c_without_libc(&repository.join("tests/c/simple/hello_nostdlib.c"), &guest);
+    let report = tmp.path().join("verify.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=info", "run", "--verify", "--verify-strict"])
+        .arg("--verify-json")
+        .arg(&report)
+        .args([
+            "--detlog-heap",
+            "--detlog-stack",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest)
+        .output()
+        .expect("failed to run strict INFO verification");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "strict INFO verification failed:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Comparing INFO messages"),
+        "strict comparison did not name its INFO envelope:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Comparing full trace messages"),
+        "ordinary strict verification unexpectedly promoted diagnostics:\n{stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("strict verification did not publish its report"),
+    )
+    .expect("strict verification report was not valid JSON");
+    assert_eq!(report["verified"], serde_json::json!(true));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(report["comparison"]["log_scope"], serde_json::json!("info"));
+    assert!(
+        report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        report["compared_log_messages"]["right"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+}
+
+#[test]
 fn verify_honors_tmp_and_environment() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
