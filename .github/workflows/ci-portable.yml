@@ -177,44 +177,28 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
-  # Keep dependency freshness visible without letting it taint the authoritative
-  # product-test job queried by merge-gate.
+  # Exact dependency currency is part of the authoritative product-test result:
+  # an old Reverie pin cannot produce current Hermit validation evidence.
   reverie-pin:
-    name: Reverie pin is consistent
+    name: Reverie pin is latest main
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Reject a Reverie dependency pin that is not on main's history
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
+      - name: Require the exact latest Reverie main revision
         run: |
           set -euo pipefail
-          checker="$RUNNER_TEMP/check-reverie-pin"
-          checker_tests="$RUNNER_TEMP/check-reverie-pin-tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-reverie-pin.rs -o "$checker_tests"
-          "$checker_tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-reverie-pin.rs -o "$checker"
-
-          reason="$({
-            printf '%s\n' "$PR_BODY" |
-              sed -n 's/^Stale-Reverie-Pin-Reason:[[:space:]]*//p' |
-              head -n 1
-          } || true)"
-          args=()
-          if [[ -n "$reason" ]]; then
-            args+=(--allow-stale-reverie-pin "$reason")
-          fi
-          "$checker" "${args[@]}"
+          ./ci/run-reverie-pin-check.sh --self-test
+          ./ci/run-reverie-pin-check.sh
       - name: Reject a stale nested-workspace Cargo.lock before the opaque --locked build failure
         run: |
           set -euo pipefail
-          checker="$RUNNER_TEMP/check-nested-lockfiles"
-          checker_tests="$RUNNER_TEMP/check-nested-lockfiles-tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-nested-lockfiles.rs -o "$checker_tests"
-          "$checker_tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$checker"
-          "$checker"
+          nested_checker="$RUNNER_TEMP/check-nested-lockfiles"
+          nested_checker_tests="$RUNNER_TEMP/check-nested-lockfiles-tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-nested-lockfiles.rs -o "$nested_checker_tests"
+          "$nested_checker_tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$nested_checker"
+          "$nested_checker"
 
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
@@ -274,7 +258,9 @@ jobs:
     needs: select
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The selected debug DAG has a 1260s critical path. Keep the hosted job
+    # outside that path plus at least 300s for setup and artifact overhead.
+    timeout-minutes: 30
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}
@@ -438,7 +424,9 @@ jobs:
     needs: select
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # runtime_release -> liteinst_runtime_release is a 2100s selected-DAG path.
+    # Keep the hosted job outside it plus at least 300s of workflow overhead.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -835,6 +823,7 @@ jobs:
     name: Regular tests (GitHub-managed portable)
     needs:
       - select
+      - reverie-pin
       - plan
       - preflight
       - build-debug

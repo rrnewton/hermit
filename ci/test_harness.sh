@@ -234,9 +234,20 @@ function assert_workflow_entrypoint {
         die "GitHub $lane workflow command diverged: ${commands[0]}"
 }
 
+function workflow_job_timeout_minutes {
+    local workflow=$1 job=$2
+    awk -v start="  $job:" '
+        $0 == start { inside = 1; next }
+        inside && /^  [a-zA-Z0-9_-]+:/ { exit }
+        inside && /^    timeout-minutes: [0-9]+$/ { print $2; exit }
+    ' "$workflow"
+}
+
 function assert_parallel_portable_workflow {
     local workflow=$1
-    local run_dag_count run_node_count
+    local run_dag_count run_node_count debug_inner_path release_inner_path
+    local debug_outer_minutes release_outer_minutes
+    local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
 
@@ -244,6 +255,45 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
     ((run_node_count == 5)) ||
         die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
+
+    # The hosted job is the outer kill boundary. Compute the critical path for
+    # each exact run-node selection, retaining dependencies among selected nodes
+    # just as safe-ci --only does. A max-single-node proxy misses release's
+    # runtime_release -> liteinst_runtime_release chain.
+    debug_inner_path=$(jq --slurpfile shards "$ROOT_DIR/ci/portable-shards.json" '
+        ($shards[0].build_debug_nodes) as $selected
+        | (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
+        | def critical($id):
+            $steps[$id] as $step
+            | ($step.timeout + ([($step.deps // [])[] as $dep
+                | select($selected | index($dep) != null)
+                | critical($dep)] | max // 0));
+          [$selected[] | critical(.)] | max
+    ' "$DAG_ROOT/portable.json")
+    release_inner_path=$(jq --slurpfile shards "$ROOT_DIR/ci/portable-shards.json" '
+        ($shards[0].build_dbi_nodes + $shards[0].build_aux_nodes) as $selected
+        | (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
+        | def critical($id):
+            $steps[$id] as $step
+            | ($step.timeout + ([($step.deps // [])[] as $dep
+                | select($selected | index($dep) != null)
+                | critical($dep)] | max // 0));
+          [$selected[] | critical(.)] | max
+    ' "$DAG_ROOT/portable.json")
+    debug_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-debug)
+    release_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-release)
+    [[ $debug_inner_path =~ ^[1-9][0-9]*$ ]] ||
+        die "portable debug selection has no numeric critical path"
+    [[ $release_inner_path =~ ^[1-9][0-9]*$ ]] ||
+        die "portable release selection has no numeric critical path"
+    [[ $debug_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
+        die "GitHub debug build has no numeric outer timeout"
+    [[ $release_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
+        die "GitHub release build has no numeric outer timeout"
+    ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
+        die "GitHub debug outer timeout must exceed ${debug_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
+    ((release_outer_minutes * 60 > release_inner_path + hosted_job_overhead_seconds)) ||
+        die "GitHub release outer timeout must exceed ${release_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
     # Match the literal command embedded in workflow YAML.
@@ -323,6 +373,269 @@ function assert_validate_entrypoint {
         die "validate.sh $function_name command diverged from the audited entrypoint"
 }
 
+# Keep the latest-Reverie invariant attached to every testing evidence path.
+# The checker unit tests plant stale/current pins; these structural assertions
+# prove that those same fail-closed semantics cannot be bypassed by selecting a
+# different local, DAG, hosted-CI, merge-gate, or receipt path.
+function assert_reverie_pin_enforcement {
+    local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
+    local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
+    local liteinst_stage="$ROOT_DIR/scripts/stage-liteinst-runtime.sh"
+    grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
+        die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
+    ! grep -Fq 'main_sha' "$checker" ||
+        die "latest-Reverie checker must not accept a pre-recorded main SHA"
+    ! grep -Fq -- '--reverie-remote' "$checker" ||
+        die "production callers must not redirect the latest-Reverie authority"
+    [[ -x $runner ]] ||
+        die "latest-Reverie CI runner must be executable"
+    [[ $(grep -Fxc '"$checker" "$@"' "$runner") == 1 ]] ||
+        die "latest-Reverie runner must forward every verifier argument exactly"
+
+    # Exhaustive tracked-reference audit. Any new direct source reference fails
+    # until it is classified in this explicit trusted allowlist; checking a few
+    # known callers would let a new bypass escape unnoticed.
+    local direct_references expected_direct_references
+    direct_references=$(
+        git -C "$ROOT_DIR" grep -Il -F 'scripts/check-reverie-pin.rs' -- . |
+            LC_ALL=C sort
+    )
+    expected_direct_references=$'.github/workflows/merge-gate.yml\nci/run-reverie-pin-check.sh\nci/test_harness.sh\ndocs/updating-reverie.md\nscripts/check-nested-lockfiles.rs\nscripts/check-reverie-pin.rs'
+    [[ $direct_references == "$expected_direct_references" ]] ||
+        die "direct Reverie-pin source references differ from the trusted allowlist:
+$direct_references"
+
+    # Executable source consumers are limited to the portable rustc launcher
+    # and merge-gate's trusted-main compiler. The harness is this audit; the
+    # remaining allowlisted references are documentation or checker source.
+    [[ $(grep -Fxc '        scripts/check-reverie-pin.rs -o "$checker"' "$runner") == 2 ]] ||
+        die "latest-Reverie runner must compile the canonical source in both modes"
+    [[ $(grep -Fxc $'\t$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh' "$ROOT_DIR/Makefile") == 1 ]] ||
+        die "Makefile lint must use the canonical Reverie-pin launcher"
+    [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit hook must use the canonical Reverie-pin launcher"
+    [[ $(grep -Fxc '"${proxy[@]}" "$checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit hook must bind the launcher to the exact repository"
+    [[ $(grep -Fc '"$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 2 ]] ||
+        die "both validate Reverie-pin gates must use the exact-repository launcher"
+    [[ $(grep -Fxc '    "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin' "$liteinst_stage") == 1 ]] ||
+        die "LiteInst staging must obtain its cache pin through the exact-repository launcher"
+
+    local dag
+    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
+        jq -e '
+            [.steps[] | select(
+                .group == "check"
+                and .job == "reverie_pin"
+                and .cmd == "./ci/run-reverie-pin-check.sh"
+            )] | length == 1
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
+    done
+
+    # Execute the same rustc wrapper with a PATH that deliberately excludes
+    # rust-script. A fake git transport keeps both brackets hermetic while the
+    # production checker still dereferences refs/heads/main and scans a real Git
+    # fixture. The positive arm proves the path fires; the planted stale pin
+    # must return the checker's typed policy refusal (1), not a compile/no-result
+    # error (2).
+    (
+        local scratch isolated_path race_path shared_compile_dir fixture
+        local real_git current stale status
+        local fake_cargo staged_runtime direct_status
+        local allowed_cpu parallel_index parallel_failures shared_failures
+        local -a checker_pids
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        isolated_path="$scratch/bin"
+        fixture="$scratch/hermit"
+        real_git=$(command -v git)
+        current=0123456789abcdef0123456789abcdef01234567
+        stale=89abcdef0123456789abcdef0123456789abcdef
+        mkdir -p "$isolated_path" "$fixture"
+        ln -s "$(command -v rustc)" "$isolated_path/rustc"
+        if PATH="$isolated_path:/usr/bin:/bin" command -v rust-script >/dev/null; then
+            die "rust-script unexpectedly present in isolated checker PATH"
+        fi
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --self-test >/dev/null
+
+        # The pin gate and both DBI build children may compile the checker at
+        # once in one worktree. Exercise real rustc concurrently within the
+        # e2e.metadata node's 1 GiB cap. Pin each compiler to one allowed CPU so
+        # rustc cannot infer the 316-CPU host and create hundreds of codegen
+        # threads; filesystem concurrency remains real and deterministic.
+        allowed_cpu=$(taskset -pc "$$" | sed -E 's/.*: ([0-9]+).*/\1/')
+        [[ $allowed_cpu =~ ^[0-9]+$ ]] ||
+            die "could not determine one allowed CPU for the checker race bracket"
+        checker_pids=()
+        for parallel_index in 1 2 3 4; do
+            taskset -c "$allowed_cpu" "$runner" --self-test \
+                >"$scratch/parallel-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        parallel_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                cat "$scratch/parallel-checker-$((parallel_index + 1)).log" >&2
+                parallel_failures=$((parallel_failures + 1))
+            fi
+        done
+        ((parallel_failures == 0)) ||
+            die "$parallel_failures of 4 concurrent real Reverie-pin checker builds failed"
+
+        # Bracket the shared-intermediate failure deterministically at higher
+        # concurrency without making twelve rustc processes exceed that cap. The
+        # stand-in writes one crate-named intermediate beside `-o`, exactly the
+        # path class that collides when outputs share a directory. First prove a
+        # planted shared directory fails, then send twelve invocations through
+        # the production launcher and require its private directories to pass.
+        race_path="$scratch/race-bin"
+        shared_compile_dir="$scratch/shared-compile-dir"
+        mkdir -p "$race_path" "$shared_compile_dir"
+        cat >"$race_path/rustc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=
+while (($# > 0)); do
+    if [[ $1 == -o ]]; then
+        output=$2
+        shift 2
+    else
+        shift
+    fi
+done
+[[ -n $output ]]
+intermediate="$(dirname -- "$output")/check_reverie_pin.rcgu.o"
+if ! (set -o noclobber; : >"$intermediate") 2>/dev/null; then
+    echo "planted shared rustc intermediate collision: $intermediate" >&2
+    exit 97
+fi
+sleep 0.2
+printf '#!/usr/bin/env bash\nexit 0\n' >"$output"
+chmod +x "$output"
+rm -f -- "$intermediate"
+EOF
+        chmod +x "$race_path/rustc"
+        checker_pids=()
+        for parallel_index in $(seq 1 12); do
+            PATH="$race_path:/usr/bin:/bin" rustc --edition=2021 --test \
+                scripts/check-reverie-pin.rs \
+                -o "$shared_compile_dir/checker-$parallel_index" \
+                >"$scratch/shared-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        shared_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                shared_failures=$((shared_failures + 1))
+            fi
+        done
+        ((shared_failures > 0)) ||
+            die "planted shared-directory compiler race was inert"
+
+        checker_pids=()
+        for parallel_index in $(seq 1 12); do
+            PATH="$race_path:/usr/bin:/bin" "$runner" --self-test \
+                >"$scratch/isolated-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        parallel_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                cat "$scratch/isolated-checker-$((parallel_index + 1)).log" >&2
+                parallel_failures=$((parallel_failures + 1))
+            fi
+        done
+        ((parallel_failures == 0)) ||
+            die "$parallel_failures of 12 private-directory compiler probes failed"
+
+        cat >"$isolated_path/git" <<EOF
+#!/usr/bin/env bash
+if [[ \${1:-} == ls-remote ]]; then
+    printf '%s\trefs/heads/main\n' '$current'
+    exit 0
+fi
+exec '$real_git' "\$@"
+EOF
+        chmod +x "$isolated_path/git"
+        "$real_git" -C "$fixture" init -q
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$current" >"$fixture/Cargo.toml"
+        "$real_git" -C "$fixture" add Cargo.toml
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" >/dev/null
+
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$stale" >"$fixture/Cargo.toml"
+        if PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" \
+            >/dev/null 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        [[ $status == 1 ]] ||
+            die "rustc checker stale-pin bracket returned $status instead of 1"
+
+        # Reproduce the hosted release-build failure signature, then exercise
+        # the real LiteInst staging script through the canonical launcher. A
+        # tiny Cargo stand-in isolates this regression to staging/launcher
+        # behavior while still requiring the production script to atomically
+        # install a non-empty runtime under a PATH with no rust-script.
+        if PATH="$isolated_path:/usr/local/bin:/usr/bin:/bin" \
+            "$checker" --repo "$ROOT_DIR" --print-pin >/dev/null 2>&1; then
+            direct_status=0
+        else
+            direct_status=$?
+        fi
+        [[ $direct_status == 127 ]] ||
+            die "direct LiteInst pin source negative returned $direct_status instead of hosted rc=127"
+        fake_cargo="$scratch/fake-cargo"
+        staged_runtime="$scratch/staged/libreverie_liteinst.so"
+        cat >"$fake_cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == build ]]
+[[ -n ${HERMIT_LITEINST_STAGE:-} ]]
+printf 'hermetic-liteinst-runtime\n' >"$HERMIT_LITEINST_STAGE"
+EOF
+        chmod +x "$fake_cargo"
+        PATH="$isolated_path:/usr/local/bin:/usr/bin:/bin" CARGO="$fake_cargo" \
+            "$liteinst_stage" dev "$staged_runtime" "$scratch/runtime-target"
+        [[ -s $staged_runtime && $(<"$staged_runtime") == hermetic-liteinst-runtime ]] ||
+            die "rust-script-free LiteInst staging did not install the fixture runtime"
+    )
+
+    [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh must execute the latest-Reverie gate exactly once"
+    [[ $(grep -Fc 'REVERIE_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipt cleanup must fail closed when the pin gate was bypassed"
+    [[ $(grep -Fc '\"reverie_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate.sh receipts must state whether the latest-Reverie gate passed"
+
+    local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
+    [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one latest-Reverie job"
+    [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
+        die "the authoritative portable aggregate must depend on the Reverie pin job"
+    [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical checker self-tests through rustc"
+    [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical live-query checker through rustc"
+    ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
+        die "portable CI must not retain a stale-Reverie override"
+
+    local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
+    [[ $(grep -Fxc '    name: reverie-pin-is-latest-main' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must check exact PR heads with the trusted pin checker"
+    [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
+        die "merge-gate must depend on its exact-head Reverie pin job"
+    grep -Fq 'trusted/scripts/check-reverie-pin.rs -o "$checker"' "$merge_workflow" ||
+        die "merge-gate must compile the checker from trusted main"
+    grep -Fq 'git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"' "$merge_workflow" ||
+        die "merge-gate must inspect the exact PR head"
+    grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
+        die "merge-gate must run the canonical live-query checker on the exact PR head"
+}
+
 function dag_critical_path_seconds {
     local dag=$1
     jq -r '
@@ -344,25 +657,255 @@ function emit_manifest_buckets {
 function audit_ci_correspondence {
     local lane dag
 
-    # Both DAG launch surfaces must inherit one explicit inner-build width. The
-    # mutation control proves a caller-selected K reaches Cargo and nested native
-    # builds; the invalid-value arm proves the guard is not an inert declaration.
+    # Both DAG launch surfaces use the explicit ordinary-launcher mode; the DBI
+    # wrapper is the sole child-budget caller.
     # shellcheck disable=SC2016
-    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
-        die "run-dag.sh must source the shared build-job configuration exactly once"
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
+        die "run-dag.sh must source ordinary build-job configuration exactly once"
     # shellcheck disable=SC2016
-    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
-        die "run-node.sh must source the shared build-job configuration exactly once"
-    local configured_jobs
-    configured_jobs=$(
-        CI_DAG_BUILD_JOBS=5 bash -c 'source "$1"; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
-            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "run-node.sh must source ordinary build-job configuration exactly once"
+    local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
+    local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbi-budget.sh"
+    [[ -x $budget_wrapper ]] || die "DBI child-budget wrapper must be executable"
+    [[ $(grep -Fc 'reverie-dbi-budget=portable-build-child-only' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
+        die "run-dag.sh must identify the DBI budget as portable-child-only"
+    [[ $(grep -Fc 'reverie-dbi-budget=portable-build-child-only' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "run-node.sh must identify the DBI budget as portable-child-only"
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbi-budget-child' "$budget_wrapper") == 1 ]] ||
+        die "DBI wrapper must select the explicit portable child-budget mode"
+    [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
+        die "DBI wrapper must bind its calibration through the canonical local-pin verifier"
+    [[ $(grep -Fc 'e159d6cef0fc9a75020d70e6374c7899da07868f' "$budget_wrapper") == 1 ]] ||
+        die "DBI wrapper must name exactly one calibrated Reverie pin"
+    [[ $(grep -Fc 'e159d6cef0fc9a75020d70e6374c7899da07868f' "$budget_config") == 2 ]] ||
+        die "DBI derivation must independently require and diagnose the calibrated Reverie pin"
+    # shellcheck disable=SC2016
+    local budget_record='reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}'
+    [[ $(grep -Fc "$budget_record" "$budget_wrapper") == 1 ]] ||
+        die "DBI child wrapper must log the pin and every derivation condition"
+
+    jq -e '
+        [.steps[] | select(
+            .group == "build"
+            and (.job == "workspace" or .job == "runtime_release")
+            and (.cmd | contains("./ci/run-with-reverie-dbi-budget.sh cargo build"))
+            and .timeout >= 1200
+        )] | length == 2
+    ' "$DAG_ROOT/portable.json" >/dev/null ||
+        die "portable DBI builds must derive inside the child and allow 1050s DBI + 150s overhead"
+    jq -e '
+        [.steps[] | select(
+            .group == "build" and .job == "privileged_tests"
+            and .timeout == 120
+            and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p detcore --test tests_misc --no-run"
+        )] | length == 1
+    ' "$DAG_ROOT/privileged.json" >/dev/null ||
+        die "portable-only DBI override must not alter the privileged command or timeout"
+
+    (
+        local scratch fake_runner privileged_env privileged_node_env name
+        local budget_probe budget_tuple clamp_boundaries cpu_boundaries
+        local hosted_wrapper_log boxed_wrapper_log wrong_pin_log wrong_pin_status
+        local configured_jobs fixture wrong_pin
+        local -a clean_budget_env budget_names planted_budget_env
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+
+        for cpu_count in 2 4 64; do
+            mkdir -p "$scratch/nproc-$cpu_count"
+            printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$cpu_count" >"$scratch/nproc-$cpu_count/nproc"
+            chmod +x "$scratch/nproc-$cpu_count/nproc"
+        done
+        mkdir -p "$scratch/nproc-zero" "$scratch/nproc-invalid"
+        printf '#!/usr/bin/env bash\nprintf "0\\n"\n' >"$scratch/nproc-zero/nproc"
+        printf '#!/usr/bin/env bash\nprintf "invalid\\n"\n' >"$scratch/nproc-invalid/nproc"
+        chmod +x "$scratch/nproc-zero/nproc" "$scratch/nproc-invalid/nproc"
+
+        budget_names=(
+            REVERIE_DBI_BUDGET_BOUND_PIN
+            REVERIE_DBI_BUILD_JOBS_SOURCE
+            REVERIE_DBI_RAW_BUILD_JOBS
+            REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
+            REVERIE_DBI_EFFECTIVE_CPUS
+            REVERIE_DBI_MAX_PARALLEL_JOBS
+            REVERIE_DBI_EFFECTIVE_BUILD_JOBS
+            REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+            REVERIE_DBI_MAX_BUILD_SECONDS
+            CI_DAG_LAUNCH_WIDTH_BOUND
+            CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
+            CI_DAG_LAUNCH_RAW_BUILD_JOBS
+            CI_DAG_EFFECTIVE_CPUS
+            CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
+            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS
+            CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+            REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
+            REVERIE_DBI_BUDGET_CHILD
+        )
+        clean_budget_env=(env -u CARGO_BUILD_JOBS -u THIRD_PARTY_BUILD_JOBS -u SAFE_CI_IN_SCOPE)
+        for name in "${budget_names[@]}"; do
+            clean_budget_env+=(-u "$name")
+            planted_budget_env+=("$name=planted")
+        done
+
+        # Exercise the real privileged launcher with every current and retired
+        # budget variable planted. The fake runner observes exactly what the DAG
+        # engine would inherit; none of the portable provenance may survive.
+        fake_runner="$scratch/observe-runner"
+        printf '#!/usr/bin/env bash\nenv | LC_ALL=C sort\n' >"$fake_runner"
+        chmod +x "$fake_runner"
+        privileged_env=$(
+            env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
+                SAFE_CI_DAG_RUNNER="$fake_runner" \
+                "$ROOT_DIR/ci/run-dag.sh" privileged ascii 2>/dev/null
+        )
+        for name in "${budget_names[@]}"; do
+            ! grep -q "^${name}=" <<<"$privileged_env" ||
+                die "privileged DAG runner inherited portable DBI variable $name"
+        done
+        grep -Fxq 'CARGO_BUILD_JOBS=8' <<<"$privileged_env" ||
+            die "privileged DAG runner lost the historical Cargo width"
+        grep -Fxq 'THIRD_PARTY_BUILD_JOBS=8' <<<"$privileged_env" ||
+            die "privileged DAG runner lost the historical native-build width"
+        privileged_node_env=$(
+            env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
+                SAFE_CI_DAG_RUNNER="$fake_runner" RUN_NODE_PERF_DIR="$scratch/perf" \
+                "$ROOT_DIR/ci/run-node.sh" privileged build.privileged_tests 2>/dev/null
+        )
+        for name in "${budget_names[@]}"; do
+            ! grep -q "^${name}=" <<<"$privileged_node_env" ||
+                die "privileged node runner inherited portable DBI variable $name"
+        done
+        grep -Fxq 'CARGO_BUILD_JOBS=8' <<<"$privileged_node_env" ||
+            die "privileged node runner lost the historical Cargo width"
+        grep -Fxq 'THIRD_PARTY_BUILD_JOBS=8' <<<"$privileged_node_env" ||
+            die "privileged node runner lost the historical native-build width"
+
+        configured_jobs=$(
+            "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=5 \
+                bash -c 'source "$1" launcher; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
+                _ "$budget_config"
+        )
+        [[ $configured_jobs == '5 5' ]] ||
+            die "ordinary launcher did not propagate mutation K=5: $configured_jobs"
+
+        # All budget arithmetic uses a fake `nproc`, not an input variable. This
+        # brackets the production observation point at the child process itself.
+        # shellcheck disable=SC2016
+        budget_probe='source "$1" reverie-dbi-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBI_BUILD_JOBS_SOURCE" "$REVERIE_DBI_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBI_EFFECTIVE_CPUS" "$REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBI_MAX_BUILD_SECONDS"'
+        budget_tuple=$(
+            PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+                REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+                CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
+        )
+        [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
+            die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
+        budget_tuple=$(
+            PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
+                REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+                SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
+                bash -c "$budget_probe" _ "$budget_config"
+        )
+        [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
+            die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
+
+        hosted_wrapper_log=$(
+            PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+                CARGO_BUILD_JOBS=8 "$budget_wrapper" true 2>&1
+        )
+        [[ $hosted_wrapper_log == *'pin:e159d6cef0fc9a75020d70e6374c7899da07868f,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
+            die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
+        boxed_wrapper_log=$(
+            PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
+                SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true 2>&1
+        )
+        [[ $boxed_wrapper_log == *'pin:e159d6cef0fc9a75020d70e6374c7899da07868f,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
+            die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
+
+        clamp_boundaries=$(
+            for requested in 15 16 17 64; do
+                PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
+                    REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+                    CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
+            done
+        )
+        [[ $clamp_boundaries == $'inherited-launch-cargo-build-jobs 15 15 15 child-nproc 64 16 15 1050 70\ninherited-launch-cargo-build-jobs 16 16 16 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 17 17 17 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 64 64 64 child-nproc 64 16 16 1050 66' ]] ||
+            die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
+        cpu_boundaries=$(
+            PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+                REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+                CARGO_BUILD_JOBS=17 bash -c "$budget_probe" _ "$budget_config"
+            PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
+                REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+                CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
+        )
+        [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
+            die "child nproc boundary did not cap the budget width: $cpu_boundaries"
+
+        # Plant a well-formed but uncalibrated pin in a real Git fixture. The
+        # production wrapper must refuse it through the canonical --print-pin
+        # path before executing the requested command.
+        fixture="$scratch/wrong-pin-hermit"
+        wrong_pin=89abcdef0123456789abcdef0123456789abcdef
+        mkdir -p "$fixture/ci" "$fixture/scripts/lib"
+        cp "$budget_config" "$budget_wrapper" "$ROOT_DIR/ci/run-reverie-pin-check.sh" "$fixture/ci/"
+        cp "$ROOT_DIR/scripts/check-reverie-pin.rs" "$fixture/scripts/"
+        cp "$ROOT_DIR/scripts/lib/rust_script_prelude.rs" "$fixture/scripts/lib/"
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$wrong_pin" >"$fixture/Cargo.toml"
+        git -C "$fixture" init -q
+        git -C "$fixture" add Cargo.toml ci scripts
+        if wrong_pin_log=$(
+            PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
+                "$fixture/ci/run-with-reverie-dbi-budget.sh" true 2>&1
+        ); then
+            wrong_pin_status=0
+        else
+            wrong_pin_status=$?
+        fi
+        [[ $wrong_pin_status == 2 ]] ||
+            die "uncalibrated Reverie pin returned $wrong_pin_status instead of 2: $wrong_pin_log"
+        [[ $wrong_pin_log == *"no calibrated budget for Reverie pin $wrong_pin"* ]] ||
+            die "uncalibrated Reverie pin refusal lost its binding: $wrong_pin_log"
+
+        if "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=0 \
+            bash -c 'source "$1" launcher' _ "$budget_config" 2>/dev/null; then
+            die "ordinary launcher accepted a zero build width"
+        fi
+        if "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=not-a-number \
+            bash -c 'source "$1" launcher' _ "$budget_config" 2>/dev/null; then
+            die "ordinary launcher accepted a noninteger build width"
+        fi
+        if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=wrong CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted an uncalibrated Reverie pin"
+        fi
+        if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f \
+            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted a retired unconditioned DBI threshold"
+        fi
+        if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted nproc=0"
+        fi
+        if PATH="$scratch/nproc-invalid:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted a noninteger nproc observation"
+        fi
+        if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=e159d6cef0fc9a75020d70e6374c7899da07868f CARGO_BUILD_JOBS=0 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted a zero Cargo width"
+        fi
+        if "${clean_budget_env[@]}" bash -c 'source "$1"' _ "$budget_config" 2>/dev/null; then
+            die "build-job configuration accepted an implicit source mode"
+        fi
     )
-    [[ $configured_jobs == "5 5" ]] ||
-        die "shared build-job configuration did not propagate mutation K=5: $configured_jobs"
-    if CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
-        die "shared build-job configuration accepted an invalid zero width"
-    fi
 
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
@@ -373,13 +916,15 @@ function audit_ci_correspondence {
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
+    assert_reverie_pin_enforcement
+
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs
     # its small hardware DAG within one job.
     assert_parallel_portable_workflow "$ROOT_DIR/.github/workflows/ci-portable.yml"
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
@@ -400,12 +945,37 @@ function audit_ci_correspondence {
     [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
 
-    local privileged_critical_path
+    # This validation command contains real concurrent rustc probes. Keep both
+    # lane copies on the measured 30s workload class and the same 60s cap so a
+    # shorter privileged proxy cannot reject work that passed the portable gate.
+    for lane in portable privileged; do
+        jq -e '
+            [.steps[] | select(
+                .group == "e2e"
+                and .job == "metadata"
+                and .cmd == "./ci/test_harness.sh validate"
+                and .timeout == 60
+                and .hint.est_duration_s == 30
+                and .hint.hard_mem_max_bytes == 1073741824
+            )] | length == 1
+        ' "$DAG_ROOT/$lane.json" >/dev/null ||
+            die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
+    done
+
+    local privileged_critical_path privileged_job_timeout_minutes
+    local privileged_inner_timeout_seconds=360
+    local privileged_runner_overhead_seconds=30
     privileged_critical_path=$(dag_critical_path_seconds "$DAG_ROOT/privileged.json")
+    privileged_job_timeout_minutes=$(workflow_job_timeout_minutes \
+        "$ROOT_DIR/.github/workflows/ci-privileged.yml" privileged)
     [[ $privileged_critical_path =~ ^[0-9]+$ ]] ||
         die "privileged DAG critical path is not an integer: $privileged_critical_path"
-    ((privileged_critical_path <= 270)) ||
-        die "privileged DAG timeout path ${privileged_critical_path}s exceeds workflow bound 270s"
+    [[ $privileged_job_timeout_minutes =~ ^[1-9][0-9]*$ ]] ||
+        die "privileged workflow has no numeric outer job timeout"
+    ((privileged_inner_timeout_seconds > privileged_critical_path + privileged_runner_overhead_seconds)) ||
+        die "privileged DAG launcher must exceed ${privileged_critical_path}s critical path plus ${privileged_runner_overhead_seconds}s runner overhead"
+    ((privileged_job_timeout_minutes * 60 > privileged_inner_timeout_seconds + 180)) ||
+        die "privileged job timeout must exceed ${privileged_inner_timeout_seconds}s DAG launcher plus 180s workflow overhead"
 
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
@@ -767,6 +1337,97 @@ function observation_hash {
     } | sha256sum | cut -d' ' -f1
 }
 
+# $1 is the number of guest executions the mode is contracted to perform.
+# `complete` and `eligible` are bound to that obligation: a run that produced
+# fewer records than executions is a SHORTFALL, not a pass. Reporting the count
+# without enforcing it lets one surviving record authorize a two-execution cell.
+function summarize_sabre_path_evidence {
+    local expected=$1
+    shift
+    jq -s --argjson expected "$expected" '
+        if all(.[];
+            .schema == 1
+            and (.guest_rpc_observed | type == "boolean")
+            and (.ptrace_fallback_sites | type == "number")
+            and (.trusted_shared_object_sites | type == "number")
+            and (.trusted_shared_objects | type == "array"))
+        then {
+            schema: 1,
+            expected_execution_count: $expected,
+            complete: (length == $expected),
+            execution_count: length,
+            guest_rpc_observed: (length > 0 and all(.[]; .guest_rpc_observed)),
+            ptrace_fallback_sites: (map(.ptrace_fallback_sites) | add // 0),
+            trusted_shared_object_sites: (map(.trusted_shared_object_sites) | add // 0),
+            trusted_shared_objects: (map(.trusted_shared_objects) | add // [] | unique),
+            eligible: (length == $expected and length > 0 and all(.[];
+                .guest_rpc_observed
+                and .ptrace_fallback_sites == 0
+                and .trusted_shared_object_sites == 0)),
+            executions: .
+        }
+        else error("invalid SaBRe path-evidence record")
+        end
+    ' "$@"
+}
+
+function collect_sabre_path_evidence {
+    local cell_dir=$1
+    local expected=$2
+    local -a files=()
+    shopt -s nullglob
+    files=("$cell_dir"/captures/*.sabre-path.jsonl)
+    shopt -u nullglob
+    if ((${#files[@]} == 0)); then
+        jq -cn --argjson expected "$expected" '{schema:1,
+            expected_execution_count:$expected,complete:false,execution_count:0,
+            guest_rpc_observed:false,
+            ptrace_fallback_sites:0,trusted_shared_object_sites:0,
+            trusted_shared_objects:[],eligible:false,executions:[]}'
+        return
+    fi
+    summarize_sabre_path_evidence "$expected" "${files[@]}"
+}
+
+# Hermit's built-in verification executes the guest twice (see the guest_tmpdir
+# comment in prepare_test); every other mode executes it once. The decision
+# point must know this number, not merely report whatever arrived.
+function expected_sabre_execution_count {
+    case $1 in
+    verify | replay) echo 2 ;;
+    *) echo 1 ;;
+    esac
+}
+
+function audit_sabre_path_evidence_contract {
+    local eligible fallback trusted shortfall
+    eligible=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 2)
+    fallback=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
+    trusted=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
+        summarize_sabre_path_evidence 1)
+    # PLANTED NEGATIVE for the execution-count obligation: one otherwise-clean
+    # record where the mode contracts for two. Every per-record predicate here
+    # passes, so this is refused only if the count itself is enforced.
+    shortfall=$(printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 2)
+    jq -e '.eligible and .complete and .execution_count == 2' <<<"$eligible" >/dev/null ||
+        die "legitimate SaBRe path evidence must remain eligible"
+    jq -e '(.eligible | not) and .ptrace_fallback_sites == 1' <<<"$fallback" >/dev/null ||
+        die "ptrace-installed SaBRe markers must be classified as fallback"
+    jq -e '(.eligible | not) and .trusted_shared_object_sites == 1' <<<"$trusted" >/dev/null ||
+        die "trusted shared-object native execution must be ineligible"
+    jq -e '(.eligible | not) and (.complete | not)
+        and .execution_count == 1 and .expected_execution_count == 2' <<<"$shortfall" >/dev/null ||
+        die "an execution-count shortfall must be ineligible even when every record is clean"
+}
+
 function prepare_test {
     local test=$1
     local cell_dir=$2
@@ -835,7 +1496,7 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
-    local timeout_seconds stdout_file stderr_file guest_tmpdir kind guest_backend
+    local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
@@ -861,6 +1522,11 @@ function execute_attempt {
         E2E_TMPDIR="$guest_tmpdir"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
+    if [[ $backend == sabre ]]; then
+        path_evidence_file="$cell_dir/captures/${mode}-${attempt}.sabre-path.jsonl"
+        : >"$path_evidence_file"
+        env_args+=(HERMIT_SABRE_PATH_EVIDENCE="$path_evidence_file")
+    fi
     local -a command guest_command profile run_args guest_args custom_args
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     mapfile -t guest_args < <(
@@ -929,6 +1595,7 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
+    local path_evidence=$9
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -1000,14 +1667,15 @@ function append_result {
         --argjson effective_args "$effective_args" \
         --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
-        '{schema:1,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
+        --argjson path_evidence "$path_evidence" \
+        '{schema:2,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
           outcome:$outcome,duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
-          relaxations:$relaxations,preprocessor:null,
+          relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -1023,7 +1691,7 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason=
+    local outcome=PASS reason='' path_evidence=null
     if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
@@ -1108,9 +1776,28 @@ function run_cell {
         fi
     fi
 
+    if [[ $backend == sabre ]]; then
+        path_evidence=$(collect_sabre_path_evidence "$cell_dir" \
+            "$(expected_sabre_execution_count "$mode")") || {
+            outcome=ERROR
+            reason="invalid SaBRe path evidence"
+            path_evidence=null
+        }
+        if [[ $outcome == PASS && $(jq -r '.eligible // false' <<<"$path_evidence") != true ]]; then
+            outcome=FAIL
+            reason=$(jq -r '
+                "SaBRe path ineligible: executions=\(.execution_count)/\(.expected_execution_count), "
+                + "guest_rpc_observed=\(.guest_rpc_observed), "
+                + "ptrace_fallback_sites=\(.ptrace_fallback_sites), "
+                + "trusted_shared_object_sites=\(.trusted_shared_object_sites), "
+                + "trusted_shared_objects=\(.trusted_shared_objects | join(","))"
+            ' <<<"$path_evidence")
+        fi
+    fi
+
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -1203,7 +1890,9 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_sabre_path_evidence_contract
         audit_test_footprints
+        python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
