@@ -4387,7 +4387,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
@@ -4445,7 +4445,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
@@ -4503,7 +4503,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
@@ -4561,7 +4561,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
@@ -4619,7 +4619,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
@@ -4677,7 +4677,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
