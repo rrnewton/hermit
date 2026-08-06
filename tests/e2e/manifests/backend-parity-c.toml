@@ -3190,9 +3190,10 @@ program = "tests/c/getpriority_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "dbt", "kvm"]
+ci = true
+backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
+kvm = "KVM times out before guest start on the validation host, so no getpriority verdict is available; re-enable when the startup livelock is fixed"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
