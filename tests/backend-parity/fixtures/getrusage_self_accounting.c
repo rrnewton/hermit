@@ -18,6 +18,20 @@
 // native passes only the acceptance and the always-zero major-fault check
 // (ok=2) because it faithfully reports real CPU time, minor faults, and an
 // involuntary context switch.
+//
+// EMISSION CONTRACT: the fixture prints every accounting field it checked, not
+// just a count of passing checks. The determinized value IS the observation
+// here, so hiding it behind `ok=N` is what made this fixture blind. Two
+// concrete failures the old `getrusage ok=N` line could not express:
+//   * A backend that zeroes ru_utime but leaks ru_minflt, and a backend that
+//     does the reverse, both print `getrusage ok=5`. Same bytes, different
+//     defects, and the two backends compare EQUAL to each other, so
+//     cross-backend parity can never separate them.
+//   * A backend that determinizes to a wrong-but-constant value scores exactly
+//     as low as one where the field is not determinized at all.
+// The fixture also used to `return 0` unconditionally, so it could not fail by
+// exit status either -- the tally was its only channel and the tally was blind.
+// It now fails closed when any check fails.
 
 #include <stdio.h>
 #include <string.h>
@@ -49,6 +63,20 @@ int main(void) {
 
     // Consume acc so the burn loop cannot be optimized away.
     if (acc == 0) return 2;
-    printf("getrusage ok=%d\n", ok);
-    return 0;
+
+    // Emit every accounting field that was checked. Under Hermit these are the
+    // determinized zeros; natively they are the host's real CPU accounting, so
+    // the line distinguishes "determinized" from "determinized to the wrong
+    // value" from "not determinized at all".
+    printf("getrusage ok=%d accepted=%d utime_sec=%lld utime_usec=%lld "
+           "stime_sec=%lld stime_usec=%lld minflt=%ld majflt=%ld "
+           "nvcsw=%ld nivcsw=%ld\n",
+           ok, rc == 0,
+           (long long)ru.ru_utime.tv_sec, (long long)ru.ru_utime.tv_usec,
+           (long long)ru.ru_stime.tv_sec, (long long)ru.ru_stime.tv_usec,
+           ru.ru_minflt, ru.ru_majflt, ru.ru_nvcsw, ru.ru_nivcsw);
+
+    // Fail closed: previously this returned 0 even when checks failed, so the
+    // fixture could not signal a defect through exit status at all.
+    return ok == 6 ? 0 : 1;
 }

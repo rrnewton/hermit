@@ -40,7 +40,7 @@
 /* Poison sentinel: a value neither Detcore nor the kernel writes on success. */
 #define SENTINEL 0x7f
 
-static int query_move_pages(int iter, void *const pages[2]) {
+static int query_move_pages(int iter, void *const pages[2], int out_status[2]) {
   int status[2] = {SENTINEL, SENTINEL};
 
   /* nodes == NULL selects location-query mode; pid 0 targets this process. */
@@ -51,6 +51,8 @@ static int query_move_pages(int iter, void *const pages[2]) {
             ret);
     return 1;
   }
+  out_status[0] = status[0];
+  out_status[1] = status[1];
   for (int p = 0; p < 2; p++) {
     if (status[p] != 0) {
       fprintf(stderr,
@@ -95,12 +97,22 @@ int main(void) {
   void *const pages[2] = {region, region + page_size};
 
   /* Repeat to prove the determinized answer is stable, not incidental. */
+  int status[2] = {SENTINEL, SENTINEL};
   for (int i = 0; i < 4; i++) {
-    if (query_move_pages(i, pages)) {
+    if (query_move_pages(i, pages, status)) {
       return 1;
     }
   }
 
-  puts("numa-node-identity-ok");
+  /* Emit the observations rather than a success token. resident_node and
+   * absent_node are the determinized answers this contract exists to pin: a real
+   * kernel reports -ENOENT (-2) for the not-present page, so absent_node=0 is
+   * Detcore's single-virtual-node determinization and is the value a divergent
+   * backend would get wrong. Printing only "numa-node-identity-ok" meant a
+   * backend reporting the WRONG constant node produced byte-identical output,
+   * and two backends agreeing on the same wrong node could never be separated
+   * by comparing them. */
+  printf("numa-node-identity mempolicy_mode=%d resident_node=%d absent_node=%d\n",
+         mode, status[0], status[1]);
   return 0;
 }
