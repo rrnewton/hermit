@@ -2376,9 +2376,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         // Same guest-logical-control point that already anchors the stack/heap hashes: the
         // syscall is complete and its result written back, so the guest logically has control.
-        let control_point_regs = guest.regs().await;
-        let regs_seq = guest.thread_state().stats.syscall_count;
-        self.detlog_registers(guest, &control_point_regs, regs_seq);
+        // Reading registers is itself backend work, so keep the disabled path inert.  In
+        // particular, a run that does not request register evidence must not be perturbed by
+        // collecting data that will immediately be discarded.
+        if self.cfg.detlog_regs {
+            let control_point_regs = guest.regs().await;
+            let regs_seq = guest.thread_state().stats.syscall_count;
+            self.detlog_registers(guest, &control_point_regs, regs_seq);
+        }
         self.detlog_memory_maps(guest)?;
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
