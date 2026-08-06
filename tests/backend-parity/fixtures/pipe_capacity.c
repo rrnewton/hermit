@@ -46,7 +46,8 @@ int main(void) {
     if (shrunk > 0 && shrunk <= def) {
         ok++;
     }
-    if (shrunk > 0 && fcntl(fds[1], F_GETPIPE_SZ) == shrunk) {
+    int readback = shrunk > 0 ? fcntl(fds[1], F_GETPIPE_SZ) : -1;
+    if (shrunk > 0 && readback == shrunk) {
         ok++;
     }
     close(fds[0]);
@@ -54,6 +55,24 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("pipecap ok=%d\n", ok);
+    /*
+     * Emit the OBSERVED CAPACITIES, not just the check tally.
+     *
+     * `ok=N` answers "did this backend satisfy my checks", never "did the
+     * backends OBSERVE THE SAME THING". Two backends can report different pipe
+     * capacities and still both satisfy every relational check above -- def>0,
+     * shrunk<=def, readback==shrunk hold for ANY consistent pair of numbers --
+     * so both printed the identical byte stream `pipecap ok=5` and their
+     * disagreement was structurally invisible to a stdout parity comparison.
+     * Printing the numbers is what makes that comparison able to see anything.
+     *
+     * These are safe to print under `--strict --verify`, which double-runs and
+     * compares stdout: the default pipe size and the post-F_SETPIPE_SZ readback
+     * are kernel constants for a given host, stable across runs. They vary
+     * BETWEEN hosts, which is precisely why the old header refused to print
+     * them -- but parity compares backends on ONE host, and buying host-stable
+     * bytes by discarding the observation is what created the blind spot.
+     */
+    printf("pipecap ok=%d def=%d shrunk=%d readback=%d\n", ok, def, shrunk, readback);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
