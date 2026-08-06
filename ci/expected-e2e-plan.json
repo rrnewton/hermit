@@ -568,6 +568,13 @@
       "test": "language-runtimes/tcl-rand-clock"
     },
     {
+      "backend": "dbi",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/host-identity"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -587,6 +594,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/fcntl-owner"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/host-identity"
     },
     {
       "backend": "ptrace",
