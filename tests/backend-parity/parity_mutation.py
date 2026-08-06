@@ -121,17 +121,79 @@ FIXTURES: dict[str, FixtureSpec] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Strictness tiers
+# ---------------------------------------------------------------------------
+#
+# "Parity" is not one predicate. A green must say WHICH streams it compared,
+# because a green that does not is exactly how the predecessor reported PASS
+# for a mutation it never looked at. Each tier is a superset of the one below.
+#
+#   TIER-1  exit status + stdout
+#   TIER-2  + stderr
+#   TIER-3  + the unstripped hermit INFO log
+#   TIER-4  + stack/heap observations (not yet produced by this harness)
+#
+# Cross-backend note, and it is the reason tiers exist rather than one boolean:
+# different backends legitimately emit different INFO logs (backend name,
+# interception detail), so requiring TIER-3 equality between the ptrace golden
+# and a candidate would be red everywhere for reasons that are not parity
+# defects. A lane that is red everywhere gets disabled wholesale. So a
+# cross-backend cell REPORTS the highest tier it achieves; it does not pretend
+# to a tier it cannot reach. Same-backend legs (golden vs mutated) are held to
+# the fixture's top supported tier, because there the log genuinely should match.
+
+TIER_STREAMS: tuple[tuple[int, str], ...] = (
+    (1, "exit+stdout"),
+    (2, "+stderr"),
+    (3, "+info-log"),
+)
+MAX_TIER = TIER_STREAMS[-1][0]
+TIER_NAMES: dict[int, str] = {n: label for n, label in TIER_STREAMS}
+
+
+def tier_label(tier: int) -> str:
+    parts = [label for n, label in TIER_STREAMS if n <= tier]
+    return f"TIER-{tier} ({' '.join(parts)})" if parts else "TIER-0 (nothing compared)"
+
+
 @dataclasses.dataclass(frozen=True)
 class Observation:
-    """The guest-visible result of one fixture execution: what parity compares."""
+    """The guest-visible result of one fixture execution: what parity compares.
+
+    Carries every stream the strict standard names. The predecessor carried
+    only (exit_status, stdout) and discarded stderr at the ``communicate``
+    call, so a mutation visible solely in stderr or in the INFO log compared
+    EQUAL and reported PASS. Widening the type is the fix; a comparison cannot
+    be stricter than the thing it compares.
+    """
 
     exit_status: int
     stdout: bytes
+    stderr: bytes = b""
+    info_log: bytes = b""
+
+    def stream(self, tier: int) -> tuple:
+        """The comparison key at a given tier. Tiers nest, so this is a prefix."""
+        key: list = [self.exit_status, self.stdout]
+        if tier >= 2:
+            key.append(self.stderr)
+        if tier >= 3:
+            key.append(self.info_log)
+        return tuple(key)
+
+    def matches(self, other: "Observation", tier: int) -> bool:
+        return self.stream(tier) == other.stream(tier)
 
     def __eq__(self, other: object) -> bool:
+        """Equality is TIER-1 and is kept only for existing call sites.
+
+        Prefer :meth:`matches` with an explicit tier: an untiered ``==`` is a
+        comparison that does not record what it compared.
+        """
         if not isinstance(other, Observation):
             return NotImplemented
-        return self.exit_status == other.exit_status and self.stdout == other.stdout
+        return self.matches(other, 1)
 
     def is_empty(self) -> bool:
         """True when this run emitted no identity payload at all.
@@ -140,12 +202,35 @@ class Observation:
         observation-free run reports parity. That is the vacuity that let a
         vdso fixture go green by emitting no bytes: nothing was compared, and
         nothing-vs-nothing matched.
+
+        Deliberately keyed on STDOUT only: the identity payload is the fixture's
+        canonical stdout line. A run that emits only a stderr warning has still
+        produced no identity payload and must not qualify.
         """
         return not self.stdout.strip()
 
     def summary(self) -> str:
-        text = self.stdout.decode("utf-8", "replace").strip().replace("\n", " | ")
-        return f"exit={self.exit_status} stdout={text!r}"
+        def show(raw: bytes) -> str:
+            return raw.decode("utf-8", "replace").strip().replace("\n", " | ")
+
+        parts = [f"exit={self.exit_status}", f"stdout={show(self.stdout)!r}"]
+        if self.stderr.strip():
+            parts.append(f"stderr={show(self.stderr)[:120]!r}")
+        if self.info_log.strip():
+            parts.append(f"info-log={len(self.info_log)}B")
+        return " ".join(parts)
+
+    def first_differing_tier(self, other: "Observation") -> int | None:
+        """Lowest tier at which these two disagree, or None if equal through MAX_TIER."""
+        for tier, _ in TIER_STREAMS:
+            if not self.matches(other, tier):
+                return tier
+        return None
+
+    def achieved_tier(self, other: "Observation") -> int:
+        """Highest tier at which these two agree (0 if they differ at TIER-1)."""
+        first = self.first_differing_tier(other)
+        return MAX_TIER if first is None else first - 1
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +286,52 @@ def source_declared_fields(spec: FixtureSpec) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def _run(command: list[str], env: dict[str, str], timeout: int) -> Observation | None:
+# Hermit writes its own diagnostics to stderr interleaved with the guest's, in
+# the tracing default format:
+#
+#   2026-08-06T21:53:42.208442Z  INFO detcore::scheduler::runqueue: DETLOG ...
+#   ^ RFC3339 timestamp          ^ level
+#
+# Splitting them is what makes TIER-2 and TIER-3 separable; lumping them
+# together makes every guest stderr byte look like a log line and vice versa.
+#
+# NOTE the leading timestamp: an earlier version of this regex anchored the
+# level at the start of the line, so EVERY hermit log line fell through to the
+# "guest stderr" bucket. The visible symptom was every cross-backend cell
+# reporting TIER-1 -- not because the backends differed, but because TIER-2 was
+# comparing wall-clock timestamps against themselves. A tier that can never be
+# reached is a vacuous tier, so this pattern is load-bearing.
+_LOG_LINE_RE = re.compile(
+    rb"^(?P<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)?\s*(?:\[[^\]]*\]\s*)?"
+    rb"(?:TRACE|DEBUG|INFO|WARN|ERROR)\b"
+)
+_TIMESTAMP_RE = re.compile(rb"\d{4}-\d{2}-\d{2}T[\d:.]+Z")
+
+
+def normalize_log(raw: bytes) -> bytes:
+    """Blank wall-clock timestamps in a log stream.
+
+    "Unstripped" means we do not discard log CONTENT -- not that we compare
+    wall-clock readings. A timestamp differs between any two runs, including
+    two runs of the same backend, so leaving it in makes TIER-3 unreachable by
+    construction and therefore meaningless. Everything else in the line, target
+    and message included, is compared byte for byte.
+    """
+    return _TIMESTAMP_RE.sub(b"<TS>", raw)
+
+
+def split_stderr(raw: bytes) -> tuple[bytes, bytes]:
+    """Split a combined stderr stream into (guest stderr, hermit INFO log)."""
+    guest: list[bytes] = []
+    log: list[bytes] = []
+    for line in raw.splitlines(keepends=True):
+        (log if _LOG_LINE_RE.match(line) else guest).append(line)
+    return b"".join(guest), normalize_log(b"".join(log))
+
+
+def _run(
+    command: list[str], env: dict[str, str], timeout: int, capture_log: bool = False
+) -> Observation | None:
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -211,12 +341,18 @@ def _run(command: list[str], env: dict[str, str], timeout: int) -> Observation |
         start_new_session=True,
     )
     try:
-        stdout, _ = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         return None
-    return Observation(process.returncode, stdout)
+    # stderr was previously captured and then DISCARDED here (`stdout, _ = ...`),
+    # which is why a mutation visible only in stderr compared equal and passed.
+    if capture_log:
+        guest_stderr, info_log = split_stderr(stderr)
+    else:
+        guest_stderr, info_log = stderr, b""
+    return Observation(process.returncode, stdout, guest_stderr, info_log)
 
 
 def observe_native(binary: Path, mutate: str | None) -> Observation | None:
@@ -229,7 +365,10 @@ def observe_native(binary: Path, mutate: str | None) -> Observation | None:
 
 
 def _hermit_command(hermit: Path, backend: str, binary: Path, mutate: str | None) -> list[str]:
-    command = [str(hermit), "run"]
+    # --log=info is what makes TIER-3 possible at all: without it hermit emits
+    # no INFO log, so "compare the unstripped INFO log" would be comparing two
+    # empty strings — a vacuous pass wearing the name of the strictest tier.
+    command = [str(hermit), "--log=info", "run"]
     if backend != GOLDEN_BACKEND:
         command.extend(["--backend", backend])
     command.extend(["--strict", "--base-env=minimal", "--max-timeslice=disabled", "--tmp=/tmp"])
@@ -247,7 +386,12 @@ def observe_hermit(
     """Run the fixture under a hermit backend, optionally planting a mutation."""
     env = dict(os.environ)
     env.pop("HERMIT_PARITY_MUTATE", None)  # only the guest, via --env, should see it
-    return _run(_hermit_command(hermit, backend, binary, mutate), env, HERMIT_TIMEOUT_S)
+    return _run(
+        _hermit_command(hermit, backend, binary, mutate),
+        env,
+        HERMIT_TIMEOUT_S,
+        capture_log=True,
+    )
 
 
 def backend_available(hermit: Path, backend: str) -> tuple[bool, str]:
@@ -274,6 +418,10 @@ class Report:
     checks: int = 0
     failures: list[str] = dataclasses.field(default_factory=list)
     skips: list[str] = dataclasses.field(default_factory=list)
+    # Per-cell achieved strictness. A green that does not record which streams
+    # it compared is the defect this harness exists to remove, so the tier
+    # travels with the verdict rather than being inferred from the run mode.
+    tiers: dict[str, int] = dataclasses.field(default_factory=dict)
 
     def ok(self, message: str) -> None:
         self.checks += 1
@@ -288,11 +436,32 @@ class Report:
         self.skips.append(message)
         print(f"  SKIP {message}")
 
+    def tier(self, label: str, achieved: int) -> None:
+        self.tiers[label] = achieved
+
+    def tier_summary(self) -> str:
+        if not self.tiers:
+            return "no parity cells recorded a tier"
+        buckets: dict[int, int] = {}
+        for achieved in self.tiers.values():
+            buckets[achieved] = buckets.get(achieved, 0) + 1
+        parts = [f"{count} at {tier_label(t)}" for t, count in sorted(buckets.items(), reverse=True)]
+        return f"{len(self.tiers)} parity cell(s): " + "; ".join(parts)
+
 
 def require_divergence(
-    report: Report, label: str, golden: Observation | None, mutated: Observation | None
+    report: Report,
+    label: str,
+    golden: Observation | None,
+    mutated: Observation | None,
+    tier: int = 1,
 ) -> None:
-    """Assert that a planted mutation was CAUGHT (mutated diverges from golden)."""
+    """Assert that a planted mutation was CAUGHT at ``tier`` or below.
+
+    Detection at a LOWER tier counts: a mutation caught by stdout is caught.
+    What must not happen is a mutation invisible through ``tier``, because that
+    is a field the harness cannot see and therefore cannot police.
+    """
     if golden is None or mutated is None:
         report.fail(f"{label}: run timed out (golden={golden}, mutated={mutated})")
         return
@@ -302,22 +471,38 @@ def require_divergence(
             f"there was nothing a mutation could perturb"
         )
         return
-    if mutated == golden:
+    caught_at = golden.first_differing_tier(mutated)
+    if caught_at is None or caught_at > tier:
         report.fail(
-            f"{label}: VACUOUS -- mutation changed nothing; field is not "
-            f"load-bearing (both {golden.summary()})"
+            f"{label}: VACUOUS at {tier_label(tier)} -- mutation changed nothing "
+            f"the harness compares; field is not load-bearing "
+            f"(both {golden.summary()})"
         )
     else:
-        report.ok(f"{label}: divergence caught (golden {golden.summary()} != mutated {mutated.summary()})")
+        report.ok(
+            f"{label}: divergence caught at {tier_label(caught_at)} "
+            f"(golden {golden.summary()} != mutated {mutated.summary()})"
+        )
 
 
 def require_parity(
-    report: Report, label: str, golden: Observation | None, candidate: Observation | None
-) -> None:
-    """Assert that a clean candidate run MATCHES the golden ptrace reference."""
+    report: Report,
+    label: str,
+    golden: Observation | None,
+    candidate: Observation | None,
+    min_tier: int = 1,
+) -> int:
+    """Assert clean candidate == golden ptrace reference, and RECORD THE TIER.
+
+    Returns the achieved tier (0 on failure). ``min_tier`` is the floor a cell
+    must clear to count as parity at all; the achieved tier is reported
+    separately so a green carries what it actually verified rather than a bare
+    PASS. That distinction is the whole point: the rejected predecessor's PASS
+    did not say which streams it had looked at, and the answer was "two".
+    """
     if golden is None or candidate is None:
         report.fail(f"{label}: run timed out (golden={golden}, candidate={candidate})")
-        return
+        return 0
     # NON-VACUITY leg. Checked BEFORE equality, because empty == empty is the
     # exact shape that reports success while comparing nothing.
     if golden.is_empty() or candidate.is_empty():
@@ -326,13 +511,19 @@ def require_parity(
             f"(golden {golden.summary()}, candidate {candidate.summary()}); "
             f"a run that emits nothing must not report parity"
         )
-        return
-    if candidate == golden:
-        report.ok(f"{label}: parity with golden ({golden.summary()})")
-    else:
+        return 0
+    achieved = golden.achieved_tier(candidate)
+    if achieved < min_tier:
+        first = golden.first_differing_tier(candidate)
         report.fail(
-            f"{label}: PARITY BREAK -- golden {golden.summary()} != candidate {candidate.summary()}"
+            f"{label}: PARITY BREAK at {tier_label(first or min_tier)} "
+            f"(achieved {tier_label(achieved)}, required {tier_label(min_tier)}) -- "
+            f"golden {golden.summary()} != candidate {candidate.summary()}"
         )
+        return 0
+    report.tier(label, achieved)
+    report.ok(f"{label}: parity at {tier_label(achieved)} ({golden.summary()})")
+    return achieved
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +578,7 @@ def run_hermit(
     hermit: Path,
     candidates: tuple[str, ...],
     require_backend: bool,
+    min_tier: int = 1,
 ) -> None:
     print(f"[hermit] {name}")
     # Golden ptrace reference: the default comparison target.
@@ -406,12 +598,33 @@ def run_hermit(
         return
     report.ok(f"{name} [hermit/{GOLDEN_BACKEND}]: golden reference ({golden.summary()})")
 
+    # GOLDEN SELF-CONSISTENCY, and it is the positive control for the whole
+    # tier ladder. Run the golden backend a SECOND time and require the top
+    # tier. If ptrace cannot match itself through the INFO log, then TIER-3 is
+    # unreachable by construction and every "achieved TIER-1" below would be an
+    # artifact of the harness rather than a statement about the candidate.
+    # A ladder whose top rung nothing can stand on is decoration.
+    golden_repeat = observe_hermit(hermit, GOLDEN_BACKEND, binary, mutate=None)
+    require_parity(
+        report,
+        f"{name} [hermit/{GOLDEN_BACKEND}] self-consistency",
+        golden,
+        golden_repeat,
+        min_tier=MAX_TIER,
+    )
+
     # Seam works through hermit + --env passthrough (prove the mutation is
     # observable under the golden backend before trusting it as a probe).
     for field in spec.fields:
         mutated = observe_hermit(hermit, GOLDEN_BACKEND, binary, mutate=field)
+        # Same backend on both sides, so the INFO log SHOULD match apart from
+        # the mutation: hold this leg to the strictest tier.
         require_divergence(
-            report, f"{name} [hermit/{GOLDEN_BACKEND}] mutate({field})", golden, mutated
+            report,
+            f"{name} [hermit/{GOLDEN_BACKEND}] mutate({field})",
+            golden,
+            mutated,
+            tier=MAX_TIER,
         )
 
     for backend in candidates:
@@ -427,18 +640,135 @@ def run_hermit(
             continue
         # (b) clean candidate run -> assert parity with golden ptrace.
         clean = observe_hermit(hermit, backend, binary, mutate=None)
-        require_parity(report, f"{name} [hermit/{backend}] clean", golden, clean)
+        require_parity(
+            report, f"{name} [hermit/{backend}] clean", golden, clean, min_tier=min_tier
+        )
         # (a) plant a divergence in this backend -> assert it is caught.
         for field in spec.fields:
             mutated = observe_hermit(hermit, backend, binary, mutate=field)
             require_divergence(
-                report, f"{name} [hermit/{backend}] mutate({field})", golden, mutated
+                report,
+                f"{name} [hermit/{backend}] mutate({field})",
+                golden,
+                mutated,
+                tier=max(min_tier, 1),
             )
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Self-test: prove the harness can FAIL
+# ---------------------------------------------------------------------------
+#
+# A mutation harness that cannot fail is the ultimate vacuous guard, so the
+# harness brackets ITSELF. Each case plants a condition directly against the
+# comparators and asserts the verdict, then a positive control asserts the same
+# comparator still accepts a legitimate run — a checker that rejects everything
+# passes every negative and is worthless.
+#
+# The four bracket cases are the ones the closure of PR #1641 named. Two of
+# them (stdout-only, stderr-drift) were IMPOSSIBLE to express before, because
+# Observation did not carry stderr at all.
+
+
+def _obs(exit_status=0, stdout=b"id: 1\n", stderr=b"", info=b"") -> Observation:
+    return Observation(exit_status, stdout, stderr, info)
+
+
+def run_self_test(report: Report) -> None:
+    print("[self-test] harness bracket cases")
+
+    # --- NEGATIVE: omitted. A run that emits nothing must not report parity.
+    require_parity(report, "self-test/omitted", _obs(stdout=b""), _obs(stdout=b""), min_tier=1)
+    # --- NEGATIVE: inert. A mutation that perturbs nothing observable is a
+    #     field the harness cannot police, not a passing field.
+    require_divergence(report, "self-test/inert", _obs(), _obs(), tier=MAX_TIER)
+
+    # --- NEGATIVE: stdout-only. The named predecessor defect: an exit-0
+    #     mutation whose only effect is in stdout must be CAUGHT, and a
+    #     candidate differing only in stdout must NOT report parity.
+    require_parity(
+        report, "self-test/stdout-drift", _obs(stdout=b"id: 1\n"), _obs(stdout=b"id: 2\n")
+    )
+
+    # --- NEGATIVE: stderr-drift. Unexpressible before this change. Identical
+    #     exit status and identical stdout, differing ONLY in stderr: the
+    #     predecessor compared equal here and reported PASS.
+    require_parity(
+        report,
+        "self-test/stderr-drift",
+        _obs(stderr=b"warn: fallback\n"),
+        _obs(stderr=b""),
+        min_tier=2,
+    )
+    require_divergence(
+        report,
+        "self-test/stderr-mutation",
+        _obs(stderr=b""),
+        _obs(stderr=b"warn: fallback\n"),
+        tier=2,
+    )
+
+    # --- NEGATIVE: info-log drift is invisible at TIER-2 and caught at TIER-3.
+    #     This is what makes the tier a real distinction rather than a label.
+    require_parity(
+        report,
+        "self-test/info-drift-at-tier3",
+        _obs(info=b"INFO a\n"),
+        _obs(info=b"INFO b\n"),
+        min_tier=3,
+    )
+
+    # --- POSITIVE CONTROLS. Without these the negatives above are satisfied by
+    #     a comparator that refuses everything.
+    achieved = require_parity(
+        report,
+        "self-test/positive-identical",
+        _obs(stderr=b"w\n", info=b"INFO a\n"),
+        _obs(stderr=b"w\n", info=b"INFO a\n"),
+        min_tier=MAX_TIER,
+    )
+    if achieved != MAX_TIER:
+        report.fail(
+            f"self-test/positive-identical: identical observations must reach "
+            f"{tier_label(MAX_TIER)}, got {tier_label(achieved)}"
+        )
+    else:
+        report.ok(f"self-test/positive-identical: reached {tier_label(MAX_TIER)}")
+    require_divergence(
+        report, "self-test/positive-divergence", _obs(stdout=b"id: 1\n"), _obs(stdout=b"id: 2\n")
+    )
+    # --- POSITIVE: a candidate that matches through stdout but drifts in the
+    #     INFO log must still report parity AT TIER-2 rather than be rejected.
+    #     This is the case that keeps cross-backend cells usable.
+    tier2 = require_parity(
+        report,
+        "self-test/positive-tier2-with-log-drift",
+        _obs(info=b"INFO ptrace\n"),
+        _obs(info=b"INFO dbi\n"),
+        min_tier=2,
+    )
+    if tier2 != 2:
+        report.fail(f"self-test/positive-tier2-with-log-drift: expected TIER-2, got {tier2}")
+
+
+def self_test_expectations() -> dict[str, bool]:
+    """label -> True if that self-test case is EXPECTED to fail."""
+    return {
+        "self-test/omitted": True,
+        "self-test/inert": True,
+        "self-test/stdout-drift": True,
+        "self-test/stderr-drift": True,
+        "self-test/stderr-mutation": False,
+        "self-test/info-drift-at-tier3": True,
+        "self-test/positive-identical": False,
+        "self-test/positive-divergence": False,
+        "self-test/positive-tier2-with-log-drift": False,
+    }
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -479,11 +809,66 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="keep compiled fixture binaries for inspection",
     )
+    parser.add_argument(
+        "--min-tier",
+        type=int,
+        default=1,
+        choices=[n for n, _ in TIER_STREAMS],
+        help="floor a cross-backend cell must clear to count as parity "
+        "(1 exit+stdout, 2 +stderr, 3 +unstripped INFO log); the ACHIEVED "
+        "tier is recorded per cell regardless",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="bracket the harness itself: prove each comparator FAILS on its "
+        "planted negative and still accepts its positive control. Exits "
+        "nonzero if any expectation is not met.",
+    )
     return parser.parse_args(argv)
+
+
+def run_self_test_mode() -> int:
+    """Run the bracket cases and verify each produced its EXPECTED verdict."""
+    report = Report()
+    run_self_test(report)
+    expectations = self_test_expectations()
+    failed_labels = {msg.split(":", 1)[0].strip() for msg in report.failures}
+
+    print()
+    mismatches: list[str] = []
+    for label, should_fail in sorted(expectations.items()):
+        did_fail = label in failed_labels
+        verdict = "OK " if did_fail == should_fail else "BAD"
+        want = "FAIL" if should_fail else "PASS"
+        got = "FAIL" if did_fail else "PASS"
+        print(f"  {verdict} {label}: expected {want}, got {got}")
+        if did_fail != should_fail:
+            mismatches.append(f"{label}: expected {want}, got {got}")
+
+    negatives = sum(1 for v in expectations.values() if v)
+    positives = len(expectations) - negatives
+    print()
+    print(
+        f"parity-mutation self-test: {len(expectations)} bracket case(s) "
+        f"({negatives} planted negative(s) that MUST fail, "
+        f"{positives} positive control(s) that MUST pass); "
+        f"{len(mismatches)} mismatch(es)"
+    )
+    if mismatches:
+        for bad in mismatches:
+            print(f"  MISMATCH {bad}")
+        return 1
+    print("  harness is PROVEN ABLE TO FAIL: every planted negative was refused,")
+    print("  and every positive control was still accepted (so it is not inert).")
+    return 0
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+
+    if args.self_test:
+        return run_self_test_mode()
 
     selected = args.fixtures or list(FIXTURES)
     unknown = [name for name in selected if name not in FIXTURES]
@@ -512,6 +897,7 @@ def main(argv: list[str]) -> int:
                         args.hermit,
                         candidates,
                         args.require_backend,
+                        args.min_tier,
                     )
     finally:
         if not args.keep:
@@ -522,6 +908,11 @@ def main(argv: list[str]) -> int:
         f"parity-mutation: {report.checks} checks, "
         f"{len(report.failures)} failed, {len(report.skips)} skipped"
     )
+    # A green must carry what it verified. Print the achieved strictness per
+    # cell, not just a count of passes.
+    print(f"parity-mutation strictness: {report.tier_summary()}")
+    for label, achieved in sorted(report.tiers.items()):
+        print(f"  tier: {label} -> {tier_label(achieved)}")
     for skipped in report.skips:
         print(f"  skipped: {skipped}")
     for failed in report.failures:
