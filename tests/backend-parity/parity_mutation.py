@@ -134,6 +134,30 @@ FIXTURES: dict[str, FixtureSpec] = {
 #   TIER-3  + the unstripped hermit INFO log
 #   TIER-4  + stack/heap observations (not yet produced by this harness)
 #
+# RELATIONSHIP TO THE PRODUCT'S OWN L-LEVELS, stated so the two vocabularies do
+# not silently drift apart. `hermit run --strict --verify --verify-strict`
+# establishes L2 under the `BitwiseInfoV1` policy (detcore/src/logdiff.rs), and
+# that is the authority for what "bitwise" means in this repository. But
+# --verify compares a backend against ITSELF on a repeat run; it cannot compare
+# one backend against another, which is what parity means here. So this harness
+# is not a substitute for --verify-strict and does not reimplement it -- it
+# applies the same idea across backends.
+#
+# TIER-2 corresponds to what KVM's --verify can currently assert (exit status,
+# stdout, stderr) and TIER-3 to the full-INFO envelope, which is why the repo
+# says KVM "cannot claim full L2 INFO parity until internal log comparison
+# exists".
+#
+# KNOWN GAP, and it is deliberate rather than overlooked: BitwiseInfoV1 both
+# removes the wall-clock prefix AND ordinalizes host addresses marked with the
+# `<hostaddr 0x...>` wrapper, preserving identity and order. TIER-3 here does
+# only the wall-clock part. That makes TIER-3 CONSERVATIVE: an unmarked host
+# address differing between runs reports a parity BREAK that BitwiseInfoV1
+# would forgive. It can therefore understate an achieved tier, never overstate
+# one -- a false negative, not a false green. Adopting the product
+# canonicalizer here is the right follow-up; until then, read a TIER-2 result
+# as "TIER-2 or better".
+#
 # Cross-backend note, and it is the reason tiers exist rather than one boolean:
 # different backends legitimately emit different INFO logs (backend name,
 # interception detail), so requiring TIER-3 equality between the ptrace golden
