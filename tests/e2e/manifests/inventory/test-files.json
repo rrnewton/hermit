@@ -1597,6 +1597,12 @@
       "why": "tests/chaos/order_violation.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/chaos/thread_interleaving.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/chaos/thread_interleaving.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/compat/complex_shell_workload.sh",
       "runner": "validate.sh compatibility partitions",
