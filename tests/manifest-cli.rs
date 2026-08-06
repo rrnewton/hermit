@@ -302,9 +302,17 @@ fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
             let file_type = entry
                 .file_type()
                 .unwrap_or_else(|e| fail(format!("cannot inspect {}: {e}", path.display())));
+            let is_toml = path.extension().is_some_and(|ext| ext == "toml");
+            if file_type.is_symlink() && is_toml {
+                let relative = path.strip_prefix(manifest_root).unwrap_or(&path);
+                fail(format!(
+                    "{}: manifest documents must be regular files, not symlinks",
+                    relative.display()
+                ));
+            }
             if file_type.is_dir() {
                 directories.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "toml") {
+            } else if file_type.is_file() && is_toml {
                 let relative = path
                     .strip_prefix(manifest_root)
                     .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));

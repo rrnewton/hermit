@@ -63,6 +63,7 @@ import argparse
 import contextlib
 import difflib
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,19 @@ L2_PASS = {"detlog", "guest"}  # a real --verify witness; "gap" means no witness
 
 class ConvertError(Exception):
     """A source row/fixture that cannot be auto-converted; reported, not fatal."""
+
+
+SAFE_ROW_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+
+
+def manifest_slug(row_name: str) -> str:
+    """Return the shard slug for one safe matrix-row filename component."""
+    if not SAFE_ROW_NAME.fullmatch(row_name) or row_name in (".", ".."):
+        raise ConvertError(
+            f"{row_name!r}: matrix row name must be one non-empty safe filename component "
+            "containing only ASCII letters, digits, '_' or '-'"
+        )
+    return row_name.replace("_", "-")
 
 
 @dataclass
@@ -144,6 +158,7 @@ def parse_matrix_row(raw: str) -> MatrixRow:
     else:
         raise ConvertError(f"unexpected column count {len(cols)} (want 6 or 11)")
 
+    manifest_slug(row.name)
     for backend in ("ptrace", "dbi", "kvm"):
         if getattr(row, backend) not in ("pass", "gap"):
             raise ConvertError(f"{row.name}/{backend}: expected pass|gap")
@@ -169,7 +184,7 @@ class Plan:
 def build_plan(
     row: MatrixRow, program: str, fixture_content: str | None, note: str = ""
 ) -> Plan:
-    slug = row.name.replace("_", "-")
+    slug = manifest_slug(row.name)
     enabled = ["ptrace"]
     disabled: dict = {}
 
@@ -284,13 +299,45 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def discover_manifest_documents(manifest_root: Path):
+    for path in sorted(manifest_root.rglob("*.toml")):
+        relative = path.relative_to(manifest_root)
+        if path.is_symlink():
+            raise ConvertError(
+                f"{relative}: manifest documents must be regular files, not symlinks"
+            )
+        if path.is_file():
+            if len(relative.parts) > 2:
+                raise ConvertError(
+                    f"{relative}: manifest shards must be exactly one directory below manifests/"
+                )
+            yield path
+
+
 def manifest_has_id(plan: Plan, manifest_root: Path = MANIFEST_ROOT) -> bool:
     needle = f'id = "{BUCKET}/{plan.slug}"'
-    return any(needle in path.read_text() for path in manifest_root.rglob("*.toml"))
+    return any(
+        needle in path.read_text()
+        for path in discover_manifest_documents(manifest_root)
+    )
 
 
 def manifest_path(plan: Plan, manifest_root: Path = MANIFEST_ROOT) -> Path:
-    return manifest_root / BUCKET / f"{plan.slug}.toml"
+    expected_slug = manifest_slug(plan.name)
+    if plan.slug != expected_slug:
+        raise ConvertError(
+            f"refusing inconsistent manifest slug {plan.slug!r}; expected {expected_slug!r}"
+        )
+    required_bucket = manifest_root / BUCKET
+    target = required_bucket / f"{plan.slug}.toml"
+    resolved_root = manifest_root.resolve()
+    resolved_bucket = required_bucket.resolve()
+    resolved_parent = target.resolve().parent
+    if resolved_bucket.parent != resolved_root or resolved_parent != resolved_bucket:
+        raise ConvertError(
+            f"refusing manifest target outside required bucket {required_bucket}: {target}"
+        )
+    return target
 
 
 def render_manifest(plan: Plan) -> str:
@@ -503,6 +550,26 @@ def self_test() -> int:
         fixtures = repo / "tests/c"
         manifest_root.mkdir(parents=True)
         fixtures.mkdir(parents=True)
+
+        discovery_root = repo / "manifest-discovery"
+        discovery_bucket = discovery_root / BUCKET
+        discovery_bucket.mkdir(parents=True)
+        regular_document = discovery_bucket / "regular.toml"
+        linked_document = discovery_bucket / "linked.toml"
+        regular_document.write_text("schema = 2\n")
+        assert list(discover_manifest_documents(discovery_root)) == [regular_document]
+        linked_document.symlink_to("regular.toml")
+        try:
+            list(discover_manifest_documents(discovery_root))
+        except ConvertError:
+            pass
+        else:
+            raise AssertionError("manifest-document symlink was accepted")
+        linked_document.unlink()
+        regular_document.unlink()
+        discovery_bucket.rmdir()
+        discovery_root.rmdir()
+
         (fixtures / "probe_a.c").write_text("int main(void) { return 0; }\n")
         (fixtures / "probe_b.c").write_text("int main(void) { return 0; }\n")
 
@@ -522,6 +589,32 @@ def self_test() -> int:
             "tests/c/probe_b.c",
             None,
         )
+
+        assert plan_a.slug == "probe-a"
+        assert manifest_path(plan_a, manifest_root).parent.resolve() == (
+            manifest_root / BUCKET
+        ).resolve()
+        for unsafe_name in ("..", "../escape", "nested/probe", r"nested\probe"):
+            try:
+                parse_matrix_row(
+                    f"{unsafe_name}\tpass\tgap\tgap\tnot qualified\tnot qualified"
+                )
+            except ConvertError:
+                pass
+            else:
+                raise AssertionError(f"unsafe row name was accepted: {unsafe_name!r}")
+        forged_plan = build_plan(
+            parse_matrix_row("forged\tpass\tgap\tgap\tnot qualified\tnot qualified"),
+            "tests/c/probe_a.c",
+            None,
+        )
+        forged_plan.slug = "../escaped"
+        try:
+            manifest_path(forged_plan, manifest_root)
+        except ConvertError:
+            pass
+        else:
+            raise AssertionError("forged escaping shard slug was accepted")
 
         dry_run = io.StringIO()
         with contextlib.redirect_stdout(dry_run):

@@ -203,6 +203,35 @@ function check_inventory_partition {
     rm -rf "$scratch"
 }
 
+function discover_manifest_documents {
+    local manifest_root=${1:-$MANIFEST_ROOT} linked
+    linked=$(find "$manifest_root" -type l -name '*.toml' -print -quit)
+    [[ -z $linked ]] ||
+        die "${linked#"$ROOT_DIR/"}: manifest documents must be regular files, not symlinks"
+    find "$manifest_root" -type f -name '*.toml' -printf 'tests/e2e/manifests/%P\n'
+}
+
+function self_test_manifest_document_discovery {
+    local scratch manifest_root actual
+    scratch=$(mktemp -d)
+    manifest_root="$scratch/manifests"
+    actual="$scratch/actual"
+    mkdir -p "$manifest_root/backend-parity-c"
+    printf 'schema = 2\n' >"$manifest_root/backend-parity-c/regular.toml"
+
+    discover_manifest_documents "$manifest_root" >"$actual"
+    [[ $(<"$actual") == tests/e2e/manifests/backend-parity-c/regular.toml ]] ||
+        die "regular manifest-document positive control failed"
+
+    ln -s regular.toml "$manifest_root/backend-parity-c/linked.toml"
+    if (discover_manifest_documents "$manifest_root" >/dev/null 2>&1); then
+        die "manifest-document symlink negative control did not fail"
+    fi
+
+    rm -r -- "$scratch"
+    echo "PASS: manifest-document discovery accepts regular files and rejects symlinks"
+}
+
 function self_test_inventory_partition {
     local scratch expected explicit_paths manifest_programs manifest_documents rc
     scratch=$(mktemp -d)
@@ -261,7 +290,7 @@ function audit_inventory {
         [[ $test != direct:* ]] || continue
         printf '%s\n' "${test#"$ROOT_DIR/"}"
     done | LC_ALL=C sort >"$manifest_programs"
-    find "$MANIFEST_ROOT" -type f -name '*.toml' -printf 'tests/e2e/manifests/%P\n' |
+    discover_manifest_documents "$MANIFEST_ROOT" |
         LC_ALL=C sort >"$manifest_documents"
 
     if check_inventory_partition "$expected" "$explicit_paths" "$manifest_programs" "$manifest_documents"; then
@@ -1975,6 +2004,7 @@ case "$subcommand" in
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/retarget_to_manifest.py" --self-test
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
+        self_test_manifest_document_discovery
         self_test_inventory_partition
         audit_inventory
         audit_ci_correspondence

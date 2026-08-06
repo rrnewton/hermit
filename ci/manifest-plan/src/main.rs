@@ -89,12 +89,19 @@ fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
             let file_type = entry
                 .file_type()
                 .unwrap_or_else(|error| die(format!("cannot inspect {}: {error}", path.display())));
+            let is_toml = path
+                .extension()
+                .is_some_and(|extension| extension == "toml");
+            if file_type.is_symlink() && is_toml {
+                let relative = path.strip_prefix(manifest_root).unwrap_or(&path);
+                die(format!(
+                    "{}: manifest documents must be regular files, not symlinks",
+                    relative.display()
+                ));
+            }
             if file_type.is_dir() {
                 directories.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|extension| extension == "toml")
-            {
+            } else if file_type.is_file() && is_toml {
                 let relative = path
                     .strip_prefix(manifest_root)
                     .unwrap_or_else(|_| die(format!("manifest escaped root: {}", path.display())));
@@ -897,6 +904,29 @@ mod tests {
             )
         );
         std::fs::remove_dir_all(root).expect("remove temporary manifest root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_manifest_document_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_manifest_root("symlink-document");
+        let bucket = root.join("backend-parity-c");
+        let regular = bucket.join("regular.toml");
+        let linked = bucket.join("linked.toml");
+        std::fs::create_dir_all(&bucket).expect("create shard directory");
+        std::fs::write(&regular, "schema = 2\n").expect("write regular manifest");
+
+        assert_eq!(discover_manifest_paths(&root), vec![regular.clone()]);
+        symlink("regular.toml", &linked).expect("create manifest symlink");
+        let error = std::panic::catch_unwind(|| discover_manifest_paths(&root))
+            .expect_err("manifest symlink must be rejected");
+        std::fs::remove_dir_all(root).expect("remove temporary manifest root");
+        assert!(
+            panic_message(error)
+                .contains("linked.toml: manifest documents must be regular files, not symlinks")
+        );
     }
 
     #[test]
