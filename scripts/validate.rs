@@ -97,6 +97,30 @@
 //! pass just because it ran ~47 DAG nodes. Real libtest-count parsing is Phase 2;
 //! the counted+coverage receipt is minted by `finalize_receipt.py --scan`.
 //!
+//! ## The `coverage` object (node-ran, informational, shape-exact)
+//!
+//! This producer DOES emit a `coverage` object, in the consumer's exact
+//! `CoverageRow` shape. Two things make that safe rather than a fake-green risk:
+//!
+//!   1. It is NODE-RAN granularity — which planned `test.*` DAG nodes ran —
+//!      derived from typed gate outcomes. `zero_executed_nodes` is therefore
+//!      ALWAYS empty and means "not determinable at this granularity", never
+//!      "verified none": a node that ran while executing zero test cases is only
+//!      visible in the log banners, which is `finalize_receipt.py --scan`'s job.
+//!   2. The coverage clause of the landing predicate fires only at
+//!      `schema_version >= 5`, and this producer stays at 3 — where a row that
+//!      carries no `executed_tests` can never qualify as a landing green at all.
+//!      So the object is informational here and authoritative only after `--scan`
+//!      re-mints the row.
+//!
+//! Shape-exactness is the load-bearing part. `HistoryRow.coverage` is a typed
+//! `#[serde(default)] Option<CoverageRow>`: the default supplies `None` only for
+//! an ABSENT key. A present-but-wrong-shaped `coverage` is a hard serde error on
+//! the whole row, and the reader then drops that entire row into a `skipped`
+//! counter nobody reads — so a malformed coverage object makes a green receipt
+//! VANISH, which is strictly worse than omitting it. Any change to these fields
+//! must round-trip through the real `CoverageRow`.
+//!
 //! # Usage
 //!
 //! ```text
@@ -119,6 +143,7 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -131,6 +156,7 @@ use safe_ci_dag_runner::cgroup::reexec_in_scope;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::io::dag_from_json;
+use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
@@ -177,8 +203,40 @@ const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
 
 /// The meta-profile that subsumes the GitHub-authoritative validation surface:
 /// bootstrap preflight + the manifest gate + BOTH the portable and privileged
-/// DAG lanes in one boxed, self-teed run. See `run_full_profile`.
+/// DAG lanes in one boxed, self-teed run. See `run_meta_profile`.
 const FULL_PROFILE: &str = "full";
+
+/// `validate.sh --portable-only` (`run_portable_only_suite`, validate.sh:4183):
+/// the always-on preflight + the manifest gate + the portable DAG lane ONLY.
+///
+/// This is NOT the same thing as the bare `portable` profile, and the distinction
+/// is load-bearing: bare `portable` resolves `ci/dag/portable.json` and runs the
+/// runner once with NO preflight and NO manifest gate, so it is strictly weaker.
+/// Naming the two separately keeps `./scripts/validate.rs portable-only`
+/// gate-for-gate identical to `./validate.sh --portable-only` instead of quietly
+/// dropping two gates behind a similar-looking name.
+const PORTABLE_ONLY_PROFILE: &str = "portable-only";
+
+/// `validate.sh --privileged-only` (`run_privileged_validation`, validate.sh:4381):
+/// preflight + manifest + the privileged DAG lane ONLY. Same distinction from the
+/// bare `privileged` profile as above.
+const PRIVILEGED_ONLY_PROFILE: &str = "privileged-only";
+
+/// Resolve a meta-profile name to the ordered DAG lanes it runs, or `None` when
+/// the name is an ordinary single-DAG-file profile (`ci/dag/<name>.json`).
+///
+/// Every meta-profile shares the same shape — the two always-on preflight gates,
+/// the manifest gate, then its lanes — so the lane list is the ONLY thing that
+/// varies between them. Keeping that the single point of difference is what makes
+/// "did a gate get dropped?" answerable by reading one table.
+fn meta_profile_lanes(profile: &str) -> Option<&'static [&'static str]> {
+    match profile {
+        FULL_PROFILE => Some(&["portable", "privileged"]),
+        PORTABLE_ONLY_PROFILE => Some(&["portable"]),
+        PRIVILEGED_ONLY_PROFILE => Some(&["privileged"]),
+        _ => None,
+    }
+}
 
 // --------------------------------------------------------------------------- unified gate outcome
 
@@ -231,7 +289,15 @@ fn usage() -> &'static str {
      PHASE 1 typed wrapper: run a CI validation lane as a safe-ci-dag-runner DAG,\n\
      in-process (library call, not a subprocess), boxed by default.\n\
      \n\
-     <profile>                selects ci/dag/<profile>.json (e.g. portable, privileged)\n\
+     <profile>                a META-profile, or a lane name selecting ci/dag/<name>.json\n\
+     \x20                        meta-profiles (preflight + manifest + lanes, subsuming\n\
+     \x20                        the matching validate.sh level, gate for gate):\n\
+     \x20                          full            portable + privileged  (run_full_suite)\n\
+     \x20                          portable-only   portable               (--portable-only)\n\
+     \x20                          privileged-only privileged             (--privileged-only)\n\
+     \x20                        lane names (bare DAG file, NO preflight, NO manifest —\n\
+     \x20                        strictly weaker than the same-named meta-profile):\n\
+     \x20                          portable, privileged, ...\n\
      -j N                     scheduler width (default: host_cpus/8, floor 2, cap 16)\n\
      -v                       increase verbosity (repeatable)\n\
      -k, --keep-going         do not eager-exit on the first failure\n\
@@ -644,17 +710,34 @@ fn run_dag_lane(
     Ok((gates, skipped, result.wall_s, result.ok))
 }
 
-/// The `full` meta-profile: the honest Rust subsumption of validate.sh's
-/// `run_full_suite` (its 6 `run_check` gates). Runs the two always-on preflight
-/// gates (fail-fast, mirroring validate.sh:4537), the centralized manifest gate,
-/// then BOTH the portable and privileged DAG lanes in-process. Verbosity is
-/// forced to >=2 so the runner streams each node's `[tag]`-prefixed output and
-/// terminal PASS/FAIL into the (teed) log, which `finalize_receipt.py --scan`
-/// parses to mint the counted+coverage schema-5 receipt.
+/// Run a meta-profile: the honest Rust subsumption of the validate.sh suite
+/// functions that are built out of `run_ci_manifest_lane` (validate.sh:4174).
+///
+/// Every one of them has the identical shape, so this is one implementation
+/// parameterised by `lanes`:
+///
+/// | profile | validate.sh | lanes |
+/// | --- | --- | --- |
+/// | `full` | `run_full_suite` :4399 | portable, privileged |
+/// | `portable-only` | `run_portable_only_suite` :4183 | portable |
+/// | `privileged-only` | `run_privileged_validation` :4381 | privileged |
+///
+/// Shared by all three: the two always-on preflight gates with validate.sh's
+/// fail-fast (:4537), then the centralized manifest gate. validate.sh invokes the
+/// manifest command once PER LANE; a multi-lane profile runs the identical
+/// command twice, so it is deduped to one gate here. The gate still RUNS — it is
+/// not dropped — and the dedup is recorded so a reviewer can see the count change
+/// from 6 observed `run_check` calls to 5 distinct gates and know why.
+///
+/// Verbosity is forced to >=2 so the runner streams each node's `[tag]`-prefixed
+/// output and terminal PASS/FAIL into the (teed) log, which
+/// `finalize_receipt.py --scan` parses to mint the counted+coverage schema-5
+/// receipt.
 ///
 /// Returns (all gates, all skipped, total wall seconds, overall_ok).
-fn run_full_profile(
+fn run_meta_profile(
     root: &Path,
+    lanes: &[&str],
     jobs: i64,
     keep_going: bool,
     verbosity: i64,
@@ -716,7 +799,7 @@ fn run_full_profile(
     gates.push(g);
 
     let mut overall_ok = manifest_ok;
-    for lane in ["portable", "privileged"] {
+    for lane in lanes {
         match run_dag_lane(root, lane, jobs, keep_going, verbosity, cgroups.clone()) {
             Ok((lg, ls, lw, lok)) => {
                 gates.extend(lg);
@@ -730,6 +813,49 @@ fn run_full_profile(
         }
     }
     (gates, skipped, wall, overall_ok)
+}
+
+// --------------------------------------------------------------------------- planned test-node set
+
+/// The `test.*` nodes of one resolved DAG, as un-prefixed `group.job` tags.
+///
+/// `finalize_receipt.py` derives its planned set the same way (the `test.*` nodes
+/// of `ci/dag/{portable,privileged}.json` at the commit), so the names emitted
+/// here must be un-prefixed to line up with it. Lane-prefixed gate tags
+/// (`portable:test.unit`) are normalised back with `strip_lane_prefix`.
+fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
+    cfg.steps
+        .iter()
+        .map(|s| s.tag())
+        .filter(|t| t.starts_with("test."))
+        .collect()
+}
+
+/// Union of the `test.*` nodes across `lanes`. A lane whose DAG cannot be read or
+/// parsed contributes nothing and is reported: silently shrinking the PLANNED set
+/// would make coverage look satisfied precisely when we know least about it.
+fn planned_test_nodes_for_lanes(root: &Path, lanes: &[&str]) -> BTreeSet<String> {
+    let mut planned = BTreeSet::new();
+    for lane in lanes {
+        let path = root.join("ci").join("dag").join(format!("{lane}.json"));
+        match std::fs::read_to_string(&path).ok().as_deref().map(dag_from_json) {
+            Some(Ok(cfg)) => planned.extend(test_nodes_of(&cfg)),
+            _ => eprintln!(
+                "validate.rs: warning: could not derive planned test nodes from {}",
+                path.display()
+            ),
+        }
+    }
+    planned
+}
+
+/// Strip the `lane:` prefix a meta-profile puts on its gate tags, yielding the
+/// bare `group.job` DAG tag.
+fn strip_lane_prefix(tag: &str) -> &str {
+    match tag.rsplit_once(':') {
+        Some((_, bare)) => bare,
+        None => tag,
+    }
 }
 
 /// Mirror validate.sh's `command -v <name>` availability probe.
@@ -885,6 +1011,7 @@ fn write_ledger_record(
     commit: &str,
     tree_is_dirty: bool,
     selection_mode: &str,
+    planned_test_nodes: &BTreeSet<String>,
 ) {
     // DAG-lane semantics: the gate (NODE) is the unit of execution, NOT a libtest
     // test case. See the module doc comment. These are DAG-node counts:
@@ -911,6 +1038,48 @@ fn write_ledger_record(
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
+
+    // Per-node coverage, in the EXACT `CoverageRow` shape the consumer defines
+    // (ci-hub/lib/records.rs:204 — planned_test_nodes:u64, executed_test_nodes:u64,
+    // zero_executed_nodes:[String], absent_nodes:[String]).
+    //
+    // Shape-exactness is not cosmetic. `HistoryRow.coverage` is a TYPED
+    // `#[serde(default)] Option<CoverageRow>`: `serde(default)` supplies `None`
+    // only when the key is ABSENT. A key that is present with the WRONG shape is a
+    // hard serde error on the whole row, and `parse_ledger` then drops that entire
+    // row into a `skipped` counter nobody reads — so a malformed coverage object
+    // makes a green receipt VANISH rather than merely lose its coverage. Emitting
+    // an int where a `Vec<String>` is expected is the specific way to trigger it.
+    //
+    // What these values mean HERE (and what they deliberately do not claim):
+    // this is NODE-RAN granularity, derived from typed gate outcomes. It is not
+    // libtest-banner granularity, so `zero_executed_nodes` is always empty — a node
+    // that ran but executed zero test cases is only detectable by parsing the log
+    // banners, which is `finalize_receipt.py --scan`'s job, not something this
+    // producer can honestly assert at runtime. The empty list therefore means
+    // "not determinable here", NOT "verified none". That is safe because the
+    // coverage clause of the landing predicate fires only at schema_version >= 5
+    // (validate_status.rs:173) and this producer stays at 3, where a row carrying
+    // no `executed_tests` can never qualify as a landing green in the first place
+    // (qualifying_receipt.rs:136). The authoritative counted+coverage row is minted
+    // by finalize_receipt.py --scan off the durable log.
+    let executed_test_nodes: BTreeSet<String> = gates
+        .iter()
+        .filter(|g| !g.aborted)
+        .map(|g| strip_lane_prefix(&g.tag).to_string())
+        .filter(|t| planned_test_nodes.contains(t))
+        .collect();
+    let absent_nodes: Vec<&String> = planned_test_nodes
+        .iter()
+        .filter(|t| !executed_test_nodes.contains(*t))
+        .collect();
+    let coverage = serde_json::json!({
+        "planned_test_nodes": planned_test_nodes.len(),
+        "executed_test_nodes": executed_test_nodes.len(),
+        // Always empty: see the note above — not determinable at NODE granularity.
+        "zero_executed_nodes": Vec::<String>::new(),
+        "absent_nodes": absent_nodes,
+    });
 
     let gates_json: Vec<serde_json::Value> = gates
         .iter()
@@ -962,6 +1131,8 @@ fn write_ledger_record(
         // --scan reads this to mint the counted schema-5 receipt; verify_receipt.sh
         // (merge gate) requires it to exist and start with '/'.
         "log_file": log_file,
+        // Node-ran coverage in the consumer's exact CoverageRow shape (see above).
+        "coverage": coverage,
         "gates": gates_json,
     });
 
@@ -1058,14 +1229,20 @@ fn main() -> ExitCode {
 
     let root = repo_root();
 
-    // The `full` meta-profile is NOT a single DAG file: it subsumes validate.sh's
-    // run_full_suite (preflight gates + manifest + BOTH the portable and privileged
-    // DAG lanes). Any other profile — or an explicit --dag-file override — resolves
-    // to a single ci/dag/<name>.json and runs the runner once.
-    let is_full = args.profile == FULL_PROFILE && args.dag_file.is_none();
+    // A meta-profile is NOT a single DAG file: it subsumes one of validate.sh's
+    // run_ci_manifest_lane-built suites (preflight gates + manifest + its lanes).
+    // Any other profile — or an explicit --dag-file override — resolves to a single
+    // ci/dag/<name>.json and runs the runner once. An explicit --dag-file always
+    // wins, so `--dag-file X full` stays an exact single-DAG run.
+    let meta_lanes = if args.dag_file.is_none() {
+        meta_profile_lanes(&args.profile)
+    } else {
+        None
+    };
+    let is_full = meta_lanes.is_some();
 
     // Resolve/validate the single DAG file up front (only for the single-lane path);
-    // for `full` there is no ci/dag/full.json and this would spuriously error.
+    // a meta-profile has no ci/dag/<profile>.json and this would spuriously error.
     let cfg = if is_full {
         None
     } else {
@@ -1122,13 +1299,29 @@ fn main() -> ExitCode {
     // Run the gates. `full` fans out to the subsumption; everything else runs the
     // single resolved DAG once (and forwards per-step perf rows, which only the
     // single-lane path produces via the typed RunResult).
-    let (gates, skipped, wall, ok, selection_mode): (Vec<GateOutcome>, Vec<String>, f64, bool, &str) =
-        if is_full {
-            eprintln!("validate.rs: running profile \"full\" (subsumes run_full_suite) at -j {jobs}");
-            let (g, s, w, o) =
-                run_full_profile(&root, jobs, args.keep_going, args.verbosity, cgroups);
-            (g, s, w, o, "full")
-        } else {
+    #[allow(clippy::type_complexity)]
+    let (gates, skipped, wall, ok, selection_mode, planned): (
+        Vec<GateOutcome>,
+        Vec<String>,
+        f64,
+        bool,
+        &str,
+        BTreeSet<String>,
+    ) = if let Some(lanes) = meta_lanes {
+        eprintln!(
+            "validate.rs: running meta-profile {:?} (preflight + manifest + lanes {}) at -j {jobs}",
+            args.profile,
+            lanes.join(", ")
+        );
+        let planned = planned_test_nodes_for_lanes(&root, lanes);
+        let (g, s, w, o) =
+            run_meta_profile(&root, lanes, jobs, args.keep_going, args.verbosity, cgroups);
+        // selection_mode mirrors validate.sh: a level (full / portable-only /
+        // privileged-only) runs its whole configured plan, so the SELECTION is
+        // full; it is the PROFILE that records how narrow the plan was. Only
+        // --selective / --only narrow the selection itself.
+        (g, s, w, o, "full", planned)
+    } else {
             let (cfg, dag_path) = cfg.expect("single-lane path always resolves a cfg");
             eprintln!(
                 "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
@@ -1171,7 +1364,16 @@ fn main() -> ExitCode {
             let gates: Vec<GateOutcome> =
                 result.outcomes.iter().map(GateOutcome::from).collect();
             let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
-            (gates, result.skipped.clone(), result.wall_s, result.ok, selection_mode)
+            // Planned set for a single-lane run is that lane's own test.* nodes.
+            let planned = test_nodes_of(&cfg);
+            (
+                gates,
+                result.skipped.clone(),
+                result.wall_s,
+                result.ok,
+                selection_mode,
+                planned,
+            )
         };
 
     let finished_at = utc_now();
@@ -1203,6 +1405,7 @@ fn main() -> ExitCode {
         &commit,
         dirty,
         selection_mode,
+        &planned,
     );
 
     let verdict = if exit_code == 0 { "PASS" } else { "FAIL" };
