@@ -2228,12 +2228,6 @@
     },
     {
       "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/file-lock-ordering.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/file-lock-ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/mcookie-random.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/mcookie-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
@@ -2315,12 +2309,6 @@
       "path": "tests/e2e/system-utils/uuidgen-random.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/uuidgen-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/vdso-getrandom.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
-      "why": "tests/e2e/system-utils/vdso-getrandom.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "support-data",
@@ -3101,6 +3089,24 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
       "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/shm_coherency_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/shm_coherency_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: forks a writer and samples MAP_SHARED anonymous, MAP_SHARED file-backed and memfd mappings without any added barrier, printing the observed words and the branch taken including whether a partial update was caught, plus MAP_PRIVATE COW isolation and msync writeback, so verify's double run asserts that what each process OBSERVES is reproducible"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/file-lock-ordering.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/file-lock-ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/vdso-getrandom.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/vdso-getrandom.c is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     }
   ],
   "schema": 2

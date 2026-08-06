@@ -9,6 +9,7 @@ schema = 2
 bucket = "system-utils"
 
 [[test]]
+
 id = "system-utils/clock-determinism"
 description = "clock_gettime/gettimeofday output is identical across repeated Hermit runs"
 lane = "portable"
@@ -65,6 +66,7 @@ dbi = "The custom clock matrix baseline is ptrace-only"
 kvm = "The custom clock matrix baseline is ptrace-only"
 sabre = "The custom clock matrix baseline is ptrace-only"
 [[test]]
+
 id = "system-utils/date-nanoseconds"
 description = "A valid wall-clock timestamp varies natively and repeats under Hermit"
 lane = "portable"
@@ -121,6 +123,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/example-date"
 description = "The user-facing nanosecond date example repeats under every applicable backend"
 lane = "portable"
@@ -173,6 +176,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/example-devrand"
 description = "The user-facing /dev/urandom example repeats under every applicable backend"
 lane = "portable"
@@ -225,6 +229,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/mcookie-random"
 description = "mcookie's 128-bit magic cookie varies natively and repeats under Hermit"
 lane = "portable"
@@ -280,6 +285,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/mktemp-name"
 description = "mktemp -u random temp-name suffix varies natively and repeats under Hermit"
 lane = "portable"
@@ -335,6 +341,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/openssl-enc"
 description = "openssl symmetric encryption with a random salt varies natively and repeats under Hermit"
 lane = "portable"
@@ -390,6 +397,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/openssl-genpkey"
 description = "An OpenSSL Ed25519 keypair varies natively and repeats under Hermit"
 lane = "portable"
@@ -445,6 +453,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/openssl-passwd"
 description = "openssl passwd -6 salted hash varies natively and repeats under Hermit"
 lane = "portable"
@@ -501,6 +510,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/openssl-rand"
 description = "OpenSSL DRBG hex output varies natively and repeats under Hermit"
 lane = "portable"
@@ -556,6 +566,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/openssl-x509"
 description = "openssl self-signed X.509 cert varies natively and repeats under Hermit"
 lane = "portable"
@@ -612,6 +623,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/proc-uptime"
 description = "Boot-relative uptime from /proc/uptime varies natively and repeats under Hermit"
 lane = "portable"
@@ -669,6 +681,7 @@ liteinst = "No edge-case Hermit arguments are required"
 
 
 [[test]]
+
 id = "system-utils/random-device"
 description = "Kernel random bytes vary natively and repeat under Hermit"
 lane = "portable"
@@ -724,6 +737,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/record-getpid"
 description = "Process identity is deterministic in run and record/replay modes"
 lane = "portable"
@@ -779,6 +793,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/shuf-permutation"
 description = "A shuf random permutation varies natively and repeats under Hermit"
 lane = "portable"
@@ -834,6 +849,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/sort-random"
 description = "sort -R random-key permutation varies natively and repeats under Hermit"
 lane = "portable"
@@ -889,6 +905,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/ssh-keygen-ed25519"
 description = "ssh-keygen Ed25519 public key varies natively and repeats under Hermit"
 lane = "portable"
@@ -944,6 +961,7 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 [[test]]
+
 id = "system-utils/uuidgen-random"
 description = "uuidgen -r random UUID varies natively and repeats under Hermit"
 lane = "portable"
@@ -1000,6 +1018,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/proc-random-uuid"
 description = "Kernel /proc random UUID varies natively and repeats under Hermit"
 lane = "portable"
@@ -1056,6 +1075,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/vdso-getrandom"
 description = "Entropy reached through the vDSO specifically, where no syscall crosses the boundary"
 lane = "portable"
@@ -1115,6 +1135,7 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+
 id = "system-utils/file-lock-ordering"
 description = "File-lock exclusion, POSIX vs OFD inheritance across fork, and listxattr enumeration order"
 lane = "portable"
@@ -1171,3 +1192,61 @@ dbi = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+
+id = "system-utils/shm-coherency-identity"
+description = "what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/shm_coherency_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: the reader catches a different prefix of the writer's record run to run, by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbi = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+kvm = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+liteinst = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+ptrace = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+sabre = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbi = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+kvm = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+liteinst = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+ptrace = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbi = "Record/replay identity of shared-memory observation is a separate contract"
+kvm = "Record/replay identity of shared-memory observation is a separate contract"
+liteinst = "Record/replay identity of shared-memory observation is a separate contract"
+ptrace = "Record/replay identity of shared-memory observation is a separate contract"
+sabre = "Record/replay identity of shared-memory observation is a separate contract"
