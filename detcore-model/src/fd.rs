@@ -19,7 +19,44 @@ pub type RawFd = std::os::unix::io::RawFd;
 pub type RawInode = u64;
 
 /// Deterministic "virtual" inode.
-pub type DetInode = RawInode;
+///
+/// A NEWTYPE, not an alias, and that is the whole point. While this was
+/// `pub type DetInode = RawInode`, the two were the SAME type to the compiler,
+/// so a raw host inode could be passed wherever a determinized one was required
+/// and nothing diagnosed it. That is not hypothetical: `ResourceID::FileContents`
+/// was being handed a variable literally named `raw_ino` at three sites in
+/// `detcore/src/syscalls/files.rs`, and a host inode (`FileContents(221742951)`)
+/// reached the log. Det inodes are minted from a counter starting at 1
+/// (`tool_global::add_inode`), so a value that large cannot be one.
+///
+/// Construction is deliberately explicit: `from_determinized` is the only way in,
+/// and its name is the claim being made. Anything holding a `RawInode` must go
+/// through `add_inode`/`determinize_inode` to obtain one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DetInode(RawInode);
+
+impl DetInode {
+    /// Mint a `DetInode` from an already-determinized value.
+    ///
+    /// The ONLY constructor. Call it where determinization actually happens, not
+    /// to silence a type error -- doing the latter reintroduces exactly the leak
+    /// this newtype exists to make unrepresentable.
+    pub const fn from_determinized(value: RawInode) -> Self {
+        Self(value)
+    }
+
+    /// The underlying integer, for syscall returns and formatting.
+    pub const fn into_raw(self) -> RawInode {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DetInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Identity of a Linux descriptor table (`files_struct`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

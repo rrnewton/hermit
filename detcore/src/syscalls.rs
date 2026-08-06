@@ -29,7 +29,9 @@ use crate::types::RawFd;
 fn deterministic_stdio_inode(fd: RawFd) -> Option<DetInode> {
     (libc::STDIN_FILENO..=libc::STDERR_FILENO)
         .contains(&fd)
-        .then_some(DET_SPECIAL_INODE_OFFSET + fd as DetInode)
+        .then_some(DetInode::from_determinized(
+            DET_SPECIAL_INODE_OFFSET.into_raw() + fd as u64,
+        ))
 }
 
 #[cfg(test)]

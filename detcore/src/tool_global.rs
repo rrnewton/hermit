@@ -165,7 +165,9 @@ impl InodePool {
     fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
-                let new = self.next_inode;
+                // `next_inode` is the raw counter; minting here is THE conversion
+                // boundary where a determinized inode legitimately comes into being.
+                let new = DetInode::from_determinized(self.next_inode);
                 self.next_inode += 1;
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(

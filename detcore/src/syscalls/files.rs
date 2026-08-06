@@ -1388,7 +1388,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => determinize_inode(guest, stat.inode).await,
         };
-        stat.inode = d_ino; // Reveal only the deterministic inode.
+        stat.inode = d_ino.into_raw(); // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping.
@@ -2599,7 +2599,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.into_raw();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
@@ -2639,7 +2639,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.into_raw();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
