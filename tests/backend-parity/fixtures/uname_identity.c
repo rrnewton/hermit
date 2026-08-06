@@ -24,33 +24,34 @@
 #include <string.h>
 #include <sys/utsname.h>
 
+/*
+ * THE PINNED IDENTITY STRINGS ARE EMITTED, not just a match count. These four
+ * strings are the entire substance of this contract, and "uname ok=4" hid every
+ * one of them: a backend virtualizing the WRONG release and a backend
+ * virtualizing the wrong nodename both printed "uname ok=3" and compared EQUAL,
+ * and two backends pinning the SAME wrong value agree with each other, so
+ * cross-backend comparison could never see it. Only comparison against the
+ * expected string can, and that needs the string in the byte stream.
+ *
+ * Under Hermit these are the virtualized identity and are identical on every
+ * host, so emitting them keeps the output host-independent in the context this
+ * fixture is contracted for. Natively they are the real host identity and this
+ * fixture already fails by construction (native scores ok=2: sysname and machine
+ * happen to match, release and nodename do not).
+ */
 #define PINNED_SYSNAME "Linux"
 #define PINNED_MACHINE "x86_64"
 #define PINNED_RELEASE "5.2.0"
 #define PINNED_NODENAME "hermetic-container.local"
 
-/* Number of behavioural checks this fixture must complete UNDER HERMIT; a lower
-   count is a failure, not a smaller success. Native reaches fewer because it
-   does not pin the virtualized identity this fixture reads.
-
-   CONSEQUENCE TO WEIGH BEFORE ENABLING ANOTHER CELL. The only enabled cell is
-   verify/ptrace, and 4 is measured correct there. This file's header above also
-   records that the DBT backend forwards the host nodename and so reaches only 3.
-   MEASURED 2026-08-23 on hermit 485a0ad4 built with third-party-backends, that is
-   no longer what DBT does: `--backend=dbt` reaches 4 and exits 0, i.e. all four
-   pinned values including nodename matched. The header's claim looks stale rather
-   than wrong-at-the-time; it is left in place because confirming when the leak
-   closed is not this change's job. Either way the gate reports what it observes,
-   so a backend that does leak the nodename exits 1 instead of passing quietly.
-*/
-#define EXPECTED_CHECKS_UNDER_HERMIT 4
-
 int main(void) {
+    enum { EXPECTED_CHECKS = 4 };
     int ok = 0;
     struct utsname u;
 
     memset(&u, 0, sizeof(u));
-    if (uname(&u) == 0) {
+    int uname_rc = uname(&u) == 0;
+    if (uname_rc) {
         if (strcmp(u.sysname, PINNED_SYSNAME) == 0) {
             ok += 1;
         }
@@ -65,15 +66,15 @@ int main(void) {
         }
     }
 
-    printf("uname ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS_UNDER_HERMIT) {
-        fprintf(stderr, "uname completed %d of %d checks\n", ok, EXPECTED_CHECKS_UNDER_HERMIT);
-        return 1;
-    }
-    return 0;
+    /* The four pinned strings ARE the contract, so they are emitted. Under
+     * Hermit they are the same virtualized identity on every host. */
+    printf(
+        "uname ok=%d uname_rc=%d sysname=%s machine=%s release=%s nodename=%s\n",
+        ok,
+        uname_rc,
+        u.sysname,
+        u.machine,
+        u.release,
+        u.nodename);
+    return ok == EXPECTED_CHECKS ? 0 : 1;
 }
