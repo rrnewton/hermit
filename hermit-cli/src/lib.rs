@@ -1143,6 +1143,32 @@ async fn run_sabre(
          are ABSENT from the Detcore log. A SaBRe run is NOT full-coverage \
          and its log is not comparable to the ptrace reference prefix.",
     );
+
+    // MAKE THE DEGRADATION LOUD.
+    //
+    // The `tracing::info!` above is invisible at the default log level, so a
+    // SaBRe run that fell back to ptrace looked identical to one that actually
+    // instrumented -- same exit status, same stdout, nothing on stderr. A
+    // scorecard reading such a run records a pass for SaBRe that is really a
+    // measurement of plain ptrace, which is the fake-green class applied to a
+    // backend.
+    //
+    // Emit an UNCONDITIONAL, machine-readable banner on stderr in the same
+    // shape as the e9patch backend's, so a cell can classify the run instead of
+    // inferring from a clean exit. Printing it always -- not only when degraded
+    // -- is deliberate: a MISSING banner and a banner reporting zero must stay
+    // distinguishable, or a scorecard cannot tell "did not fall back" from
+    // "produced no evidence either way".
+    let sabre_degraded = supervised.path_evidence.ptrace_fallback_sites > 0;
+    eprintln!(
+        ":: Backend: sabre static rewriting + ptrace runtime; \
+         ptrace_fallback_sites={}; trusted_shared_object_sites={}; \
+         guest_rpc_observed={}; reach_state={}",
+        supervised.path_evidence.ptrace_fallback_sites,
+        supervised.path_evidence.trusted_shared_object_sites,
+        supervised.path_evidence.guest_rpc_observed,
+        if sabre_degraded { "degraded-ptrace-fallback" } else { "sabre-exercised" },
+    );
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
