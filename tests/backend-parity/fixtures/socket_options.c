@@ -15,6 +15,22 @@
 // value asserted here is a boolean the guest itself just set, so the answer is
 // host-independent, and no byte is written or read, so there is no blocking
 // wait to schedule.
+//
+// EACH ROUND-TRIP IS REPORTED SEPARATELY, and the fixture fails closed. Printing
+// only "sockopt ok=6" was blind in the way a sum always is: six independent
+// checks collapsed into one scalar, so a backend that dropped SO_KEEPALIVE and a
+// backend that dropped SO_BROADCAST both printed "sockopt ok=5" and compared
+// EQUAL to each other. The failing option was unrecoverable from the byte
+// stream. Worse, main() returned 0 unconditionally, so exit status carried no
+// signal either and a partial failure looked like a pass to any status-only
+// observer.
+//
+// There is no host-independent VALUE to print here -- the observable genuinely
+// is a boolean, and the kernel canonicalises the readback -- so this fixture is
+// de-aliased rather than value-printing, the same fallback cwd_roundtrip uses.
+// The raw readback integer is deliberately NOT printed: it is kernel-normalised
+// rather than guest-determined, so emitting it would trade blindness for
+// host-dependence.
 #include <errno.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -31,36 +47,34 @@ static int roundtrip(int fd, int opt, int value) {
     return readback == 0;
 }
 
-/* Number of behavioural checks this fixture must complete; a lower count is a
-   failure, not a smaller success. */
-#define EXPECTED_CHECKS 6
-
 int main(void) {
-    int ok = 0;
+    enum { EXPECTED_CHECKS = 6 };
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         printf("sockopt ok=0 [socketpair fail]\n");
         return 1;
     }
 
-    if (roundtrip(sv[0], SO_REUSEADDR, 1)) ok++;  // (1) enable, reads back set.
-    if (roundtrip(sv[0], SO_REUSEADDR, 0)) ok++;  // (2) disable, reads back clear.
-    if (roundtrip(sv[0], SO_KEEPALIVE, 1)) ok++;  // (3)
-    if (roundtrip(sv[0], SO_KEEPALIVE, 0)) ok++;  // (4)
-    if (roundtrip(sv[0], SO_BROADCAST, 1)) ok++;  // (5)
-    if (roundtrip(sv[0], SO_BROADCAST, 0)) ok++;  // (6)
+    int reuseaddr_set = roundtrip(sv[0], SO_REUSEADDR, 1);   // (1) reads back set
+    int reuseaddr_clear = roundtrip(sv[0], SO_REUSEADDR, 0); // (2) reads back clear
+    int keepalive_set = roundtrip(sv[0], SO_KEEPALIVE, 1);   // (3)
+    int keepalive_clear = roundtrip(sv[0], SO_KEEPALIVE, 0); // (4)
+    int broadcast_set = roundtrip(sv[0], SO_BROADCAST, 1);   // (5)
+    int broadcast_clear = roundtrip(sv[0], SO_BROADCAST, 0); // (6)
 
     close(sv[0]);
     close(sv[1]);
-    printf("sockopt ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "sockopt completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+    int ok = reuseaddr_set + reuseaddr_clear + keepalive_set + keepalive_clear +
+        broadcast_set + broadcast_clear;
+    printf(
+        "sockopt ok=%d reuseaddr_set=%d reuseaddr_clear=%d keepalive_set=%d "
+        "keepalive_clear=%d broadcast_set=%d broadcast_clear=%d\n",
+        ok,
+        reuseaddr_set,
+        reuseaddr_clear,
+        keepalive_set,
+        keepalive_clear,
+        broadcast_set,
+        broadcast_clear);
+    return ok == EXPECTED_CHECKS ? 0 : 1;
 }
