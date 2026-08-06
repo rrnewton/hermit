@@ -29,7 +29,7 @@ use crate::types::RawFd;
 fn deterministic_stdio_inode(fd: RawFd) -> Option<DetInode> {
     (libc::STDIN_FILENO..=libc::STDERR_FILENO)
         .contains(&fd)
-        .then_some(DET_SPECIAL_INODE_OFFSET + fd as DetInode)
+        .then_some(DET_SPECIAL_INODE_OFFSET.offset_by(fd as u64))
 }
 
 #[cfg(test)]
@@ -38,9 +38,18 @@ mod tests {
 
     #[test]
     fn stdio_inode_namespace_is_fixed() {
-        assert_eq!(deterministic_stdio_inode(libc::STDIN_FILENO), Some(1000));
-        assert_eq!(deterministic_stdio_inode(libc::STDOUT_FILENO), Some(1001));
-        assert_eq!(deterministic_stdio_inode(libc::STDERR_FILENO), Some(1002));
+        assert_eq!(
+            deterministic_stdio_inode(libc::STDIN_FILENO),
+            Some(DetInode::from_ordinal(1000))
+        );
+        assert_eq!(
+            deterministic_stdio_inode(libc::STDOUT_FILENO),
+            Some(DetInode::from_ordinal(1001))
+        );
+        assert_eq!(
+            deterministic_stdio_inode(libc::STDERR_FILENO),
+            Some(DetInode::from_ordinal(1002))
+        );
         assert_eq!(deterministic_stdio_inode(3), None);
     }
 }
