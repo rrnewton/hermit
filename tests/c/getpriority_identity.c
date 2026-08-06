@@ -47,8 +47,17 @@
 /* An out-of-range `which` that Linux (and Detcore) reject with EINVAL. */
 #define WHICH_INVALID 999
 
+/*
+ * Reports the OBSERVED value on stdout and branches on it. Printing the
+ * observation rather than a bare "ok" token matters for a parity contract: the
+ * contract compares stdout across backends, so a constant success token makes
+ * every passing backend look alike no matter what it actually saw, and a
+ * divergence has to be re-derived by hand. With the value in the stream, a
+ * cross-backend diff names the offending number directly.
+ */
 static int expect_raw_priority(int iter) {
   long ret = syscall(SYS_getpriority, WHICH_PROCESS, 0);
+  printf("getpriority[%d]=%ld\n", iter, ret);
   if (ret != VIRTUAL_RAW_PRIORITY) {
     fprintf(stderr, "iter %d: getpriority returned %ld, expected %d (nice 0)\n",
             iter, ret, VIRTUAL_RAW_PRIORITY);
@@ -67,6 +76,7 @@ int main(void) {
 
   /* setpriority must be accepted as an inert no-op returning 0. */
   long set_ret = syscall(SYS_setpriority, WHICH_PROCESS, 0, ATTEMPTED_NICE);
+  printf("setpriority(nice=%d)=%ld\n", ATTEMPTED_NICE, set_ret);
   if (set_ret != 0) {
     fprintf(stderr, "setpriority returned %ld, expected 0 (inert no-op)\n",
             set_ret);
@@ -81,6 +91,7 @@ int main(void) {
 
   /* An invalid `which` preserves the Linux EINVAL boundary. */
   long bad = syscall(SYS_getpriority, WHICH_INVALID, 0);
+  printf("getpriority(which=%d)=%ld errno=%d\n", WHICH_INVALID, bad, errno);
   if (bad != -1 || errno != EINVAL) {
     fprintf(stderr,
             "getpriority(invalid which) returned %ld errno %d, expected -1 EINVAL\n",
@@ -88,6 +99,5 @@ int main(void) {
     return 1;
   }
 
-  puts("getpriority-identity-ok");
   return 0;
 }
