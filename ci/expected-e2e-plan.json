@@ -1,4 +1,5 @@
 {
+  "schema": 1,
   "cells": [
     {
       "backend": "ptrace",
@@ -12,7 +13,49 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "backend-parity-c/cwd-roundtrip"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fcntl-owner"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/membarrier-query"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/o-tmpfile-anon"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
       "test": "backend-parity-c/personality-domain"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-capacity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/record-lock"
     },
     {
       "backend": "dbi",
@@ -212,6 +255,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/sqlite-query-determinism"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "chaos",
@@ -348,7 +398,21 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/python-dict-hash-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/python-hash-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-hashseed"
     },
     {
       "backend": "ptrace",
@@ -377,6 +441,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/rust-hashmap-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/tcl-rand-clock"
     },
     {
       "backend": "liteinst",
@@ -538,35 +609,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
-    },
-    {
-      "backend": "ptrace",
-      "category": "data-handling",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "data-handling/sqlite-query-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/python-dict-hash-iteration"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/python-hashseed"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/tcl-rand-clock"
     }
-  ],
-  "schema": 1
+  ]
 }
