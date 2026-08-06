@@ -69,6 +69,12 @@ grep -Fq 'queue_hosted_retry "$demo_status" demo-hot-path-rerun' "$WORKFLOW" ||
     fail "demo NO_RESULT must rerun the selected pull-request run"
 grep -Fq 'queued | in_progress | waiting | requested | pending)' "$WORKFLOW" ||
     fail "active NO_RESULT runs must wait for workflow_run completion, not rerun"
+grep -Fq 'label_event()' "$WORKFLOW" ||
+    fail "label events must be recognized before hosted retry dispatch"
+grep -Fq 'dispatch_budget_spent()' "$WORKFLOW" ||
+    fail "hosted retries must consult the exact-head dispatch budget"
+grep -Fq 'Could not read the dispatch budget' "$WORKFLOW" ||
+    fail "an unreadable dispatch budget must retain NO_RESULT without dispatch"
 grep -Fq 'actions/runs/${run_id}/rerun' "$WORKFLOW" ||
     fail "demo recovery must use the selected run ID"
 if grep -Fq 'queue_dispatch demo-hot-path.yml' "$WORKFLOW"; then
@@ -81,4 +87,85 @@ if grep -Eq 'success[[:space:]]*\|[[:space:]]*skipped|success[[:space:]]+or[[:sp
     fail "skipped must never satisfy a required check"
 fi
 
-echo "check-merge-gate-policy.sh: OK - PASSED/FAILED/NO_RESULT gate wiring enforced"
+# Exercise the real workflow function bodies against an inert `gh` function.
+# This is intentionally incapable of dispatching a workflow: queue_dispatch only
+# appends to a temporary TSV, and the stub refuses every API shape except the
+# read-only dispatch-budget query. Sed stops at the workflow function's own
+# ten-space closing brace; nested braces are more deeply indented.
+tmpdir=$(mktemp -d)
+trap 'rm -rf -- "$tmpdir"' EXIT
+functions_file="$tmpdir/dispatch-functions.sh"
+for function_name in queue_dispatch label_event dispatch_budget_spent queue_hosted_retry; do
+    body=$(sed -n "/^          ${function_name}()/,/^          }$/p" "$WORKFLOW")
+    [[ -n $body ]] || fail "could not extract $function_name from workflow"
+    sed 's/^          //' <<<"$body" >>"$functions_file"
+done
+# shellcheck source=/dev/null
+source "$functions_file"
+MAX_HEAD_DISPATCHES=$(sed -n 's/^          MAX_HEAD_DISPATCHES=//p' "$WORKFLOW")
+[[ $MAX_HEAD_DISPATCHES =~ ^[0-9]+$ ]] || fail "dispatch limit must be a numeric literal"
+
+GH_STUB_MODE=count
+GH_STUB_COUNT=0
+GH_EXPECTED_WORKFLOW=ci-portable.yml
+GH_EXPECTED_SHA=0123456789abcdef0123456789abcdef01234567
+GH_CALLS_FILE="$tmpdir/gh-calls"
+gh() {
+    [[ ${1:-} == api ]] || fail "inert gh stub refused non-API operation: $*"
+    [[ ${2:-} == "repos/${REPO}/actions/runs?event=workflow_dispatch&head_sha=${GH_EXPECTED_SHA}&per_page=100" ]] ||
+        fail "inert gh stub refused query not bound to the expected repo and exact head: $*"
+    [[ ${3:-} == --jq ]] || fail "inert gh stub requires the workflow-path selector: $*"
+    [[ ${4:-} == "[.workflow_runs[] | select(.path == \".github/workflows/${GH_EXPECTED_WORKFLOW}\")] | length" ]] ||
+        fail "inert gh stub refused query not bound to the expected workflow path: $*"
+    printf 'api\n' >>"$GH_CALLS_FILE"
+    case "$GH_STUB_MODE" in
+        count) printf '%s\n' "$GH_STUB_COUNT" ;;
+        fail) return 1 ;;
+        malformed) printf '%s\n' not-a-count ;;
+        *) fail "unknown gh stub mode: $GH_STUB_MODE" ;;
+    esac
+}
+sleep() { :; }
+
+dispatch_file="$tmpdir/dispatch.tsv"
+REPO=rrnewton/hermit
+case_log="$tmpdir/case.log"
+cases_run=0
+run_retry_case() {
+    local name=$1 event=$2 action=$3 status=$4 workflow=$5 stub_mode=$6 prior=$7 expected=$8 expected_api_calls=$9
+    : >"$dispatch_file"
+    : >"$case_log"
+    : >"$GH_CALLS_FILE"
+    EVENT_NAME=$event
+    PR_ACTION=$action
+    GH_STUB_MODE=$stub_mode
+    GH_STUB_COUNT=$prior
+    GH_EXPECTED_WORKFLOW=$workflow
+    no_result=0
+    queue_hosted_retry "$status" "$workflow" branch rrnewton/hermit 123 \
+        "$GH_EXPECTED_SHA" >"$case_log" 2>&1
+    local actual api_calls
+    actual=$(wc -l <"$dispatch_file")
+    api_calls=$(wc -l <"$GH_CALLS_FILE")
+    [[ $actual -eq $expected ]] ||
+        fail "$name: expected $expected inert dispatch record(s), got $actual: $(cat "$case_log")"
+    [[ $api_calls -eq $expected_api_calls ]] ||
+        fail "$name: expected $expected_api_calls budget API call(s), got $api_calls: $(cat "$case_log")"
+    [[ $no_result -eq 1 ]] || fail "$name: every retry path must retain NO_RESULT"
+    cases_run=$((cases_run + 1))
+}
+
+run_retry_case labeled-suppressed pull_request labeled missing ci-portable.yml count 0 0 0
+run_retry_case unlabeled-suppressed pull_request unlabeled missing ci-portable.yml count 0 0 0
+run_retry_case synchronize-dispatches pull_request synchronize missing ci-portable.yml count 0 1 1
+run_retry_case opened-dispatches pull_request opened missing ci-portable.yml count 1 1 1
+run_retry_case budget-at-limit workflow_dispatch '' missing ci-portable.yml count 2 0 1
+run_retry_case budget-over-limit workflow_dispatch '' missing ci-portable.yml count 4 0 1
+run_retry_case budget-api-failure workflow_dispatch '' missing ci-portable.yml fail 0 0 3
+run_retry_case budget-malformed workflow_dispatch '' missing ci-portable.yml malformed 0 0 1
+run_retry_case active-queued workflow_dispatch '' queued ci-portable.yml fail 0 0 0
+run_retry_case active-in-progress workflow_dispatch '' in_progress ci-portable.yml fail 0 0 0
+run_retry_case demo-rerun-not-budgeted workflow_dispatch '' missing demo-hot-path-rerun count 99 1 0
+run_retry_case demo-label-suppressed pull_request labeled missing demo-hot-path-rerun count 99 0 0
+
+echo "check-merge-gate-policy.sh: OK - PASSED/FAILED/NO_RESULT wiring plus ${cases_run}/12 dispatch brackets enforced"

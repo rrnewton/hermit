@@ -654,6 +654,57 @@ jobs:
               "$workflow" "$head_ref" "$pr_number" "$head_sha" "$run_id" >>"$dispatch_file"
           }
 
+          # A hosted build's outcome cannot change because a label changed, so a
+          # labeled/unlabeled event must re-evaluate the gate WITHOUT dispatching a
+          # fresh ~40-minute hosted run. Bulk-labelling N pull requests otherwise
+          # fans out to N dispatches; on 2026-08-05 one `ci-batch` pass over 15 PRs
+          # saturated the shared hosted pool so thoroughly that main's own portable
+          # run sat 67 minutes without dispatching a single job. The gate still
+          # reports NO_RESULT and still blocks; only the dispatch is suppressed, and
+          # the already-queued run's completion refires the gate as usual.
+          label_event() {
+            [ "$EVENT_NAME" = pull_request ] &&
+              { [ "$PR_ACTION" = labeled ] || [ "$PR_ACTION" = unlabeled ]; }
+          }
+
+          # Stop re-dispatch after observing two workflow_dispatch runs for a
+          # (workflow, head_sha) pair. Saturation produces NO_RESULT, NO_RESULT
+          # produces another dispatch, and that dispatch deepens the saturation.
+          # Concurrent gate evaluations can both observe the pre-limit count, so
+          # this is a convergence threshold rather than an atomic quota; once their
+          # runs are visible, every later evaluation refuses another dispatch.
+          MAX_HEAD_DISPATCHES=2
+          dispatch_budget_spent() {
+            local workflow=$1 head_sha=$2 prior attempt budget_read=false
+            # Only real workflow files are dispatched by path; demo-hot-path-rerun
+            # reruns an existing run id and is capped by GitHub's own attempt limit.
+            case "$workflow" in
+              *.yml) ;;
+              *) return 1 ;;
+            esac
+            for attempt in 1 2 3; do
+              if prior=$(gh api \
+                "repos/${REPO}/actions/runs?event=workflow_dispatch&head_sha=${head_sha}&per_page=100" \
+                --jq "[.workflow_runs[] | select(.path == \".github/workflows/${workflow}\")] | length" \
+                2>/dev/null); then
+                budget_read=true
+                break
+              fi
+              [ "$attempt" -eq 3 ] || sleep "$attempt"
+            done
+            if [ "$budget_read" != true ]; then
+              echo "::warning::Could not read the dispatch budget for $workflow at $head_sha after 3 attempts; retaining NO_RESULT without dispatch." >&2
+              return 0
+            fi
+            case "$prior" in
+              '' | *[!0-9]*)
+                echo "::warning::Invalid dispatch budget '$prior' for $workflow at $head_sha; retaining NO_RESULT without dispatch." >&2
+                return 0
+                ;;
+            esac
+            [ "$prior" -ge "$MAX_HEAD_DISPATCHES" ]
+          }
+
           queue_hosted_retry() {
             local status=$1
             shift
@@ -662,7 +713,17 @@ jobs:
                 no_result=1
                 echo "NO_RESULT is still active ($status); completion will refire the gate."
                 ;;
-              *) queue_dispatch "$@" ;;
+              *)
+                if label_event; then
+                  no_result=1
+                  echo "NO_RESULT on a '$PR_ACTION' event; not dispatching $1 for PR #$4 at $5 (a label cannot change a build outcome)."
+                elif dispatch_budget_spent "$1" "$5"; then
+                  no_result=1
+                  echo "::warning::NO_RESULT for PR #$4 at $5: $1 already dispatched ${MAX_HEAD_DISPATCHES}x for this head; not dispatching again."
+                else
+                  queue_dispatch "$@"
+                fi
+                ;;
             esac
           }
 
