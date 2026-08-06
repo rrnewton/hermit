@@ -166,6 +166,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         virtualize_time: false,
         virtualize_metadata: false,
         virtualize_cpuid: true,
+        determinize_rdrand: true,
         cpuid_virtualized_by_backend: false,
         backend_supports_madvise: true,
         discover_live_file_metadata: false,
