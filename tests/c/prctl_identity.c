@@ -17,6 +17,13 @@
  * runs and across the ptrace, DBT, and KVM backends. It uses no threads, no
  * blocking I/O, and no signal delivery, so it is safe under the DBT
  * no-preemption scheduler.
+ *
+ * EMISSION CONTRACT: the fixture prints every value it read back, not the bare
+ * success token "prctl-identity-ok" it used to print. Every emitted value is one
+ * the guest itself installed (or the fixed post-exec pdeathsig default), so the
+ * line stays host-independent while making a wrong read-back visible in the byte
+ * stream. The old token carried no observation at all -- strictly less
+ * informative than a tally, which at least reports how many checks passed.
  */
 
 #include <errno.h>
@@ -47,13 +54,15 @@ int main(void) {
   /* PR_SET_DUMPABLE / PR_GET_DUMPABLE: a set value reads straight back. */
   if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0)
     return fail("PR_SET_DUMPABLE 0");
-  if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0) {
+  const int dumpable_after_clear = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+  if (dumpable_after_clear != 0) {
     fprintf(stderr, "prctl-identity: dumpable not 0\n");
     return 1;
   }
   if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) != 0)
     return fail("PR_SET_DUMPABLE 1");
-  if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 1) {
+  const int dumpable_after_set = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+  if (dumpable_after_set != 1) {
     fprintf(stderr, "prctl-identity: dumpable not 1\n");
     return 1;
   }
@@ -61,13 +70,15 @@ int main(void) {
   /* PR_SET_KEEPCAPS / PR_GET_KEEPCAPS: boolean round-trip. */
   if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0)
     return fail("PR_SET_KEEPCAPS 1");
-  if (prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0) != 1) {
+  const int keepcaps_after_set = prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0);
+  if (keepcaps_after_set != 1) {
     fprintf(stderr, "prctl-identity: keepcaps not 1\n");
     return 1;
   }
   if (prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0)
     return fail("PR_SET_KEEPCAPS 0");
-  if (prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0) != 0) {
+  const int keepcaps_after_clear = prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0);
+  if (keepcaps_after_clear != 0) {
     fprintf(stderr, "prctl-identity: keepcaps not 0\n");
     return 1;
   }
@@ -81,6 +92,10 @@ int main(void) {
     return 1;
   }
 
-  puts("prctl-identity-ok");
+  /* Emit every read-back value rather than a success token. */
+  printf("prctl-identity name=%s dumpable_after_clear=%d dumpable_after_set=%d "
+         "keepcaps_after_set=%d keepcaps_after_clear=%d pdeathsig_initial=%d\n",
+         name, dumpable_after_clear, dumpable_after_set, keepcaps_after_set,
+         keepcaps_after_clear, pdeath);
   return 0;
 }
