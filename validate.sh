@@ -4312,10 +4312,15 @@ function run_portable_only_suite {
 }
 
 # Resolve the last-known-green baseline commit for --selective. Precedence:
-# explicit --baseline, then $HERMIT_LAST_GREEN_SHA, then the most recent passing
-# validate-run-ledger entry (preferring this slot). Only a commit that exists
-# locally is returned; anything else prints nothing so selection falls back to
-# the full lane. Never fail-open on a stale or missing baseline.
+# explicit --baseline, then $HERMIT_LAST_GREEN_SHA, then anchor_select.py, which
+# applies the shared qualifying-receipt predicate to the validate-run ledger.
+# Only a commit that exists locally is returned; anything else prints nothing so
+# selection falls back to the full lane. Never fail-open on a stale or missing
+# baseline.
+#
+# NOTE the two explicit overrides above are deliberately NOT run through the
+# predicate: a human naming a baseline is an instruction, not an inference. That
+# is a remaining, intentional bypass -- see the task note on this change.
 function resolve_selective_baseline {
     local sha=""
     # --shallow-select pins the baseline to HEAD~1 (footprint of the newest commit
@@ -4330,15 +4335,38 @@ function resolve_selective_baseline {
         sha=$SELECTIVE_BASELINE
     elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
         sha=$HERMIT_LAST_GREEN_SHA
-    elif [[ -n $VALIDATION_LEDGER_FILE && -f $VALIDATION_LEDGER_FILE ]] \
-        && command -v jq >/dev/null 2>&1; then
-        sha=$(jq -r --arg slot "$VALIDATION_SLOT" '
-            select(.result == "pass" and .commit != "unknown" and .slot == $slot)
-            | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
-        if [[ -z $sha ]]; then
-            sha=$(jq -r '
-                select(.result == "pass" and .commit != "unknown")
-                | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
+    else
+        # THE ONE VERIFIER. This branch used to infer the baseline with
+        #   jq 'select(.result == "pass" and .commit != "unknown" and .slot == $slot)'
+        # which checks TWO fields. It did not check commit_anchored, tree_dirty,
+        # profile, selection_mode (the 1-hop clause), failures, executed_tests, or
+        # per-node coverage -- the seven other clauses of the shared
+        # qualifying-receipt predicate. A receipt that PASSED WHILE EXECUTING ZERO
+        # TESTS was therefore eligible as the green anchor, and inheriting from it
+        # silently shrinks the test set on the strength of a run that tested
+        # nothing. Demonstrated on a real ancestor, not asserted: the old jq filter
+        # accepted such a row; anchor_select refuses it with "executed_tests==0".
+        #
+        # anchor_select.py applies that shared predicate (it loads the same
+        # qualifying-receipt.json every other consumer reads) plus ancestry and the
+        # merge-gate floors. Its contract is: exit 0 = inherit, and EVERY non-zero
+        # exit means run the FULL lane. There is no path on which a failure of the
+        # tool yields a smaller test set.
+        #
+        # Parent-helper availability follows the guarded idiom already used in this
+        # file for failure_evidence.py and nonzero_result.py: when the dev-hermit
+        # parent is absent -- a bare hermit checkout, e.g. on hosted CI -- we emit
+        # nothing and the caller runs the full suite. Slower, never weaker.
+        local anchor_helper="$DEV_HERMIT_PARENT/ci-hub/validate/anchor_select.py"
+        local anchor_json=""
+        if [[ -n $DEV_HERMIT_PARENT && -r $anchor_helper ]] \
+            && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+            if anchor_json=$(python3 "$anchor_helper" --target HEAD --include-dirty \
+                --ledger "$VALIDATION_LEDGER_FILE" --json 2>/dev/null); then
+                sha=$(jq -r '.anchor.sha // empty' <<<"$anchor_json" 2>/dev/null)
+            else
+                sha=""
+            fi
         fi
     fi
     [[ -n $sha ]] || return 0
