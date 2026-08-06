@@ -397,6 +397,31 @@ pub(super) fn run_dbi(
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbi",
         ));
     }
+    // RDRAND/RDSEED determinization rewrites the guest's text in place. A
+    // translating backend keeps its own copy of the instruction stream, so the
+    // in-place patch and DynamoRIO's code cache become two writers of the same
+    // instructions and DR faults internally. Fence it off here rather than
+    // shipping a crash.
+    //
+    // This is a NAMED hole, not a silent downgrade: on DBI the instruction goes
+    // back to being masked-but-live, exactly as it was before determinization
+    // existed, and the warning says so. Closing it properly means instrumenting
+    // the instruction at translation time, which is the DBT backend's own job.
+    let config = &{
+        let mut config = config.clone();
+        if config.determinize_rdrand {
+            config.determinize_rdrand = false;
+            // Printed, not logged: a determinism guarantee being withdrawn must
+            // be visible at the default log level, or the fence is itself a
+            // silent downgrade. This matches the backend notices above.
+            eprintln!(
+                "hermit: [dbi backend] RDRAND/RDSEED determinization is DISABLED on this \
+                 backend; the instructions stay masked in CPUID but remain live for a guest \
+                 that ignores CPUID"
+            );
+        }
+        config
+    };
     let config_json = serde_json::to_string(config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBI backend: {error}"
