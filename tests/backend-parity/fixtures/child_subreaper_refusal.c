@@ -27,37 +27,38 @@
  * contract) and prints only a check count.
  */
 
+/*
+ * THE OBSERVED errno IS EMITTED. This fixture asserts a specific refusal, and
+ * "subreaper ok=2" carried neither the errno nor which entry point produced it.
+ * The diagnostics went to stderr, which the cell observation EXCLUDES
+ * (observation = {status, stdout}), so a backend refusing with the wrong errno
+ * reached the oracle as an empty stdout and a bare non-zero status -- the same
+ * observation as any other failure. Both entry points are now probed
+ * unconditionally and each reports its rc and errno, so a wrong refusal is
+ * legible in the byte stream and names itself. ENOSYS is a fixed Linux ABI
+ * constant, so emitting it adds no host state.
+ */
 int main(void) {
   enum { EXPECTED_CHECKS = 2 };
-  int ok = 0;
 
   errno = 0;
   int set_rc = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-  if (set_rc == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(
-        stderr,
-        "PR_SET_CHILD_SUBREAPER rc=%d errno=%d (want -1/ENOSYS)\n",
-        set_rc,
-        errno);
-    return 1;
-  }
+  int set_errno = errno;
+  int set_refused = set_rc == -1 && set_errno == ENOSYS;
 
   int value = -1;
   errno = 0;
   int get_rc = prctl(PR_GET_CHILD_SUBREAPER, &value, 0, 0, 0);
-  if (get_rc == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(
-        stderr,
-        "PR_GET_CHILD_SUBREAPER rc=%d errno=%d (want -1/ENOSYS)\n",
-        get_rc,
-        errno);
-    return 1;
-  }
+  int get_errno = errno;
+  int get_refused = get_rc == -1 && get_errno == ENOSYS;
 
-  printf("subreaper ok=%d\n", ok);
-  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  int ok = set_refused + get_refused;
+  printf(
+      "subreaper ok=%d set_rc=%d set_errno=%d get_rc=%d get_errno=%d\n",
+      ok,
+      set_rc,
+      set_errno,
+      get_rc,
+      get_errno);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }
