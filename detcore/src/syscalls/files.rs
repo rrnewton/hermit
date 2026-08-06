@@ -846,7 +846,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        if let Some(resource) = out_resource.or_else(|| out_inode.map(ResourceID::FileContents)) {
+        // Same raw-host-inode leak as the positional-write sites above; determinize the
+        // sendfile destination's fallback resource id through the same per-run counter.
+        let out_resource = match out_resource {
+            Some(resource) => Some(resource),
+            None => match out_inode {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
+        if let Some(resource) = out_resource {
             resources.insert(resource, Permission::W);
         }
         resources.fyi("sendfile");
@@ -966,7 +977,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // Determinize the fallback inode. `resource.or_else(|| raw_ino.map(FileContents))`
+        // put a RAW HOST INODE into the resource id, so a guest that creates its own file
+        // named a different resource on every run and the DETLOG differed run-to-run while
+        // stdout was identical. determinize_inode() maps it through the existing per-run
+        // monotonic counter (tool_global.rs `next_inode`), which is the same identity the
+        // neighbouring fstat path already records. It must run AFTER the with_detfd closure
+        // returns, because the closure is synchronous and this is an RPC.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1223,7 +1249,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // Determinize the fallback inode. `resource.or_else(|| raw_ino.map(FileContents))`
+        // put a RAW HOST INODE into the resource id, so a guest that creates its own file
+        // named a different resource on every run and the DETLOG differed run-to-run while
+        // stdout was identical. determinize_inode() maps it through the existing per-run
+        // monotonic counter (tool_global.rs `next_inode`), which is the same identity the
+        // neighbouring fstat path already records. It must run AFTER the with_detfd closure
+        // returns, because the closure is synchronous and this is an RPC.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1253,7 +1294,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // Determinize the fallback inode. `resource.or_else(|| raw_ino.map(FileContents))`
+        // put a RAW HOST INODE into the resource id, so a guest that creates its own file
+        // named a different resource on every run and the DETLOG differed run-to-run while
+        // stdout was identical. determinize_inode() maps it through the existing per-run
+        // monotonic counter (tool_global.rs `next_inode`), which is the same identity the
+        // neighbouring fstat path already records. It must run AFTER the with_detfd closure
+        // returns, because the closure is synchronous and this is an RPC.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
