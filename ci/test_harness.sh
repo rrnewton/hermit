@@ -300,6 +300,17 @@ function assert_parallel_portable_workflow {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must derive one e2e matrix from the audited plan"
+    # These are the two live workflow-shaped run consumers. Bind them to the
+    # same parser contract as run_required: the matrix producer is nonempty by
+    # construction, so neither branch may carry the build-only --allow-empty.
+    [[ $(grep -Fxc '              --mode "${{ matrix.mode }}" --ci-only --prebuilt \' "$workflow") == 1 ]] ||
+        die "GitHub portable naked-cell run must use the supported nonempty invocation shape"
+    [[ $(grep -Fxc '              --ci-only --prebuilt \' "$workflow") == 1 ]] ||
+        die "GitHub portable backend-cell run must use the supported nonempty invocation shape"
+    [[ $(grep -Fc -- '--ci-only --allow-empty' "$workflow") == 0 ]] ||
+        die "GitHub portable run consumers must not retain build-only --allow-empty"
+    ! grep -Fq 'e2e cells run with --allow-empty' "$workflow" ||
+        die "GitHub portable workflow retains stale empty-run authority documentation"
     [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
@@ -666,8 +677,8 @@ function emit_discoverable_manifest_buckets {
 # brackets and run_required on this one authority: zero selected/executed work
 # is never a qualifying run result, even if a shell command itself returned 0.
 function run_result_qualifies {
-    local selected=$1 executed=$2 recorded=$3 failures=$4
-    ((selected > 0 && executed == selected && recorded == executed && failures == 0))
+    local selected=$1 executed=$2 recorded=$3 nonpass=$4
+    ((selected > 0 && executed == selected && recorded == executed && nonpass == 0))
 }
 
 function audit_ci_correspondence {
@@ -1905,7 +1916,7 @@ function run_required {
     mkdir -p "$(dirname "$RESULTS")"
     : >"$RESULTS"
 
-    local planned test_id mode backend test metadata failures=0 selected=0 executed=0 recorded=0
+    local planned test_id mode backend test metadata selected=0 executed=0 recorded=0 nonpass=0
     if ((PROBE_DISABLED)); then
         planned=$(emit_gap_plan)
     else
@@ -1916,17 +1927,14 @@ function run_required {
         selected=$((selected + 1))
         test=${TEST_BY_ID[$test_id]}
         metadata=$(metadata_json "$test")
-        if run_cell "$test" "$metadata" "$mode" "$backend"; then
-            :
-        else
-            failures=$((failures + 1))
-        fi
+        run_cell "$test" "$metadata" "$mode" "$backend" || :
         executed=$((executed + 1))
     done < <(jq -r '[.test,.mode,(.backend // "")] | @tsv' <<<"$planned")
 
     ((selected > 0)) || die "filters selected no required test cells (NO_RESULT)"
     ((executed == selected)) || die "run execution shortfall: selected=$selected executed=$executed"
     recorded=$(jq -s 'length' "$RESULTS")
+    nonpass=$(jq -s '[.[] | select(.outcome != "PASS")] | length' "$RESULTS")
     write_junit
     jq -s --argjson selected "$selected" --argjson executed "$executed" --argjson recorded "$recorded" \
         '{schema:1,selected:$selected,executed:$executed,recorded:$recorded,tests:(map(.test)|unique|length),cells:length,
@@ -1939,7 +1947,7 @@ function run_required {
         "$RESULTS" >"$(dirname "$RESULTS")/summary.json"
     echo "Results: $RESULTS"
     echo "JUnit:  $JUNIT"
-    run_result_qualifies "$selected" "$executed" "$recorded" "$failures"
+    run_result_qualifies "$selected" "$executed" "$recorded" "$nonpass"
 }
 
 subcommand=${1:-}
