@@ -443,6 +443,16 @@ pub(super) fn run_dbi(
     if let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
+    // Hand --log-file to the in-guest DBI tool. Without this the DBI backend is
+    // the only one that ignores --log-file, because its Detcore tool runs in the
+    // guest process and never sees the supervisor's file-backed subscriber; its
+    // records went to stderr instead, so a cross-backend harness had to
+    // special-case DBI rather than read one artifact per backend.
+    if let Some(path) = std::env::var_os(detcore_dbi::LOG_FILE_ENV) {
+        if !path.is_empty() {
+            environment.insert(detcore_dbi::LOG_FILE_ENV.into(), path);
+        }
+    }
     environment.insert(detcore_dbi::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);

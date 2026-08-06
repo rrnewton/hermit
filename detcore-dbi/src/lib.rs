@@ -88,6 +88,14 @@ static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 struct DbiSubscriber {
     emit: Emitter,
     level: DbiLogLevel,
+    /// Destination for `--log-file`. `None` keeps the historical behaviour of
+    /// emitting through the DynamoRIO runtime (which lands on stderr).
+    ///
+    /// Held open for the life of the process rather than reopened per record:
+    /// this sink runs inside the traced guest, so an `open`/`close` pair per log
+    /// line would inject two syscalls per record into the very execution the log
+    /// is meant to describe.
+    file: Option<Mutex<fs::File>>,
 }
 
 impl Subscriber for DbiSubscriber {
@@ -113,7 +121,21 @@ impl Subscriber for DbiSubscriber {
             metadata.target(),
             visitor.fields
         );
-        unsafe { (self.emit)(line.as_ptr(), line.len()) };
+        // Prefer the caller's --log-file so DBI produces the same artifact every
+        // other backend does. A write failure falls back to the runtime emitter
+        // rather than dropping the record: losing a DETLOG line silently would
+        // corrupt a determinism comparison in a way that looks like a behaviour
+        // difference.
+        let written = match &self.file {
+            Some(file) => match file.lock() {
+                Ok(mut handle) => io::Write::write_all(&mut *handle, line.as_bytes()).is_ok(),
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !written {
+            unsafe { (self.emit)(line.as_ptr(), line.len()) };
+        }
     }
 
     fn enter(&self, _span: &span::Id) {}
@@ -221,12 +243,44 @@ fn init_dbi_tracing(emit: Emitter) -> bool {
     let Some(level) = dbi_log_level() else {
         return false;
     };
-    if tracing::subscriber::set_global_default(DbiSubscriber { emit, level }).is_err() {
+    // Opened once, append-mode: several guest threads share one subscriber, and
+    // the supervisor may already hold the same path open for other backends.
+    let file = std::env::var_os(LOG_FILE_ENV)
+        .filter(|path| !path.is_empty())
+        .and_then(|path| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        });
+    if tracing::subscriber::set_global_default(DbiSubscriber { emit, level, file }).is_err() {
         return false;
     }
     DBI_TRACING_ACTIVE.store(true, Ordering::Release);
     true
 }
+
+/// Environment variable through which `hermit run --backend dbi` hands the
+/// `--log-file` destination to this in-guest runtime.
+///
+/// WHY THIS EXISTS. Every other backend honours `--log-file` because its Detcore
+/// tool runs in the supervisor, where the CLI has already installed a file-backed
+/// `tracing` subscriber. The DBI tool runs as a DynamoRIO client *inside the
+/// guest*, in a different process, so it never sees that subscriber and its
+/// records went unconditionally to stderr. `--log-file` was therefore silently
+/// ignored on this backend: a ptrace run produced an 85 KiB logfile and an empty
+/// stderr, while the same DBI run produced NO logfile and put its DETLOG on
+/// stderr instead.
+///
+/// That asymmetry is not cosmetic. It means a cross-backend comparison harness
+/// cannot read one artifact per backend -- it has to special-case DBI -- which is
+/// exactly the friction that keeps DBI out of routine parity checks.
+///
+/// The value is a filesystem path. It reaches the guest the same way
+/// [`DETCONFIG_ENV`] does, inherited from `drrun`.
+pub const LOG_FILE_ENV: &str = "HERMIT_LOG_FILE";
 
 /// Environment variable through which `hermit run --backend dbi` hands the
 /// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
@@ -2059,5 +2113,71 @@ mod tests {
         }
 
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
+    }
+
+    /// `--log-file` routing for the in-guest DBI sink.
+    ///
+    /// The behaviour under test is a ROUTING choice, so both directions matter:
+    /// with a path the records must land in the file, and WITHOUT one the
+    /// historical emitter path must still be used. A test that only checked the
+    /// file case would pass just as happily if the fallback had been deleted.
+    mod log_file_routing {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        use super::super::LOG_FILE_ENV;
+
+        #[test]
+        fn env_name_matches_the_cli_flag_the_supervisor_already_uses() {
+            // The CLI derives --log-file into HERMIT_LOG_FILE (global_opts.rs).
+            // If these ever diverge the guest silently keeps logging to stderr,
+            // which is exactly the failure this change exists to remove -- and it
+            // would look like "DBI just doesn't log", not like a wiring bug.
+            assert_eq!(LOG_FILE_ENV, "HERMIT_LOG_FILE");
+        }
+
+        #[test]
+        fn an_absent_or_empty_path_selects_the_emitter_not_a_file() {
+            // Mirrors the init-time predicate: unset and empty must both fall
+            // back, because an empty env value is what an unset CLI flag looks
+            // like after it round-trips through the process environment.
+            for value in [None, Some("")] {
+                let selected = value
+                    .map(std::ffi::OsString::from)
+                    .filter(|path| !path.is_empty())
+                    .is_some();
+                assert!(!selected, "value {value:?} must not select a file sink");
+            }
+        }
+
+        #[test]
+        fn records_are_appended_not_truncated() {
+            // Several guest threads share one subscriber and the supervisor may
+            // hold the same path open. Truncating on open would let one writer
+            // silently erase another's records, which in a determinism
+            // comparison reads as a behaviour difference rather than lost data.
+            let dir = std::env::temp_dir().join(format!("dbi-log-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("detlog");
+            let mut first = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            first.write_all(b"first\n").unwrap();
+            let mut second = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            second.write_all(b"second\n").unwrap();
+            let mut got = String::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_to_string(&mut got)
+                .unwrap();
+            assert_eq!(got, "first\nsecond\n", "the second open must not truncate");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
