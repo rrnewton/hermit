@@ -23,7 +23,7 @@ int main(void) {
 
     if (fd < 0) {
         printf("fadvise ok=-1 mkstemp\n");
-        return 0;
+        return 1;
     }
 
     char buf[8192];
@@ -32,32 +32,25 @@ int main(void) {
         printf("fadvise ok=-1 write\n");
         close(fd);
         unlink(path);
-        return 0;
+        return 1;
     }
 
-    /* check 1: NORMAL over the whole file. */
-    if (posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL) == 0) {
-        ok++;
-    }
-    /* check 2: SEQUENTIAL over the whole file. */
-    if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) == 0) {
-        ok++;
-    }
-    /* check 3: WILLNEED over a bounded range. */
-    if (posix_fadvise(fd, 0, 4096, POSIX_FADV_WILLNEED) == 0) {
-        ok++;
-    }
-    /* check 4: DONTNEED over a bounded range. */
-    if (posix_fadvise(fd, 0, 4096, POSIX_FADV_DONTNEED) == 0) {
-        ok++;
-    }
-    /* check 5: RANDOM over the whole file. */
-    if (posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) == 0) {
-        ok++;
-    }
+    /* Each hint is reported separately: summing five independent
+     * posix_fadvise contracts into one scalar meant two backends rejecting
+     * DIFFERENT hints compared equal. The advice values are guest-chosen
+     * constants and the returns are booleans, so there is no host-independent
+     * value to print and this fixture is de-aliased rather than value-printing. */
+    int normal = posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL) == 0;
+    int sequential = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) == 0;
+    int willneed = posix_fadvise(fd, 0, 4096, POSIX_FADV_WILLNEED) == 0;
+    int dontneed = posix_fadvise(fd, 0, 4096, POSIX_FADV_DONTNEED) == 0;
+    int random_hint = posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) == 0;
+    ok = normal + sequential + willneed + dontneed + random_hint;
 
     close(fd);
     unlink(path);
-    printf("fadvise ok=%d\n", ok);
-    return 0;
+    printf("fadvise ok=%d normal=%d sequential=%d willneed=%d dontneed=%d "
+           "random=%d\n",
+           ok, normal, sequential, willneed, dontneed, random_hint);
+    return ok == 5 ? 0 : 1;
 }
