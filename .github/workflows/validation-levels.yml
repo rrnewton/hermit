@@ -176,7 +176,8 @@ jobs:
     # completed and its true duration is only known to exceed 6h. 720 lets it run
     # to completion at least once so we can measure the real cost and then
     # right-size (trim SUPER_REPETITIONS or split). The super-cancel-alert job
-    # below makes any future timeout LOUD instead of silent regardless.
+    # below makes a future super-job timeout LOUD while the workflow run itself
+    # remains alive. A whole-run cancellation also cancels in-run alert jobs.
     timeout-minutes: 720
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -217,11 +218,12 @@ jobs:
     name: Alert on silently-cancelled super validation
     # A job killed by timeout-minutes (or otherwise cancelled) concludes
     # `cancelled` — grey and silent, indistinguishable from a run that did
-    # nothing. This downstream job runs even when `super` was cancelled
-    # (if: always()) and fails LOUDLY (red) so a cancelled weekly stress run can
-    # never again pass unnoticed. It is skipped only when `super` legitimately
-    # did not run (e.g. merge_group events), so it never fires on normal
-    # completion.
+    # nothing. While the workflow run remains alive, this downstream job runs
+    # even when `super` was cancelled (`if: always()`) and fails LOUDLY (red).
+    # Whole-run cancellation remains an explicitly external-observation gap:
+    # GitHub also cancels this job in that case. This job is skipped when
+    # `super` legitimately did not run (e.g. merge_group events), so it never
+    # fires on normal completion.
     needs: super
     if: ${{ always() && needs.super.result != 'skipped' }}
     runs-on: ubuntu-latest

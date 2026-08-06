@@ -14,7 +14,9 @@
 //! from a run that never had to do anything. A cancelled stress run is a
 //! NO-RESULT, not a pass: absence must be loud, not silent. This helper is run
 //! by a downstream workflow job that `needs` the `super` job with
-//! `if: always()`, so it executes even when `super` itself was cancelled. It
+//! `if: always()`, so it executes when `super` itself was cancelled while the
+//! workflow run remains alive. A whole-run cancellation also cancels this
+//! downstream job and therefore requires external observation. The helper
 //! inspects the `super` job's result and fails (exit 1, red job) with an
 //! `::error::` annotation whenever that result is anything other than a
 //! genuine completion (`success`, `failure`) or a legitimate skip (`skipped`).
