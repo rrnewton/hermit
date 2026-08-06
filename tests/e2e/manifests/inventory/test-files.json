@@ -578,6 +578,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/proc_sys_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/proc_sys_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: reads the guest-visible /proc and /sys host-state carriers and prints them so verify's double run asserts run-to-run identity without freezing any field to a constant"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/clone.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/clone.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
