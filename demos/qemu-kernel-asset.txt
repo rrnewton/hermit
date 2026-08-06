@@ -1,0 +1,60 @@
+QEMU demo kernel asset — pinned manifest
+========================================
+
+`demos/05-qemu-busybox.sh` boots this exact kernel. It is pinned BY CONTENT
+(sha256), so any byte-identical copy is accepted no matter where it came from;
+the URL below is a convenience, not the authority.
+
+The binary itself is deliberately NOT committed. Repository policy forbids
+committing binaries, and a 12 MB bzImage in git history would be permanent. This
+manifest is the committed artifact: it records the checksum, the location, and
+the exact command that reproduces it.
+
+  asset        bzImage (x86_64 Linux kernel, bootable under QEMU)
+  sha256       e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2
+  size         12742656 bytes
+  kernel       6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79
+  repo         rrnewton/dev-hermit
+  release tag  qemu-kernel-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2
+  url          https://github.com/rrnewton/dev-hermit/releases/download/
+               qemu-kernel-<sha256>/bzImage
+
+How the demo finds it, in order. The first candidate whose sha256 matches the
+pin wins; a candidate that does not match is ignored, never trusted:
+
+  1. $KERNEL_IMAGE                       explicit path, checked first
+  2. target/qemu-busybox/bzImage         per-run cache (DELETED by `cargo clean`)
+  3. $QEMU_KERNEL_CACHE, else
+     ${XDG_CACHE_HOME:-$HOME/.cache}/hermit-demos/bzImage-<sha256>
+                                         durable cache, survives `cargo clean`
+  4. download from the URL above         last resort; also seeds (3)
+
+Because (3) is seeded on the first successful download, a machine needs egress
+AT MOST ONCE. After that the demo is offline and hermetic.
+
+Provisioning when the network refuses the asset host
+----------------------------------------------------
+
+An egress allowlist can refuse the release host: on the dev-hermit box the URL
+returns 403 both directly and through `with-proxy`, and `curl` is not on the
+herdr-run allowlist. `gh` IS, and this is a GitHub release asset, so fetch it
+through a Herdr pane instead. Measured working 2026-08-06:
+
+  agent-utils/bin/herdr-run --agent <you> \
+    'with-proxy gh release download \
+       qemu-kernel-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2 \
+       --repo rrnewton/dev-hermit --pattern bzImage --dir /tmp/khfetch --clobber'
+
+  sha256sum /tmp/khfetch/bzImage    # must equal the sha256 above
+  mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/hermit-demos"
+  cp /tmp/khfetch/bzImage \
+     "${XDG_CACHE_HOME:-$HOME/.cache}/hermit-demos/bzImage-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2"
+
+Verify the pin, always
+----------------------
+
+  sha256sum <candidate-bzImage> | cut -d' ' -f1
+
+must print the sha256 above. The demo enforces this itself and refuses a
+mismatch rather than booting an unknown kernel — do not weaken that check to
+make a local file work.
