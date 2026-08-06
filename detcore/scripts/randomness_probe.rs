@@ -173,7 +173,22 @@ unsafe fn rdseed_unconditional() -> String {
     hex(&out)
 }
 
+/// Printed for the instruction sources when the *host* cannot execute them.
+///
+/// The decision is made by the caller, never here: under Hermit the guest's
+/// CPUID deliberately reports the features as absent, so a probe that decided
+/// for itself would print this on every Hermit run and the fixture would stop
+/// covering the very instructions it exists to cover.
+const SKIPPED_HOST: &str = "SKIPPED_HOST";
+
 fn main() {
+    // `--no-instructions` is passed by the fixture when the *real* host does not
+    // advertise RDRAND/RDSEED, so that the probe does not take a #UD on a
+    // machine that genuinely lacks them (portable CI runs on such hosts). Both
+    // the native control and the Hermit run are given the same flag, so the two
+    // source sets always agree.
+    let instructions = !std::env::args().any(|arg| arg == "--no-instructions");
+
     // Stable order: the fixture compares the whole stream byte for byte.
     println!("getrandom {}", getrandom_raw());
     println!("urandom {}", read_device("/dev/urandom"));
@@ -181,8 +196,14 @@ fn main() {
     println!("at_random {}", at_random());
     println!("getentropy {}", getentropy());
     println!("arc4random {}", arc4random());
-    // SAFETY: x86-64 always has these instructions decodable; whether the CPU
-    // *advertises* them is deliberately not consulted, which is the point.
-    println!("rdrand {}", unsafe { rdrand_unconditional() });
-    println!("rdseed {}", unsafe { rdseed_unconditional() });
+    if instructions {
+        // SAFETY: the caller has confirmed the host advertises these. Whether
+        // the *guest's* CPUID advertises them is deliberately not consulted,
+        // which is the point of the fixture.
+        println!("rdrand {}", unsafe { rdrand_unconditional() });
+        println!("rdseed {}", unsafe { rdseed_unconditional() });
+    } else {
+        println!("rdrand {SKIPPED_HOST}");
+        println!("rdseed {SKIPPED_HOST}");
+    }
 }
