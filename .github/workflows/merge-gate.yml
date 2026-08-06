@@ -200,17 +200,48 @@ jobs:
       pull-requests: read
     steps:
       - name: Fetch the trusted receipt verifier
+        # The verifier is NOT self-contained: it reads its qualifying-receipt
+        # predicate and its producer-definition registration from sibling files.
+        # Fetching only the script left those at $RUNNER_TEMP/../validate/*.json,
+        # which does not exist, so the verifier exited 2 ("predicate unreadable")
+        # on every call and the gate read that as "verifier unavailable" -- fail
+        # closed, but it silently converted every legitimate receipt into a
+        # refusal. Fetch ALL THREE artifacts from the SAME immutable parent
+        # commit, digest-check each, and hand their paths to the verifier.
+        #
+        # ADVANCING THE PIN: PARENT_REF and the three digests move together, in
+        # one edit. Because this step lives in merge-gate.yml, changing it also
+        # changes the blob that the "Require the registered v4 gate definition"
+        # step compares against vars.MERGE_GATE_V4_BLOB -- that variable MUST be
+        # re-registered in the same operation or the gate refuses its own
+        # definition and every PR blocks.
         env:
           GH_TOKEN: ${{ github.token }}
+          PARENT_REF: 291a7a2ab135ecfaa9bb054d9679e5dad68736f2
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$PARENT_REF" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            437a2c52b43e978fbd4bd82216ee5a5f164bb10bb10e24e84752ed23b104a806
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            1bad737321f9a1a1761fa0bb722145a20f8f9e7900d005b740c64a50c5e4b21b
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            e5c1ffe517533f4b6b4ee281b4290fc5f0f6e98f286717e93e93aa5342c020fe
+
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
       - name: Remove local-validation label when its evidence is no longer valid
         # The verifier fetch is part of the authorization boundary. If that
         # preceding step fails (API outage, missing commit, or digest mismatch),
@@ -566,17 +597,48 @@ jobs:
           fi
           echo "Gate definition is registered v4 blob ${actual_blob}."
       - name: Fetch the trusted receipt verifier
+        # The verifier is NOT self-contained: it reads its qualifying-receipt
+        # predicate and its producer-definition registration from sibling files.
+        # Fetching only the script left those at $RUNNER_TEMP/../validate/*.json,
+        # which does not exist, so the verifier exited 2 ("predicate unreadable")
+        # on every call and the gate read that as "verifier unavailable" -- fail
+        # closed, but it silently converted every legitimate receipt into a
+        # refusal. Fetch ALL THREE artifacts from the SAME immutable parent
+        # commit, digest-check each, and hand their paths to the verifier.
+        #
+        # ADVANCING THE PIN: PARENT_REF and the three digests move together, in
+        # one edit. Because this step lives in merge-gate.yml, changing it also
+        # changes the blob that the "Require the registered v4 gate definition"
+        # step compares against vars.MERGE_GATE_V4_BLOB -- that variable MUST be
+        # re-registered in the same operation or the gate refuses its own
+        # definition and every PR blocks.
         env:
           GH_TOKEN: ${{ github.token }}
+          PARENT_REF: 291a7a2ab135ecfaa9bb054d9679e5dad68736f2
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$PARENT_REF" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            437a2c52b43e978fbd4bd82216ee5a5f164bb10bb10e24e84752ed23b104a806
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            1bad737321f9a1a1761fa0bb722145a20f8f9e7900d005b740c64a50c5e4b21b
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            e5c1ffe517533f4b6b4ee281b4290fc5f0f6e98f286717e93e93aa5342c020fe
+
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
       - name: Fetch the trusted check-outcome authority
         env:
           GH_TOKEN: ${{ github.token }}
