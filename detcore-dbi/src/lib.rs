@@ -18,6 +18,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::pin::pin;
@@ -85,9 +86,45 @@ type Idler = reverie_dbi::RuntimeIdler;
 static DBI_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Where an in-guest tracing event is written.
+///
+/// The DBI Detcore Tool runs *inside* the DynamoRIO client, in a different
+/// process from the `hermit` CLI, so it cannot share the CLI's tracing
+/// subscriber. The CLI's `--log-file` therefore has to cross the process
+/// boundary the same way `--log` already does: as an environment variable
+/// ([`LOG_FILE_ENV`]), read here.
+enum DbiSink {
+    /// The DynamoRIO runtime emitter. This is the default, and it lands on
+    /// stderr -- which is exactly why it is wrong when `--log-file` was asked
+    /// for: DBI's evidence channel would differ from every other backend.
+    Emitter(Emitter),
+    /// The canonical log file named by `--log-file`.
+    ///
+    /// Opened for APPEND, never truncate: the CLI owns creating/truncating this
+    /// path and keeps writing its own lines there, so truncating from the guest
+    /// would race the parent and discard its output.
+    File(Mutex<fs::File>),
+}
+
 struct DbiSubscriber {
-    emit: Emitter,
+    sink: DbiSink,
     level: DbiLogLevel,
+}
+
+impl DbiSubscriber {
+    fn write_line(&self, line: &str) {
+        match &self.sink {
+            DbiSink::Emitter(emit) => unsafe { emit(line.as_ptr(), line.len()) },
+            DbiSink::File(file) => {
+                // One write_all per line keeps a line intact under concurrent
+                // guest threads; a poisoned lock must not abort the guest, so a
+                // failed write is dropped rather than unwrapped.
+                if let Ok(mut file) = file.lock() {
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
+        }
+    }
 }
 
 impl Subscriber for DbiSubscriber {
@@ -113,7 +150,7 @@ impl Subscriber for DbiSubscriber {
             metadata.target(),
             visitor.fields
         );
-        unsafe { (self.emit)(line.as_ptr(), line.len()) };
+        self.write_line(&line);
     }
 
     fn enter(&self, _span: &span::Id) {}
@@ -214,6 +251,31 @@ fn dbi_log_level() -> Option<DbiLogLevel> {
     }
 }
 
+/// Environment variable through which `hermit run --backend dbi` hands the
+/// CLI's `--log-file` path to this in-guest runtime, so DETLOG lands in the
+/// canonical log file instead of escaping to stderr through the DynamoRIO
+/// emitter. Mirrors how `HERMIT_LOG` already crosses the same boundary.
+pub const LOG_FILE_ENV: &str = "HERMIT_LOG_FILE";
+
+/// Choose the event sink: the `--log-file` path when one was handed across,
+/// otherwise the DynamoRIO emitter.
+///
+/// A file that cannot be opened falls back to the emitter. Losing the log
+/// entirely is strictly worse than putting it on the wrong channel, and the
+/// fallback stays visible because the lines still appear.
+fn dbi_log_sink(emit: Emitter) -> DbiSink {
+    let Some(path) = std::env::var_os(LOG_FILE_ENV) else {
+        return DbiSink::Emitter(emit);
+    };
+    if path.is_empty() {
+        return DbiSink::Emitter(emit);
+    }
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => DbiSink::File(Mutex::new(file)),
+        Err(_) => DbiSink::Emitter(emit),
+    }
+}
+
 fn init_dbi_tracing(emit: Emitter) -> bool {
     if DBI_TRACING_ACTIVE.load(Ordering::Acquire) {
         return true;
@@ -221,7 +283,8 @@ fn init_dbi_tracing(emit: Emitter) -> bool {
     let Some(level) = dbi_log_level() else {
         return false;
     };
-    if tracing::subscriber::set_global_default(DbiSubscriber { emit, level }).is_err() {
+    let sink = dbi_log_sink(emit);
+    if tracing::subscriber::set_global_default(DbiSubscriber { sink, level }).is_err() {
         return false;
     }
     DBI_TRACING_ACTIVE.store(true, Ordering::Release);

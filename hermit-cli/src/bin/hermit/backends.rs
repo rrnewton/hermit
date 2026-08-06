@@ -385,6 +385,7 @@ pub(super) fn run_dbi(
     verify_allow: VerifyAllow,
     summary: bool,
     log: Option<LevelFilter>,
+    log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
@@ -442,6 +443,16 @@ pub(super) fn run_dbi(
     let mut guest = StdCommand::new(&prepared.program);
     if let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
+    }
+    // `--log-file` has to cross into the guest the same way `--log` does: the
+    // DBI Detcore Tool runs inside the DynamoRIO client, in another process, so
+    // without this its DETLOG escapes to stderr through the DynamoRIO emitter
+    // and DBI's evidence channel differs from every other backend.
+    if let Some(path) = log_file {
+        environment.insert(
+            detcore_dbi::LOG_FILE_ENV.into(),
+            path.as_os_str().to_owned(),
+        );
     }
     environment.insert(detcore_dbi::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
@@ -588,6 +599,7 @@ pub(super) fn run_dbi(
     _verify_allow: VerifyAllow,
     _summary: bool,
     _log: Option<LevelFilter>,
+    _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
