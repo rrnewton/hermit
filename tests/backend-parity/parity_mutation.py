@@ -133,6 +133,16 @@ class Observation:
             return NotImplemented
         return self.exit_status == other.exit_status and self.stdout == other.stdout
 
+    def is_empty(self) -> bool:
+        """True when this run emitted no identity payload at all.
+
+        Two empty observations compare EQUAL, so without this an
+        observation-free run reports parity. That is the vacuity that let a
+        vdso fixture go green by emitting no bytes: nothing was compared, and
+        nothing-vs-nothing matched.
+        """
+        return not self.stdout.strip()
+
     def summary(self) -> str:
         text = self.stdout.decode("utf-8", "replace").strip().replace("\n", " | ")
         return f"exit={self.exit_status} stdout={text!r}"
@@ -286,6 +296,12 @@ def require_divergence(
     if golden is None or mutated is None:
         report.fail(f"{label}: run timed out (golden={golden}, mutated={mutated})")
         return
+    if golden.is_empty() and mutated.is_empty():
+        report.fail(
+            f"{label}: VACUOUS -- neither run emitted an identity payload, so "
+            f"there was nothing a mutation could perturb"
+        )
+        return
     if mutated == golden:
         report.fail(
             f"{label}: VACUOUS -- mutation changed nothing; field is not "
@@ -301,6 +317,15 @@ def require_parity(
     """Assert that a clean candidate run MATCHES the golden ptrace reference."""
     if golden is None or candidate is None:
         report.fail(f"{label}: run timed out (golden={golden}, candidate={candidate})")
+        return
+    # NON-VACUITY leg. Checked BEFORE equality, because empty == empty is the
+    # exact shape that reports success while comparing nothing.
+    if golden.is_empty() or candidate.is_empty():
+        report.fail(
+            f"{label}: VACUOUS -- no identity payload to compare "
+            f"(golden {golden.summary()}, candidate {candidate.summary()}); "
+            f"a run that emits nothing must not report parity"
+        )
         return
     if candidate == golden:
         report.ok(f"{label}: parity with golden ({golden.summary()})")
@@ -370,6 +395,13 @@ def run_hermit(
         report.fail(
             f"{name} [hermit/{GOLDEN_BACKEND}]: golden reference did not pass "
             f"({golden.summary() if golden else 'timeout'})"
+        )
+        return
+    if golden.is_empty():
+        report.fail(
+            f"{name} [hermit/{GOLDEN_BACKEND}]: VACUOUS -- golden reference "
+            f"emitted no identity line, so every candidate that also emits "
+            f"nothing would report parity against it"
         )
         return
     report.ok(f"{name} [hermit/{GOLDEN_BACKEND}]: golden reference ({golden.summary()})")
