@@ -1699,6 +1699,12 @@
       "why": "tests/e2e/data-handling/shell-pipeline.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/data-handling/zstd-multithread.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/data-handling.toml",
+      "why": "tests/e2e/data-handling/zstd-multithread.sh is owned by ci/test_harness.sh via tests/e2e/manifests/data-handling.toml: It exercises a real multithreaded zstd worker pool and asserts the reassembled frame is byte-identical under strict verification"
+    },
+    {
       "disposition": "support-data",
       "path": "tests/e2e/determinism-stress/README.md",
       "runner": "maintainers of tests/e2e/determinism-stress",
@@ -1829,6 +1835,12 @@
       "path": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/node-v8-jit.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/node-v8-jit.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises V8 JIT code generation and Math.random entropy determinization under strict verification"
     },
     {
       "path": "tests/e2e/language-runtimes/perl-hash-order.sh",

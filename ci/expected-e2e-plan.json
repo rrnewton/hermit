@@ -212,6 +212,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "chaos",
@@ -321,6 +328,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/m4-macro-mkstemp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/node-v8-jit"
     },
     {
       "backend": "ptrace",
