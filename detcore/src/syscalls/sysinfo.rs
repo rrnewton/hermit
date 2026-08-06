@@ -31,6 +31,23 @@ fn clock_t_from_ticks(ticks: u64) -> libc::clock_t {
     ticks as libc::clock_t
 }
 
+const NANOS_PER_MICRO: u64 = 1_000;
+const MICROS_PER_SECOND: u64 = 1_000_000;
+
+/// Convert logical CPU time to `getrusage`'s `timeval`.
+///
+/// `times(2)` quantizes the same source to USER_HZ clock ticks (10 ms); `rusage` carries
+/// microseconds, so this deliberately does NOT round-trip through [`clock_ticks`]. Keeping the
+/// finer resolution is the point: a guest whose whole run is shorter than one clock tick still
+/// observes CPU time advancing, which is what #140 asks for.
+fn timeval_from_logical(duration: crate::types::LogicalTime) -> libc::timeval {
+    let micros = duration.as_nanos() / NANOS_PER_MICRO;
+    libc::timeval {
+        tv_sec: (micros / MICROS_PER_SECOND) as libc::time_t,
+        tv_usec: (micros % MICROS_PER_SECOND) as libc::suseconds_t,
+    }
+}
+
 fn logical_clock_ticks(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
@@ -181,11 +198,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(0)
     }
-    /// Return a deterministic resource-usage snapshot. Host CPU times, page-fault counts, and
-    /// context-switch counts depend on kernel scheduling, so report zero until Detcore models
-    /// those counters using logical execution progress.
+    /// Return a deterministic resource-usage snapshot.
     ///
-    /// `ru_maxrss` is the exception: it is populated with the guest's peak resident set size so
+    /// `ru_utime`/`ru_stime` come from the SAME logical CPU accounting that [`Self::handle_times`]
+    /// reads, so `getrusage(2)` and `times(2)` cannot disagree about how much CPU the guest has
+    /// used. They previously reported zero, which was deterministic but wrong: a guest computing
+    /// `utime / elapsed` saw `0 / N` while Detcore's own virtual clock advanced by `N` seconds.
+    ///
+    /// Page-fault and context-switch counters (`ru_minflt`, `ru_majflt`, `ru_nvcsw`, `ru_nivcsw`)
+    /// are still reported as zero. Those need event counts Detcore mediates but does not currently
+    /// accumulate, so they are left for a separate change rather than guessed at here.
+    ///
+    /// `ru_maxrss` is populated with the guest's peak resident set size so
     /// that programs which require a positive maximum RSS (e.g. rr's `rusage` test) behave like
     /// they do on Linux. The value comes from the same procfs memory accounting that `sysinfo`'s
     /// free-memory reporting already relies on, which is deterministic across runs under Detcore's
@@ -212,6 +236,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         if matches!(who, libc::RUSAGE_SELF | libc::RUSAGE_THREAD) {
             usage.ru_maxrss = self.guest_peak_rss_kb(guest) as libc::c_long;
         }
+
+        // CPU time, from the same logical accounting `times(2)` uses. RUSAGE_THREAD reads this
+        // thread's own logical clock; SELF aggregates the process's threads; CHILDREN reports the
+        // totals reaped from exited children. Matching Linux, the three are distinct sources
+        // rather than the same number relabelled.
+        let (user, system) = match who {
+            libc::RUSAGE_THREAD => {
+                let thread_time = &guest.thread_state().thread_logical_time;
+                (thread_time.user_cpu_time(), thread_time.system_cpu_time())
+            }
+            libc::RUSAGE_CHILDREN => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                (cpu.children_user, cpu.children_system)
+            }
+            _ => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                (cpu.user, cpu.system)
+            }
+        };
+        usage.ru_utime = timeval_from_logical(user);
+        usage.ru_stime = timeval_from_logical(system);
 
         guest.memory().write_value(usage_addr, &usage)?;
         Ok(0)
@@ -336,6 +381,44 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
     use crate::types::LogicalTime;
+
+    #[test]
+    fn rusage_cpu_time_keeps_microsecond_resolution_below_one_clock_tick() {
+        // The bug this guards: getrusage used to report zero CPU time. Quantizing to USER_HZ
+        // like times(2) would reintroduce it for any guest whose run is under 10 ms, so the
+        // conversion must NOT round-trip through clock_ticks.
+        let sub_tick = LogicalTime::from_nanos(1_500_000); // 1.5 ms == 0 clock ticks
+        assert_eq!(clock_ticks(sub_tick), 0, "precondition: under one USER_HZ tick");
+
+        let tv = timeval_from_logical(sub_tick);
+        assert_eq!(tv.tv_sec, 0);
+        assert_eq!(tv.tv_usec, 1_500, "sub-tick CPU time must still be visible");
+    }
+
+    #[test]
+    fn rusage_cpu_time_splits_seconds_and_microseconds_like_linux() {
+        let tv = timeval_from_logical(LogicalTime::from_nanos(2_000_250_400));
+        assert_eq!(tv.tv_sec, 2);
+        // 250_400 ns truncates toward zero, matching the kernel's ns -> us conversion.
+        assert_eq!(tv.tv_usec, 250);
+
+        assert_eq!(timeval_from_logical(LogicalTime::from_nanos(0)).tv_sec, 0);
+        assert_eq!(timeval_from_logical(LogicalTime::from_nanos(0)).tv_usec, 0);
+    }
+
+    #[test]
+    fn rusage_and_times_agree_on_the_same_logical_cpu_time() {
+        // The sharpest symptom in the sweep was two views of one virtual timeline disagreeing.
+        // Both views derive from the same LogicalTime, so a whole number of ticks must convert
+        // to the same duration through either path.
+        let cpu = LogicalTime::from_millis(70); // 7 whole USER_HZ ticks
+        let tv = timeval_from_logical(cpu);
+        let via_rusage_micros = tv.tv_sec as u64 * MICROS_PER_SECOND + tv.tv_usec as u64;
+        let via_times_micros = clock_ticks(cpu) * (NANOS_PER_CLOCK_TICK / NANOS_PER_MICRO);
+
+        assert_eq!(via_rusage_micros, via_times_micros);
+        assert_eq!(via_rusage_micros, 70_000);
+    }
 
     #[test]
     fn logical_clock_ticks_include_boot_offset_and_fractional_seconds() {
