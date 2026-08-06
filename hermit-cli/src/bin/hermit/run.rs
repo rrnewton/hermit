@@ -1367,7 +1367,9 @@ fn liteinst_fences_off_rdrand_determinization_under_strict() {
 /// determinization on, three distinct with it off). DBI keeps its own separate
 /// fence inside `run_dbi` for a different cause, so double-fencing here would
 /// print two withdrawal notices for one withdrawal. KVM is UNMEASURED, and an
-/// unmeasured backend must not be fenced.
+/// unmeasured backend must not be fenced. KVM specifically hangs here with the
+/// flag OFF and with a guest containing no RDRAND, so its hang is
+/// unattributable to this feature.
 #[test]
 fn other_backends_keep_rdrand_determinization() {
     for backend in ["ptrace", "kvm", "dbi"] {
@@ -2246,9 +2248,14 @@ impl RunOpts {
         // translating backend holds a second copy of the instruction stream,
         // LiteInst because the scan cannot read its trampolines at all, and
         // e9patch because the guest ends up executing entropy despite the scan
-        // reporting success. KVM is unmeasured and therefore not fenced --
-        // fencing an unmeasured backend would silently withdraw a guarantee it
-        // may well satisfy.
+        // reporting success. KVM is excluded on evidence rather than by
+        // default: it hangs on this host in BOTH directions -- with
+        // `--no-determinize-rdrand`, and with a guest containing no RDRAND at
+        // all, strict and non-strict alike, still incomplete at 300s. A
+        // flag-independent hang is not attributable to this feature, so
+        // fencing KVM would silently withdraw a guarantee with no evidence
+        // against it. It does mean determinization is UNVERIFIED on KVM here,
+        // which is a coverage gap, not a reason to fence.
         let rdrand_fence_reason = match backend {
             // Trampolines live in mappings backed by a deleted memfd, unreadable
             // both through `/proc/<pid>/map_files` (EPERM) and by the recorded
@@ -2271,7 +2278,9 @@ impl RunOpts {
             Backend::E9patch => Some("the rewritten guest still reads host entropy"),
             // ptrace is measured working. DBI keeps its own fence in `run_dbi`
             // for its own distinct cause; fencing it here too would print two
-            // withdrawal notices for one withdrawal. KVM is unmeasured.
+            // withdrawal notices for one withdrawal. KVM hangs on this host
+            // regardless of the flag, so it is unattributable, not broken by
+            // this feature.
             Backend::Ptrace | Backend::Dbi | Backend::Kvm => None,
         };
         if let Some(reason) = rdrand_fence_reason
