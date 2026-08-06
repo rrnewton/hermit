@@ -59,7 +59,7 @@ impl ReplayOpts {
         };
 
         if self.autopilot {
-            let (mut container, _identity_guard) = deterministic_container()?;
+            let (mut container, _mount_guard) = deterministic_container()?;
             with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             })
@@ -93,7 +93,7 @@ impl ReplayOpts {
             // to initialize logging inside the container because it may spawn a
             // thread. If we can guarantee that tracing won't spawn a thread, then
             // that restriction be lifted.
-            let (mut container, _identity_guard) = deterministic_container()?;
+            let (mut container, _mount_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             });
