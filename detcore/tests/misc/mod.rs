@@ -1177,6 +1177,150 @@ fn has_rdrand_without_detcore() {
     }
 }
 
+/// The randomness contract, as a fixture rather than a sweep.
+///
+/// Every source Hermit claims to determinize is read by one guest in one
+/// process, so no source can be silently skipped, and the whole output stream is
+/// compared across runs. A sweep's finding decays the moment someone changes the
+/// code; this fails the build.
+///
+/// Three properties are asserted, and all three are load-bearing:
+///
+/// 1. **Coverage.** Exactly the expected source set appears, and every source
+///    that exists on this platform yields real bytes. Without this a source that
+///    stopped reporting (an errno, a short read, `CF=0`, or a line quietly
+///    removed) would leave a *shorter* but still self-consistent stream, and the
+///    identity check below would pass while coverage silently shrank.
+/// 2. **Anti-vacuity.** The same probe run natively must produce *different*
+///    bytes. A probe whose sources were naturally constant would satisfy
+///    identity trivially and prove nothing.
+/// 3. **Identity.** Under Detcore the whole stream is byte-identical across
+///    repeated runs.
+///
+/// The probe issues `RDRAND`/`RDSEED` **without consulting CPUID**. That is the
+/// specific hole this pins down: Detcore masks the feature bits, so a
+/// CPUID-checking probe takes a determinized fallback and the fixture would pass
+/// while the instruction remained a live entropy source.
+#[test]
+fn randomness_sources_are_determinized() {
+    /// Sources that must be present in the probe's output, in order.
+    const EXPECTED: &[&str] = &[
+        "getrandom",
+        "urandom",
+        "random",
+        "at_random",
+        "getentropy",
+        "arc4random",
+        "rdrand",
+        "rdseed",
+    ];
+    /// A source absent from this platform. Reported explicitly rather than
+    /// skipped, so "not available here" cannot be read as "determinized here".
+    const ABSENT: &str = "ABSENT";
+
+    let probe = env!("CARGO_BIN_EXE_randomness_probe");
+
+    fn parse(stdout: &str) -> Vec<(String, String)> {
+        stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (name, value) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("malformed probe line: {line:?}"));
+                (name.to_owned(), value.to_owned())
+            })
+            .collect()
+    }
+
+    // ---- Property 1: coverage, checked on a native run first so a broken
+    // probe is reported as a broken probe rather than as a Hermit defect.
+    let native_runs: Vec<Vec<(String, String)>> = (0..3)
+        .map(|_| {
+            let out = std::process::Command::new(probe)
+                .output()
+                .expect("failed to run the randomness probe natively");
+            assert!(
+                out.status.success(),
+                "randomness probe failed natively: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse(&String::from_utf8_lossy(&out.stdout))
+        })
+        .collect();
+
+    let names: Vec<&str> = native_runs[0].iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names, EXPECTED,
+        "the probe's source set changed; a source must never be dropped silently"
+    );
+
+    // Which sources exist here. An ABSENT source is excluded from the variation
+    // check below but is still required to be present as a line.
+    let available: Vec<&str> = native_runs[0]
+        .iter()
+        .filter(|(_, value)| value != ABSENT)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert!(
+        available.contains(&"rdrand") && available.contains(&"rdseed"),
+        "this host must expose RDRAND and RDSEED for the fixture to mean anything; got {available:?}"
+    );
+    for (name, value) in &native_runs[0] {
+        if value == ABSENT {
+            continue;
+        }
+        assert!(
+            value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()),
+            "source {name} did not yield bytes natively: {value:?}"
+        );
+    }
+
+    // ---- Property 2: anti-vacuity. Every available source must actually vary
+    // off Hermit, or asserting identity under Hermit proves nothing.
+    for source in &available {
+        let seen: std::collections::BTreeSet<&str> = native_runs
+            .iter()
+            .map(|run| {
+                run.iter()
+                    .find(|(name, _)| name == source)
+                    .map(|(_, value)| value.as_str())
+                    .expect("source vanished between native runs")
+            })
+            .collect();
+        assert!(
+            seen.len() > 1,
+            "source {source} did not vary across 3 native runs ({seen:?}); the identity \
+             assertion under Detcore would be vacuous"
+        );
+    }
+    eprintln!("randomness fixture: covering {available:?} (absent here: none reported as bytes)");
+
+    // ---- Property 3: identity under Detcore, plus coverage again on the
+    // guest's own output. `det_test_cmd` runs the guest repeatedly and fails on
+    // any divergence between runs.
+    detcore_testutils::det_test_cmd(probe, &[], |output, _state| {
+        detcore_testutils::expect_success(output, _state);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let observed = parse(&stdout);
+        let names: Vec<&str> = observed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names, EXPECTED,
+            "a randomness source disappeared under Detcore; output was:\n{stdout}"
+        );
+        for (name, value) in &observed {
+            if value == ABSENT {
+                continue;
+            }
+            assert!(
+                value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()),
+                "source {name} yielded no bytes under Detcore ({value:?}); a source that \
+                 stops reporting is a coverage hole, not a pass. Full output:\n{stdout}"
+            );
+        }
+    });
+}
+
 #[test]
 fn rdrand_rdseed_is_masked() {
     let features = hardware_random_features();
