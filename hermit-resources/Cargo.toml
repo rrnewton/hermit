@@ -8,3 +8,6 @@ repository = "https://github.com/facebookexperimental/hermit"
 
 [lib]
 path = "src/lib.rs"
+
+[lints]
+workspace = true

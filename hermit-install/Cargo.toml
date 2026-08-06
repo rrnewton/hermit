@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [build-dependencies]
 reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6", default-features = false }
+
+[lints]
+workspace = true

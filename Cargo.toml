@@ -38,3 +38,19 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# An unconsumed `Result` is a COMPUTED-THEN-IGNORED VALUE: the check ran, the
+# verdict was produced, and nothing read it. That is the same shape as a
+# denominator that is computed and never consulted, or a counter that exists and
+# is never read -- an invariant assertion that drops its status looks like
+# verification while asserting nothing. Unlike those, the compiler can make this
+# particular version impossible, so it is denied rather than merely warned.
+#
+# Deny, not warn: the repo runs a zero-warnings policy, and a warning that does
+# not fail the build is itself a computed-then-ignored value.
+#
+# A DELIBERATE discard stays legal but must SAY SO -- `let _ = ...` with a
+# comment giving the reason. An unexplained discard is indistinguishable from an
+# oversight, which is precisely what this lint exists to separate.
+[workspace.lints.rust]
+unused_must_use = "deny"
