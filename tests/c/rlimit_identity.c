@@ -30,11 +30,29 @@
  *     a request with soft > hard fails with EINVAL, and an unprivileged attempt
  *     to raise the hard limit fails with EPERM.
  *
- * No raw host-dependent number is ever printed, so the observable result depends
- * only on the program, not on the host process's inherited limits. That makes
- * the contract byte-identical across repeated runs and across the ptrace, DBT,
- * and KVM backends. It uses no threads, no blocking I/O, and no signal delivery,
- * so it is safe under the DBT no-preemption scheduler.
+ * EMISSION CONTRACT. This fixture used to print the bare string
+ * "rlimit-identity-ok" and nothing else, on the stated reasoning that printing
+ * no raw number kept the output host-independent. That reasoning is what made
+ * it blind, and it was also wrong about which numbers are host-derived:
+ *
+ *   RLIMIT_NOFILE is virtualized by Detcore to a FIXED value. Measured with one
+ *   binary run both ways on the same host: native reports hard=524288 (the
+ *   host's inherited limit) while Hermit reports hard=1048576 (the constant).
+ *   Under Hermit that number is therefore determinized, not host-derived, and
+ *   it is precisely the thing this contract exists to pin.
+ *
+ * Hiding it cost real detection power: a backend that virtualizes NOFILE to the
+ * WRONG constant still satisfied every relative round-trip check in here and
+ * still printed the byte-identical "rlimit-identity-ok". Worse, two backends
+ * that settled on the SAME wrong constant AGREE with each other, so no amount
+ * of cross-backend comparison could ever surface it. The fixture now prints the
+ * virtualized hard limit and every value it read back, so a wrong constant is
+ * visible in the byte stream.
+ *
+ * The guest-chosen soft limits (64, then 32) are clamped to the observed hard
+ * limit and so remain host-independent on any host whose limit is at least 64.
+ * It uses no threads, no blocking I/O, and no signal delivery, so it is safe
+ * under the DBI no-preemption scheduler.
  */
 
 #include <errno.h>
@@ -150,7 +168,9 @@ int main(void) {
   }
 
   /* Faithful Linux refusal 1: a request with soft > hard fails with EINVAL. Only
-   * meaningful when the hard limit leaves room for an invalid soft value. */
+   * meaningful when the hard limit leaves room for an invalid soft value.
+   * -1 records "not applicable on this hard limit" rather than "not checked". */
+  int soft_gt_hard_errno = -1;
   if (hard != RLIM_INFINITY && hard > 0) {
     struct rlimit bad = {.rlim_cur = hard, .rlim_max = hard - 1};
     errno = 0;
@@ -163,11 +183,13 @@ int main(void) {
               strerror(errno));
       return 1;
     }
+    soft_gt_hard_errno = errno;
   }
 
   /* Faithful Linux refusal 2: an unprivileged process may not raise its hard
    * limit; requesting a larger hard limit fails with EPERM. Only meaningful when
    * the current hard limit is not already infinite. */
+  int raise_hard_errno = -1;
   if (hard != RLIM_INFINITY) {
     struct rlimit raise_hard = {.rlim_cur = hard, .rlim_max = hard + 1};
     errno = 0;
@@ -180,8 +202,18 @@ int main(void) {
               strerror(errno));
       return 1;
     }
+    raise_hard_errno = errno;
   }
 
-  puts("rlimit-identity-ok");
+  /* Emit the observations, not a success token. nofile_hard is the virtualized
+   * constant this contract exists to pin; the readbacks are what each round trip
+   * actually returned; the two errnos are the refusals actually observed. */
+  printf("rlimit-identity nofile_hard=%llu soft1_readback=%llu "
+         "prlimit_query=%llu prlimit_old=%llu soft2_readback=%llu "
+         "restore_readback=%llu soft_gt_hard_errno=%d raise_hard_errno=%d\n",
+         (unsigned long long)hard, (unsigned long long)read1.rlim_cur,
+         (unsigned long long)query.rlim_cur, (unsigned long long)old2.rlim_cur,
+         (unsigned long long)read2.rlim_cur, (unsigned long long)read3.rlim_cur,
+         soft_gt_hard_errno, raise_hard_errno);
   return 0;
 }
