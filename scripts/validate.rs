@@ -164,6 +164,17 @@ const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 /// Env var naming the dev-hermit parent workspace (second precedence).
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 
+/// Set by ci-hub's admission path (`ci-hub/validate/start_unit.py`) on the
+/// transient user unit it launches. Its PRESENCE is what distinguishes an
+/// admitted run from a bare one; the harness gate below is the only consumer
+/// that needs to tell those apart.
+const PRODUCER_ENV: &str = "CI_HUB_VALIDATE_PRODUCER";
+
+/// The admission tool a refusal points at. This is also the DETECTOR: we only
+/// refuse where this file actually exists, so the command we name is always a
+/// command the caller can really run.
+const CI_HUB_REL: &str = "ci-hub/ci-hub";
+
 /// Checkout-local default ledger file (third precedence). This is the landmine
 /// fix: a STANDALONE checkout with neither env set previously produced no
 /// receipt at all; now it always writes here so a green claim has evidence.
@@ -419,6 +430,86 @@ fn tree_dirty() -> bool {
     }
 }
 
+/// Find an enclosing dev-hermit workspace, if there is one.
+///
+/// The discriminator is deliberately the ADMISSION TOOL ITSELF (`ci-hub/ci-hub`)
+/// plus a `.gitmodules` that actually lists `hermit`. Both are required:
+///
+///   * keying on the tool means the refusal can only fire where the command it
+///     names really exists -- a gate that points at a missing binary is worse
+///     than no gate;
+///   * keying additionally on `.gitmodules` naming `hermit` avoids refusing in
+///     some unrelated tree that happens to contain a `ci-hub` directory.
+///
+/// A standalone hermit checkout has neither, so it is never refused. Walking
+/// ancestors (rather than testing one fixed path) is what makes this work from
+/// a worktree slot at `worktrees/<slot>/hermit` as well as from a primary.
+fn dev_hermit_workspace(start: &Path) -> Option<PathBuf> {
+    // An explicit parent wins, matching the precedence ledger_path already uses,
+    // but only if it really is one -- an exported stale path must not conjure a
+    // refusal out of nothing.
+    if let Ok(p) = std::env::var(PARENT_ENV) {
+        if !p.is_empty() {
+            let p = PathBuf::from(p);
+            if is_dev_hermit_workspace(&p) {
+                return Some(p);
+            }
+        }
+    }
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if is_dev_hermit_workspace(d) {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Both markers must be present. See `dev_hermit_workspace` for why.
+fn is_dev_hermit_workspace(dir: &Path) -> bool {
+    if !dir.join(CI_HUB_REL).is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(dir.join(".gitmodules")) {
+        Ok(text) => text.contains("hermit"),
+        Err(_) => false,
+    }
+}
+
+/// The refusal text. It NAMES THE COMMAND rather than only complaining, and
+/// fills in the caller's real checkout path so the suggestion is copy-pasteable.
+///
+/// `ci-hub validate-run` is the real subcommand (there is no bare
+/// `ci-hub validate`); naming a command that does not exist would reproduce
+/// exactly the defect this gate is meant to prevent.
+fn harness_refusal(workspace: &Path, checkout: &Path, profile: &str) -> String {
+    format!(
+        "validate.rs: refusing to run bare inside the dev-hermit workspace at {ws}.\n\
+         \n\
+         ci-hub is the sole admission path here. A bare run is unboxed, does not take the\n\
+         box-exclusive validate lock, writes no durable log that outlives agent recycling,\n\
+         and its result therefore cannot become a receipt -- so a green from it proves\n\
+         nothing while still consuming the machine.\n\
+         \n\
+         Run this instead:\n\
+         \n\
+         \x20 {ws}/{tool} validate-run \\\n\
+         \x20     --checkout {checkout} \\\n\
+         \x20     --agent <your-agent-name> \\\n\
+         \x20     --target <exact-40-hex-head> [--pr <number>] -- {profile}\n\
+         \n\
+         A standalone hermit checkout (no dev-hermit parent) runs bare normally; this gate\n\
+         only fires where {tool} actually exists. ci-hub itself sets {env} on the unit it\n\
+         launches, which is how an admitted run is distinguished from a bare one.",
+        ws = workspace.display(),
+        tool = CI_HUB_REL,
+        checkout = checkout.display(),
+        profile = profile,
+        env = PRODUCER_ENV,
+    )
+}
+
 /// Repo root via `git rev-parse --show-toplevel`, so profile/DAG paths resolve
 /// no matter the caller's cwd. Falls back to the current dir.
 fn repo_root() -> PathBuf {
@@ -655,6 +746,21 @@ fn main() -> ExitCode {
     };
 
     let root = repo_root();
+
+    // HARNESS DETECTION. Inside a dev-hermit workspace, ci-hub is the sole
+    // admission path, so a bare invocation is refused and told what to run.
+    // Outside one -- a standalone hermit checkout -- nothing changes.
+    //
+    // The gate is skipped when ci-hub launched us, which is the whole reason it
+    // is safe: a guard that also blocks the legitimate path gets disabled within
+    // a day, and then it protects nothing.
+    let admitted = std::env::var(PRODUCER_ENV).map(|v| !v.is_empty()).unwrap_or(false);
+    if !admitted {
+        if let Some(ws) = dev_hermit_workspace(&root) {
+            eprintln!("{}", harness_refusal(&ws, &root, &args.profile));
+            return ExitCode::from(4);
+        }
+    }
 
     // Resolve the DAG file: explicit --dag-file / RUN_DAG_FILE_OVERRIDE wins,
     // else ci/dag/<profile>.json.
