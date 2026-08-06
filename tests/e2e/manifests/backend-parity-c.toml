@@ -4656,3 +4656,66 @@ dbi = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/readdir-order-identity"
+description = "Strict verification for tests/backend-parity/fixtures/readdir_order_identity.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+# Budget set FROM MEASUREMENT, not from a guess. `--strict --verify` completes in
+# 7.59-7.99s over four consecutive runs (ptrace, devbig014, debug binary), each
+# reporting 24730 | 24730 DETLOG messages compared. 90s is the value 85 other
+# entries in this manifest already use and leaves ~11x headroom over the measured
+# maximum. An earlier revision of this test asked for 1200s -- a population-of-one
+# outlier here, ~150x the measured need -- without a completed verify run behind it.
+# The pass/fail of this guest does not depend on the budget: it finishes in 8s or
+# not at all, so the timeout cannot be what makes it pass.
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/readdir_order_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately"
+kvm = "KVM livelocks at guest startup on the current host; qualify KVM separately"
+sabre = "SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"
+liteinst = "LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native creation-order leakage is the PREMISE of this guest (measured: order_identical=0, seams_rev=n-1), recorded in the fixture header rather than gated here"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Enumeration order is filesystem-derived, not schedule-derived, so chaos adds no discriminating power here"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
