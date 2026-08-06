@@ -805,8 +805,28 @@ fn backend_values_parse_and_round_trip() {
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = format!(" --backend={value} -- fakeprog");
+        // `Display` renders the EFFECTIVE config, so the LiteInst RDRAND fence
+        // is visible here. That is the point of the fence being a config
+        // implication rather than a hidden runtime branch: the withdrawal shows
+        // up in `--save-config` and in any command line we echo back.
+        let fenced = if matches!(
+            expected,
+            Backend::Liteinst | Backend::Sabre | Backend::E9patch
+        ) {
+            " --no-determinize-rdrand"
+        } else {
+            ""
+        };
+        let normalized = format!(" --backend={value}{fenced} -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
+
+        // The rendered form must be a fixed point: re-parsing and re-validating
+        // it reproduces the same effective config. Without this the fence could
+        // silently keep appending flags on every round trip.
+        let mut reparsed =
+            RunOpts::parse_from(std::iter::once("fakehermit").chain(normalized.split_whitespace()));
+        reparsed.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(format!("{}", reparsed), normalized);
     }
 }
 
@@ -1217,9 +1237,12 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
     ]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.skid_margin, Some(500));
+    // `--no-determinize-rdrand` appears because the LiteInst RDRAND fence is a
+    // config implication and `Display` renders the effective config; the
+    // skid-margin behaviour under test is unaffected by it.
     assert_eq!(
         format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
+        " --backend=liteinst --skid-margin=500 --no-determinize-rdrand -- fakeprog"
     );
 }
 
@@ -1307,6 +1330,91 @@ fn gdbserver_forces_host_networking() {
     opts.validate_args_with_perf_support(true).unwrap();
     assert!(opts.det_opts.det_config.gdbserver);
     assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+/// NEGATIVE SIDE: LiteInst cannot satisfy the RDRAND scan (its trampolines live
+/// in unreadable deleted-memfd mappings, so every one is a refusal and
+/// fail-closed shuts the run down), so the fence must fire there.
+#[test]
+fn liteinst_fences_off_rdrand_determinization() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=liteinst", "fakeprog"]);
+    assert!(
+        opts.det_opts.det_config.determinize_rdrand,
+        "determinization is on by default; otherwise this test proves nothing"
+    );
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(!opts.det_opts.det_config.determinize_rdrand);
+}
+
+/// The fence must survive `--strict`, because `--strict` is exactly the
+/// configuration that turns a refused site into `unrecoverable_shutdown` -- it
+/// is the combination that produced the silent `rc=1`, zero-output abort.
+#[test]
+fn liteinst_fences_off_rdrand_determinization_under_strict() {
+    let mut opts =
+        RunOpts::parse_from(["fakehermit", "--backend=liteinst", "--strict", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(!opts.det_opts.det_config.determinize_rdrand);
+    assert!(
+        opts.det_opts.det_config.panic_on_unsupported_syscalls,
+        "strict must still be fail-closed; the fence narrows RDRAND only"
+    );
+}
+
+/// POSITIVE SIDE: the fence must not fire where the backend is measured working
+/// or is already handled, or it silently withdraws a guarantee that backend
+/// satisfies. ptrace is measured working (three identical values with
+/// determinization on, three distinct with it off). DBI keeps its own separate
+/// fence inside `run_dbi` for a different cause, so double-fencing here would
+/// print two withdrawal notices for one withdrawal. KVM is UNMEASURED, and an
+/// unmeasured backend must not be fenced. KVM specifically hangs here with the
+/// flag OFF and with a guest containing no RDRAND, so its hang is
+/// unattributable to this feature.
+#[test]
+fn other_backends_keep_rdrand_determinization() {
+    for backend in ["ptrace", "kvm", "dbi"] {
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", &format!("--backend={backend}"), "fakeprog"]);
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert!(
+            opts.det_opts.det_config.determinize_rdrand,
+            "backend {backend} must not be fenced by the LiteInst-specific rule"
+        );
+    }
+}
+
+/// SaBRe and e9patch are fenced for their own measured reasons, not by category.
+/// e9patch is the important one: it does not fail, it silently returns host
+/// entropy under `--strict` with rc=0, so without the fence the withdrawal is
+/// invisible -- exactly the concealment this feature exists to remove.
+#[test]
+fn sabre_and_e9patch_are_fenced_for_their_own_measured_reasons() {
+    for backend in ["sabre", "e9patch"] {
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", &format!("--backend={backend}"), "fakeprog"]);
+        assert!(opts.det_opts.det_config.determinize_rdrand);
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert!(
+            !opts.det_opts.det_config.determinize_rdrand,
+            "backend {backend} is measured broken with determinization on and must be fenced"
+        );
+    }
+}
+
+/// An explicit `--no-determinize-rdrand` on LiteInst is already off; the fence
+/// must be idempotent and must not emit a withdrawal notice for a guarantee the
+/// caller never asked for.
+#[test]
+fn liteinst_fence_is_idempotent_with_explicit_opt_out() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--backend=liteinst",
+        "--no-determinize-rdrand",
+        "fakeprog",
+    ]);
+    assert!(!opts.det_opts.det_config.determinize_rdrand);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(!opts.det_opts.det_config.determinize_rdrand);
 }
 
 #[test]
@@ -2092,6 +2200,103 @@ impl RunOpts {
             if self.tmp.is_none() {
                 self.tmp = Some(PathBuf::from("/tmp"));
             }
+        }
+
+        // RDRAND/RDSEED determinization scans every file-backed executable
+        // mapping and *refuses* any image it cannot read, because an unreadable
+        // image may hide a live RDRAND. LiteInst installs its trampolines into
+        // mappings backed by a deleted memfd, which are unreadable from both
+        // directions: `/proc/<pid>/map_files/<range>` gives EPERM and the
+        // recorded path `/memfd:liteinst2-trampoline (deleted)` gives ENOENT.
+        // Every such mapping therefore lands in `report.refused`, and under a
+        // fail-closed configuration `Detcore::rewrite_rdrand_sites` responds
+        // with `unrecoverable_shutdown`.
+        //
+        // Both halves are behaving as designed; the combination is not. LiteInst
+        // can never satisfy the scan, so `--backend liteinst` aborts under
+        // `--strict` for *every* guest -- including one that contains no RDRAND
+        // at all, since the refusals come from LiteInst's own trampolines rather
+        // than from the guest. Measured: with determinization on, both an
+        // RDRAND-using guest and a plain `printf` guest exit 1 with zero bytes
+        // of output; with `--no-determinize-rdrand` both run normally.
+        //
+        // Note this is NOT the DBI failure mode. DBI is fenced in `run_dbi`
+        // because a translating backend keeps a second copy of the instruction
+        // stream, so the in-place patch and the code cache fight. Here nothing
+        // is ever patched: the scan cannot read the image in the first place.
+        // The shared lesson is only that a backend which manufactures its own
+        // executable mappings needs to be considered explicitly.
+        //
+        // Fence it here rather than ship a backend that always aborts. This is a
+        // NAMED hole, not a silent downgrade: RDRAND/RDSEED return to
+        // masked-in-CPUID-but-live, exactly as before determinization existed.
+        // Closing it properly means making LiteInst's trampoline images readable
+        // to the scanner (or teaching the scanner to reconstruct them), which is
+        // the LiteInst backend's own job.
+        // Measured on a release build (SaBRe and e9tool are staged only by
+        // `PROFILE=release`), same guest, same binary, one flag toggled:
+        //
+        //   ptrace    on -> 3 identical values   off -> 3 distinct   WORKS
+        //   dbi       on -> fenced in `run_dbi`  off -> ok           ALREADY FENCED
+        //   liteinst  on -> rc=1, zero output    off -> ok           silent abort
+        //   sabre     on -> hangs (>90s)         off -> ok           hang
+        //   e9patch   on -> 3 DISTINCT values    off -> 3 distinct   silent nondeterminism
+        //
+        // The reason differs per backend, so this is a table of measured facts
+        // rather than a category rule. In particular "any backend that patches
+        // the guest" is NOT the right predicate: DBI fails because a
+        // translating backend holds a second copy of the instruction stream,
+        // LiteInst because the scan cannot read its trampolines at all, and
+        // e9patch because the guest ends up executing entropy despite the scan
+        // reporting success. KVM is excluded on evidence rather than by
+        // default: it hangs on this host in BOTH directions -- with
+        // `--no-determinize-rdrand`, and with a guest containing no RDRAND at
+        // all, strict and non-strict alike, still incomplete at 300s. A
+        // flag-independent hang is not attributable to this feature, so
+        // fencing KVM would silently withdraw a guarantee with no evidence
+        // against it. It does mean determinization is UNVERIFIED on KVM here,
+        // which is a coverage gap, not a reason to fence.
+        let rdrand_fence_reason = match backend {
+            // Trampolines live in mappings backed by a deleted memfd, unreadable
+            // both through `/proc/<pid>/map_files` (EPERM) and by the recorded
+            // path `/memfd:liteinst2-trampoline (deleted)` (ENOENT). Every one
+            // lands in `report.refused`, and fail-closed mode responds with
+            // `unrecoverable_shutdown` -- so `--strict` aborts on every guest,
+            // including guests containing no RDRAND at all.
+            Backend::Liteinst => Some("the RDRAND scan cannot read its trampoline mappings"),
+            // Observed: the run makes no progress and produces no output.
+            // Recorded as the observation; the mechanism is not established.
+            Backend::Sabre => Some("the guest hangs when RDRAND sites are rewritten"),
+            // The worst of the three, because it does not fail. Under `--strict`
+            // with determinization ENABLED the guest reads raw host entropy --
+            // three distinct values in three runs -- with rc=0 and no
+            // diagnostic, while the scan reports no refusals so fail-closed
+            // never fires. Fencing converts silent nondeterminism into NAMED
+            // nondeterminism. That is strictly better, but it is not the real
+            // fix: e9patch already locates the site (`mapped_sites=1`), so the
+            // instruction should be determinized at rewrite time instead.
+            Backend::E9patch => Some("the rewritten guest still reads host entropy"),
+            // ptrace is measured working. DBI keeps its own fence in `run_dbi`
+            // for its own distinct cause; fencing it here too would print two
+            // withdrawal notices for one withdrawal. KVM hangs on this host
+            // regardless of the flag, so it is unattributable, not broken by
+            // this feature.
+            Backend::Ptrace | Backend::Dbi | Backend::Kvm => None,
+        };
+        if let Some(reason) = rdrand_fence_reason
+            && config.determinize_rdrand
+        {
+            config.determinize_rdrand = false;
+            // Printed, not logged: a determinism guarantee being withdrawn must
+            // be visible at the default log level, or the fence is itself the
+            // concealment pattern this work set out to remove. This matches the
+            // notice `run_dbi` prints for the DBI fence.
+            eprintln!(
+                "hermit: [{} backend] RDRAND/RDSEED determinization is DISABLED on this backend \
+                 because {reason}; the instructions stay masked in CPUID but remain live for a \
+                 guest that ignores CPUID",
+                backend.as_str()
+            );
         }
 
         // Happens-before enforcement parks the "after" thread until its "before"
