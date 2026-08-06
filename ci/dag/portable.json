@@ -74,6 +74,19 @@
       }
     },
     {
+      "group": "check",
+      "job": "selective_baseline_qualification",
+      "desc": "Selective validation inherits a baseline only through the shared qualifying-receipt predicate; every other outcome runs the full lane",
+      "cmd": "./scripts/check-selective-baseline-qualification.sh",
+      "timeout": 60,
+      "hint": {
+        "est_duration_s": 3,
+        "rss_baseline_bytes": 67108864,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light"
+      }
+    },
+    {
       "group": "setup",
       "job": "nextest",
       "desc": "cargo-nextest available",
@@ -924,19 +937,6 @@
         "rss_baseline_bytes": 12884901888,
         "hard_mem_max_bytes": 25769803776,
         "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "check",
-      "job": "selective_baseline_qualification",
-      "desc": "Selective validation inherits a baseline only through the shared qualifying-receipt predicate; every other outcome runs the full lane",
-      "cmd": "./scripts/check-selective-baseline-qualification.sh",
-      "timeout": 60,
-      "hint": {
-        "est_duration_s": 3,
-        "rss_baseline_bytes": 67108864,
-        "hard_mem_max_bytes": 536870912,
-        "classification": "light"
       }
     }
   ]
