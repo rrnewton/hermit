@@ -20,3 +20,6 @@ path = "hello_race.rs"
 [[bin]]
 name = "hello_race_mini"
 path = "hello_race_mini.rs"
+
+[lints]
+workspace = true
