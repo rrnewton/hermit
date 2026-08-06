@@ -1210,6 +1210,14 @@ fn randomness_sources_are_determinized() {
         "random",
         "at_random",
         "getentropy",
+        // Reaches entropy through the vDSO specifically. Distinct from
+        // getrandom(2): once the vDSO has seeded its per-thread userspace
+        // CSPRNG there is no syscall left on the boundary, so a probe that
+        // exercises only getrandom(2) reports success while this path is
+        // unconstrained. On this backend it is determinized only *transitively*,
+        // because the seeding itself is an intercepted getrandom(2) — a
+        // guarantee that holds exactly as long as that interception does.
+        "vdso_getrandom",
         "arc4random",
         "rdrand",
         "rdseed",
@@ -1240,6 +1248,27 @@ fn randomness_sources_are_determinized() {
     } else {
         &["--no-instructions"]
     };
+
+    /// Reject a value that is technically well-formed but carries no entropy.
+    ///
+    /// Identity across runs plus a hex-shaped value is NOT enough: a source
+    /// zeroed out, or frozen to a constant, satisfies both and would sail
+    /// through. That is the same "stable because it is a constant" failure the
+    /// determinism work keeps finding, and a fixture blind to it reports a
+    /// guarantee it never checked.
+    fn reject_degenerate(context: &str, name: &str, value: &str) {
+        let bytes: Vec<&str> = value
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let distinct: std::collections::BTreeSet<&&str> = bytes.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "{context}: source {name} is a degenerate constant ({value}); \
+             deterministic-because-zeroed is not determinized"
+        );
+    }
 
     fn parse(stdout: &str) -> Vec<(String, String)> {
         stdout
@@ -1298,6 +1327,7 @@ fn randomness_sources_are_determinized() {
             value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()),
             "source {name} did not yield bytes natively: {value:?}"
         );
+        reject_degenerate("native", name, value);
     }
 
     // ---- Property 2: anti-vacuity. Every available source must actually vary
@@ -1318,7 +1348,12 @@ fn randomness_sources_are_determinized() {
              assertion under Detcore would be vacuous"
         );
     }
-    eprintln!("randomness fixture: covering {available:?} (absent here: none reported as bytes)");
+    // Emit the OBSERVED BYTES, not a pass count. A bare "ok" cannot show that
+    // two runs (or two backends) agreed on a *wrong* value; the values can.
+    for (name, value) in &native_runs[0] {
+        eprintln!("randomness fixture [native  ] {name} = {value}");
+    }
+    eprintln!("randomness fixture: covering {available:?}");
 
     // ---- Property 3: identity under Detcore, plus coverage again on the
     // guest's own output. `det_test_cmd` runs the guest repeatedly and fails on
@@ -1341,6 +1376,8 @@ fn randomness_sources_are_determinized() {
                 "source {name} yielded no bytes under Detcore ({value:?}); a source that \
                  stops reporting is a coverage hole, not a pass. Full output:\n{stdout}"
             );
+            reject_degenerate("detcore", name, value);
+            eprintln!("randomness fixture [detcore ] {name} = {value}");
         }
     });
 }
