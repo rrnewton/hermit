@@ -540,6 +540,20 @@
       "test": "system-utils/uuidgen-random"
     },
     {
+      "backend": "dbi",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
+    },
+    {
       "backend": "ptrace",
       "category": "data-handling",
       "lane": "portable",
