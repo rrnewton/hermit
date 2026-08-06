@@ -33,6 +33,16 @@ fn display_pathname(p: &MMapPath) -> String {
 }
 
 pub fn display(map: &MemoryMap) -> String {
+    display_as(map, &display_pathname(&map.pathname))
+}
+
+/// Render a mapping with an explicit pathname column.
+///
+/// Used to report a region that *is* the guest heap but which the kernel did
+/// not label `[heap]`, so the record is textually comparable with the labelled
+/// one another backend produces. Every other column is the mapping's real
+/// procfs data.
+pub fn display_as(map: &MemoryMap, pathname: &str) -> String {
     format!(
         "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
         map.address.0,
@@ -42,7 +52,7 @@ pub fn display(map: &MemoryMap) -> String {
         map.dev.0,
         map.dev.1,
         map.inode,
-        display_pathname(&map.pathname)
+        pathname
     )
 }
 
