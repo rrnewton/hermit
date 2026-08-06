@@ -441,7 +441,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => determinize_inode(guest, raw_inode).await.0,
             };
             Some((
-                virtual_inode,
+                // Rendered into the guest-visible procfs fdinfo text, so the
+                // deterministic value is unwrapped here on purpose.
+                virtual_inode.get(),
                 logical_flags,
                 open_file_id.deterministic_socket_cookie(),
             ))
@@ -1421,7 +1423,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => determinize_inode(guest, stat.inode).await,
         };
-        stat.inode = d_ino; // Reveal only the deterministic inode.
+        stat.inode = d_ino.get(); // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping.
@@ -2632,7 +2634,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.get();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
@@ -2672,7 +2674,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.get();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];

@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fmt;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,7 +21,60 @@ pub type RawFd = std::os::unix::io::RawFd;
 pub type RawInode = u64;
 
 /// Deterministic "virtual" inode.
-pub type DetInode = RawInode;
+///
+/// A newtype rather than an alias so that a host-assigned [`RawInode`] cannot
+/// silently stand in for a determinized one. It previously *was* an alias, and
+/// that is how a raw host inode reached `ResourceID::FileContents`: the guest's
+/// own file got a fresh kernel inode each run, so the scheduler's `COMMIT`
+/// records — which are specified to be reproducible — differed between two
+/// identical runs. The compiler could not object, because the two types were
+/// the same type. Construction is deliberately explicit and named so that every
+/// site that mints one has to say where its determinism comes from.
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub struct DetInode(RawInode);
+
+impl DetInode {
+    /// Wrap a value that is already deterministic.
+    ///
+    /// Callers must have derived `value` from deterministic state (the global
+    /// tool's inode counter, or a fixed offset constant) — never from a
+    /// host `stat`. Prefer `determinize_inode()` when starting from a
+    /// [`RawInode`].
+    pub const fn from_deterministic(value: RawInode) -> Self {
+        Self(value)
+    }
+
+    /// The underlying integer, for formatting and arithmetic on offsets.
+    pub const fn get(self) -> RawInode {
+        self.0
+    }
+}
+
+// Formats as the bare integer. `ResourceID` derives `Debug`, so a derived impl
+// here would turn the detlog's `FileContents(4)` into `FileContents(DetInode(4))`
+// — a silent change to the record format that every existing log comparison and
+// stored baseline depends on. Keep the rendering identical to the alias era.
+impl fmt::Debug for DetInode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Display for DetInode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 /// Identity of a Linux descriptor table (`files_struct`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
