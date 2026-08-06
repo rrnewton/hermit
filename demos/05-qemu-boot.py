@@ -39,6 +39,9 @@ from qemu_controller import build_qemu_command  # noqa: E402
 DEMO_LABEL = "Demo 5: QEMU Linux Snapshot"
 HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT / "hermit"))
 HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/hermit"))
+# Whether the caller pinned the binary. Must be read BEFORE main() writes
+# HERMIT_RELEASE back into the environment, which would make this always true.
+HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
 ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "600"))
@@ -51,6 +54,21 @@ LOG_FILTER = os.environ.get(
     "QEMU_LOG_FILTER",
     "warn,detcore=info,reverie_ptrace::task=info",
 )
+
+
+def _hermit_version(binary: Path) -> str:
+    """Return the binary's self-reported version, or a marker if it will not run."""
+    try:
+        result = subprocess.run(
+            [str(binary), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "version unavailable"
+    return result.stdout.strip() or "version unavailable"
 
 
 def snapshot_exists(path: Path, name: str) -> bool:
@@ -77,7 +95,24 @@ def main() -> int:
         ),
         dependency + "\n" + qemu_dependency,
     )
-    run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
+    # A pinned binary is NOT rebuilt. `make build-hermit` depends on `init-hermit`
+    # -> `checkout-all`, which runs `git submodule update --init --recursive`; the
+    # Makefile warns that this DETACHES attached primaries. When the parent gitlink
+    # and the primary's HEAD differ, that MOVES the primary checkout and then builds
+    # a different Hermit than the operator asked for -- so the run would be captured
+    # against a binary nobody chose. That is exactly the "golden captured wrong"
+    # failure this demo's anchor is supposed to be immune to, so when HERMIT_RELEASE
+    # names an existing executable we skip the build and report the binary's
+    # baked-in version instead (it carries a `-dirty` marker, so it attests the
+    # source state as well as the SHA).
+    if HERMIT_PINNED and HERMIT.is_file() and os.access(str(HERMIT), os.X_OK):
+        print(
+            "Pinned Hermit (skipping build-hermit): {} [{}]".format(
+                HERMIT, _hermit_version(HERMIT)
+            )
+        )
+    else:
+        run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     banner("Verify QEMU kernel and initramfs")
     run_checked([str(DEMO_DIR / "lib/qemu-assets.sh")], cwd=ROOT)
     if not HERMIT.is_file() or not os.access(str(HERMIT), os.X_OK):
