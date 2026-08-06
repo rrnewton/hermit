@@ -1219,8 +1219,29 @@ fn randomness_sources_are_determinized() {
     /// A source absent from this platform. Reported explicitly rather than
     /// skipped, so "not available here" cannot be read as "determinized here".
     const ABSENT: &str = "ABSENT";
+    /// An instruction source the *host* cannot execute. Distinct from ABSENT so
+    /// a reader can tell "this libc lacks the symbol" from "this CPU lacks the
+    /// instruction".
+    const SKIPPED_HOST: &str = "SKIPPED_HOST";
 
     let probe = env!("CARGO_BIN_EXE_randomness_probe");
+
+    // Whether to exercise RDRAND/RDSEED is decided HERE, from the real host's
+    // CPUID, and never by the guest: under Detcore the guest's CPUID reports
+    // both as absent by design, so a guest-side decision would silently stop
+    // covering the instructions this fixture exists to cover.
+    //
+    // Deciding it here also keeps the fixture ENABLED on portable CI hosts that
+    // genuinely lack the instructions, instead of hard-faulting there and
+    // having to be added to a skip list. A test that is skipped everywhere it
+    // is inconvenient is not a contract.
+    let host = hardware_random_features();
+    let host_has_instructions = host.rdrand && host.rdseed;
+    let args: &[&str] = if host_has_instructions {
+        &[]
+    } else {
+        &["--no-instructions"]
+    };
 
     fn parse(stdout: &str) -> Vec<(String, String)> {
         stdout
@@ -1240,6 +1261,7 @@ fn randomness_sources_are_determinized() {
     let native_runs: Vec<Vec<(String, String)>> = (0..3)
         .map(|_| {
             let out = std::process::Command::new(probe)
+                .args(args)
                 .output()
                 .expect("failed to run the randomness probe natively");
             assert!(
@@ -1261,15 +1283,17 @@ fn randomness_sources_are_determinized() {
     // check below but is still required to be present as a line.
     let available: Vec<&str> = native_runs[0]
         .iter()
-        .filter(|(_, value)| value != ABSENT)
+        .filter(|(_, value)| value != ABSENT && value != SKIPPED_HOST)
         .map(|(name, _)| name.as_str())
         .collect();
-    assert!(
+    assert_eq!(
+        host_has_instructions,
         available.contains(&"rdrand") && available.contains(&"rdseed"),
-        "this host must expose RDRAND and RDSEED for the fixture to mean anything; got {available:?}"
+        "the instruction sources must be covered exactly when the host advertises \
+         them (host_has_instructions={host_has_instructions}, covered={available:?})"
     );
     for (name, value) in &native_runs[0] {
-        if value == ABSENT {
+        if value == ABSENT || value == SKIPPED_HOST {
             continue;
         }
         assert!(
@@ -1301,7 +1325,7 @@ fn randomness_sources_are_determinized() {
     // ---- Property 3: identity under Detcore, plus coverage again on the
     // guest's own output. `det_test_cmd` runs the guest repeatedly and fails on
     // any divergence between runs.
-    detcore_testutils::det_test_cmd(probe, &[], |output, _state| {
+    detcore_testutils::det_test_cmd(probe, args, |output, _state| {
         detcore_testutils::expect_success(output, _state);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let observed = parse(&stdout);
@@ -1311,7 +1335,7 @@ fn randomness_sources_are_determinized() {
             "a randomness source disappeared under Detcore; output was:\n{stdout}"
         );
         for (name, value) in &observed {
-            if value == ABSENT {
+            if value == ABSENT || value == SKIPPED_HOST {
                 continue;
             }
             assert!(
