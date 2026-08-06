@@ -4656,3 +4656,22 @@ dbi = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/socket-epoll-ordering"
+description = "Contract fixture: ephemeral-port selection and epoll readiness ORDERING; the guest branches on which fd is ready first, so the divergence propagates into the syscall sequence rather than a printable set. Loopback only."
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/backend-parity/fixtures/socket_epoll_ordering.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not buildable on the authoring host (cmake absent); qualify DBI separately"
+kvm = "KVM does not complete a guest on the authoring host; qualify KVM separately"
+sabre = "Not buildable on the authoring host (cmake absent); qualify SaBRe separately"
+liteinst = "LiteInst preload handshake fails on the authoring host; qualify LiteInst separately"
