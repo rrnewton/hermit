@@ -31,6 +31,20 @@ fn clock_t_from_ticks(ticks: u64) -> libc::clock_t {
     ticks as libc::clock_t
 }
 
+/// Project a logical CPU duration onto `struct timeval`, the unit `getrusage` reports in.
+///
+/// Deliberately derived from nanoseconds rather than from `clock_ticks()`: `getrusage` has
+/// MICROSECOND resolution where `times()` has only clock-tick resolution, so rounding to ticks
+/// here would coarsen a value Linux reports finely. Coarsening a guest-visible quantity to make
+/// it look stable is the anti-pattern this change exists to remove, not one to reintroduce.
+fn timeval_from_logical(duration: crate::types::LogicalDuration) -> libc::timeval {
+    let nanos = duration.as_nanos();
+    libc::timeval {
+        tv_sec: (nanos / 1_000_000_000) as libc::time_t,
+        tv_usec: ((nanos % 1_000_000_000) / 1_000) as libc::suseconds_t,
+    }
+}
+
 fn logical_clock_ticks(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
@@ -211,6 +225,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         // no child has exited.
         if matches!(who, libc::RUSAGE_SELF | libc::RUSAGE_THREAD) {
             usage.ru_maxrss = self.guest_peak_rss_kb(guest) as libc::c_long;
+        }
+
+        // CPU time comes from the SAME logical accounting `times(2)` already uses
+        // (handle_times below); this path previously left it zeroed even though the value was
+        // sitting right there. Zeroing was not required by determinism -- `ru_maxrss` in this
+        // very struct is deterministic AND evolves -- and it contradicted the run's own virtual
+        // clock, which advanced /proc/uptime 123.00 -> 130.00 while ru_utime stayed 0.
+        match who {
+            // RUSAGE_THREAD is per-thread, so read this thread's own logical CPU time rather
+            // than the process aggregate; using the process total here would over-report for
+            // every thread but the first.
+            libc::RUSAGE_THREAD => {
+                let thread_time = &guest.thread_state().thread_logical_time;
+                let (user, system) = (thread_time.user_cpu_time(), thread_time.system_cpu_time());
+                usage.ru_utime = timeval_from_logical(user);
+                usage.ru_stime = timeval_from_logical(system);
+            }
+            libc::RUSAGE_SELF => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                usage.ru_utime = timeval_from_logical(cpu.user);
+                usage.ru_stime = timeval_from_logical(cpu.system);
+            }
+            // RUSAGE_CHILDREN aggregates REAPED children only. The same snapshot already tracks
+            // that separately, and it stays zero until a child is reaped -- which is what Linux
+            // reports too, so the previous zero was correct here by accident, not by design.
+            libc::RUSAGE_CHILDREN => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                usage.ru_utime = timeval_from_logical(cpu.children_user);
+                usage.ru_stime = timeval_from_logical(cpu.children_system);
+            }
+            _ => {}
         }
 
         guest.memory().write_value(usage_addr, &usage)?;
