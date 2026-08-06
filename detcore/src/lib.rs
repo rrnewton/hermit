@@ -851,11 +851,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(());
         }
+        let mut labelled_heap = false;
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
             procmaps::MMapPath::Heap if self.cfg.detlog_heap => true,
             _ => false,
         })? {
+            labelled_heap |= matches!(mmap.pathname, procmaps::MMapPath::Heap);
             let dettid = guest.thread_state().dettid;
             detlog!(
                 "[memory][dtid {}] {}->{}",
@@ -864,6 +866,51 @@ impl<T: RecordOrReplay> Detcore<T> {
                 procmaps::compute_hash(guest, &mmap)?
             )
         }
+
+        // The kernel labels `[heap]` only for `[mm->start_brk, mm->brk)`. Under a
+        // backend that loads the guest itself (DynamoRIO) that break belongs to
+        // the loader, so the guest's heap is an unlabelled anonymous mapping and
+        // the filter above matches nothing. Emitting no record there is worse
+        // than a wrong one: downstream a zero-record heap comparison reads as
+        // "compared and matched" rather than "never measured". Fall back to the
+        // brk range Detcore observed, which identifies the heap on every backend.
+        if self.cfg.detlog_heap && !labelled_heap {
+            self.detlog_brk_heap(guest)?;
+        }
+        Ok(())
+    }
+
+    /// Emit the `[heap]` record from the observed program break, for backends
+    /// where the kernel does not label the guest's heap.
+    ///
+    /// Reports the enclosing anonymous mapping so the record carries the real
+    /// procfs columns and is textually comparable with the labelled record
+    /// another backend produces for the same guest.
+    fn detlog_brk_heap<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
+        let Some((start, end)) = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_heap_range()
+        else {
+            return Ok(());
+        };
+        let enclosing = procmaps::from_pid(guest.pid(), |map| {
+            matches!(map.pathname, procmaps::MMapPath::Anonymous)
+                && map.address.0 <= start
+                && end <= map.address.1
+        })?;
+        let Some(mmap) = enclosing.into_iter().next() else {
+            return Ok(());
+        };
+        let dettid = guest.thread_state().dettid;
+        detlog!(
+            "[memory][dtid {}] {}->{}",
+            dettid,
+            procmaps::display_as(&mmap, "[heap]"),
+            procmaps::compute_hash(guest, &mmap)?
+        );
         Ok(())
     }
 
@@ -2384,6 +2431,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let regs_seq = guest.thread_state().stats.syscall_count;
             self.detlog_registers(guest, &control_point_regs, regs_seq);
         }
+
+        // brk is PassThrough, so nothing else records where the guest's heap is.
+        // Both brk(NULL) and brk(addr) return the break in effect afterwards.
+        if let Syscall::Brk(_) = &call
+            && let Ok(brk) = res
+            && brk > 0
+        {
+            guest
+                .thread_state()
+                .memory_metadata
+                .lock()
+                .expect("memory metadata mutex poisoned")
+                .observe_brk(brk as u64);
+        }
+
         self.detlog_memory_maps(guest)?;
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
