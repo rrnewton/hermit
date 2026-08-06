@@ -76,9 +76,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub use config::BlockingMode;
+pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+pub use config::config_wire_fingerprint;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
