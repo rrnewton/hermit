@@ -83,6 +83,17 @@
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_performance",
+      "desc": "Privileged manifest bucket: performance (manual until measured)",
+      "manifest": {"lane": "privileged", "category": "performance"},
+      "cmd": "./ci/test_harness.sh run --lane privileged --category performance --ci-only --allow-empty --prebuilt --results ignored/e2e/privileged/performance/results.jsonl --junit ignored/e2e/privileged/performance/junit.xml",
+      "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 120,
+      "hint": {"est_duration_s": 5,
+               "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
+               "classification": "light"}
     }
   ]
 }

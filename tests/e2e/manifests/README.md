@@ -14,7 +14,7 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `ci/test_harness.sh` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-The 13 manifests separate calibrated blocking cells from discoverable migration
+The 14 manifests separate calibrated blocking cells from discoverable migration
 inventory. CI creates one independently schedulable run node for every bucket.
 Six buckets currently contain calibrated blocking workloads:
 
@@ -25,10 +25,11 @@ Six buckets currently contain calibrated blocking workloads:
 - `applications.toml`
 - `c-programs.toml` (eight calibrated Buck-derived C probes)
 
-Eight additional `*-c.toml`/`c-programs.toml` buckets make 180 more C guests
-centrally discoverable. Eight `c-programs.toml` entries have calibrated
-standalone build and output contracts and run in blocking CI; the remaining
-172 C guests keep `ci = false` until they are calibrated. Buckets without a
+Nine additional `*-c.toml`/`c-programs.toml`/`performance.toml` buckets make
+210 more C guests centrally discoverable. Eight `c-programs.toml` entries have
+calibrated standalone build and output contracts and run in blocking CI; the
+remaining 202 C guests keep `ci = false` until they are calibrated. Buckets
+without a
 calibrated cell still have a CI node that intentionally reports zero cells,
 and the correspondence audit proves that this cannot hide a calibrated cell.
 Every entry still declares all five modes and every backend exclusion, so
