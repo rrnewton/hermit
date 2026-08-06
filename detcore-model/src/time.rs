@@ -566,6 +566,15 @@ impl DetTime {
         self.nondet_instrs += 1;
     }
 
+    /// Register that an `rdrand`/`rdseed` instruction has been emulated.
+    ///
+    /// Charged the same as `cpuid` and `rdtsc`: it is a nondeterministic
+    /// instruction Detcore intercepted and replaced with a deterministic
+    /// result, so a guest that polls it in a loop still advances virtual time.
+    pub fn add_rdrand(&mut self) {
+        self.nondet_instrs += 1;
+    }
+
     /// Update internal counts using the reverie clock value.
     pub fn add_rcbs(&mut self, count: u64) {
         if let Some(weighted_rcbs) = &mut self.weighted_rcbs {

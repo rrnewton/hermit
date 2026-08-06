@@ -50,6 +50,7 @@ mod memory;
 mod mvar;
 mod procfs;
 mod procmaps;
+pub mod rdrand;
 mod record_or_replay;
 mod resources;
 mod scheduler;
@@ -256,6 +257,129 @@ fn choose_rcb_timer(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Rewrite every `RDRAND`/`RDSEED` site in the guest's file-backed
+    /// executable mappings to a `ud2` trap, so the instruction is determinized
+    /// rather than merely hidden behind a cleared CPUID feature bit.
+    ///
+    /// Idempotent and cheap to re-run: `RandSiteTable` remembers which mappings
+    /// have been considered, so this is called once after `execve` and again
+    /// after any `mmap` that adds executable memory (which is how a dynamic
+    /// executable's shared libraries get covered).
+    ///
+    /// A site that cannot be rewritten is a hole in the guarantee, not a
+    /// cosmetic problem: the instruction stays live and silently returns host
+    /// entropy. Under a fail-closed configuration the run is therefore aborted
+    /// instead of continuing with an unannounced nondeterminism source.
+    async fn rewrite_rdrand_sites<G: Guest<Self>>(&self, guest: &mut G, context: &str) {
+        if !self.cfg.determinize_rdrand {
+            return;
+        }
+        let dettid = guest.thread_state().dettid;
+        let table = Arc::clone(&guest.thread_state().rand_sites);
+        let report = {
+            let mut table = table.lock().expect("rdrand site table mutex poisoned");
+            match rdrand::rewrite_new_executable_mappings(guest, &mut table) {
+                Ok(report) => report,
+                Err(err) => {
+                    error!(
+                        "[dtid {}] cannot enumerate executable mappings to determinize RDRAND at {}: {}",
+                        dettid, context, err
+                    );
+                    return;
+                }
+            }
+        };
+        // Scanning an image that holds no RDRAND is the common case (every
+        // shared library a dynamic executable loads) and is not worth a DETLOG
+        // line; only an actual rewrite or refusal changes what the guest sees.
+        if !report.touched_a_site() {
+            debug!(
+                "[dtid {}] {}: scanned {} executable image(s), no RDRAND/RDSEED sites",
+                dettid, context, report.mappings_scanned
+            );
+            return;
+        }
+        detlog!(
+            "[rdrand, dtid {}] {}: scanned {} executable image(s), {} site(s) rewritten, {} refused",
+            dettid,
+            context,
+            report.mappings_scanned,
+            report.rewritten,
+            report.refused,
+        );
+        for refusal in &report.refusals {
+            error!(
+                "[dtid {}] RDRAND/RDSEED site left live: {}",
+                dettid, refusal
+            );
+        }
+        if report.refused > 0 && self.cfg.panic_on_unsupported_syscalls {
+            error!(
+                "[dtid {}] {} RDRAND/RDSEED site(s) could not be determinized; refusing to \
+                 continue in fail-closed mode rather than let the guest read raw hardware \
+                 entropy. Re-run with --no-determinize-rdrand to accept the nondeterminism.",
+                dettid, report.refused
+            );
+            unrecoverable_shutdown(guest).await;
+        }
+    }
+
+    /// If this `SIGILL` came from a site we rewrote, emulate the original
+    /// `RDRAND`/`RDSEED` from the thread's deterministic PRNG and report
+    /// `true`; otherwise leave the guest untouched and report `false`.
+    ///
+    /// The emulated result follows the Intel-defined success path: the
+    /// destination register receives the value (with x86-64 partial-register
+    /// semantics), `CF` is set to report success, `OF`/`SF`/`ZF`/`AF`/`PF` are
+    /// cleared, and `RIP` advances past the *original* instruction rather than
+    /// past the two-byte `ud2`.
+    async fn emulate_rewritten_rand_instruction<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<bool, Errno> {
+        let mut regs = guest.regs().await;
+        let table = Arc::clone(&guest.thread_state().rand_sites);
+        let site = {
+            let table = table.lock().expect("rdrand site table mutex poisoned");
+            match table.lookup(regs.rip) {
+                Some(site) => site,
+                // Some other SIGILL: a genuine illegal instruction in the
+                // guest. Fall through to normal signal delivery.
+                None => return Ok(false),
+            }
+        };
+
+        let value: u64 = guest.thread_state_mut().thread_prng().random();
+        rdrand::write_destination(&mut regs, site.op, value);
+        rdrand::set_success_flags(&mut regs);
+        regs.rip = regs.rip.wrapping_add(u64::from(site.op.len));
+        guest.set_regs(regs).await.map_err(|_| Errno::EFAULT)?;
+
+        guest.thread_state_mut().thread_logical_time.add_rdrand();
+        let dettid = guest.thread_state().dettid;
+        let ordinal = {
+            let mut table = table.lock().expect("rdrand site table mutex poisoned");
+            table.record_emulation();
+            table.emulated()
+        };
+        // Recording the emulated value in the DETLOG makes an RDRAND divergence
+        // visible to --verify even when the value never reaches stdout, which
+        // is the case for a hash seed or a retry count. The site is named by
+        // its file offset, not its runtime address, so the log stays free of
+        // host state.
+        detlog!(
+            "[rdrand, dtid {}] emulated #{} {} (+{:#x}, {}-bit {}) = {:#018x}",
+            dettid,
+            ordinal,
+            site.op.insn.mnemonic(),
+            site.file_offset,
+            u32::from(site.op.width) * 8,
+            site.op.reg.name(),
+            rdrand::read_destination(&regs, site.op),
+        );
+        Ok(true)
+    }
+
     /// Registers a child whose native backend executed the clone syscall.
     ///
     /// The caller must initialize the child's local thread state from the same
@@ -1099,6 +1223,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[dtid {}] handling inbound signal (#{}) {}",
                 dettid, mycount, signal
             );
+            if signal == Signal::SIGILL
+                && self.cfg.determinize_rdrand
+                && self.emulate_rewritten_rand_instruction(guest).await?
+            {
+                // This SIGILL is the trap we installed over an RDRAND/RDSEED.
+                // It has been emulated from the deterministic PRNG; swallow it
+                // so the guest never observes a fault. Accounting for the
+                // signal itself already happened above, which is what keeps the
+                // event on the deterministic schedule.
+                self.post_handler_hook(guest).await;
+                return Ok(None);
+            }
             guest.thread_state_mut().stats.count_signal();
             let time = &guest.thread_state().thread_logical_time;
             let nanos = time.as_nanos();
@@ -1183,6 +1319,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                 .memory_metadata
                                 .lock()
                                 .expect("memory metadata mutex poisoned")
+                                .clone(),
+                        ))
+                    },
+                    rand_sites: if clone_flags.contains(CloneFlags::CLONE_VM) {
+                        Arc::clone(&pts.1.rand_sites)
+                    } else {
+                        // A forked child gets a copy-on-write copy of the
+                        // parent's already-rewritten text, so it inherits the
+                        // trap sites and needs its own copy of the table that
+                        // decodes them.
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .rand_sites
+                                .lock()
+                                .expect("rdrand site table mutex poisoned")
                                 .clone(),
                         ))
                     },
@@ -1353,6 +1504,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
         }
+
+        // The freshly execed image (and, for a dynamic executable, its
+        // interpreter) is mapped now. Rewrite any RDRAND/RDSEED it contains
+        // before the guest runs its first instruction.
+        self.rewrite_rdrand_sites(guest, "post_exec").await;
 
         self.post_handler_hook(guest).await;
         Ok(())

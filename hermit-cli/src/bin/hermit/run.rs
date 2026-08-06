@@ -2078,6 +2078,7 @@ impl RunOpts {
 
         if self.strace_only {
             config.virtualize_cpuid = false;
+            config.determinize_rdrand = false;
             config.virtualize_metadata = false;
             config.virtualize_time = false;
             config.deterministic_io = false;

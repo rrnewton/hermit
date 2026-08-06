@@ -24,6 +24,7 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
@@ -1310,6 +1311,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let len = call.len();
+        let executable = call.prot().contains(ProtFlags::PROT_EXEC);
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");
 
@@ -1324,6 +1326,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .map_shared_object(start, len, object, offset);
             }
             None => {}
+        }
+        // A dynamic executable's shared libraries arrive here, not at execve,
+        // so this is where RDRAND/RDSEED inside libcrypto and friends gets
+        // determinized. The scan is keyed on mappings already seen, so the
+        // common non-executable mmap costs one /proc/<pid>/maps read.
+        if executable {
+            self.rewrite_rdrand_sites(guest, "mmap").await;
         }
         Ok(result)
     }
