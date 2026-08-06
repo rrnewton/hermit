@@ -31,6 +31,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -352,17 +353,92 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// suppressed. Re-enables `flock` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#791)
+    /// Advisory whole-file locks, forwarded to the kernel.
+    ///
+    /// This was previously an unconditional no-op success, justified by the
+    /// claim that "an advisory whole-file lock is never contended within the
+    /// serialized container". That is false: serializing guest threads stops
+    /// them EXECUTING simultaneously, it does not stop their lock HOLD
+    /// INTERVALS from overlapping. A holder that is descheduled -- because it
+    /// blocked, forked, or simply used up its timeslice -- keeps holding while
+    /// another process runs and observes the lock. Measured before this change,
+    /// on both ptrace and DBI, two processes held the same `LOCK_EX`
+    /// simultaneously while native correctly returned `EWOULDBLOCK`.
+    ///
+    /// A no-op is the wrong failure direction for a determinism tool. It is
+    /// deterministically wrong, so double-run verification cannot see it, and it
+    /// silently removes mutual exclusion from every guest that uses a lockfile.
+    ///
+    /// Forwarding is what `fcntl` already does for POSIX record locks, which is
+    /// why those work. The guest's descriptor is a real host descriptor, so the
+    /// kernel supplies the whole contract for free and consistently with itself:
+    /// shared vs exclusive, `LOCK_NB`, atomic upgrade/downgrade, release on
+    /// `LOCK_UN`, release when the last descriptor for the open file
+    /// description is closed, and release on process exit.
+    ///
+    /// Determinism: the outcome is a function of which guest holds the lock,
+    /// and that is fixed by Detcore's deterministic schedule, so a given
+    /// program and seed produce the same acquisition outcome every run. No host
+    /// state enters the decision -- the contending parties are all guests.
     pub async fn handle_flock<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
-        info!(
-            "flock(fd={}, operation={:#x}) treated as a deterministic no-op success",
-            call.fd(),
-            call.operation()
-        );
-        Ok(0)
+        const LOCK_NB: i32 = libc::LOCK_NB;
+        let (fd, operation) = (call.fd(), call.operation());
+        let caller_wants_nonblocking = operation & LOCK_NB != 0;
+
+        // Always ask the kernel non-blockingly, even when the guest asked to
+        // block. A guest thread parked inside a kernel flock is not visible to
+        // the deterministic scheduler as blocked, so nothing runs to release the
+        // lock and the whole container wedges -- measured: a four-way contention
+        // guest that completes natively hung indefinitely under a plain
+        // forwarding implementation. Probing first keeps the common cases exact
+        // and turns the one case we cannot serve into a diagnosable refusal
+        // instead of a hang.
+        let probe = call.with_operation(operation | LOCK_NB);
+        let result = self.record_or_replay(guest, probe).await;
+
+        match result {
+            Ok(value) => {
+                trace!("flock(fd={}, operation={:#x}) acquired", fd, operation);
+                Ok(value)
+            }
+            Err(Errno::EWOULDBLOCK) if caller_wants_nonblocking => {
+                // Exactly what the guest asked for.
+                trace!("flock(fd={}, operation={:#x}) would block", fd, operation);
+                Err(Errno::EWOULDBLOCK.into())
+            }
+            Err(Errno::EWOULDBLOCK) => {
+                // The guest asked to wait. Waiting faithfully needs a wait queue
+                // owned by the deterministic scheduler, the way futexes are
+                // handled; until that exists, refuse loudly. Returning success
+                // would recreate the mutual-exclusion bug this handler was
+                // written to fix, and blocking in the kernel would deadlock.
+                error!(
+                    "[dtid {}] blocking flock(fd={}, operation={:#x}) is contended, and Detcore \
+                     cannot yet park a thread on a file lock deterministically. Refusing rather \
+                     than granting a lock another guest holds. Use LOCK_NB, or run without \
+                     --strict to receive ENOLCK.",
+                    guest.thread_state().dettid,
+                    fd,
+                    operation
+                );
+                if self.cfg.panic_on_unsupported_syscalls {
+                    unrecoverable_shutdown(guest).await
+                } else {
+                    Err(Errno::ENOLCK.into())
+                }
+            }
+            Err(err) => {
+                trace!(
+                    "flock(fd={}, operation={:#x}) refused: {}",
+                    fd, operation, err
+                );
+                Err(err.into())
+            }
+        }
     }
 
     async fn snapshot_procfs<G: Guest<Self>>(
