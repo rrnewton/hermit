@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [build-dependencies]
 reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "349460925ee56f2aca686a3392b534e8861ba375", default-features = false }
+
+[lints]
+workspace = true
