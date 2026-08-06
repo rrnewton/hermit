@@ -105,7 +105,8 @@ struct InodePool {
     // TODO(T87258449): merge these two maps:
     inodes: HashMap<RawInode, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
-    next_inode: RawInode,
+    /// Plain monotonic counter. Only `add_inode` turns it into a `DetInode`.
+    next_inode: u64,
 }
 
 /// Everything we know (globally) about a DetInode.
@@ -165,7 +166,8 @@ impl InodePool {
     fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
-                let new = self.next_inode;
+                // THE one host-inode -> DetInode conversion in the tree.
+                let new = DetInode::from_det_counter(self.next_inode);
                 self.next_inode += 1;
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(

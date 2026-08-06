@@ -19,7 +19,54 @@ pub type RawFd = std::os::unix::io::RawFd;
 pub type RawInode = u64;
 
 /// Deterministic "virtual" inode.
-pub type DetInode = RawInode;
+///
+/// This is a newtype, not an alias for [`RawInode`], and that is load-bearing: a
+/// raw host inode reaching a deterministic record (a DETLOG line, a
+/// `ResourceID`) is a determinism bug, and while the two were the same type the
+/// compiler could not see it. A `FileContents(<raw host inode>)` leak shipped
+/// exactly that way.
+///
+/// There is deliberately **no** `From<RawInode>` and no public constructor from a
+/// host value. The only way to obtain a `DetInode` from a host inode is the
+/// global-state mapping in `detcore`'s `add_inode`, which allocates from a
+/// monotonic counter and records the correspondence; it reaches this type
+/// through [`DetInode::from_det_counter`]. Every other site must already hold a
+/// `DetInode`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub struct DetInode(u64);
+
+impl DetInode {
+    /// Mint a `DetInode` from a value the caller has already made deterministic.
+    ///
+    /// The name is deliberately awkward: every call site is an assertion that the
+    /// argument is a deterministic counter/offset, never a host inode. Audit them
+    /// with `grep -rn from_det_counter`.
+    pub const fn from_det_counter(value: u64) -> Self {
+        DetInode(value)
+    }
+
+    /// The underlying number, for formatting and for the syscall return path.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DetInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Identity of a Linux descriptor table (`files_struct`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
