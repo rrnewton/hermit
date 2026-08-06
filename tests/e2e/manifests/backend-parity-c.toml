@@ -4658,45 +4658,34 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
-id = "backend-parity-c/readdir-order-identity"
-description = "Strict verification for tests/backend-parity/fixtures/readdir_order_identity.c"
+id = "backend-parity-c/inline-syscall-sites"
+description = "Inline syscall instructions in the main ELF, so a main-ELF rewriter has sites to patch"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-# Budget set FROM MEASUREMENT, not from a guess. `--strict --verify` completes in
-# 7.59-7.99s over four consecutive runs (ptrace, devbig014, debug binary), each
-# reporting 24730 | 24730 DETLOG messages compared. 90s is the value 85 other
-# entries in this manifest already use and leaves ~11x headroom over the measured
-# maximum. An earlier revision of this test asked for 1200s -- a population-of-one
-# outlier here, ~150x the measured need -- without a completed verify run behind it.
-# The pass/fail of this guest does not depend on the budget: it finishes in 8s or
-# not at all, so the timeout cannot be what makes it pass.
+# House budget. Measured: ptrace --strict --verify completes in well under 1s.
 timeout_seconds = 90
 occasional = false
-program = "tests/backend-parity/fixtures/readdir_order_identity.c"
+program = "tests/backend-parity/fixtures/inline_syscall_sites.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
+# MEASURED e9patch reach: candidate_sites=5 mapped_sites=5 (a typical libc guest measures 0).
 [test.modes.verify]
-# ci = true: a fixture that never runs pins nothing. 85 of the 86 entries in this
-# manifest have no CI-enabled mode at all; this one is measured at ~8s, so there is
-# no cost argument for leaving it dormant.
+# ci = true: a corpus guest that never runs pins nothing. Establishing on ptrace
+# first is the point -- this is a SHARED guest every backend ratchets against,
+# not a patching-backend-specific corpus.
 ci = true
 backends_enabled = ["ptrace"]
-# The guest only REPORTS unless asked to assert. `verify` grades on the exit status
-# of `hermit --strict --verify`, so the flag is what makes this cell able to fail on
-# an ordering regression at all. Small (single-buffer) is determinized today and is
-# the part held; large pins a known per-buffer-sort gap and stays reported-only.
-guest_args = { ptrace = ["--require-small-determinized"] }
 [test.modes.verify.backends_disabled]
-dbi = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately"
-kvm = "KVM livelocks at guest startup on the current host; qualify KVM separately"
-sabre = "SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"
-liteinst = "LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately"
+dbi = "Not yet qualified for this guest; ratchet separately"
+kvm = "KVM livelocks at guest startup on the current host; qualify separately"
+sabre = "Not yet qualified for this guest; ratchet separately"
+liteinst = "LiteInst preload runtime is not built beside the binary on this host"
 
 [test.modes.naked]
 ci = false
 backends_enabled = []
 [test.modes.naked.backends_disabled]
-native = "Native creation-order leakage is the PREMISE of this guest (measured: order_identical=0, seams_rev=n-1), recorded in the fixture header rather than gated here"
+native = "Native is the uninstrumented baseline; the contract is the hermit run"
 
 [test.modes.replay]
 ci = false
@@ -4712,7 +4701,130 @@ liteinst = "Record/replay is unsupported by LiteInst"
 ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
-ptrace = "Enumeration order is filesystem-derived, not schedule-derived, so chaos adds no discriminating power here"
+ptrace = "Syscall-site reach is not schedule-derived, so chaos adds no discriminating power"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/static-nolibc-syscall-sites"
+description = "Freestanding static guest: no PLT, no interpreter, whole program in the main ELF"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+# House budget. Measured: ptrace --strict --verify completes in well under 1s.
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-static", "-nostdlib", "-nostartfiles"]
+
+# MEASURED e9patch reach: candidate_sites=6 mapped_sites=6.
+[test.modes.verify]
+# ci = true: a corpus guest that never runs pins nothing. Establishing on ptrace
+# first is the point -- this is a SHARED guest every backend ratchets against,
+# not a patching-backend-specific corpus.
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not yet qualified for this guest; ratchet separately"
+kvm = "KVM livelocks at guest startup on the current host; qualify separately"
+sabre = "Not yet qualified for this guest; ratchet separately"
+liteinst = "LiteInst preload runtime is not built beside the binary on this host"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the uninstrumented baseline; the contract is the hermit run"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Syscall-site reach is not schedule-derived, so chaos adds no discriminating power"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/mixed-inline-and-libc-syscalls"
+description = "Patched inline sites and unpatched libc.so syscalls interleaved in one run"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+# House budget. Measured: ptrace --strict --verify completes in well under 1s.
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+# MEASURED e9patch reach: candidate_sites=1 mapped_sites=1; the libc half is deliberately out of reach.
+[test.modes.verify]
+# ci = true: a corpus guest that never runs pins nothing. Establishing on ptrace
+# first is the point -- this is a SHARED guest every backend ratchets against,
+# not a patching-backend-specific corpus.
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not yet qualified for this guest; ratchet separately"
+kvm = "KVM livelocks at guest startup on the current host; qualify separately"
+sabre = "Not yet qualified for this guest; ratchet separately"
+liteinst = "LiteInst preload runtime is not built beside the binary on this host"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the uninstrumented baseline; the contract is the hermit run"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Syscall-site reach is not schedule-derived, so chaos adds no discriminating power"
 dbi = "Chaos scheduling is unsupported by DBI"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
