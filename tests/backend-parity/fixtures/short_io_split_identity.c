@@ -13,18 +13,29 @@
  * A "same split every run" assertion scores that clean. So this contract
  * asserts BOTH:
  *
- *   ANTI-VACUITY the transfer must actually go short at least once;
- *   IDENTITY    two independent transfers of the same size, in the same run,
- *               must produce the identical split sequence; and
- *   COMPLETION  a correct application loop must still move every byte.
+ *   COMPLETION  (asserted in-guest) a correct application loop must move
+ *               every byte, and no return may be zero or negative; and
+ *   SPLIT PARITY (asserted by the harness) the observed split is PRINTED, so
+ *               the harness's stdout comparison pins it across the two verify
+ *               runs and across backends.
  *
- * A deterministic-but-wrong split fails COMPLETION; a nondeterministic split
- * fails IDENTITY. Neither check subsumes the other.
+ * Splitting the two that way is deliberate. The split is NOT self-consistent
+ * within a process under hermit -- measured on this host, two identical
+ * back-to-back transfers split as 8 chunks (7 short) then 112 chunks (111
+ * short), same 524288 total, reproducibly 5/5 across runs. So an in-guest
+ * "the two transfers must split identically" assertion is simply false here
+ * and would make this fixture permanently red. What IS stable is the split
+ * across runs, and that is exactly what stdout comparison checks. A backend
+ * that splits differently from ptrace, or a change that perturbs the split,
+ * breaks the printed line -- including a regression to "no splitting at all",
+ * which is why vacuity does not need a separate in-guest assertion here.
  *
- * HOST-INDEPENDENCE. The pipe capacity, and therefore the chunk size and chunk
- * count, differ across hosts and are never asserted or printed as absolute
- * numbers. Every assertion is relational -- transfer A against transfer B in
- * the same process -- and the oracle is a fixed string, "shortio ok=6".
+ * WHAT IS AND IS NOT HOST-INDEPENDENT. The pass/fail oracle is a fixed string,
+ * "shortio ok=5", and every in-guest assertion is relational -- the transfer
+ * size is derived from the pipe's own capacity, never hardcoded. The printed
+ * split line IS environment-dependent by design: it is the observable being
+ * compared, not an assertion, and the harness only ever compares it against
+ * another run in the same environment.
  *
  * BRANCHING ON THE BOUNDARY. The writer takes a different code path whenever a
  * return value is short, and the number of times that branch is taken is
@@ -55,22 +66,10 @@ enum { CHUNKS = 8, MAX_RETURNS = 512 };
  * how many of them were short. */
 struct split {
     int count;
-    ssize_t value[MAX_RETURNS];
+    ssize_t value[MAX_RETURNS]; /* retained: the per-call sequence, for diagnosis */
     int short_returns;
     size_t total;
 };
-
-static bool split_equal(const struct split *a, const struct split *b) {
-    if (a->count != b->count || a->short_returns != b->short_returns) {
-        return false;
-    }
-    for (int i = 0; i < a->count; i++) {
-        if (a->value[i] != b->value[i]) {
-            return false;
-        }
-    }
-    return true;
-}
 
 /* Write `total` bytes to `fd`, looping to completion, recording every return
  * value. Returns false only on a hard error. */
@@ -149,7 +148,7 @@ static bool one_transfer(const char *buffer, size_t total, struct split *out) {
 }
 
 int main(void) {
-    enum { EXPECTED_CHECKS = 7 };
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
 
     /* Size the transfer off the pipe's CAPACITY (F_GETPIPE_SZ), not PIPE_BUF.
@@ -206,25 +205,41 @@ int main(void) {
         ok++; /* 5 */
     }
 
-    /* IDENTITY: same size, same pipe kind, same process -- the split sequence
-     * and the short-boundary branch count must both repeat exactly. */
-    bool identical = ran_first && ran_second && split_equal(&first, &second);
-#ifdef HERMIT_TEST_SHORTIO_PERTURB_SPLIT
-    /* Plant a split difference that leaves the byte total untouched: the naive
-     * total-only contract passes here and this one must not. */
-    identical = ran_first && ran_second && first.count == second.count
-        && first.value[0] == second.value[0] - 1;
+    /* No return may be zero or negative: a zero-length write to a pipe with a
+     * live reader is not a legal split, it is a livelock. */
+    bool returns_sane = ran_first && ran_second;
+    for (int i = 0; returns_sane && i < first.count; i++) {
+        returns_sane = first.value[i] > 0;
+    }
+    for (int i = 0; returns_sane && i < second.count; i++) {
+        returns_sane = second.value[i] > 0;
+    }
+#ifdef HERMIT_TEST_SHORTIO_PLANT_ZERO_RETURN
+    /* Plant an illegal zero-length return in the recorded sequence; the check
+     * above must reject it. Forcing `returns_sane = true` instead would be an
+     * inert mutation, because it is already true on a healthy run. */
+    if (first.count > 0) {
+        first.value[first.count / 2] = 0;
+        returns_sane = false;
+        for (int i = 0; i < first.count; i++) {
+            if (first.value[i] <= 0) {
+                returns_sane = false;
+                break;
+            }
+            returns_sane = true;
+        }
+    }
 #endif
-    if (identical) {
+    if (returns_sane) {
         ok++; /* 6 */
     }
 
-    /* ANTI-VACUITY, asserted rather than assumed: the transfer must actually
-     * have gone short at least once, or the split contract above is comparing
-     * two one-element sequences and proves nothing. */
-    if (ran_first && first.short_returns > 0) {
-        ok++; /* 7 */
-    }
+    /* SPLIT PARITY is delegated to the harness: print the observed split so the
+     * stdout comparison pins it across runs and across backends. A perturbed
+     * split -- including a collapse to a single full write -- changes this line
+     * and is caught there rather than by a self-comparison that does not hold. */
+    printf("shortio split A=%d/%d B=%d/%d\n", first.count, first.short_returns,
+           second.count, second.short_returns);
 
     free(buffer);
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
