@@ -1,0 +1,4 @@
+# Run metadata is everything that varies between two runs of the same code.
+# Keeping it OUT of git is what makes the scorecard idempotent.
+run-metadata.json
+*/run-metadata.json
