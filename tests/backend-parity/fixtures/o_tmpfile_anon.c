@@ -45,7 +45,8 @@ int main(void) {
     }
     if (fd >= 0 && ftruncate(fd, 10) == 0) {
         char tail[10];
-        if (pread(fd, tail, 10, 0) == 10 && tail[6] == 0 && tail[9] == 0) {
+        if (pread(fd, tail, 10, 0) == 10 && tail[6] == 0 && tail[7] == 0 &&
+            tail[8] == 0 && tail[9] == 0) {
             ok++;
         }
     }
