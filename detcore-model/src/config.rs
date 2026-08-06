@@ -1123,6 +1123,61 @@ impl Config {
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
+/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
+/// to an out-of-process plugin.
+///
+/// Named alongside the other `REVERIE_SABRE_HERMIT_*` launch variables so the
+/// two travel together and a reader finds them in one place.
+pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
+
+/// A fingerprint of this build's [`Config`] *shape*, for detecting a plugin and
+/// a coordinator compiled from different definitions of it.
+///
+/// # Why this exists
+///
+/// An out-of-process plugin such as `libdetcore_sabre.so` is a separate Cargo
+/// artifact that lands in the same target directory as `hermit`. Changing
+/// `Config` -- or merely switching branches -- leaves the plugin stale while
+/// everything still *looks* built. `Config` is transferred during the RPC
+/// handshake, so a stale plugin decodes it against the wrong layout and the
+/// failure surfaces as an opaque codec error: measured, one added `bool` field
+/// produced `Decode(InvalidBooleanValue(20))` at connect, which points nowhere
+/// near "your plugin is from a different build" and cost a long diagnosis while
+/// blocking every SaBRe measurement.
+///
+/// # What it measures
+///
+/// The JSON encoding of `Config::default()`, which carries every field NAME and
+/// its default VALUE. That is a direct reading of the struct definition rather
+/// than a proxy for it: adding, removing, renaming, reordering or retyping a
+/// field all change the string. A git SHA or build timestamp would be a proxy --
+/// it would flag rebuilds that changed nothing and, worse, could match across
+/// two trees that genuinely differ.
+///
+/// It is deliberately stricter than the wire format strictly requires: bincode
+/// is positional, so a pure rename would not break decoding, yet it changes this
+/// fingerprint. Refusing in that case is the safe direction -- a false mismatch
+/// costs one rebuild, a missed mismatch costs what this exists to prevent.
+pub fn config_wire_fingerprint() -> String {
+    // Config derives Serialize, so this cannot fail for the default value; if it
+    // ever does, report the error rather than returning a fingerprint that would
+    // compare equal to another failure.
+    let shape =
+        serde_json::to_string(&Config::default()).unwrap_or_else(|e| format!("unserializable:{e}"));
+    fingerprint_of_shape(&shape)
+}
+
+/// FNV-1a over the shape string. Inline to avoid taking a digest dependency for
+/// sixteen hex digits; this is a mismatch detector, not a security boundary.
+fn fingerprint_of_shape(shape: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in shape.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
@@ -1306,6 +1361,31 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    #[test]
+    fn config_fingerprint_is_stable_and_shape_sensitive() {
+        // STABLE: a build must agree with itself, or the guard would reject a
+        // MATCHED pair -- which would be worse than having no guard at all.
+        assert_eq!(config_wire_fingerprint(), config_wire_fingerprint());
+        assert_eq!(config_wire_fingerprint().len(), 16);
+
+        let base = serde_json::to_string(&Config::default()).unwrap();
+        assert_eq!(fingerprint_of_shape(&base), config_wire_fingerprint());
+
+        // SHAPE-SENSITIVE, checked on the same mechanism the real function uses.
+        // One added field is exactly the change that caused the outage.
+        let with_extra_field = format!("{},\"a_new_flag\":false}}", &base[..base.len() - 1]);
+        assert_ne!(
+            fingerprint_of_shape(&with_extra_field),
+            config_wire_fingerprint()
+        );
+        // A removed field.
+        let removed = base.replacen("\"virtualize_time\":true,", "", 1);
+        assert_ne!(fingerprint_of_shape(&removed), config_wire_fingerprint());
+        // A pure rename, which bincode would tolerate but which we still refuse.
+        let renamed = base.replacen("\"virtualize_time\"", "\"virtualise_time\"", 1);
+        assert_ne!(fingerprint_of_shape(&renamed), config_wire_fingerprint());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
