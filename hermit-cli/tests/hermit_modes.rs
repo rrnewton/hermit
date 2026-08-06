@@ -1071,15 +1071,24 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let tmp = tempfile::Builder::new()
-        .prefix("verify-strict-info-")
+        .prefix("verify-memory-regions-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create strict verification directory");
-    let guest = tmp.path().join("hello_nostdlib");
-    compile_c_without_libc(&repository.join("tests/c/simple/hello_nostdlib.c"), &guest);
+    // This existing fixture intentionally materializes both a C stack value and
+    // several malloc allocations. A no-libc hello fixture has no [heap] mapping
+    // and cannot witness --detlog-heap even when aggregate INFO counts are nonzero.
+    let guest = tmp.path().join("print_memaddrs");
+    compile_c(&repository.join("tests/c/print_memaddrs.c"), &guest);
     let report = tmp.path().join("verify.json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run", "--verify", "--verify-strict"])
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--verify-strict",
+            "--verify-logs",
+        ])
         .arg("--verify-json")
         .arg(&report)
         .args([
@@ -1105,6 +1114,27 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
     assert!(
         !stderr.contains("Comparing full trace messages"),
         "ordinary strict verification unexpectedly promoted diagnostics:\n{stderr}"
+    );
+    let memory_region_count = |region: &str| {
+        let marker = format!("[{region}]->");
+        stderr
+            .lines()
+            .filter(|line| {
+                line.contains(" INFO ")
+                    && line.contains("DETLOG [memory]")
+                    && line.contains(&marker)
+            })
+            .count()
+    };
+    let heap_info_messages = memory_region_count("heap");
+    let stack_info_messages = memory_region_count("stack");
+    assert!(
+        heap_info_messages > 0,
+        "fixture produced no compared INFO heap evidence:\n{stderr}"
+    );
+    assert!(
+        stack_info_messages > 0,
+        "fixture produced no compared INFO stack evidence:\n{stderr}"
     );
 
     let report: serde_json::Value = serde_json::from_slice(
