@@ -26,9 +26,12 @@ works on my machine" is the problem:
 
 Hermit targets x86-64 Linux. It runs the program inside its own Linux
 namespaces, so an ordinary run needs no special privileges. Under the hood it
-uses [Reverie](https://github.com/facebookexperimental/reverie) to intercept the
-program's system calls and CPU events; the [Architecture](#architecture) section
-explains how the pieces fit together.
+uses [Reverie](https://github.com/rrnewton/reverie) to intercept the program's
+system calls and CPU events; the [Architecture](#architecture) section explains
+how the pieces fit together. That is the fork this repository builds against —
+every Cargo git dependency here pins `https://github.com/rrnewton/reverie.git`.
+Reverie's upstream reference repository is
+[facebookexperimental/reverie](https://github.com/facebookexperimental/reverie).
 
 ## Requirements
 
