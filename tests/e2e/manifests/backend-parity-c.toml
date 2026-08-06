@@ -4839,3 +4839,68 @@ dbi = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/static-libc-syscall-sites"
+description = "Statically linked against glibc: libc's own syscall instructions live in the main ELF"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+# House budget. Measured: ptrace --strict --verify completes in ~0.1s.
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/static_libc_syscall_sites.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+# -static is the whole point: it links libc's syscall instructions into the main
+# ELF. _GNU_SOURCE is needed for mkstemp under -std=c11. Requires glibc-static on
+# the builder (present as glibc-static-2.34-274.el9).
+cflags = ["-D_GNU_SOURCE", "-static"]
+
+# MEASURED e9patch reach: candidate_sites=144 mapped_sites=144 -- 24x the inline
+# guest, because this is libc's real syscall surface rather than a hand-written
+# stub. objdump counts 113 syscall instructions in the main ELF.
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not yet qualified for this guest; ratchet separately"
+kvm = "KVM livelocks at guest startup on the current host; qualify separately"
+sabre = "SaBRe SIGSEGVs on statically linked guests (rc=139, reproduced); tracked separately, do not enable until fixed"
+liteinst = "LiteInst instruments via LD_PRELOAD, which a static binary has no loader to honour; structurally inapplicable here"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the uninstrumented baseline; the contract is the hermit run"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Syscall-site reach is not schedule-derived, so chaos adds no discriminating power"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
