@@ -61,6 +61,20 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "backend-parity-c/getpriority-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getpriority-identity"
+    },
+    {
+      "backend": "dbt",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
       "test": "backend-parity-c/host-identity"
     },
     {
