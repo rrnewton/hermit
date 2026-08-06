@@ -96,10 +96,14 @@ impl Write for RawStderr {
 }
 
 fn forward_detlog(message: std::fmt::Arguments<'_>) {
+    // Use the SHARED renderer, never a locally formatted line. This sink
+    // previously wrote `INFO detcore: DETLOG ...` with no timestamp, and the
+    // comparator's record splitter keys on a leading RFC3339 stamp -- so an
+    // entire SaBRe run collapsed into ONE record and could not be diffed against
+    // any other backend. See `detcore::detlog::canonical_record` for the contract.
     let mut stderr = RawStderr;
-    let _ = stderr.write_all(b"INFO detcore: DETLOG ");
-    let _ = stderr.write_fmt(message);
-    let _ = stderr.write_all(b"\n");
+    let line = detcore::detlog::canonical_detlog_line(message);
+    let _ = stderr.write_all(line.as_bytes());
 }
 
 fn init_detlog_forwarder() {

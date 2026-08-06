@@ -90,64 +90,6 @@ struct DbiSubscriber {
     level: DbiLogLevel,
 }
 
-/// Monotonic source for the record-separator stamp. See [`record_separator_stamp`].
-static NEXT_RECORD_STAMP: AtomicU64 = AtomicU64::new(0);
-
-/// Render one log record in the CANONICAL framing that every other backend emits.
-///
-/// This is the whole point of the function existing separately: the framing is a
-/// cross-backend CONTRACT, not cosmetics. `detcore::logdiff::extract_log_messages`
-/// splits a log into records by matching a leading RFC3339 timestamp
-/// (`\d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z +`) and then requires each record to start
-/// with a level tag. The ptrace/KVM/SaBRe paths get that shape for free because
-/// they log through `tracing_subscriber::fmt()`; the DBI tool runs as a
-/// DynamoRIO client inside the guest and hand-rolls its own subscriber, so it has
-/// to reproduce the shape deliberately.
-///
-/// Before this, DBI emitted `"{level} {target}: {fields}"` with NO timestamp.
-/// That does not merely look different — it means the splitter finds ZERO
-/// separators and collapses an entire DBI run into ONE record, so a DBI-vs-ptrace
-/// log diff compares 1 message against thousands and can never report anything
-/// meaningful. Cross-backend parity was impossible by construction.
-///
-/// The layout matches `tracing_subscriber::fmt()`'s default exactly: the stamp,
-/// one space, the level right-aligned in five columns (so `INFO`/`WARN` get a
-/// leading space and `ERROR`/`DEBUG`/`TRACE` do not — this is why ptrace lines
-/// read `…Z  INFO detcore:` with two spaces), one space, the target, `": "`, the
-/// fields, and a trailing newline.
-fn format_record(stamp: u64, level: &tracing::Level, target: &str, fields: &str) -> String {
-    // The stamp is a RECORD SEPARATOR, not a clock reading — see
-    // `record_separator_stamp` for why it must not be a real wall-clock time.
-    let micros = stamp % 1_000_000;
-    let secs = (stamp / 1_000_000) % 60;
-    let mins = (stamp / 60_000_000) % 60;
-    let hours = (stamp / 3_600_000_000) % 24;
-    format!(
-        "1970-01-01T{hours:02}:{mins:02}:{secs:02}.{micros:06}Z {level:>5} {target}: {fields}\n"
-    )
-}
-
-/// A synthetic, strictly increasing stamp used ONLY to delimit records.
-///
-/// Deliberately NOT a wall-clock reading, for two reasons:
-///
-/// 1. **It must not perturb the guest.** This subscriber runs inside the traced
-///    process. Calling the clock here would inject a `clock_gettime` that Detcore
-///    intercepts and that advances virtualized time, so merely enabling logging
-///    would change the schedule it is supposed to observe. A logger that alters
-///    the run it records is worse than no logger.
-/// 2. **The value is discarded anyway.** `extract_log_messages` splits *on* the
-///    timestamp and keeps only what follows, so nothing downstream ever reads it.
-///    A counter satisfies the contract exactly as well as a clock, and unlike a
-///    clock it is deterministic — two runs of the same guest produce identical
-///    bytes even before the comparator strips anything.
-///
-/// The counter is microsecond-shaped purely so the rendered text is a well-formed
-/// RFC3339 instant; it is not a duration and must not be read as elapsed time.
-fn record_separator_stamp() -> u64 {
-    NEXT_RECORD_STAMP.fetch_add(1, Ordering::Relaxed)
-}
-
 impl Subscriber for DbiSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         self.level.enables(metadata.level())
@@ -165,11 +107,13 @@ impl Subscriber for DbiSubscriber {
         let metadata = event.metadata();
         let mut visitor = DbiEventVisitor::default();
         event.record(&mut visitor);
-        let line = format_record(
-            record_separator_stamp(),
-            metadata.level(),
+        // Shared renderer, not a local format!: the record framing is a
+        // cross-backend contract and a second copy is how it drifts.
+        let line = detcore::detlog::canonical_record(
+            detcore::detlog::next_record_stamp(),
+            metadata.level().as_str(),
             metadata.target(),
-            &visitor.fields,
+            format_args!("{}", visitor.fields),
         );
         unsafe { (self.emit)(line.as_ptr(), line.len()) };
     }
@@ -2117,96 +2061,5 @@ mod tests {
         }
 
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
-    }
-
-    /// The DBI record framing is a CROSS-BACKEND CONTRACT with
-    /// `detcore::logdiff::extract_log_messages`, which splits a log on a leading
-    /// RFC3339 stamp and then requires a level tag. These tests pin the producer
-    /// side of that contract; `detcore/src/logdiff.rs` pins the consumer side.
-    mod record_framing {
-        use super::super::format_record;
-        use super::super::record_separator_stamp;
-
-        #[test]
-        fn matches_the_tracing_fmt_default_layout() {
-            // Byte-for-byte the shape ptrace emits:
-            //   2026-08-06T12:04:57.836579Z  INFO detcore::tool_local: DETLOG ...
-            // Note the TWO spaces before INFO: the level is right-aligned in five
-            // columns, so `INFO` carries a leading pad. Getting this wrong is not
-            // cosmetic -- the consumer's tag regex anchors at the record start.
-            let line = format_record(0, &tracing::Level::INFO, "detcore::tool_local", "DETLOG x");
-            assert_eq!(
-                line,
-                "1970-01-01T00:00:00.000000Z  INFO detcore::tool_local: DETLOG x\n"
-            );
-        }
-
-        #[test]
-        fn five_column_level_alignment_matches_each_level() {
-            // ERROR/DEBUG/TRACE are already five characters and must NOT be padded;
-            // INFO/WARN must be. A backend that padded uniformly would shift every
-            // record by one byte relative to ptrace.
-            for (level, expected) in [
-                (tracing::Level::ERROR, "Z ERROR t: m\n"),
-                (tracing::Level::WARN, "Z  WARN t: m\n"),
-                (tracing::Level::INFO, "Z  INFO t: m\n"),
-                (tracing::Level::DEBUG, "Z DEBUG t: m\n"),
-                (tracing::Level::TRACE, "Z TRACE t: m\n"),
-            ] {
-                let line = format_record(0, &level, "t", "m");
-                assert!(line.ends_with(expected), "{level}: {line:?}");
-            }
-        }
-
-        #[test]
-        fn stamp_is_a_well_formed_rfc3339_instant() {
-            // The consumer matches \d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z, so the
-            // rendered stamp must stay well-formed across the whole counter range,
-            // including the rollovers.
-            for stamp in [0, 999_999, 1_000_000, 59_999_999, 60_000_000, 3_599_999_999] {
-                let line = format_record(stamp, &tracing::Level::INFO, "t", "m");
-                let stamp_text = line.split(' ').next().unwrap();
-                assert_eq!(
-                    stamp_text.len(),
-                    "1970-01-01T00:00:00.000000Z".len(),
-                    "{line:?}"
-                );
-                assert!(stamp_text.ends_with('Z'), "{line:?}");
-                let time = &stamp_text["1970-01-01T".len()..];
-                let (hh, rest) = time.split_at(2);
-                let (mm, ss) = rest[1..].split_at(2);
-                assert!(hh.parse::<u32>().unwrap() < 24, "{line:?}");
-                assert!(mm.parse::<u32>().unwrap() < 60, "{line:?}");
-                assert!(ss[1..3].parse::<u32>().unwrap() < 60, "{line:?}");
-            }
-        }
-
-        #[test]
-        fn stamps_strictly_increase_so_records_stay_separable() {
-            // Two records with the SAME stamp would still split correctly, but a
-            // decreasing stamp would read as time travel to anyone eyeballing the
-            // log. Monotonic is the honest contract.
-            let a = record_separator_stamp();
-            let b = record_separator_stamp();
-            let c = record_separator_stamp();
-            assert!(a < b && b < c, "{a} {b} {c}");
-        }
-
-        #[test]
-        fn the_stamp_is_deterministic_not_a_clock() {
-            // The regression this guards: reaching for SystemTime::now() here would
-            // inject a clock_gettime into the TRACED process, which Detcore
-            // intercepts and which advances virtualized time -- so enabling logging
-            // would change the schedule being logged. A counter cannot do that.
-            // Rendering is a pure function of the counter, and this pins it.
-            assert_eq!(
-                format_record(42, &tracing::Level::INFO, "t", "m"),
-                format_record(42, &tracing::Level::INFO, "t", "m")
-            );
-            assert_ne!(
-                format_record(42, &tracing::Level::INFO, "t", "m"),
-                format_record(43, &tracing::Level::INFO, "t", "m")
-            );
-        }
     }
 }
