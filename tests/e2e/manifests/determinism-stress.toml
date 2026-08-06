@@ -265,6 +265,18 @@ liteinst = "Record/replay is unsupported by LiteInst"
 [test.modes.chaos]
 ci = true
 seeds = [0,9]
+# order_violation.c has exactly TWO observable outcomes: Thread1 either reads
+# global_str before Thread2 stores it (prints the null-use error, exit 1) or
+# after (prints "Hello world!", exit 0). So min_distinct = 2 is simultaneously
+# this oracle's floor AND the guest's ceiling -- it is SATURATED and can only
+# catch a total collapse to one class, never a partial narrowing. Declaring the
+# ceiling makes that visible on every recorded row (`oracle_saturated: true`)
+# instead of letting a pinned `distinct=2` read as strength. The degree signal
+# for this guest is the class BALANCE, which the harness records as
+# normalized_entropy / minority_share; no `min_normalized_entropy` floor is set
+# here because a two-seed sweep cannot populate the classes representatively --
+# a floor this sweep cannot meet would be a new false red, not a better oracle.
+outcome_classes = 2
 assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }
 backends_enabled = ["ptrace"]
 [test.modes.chaos.backends_disabled]
