@@ -17,7 +17,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-detcore = { version = "0.2.0", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
 libc = "0.2.186"
 # `default-features = false` disables reverie-e9patch's own `preload-constructor`
 # `.init_array` entry: this crate supplies its own Detcore-embedding constructor,
