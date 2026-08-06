@@ -3109,6 +3109,12 @@
       "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM does not start"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/errno_path_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/errno_path_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: exercises 40 syscall failure cases chosen to fail for argument-intrinsic reasons and prints each errno, so verify's double run asserts that failure is as deterministic as success"
+    },
+    {
       "path": "tests/c/hardware_trap_identity.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
