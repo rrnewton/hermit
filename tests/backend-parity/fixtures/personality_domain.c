@@ -77,13 +77,32 @@ int main(void) {
 
     rc = personality(0xffffffffUL);
     unsigned int final = rc == -1 ? 0xffffffffU : (unsigned int)rc;
-    if (rc != -1 && (unsigned int)rc == start) {
+    bool final_eq_start = rc != -1 && (unsigned int)rc == start;
+    if (final_eq_start) {
         ok++;
     }
 
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* stable wrong stdout must be rejected by the normal exit oracle */
 #endif
-    printf("pers ok=%d start=0x%x final=0x%x\n", ok, start, final);
+    /*
+     * UNION of the landed value emission and this branch's de-aliasing.
+     *
+     * `delta = start ^ target` is deliberately NOT printed. The fixture defines
+     * target = start ^ UNAME26, so that expression is identically the constant
+     * UNAME26 -- the same value it would be printed beside. Measured: two
+     * contexts with DIFFERENT inherited personas (plain vs `setarch -R`), both
+     * passing every check, emitted a byte-identical
+     * "delta=0x20000 uname26=0x20000", so the field cannot distinguish them.
+     * It varies only under HERMIT_TEST_PERSONALITY_NO_TRANSITION, which makes
+     * it a mutation-bracket aid rather than a parity de-blinder.
+     *
+     * `start` is the one observation no check pins -- every check is relational
+     * (start->target->start) -- so it is what actually de-blinds this fixture.
+     * `restored` is kept from the de-aliasing work: it is redundant on a
+     * passing run but names WHICH check failed on a failing one.
+     */
+    printf("pers ok=%d start=0x%x final=0x%x restored=%d\n",
+           ok, start, final, final_eq_start ? 1 : 0);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
