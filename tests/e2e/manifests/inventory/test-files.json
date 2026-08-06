@@ -3191,6 +3191,12 @@
       "path": "tests/c/file_timestamp_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
       "why": "tests/c/file_timestamp_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/startup_surface_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/startup_surface_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"
     }
   ],
   "schema": 2
