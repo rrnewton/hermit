@@ -516,7 +516,7 @@ dependencies = [
 name = "detcore-e9patch"
 version = "0.2.0"
 dependencies = [
- "detcore",
+ "hermit-detcore",
  "libc",
  "reverie-e9patch",
 ]
