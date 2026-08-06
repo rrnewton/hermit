@@ -184,6 +184,29 @@ pub(super) fn image_container(
     );
     container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
 
+    // Give the guest a working `/dev`. An OCI image layer ships no device
+    // nodes, so without this the image root has an empty `/dev` and even
+    // `sh -c` fails with "cannot create /dev/null".
+    //
+    // These are bind mounts of the host nodes, not fresh ones: creating a
+    // character device requires real CAP_MKNOD, which a user namespace does not
+    // grant (`mknod` there returns EPERM). Binding the host node is what
+    // podman's own runtime does. The materializer pre-created the placeholder
+    // targets, which is why binding still works after the read-only remount
+    // above.
+    //
+    // `/dev/random` and `/dev/urandom` are safe to expose because Detcore
+    // virtualizes reads from them; the guest sees a deterministic stream
+    // regardless of the backing inode.
+    for device in crate::image::REQUIRED_DEVICES {
+        let host = Path::new("/dev").join(device);
+        // Skip anything this host does not provide rather than failing the run
+        // over, say, a missing /dev/tty in a detached session.
+        if host.exists() {
+            container.mount(Mount::bind(&host, rootfs.join("dev").join(device)));
+        }
+    }
+
     // Mount the deterministic /proc into the target root. The materializer
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which
     // defers dir creation to the pre-exec child on a tiny clone stack).
