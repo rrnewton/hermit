@@ -561,3 +561,119 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
+[[test]]
+id = "determinism-stress-c/epoll-edge-vs-level"
+description = "EPOLLET vs level-triggered wakeup counts over an identical fd script"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/epoll_edge_vs_level.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-Wno-error=unused-parameter", "-Wno-error=unused-variable", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not yet qualified for edge-triggered epoll semantics"
+kvm = "KVM compares output only and cannot assert DETLOG identity yet"
+sabre = "Not yet qualified for this ordering fixture"
+liteinst = "Not yet qualified for this ordering fixture"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the differential control, run by hand; this cell asserts the virtualized contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from this ordering contract"
+dbi = "Record/replay qualification is separate from this ordering contract"
+kvm = "Record/replay qualification is separate from this ordering contract"
+sabre = "Record/replay qualification is separate from this ordering contract"
+liteinst = "Record/replay qualification is separate from this ordering contract"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is orthogonal to this ordering contract"
+dbi = "Chaos scheduling is orthogonal to this ordering contract"
+kvm = "Chaos scheduling is orthogonal to this ordering contract"
+sabre = "Chaos scheduling is orthogonal to this ordering contract"
+liteinst = "Chaos scheduling is orthogonal to this ordering contract"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No calibrated custom arguments for this ordering fixture"
+dbi = "No calibrated custom arguments for this ordering fixture"
+kvm = "No calibrated custom arguments for this ordering fixture"
+sabre = "No calibrated custom arguments for this ordering fixture"
+liteinst = "No calibrated custom arguments for this ordering fixture"
+
+
+[[test]]
+id = "determinism-stress-c/io-uring-completion-order"
+description = "io_uring availability and completion-order surface; records NOT-SUPPORTED as a result"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/io_uring_completion_order.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-Wno-error=unused-parameter", "-Wno-error=unused-variable", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not yet qualified for the io_uring surface"
+kvm = "KVM compares output only and cannot assert DETLOG identity yet"
+sabre = "Not yet qualified for this ordering fixture"
+liteinst = "Not yet qualified for this ordering fixture"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the differential control, run by hand; this cell asserts the virtualized contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from this ordering contract"
+dbi = "Record/replay qualification is separate from this ordering contract"
+kvm = "Record/replay qualification is separate from this ordering contract"
+sabre = "Record/replay qualification is separate from this ordering contract"
+liteinst = "Record/replay qualification is separate from this ordering contract"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is orthogonal to this ordering contract"
+dbi = "Chaos scheduling is orthogonal to this ordering contract"
+kvm = "Chaos scheduling is orthogonal to this ordering contract"
+sabre = "Chaos scheduling is orthogonal to this ordering contract"
+liteinst = "Chaos scheduling is orthogonal to this ordering contract"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No calibrated custom arguments for this ordering fixture"
+dbi = "No calibrated custom arguments for this ordering fixture"
+kvm = "No calibrated custom arguments for this ordering fixture"
+sabre = "No calibrated custom arguments for this ordering fixture"
+liteinst = "No calibrated custom arguments for this ordering fixture"

@@ -566,6 +566,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/tcl-rand-clock"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/epoll-edge-vs-level"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/io-uring-completion-order"
     }
   ],
   "schema": 1

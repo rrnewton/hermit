@@ -3089,6 +3089,18 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
       "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/determinism-stress/epoll_edge_vs_level.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/epoll_edge_vs_level.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Contract fixture pinning EPOLLET vs level-triggered wakeup counts over an identical fd script. The two modes must disagree; a backend implementing edge as level makes them agree and the fixture fails."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/determinism-stress/io_uring_completion_order.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/io_uring_completion_order.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Contract fixture for the io_uring surface, which bypasses the classic syscall path a backend intercepts. Records NOT-SUPPORTED with the exact errno as a determinate result rather than skipping."
     }
   ],
   "schema": 2
