@@ -47,6 +47,20 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "backend-parity-c/getcpu-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getcpu-identity"
+    },
+    {
+      "backend": "dbt",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
       "test": "backend-parity-c/host-identity"
     },
     {
