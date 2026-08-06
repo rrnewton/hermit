@@ -60,7 +60,7 @@ function validation_slot_name {
 #   quick        Core ptrace run/verify/record smoke tests; no alternate backends.
 #   portable-only  Portable build, test, lint, format, and documentation gates
 #                matching GitHub-managed portable CI; no PMU or namespace requirements.
-#   full         Everything in quick plus the complete suite and DBI/KVM gates.
+#   full         Everything in quick plus the complete suite and DBT/KVM gates.
 #   super        Repeat stress probes (20x by default) under moderate
 #                oversubscription and report a pass rate for every probe.
 #   --quick      Alias for the quick level.
@@ -218,7 +218,7 @@ Levels:
   quick            Core ptrace run/verify/record smoke tests; no alternate backends.
   portable-only    Portable build, test, lint, format, and doc gates matching
                    GitHub-managed portable CI; no PMU or namespace requirements.
-  full             quick plus the complete suite and DBI/KVM gates (default).
+  full             quick plus the complete suite and DBT/KVM gates (default).
   super            Repeat stress probes (20x by default) under moderate
                    oversubscription; report a pass rate per probe.
   --quick          Alias for the quick level.
@@ -763,7 +763,7 @@ readonly HOST_OS
 # Cap the parallelism of the vendored third-party (DynamoRIO/elfutils) build.
 # The DAG build cells run `CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)}
 # cargo build ... --features third-party-backends`, and CARGO_BUILD_JOBS flows
-# through NUM_JOBS into reverie-dbi/build.rs as the cmake `--build --parallel N`
+# through NUM_JOBS into reverie-dbt/build.rs as the cmake `--build --parallel N`
 # for the bundled DynamoRIO. On a many-core host nproc can be 300+, and an
 # unbounded `--parallel` drives the elfutils dependency scan into a
 # concurrency-exposed SIGABRT (core dump) roughly half the time -- an
@@ -864,7 +864,7 @@ function detect_cache_state {
 # it. This is a CONTENT FACT, not a heuristic: it removes ONLY genuinely-corrupt
 # (0-byte) objects, so healthy artifacts -- and thus incremental skipping and the
 # warm cache -- are preserved (a blanket "clean rebuild after any failure" would
-# not be: cold rebuilds cost +232s and fail more). Covers DynamoRIO (reverie-dbi),
+# not be: cold rebuilds cost +232s and fail more). Covers DynamoRIO (reverie-dbt),
 # SaBRe + e9patch (hermit-install); rustc's target/deps self-heal via fingerprints.
 # Catches corruption from a kill we did not observe, which the per-crate build.rs
 # guard cannot: cargo re-runs a build script only on input change or prior failure,
@@ -1813,8 +1813,8 @@ fi
 # signatures build-toolchain-specific.
 #
 #   3. A failure of the vendored third-party DynamoRIO build, surfaced by cargo
-#      as `failed to run custom build command for reverie-dbi ...` or a panic in
-#      `reverie-dbi/build.rs` (which asserts the DynamoRIO cmake `--build`
+#      as `failed to run custom build command for reverie-dbt ...` or a panic in
+#      `reverie-dbt/build.rs` (which asserts the DynamoRIO cmake `--build`
 #      status). The bundled DynamoRIO/elfutils build is driven at
 #      `--parallel ${THIRD_PARTY_BUILD_JOBS:-$(nproc)}`; on a many-core host an
 #      unbounded parallelism drives the elfutils dependency scan into a
@@ -1824,17 +1824,17 @@ fi
 #      same class as the sandbox blocks above. We PREVENT it by capping
 #      THIRD_PARTY_BUILD_JOBS (see the export near the counters), and detect it
 #      here so any residual transient is retried and clearly labeled. This anchor
-#      is narrow to the reverie-dbi third-party build script: a *persistent*
+#      is narrow to the reverie-dbt third-party build script: a *persistent*
 #      breakage (e.g. a bad reverie pin) fails every retry and still leaves the
 #      run RED via the retry-exhaustion path -- it is never silently greened,
 #      only relabeled from "test failure" to "third-party build (environmental)".
-#      Only reverie-dbi's own build script matches, so a Hermit test that merely
+#      Only reverie-dbt's own build script matches, so a Hermit test that merely
 #      prints "panicked at .../build.rs" for a different crate cannot trip it.
 function is_environmental_block {
     local output_start=$1
     tail -n "+$output_start" "$LOG_FILE" |
         sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
-        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\.rs'
+        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)|failed to run custom build command for [^[:space:]]*reverie-dbt|panicked at [^[:space:]]*reverie-dbt/build\.rs'
 }
 
 function failure_summary {
@@ -2273,10 +2273,10 @@ function kvm_backend_available {
     [[ -r /dev/kvm && -w /dev/kvm ]]
 }
 
-function dbi_backend_available {
+function dbt_backend_available {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" --log=info run --backend dbi --strict --verify -- \
-        /bin/echo hermit-dbi-probe \
+        "$HERMIT_BIN" --log=info run --backend dbt --strict --verify -- \
+        /bin/echo hermit-dbt-probe \
         </dev/null >/dev/null 2>&1
 }
 
@@ -2296,10 +2296,10 @@ function run_full_backend_gates {
         note_backend_skip "KVM" "/dev/kvm is not readable and writable"
     fi
 
-    if dbi_backend_available; then
-        backends+=(--backend dbi)
+    if dbt_backend_available; then
+        backends+=(--backend dbt)
     else
-        note_backend_skip "DBI" "backend smoke did not complete successfully"
+        note_backend_skip "DBT" "backend smoke did not complete successfully"
     fi
 
     run_check "Real backend compatibility matrix" \
@@ -2451,7 +2451,7 @@ function compatibility_status {
     local backend_index=0
     local failed_list
     local rendered_status
-    local -a backend_names=(ptrace KVM DBI SaBRe)
+    local -a backend_names=(ptrace KVM DBT SaBRe)
     local -a failed_backends=()
 
     for cell in "$@"; do
@@ -2492,7 +2492,7 @@ function print_compatibility_summary {
     local category_cell
     local ptrace
     local kvm
-    local dbi
+    local dbt
     local sabre
     local status
     local total=0
@@ -2500,7 +2500,7 @@ function print_compatibility_summary {
     local raw_tmp="$VALIDATE_RESULTS_FILE.tmp.$$"
     local rendered="$VALIDATION_TMP_DIR/compat-summary-rendered.tsv"
     local -a programs=()
-    local -a backends=(ptrace kvm dbi sabre)
+    local -a backends=(ptrace kvm dbt sabre)
     local -A category_totals=()
     local -A pass_counts=()
     local -A measured_counts=()
@@ -2512,11 +2512,11 @@ function print_compatibility_summary {
         category=$(compatibility_category "$program")
         backend_compatibility_cell ptrace "$program" ptrace
         backend_compatibility_cell kvm "$program" kvm
-        backend_compatibility_cell dbi "$program" dbi
+        backend_compatibility_cell dbt "$program" dbt
         backend_compatibility_cell sabre "$program" sabre
-        compatibility_status status "$program" "$ptrace" "$kvm" "$dbi" "$sabre"
+        compatibility_status status "$program" "$ptrace" "$kvm" "$dbt" "$sabre"
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$program" "$category" "$ptrace" "$kvm" "$dbi" "$sabre" "$status" \
+            "$program" "$category" "$ptrace" "$kvm" "$dbt" "$sabre" "$status" \
             >>"$rendered"
         total=$((total + 1))
         category_totals[$category]=$((${category_totals[$category]:-0} + 1))
@@ -2538,7 +2538,7 @@ function print_compatibility_summary {
     {
         printf "Hermit compatibility results\n"
         printf "profile\t%s\n" "$VALIDATION_PROFILE"
-        printf "program\tcategory\tptrace\tKVM\tDBI\tSaBRe\tstatus\n"
+        printf "program\tcategory\tptrace\tKVM\tDBT\tSaBRe\tstatus\n"
         cat "$rendered"
     } >"$raw_tmp"
     mv "$raw_tmp" "$VALIDATE_RESULTS_FILE"
@@ -2549,17 +2549,17 @@ function print_compatibility_summary {
 
     printf "\nCOMPATIBILITY SUMMARY (%s recorded programs)\n" "$total"
     printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
-        "Category" "Programs" "ptrace" "KVM" "DBI" "SaBRe"
+        "Category" "Programs" "ptrace" "KVM" "DBT" "SaBRe"
     printf "%s\n" "-----------------------|----------|-----------|-----------|-----------|----------"
     for category in "${COMPAT_SUMMARY_CATEGORIES[@]}"; do
         category_programs=${category_totals[$category]:-0}
         ((category_programs > 0)) || continue
         compatibility_count_cell ptrace "$category" ptrace pass_counts measured_counts
         compatibility_count_cell kvm "$category" kvm pass_counts measured_counts
-        compatibility_count_cell dbi "$category" dbi pass_counts measured_counts
+        compatibility_count_cell dbt "$category" dbt pass_counts measured_counts
         compatibility_count_cell sabre "$category" sabre pass_counts measured_counts
         printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
-            "$category" "$category_programs" "$ptrace" "$kvm" "$dbi" "$sabre"
+            "$category" "$category_programs" "$ptrace" "$kvm" "$dbt" "$sabre"
     done
 
     for backend in "${backends[@]}"; do
@@ -2572,10 +2572,10 @@ function print_compatibility_summary {
     done
     compatibility_count_cell ptrace total ptrace pass_counts measured_counts
     compatibility_count_cell kvm total kvm pass_counts measured_counts
-    compatibility_count_cell dbi total dbi pass_counts measured_counts
+    compatibility_count_cell dbt total dbt pass_counts measured_counts
     compatibility_count_cell sabre total sabre pass_counts measured_counts
     printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
-        "TOTAL" "$total" "$ptrace" "$kvm" "$dbi" "$sabre"
+        "TOTAL" "$total" "$ptrace" "$kvm" "$dbt" "$sabre"
     printf "P/M means passing/measured; failures are M-P and unmeasured rows are excluded from M.\n"
     for backend in "${backends[@]}"; do
         printf "  %-7s %s passed, %s failed, %s unmeasured\n" \
@@ -2614,10 +2614,10 @@ function super_probe_command {
             timeout "$STRICT_COMPAT_TIMEOUT" \
                 "$HERMIT_BIN" run --backend kvm --verify -- \
                 /bin/echo "hermit-super-kvm-$iteration" ;;
-        dbi-verify)
+        dbt-verify)
             timeout "$STRICT_COMPAT_TIMEOUT" \
-                "$HERMIT_BIN" run --backend dbi --verify -- \
-                /bin/echo "hermit-super-dbi-$iteration" ;;
+                "$HERMIT_BIN" run --backend dbt --verify -- \
+                /bin/echo "hermit-super-dbt-$iteration" ;;
         *)
             echo "validate.sh: unknown super probe: $probe" >&2
             return 2 ;;
@@ -2698,11 +2698,11 @@ function run_super_stress_suite {
         printf "  SKIP KVM super stress (backend unavailable)\n" \
             >>"$VALIDATION_TMP_DIR/super-report"
     fi
-    if backend_selector_supported && dbi_backend_available; then
-        probes+=(dbi-verify)
+    if backend_selector_supported && dbt_backend_available; then
+        probes+=(dbt-verify)
     else
-        note_backend_skip "DBI super stress" "backend unavailable"
-        printf "  SKIP DBI super stress (backend unavailable)\n" \
+        note_backend_skip "DBT super stress" "backend unavailable"
+        printf "  SKIP DBT super stress (backend unavailable)\n" \
             >>"$VALIDATION_TMP_DIR/super-report"
     fi
 
@@ -4682,21 +4682,21 @@ function run_super_diagnostic_suite {
         cargo test -p hermit --features third-party-backends --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#598)
-    run_check_with_timeout 300 "DBI pipe backpressure diagnostic" \
-        cargo test -p hermit --features third-party-backends --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+    run_check_with_timeout 300 "DBT pipe backpressure diagnostic" \
+        cargo test -p hermit --features third-party-backends --test cli run_dbt_verifies_pipe_backpressure -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#736): Review weekly routing for the DBI failed-exec stall.
-    run_check_with_timeout 180 "DBI failed-exec recovery diagnostic" \
-        cargo test -p hermit --features third-party-backends --test cli run_dbi_recovers_after_failed_exec -- --exact --test-threads=1
-    # This test exercises verify, tampered reports, fork/exec, and strict DBI
+    # TODO-HUMAN-REVIEW(#736): Review weekly routing for the DBT failed-exec stall.
+    run_check_with_timeout 180 "DBT failed-exec recovery diagnostic" \
+        cargo test -p hermit --features third-party-backends --test cli run_dbt_recovers_after_failed_exec -- --exact --test-threads=1
+    # This test exercises verify, tampered reports, fork/exec, and strict DBT
     # teardown in one case. Keep its coverage, but do not let a backend
     # lifecycle deadlock consume the portable PR gate.
-    run_check_with_timeout 180 "DBI unsupported-syscall aggregation diagnostic" \
-        cargo test -p hermit --features third-party-backends --test cli run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
-    run_check_with_timeout 30 "DBI strict blocked-stdin teardown diagnostic" \
-        cargo test -p hermit --features third-party-backends --test cli run_dbi_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
-    run_check_with_timeout 120 "DBI guest-stderr isolation diagnostic" \
-        cargo test -p hermit --features third-party-backends --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
+    run_check_with_timeout 180 "DBT unsupported-syscall aggregation diagnostic" \
+        cargo test -p hermit --features third-party-backends --test cli run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
+    run_check_with_timeout 30 "DBT strict blocked-stdin teardown diagnostic" \
+        cargo test -p hermit --features third-party-backends --test cli run_dbt_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
+    run_check_with_timeout 120 "DBT guest-stderr isolation diagnostic" \
+        cargo test -p hermit --features third-party-backends --test cli run_dbt_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
 }
 
 function run_super_suite {

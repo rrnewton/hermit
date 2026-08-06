@@ -4,14 +4,14 @@
 # The outer safe-ci cpu.max is a containment ceiling, not a request for Cargo to
 # use every granted core. On the 316-CPU validation host that inference produced
 # NUM_JOBS=284 and raced the native linker. K=8 is measurement-backed: on
-# 2026-08-04 the pre-collapse build.dbi_release and rr_suite_contract nodes both
+# 2026-08-04 the pre-collapse build.dbt_release and rr_suite_contract nodes both
 # completed at j8 under their cgroup-recorded memory caps. The collapsed fat-build
 # nodes declare their independently measured higher width in the DAG manifest.
 #
 # This file has two explicit source modes. `launcher` preserves the historical
-# shared Cargo widths and strips every portable DBI-budget variable before the
-# DAG runner starts. `reverie-dbi-budget-child` is called only by the portable
-# DBI wrapper, after safe-ci has entered the child and selected any child-local
+# shared Cargo widths and strips every portable DBT-budget variable before the
+# DAG runner starts. `reverie-dbt-budget-child` is called only by the portable
+# DBT wrapper, after safe-ci has entered the child and selected any child-local
 # Cargo width.
 
 CI_DAG_BUILD_JOBS=${CI_DAG_BUILD_JOBS:-8}
@@ -22,29 +22,29 @@ fi
 
 build_job_context=${1:-}
 if [[ $build_job_context == launcher ]]; then
-    # These variables are meaningful only in the two portable DBI build
+    # These variables are meaningful only in the two portable DBT build
     # children. Remove even planted ambient values so the privileged runner's
     # environment remains identical to the pre-budget launcher contract.
-    unset REVERIE_DBI_BUDGET_BOUND_PIN
-    unset REVERIE_DBI_BUILD_JOBS_SOURCE
-    unset REVERIE_DBI_RAW_BUILD_JOBS
-    unset REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
-    unset REVERIE_DBI_EFFECTIVE_CPUS
-    unset REVERIE_DBI_MAX_PARALLEL_JOBS
-    unset REVERIE_DBI_EFFECTIVE_BUILD_JOBS
-    unset REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-    unset REVERIE_DBI_MAX_BUILD_SECONDS
+    unset REVERIE_DBT_BUDGET_BOUND_PIN
+    unset REVERIE_DBT_BUILD_JOBS_SOURCE
+    unset REVERIE_DBT_RAW_BUILD_JOBS
+    unset REVERIE_DBT_EFFECTIVE_CPUS_SOURCE
+    unset REVERIE_DBT_EFFECTIVE_CPUS
+    unset REVERIE_DBT_MAX_PARALLEL_JOBS
+    unset REVERIE_DBT_EFFECTIVE_BUILD_JOBS
+    unset REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+    unset REVERIE_DBT_MAX_BUILD_SECONDS
 
     # Retire the previous launcher-carried derivation names fail-closed too.
     unset CI_DAG_LAUNCH_WIDTH_BOUND
     unset CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
     unset CI_DAG_LAUNCH_RAW_BUILD_JOBS
     unset CI_DAG_EFFECTIVE_CPUS
-    unset CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
-    unset CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS
-    unset CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-    unset REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
-    unset REVERIE_DBI_BUDGET_CHILD
+    unset CI_DAG_REVERIE_DBT_MAX_PARALLEL_JOBS
+    unset CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS
+    unset CI_DAG_REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+    unset REVERIE_DBT_PINNED_MAX_PARALLEL_JOBS
+    unset REVERIE_DBT_BUDGET_CHILD
 
     # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep
     # the nested native-build knob identical so validate.sh cannot widen it.
@@ -53,39 +53,40 @@ if [[ $build_job_context == launcher ]]; then
     return 0
 fi
 
-if [[ $build_job_context != reverie-dbi-budget-child ]]; then
-    echo "configure-build-jobs.sh: expected source mode launcher or reverie-dbi-budget-child" >&2
+if [[ $build_job_context != reverie-dbt-budget-child ]]; then
+    echo "configure-build-jobs.sh: expected source mode launcher or reverie-dbt-budget-child" >&2
     return 2
 fi
 
 # fc97 briefly exported this unconditioned threshold before the budget was
 # normalized to effective-job-seconds. A direct wrapper invocation must not
 # carry that retired authority into Cargo; normal launchers scrub it above.
-if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
-    echo "configure-build-jobs.sh: retired CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS is not accepted in a DBI budget child" >&2
+if [[ -v CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS ]]; then
+    echo "configure-build-jobs.sh: retired CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS is not accepted in a DBT budget child" >&2
     return 2
 fi
 
-# The calibration below is valid only for Reverie 038e993. The portable wrapper
-# obtains the repository's recorded pin through the canonical checker and
-# carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
+# The calibration below is valid for Reverie 88363a5, carried from 038e993 by
+# the identity-and-build evidence recorded below. The portable wrapper obtains
+# the repository's recorded pin through the canonical checker and carries it
+# here; a pin bump cannot silently retain the old clamp or threshold.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 88363a56870dcdd88b13b1309233706b691f6a41 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 88363a56870dcdd88b13b1309233706b691f6a41" >&2
     return 2
 fi
 
 if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
-    REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+    REVERIE_DBT_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
     if [[ ${SAFE_CI_IN_SCOPE:-} == 1 ]]; then
-        REVERIE_DBI_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
+        REVERIE_DBT_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
     else
-        REVERIE_DBI_BUILD_JOBS_SOURCE=inherited-launch-cargo-build-jobs
+        REVERIE_DBT_BUILD_JOBS_SOURCE=inherited-launch-cargo-build-jobs
     fi
 else
-    REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
-    REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
+    REVERIE_DBT_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    REVERIE_DBT_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
 fi
-if [[ ! $REVERIE_DBI_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
+if [[ ! $REVERIE_DBT_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "configure-build-jobs.sh: selected raw build width must be a positive integer" >&2
     return 2
 fi
@@ -93,12 +94,12 @@ fi
 # Observe affinity/cpuset visibility in this child, after safe-ci has applied
 # its containment. A launcher observation would be only a correlated proxy for
 # the CPUs available to the native build.
-if ! REVERIE_DBI_EFFECTIVE_CPUS=$(nproc); then
+if ! REVERIE_DBT_EFFECTIVE_CPUS=$(nproc); then
     echo "configure-build-jobs.sh: child nproc observation failed" >&2
     return 2
 fi
-REVERIE_DBI_EFFECTIVE_CPUS_SOURCE=child-nproc
-if [[ ! $REVERIE_DBI_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
+REVERIE_DBT_EFFECTIVE_CPUS_SOURCE=child-nproc
+if [[ ! $REVERIE_DBT_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
     echo "configure-build-jobs.sh: child nproc must return a positive integer" >&2
     return 2
 fi
@@ -121,9 +122,9 @@ fi
 #
 # CARRY TO 9470712 (2026-08-05). The threshold above was measured at 025d378
 # and is reused here, so the reuse is evidenced rather than assumed. The budget
-# governs exactly one quantity: the elapsed time reverie-dbi/build.rs reports
+# governs exactly one quantity: the elapsed time reverie-dbt/build.rs reports
 # for a DynamoRIO content-key MISS. That build's inputs are hashed by
-# source_recipe_key() over {reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs,
+# source_recipe_key() over {reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs,
 # $CMAKE, $CMAKE_GENERATOR} -- host-invariant while CMAKE/CMAKE_GENERATOR are
 # unset -- and six cold builds (three per pin, interleaved on one host,
 # taskset 4 CPUs, CARGO_BUILD_JOBS=4) all printed the SAME recipe key
@@ -133,13 +134,13 @@ fi
 # 158.32 / 164.04). The new pin's slowest sample is 3% faster than the old
 # pin's slowest and the whole set spans 7.1%, so the pin move causes no
 # throughput change. Corroborating Git evidence: 025d378..9470712 touches only
-# reverie-ptrace/src/{error,task,tracer}.rs; the reverie-dbi subtree
+# reverie-ptrace/src/{error,task,tracer}.rs; the reverie-dbt subtree
 # (c38c979057f9fe3e4d46772c1fddd05a71db4bf9) and third-party/
 # (fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a) are identical at both pins, and
 # MAX_PARALLEL_JOBS is still 16.
 #
 # CARRY TO e159d6c (2026-08-06). The only 9470712..e159d6c change is a
-# hostname-neutral wording edit in reverie-dbi/build.rs. The vendored
+# hostname-neutral wording edit in reverie-dbt/build.rs. The vendored
 # DynamoRIO tree, build commands, MAX_PARALLEL_JOBS=16 clamp, and
 # CI_MAX_BUILD_JOB_SECONDS=572 remain identical. Because source_recipe_key()
 # deliberately hashes the full build script, its default-tool identity changes
@@ -150,7 +151,7 @@ fi
 #
 # CARRY TO 6a6b4ec (2026-08-06). The e159d6c..6a6b4ec changes are confined to
 # reverie-kvm task lifecycle, process-tree exit accounting, and KVM tests.
-# reverie-dbi/build.rs, its vendored DynamoRIO tree, build commands, and the
+# reverie-dbt/build.rs, its vendored DynamoRIO tree, build commands, and the
 # MAX_PARALLEL_JOBS=16 clamp are byte-identical, so source_recipe_key() remains
 # sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d.
 # CI_MAX_BUILD_JOB_SECONDS=572 and the measured hosted-runner budget therefore
@@ -158,8 +159,8 @@ fi
 #
 # CARRY TO dd3c178 (2026-08-06). The only 6a6b4ec..dd3c178 change adds
 # reverie-kvm sendmsg/recvmsg ancillary-data translation and KVM tests.
-# reverie-dbi/build.rs, its vendored DynamoRIO tree, build commands, and the
-# MAX_PARALLEL_JOBS=16 clamp remain byte-identical. The DBI recipe identity
+# reverie-dbt/build.rs, its vendored DynamoRIO tree, build commands, and the
+# MAX_PARALLEL_JOBS=16 clamp remain byte-identical. The DBT recipe identity
 # therefore remains sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,
 # and the hosted-runner budget carries unchanged.
 #
@@ -172,47 +173,47 @@ fi
 # `git diff --name-only dd3c178..0ae0c01` is exactly two files, both KVM:
 #   reverie-kvm/src/elf.rs
 #   reverie-kvm/src/executor.rs
-# The DBI inputs are byte-identical by git object identity at both pins --
-# reverie-dbi/build.rs 9e35e1b699b7, reverie-dbi/vendor/dynamorio de352475846e,
-# third-party fb49c0ba7a9a, and the whole reverie-dbi subtree eb284556d2df --
+# The DBT inputs are byte-identical by git object identity at both pins --
+# reverie-dbt/build.rs 9e35e1b699b7, reverie-dbt/vendor/dynamorio de352475846e,
+# third-party fb49c0ba7a9a, and the whole reverie-dbt subtree eb284556d2df --
 # so source_recipe_key() is unchanged at
 # sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d and
 # the MAX_PARALLEL_JOBS=16 clamp still applies. The hosted-runner budget
 # therefore carries without re-derivation. This carry is evidenced by tree
 # identity rather than by a fresh timing run, exactly as the 6a6b4ec and
-# dd3c178 carries above: no DBI build input changed, so there is nothing for a
+# dd3c178 carries above: no DBT build input changed, so there is nothing for a
 # new timing sample to measure.
 #
 # CARRY TO 6144323 (2026-08-07). 0ae0c01..6144323 is exactly one commit,
 # rrnewton/reverie#377 (HybridPtrace A-class lifecycle-owner for reverie-e9patch),
 # touching 8 files: reverie-e9patch/{README.md,src/backend.rs,src/lib.rs,
 # src/runtime.rs}, reverie-preload/{README.md,src/lifecycle.rs}, and
-# reverie-ptrace/{src/tracer.rs,tests/stdio_drain.rs}. NONE is a DBI input.
+# reverie-ptrace/{src/tracer.rs,tests/stdio_drain.rs}. NONE is a DBT input.
 #
 # Verified by git object identity at both pins, not by inspection: build.rs
 # 9e35e1b699b7, vendor/dynamorio de352475846e, third-party fb49c0ba7a9a, and the
-# whole reverie-dbi subtree eb284556d2df are byte-identical at 0ae0c01 and at
+# whole reverie-dbt subtree eb284556d2df are byte-identical at 0ae0c01 and at
 # 6144323 -- the same four object ids this file already records for 0ae0c01, so
 # the recorded evidence for the previous carry independently checks out too.
 # source_recipe_key() is therefore unchanged at
 # sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d and the
-# MAX_PARALLEL_JOBS=16 clamp (reverie-dbi/build.rs:25) still applies, so the
+# MAX_PARALLEL_JOBS=16 clamp (reverie-dbt/build.rs:25) still applies, so the
 # hosted-runner budget carries without re-derivation. Evidenced by tree identity
 # rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178 and 0ae0c01
-# carries above: no DBI build input changed, so there is nothing to re-measure.
+# carries above: no DBT build input changed, so there is nothing to re-measure.
 #
 # CARRY TO 038e993 (2026-08-07). NOTE: unlike the 6a6b4ec/dd3c178/0ae0c01/6144323
-# carries above, the whole reverie-dbi subtree is NOT identical this time, so the
+# carries above, the whole reverie-dbt subtree is NOT identical this time, so the
 # argument is narrower and is stated explicitly rather than reused.
 #
-# 6144323..038e993 touches reverie-dbi/native/client.c, two test fixtures
+# 6144323..038e993 touches reverie-dbt/native/client.c, two test fixtures
 # (first_scrub_marker.c, stack_scrub_marker.c) and one test
 # (stack_scrub_preserves_guest_data.rs).
 #
 # The budget governs exactly one quantity: the elapsed time build_dynamorio()
 # reports on a DynamoRIO content-key MISS. source_recipe_key() is computed over
-# (source_dir = reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs, $CMAKE,
-# $CMAKE_GENERATOR) -- see reverie-dbi/build.rs:75-80 -- and ALL FOUR are
+# (source_dir = reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE,
+# $CMAKE_GENERATOR) -- see reverie-dbt/build.rs:75-80 -- and ALL FOUR are
 # unchanged: vendor/dynamorio and build.rs are byte-identical at both pins.
 # build_dynamorio() only cmake-configures and cmake-builds source_dir
 # (build.rs:199-220); native/client.c is not referenced by build.rs at all and is
@@ -227,29 +228,42 @@ fi
 # effective-job-seconds and would fail the portable lane on its first genuine
 # cold miss. The replacement bar stated above -- >=5 clean Hermit-lane samples
 # -- is unchanged and still unmet.
-REVERIE_DBI_MAX_PARALLEL_JOBS=16
-REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
-REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
-if ((REVERIE_DBI_EFFECTIVE_CPUS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
-    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_EFFECTIVE_CPUS
+#
+# CARRY TO 88363a5 (2026-08-07). This is the DBI-to-DBT identity rename rebased
+# onto 038e993. The vendored DynamoRIO tree is byte-identical at both pins
+# (de352475846e385002c1e4e54604fa0a7647b2de). build.rs changes only DBT-facing
+# environment-variable and diagnostic names; its CMake commands and
+# MAX_PARALLEL_JOBS=16 clamp are unchanged. Because build.rs is deliberately a
+# recipe-key input, the rename changes the key to
+# sha256:019b79670b3572c1afc2690932dd3fbbf70bbc9d0d96b5086ea121422de4bbb9.
+# A sequential cold build at 88363a5 (`CARGO_BUILD_JOBS=1 cargo build -p
+# reverie-dbt -j 1`) observed that exact key and completed the DynamoRIO source
+# build in 108.37s (108.37 effective-job-seconds). This single development-host
+# sample corroborates the identity transition; it does not replace the slower
+# hosted-runner calibration or its >=5-sample replacement bar.
+REVERIE_DBT_MAX_PARALLEL_JOBS=16
+REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
+REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
+if ((REVERIE_DBT_EFFECTIVE_CPUS < REVERIE_DBT_EFFECTIVE_BUILD_JOBS)); then
+    REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_EFFECTIVE_CPUS
 fi
-if ((REVERIE_DBI_MAX_PARALLEL_JOBS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
-    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_MAX_PARALLEL_JOBS
+if ((REVERIE_DBT_MAX_PARALLEL_JOBS < REVERIE_DBT_EFFECTIVE_BUILD_JOBS)); then
+    REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_MAX_PARALLEL_JOBS
 fi
-REVERIE_DBI_MAX_BUILD_SECONDS=$((
-    (REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS +
-        REVERIE_DBI_EFFECTIVE_BUILD_JOBS - 1) /
-        REVERIE_DBI_EFFECTIVE_BUILD_JOBS
+REVERIE_DBT_MAX_BUILD_SECONDS=$((
+    (REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS +
+        REVERIE_DBT_EFFECTIVE_BUILD_JOBS - 1) /
+        REVERIE_DBT_EFFECTIVE_BUILD_JOBS
 ))
 
-export CARGO_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
-export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
-export REVERIE_DBI_BUDGET_BOUND_PIN
-export REVERIE_DBI_BUILD_JOBS_SOURCE
-export REVERIE_DBI_RAW_BUILD_JOBS
-export REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
-export REVERIE_DBI_EFFECTIVE_CPUS
-export REVERIE_DBI_MAX_PARALLEL_JOBS
-export REVERIE_DBI_EFFECTIVE_BUILD_JOBS
-export REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-export REVERIE_DBI_MAX_BUILD_SECONDS
+export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
+export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
+export REVERIE_DBT_BUDGET_BOUND_PIN
+export REVERIE_DBT_BUILD_JOBS_SOURCE
+export REVERIE_DBT_RAW_BUILD_JOBS
+export REVERIE_DBT_EFFECTIVE_CPUS_SOURCE
+export REVERIE_DBT_EFFECTIVE_CPUS
+export REVERIE_DBT_MAX_PARALLEL_JOBS
+export REVERIE_DBT_EFFECTIVE_BUILD_JOBS
+export REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+export REVERIE_DBT_MAX_BUILD_SECONDS
