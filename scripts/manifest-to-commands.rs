@@ -27,6 +27,7 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -67,6 +68,52 @@ fn slug(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut directories = vec![manifest_root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", directory.display())))
+        {
+            let entry = entry.unwrap_or_else(|e| fail(format!("cannot read directory entry: {e}")));
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|e| fail(format!("cannot inspect {}: {e}", path.display())));
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "toml") {
+                let relative = path
+                    .strip_prefix(manifest_root)
+                    .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+                if relative.components().count() > 2 {
+                    fail(format!(
+                        "{}: manifest shards must be exactly one directory below manifests/",
+                        relative.display()
+                    ));
+                }
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn expected_bucket(manifest_root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(manifest_root)
+        .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+    match relative.components().count() {
+        1 => path.file_stem(),
+        2 => path.parent().and_then(Path::file_name),
+        _ => None,
+    }
+    .and_then(|value| value.to_str())
+    .unwrap_or_else(|| fail(format!("manifest has an invalid path: {}", path.display())))
+    .to_owned()
 }
 
 fn string_array(value: Option<&Value>, context: &str) -> Vec<String> {
@@ -420,28 +467,15 @@ rewrites the generated *.txt files in place.
   --guest-args  Write nothing; print the declared per-backend guest arguments as
                 TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
 
-/// Parse every manifest under `manifests`, validating schema and bucket naming,
-/// and return `(bucket, test)` pairs in file order.
-fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
-    let mut paths = fs::read_dir(manifests)
-        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect::<Vec<_>>();
-    paths.sort();
+/// Parse every root manifest and one-level shard under `manifests`, validating
+/// schema and bucket naming. Return `(bucket, test)` pairs plus document count.
+fn load_manifest_tests(manifests: &Path) -> (Vec<(String, Value)>, usize) {
+    let paths = discover_manifest_paths(manifests);
+    let documents = paths.len();
 
     let mut collected = Vec::new();
     for path in paths {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| {
-                fail(format!(
-                    "manifest has a non-UTF-8 file name: {}",
-                    path.display()
-                ))
-            });
+        let expected_bucket = expected_bucket(manifests, &path);
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
@@ -458,9 +492,9 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
             .get("bucket")
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail(format!("{}: missing `bucket`", path.display())));
-        if bucket != stem {
+        if bucket != expected_bucket {
             fail(format!(
-                "{}: bucket `{bucket}` must match file stem `{stem}`",
+                "{}: bucket `{bucket}` must match `{expected_bucket}`",
                 path.display()
             ));
         }
@@ -472,7 +506,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
             collected.push((bucket.to_owned(), test.clone()));
         }
     }
-    collected
+    (collected, documents)
 }
 
 fn main() -> ExitCode {
@@ -483,8 +517,9 @@ fn main() -> ExitCode {
     }
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
+    let (manifest_tests, documents) = load_manifest_tests(&manifests);
     if std::env::args().skip(1).any(|a| a == "--guest-args") {
-        for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
+        for line in guest_args_tsv(&manifest_tests) {
             println!("{line}");
         }
         return ExitCode::SUCCESS;
@@ -503,16 +538,15 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
-    for (bucket, test) in load_manifest_tests(&manifests) {
-        let lines = commands_for_test(&test, &bucket);
-        match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
-            Some((_, existing)) => existing.extend(lines),
-            None => by_bucket.push((bucket, lines)),
-        }
+    let mut by_bucket: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (bucket, test) in manifest_tests {
+        by_bucket
+            .entry(bucket.clone())
+            .or_default()
+            .extend(commands_for_test(&test, &bucket));
     }
 
-    let mut files = 0usize;
+    let files = by_bucket.len();
     let mut commands = 0usize;
     for (bucket, lines) in by_bucket {
         let destination = output.join(format!("{bucket}.txt"));
@@ -531,11 +565,12 @@ fn main() -> ExitCode {
                 .display(),
             lines.len()
         );
-        files += 1;
         commands += lines.len();
     }
 
-    println!("generated {commands} commands across {files} bucket files");
+    println!(
+        "generated {commands} commands across {files} bucket files from {documents} manifest documents"
+    );
     ExitCode::SUCCESS
 }
 

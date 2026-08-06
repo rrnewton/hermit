@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
-INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
+EXPLICIT_INVENTORY="$MANIFEST_ROOT/inventory/explicit-test-files.json"
 EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/ignored/e2e}
@@ -24,7 +24,7 @@ else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT EXPLICIT_INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
@@ -152,8 +152,8 @@ function load_tests {
     ((${#TESTS[@]} > 0)) || die "no tests discovered below $MANIFEST_ROOT"
 }
 
-function audit_inventory {
-    [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
+function validate_explicit_inventory_schema {
+    local inventory=$1
     jq -e '
         .schema == 2
         and (.files | type == "array" and length > 0)
@@ -165,68 +165,130 @@ function audit_inventory {
             and (.runner | type == "string" and length > 0)
             and (.why | type == "string" and length > 0)
             and (. as $entry | ($entry.why | startswith($entry.path + " is owned by " + $entry.runner + ": ")))))
+        and (all(.files[];
+            .disposition != "manifest-test" and .disposition != "manifest-policy"))
         and ((.files | map(.path) | unique | length) == (.files | length))
-        and ([.files[] | select(.disposition != "manifest-test")
+        and ([.files[]
               | . as $entry
               | ($entry.why | ltrimstr($entry.path + " is owned by " + $entry.runner + ": "))]
              | length == (unique | length))
-        and all(.files[] | select(.disposition != "manifest-test");
+        and all(.files[];
             (. as $entry
              | ($entry.why
                 | ltrimstr($entry.path + " is owned by " + $entry.runner + ": ")
                 | length >= 120)))
-    ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
+    ' "$inventory" >/dev/null
+}
 
-    local scratch expected actual
+function check_inventory_partition {
+    local expected=$1 explicit_paths=$2 manifest_programs=$3 manifest_documents=$4
+    local scratch actual overlap
     scratch=$(mktemp -d)
-    expected="$scratch/expected"
     actual="$scratch/actual"
-    # Enumerate through GIT, not a bare filesystem walk.
-    #
-    # `find` reported every file ON DISK, so any ignored build output under
-    # tests/ failed this gate: __pycache__, .pytest_cache, coverage data, editor
-    # swap files, core dumps. That conflates "exists on disk" with "must be
-    # inventoried", and it made the gate depend on checkout state rather than on
-    # repository content -- the same commit passed in a fresh worktree and failed
-    # in a checkout where a tool had run.
-    #
-    # It is a RECURRING self-inflicted red, not a one-off: `make validate-kvm`
-    # and `make validate-dbi` both run `python3 tests/backend-parity/run_matrix.py`,
-    # which creates tests/backend-parity/__pycache__. Running a per-backend
-    # validate therefore reds the next full validate's metadata gate, via a file
-    # that .gitignore hides so `git status` still reads clean.
-    #
-    # `--cached --others --exclude-standard` is tracked files PLUS genuinely new
-    # untracked ones, MINUS ignored output. This does not relax the check: a new
-    # undispositioned test file is still caught by `--others`. Verified three
-    # ways -- on a clean tree the two enumerations are byte-identical (518 files);
-    # with a planted `__pycache__/*.pyc` only `find` reports it; with a planted
-    # new `tests/*.c` both still report it.
-    git -C "$ROOT_DIR" ls-files --cached --others --exclude-standard -- tests \
-        | LC_ALL=C sort >"$expected"
-    jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
-    if ! diff -u "$expected" "$actual"; then
+    overlap="$scratch/overlap"
+
+    LC_ALL=C comm -12 "$explicit_paths" "$manifest_programs" >"$overlap"
+    LC_ALL=C comm -12 "$explicit_paths" "$manifest_documents" >>"$overlap"
+    if [[ -s $overlap ]]; then
+        cat "$overlap" >&2
         rm -rf "$scratch"
-        die "test inventory is stale; every file in tests/ must have an explicit disposition"
+        return 10
     fi
 
-    local manifest_programs="$scratch/manifest-programs"
-    local inventory_manifest_tests="$scratch/inventory-manifest-tests"
+    LC_ALL=C sort "$explicit_paths" "$manifest_programs" "$manifest_documents" >"$actual"
+    if ! diff -u "$expected" "$actual"; then
+        rm -rf "$scratch"
+        return 11
+    fi
+    rm -rf "$scratch"
+}
+
+function self_test_inventory_partition {
+    local scratch expected explicit_paths manifest_programs manifest_documents rc
+    scratch=$(mktemp -d)
+    expected="$scratch/expected"
+    explicit_paths="$scratch/explicit"
+    manifest_programs="$scratch/programs"
+    manifest_documents="$scratch/documents"
+
+    printf '%s\n' tests/explicit.txt tests/program.c tests/e2e/manifests/bucket.toml |
+        LC_ALL=C sort >"$expected"
+    printf '%s\n' tests/explicit.txt >"$explicit_paths"
+    printf '%s\n' tests/program.c >"$manifest_programs"
+    printf '%s\n' tests/e2e/manifests/bucket.toml >"$manifest_documents"
+    check_inventory_partition "$expected" "$explicit_paths" "$manifest_programs" "$manifest_documents" ||
+        die "inventory partition positive control failed"
+
+    printf '%s\n' tests/explicit.txt tests/program.c >"$explicit_paths"
+    if check_inventory_partition "$expected" "$explicit_paths" "$manifest_programs" "$manifest_documents" >/dev/null 2>&1; then
+        die "explicit/derived overlap negative control did not fail"
+    else
+        rc=$?
+    fi
+    [[ $rc == 10 ]] || die "explicit/derived overlap failed with unexpected status $rc"
+
+    printf '%s\n' tests/explicit.txt >"$explicit_paths"
+    printf '%s\n' tests/explicit.txt tests/program.c tests/unclassified.txt tests/e2e/manifests/bucket.toml |
+        LC_ALL=C sort >"$expected"
+    if check_inventory_partition "$expected" "$explicit_paths" "$manifest_programs" "$manifest_documents" >/dev/null 2>&1; then
+        die "unclassified-file negative control did not fail"
+    else
+        rc=$?
+    fi
+    [[ $rc == 11 ]] || die "unclassified-file control failed with unexpected status $rc"
+
+    rm -rf "$scratch"
+    echo "PASS: derived inventory rejects overlap and unclassified files"
+}
+
+function audit_inventory {
+    [[ -f $EXPLICIT_INVENTORY ]] ||
+        die "missing explicit test inventory: ${EXPLICIT_INVENTORY#"$ROOT_DIR/"}"
+    validate_explicit_inventory_schema "$EXPLICIT_INVENTORY" ||
+        die "explicit test inventory schema violation"
+
+    local scratch expected explicit_paths manifest_programs manifest_documents
+    scratch=$(mktemp -d)
+    expected="$scratch/expected"
+    explicit_paths="$scratch/explicit-paths"
+    manifest_programs="$scratch/manifest-programs"
+    manifest_documents="$scratch/manifest-documents"
+    # Bind the inventory to repository content, not ignored build output left on
+    # disk by prior test runs. New untracked, non-ignored files remain visible.
+    git -C "$ROOT_DIR" ls-files --cached --others --exclude-standard -- tests \
+        | LC_ALL=C sort >"$expected"
+    jq -r '.files[].path' "$EXPLICIT_INVENTORY" | LC_ALL=C sort >"$explicit_paths"
+
     local test
     for test in "${TESTS[@]}"; do
         [[ $test != direct:* ]] || continue
         printf '%s\n' "${test#"$ROOT_DIR/"}"
     done | LC_ALL=C sort >"$manifest_programs"
-    jq -r '.files[] | select(.disposition == "manifest-test") | .path' "$INVENTORY" |
-        LC_ALL=C sort >"$inventory_manifest_tests"
-    if ! diff -u "$manifest_programs" "$inventory_manifest_tests"; then
+    find "$MANIFEST_ROOT" -type f -name '*.toml' -printf 'tests/e2e/manifests/%P\n' |
+        LC_ALL=C sort >"$manifest_documents"
+
+    if check_inventory_partition "$expected" "$explicit_paths" "$manifest_programs" "$manifest_documents"; then
+        :
+    else
+        local rc=$?
         rm -rf "$scratch"
-        die "manifest programs and disposition=manifest-test inventory entries differ"
+        if [[ $rc == 10 ]]; then
+            die "manifest programs/documents must be derived, not duplicated in the explicit inventory"
+        fi
+        die "derived test inventory is stale; every file must be a current manifest program/document or explicit exception"
     fi
+
+    local explicit_count manifest_count manifest_document_count
+    explicit_count=$(wc -l <"$explicit_paths")
+    manifest_count=$(wc -l <"$manifest_programs")
+    manifest_document_count=$(wc -l <"$manifest_documents")
     rm -rf "$scratch"
 
-    jq '{files:(.files|length),by_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
-        "$INVENTORY"
+    jq --argjson derived_manifest_tests "$manifest_count" \
+       --argjson derived_manifest_documents "$manifest_document_count" \
+       --argjson explicit_files "$explicit_count" \
+       '{files:($derived_manifest_tests + $derived_manifest_documents + $explicit_files),derived_manifest_tests:$derived_manifest_tests,derived_manifest_documents:$derived_manifest_documents,explicit_files:$explicit_files,by_explicit_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
+        "$EXPLICIT_INVENTORY"
 }
 
 function audit_test_footprints {
@@ -1914,7 +1976,9 @@ case "$subcommand" in
         (($# == 0)) || true
         audit_sabre_path_evidence_contract
         audit_test_footprints
+        python3 "$ROOT_DIR/tests/backend-parity/retarget_to_manifest.py" --self-test
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
+        self_test_inventory_partition
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
