@@ -824,6 +824,144 @@ fn default_bind_mounts() {
     command_output(command, "tmpfs bind mounts");
 }
 
+/// Every entry Hermit promises a guest by default.
+const MINIMAL_GUEST_DEV: &[&str] = &[
+    "null", "zero", "full", "random", "urandom", "tty", "shm", "pts", "ptmx", "fd", "stdin",
+    "stdout", "stderr",
+];
+
+/// Host device nodes that a hermetic guest has no business seeing. Only those
+/// that actually exist on this host are asserted against, so the check states
+/// what it covered instead of silently passing on a machine that has none.
+const HOST_ONLY_DEVICES: &[&str] = &[
+    "/dev/kvm",
+    "/dev/mem",
+    "/dev/kmsg",
+    "/dev/loop0",
+    "/dev/console",
+    "/dev/fuse",
+];
+
+/// Plant a file in the host's world-writable `/dev/shm` and return its bare
+/// name. This is the leak probe: it exists on the host for the duration of the
+/// test and is visible in-guest if and only if the guest is looking at the host
+/// `/dev`.
+fn plant_host_shm_probe() -> (String, PathBuf) {
+    let name = format!(
+        "hermit-dev-leak-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host clock should be after the epoch")
+            .as_nanos()
+    );
+    let path = Path::new("/dev/shm").join(&name);
+    fs::write(&path, b"host-only")
+        .unwrap_or_else(|error| panic!("failed to plant {}: {error}", path.display()));
+    (name, path)
+}
+
+fn guest_dev_listing(command: Command, label: &str) -> Vec<String> {
+    let output = command_output(command, label);
+    let mut names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The guest must get a scoped `/dev`, not the host's. Brackets both sides: the
+/// planted host-only artifact and the real host-only device nodes must be
+/// absent, and every device Hermit promises must be present *and usable*.
+#[test]
+fn default_guest_dev_is_scoped_to_the_minimal_set() {
+    let _guard = hermit_run_lock();
+    let (probe, probe_path) = plant_host_shm_probe();
+
+    let mut command = default_hermit_command("minimal");
+    command.args(["--", "/bin/sh", "-c", "ls -1 /dev"]);
+    let guest_dev = guest_dev_listing(command, "scoped guest /dev listing");
+    let _ = fs::remove_file(&probe_path);
+
+    let mut expected: Vec<String> = MINIMAL_GUEST_DEV.iter().map(|s| (*s).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        guest_dev, expected,
+        "guest /dev must hold exactly the minimal set"
+    );
+
+    let present_host_only: Vec<&str> = HOST_ONLY_DEVICES
+        .iter()
+        .copied()
+        .filter(|device| Path::new(device).exists())
+        .collect();
+    assert!(
+        !present_host_only.is_empty(),
+        "this host exposes none of {HOST_ONLY_DEVICES:?}, so the negative half of this \
+         check would be vacuous"
+    );
+    for device in &present_host_only {
+        let bare = device.trim_start_matches("/dev/");
+        assert!(
+            !guest_dev.iter().any(|entry| entry == bare),
+            "{device} exists on this host and leaked into the guest /dev"
+        );
+    }
+
+    // The planted probe is the dynamic half: it was created on the host while
+    // this test ran, so its absence cannot be explained by a stale image.
+    let mut probe_check = default_hermit_command("minimal");
+    probe_check.arg("--").args([
+        "/bin/sh",
+        "-c",
+        &format!("test -e /dev/shm/{probe} && echo LEAKED || echo SCOPED"),
+    ]);
+    let probe_output = command_output(probe_check, "planted /dev/shm probe under scoped /dev");
+    assert_eq!(
+        String::from_utf8_lossy(&probe_output.stdout).trim(),
+        "SCOPED",
+        "the host /dev/shm artifact planted by this test reached the guest"
+    );
+
+    // Positive bracket: the minimal set is not just present as names, it works.
+    let mut usable = default_hermit_command("minimal");
+    usable.arg("--").args([
+        "/bin/sh",
+        "-c",
+        "echo discard > /dev/null && head -c 8 /dev/zero > /dev/null \
+         && head -c 8 /dev/urandom > /dev/null && head -c 8 /dev/random > /dev/null \
+         && echo ok > /dev/shm/scratch && test -d /dev/pts && test -e /dev/fd/1",
+    ]);
+    command_output(usable, "minimal guest /dev is usable");
+}
+
+/// The escape hatch must actually restore the host tree. Without this the
+/// negative assertions above could pass for the wrong reason — a probe that
+/// never resolves, or a guest that cannot list `/dev` at all.
+#[test]
+fn host_dev_flag_restores_the_host_device_tree() {
+    let _guard = hermit_run_lock();
+    let (probe, probe_path) = plant_host_shm_probe();
+
+    let mut command = default_hermit_command("minimal");
+    command.arg("--host-dev").arg("--").args([
+        "/bin/sh",
+        "-c",
+        &format!("test -e /dev/shm/{probe} && echo LEAKED || echo SCOPED"),
+    ]);
+    let output = command_output(command, "planted /dev/shm probe under --host-dev");
+    let _ = fs::remove_file(&probe_path);
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "LEAKED",
+        "--host-dev must expose the host /dev, otherwise the scoped-/dev probe proves nothing"
+    );
+}
+
 #[test]
 fn default_preserved_tmpfs() {
     let _guard = hermit_run_lock();

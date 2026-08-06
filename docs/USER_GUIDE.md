@@ -132,6 +132,7 @@ default stricter.
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
 - gives the guest an isolated PID namespace and `/tmp`;
+- gives the guest a scoped `/dev` instead of the host's;
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
 
@@ -451,6 +452,18 @@ Hermit starts.
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
 and reproducibility.
+
+The guest also gets a scoped `/dev` rather than the host's device tree. It
+contains the character devices `null`, `zero`, `full`, `random`, `urandom`, and
+`tty`; an empty `/dev/shm`; a private `/dev/pts` (so guest pseudo-terminals are
+numbered from zero and host ptys are invisible); and the usual `fd`, `stdin`,
+`stdout`, `stderr`, and `ptmx` symlinks. `--backend=kvm` additionally gets
+`/dev/kvm`, which that backend needs to start. Host block devices, `/dev/mem`,
+and the contents of the host `/dev/shm` are not visible.
+
+`--host-dev` restores the host's entire `/dev`. Like `--tmp=/tmp` it is a
+diagnosis aid: it weakens isolation and reproducibility, and should be used only
+with trusted guests that need a device Hermit does not provide.
 
 Network modes are:
 

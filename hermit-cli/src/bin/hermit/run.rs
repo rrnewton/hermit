@@ -44,10 +44,11 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
-use super::container::IdentityGuard;
+use super::container::MountGuard;
 use super::container::apply_affinity;
 use super::container::default_container;
-use super::container::identity_hardening_mounts;
+use super::container::hardening_mounts;
+use super::container::host_dev_hardening_mounts;
 use super::container::image_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
@@ -98,7 +99,7 @@ fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Err
 }
 struct PreparedMounts {
     mounts: Vec<Mount>,
-    identity_sources: IdentityGuard,
+    mount_sources: MountGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +203,18 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
+    /// Give the guest the host's entire `/dev` instead of the scoped default.
+    ///
+    /// By default the guest gets a fresh `/dev` holding only `null`, `zero`, `full`, `random`,
+    /// `urandom`, and `tty`, plus an empty `/dev/shm`, a private `/dev/pts`, and the usual
+    /// `/proc/self/fd` symlinks (`--backend=kvm` additionally gets `/dev/kvm`). This flag restores
+    /// the pre-scoping behavior, exposing host block devices, `/dev/kvm`, `/dev/mem`, and the host
+    /// `/dev/shm` contents to the guest. It compromises isolation and deterministic
+    /// reproducibility; use it only with trusted guests that need a device Hermit does not
+    /// provide.
+    #[clap(long)]
+    host_dev: bool,
+
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
     #[clap(
@@ -239,6 +252,7 @@ pub struct RunOpts {
         conflicts_with_all = [
             "mount",
             "bind",
+            "host_dev",
             "network",
             "tmp",
             "namespace_only",
@@ -1770,6 +1784,21 @@ impl RunOpts {
         }
     }
 
+    /// Host `/dev` entries the *backend* needs, on top of the default guest
+    /// device set. The KVM backend opens `/dev/kvm` from inside the container to
+    /// create the VM, so scoping it away would make `--backend=kvm` fail to
+    /// start. No other backend reaches for a host device node: ptrace and
+    /// e9patch use ptrace/seccomp, DBI rewrites the code stream, and PMU
+    /// preemption goes through `perf_event_open`, none of which has a `/dev`
+    /// entry.
+    fn extra_guest_devices(&self) -> Vec<&'static str> {
+        if self.runtime_backend() == Backend::Kvm {
+            vec!["kvm"]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn verify_liteinst_activation(&self) -> Result<(), Error> {
         let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
         let mut command = Command::new(executable);
@@ -1965,6 +1994,12 @@ impl RunOpts {
         if self.image.is_some() && (!self.mount.is_empty() || !self.bind.is_empty()) {
             anyhow::bail!(
                 "--image does not yet compose with custom --mount/--bind targets inside the OCI rootfs"
+            );
+        }
+        if self.image.is_some() && self.host_dev {
+            anyhow::bail!(
+                "--image gives the guest the image's own /dev, so --host-dev (which restores the \
+                 host /dev over Hermit's scoped one) has nothing to act on"
             );
         }
 
@@ -2653,7 +2688,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
+        let (mut container, _mount_sources) = self.container(tmpfs.path())?;
 
         with_container(&mut container, || {
             self.run_in_container(global, capture_output)
@@ -2668,7 +2703,7 @@ impl RunOpts {
         let tmpfs = self.tmpfs()?;
         let PreparedMounts {
             mounts,
-            identity_sources: _identity_sources,
+            mount_sources: _mount_sources,
         } = self.mounts(tmpfs.path())?;
 
         let mut command = Command::new(&self.program);
@@ -2823,7 +2858,11 @@ impl RunOpts {
 
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
-        let (mut mounts, identity_sources) = identity_hardening_mounts()?;
+        let (mut mounts, mount_sources) = if self.host_dev {
+            host_dev_hardening_mounts()?
+        } else {
+            hardening_mounts(&self.extra_guest_devices())?
+        };
 
         for mount in &self.mount {
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
@@ -2875,20 +2914,19 @@ impl RunOpts {
 
         Ok(PreparedMounts {
             mounts,
-            identity_sources,
+            mount_sources,
         })
     }
 
     /// Returns a configured container to run a function in.
-    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
+    fn container(&self, tmpfs: &Path) -> Result<(Container, MountGuard), Error> {
         // PROTOTYPE: when an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
         // with a chroot into the pinned image root.
         if let Some(image) = &self.image {
             let rootfs = crate::image::materialize_rootfs(image)?;
-            let (mut container, identity_sources) =
-                image_container(&rootfs, tmpfs, self.pin_threads)?;
+            let (mut container, mount_sources) = image_container(&rootfs, tmpfs, self.pin_threads)?;
             match &self.network {
                 NetworkingMode::Local => {
                     container.local_networking_only();
@@ -2898,7 +2936,7 @@ impl RunOpts {
                 }
                 NetworkingMode::Host => {}
             }
-            return Ok((container, identity_sources));
+            return Ok((container, mount_sources));
         }
 
         let mut container = default_container(self.pin_threads);
@@ -2917,11 +2955,11 @@ impl RunOpts {
 
         let PreparedMounts {
             mounts,
-            identity_sources,
+            mount_sources,
         } = self.mounts(tmpfs)?;
         container.mounts(mounts);
 
-        Ok((container, identity_sources))
+        Ok((container, mount_sources))
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
@@ -2938,7 +2976,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
+        let (mut container, _mount_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
         with_container(&mut container, || {
