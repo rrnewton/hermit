@@ -1090,15 +1090,27 @@ fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls
     assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
 
     // ... and the opt-out is the only way to turn it off.
-    let mut opted_out =
-        RunOpts::parse_from(["fakehermit", "--no-panic-on-unsupported-syscalls", "fakeprog"]);
+    let mut opted_out = RunOpts::parse_from([
+        "fakehermit",
+        "--no-panic-on-unsupported-syscalls",
+        "fakeprog",
+    ]);
     opted_out.validate_args_with_perf_support(true).unwrap();
     assert!(!opted_out.det_opts.det_config.panic_on_unsupported_syscalls);
-    assert!(!opted_out.det_opts.det_config.shutdown_on_unsupported_syscall);
+    assert!(
+        !opted_out
+            .det_opts
+            .det_config
+            .shutdown_on_unsupported_syscall
+    );
 
     // --strict REFUSES the opt-out rather than silently overriding it.
-    let mut conflict = RunOpts::parse_from(
-        ["fakehermit", "--strict", "--no-panic-on-unsupported-syscalls", "fakeprog"]);
+    let mut conflict = RunOpts::parse_from([
+        "fakehermit",
+        "--strict",
+        "--no-panic-on-unsupported-syscalls",
+        "fakeprog",
+    ]);
     assert!(conflict.validate_args_with_perf_support(true).is_err());
 
     // --passthru-opt is permissive by nature: it implies the opt-out instead of bailing,
@@ -1108,9 +1120,17 @@ fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls
     assert!(!passthru.det_opts.det_config.panic_on_unsupported_syscalls);
 
     // ... but combined with an EXPLICIT request it is still a hard conflict.
-    let mut passthru_explicit = RunOpts::parse_from(
-        ["fakehermit", "--passthru-opt", "--panic-on-unsupported-syscalls", "fakeprog"]);
-    assert!(passthru_explicit.validate_args_with_perf_support(true).is_err());
+    let mut passthru_explicit = RunOpts::parse_from([
+        "fakehermit",
+        "--passthru-opt",
+        "--panic-on-unsupported-syscalls",
+        "fakeprog",
+    ]);
+    assert!(
+        passthru_explicit
+            .validate_args_with_perf_support(true)
+            .is_err()
+    );
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     strict.validate_args_with_perf_support(true).unwrap();
