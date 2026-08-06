@@ -11,58 +11,70 @@
 // process-local status-flag toggle. No blocking read is performed (a read on an
 // empty non-blocking pipe would livelock under DBT), so the contract is a pure
 // query/flag round-trip that every backend and native agree on.
+//
+// THE READABLE-BYTE COUNT IS PRINTED, and each flag check is named separately.
+// "fionread ok=6" was blind twice over: six checks collapsed into one scalar, so
+// a backend that misreported the byte count and a backend that dropped the
+// FIONBIO toggle both printed "fionread ok=5" and compared EQUAL; and because
+// main() returned 0 unconditionally, exit status carried no signal either.
+// navail is the strongest observable here and it is fully guest-determined --
+// the guest wrote exactly those six bytes -- so it is printed and compared
+// exactly. Only the O_NONBLOCK BIT of the status word is emitted, not the raw
+// F_GETFL result, because the surrounding access-mode bits are inherited rather
+// than guest-chosen.
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-/* Number of behavioural checks this fixture must complete; a lower count is a
-   failure, not a smaller success. */
-#define EXPECTED_CHECKS 6
-
 int main(void) {
-    int ok = 0;
+    enum { EXPECTED_CHECKS = 6, WROTE_BYTES = 6 };
     int fds[2];
     if (pipe(fds) != 0) {
         printf("fionread ok=0 [pipe fail]\n");
         return 1;
     }
 
-    // Guest writes exactly six bytes into the pipe.
-    if (write(fds[1], "hello\n", 6) != 6) {
+    // Guest writes exactly WROTE_BYTES bytes into the pipe.
+    if (write(fds[1], "hello\n", WROTE_BYTES) != WROTE_BYTES) {
         printf("fionread ok=0 [write fail]\n");
         return 1;
     }
 
     // (1) FIONREAD reports bytes readable; (2) the count equals what we wrote.
     int navail = -1;
-    if (ioctl(fds[0], FIONREAD, &navail) == 0) ok++;
-    if (navail == 6) ok++;
+    int fionread_ok = ioctl(fds[0], FIONREAD, &navail) == 0;
+    int navail_exact = navail == WROTE_BYTES;
 
     // (3) FIONBIO sets non-blocking; (4) fcntl F_GETFL reflects O_NONBLOCK.
     int on = 1;
-    if (ioctl(fds[0], FIONBIO, &on) == 0) ok++;
+    int fionbio_set = ioctl(fds[0], FIONBIO, &on) == 0;
     int fl = fcntl(fds[0], F_GETFL);
-    if (fl >= 0 && (fl & O_NONBLOCK)) ok++;
+    int nonblock_after_set = fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0;
 
     // (5) FIONBIO clears non-blocking; (6) F_GETFL shows O_NONBLOCK cleared.
     int off = 0;
-    if (ioctl(fds[0], FIONBIO, &off) == 0) ok++;
+    int fionbio_clear = ioctl(fds[0], FIONBIO, &off) == 0;
     fl = fcntl(fds[0], F_GETFL);
-    if (fl >= 0 && !(fl & O_NONBLOCK)) ok++;
+    int nonblock_after_clear = fl >= 0 ? ((fl & O_NONBLOCK) != 0) : -1;
 
     close(fds[0]);
     close(fds[1]);
-    printf("fionread ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "fionread completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+    int clear_readback_ok = fl >= 0;
+    int ok = fionread_ok + navail_exact + fionbio_set + nonblock_after_set +
+        fionbio_clear + (clear_readback_ok && nonblock_after_clear == 0);
+    printf(
+        "fionread ok=%d navail=%d fionread_ok=%d fionbio_set=%d "
+        "nonblock_after_set=%d fionbio_clear=%d clear_readback_ok=%d "
+        "nonblock_after_clear=%d\n",
+        ok,
+        navail,
+        fionread_ok,
+        fionbio_set,
+        nonblock_after_set,
+        fionbio_clear,
+        clear_readback_ok,
+        nonblock_after_clear);
+    return ok == EXPECTED_CHECKS ? 0 : 1;
 }
