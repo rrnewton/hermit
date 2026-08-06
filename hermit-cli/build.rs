@@ -22,14 +22,17 @@
 mod build_support;
 
 use build_support::build_date;
+use build_support::git_full_sha;
 use build_support::git_short_sha;
 use build_support::git_watch_paths;
 
 fn main() {
     let sha = git_short_sha();
+    let full_sha = git_full_sha();
     let date = build_date();
 
     println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
+    println!("cargo:rustc-env=HERMIT_BUILD_GIT_FULL_SHA={full_sha}");
     println!("cargo:rustc-env=HERMIT_BUILD_DATE={date}");
 
     // Re-run when the revision, index, or a tracked worktree file changes so

@@ -209,12 +209,11 @@ pub struct StartOpts {
     /// "guest_signal":int|null}`. This is the exit-code-independent verdict
     /// channel: `verified` reflects whether the record and replay runs matched,
     /// regardless of what the guest exited with, so a caller need not (and must
-    /// not) infer the verdict from the process exit code. A record/replay parity
-    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
-    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
-    /// comparison that strips only the real wall-clock prefix, canonicalizes host
-    /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — rather than a stripped match.
+    /// not) infer the verdict from the process exit code. This record/replay
+    /// payload is a legacy diagnostic, not the versioned backend-local strict
+    /// receipt emitted by `hermit run --strict --verify --verify-strict`. No
+    /// admission or parity ratchet may authorize from `verified` or
+    /// `bitwise_parity`; migrate through the shared strict receipt verifier.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
