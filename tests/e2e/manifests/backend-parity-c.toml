@@ -4676,8 +4676,16 @@ program = "tests/backend-parity/fixtures/readdir_order_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+# ci = true: a fixture that never runs pins nothing. 85 of the 86 entries in this
+# manifest have no CI-enabled mode at all; this one is measured at ~8s, so there is
+# no cost argument for leaving it dormant.
+ci = true
 backends_enabled = ["ptrace"]
+# The guest only REPORTS unless asked to assert. `verify` grades on the exit status
+# of `hermit --strict --verify`, so the flag is what makes this cell able to fail on
+# an ordering regression at all. Small (single-buffer) is determinized today and is
+# the part held; large pins a known per-buffer-sort gap and stays reported-only.
+guest_args = { ptrace = ["--require-small-determinized"] }
 [test.modes.verify.backends_disabled]
 dbi = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately"
 kvm = "KVM livelocks at guest startup on the current host; qualify KVM separately"

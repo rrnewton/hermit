@@ -129,6 +129,8 @@ static int enumerate(const char *dir, char names[][NAME_CAP], int cap) {
 
 /* Build two dirs holding the SAME name set in two different creation orders,
  * enumerate both, and report whether the two orders agree. */
+/* Returns 1 when the two creation orders enumerated identically, 0 when they
+ * diverged, and -1 on a setup error. */
 static int probe(const char *root, const char *label, int count,
                  char names_a[][NAME_CAP], char names_b[][NAME_CAP]) {
     char da[PATH_CAP], db[PATH_CAP];
@@ -166,26 +168,63 @@ static int probe(const char *root, const char *label, int count,
         if (strcmp(names_b[i - 1], names_b[i]) > 0) seams_b++;
     }
 
+    int identical = (first_diff == -1) && (wa == wb);
     printf("%s n=%d order_identical=%d first_diff=%d seams_fwd=%d seams_rev=%d words_equal=%d\n",
            label, count, first_diff == -1 ? 1 : 0, first_diff, seams_a, seams_b,
            wa == wb ? 1 : 0);
-    return 0;
+    /* 1 = the two creation orders enumerated identically, 0 = they did not.
+     * Returned rather than only printed: a verdict a caller cannot branch on is
+     * a verdict no test harness can fail on. */
+    return identical ? 1 : 0;
 }
 
-int main(void) {
+/*
+ * EXIT STATUS IS THE CONTRACT, and it is opt-in.
+ *
+ * With no arguments this only REPORTS, which is what the native premise needs:
+ * native creation-order leakage is expected (small order_identical=0), so an
+ * unconditional assertion would make the documented baseline "fail".
+ *
+ * With `--require-small-determinized` the SMALL probe becomes fatal. Small fits
+ * in one getdents64 buffer and IS determinized today, so that is a contract we
+ * hold and can regress. LARGE stays reported-only because it pins a KNOWN GAP
+ * (per-buffer sort, seams_rev=1); making it fatal would land a red test.
+ *
+ * Why this matters: the harness's `verify` mode grades a cell on the EXIT STATUS
+ * of `hermit --strict --verify` and never compares the observation hash against
+ * a baseline (ci/test_harness.sh: the `else` branch of run_cell). A fixture that
+ * only prints its verdict therefore pins nothing -- and `--verify` is itself
+ * structurally blind to this bug class, as the header explains. Returning the
+ * verdict through the exit status is what makes the cell able to fail at all.
+ */
+int main(int argc, char **argv) {
+    int require_small = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--require-small-determinized") == 0) require_small = 1;
+    }
+
     char root[] = "/tmp/readdir_order_identity_XXXXXX";
     if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
 
     static char small_a[SMALL_N][NAME_CAP], small_b[SMALL_N][NAME_CAP];
-    if (probe(root, "small", SMALL_N, small_a, small_b) != 0) {
+    int small_ok = probe(root, "small", SMALL_N, small_a, small_b);
+    if (small_ok < 0) {
         fprintf(stderr, "small probe failed\n");
         return 2;
     }
 
     static char large_a[LARGE_N][NAME_CAP], large_b[LARGE_N][NAME_CAP];
-    if (probe(root, "large", LARGE_N, large_a, large_b) != 0) {
+    if (probe(root, "large", LARGE_N, large_a, large_b) < 0) {
         fprintf(stderr, "large probe failed\n");
         return 2;
+    }
+
+    if (require_small && !small_ok) {
+        fprintf(stderr,
+                "CONTRACT VIOLATED: small (single-buffer) enumeration is no longer "
+                "creation-order independent; directory order is leaking guest-visible "
+                "state. Do not resolve this by relaxing the assertion.\n");
+        return 1;
     }
     return 0;
 }
