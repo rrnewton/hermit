@@ -10,11 +10,10 @@
  * Guest-observable file-lock semantics and xattr enumeration order.
  *
  * WHAT THIS PINS
- *   1. flock(2) mutual exclusion between processes -- REPORTED, not asserted.
- *      Under Hermit today it is NOT enforced (handle_flock is an unconditional
- *      no-op success), so this line prints NOT_ENFORCED. Native prints ENFORCED.
- *      The observed word is emitted so the day flock starts working the output
- *      changes and someone must look, rather than the gap staying invisible.
+ *   1. flock(2) mutual exclusion between processes -- ASSERTED. This was a
+ *      no-op success until handle_flock was fixed to forward to the kernel, and
+ *      two processes could hold the same LOCK_EX at once; the assertion exists
+ *      so that cannot silently return.
  *   2. fcntl POSIX record locks -- ASSERTED. Exclusion must hold across
  *      processes.
  *   3. POSIX vs OFD inheritance across fork -- ASSERTED, and they must DIFFER.
@@ -26,13 +25,13 @@
  *   4. listxattr enumeration ORDER -- emitted verbatim, not sorted or counted,
  *      because sorting would hide exactly the reordering this is here to catch.
  *
- * WHY THERE IS NO ACQUISITION-ORDER TEST HERE
- *   Acquisition order under contention is the interesting property, but it is
- *   UNMEASURABLE while flock is a no-op: contention cannot be created, so any
- *   "stable order" would be an artifact of never having contended. Measured:
- *   natively four contending children give a MOVING winner; under Hermit no
- *   child is ever denied. That leg is blocked on the flock fix and is
- *   deliberately absent rather than present and vacuous.
+ * WHY THERE IS STILL NO ACQUISITION-ORDER TEST HERE
+ *   Ordering needs several processes to WAIT on one lock. Detcore cannot yet
+ *   park a thread on a file lock deterministically -- a blocking, contended
+ *   flock is refused rather than queued, because blocking in the kernel wedges
+ *   the serialized scheduler. So a waiting queue cannot be formed, and any
+ *   "stable order" would again be an artifact of never having waited. The leg
+ *   stays out until flock gains a scheduler-owned wait queue.
  *
  * NO SLEEPS anywhere: a sleep would decide the outcome instead of observing it.
  */
@@ -176,8 +175,7 @@ int main(void) {
     printf("posix inheritance: %s\n", posix_inh);
     printf("ofd inheritance: %s\n", ofd_inh);
 
-    /* fcntl exclusion is a real Linux contract and is asserted. flock is only
-     * reported: see the header. */
+    check(strcmp(flock_excl, "ENFORCED") == 0, "flock must exclude a second process");
     check(strcmp(posix_excl, "ENFORCED") == 0, "posix record locks must exclude a second process");
     check(strcmp(ofd_excl, "ENFORCED") == 0, "OFD locks must exclude a second open file description");
     /* The two families MUST disagree here; that difference is the contract. */
