@@ -11,7 +11,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-detcore = { version = "0.2.0", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
 libc = "0.2.186"
 reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "e159d6cef0fc9a75020d70e6374c7899da07868f" }
 reverie-memory = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "e159d6cef0fc9a75020d70e6374c7899da07868f" }
