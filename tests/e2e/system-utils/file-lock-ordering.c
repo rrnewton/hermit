@@ -213,6 +213,12 @@ int main(void) {
         }
     }
 
+    /* Leave nothing behind: the harness may run this from a shared directory,
+     * and a guest that litters perturbs whatever runs next. */
+    unlink(lock_path);
+    unlink(xattr_path);
+    rmdir(dir);
+
     printf("checks-failed: %d\n", failures);
     return failures == 0 ? 0 : 1;
 }
