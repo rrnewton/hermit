@@ -275,11 +275,16 @@ fn capture(cfg: &Config, backend: &str, tmpdir: &Path) -> Result<Capture, String
         .filter(|l| is_record(l))
         .map(str::to_string)
         .collect();
-    let (source, records, other_bytes) = if !file_records.is_empty() {
-        ("log-file", file_records, stderr.len())
-    } else {
-        ("stderr", err_records, from_file.len())
-    };
+    // Pick the RICHER stream, not merely a non-empty one. sabre writes a
+    // handful of records to --log-file and the FULL trace to stderr (4 vs ~90
+    // on /bin/true), so "non-empty log-file wins" silently compares against a
+    // truncated stream and reports a depth that is an artifact of the pick.
+    let (source, records, other_bytes) =
+        if !file_records.is_empty() && file_records.len() >= err_records.len() {
+            ("log-file", file_records, stderr.len())
+        } else {
+            ("stderr", err_records, from_file.len())
+        };
 
     if let Some(dir) = &cfg.keep {
         // Same /tmp caveat as the scratch dir: a --keep under /tmp would be
