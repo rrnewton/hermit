@@ -21,19 +21,24 @@ DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/.." && pwd)"
 export HERMIT_REPO="${HERMIT_REPO:-$ROOT/hermit}"
 
-if [ ! -f "$HERMIT_REPO/Cargo.toml" ]; then
-  echo "hermit submodule is not populated at $HERMIT_REPO" >&2
-  echo "Run: git submodule update --init hermit" >&2
-  exit 1
-fi
+# PREFLIGHT: collect every missing prerequisite and report them together.
+# These checks used to exit on the FIRST miss, so a fresh machine discovered
+# them one re-run at a time and could not tell how far it was from a working
+# demo. Record-then-report replaces that with one complete list.
+# shellcheck source=lib/preflight.sh
+. "$DEMO_DIR/lib/preflight.sh"
 
-# Check the native dependencies before Cargo reaches unwind-sys's build script.
-# Keeping this in the Makefile gives fresh machines and every demo the same
-# package names and remediation path.
-if ! command -v make >/dev/null 2>&1; then
-  echo "ERROR: make is required to check the Hermit build dependencies." >&2
-  exit 1
-fi
+preflight_require_file "$HERMIT_REPO/Cargo.toml" \
+  "hermit submodule is not populated at $HERMIT_REPO -- run: git submodule update --init hermit"
+# Native dependencies are checked via the Makefile so fresh machines and every
+# demo get the same package names and remediation path.
+preflight_require_command make \
+  "make is required to check the Hermit build dependencies -- dnf install make"
+preflight_require_command cargo \
+  "cargo is required to build the hermit binary -- install the toolchain from rust-toolchain.toml"
+preflight_require_command cc \
+  "a C compiler is required by hermit's build scripts -- dnf install gcc"
+preflight_report "${DEMO_LABEL:-demo prerequisites}"
 # Build the release hermit binary (the portable run/verify wrappers below use
 # it: the debug build serializes many-threaded guests like python3 so slowly it
 # can OOM under load) plus the debug guest binaries whose source info the
