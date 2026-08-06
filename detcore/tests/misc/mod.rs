@@ -10,6 +10,7 @@
 
 mod notification_fds;
 mod process_tree_ordering;
+mod signal_inheritance;
 mod vfork;
 
 use nix::unistd;
