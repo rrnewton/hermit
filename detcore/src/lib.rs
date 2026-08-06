@@ -2322,7 +2322,29 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // event, before the guest parent can consume it with wait. Ptrace also
         // guarantees that the process leader exits after the other threads, so
         // the final published aggregate is complete when wait returns.
-        let detpid = thread_state.detpid.expect("Missing DetPid");
+        // FAIL-CLOSED, NOT PANIC (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
+        // is `Option` and starts as `None` ("Initialized later" at the clone site),
+        // so a thread that reaches the exit hook before its per-thread identity is
+        // populated used to `.expect()` here. That panic fires inside a Reverie
+        // teardown callback, while the backend still owns the exit event, which is
+        // the worst place to abort: it can wedge the supervisor rather than fail one
+        // thread. Fall back to the PROCESS-level `self.detpid` -- the same value
+        // `thread_start` passes to `thread_start_request` -- which is non-optional
+        // and deterministic (minted from the process identity, never host-derived),
+        // so the fallback cannot introduce nondeterminism. Warn so the window is
+        // observable instead of silently papered over.
+        let detpid = match thread_state.detpid {
+            Some(detpid) => detpid,
+            None => {
+                tracing::warn!(
+                    "[detcore, dtid {}] thread exited before its per-thread detpid was \
+                     initialized; falling back to the process detpid {}",
+                    dettid,
+                    self.detpid
+                );
+                self.detpid
+            }
+        };
         if dettid == detpid {
             thread_state.record_exited_child_process_cpu_time(detpid);
         } else {
