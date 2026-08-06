@@ -331,6 +331,17 @@ fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
     iter.collect()
 }
 
+/// Number of records the splitter finds in `contents`.
+///
+/// Exposed crate-internally so the `detlog` sink tests can assert against the
+/// REAL consumer rather than a copy of its regex — a copied regex would keep
+/// passing after the real one changed, which is exactly how a framing contract
+/// silently rots.
+#[cfg(test)]
+pub(crate) fn record_count_for_test(contents: &str) -> usize {
+    extract_log_messages(contents).len()
+}
+
 fn is_info(line: &str) -> bool {
     line.starts_with("INFO ")
 }
