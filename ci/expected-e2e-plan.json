@@ -699,6 +699,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
     }
   ],
   "schema": 1
