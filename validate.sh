@@ -869,12 +869,48 @@ function detect_cache_state {
 # Catches corruption from a kill we did not observe, which the per-crate build.rs
 # guard cannot: cargo re-runs a build script only on input change or prior failure,
 # so a neighbour that truncates an already-built object is otherwise linked as-is.
+#
+# WIDENED past 0-byte *.o on two axes, because the original covered only the
+# narrowest slice of one failure mode:
+#   * FILE TYPES. A kill mid-write truncates whatever the tool was writing. The
+#     archiver's *.a and the linker's *.so are produced by the same steps as *.o
+#     (DynamoRIO ships .a/.so; hermit-install stages .so), and a truncated
+#     archive links exactly as badly as a truncated object.
+#   * HEADER MAGIC. -size 0 misses a file killed AFTER open() but BEFORE its
+#     header was fully written -- nonzero, still garbage. An object that does not
+#     begin with its format's magic cannot be a valid object, whatever its size.
+# Both remain CONTENT FACTS, not heuristics: a healthy artifact always has a
+# well-formed header, so no valid artifact is deleted and the warm cache survives.
+#
+# HONEST LIMIT, so nobody reads this as a completeness guarantee: the magic check
+# only proves the FIRST BYTES arrived. A file truncated after a valid header is
+# still accepted here -- detecting that needs a full structural parse this
+# pre-flight deliberately does not attempt. This widens the net; it does not
+# close it.
+function object_header_is_valid {
+    local f=$1 magic
+    magic=$(od -An -tx1 -N8 -- "$f" 2>/dev/null | tr -d ' \n')
+    case "$f" in
+        # ar archives: "!<arch>\n"
+        *.a) [[ $magic == 213c617263683e0a* ]] ;;
+        # ELF relocatables and shared objects: 0x7f 'E' 'L' 'F'
+        *) [[ $magic == 7f454c46* ]] ;;
+    esac
+}
+
 function purge_zero_byte_objects {
     local root=$1 removed=0 f
     [[ -d $root ]] || { printf 0; return 0; }
     while IFS= read -r -d '' f; do
+        # A 0-byte artifact is corrupt by size alone; a nonzero one is corrupt
+        # only if its header magic is absent.
+        if [[ -s $f ]] && object_header_is_valid "$f"; then
+            continue
+        fi
         rm -f -- "$f" && removed=$((removed + 1))
-    done < <(find "$root" -type f -name '*.o' -size 0 -print0 2>/dev/null)
+    done < <(find "$root" -type f \
+        \( -name '*.o' -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
+        -print0 2>/dev/null)
     printf '%s' "$removed"
 }
 
