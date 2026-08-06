@@ -1248,8 +1248,18 @@ fn log_diff_summary_from_strs(
 
     let detcore_a = filter_detcore(&all_a);
     let detcore_b = filter_detcore(&all_b);
-    let infos_a = filter_infos(&all_a);
-    let infos_b = filter_infos(&all_b);
+    // GUEST INFO STREAM ONLY. `Info` is the `BitwiseInfoV1` observation
+    // envelope, documented as the guest INFO event stream -- so it must be
+    // filtered from `detcore_a`, the Detcore-emitted messages, NOT from
+    // `all_a`. Filtering from `all_a` also admits the tracer's own
+    // `reverie_ptrace::*` messages and the CLI's `hermit::*` messages, which
+    // are not guest events. Measured on a 194-INFO-line run: 2 such lines, one
+    // of which is `hermit::backend_stats: backend run complete backend=<NAME>`
+    // -- it embeds the BACKEND NAME, so a cross-backend comparison would
+    // diverge on it unconditionally, reporting a parity failure caused by the
+    // comparison harness rather than by guest behaviour.
+    let infos_a = filter_infos(&detcore_a);
+    let infos_b = filter_infos(&detcore_b);
     let detlogs_a = opts.filter_deterministic(&detcore_a);
     let detlogs_b = opts.filter_deterministic(&detcore_b);
     let left_syscalls = collect_syscalls(&all_a);
@@ -2525,6 +2535,56 @@ Apr 09 06:08:03.200  INFO detcore: [t] finish syscall: exit_group(0)";
         assert!(
             summary.matched_with_evidence(),
             "a real, nonempty, identical comparison must count as a match"
+        );
+        Ok(())
+    }
+
+    /// GUEST-ONLY INFO SCOPE, both directions.
+    ///
+    /// The `Info` scope is the `BitwiseInfoV1` observation envelope: the GUEST
+    /// event stream. A tracer message (`reverie_ptrace::*`) or a CLI message
+    /// (`hermit::*`) is not a guest event and must not enter the comparison.
+    ///
+    /// The negative direction is the one that matters: `hermit::backend_stats`
+    /// prints `backend=<NAME>`, so if it were compared, EVERY cross-backend run
+    /// would diverge on that line alone -- a parity failure manufactured by the
+    /// harness. The positive direction guards against the obvious overcorrection
+    /// of filtering so hard that nothing is left to compare.
+    #[test]
+    fn info_scope_is_guest_only_and_still_detects_guest_divergence() -> std::io::Result<()> {
+        let opts = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let guest = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall] finish syscall #1: write(1, 0x1000, 5) = Ok(5)";
+
+        // NEGATIVE (the fix): identical guest events, DIFFERENT tracer/CLI
+        // lines -- must compare EQUAL, because those are not guest events.
+        let a = format!(
+            "{guest}\n2022-09-06T14:15:47.100000Z  INFO hermit::backend_stats: backend run complete backend=ptrace"
+        );
+        let b = format!(
+            "{guest}\n2022-09-06T14:15:47.100000Z  INFO hermit::backend_stats: backend run complete backend=dbt"
+        );
+        assert!(
+            !super::log_diff_from_strs(&a, &b, &opts, &mut Vec::new())?,
+            "a differing backend-stats line is NOT a guest event and must not cause divergence"
+        );
+
+        // POSITIVE (non-vacuity): a real guest divergence must STILL be caught.
+        let c = a.replace("Ok(5)", "Ok(6)");
+        assert!(
+            super::log_diff_from_strs(&a, &c, &opts, &mut Vec::new())?,
+            "a differing guest syscall result MUST still diverge -- filtering must not make the check vacuous"
+        );
+
+        // ANTI-VACUITY: the comparison actually had guest messages to compare.
+        let summary = super::log_diff_summary_from_strs(&a, &a, &opts, &mut Vec::new())?;
+        assert!(
+            summary.matched_with_evidence(),
+            "the guest-only scope must still select a nonempty message set"
         );
         Ok(())
     }
