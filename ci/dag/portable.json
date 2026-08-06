@@ -46,6 +46,14 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "truncated_artifact_purge",
+      "desc": "Truncated-build-artifact purge drops corrupt .o/.a/.so, keeps healthy ones",
+      "cmd": "./scripts/purge-truncated-objects-test.sh",
+      "timeout": 60,
+      "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
