@@ -759,12 +759,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         }
         // COST TIER: cadence 1 == full (every control point); N > 1 == spot-check every Nth.
-        // The cadence index is the per-thread syscall count, NOT a shared counter: a global
-        // atomic would be incremented in whatever order threads happen to reach it, so the
-        // cadence -- and therefore which points got sampled -- would itself be nondeterministic.
-        // A determinism instrument must not have a nondeterministic sampling schedule.
+        // The cadence index is a PER-THREAD counter, NOT a shared one: a global atomic would be
+        // incremented in whatever order threads happen to reach it, so the cadence -- and
+        // therefore which points got sampled -- would itself be nondeterministic. A determinism
+        // instrument must not have a nondeterministic sampling schedule.
+        //
+        // It is `stats.syscall_count`, which starts at ZERO, rather than the syscall ORDINAL used
+        // in the log (which starts at 2). With the ordinal, a guest whose control points never
+        // land on a multiple of the cadence emitted NOTHING and the run still reported PASS -- a
+        // spot-tier green backed by zero samples. Indexing from zero makes the first control point
+        // of every thread always sampled, so a spot-tier run can never be silently empty.
         let cadence = self.cfg.detlog_regs_cadence.max(1);
-        if !seq.is_multiple_of(cadence) {
+        let index = {
+            let stats = &mut guest.thread_state_mut().stats;
+            let i = stats.regs_sample_index;
+            stats.regs_sample_index = i.saturating_add(1);
+            i
+        };
+        let _ = seq;
+        if !index.is_multiple_of(cadence) {
             return;
         }
         let tier = if cadence == 1 {
@@ -2364,7 +2377,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Same guest-logical-control point that already anchors the stack/heap hashes: the
         // syscall is complete and its result written back, so the guest logically has control.
         let control_point_regs = guest.regs().await;
-        self.detlog_registers(guest, &control_point_regs, new_count);
+        let regs_seq = guest.thread_state().stats.syscall_count;
+        self.detlog_registers(guest, &control_point_regs, regs_seq);
         self.detlog_memory_maps(guest)?;
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
