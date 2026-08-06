@@ -24,17 +24,34 @@
 #include <string.h>
 #include <sys/utsname.h>
 
+/*
+ * THE PINNED IDENTITY STRINGS ARE EMITTED, not just a match count. These four
+ * strings are the entire substance of this contract, and "uname ok=4" hid every
+ * one of them: a backend virtualizing the WRONG release and a backend
+ * virtualizing the wrong nodename both printed "uname ok=3" and compared EQUAL,
+ * and two backends pinning the SAME wrong value agree with each other, so
+ * cross-backend comparison could never see it. Only comparison against the
+ * expected string can, and that needs the string in the byte stream.
+ *
+ * Under Hermit these are the virtualized identity and are identical on every
+ * host, so emitting them keeps the output host-independent in the context this
+ * fixture is contracted for. Natively they are the real host identity and this
+ * fixture already fails by construction (native scores ok=2: sysname and machine
+ * happen to match, release and nodename do not).
+ */
 #define PINNED_SYSNAME "Linux"
 #define PINNED_MACHINE "x86_64"
 #define PINNED_RELEASE "5.2.0"
 #define PINNED_NODENAME "hermetic-container.local"
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 4 };
     int ok = 0;
     struct utsname u;
 
     memset(&u, 0, sizeof(u));
-    if (uname(&u) == 0) {
+    int uname_rc = uname(&u) == 0;
+    if (uname_rc) {
         if (strcmp(u.sysname, PINNED_SYSNAME) == 0) {
             ok += 1;
         }
@@ -49,6 +66,15 @@ int main(void) {
         }
     }
 
-    printf("uname ok=%d\n", ok);
-    return 0;
+    /* The four pinned strings ARE the contract, so they are emitted. Under
+     * Hermit they are the same virtualized identity on every host. */
+    printf(
+        "uname ok=%d uname_rc=%d sysname=%s machine=%s release=%s nodename=%s\n",
+        ok,
+        uname_rc,
+        u.sysname,
+        u.machine,
+        u.release,
+        u.nodename);
+    return ok == EXPECTED_CHECKS ? 0 : 1;
 }
