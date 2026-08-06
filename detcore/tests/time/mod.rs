@@ -8,6 +8,11 @@
 
 //! Tests time-related functionality of detcore.
 
+/// Contract fixture pinning the WHOLE clock family -- every clockid,
+/// `gettimeofday`, `time`, `times`, and the vDSO fast paths -- to one
+/// continuous virtual clock.
+mod clock_family;
+
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Arc;
