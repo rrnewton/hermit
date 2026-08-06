@@ -204,11 +204,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          # The verifier is NOT a standalone file. It resolves its registries
+          # relative to its own location ("$script_dir/../validate/*.json"), so
+          # provisioning it as a lone script in $RUNNER_TEMP makes those paths
+          # point at a directory that does not exist and the verifier exits 2 on
+          # EVERY call -- which this job's caller reads as "evidence invalid",
+          # so every legitimate receipt is silently converted into a refusal.
+          # Fail-closed, but indistinguishable from mass evidence loss.
+          # Therefore: fetch the verifier WITH its dependency closure, from the
+          # SAME immutable parent commit, into the SAME relative layout, and
+          # digest-check every file. Adding a registry to the verifier without
+          # adding it here re-arms that landmine; the bracket
+          # ci-hub/validation/test_verifier_dep_closure.sh derives the required
+          # set from the pinned verifier itself and fails when they diverge.
+          ref='ea2aab13a6bb8991430ccfa46671db4e2bcca149'
+          root="$RUNNER_TEMP/receipt-gate"
+          mkdir -p "$root/validation" "$root/validate"
+          fetch_pinned() {
+            # $1 = repo-relative path, $2 = expected sha256, $3 = destination
+            gh api "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$3"
+            echo "$2  $3" | sha256sum --check
+          }
+          verifier="$root/validation/verify-local-validation-receipt.sh"
+          fetch_pinned ci-hub/validation/verify_receipt.sh \
+            54b9c8f0a41ded7260987a5d1a820cc0282a8a09ebf68e64322cb329bfc8ac9d \
+            "$verifier"
+          fetch_pinned ci-hub/validate/qualifying-receipt.json \
+            1bad737321f9a1a1761fa0bb722145a20f8f9e7900d005b740c64a50c5e4b21b \
+            "$root/validate/qualifying-receipt.json"
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Remove local-validation label when its evidence is no longer valid
@@ -570,11 +594,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          # The verifier is NOT a standalone file. It resolves its registries
+          # relative to its own location ("$script_dir/../validate/*.json"), so
+          # provisioning it as a lone script in $RUNNER_TEMP makes those paths
+          # point at a directory that does not exist and the verifier exits 2 on
+          # EVERY call -- which this job's caller reads as "evidence invalid",
+          # so every legitimate receipt is silently converted into a refusal.
+          # Fail-closed, but indistinguishable from mass evidence loss.
+          # Therefore: fetch the verifier WITH its dependency closure, from the
+          # SAME immutable parent commit, into the SAME relative layout, and
+          # digest-check every file. Adding a registry to the verifier without
+          # adding it here re-arms that landmine; the bracket
+          # ci-hub/validation/test_verifier_dep_closure.sh derives the required
+          # set from the pinned verifier itself and fails when they diverge.
+          ref='ea2aab13a6bb8991430ccfa46671db4e2bcca149'
+          root="$RUNNER_TEMP/receipt-gate"
+          mkdir -p "$root/validation" "$root/validate"
+          fetch_pinned() {
+            # $1 = repo-relative path, $2 = expected sha256, $3 = destination
+            gh api "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$3"
+            echo "$2  $3" | sha256sum --check
+          }
+          verifier="$root/validation/verify-local-validation-receipt.sh"
+          fetch_pinned ci-hub/validation/verify_receipt.sh \
+            54b9c8f0a41ded7260987a5d1a820cc0282a8a09ebf68e64322cb329bfc8ac9d \
+            "$verifier"
+          fetch_pinned ci-hub/validate/qualifying-receipt.json \
+            1bad737321f9a1a1761fa0bb722145a20f8f9e7900d005b740c64a50c5e4b21b \
+            "$root/validate/qualifying-receipt.json"
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Fetch the trusted check-outcome authority
