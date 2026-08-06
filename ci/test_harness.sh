@@ -113,6 +113,49 @@ declare -A ID_BY_TEST=()
 declare -A METADATA_BY_ID=()
 declare -a TESTS=()
 
+# --- manifest `requires` ------------------------------------------------------
+# The manifests declare a host requirement per test (313 of them). Until now the
+# planner parsed the field into `let _requires` and threw it away, and this
+# harness never read it at all, so an absent host tool did not skip its cell --
+# it hard-failed `prepare`, and prepare gates the whole portable lane. Two
+# missing tools (lua5.4, ruby) therefore turned every full local validate on a
+# host lacking them into a guaranteed red that reads as a product failure.
+#
+# Honouring the field means an unmet requirement SKIPS its cell and is reported
+# in its own bucket. It must never be folded into pass (that would claim
+# coverage we do not have) nor into fail (the honest answer is "not applicable
+# on this host", not "the product is broken").
+#
+# Two token classes, and they are checked differently:
+#   PLATFORM  linux x86_64 userns ptrace kvm cpuid -- properties of the lane and
+#             machine, already how the lane itself is selected. Not PATH lookups,
+#             so a `command -v linux` would spuriously skip 313 tests.
+#   TOOL      everything else -- a program that must exist on PATH.
+# `cxx` is spelled differently from its binary, hence the alias.
+readonly -a REQUIREMENT_PLATFORM_TOKENS=(linux x86_64 userns ptrace kvm cpuid)
+
+function requirement_binary {
+    case "$1" in
+        cxx) printf 'c++' ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+# Print the space-separated requirements this host does NOT satisfy (empty when
+# all are met). Unknown tokens are treated as tools: an unrecognised requirement
+# skips loudly into its own bucket rather than being silently ignored.
+function unmet_requirements {
+    local metadata=$1 token unmet=()
+    while IFS= read -r token; do
+        [[ -n $token ]] || continue
+        if contains "$token" "${REQUIREMENT_PLATFORM_TOKENS[@]}"; then
+            continue
+        fi
+        command -v "$(requirement_binary "$token")" >/dev/null 2>&1 || unmet+=("$token")
+    done < <(jq -r '.requires[]?' <<<"$metadata")
+    printf '%s' "${unmet[*]:-}"
+}
+
 function metadata_json {
     local test=$1
     local id=${ID_BY_TEST[$test]:-}
@@ -1692,7 +1735,15 @@ function run_cell {
     start_ms=$(date +%s%3N)
 
     local outcome=PASS reason='' path_evidence=null
-    if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
+    local unmet
+    unmet=$(unmet_requirements "$metadata")
+    if [[ -n $unmet ]]; then
+        # SKIP_UNAVAILABLE is deliberately its OWN outcome. Folding it into PASS
+        # would claim coverage this host never produced; folding it into FAIL
+        # would blame the product for a missing host tool.
+        outcome=SKIP_UNAVAILABLE
+        reason="host requirement unmet: $unmet"
+    elif ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
     elif [[ $mode == naked ]]; then
@@ -1800,22 +1851,26 @@ function run_cell {
     append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
-    [[ $outcome == PASS ]]
+    # A skipped cell is NOT a failed cell. Returning nonzero here would put the
+    # env gap straight back into the lane's exit status, which is the bug.
+    [[ $outcome == PASS || $outcome == SKIP_UNAVAILABLE ]]
 }
 
 function write_junit {
-    local tests failures errors
+    local tests failures errors skipped
     tests=$(wc -l <"$RESULTS")
     failures=$(jq -s '[.[] | select(.outcome == "FAIL")] | length' "$RESULTS")
+    skipped=$(jq -s '[.[] | select(.outcome == "SKIP_UNAVAILABLE")] | length' "$RESULTS")
     errors=$(jq -s '[.[] | select(.outcome == "ERROR")] | length' "$RESULTS")
     mkdir -p "$(dirname "$JUNIT")"
     {
         printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-        printf '<testsuite name="hermit-e2e" tests="%s" failures="%s" errors="%s">\n' "$tests" "$failures" "$errors"
+        printf '<testsuite name="hermit-e2e" tests="%s" failures="%s" errors="%s" skipped="%s">\n' "$tests" "$failures" "$errors" "$skipped"
         jq -r '
             def esc: @html;
             "  <testcase classname=\"" + (.category|esc) + "\" name=\"" + ((.test + "/" + .mode + "/" + (.backend // "none"))|esc) + "\" time=\"" + ((.duration_ms / 1000)|tostring) + "\">" +
             (if .outcome == "FAIL" then ("<failure>" + ((.reason // "failed")|esc) + "</failure>")
+             elif .outcome == "SKIP_UNAVAILABLE" then ("<skipped message=\"" + ((.reason // "host requirement unmet")|esc) + "\"/>")
              elif .outcome == "ERROR" then ("<error>" + ((.reason // "error")|esc) + "</error>")
              else "" end) + "</testcase>"
         ' "$RESULTS"
@@ -1825,6 +1880,7 @@ function write_junit {
 
 function build_required {
     local planned test_id test build_dir metadata timeout_seconds kind failures=0 selected=0
+    local unmet skipped=0
     planned=$(emit_required_plan)
     while IFS= read -r test_id; do
         [[ -n $test_id ]] || continue
@@ -1836,6 +1892,15 @@ function build_required {
         metadata=$(metadata_json "$test")
         timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
         kind=$(jq -r .program_kind <<<"$metadata")
+        unmet=$(unmet_requirements "$metadata")
+        if [[ -n $unmet ]]; then
+            # Not a failure: this host cannot run the cell at all. Skipping keeps
+            # the lane honest instead of reporting an env gap as a product red.
+            printf 'SKIP  %-11s %s (host requirement unmet: %s)\n' \
+                "$kind" "$test_id" "$unmet"
+            skipped=$((skipped + 1))
+            continue
+        fi
         if prepare_test "$test" "$build_dir" "$timeout_seconds"; then
             printf 'BUILT %-11s %s\n' "$kind" "$test_id"
         else
@@ -1845,6 +1910,7 @@ function build_required {
 
     ((selected > 0)) || ((ALLOW_EMPTY == 1)) || die "filters selected no required test cells"
     echo "Build root: $BUILD_ROOT"
+    ((skipped == 0)) || printf 'Skipped %d cell(s) whose host requirements are unmet.\n' "$skipped"
     ((failures == 0))
 }
 
