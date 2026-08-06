@@ -9,13 +9,11 @@
 
 Background
 ----------
-The legacy ``tests/backend-parity/matrix.tsv`` side-matrix (driven by the
-standalone ``run_matrix.py`` harness) records parity per backend for freestanding
-C guests, but only ptrace/DBI/KVM ever run it -- it is invisible to the
-mode x backend x test symmetry enforced over ``tests/e2e/manifests/*.toml`` by
-``ci/manifest-plan`` (PR #1518). #1498 removes ``matrix.tsv`` entirely and folds
-its catalog back into ``run_matrix.py``. Dozens of open PRs still add a
-``matrix.tsv`` row + a fixture + a ``run_matrix.py`` edit; none can land as-is.
+The retired ``tests/backend-parity/matrix.tsv`` side-matrix recorded parity per
+backend for freestanding C guests, but only ptrace/DBI/KVM ran it -- it was
+invisible to the mode x backend x test symmetry enforced over the schema-v2
+manifests by ``ci/manifest-plan``. Dozens of open legacy PRs still add a matrix
+row + a fixture + a ``run_matrix.py`` edit; none can land as-is.
 
 This tool mechanizes the coverage migration for those PRs. For each source PR it:
 
@@ -23,18 +21,16 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
      schema) and the added fixture ``.c`` file(s);
   2. writes the fixture into the working tree (so the manifest ``program`` path
      exists for the lint) if it is not already present;
-  3. appends a symmetric ``[[test]]`` block to
-     ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
+  3. writes a symmetric per-test manifest shard below
+     ``tests/e2e/manifests/backend-parity-c/`` -- ptrace established first,
      every backend x mode cell declared, DBI/KVM enabled only where the source
      row's ``--verify`` (L2) witness actually passed, everything else disabled
      with a concrete reason carried over from the matrix row;
-  4. reclassifies the fixture in
-     ``tests/e2e/manifests/inventory/test-files.json`` from the private
-     ``guest-fixture`` disposition to ``manifest-test`` so it leaves the
-     backend-private tripwire that ``ci/manifest-plan`` ratchets.
+  4. relies on the inventory audit to derive the fixture's manifest membership
+     directly from the resulting TOML shard.
 
-It deliberately does NOT touch ``matrix.tsv`` or ``run_matrix.py`` -- those are
-retired by #1498; the source PR's edits to them are simply dropped.
+It deliberately does NOT recreate ``matrix.tsv`` or touch ``run_matrix.py``;
+the source PR's edits to those retired surfaces are simply dropped.
 
 The result passes the #1518 symmetry lint: the new test has a ptrace front-door
 and never enables a backend without ptrace (so it stays out of
@@ -58,24 +54,25 @@ Usage
         --row $'getpriority_identity\tpass\tpass\tpass\t-\t-\tdetlog\tdetlog\tguest\t-\t-' \
         --fixture tests/c/getpriority_identity.c
 
-Idempotent: re-running is a no-op once a test id is present in the manifest and
-its fixture is classified ``manifest-test``.
+Idempotent: re-running is a no-op once a test id is present in any manifest.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
-import json
+import io
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.toml"
-INVENTORY = REPO_ROOT / "tests/e2e/manifests/inventory/test-files.json"
+MANIFEST_ROOT = REPO_ROOT / "tests/e2e/manifests"
+MANIFEST_DIR = MANIFEST_ROOT / "backend-parity-c"
 BUCKET = "backend-parity-c"
 REPO = "rrnewton/hermit"
 
@@ -287,40 +284,17 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def manifest_has_id(manifest_text: str, plan: Plan) -> bool:
-    return f'id = "{BUCKET}/{plan.slug}"' in manifest_text
+def manifest_has_id(plan: Plan, manifest_root: Path = MANIFEST_ROOT) -> bool:
+    needle = f'id = "{BUCKET}/{plan.slug}"'
+    return any(needle in path.read_text() for path in manifest_root.rglob("*.toml"))
 
 
-def inventory_entry(program: str) -> dict:
-    return {
-        "path": program,
-        "disposition": "manifest-test",
-        "runner": (
-            "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml "
-            "(explicit mode selection; ci=false)"
-        ),
-        "why": (
-            f"{program} is owned by ci/test_harness.sh via "
-            "tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; "
-            "ci=false): Direct C guest is centrally discoverable with ptrace "
-            "verification enabled for explicit runs; it remains outside blocking "
-            "CI until its standalone build and output contract are calibrated"
-        ),
-    }
+def manifest_path(plan: Plan, manifest_root: Path = MANIFEST_ROOT) -> Path:
+    return manifest_root / BUCKET / f"{plan.slug}.toml"
 
 
-def apply_inventory(inv: dict, program: str) -> bool:
-    """Return True if the inventory changed (add or reclassify)."""
-    for entry in inv["files"]:
-        if entry.get("path") == program:
-            if entry.get("disposition") == "manifest-test":
-                return False
-            entry.update(inventory_entry(program))
-            return True
-    # Append only -- the on-disk inventory is not globally sorted, so reordering
-    # would produce spurious churn. The lint does not depend on entry order.
-    inv["files"].append(inventory_entry(program))
-    return True
+def render_manifest(plan: Plan) -> str:
+    return f'schema = 2\nbucket = "{BUCKET}"\n\n{render_test_block(plan).lstrip()}'
 
 
 # --------------------------------------------------------------------------- #
@@ -437,26 +411,27 @@ def plans_from_local(row_str: str, fixture: str) -> tuple:
 # --------------------------------------------------------------------------- #
 # Emit
 # --------------------------------------------------------------------------- #
-def run(plans: list, apply: bool) -> int:
-    manifest_text = MANIFEST.read_text()
-    inv = json.loads(INVENTORY.read_text())
-    new_manifest = manifest_text
+def run(
+    plans: list,
+    apply: bool,
+    repo_root: Path = REPO_ROOT,
+    manifest_root: Path = MANIFEST_ROOT,
+) -> int:
     changed_fixtures = []
     converted, skipped_existing = [], []
+    candidate_slugs = set()
 
     for plan in plans:
-        if manifest_has_id(new_manifest, plan):
+        if manifest_has_id(plan, manifest_root):
             skipped_existing.append(plan.slug)
             continue
-        new_manifest = new_manifest.rstrip("\n") + "\n" + render_test_block(plan)
+        if plan.slug in candidate_slugs:
+            raise ConvertError(f"duplicate candidate test id: {BUCKET}/{plan.slug}")
+        candidate_slugs.add(plan.slug)
+        target = manifest_path(plan, manifest_root)
+        if target.exists():
+            raise ConvertError(f"refusing to overwrite existing manifest shard: {target}")
         converted.append(plan)
-
-    inv_after = json.loads(json.dumps(inv))
-    inv_changed = False
-    for plan in plans:
-        if apply_inventory(inv_after, plan.program):
-            inv_changed = True
-    new_inv_text = json.dumps(inv_after, indent=2) + "\n"
 
     # Report
     print(f"== retarget: {len(plans)} candidate(s) ==")
@@ -470,31 +445,36 @@ def run(plans: list, apply: bool) -> int:
 
     if not apply:
         print("\n--- DRY RUN (no files written) ---")
-        _print_diff(MANIFEST, manifest_text, new_manifest)
-        if inv_changed:
-            _print_diff(INVENTORY, INVENTORY.read_text(), new_inv_text)
         for plan in converted:
-            if plan.fixture_content is not None and not (REPO_ROOT / plan.program).exists():
+            _print_diff(
+                manifest_path(plan, manifest_root),
+                "",
+                render_manifest(plan),
+                repo_root,
+            )
+        for plan in converted:
+            if plan.fixture_content is not None and not (repo_root / plan.program).exists():
                 print(f"\n+++ NEW FIXTURE {plan.program} ({len(plan.fixture_content)} bytes)")
         return 0
 
-    if converted:
-        MANIFEST.write_text(new_manifest)
-    if inv_changed:
-        INVENTORY.write_text(new_inv_text)
+    (manifest_root / BUCKET).mkdir(parents=True, exist_ok=True)
     for plan in converted:
-        dest = REPO_ROOT / plan.program
+        manifest_path(plan, manifest_root).write_text(render_manifest(plan))
+    for plan in converted:
+        dest = repo_root / plan.program
         if plan.fixture_content is not None and not dest.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(plan.fixture_content)
             changed_fixtures.append(plan.program)
-    print(f"\nAPPLIED: {len(converted)} test(s), inventory_changed={inv_changed}, "
-          f"fixtures_written={len(changed_fixtures)}")
+    print(
+        f"\nAPPLIED: {len(converted)} test(s), "
+        f"fixtures_written={len(changed_fixtures)}"
+    )
     return 0
 
 
-def _print_diff(path: Path, before: str, after: str) -> None:
-    rel = path.relative_to(REPO_ROOT)
+def _print_diff(path: Path, before: str, after: str, repo_root: Path = REPO_ROOT) -> None:
+    rel = path.relative_to(repo_root)
     diff = difflib.unified_diff(
         before.splitlines(keepends=True),
         after.splitlines(keepends=True),
@@ -505,13 +485,90 @@ def _print_diff(path: Path, before: str, after: str) -> None:
     print()
 
 
+def _self_test_git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
+
+
+def self_test() -> int:
+    with tempfile.TemporaryDirectory(prefix="retarget-manifest-shards-") as tmp:
+        repo = Path(tmp)
+        manifest_root = repo / "tests/e2e/manifests"
+        fixtures = repo / "tests/c"
+        manifest_root.mkdir(parents=True)
+        fixtures.mkdir(parents=True)
+        (fixtures / "probe_a.c").write_text("int main(void) { return 0; }\n")
+        (fixtures / "probe_b.c").write_text("int main(void) { return 0; }\n")
+
+        _self_test_git(repo, "init", "-q", "-b", "main")
+        _self_test_git(repo, "config", "user.name", "Retarget Test")
+        _self_test_git(repo, "config", "user.email", "retarget@example.com")
+        _self_test_git(repo, "add", "tests/c/probe_a.c", "tests/c/probe_b.c")
+        _self_test_git(repo, "commit", "-q", "-m", "base")
+
+        plan_a = build_plan(
+            parse_matrix_row("probe_a\tpass\tgap\tgap\tnot qualified\tnot qualified"),
+            "tests/c/probe_a.c",
+            None,
+        )
+        plan_b = build_plan(
+            parse_matrix_row("probe_b\tpass\tgap\tgap\tnot qualified\tnot qualified"),
+            "tests/c/probe_b.c",
+            None,
+        )
+
+        dry_run = io.StringIO()
+        with contextlib.redirect_stdout(dry_run):
+            run([plan_a], False, repo, manifest_root)
+        assert "backend-parity-c/probe-a.toml" in dry_run.getvalue()
+        assert not manifest_path(plan_a, manifest_root).exists()
+
+        _self_test_git(repo, "switch", "-q", "-c", "shard-a")
+        with contextlib.redirect_stdout(io.StringIO()):
+            run([plan_a], True, repo, manifest_root)
+        _self_test_git(repo, "add", "tests/e2e/manifests/backend-parity-c/probe-a.toml")
+        _self_test_git(repo, "commit", "-q", "-m", "add shard a")
+        with contextlib.redirect_stdout(io.StringIO()):
+            run([plan_a], True, repo, manifest_root)
+        assert _self_test_git(repo, "status", "--porcelain") == ""
+
+        _self_test_git(repo, "switch", "-q", "main")
+        _self_test_git(repo, "switch", "-q", "-c", "shard-b")
+        with contextlib.redirect_stdout(io.StringIO()):
+            run([plan_b], True, repo, manifest_root)
+        _self_test_git(repo, "add", "tests/e2e/manifests/backend-parity-c/probe-b.toml")
+        _self_test_git(repo, "commit", "-q", "-m", "add shard b")
+        _self_test_git(repo, "merge", "-q", "--no-edit", "shard-a")
+
+        assert manifest_path(plan_a, manifest_root).is_file()
+        assert manifest_path(plan_b, manifest_root).is_file()
+        assert _self_test_git(repo, "status", "--porcelain") == ""
+
+    print("PASS: retarget dry-run/apply/idempotence and independent shard merge")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pr", type=int, nargs="+", help="source PR number(s)")
     parser.add_argument("--row", help="explicit matrix.tsv data row (local mode)")
     parser.add_argument("--fixture", help="fixture path for --row (local mode)")
     parser.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    parser.add_argument(
+        "--self-test", action="store_true", help="run local shard emission tests"
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        if args.pr or args.row or args.fixture or args.apply:
+            parser.error("--self-test does not accept conversion arguments")
+        return self_test()
 
     plans, skips = [], []
     if args.pr:

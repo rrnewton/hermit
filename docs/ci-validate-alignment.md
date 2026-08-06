@@ -102,7 +102,9 @@ When adding or changing an E2E test:
 3. Add only locally proven backend combinations to an allowlist.
 4. Run `ci/test_harness.sh validate` and inspect `plan --format json`.
 5. Run the affected mode/backend cells and retain their JSONL/JUnit results.
-6. Update `tests/e2e/manifests/inventory/test-files.json` with its disposition and runner.
+6. For a non-manifest file, update
+   `tests/e2e/manifests/inventory/explicit-test-files.json` with its disposition
+   and runner. Manifest documents and program paths are derived directly.
 7. Update the owning DAG only when a category or capability dependency changes.
 8. Never replace a semantic workload with `--help`, `--version`, or a no-op
    launcher probe.
