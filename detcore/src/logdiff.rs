@@ -1596,6 +1596,74 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         assert_eq!(v.len(), 5);
     }
 
+    /// CROSS-BACKEND RECORD-FRAMING CONTRACT.
+    ///
+    /// `extract_log_messages` is the only thing that turns a log stream into
+    /// comparable records, and it does so by splitting on a leading RFC3339
+    /// stamp. That makes the stamp a load-bearing SEPARATOR, not decoration: a
+    /// backend that omits it does not merely look different, it produces ONE
+    /// record for an entire run, so any cross-backend diff compares 1 message
+    /// against thousands and can never say anything.
+    ///
+    /// This is exactly what the DBI backend did. `detcore-dbi` hand-rolls its own
+    /// `tracing::Subscriber` (it runs as a DynamoRIO client inside the guest and
+    /// never sees the CLI's `tracing_subscriber::fmt()`), and it emitted
+    /// `"{level} {target}: {fields}"` with no stamp. These tests pin the consumer
+    /// side of the contract so the producer cannot silently regress; the producer
+    /// side is pinned in `detcore-dbi/src/lib.rs::record_framing`.
+    #[test]
+    fn unstamped_records_collapse_into_one_message() {
+        // The pre-fix DBI shape. It satisfies the level-tag check -- so it does
+        // NOT panic, it silently degrades, which is why this went unnoticed.
+        let dbi_before = "INFO detcore: DETLOG first\n                          INFO detcore: DETLOG second\n                          INFO detcore: DETLOG third\n";
+        let v = super::extract_log_messages(dbi_before);
+        assert_eq!(
+            v.len(),
+            1,
+            "an unstamped stream must be shown collapsing; if this ever splits, \
+             the separator contract changed and the DBI framing fix may be moot"
+        );
+    }
+
+    #[test]
+    fn canonically_framed_records_split_one_per_record() {
+        // The post-fix DBI shape, byte-for-byte what
+        // `detcore-dbi::format_record` emits: RFC3339 stamp, space, level right
+        // aligned in five columns, space, target, ": ", fields.
+        let dbi_after = "1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG first\n                         1970-01-01T00:00:00.000001Z  INFO detcore: DETLOG second\n                         1970-01-01T00:00:00.000002Z  INFO detcore: DETLOG third\n";
+        let v = super::extract_log_messages(dbi_after);
+        assert_eq!(v.len(), 3, "{v:?}");
+        assert_eq!(v[0].1, "INFO detcore: DETLOG first");
+        assert_eq!(v[2].1, "INFO detcore: DETLOG third");
+    }
+
+    #[test]
+    fn dbi_and_ptrace_framing_yield_identical_records() {
+        // The property that actually matters: the SAME logical record, emitted by
+        // the two backends' different subscribers, must reduce to identical text
+        // once the stamp is stripped. Otherwise every record differs on framing
+        // and a parity diff reports formatting, not behaviour.
+        let ptrace = "2026-08-06T12:04:57.836579Z  INFO detcore::tool_local: DETLOG [dtid 3] x\n";
+        let dbi = "1970-01-01T00:00:00.000000Z  INFO detcore::tool_local: DETLOG [dtid 3] x\n";
+        assert_eq!(
+            super::extract_log_messages(ptrace),
+            super::extract_log_messages(dbi)
+        );
+    }
+
+    #[test]
+    fn five_column_level_alignment_is_part_of_the_contract() {
+        // ERROR/DEBUG/TRACE are five characters and unpadded; INFO/WARN are
+        // padded. A producer that padded uniformly would shift the record text by
+        // one byte and every comparison would diff on whitespace.
+        let stream = "1970-01-01T00:00:00.000000Z ERROR t: a\n                      1970-01-01T00:00:00.000001Z  WARN t: b\n                      1970-01-01T00:00:00.000002Z  INFO t: c\n                      1970-01-01T00:00:00.000003Z DEBUG t: d\n                      1970-01-01T00:00:00.000004Z TRACE t: e\n";
+        let v = super::extract_log_messages(stream);
+        assert_eq!(v.len(), 5, "{v:?}");
+        assert_eq!(v[0].1, "ERROR t: a");
+        assert_eq!(v[1].1, "WARN t: b");
+        assert_eq!(v[4].1, "TRACE t: e");
+    }
+
     #[test]
     fn test_canonicalize_addresses_in_line() {
         use std::collections::HashMap;
