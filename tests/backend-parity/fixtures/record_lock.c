@@ -58,7 +58,9 @@ int main(void) {
     query.l_whence = SEEK_SET;
     query.l_start = 200;
     query.l_len = 50;
-    if (fcntl(fd, F_GETLK, &query) == 0 && query.l_type == F_UNLCK) {
+    int getlk_rc = fcntl(fd, F_GETLK, &query);
+    short getlk_type = query.l_type;
+    if (getlk_rc == 0 && getlk_type == F_UNLCK) {
         ok++;
     }
 
@@ -97,6 +99,11 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("reclock ok=%d\n", ok);
+    /* Emit the OBSERVED VALUES. F_UNLCK is a host-independent constant, so the
+      * queried lock type is safe to print and is the quantity that actually matters
+      * -- `ok=%d` alone cannot distinguish "reported F_UNLCK" from "reported
+      * F_RDLCK but some other check compensated". */
+    printf("reclock ok=%d getlk_type=%d unlck=%d\n",
+           ok, (int)getlk_type, (int)F_UNLCK);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
