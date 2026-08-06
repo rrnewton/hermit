@@ -596,15 +596,35 @@ pub enum Backend {
     /// Use Reverie's ptrace backend.
     #[default]
     Ptrace,
-    /// Use the DynamoRIO backend.
+    // Third-party backends are OFF by default (see hermit-cli/Cargo.toml), so a
+    // default build lists them here while refusing to run them. Marking the help
+    // text is the honest minimum: the variant still PARSES, so `--backend dbi`
+    // keeps reaching its specific "support was not included in this build" error
+    // instead of degrading to clap's generic "invalid value".
+    #[cfg_attr(feature = "dbi", doc = "Use the DynamoRIO backend.")]
+    #[cfg_attr(
+        not(feature = "dbi"),
+        doc = "Use the DynamoRIO backend (NOT BUILT IN THIS BINARY: rebuild with --features third-party-backends)."
+    )]
     Dbi,
     /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
-    /// Use the SaBRe static binary rewriting backend.
+    #[cfg_attr(feature = "sabre", doc = "Use the SaBRe static binary rewriting backend.")]
+    #[cfg_attr(
+        not(feature = "sabre"),
+        doc = "Use the SaBRe static binary rewriting backend (NOT BUILT IN THIS BINARY: rebuild with --features third-party-backends)."
+    )]
     Sabre,
     /// Use the KVM backend.
     Kvm,
-    /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
+    #[cfg_attr(
+        feature = "e9patch",
+        doc = "Preprocess the main ELF with e9patch, then use the ptrace runtime."
+    )]
+    #[cfg_attr(
+        not(feature = "e9patch"),
+        doc = "Preprocess the main ELF with e9patch, then use the ptrace runtime (NOT BUILT IN THIS BINARY: rebuild with --features third-party-backends)."
+    )]
     // TODO-HUMAN-REVIEW(PR-594): Review the CLI-only hybrid backend selection.
     E9patch,
 }
