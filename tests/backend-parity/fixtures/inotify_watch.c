@@ -11,46 +11,44 @@
  *
  * ptrace and DBT complete all four steps. KVM's ElfExecutor personality does
  * not implement the inotify family, so it is a documented gap.
+ *
+ * EACH LIFECYCLE STEP IS REPORTED SEPARATELY and the fixture fails closed.
+ * "ino ok=4" summed four steps into one scalar, which is especially lossy for a
+ * documented-gap row: a backend missing inotify entirely and a backend that
+ * merely failed to remove the watch produced different totals, but any two
+ * backends losing the SAME COUNT of different steps compared EQUAL, and
+ * main() returned 0 unconditionally so exit status distinguished nothing. Naming
+ * the steps makes a partial implementation legible as a partial implementation.
+ *
+ * The watch descriptor number is not printed: it is kernel-allocated state the
+ * guest inherits rather than a value it chooses, so it is withheld under the
+ * same rule that withholds raw file descriptors elsewhere in this family.
  */
 
 #include <stdio.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
-/* Number of behavioural checks this fixture must complete; a lower count is a
-   failure, not a smaller success. */
-#define EXPECTED_CHECKS 4
-
 int main(void) {
-    int ok = 0;
+    enum { EXPECTED_CHECKS = 4 };
 
     int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd >= 0) {
-        ok++;
-    }
+    int init_ok = fd >= 0;
 
     int wd = inotify_add_watch(fd, "/tmp", IN_CREATE | IN_DELETE);
-    if (wd >= 0) {
-        ok++;
-    }
+    int watch_added = wd >= 0;
 
-    if (inotify_rm_watch(fd, wd) == 0) {
-        ok++;
-    }
+    int watch_removed = inotify_rm_watch(fd, wd) == 0;
 
-    if (fd >= 0 && close(fd) == 0) {
-        ok++;
-    }
+    int closed = fd >= 0 && close(fd) == 0;
 
-    printf("ino ok=%d\n", ok);
-    /* Route a behavioural failure into the exit status. Without this the guest
-       exits 0 whatever `ok` reached, so a regression only lowered the printed
-       number -- and under --verify both runs lower it identically, so the
-       comparison still matches and the cell stays green. Every check above is
-       unchanged; this only requires all of them. */
-    if (ok != EXPECTED_CHECKS) {
-        fprintf(stderr, "ino completed %d of %d checks\n", ok, EXPECTED_CHECKS);
-        return 1;
-    }
-    return 0;
+    int ok = init_ok + watch_added + watch_removed + closed;
+    printf(
+        "ino ok=%d init_ok=%d watch_added=%d watch_removed=%d closed=%d\n",
+        ok,
+        init_ok,
+        watch_added,
+        watch_removed,
+        closed);
+    return ok == EXPECTED_CHECKS ? 0 : 1;
 }
