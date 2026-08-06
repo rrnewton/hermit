@@ -72,6 +72,7 @@ static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
 pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_cpuid: false,
     determinize_rdrand: false,
+    no_panic_on_unsupported_syscalls: false,
     cpuid_virtualized_by_backend: false,
     backend_supports_madvise: true,
     discover_live_file_metadata: false,
@@ -147,6 +148,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// Standardized test config: common options on.
 /// (This is drawn from the middle of the lattice of possible Configs.)
 pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
+    no_panic_on_unsupported_syscalls: false,
     virtualize_cpuid: true,
     determinize_rdrand: true,
     cpuid_virtualized_by_backend: false,
@@ -224,6 +226,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
 /// Standardized test config: all options on.
 /// (This is the top element of a lattice containing exponentially many possibly Configs.)
 pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
+    no_panic_on_unsupported_syscalls: false,
     virtualize_cpuid: true,
     determinize_rdrand: true,
     cpuid_virtualized_by_backend: false,
