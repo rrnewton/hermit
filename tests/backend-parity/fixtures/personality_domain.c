@@ -63,13 +63,19 @@ int main(void) {
     }
 
     rc = personality(0xffffffffUL);
-    if (rc != -1 && (unsigned int)rc == start) {
+    bool final_eq_start = rc != -1 && (unsigned int)rc == start;
+    if (final_eq_start) {
         ok++;
     }
 
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* stable wrong stdout must be rejected by the normal exit oracle */
 #endif
-    printf("pers ok=%d\n", ok);
+    /* Emit the OBSERVED VALUES. The raw personality word is INHERITED and therefore
+      * host-dependent, so printing it would make the byte stream host-fragile. The
+      * host-independent quantity is the DELTA the guest itself introduced -- it must
+      * be exactly UNAME26 -- plus whether the final state returned to the start. */
+    printf("pers ok=%d delta=0x%x uname26=0x%x restored=%d\n",
+           ok, start ^ target, (unsigned int)UNAME26, final_eq_start ? 1 : 0);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

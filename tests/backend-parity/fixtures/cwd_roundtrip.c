@@ -35,20 +35,24 @@ int main(void) {
         ok++;
     }
     char moved[4096];
-    if (getcwd(moved, sizeof(moved)) != NULL && strcmp(moved, start) != 0) {
+    int moved_differs = (getcwd(moved, sizeof(moved)) != NULL && strcmp(moved, start) != 0);
+    if (moved_differs) {
         ok++;
     }
     if (startfd >= 0 && fchdir(startfd) == 0) {
         ok++;
     }
     char back1[4096];
-    if (getcwd(back1, sizeof(back1)) != NULL && strcmp(back1, start) == 0) {
+    int back1_eq = (getcwd(back1, sizeof(back1)) != NULL && strcmp(back1, start) == 0);
+    if (back1_eq) {
         ok++;
     }
     /* leave via a second chdir to confirm absolute-path chdir round-trips too */
+    int abs_roundtrip = 0;
     if (dir != NULL && chdir(dir) == 0 && chdir(start) == 0) {
         char back2[4096];
-        if (getcwd(back2, sizeof(back2)) != NULL && strcmp(back2, start) == 0) {
+        abs_roundtrip = (getcwd(back2, sizeof(back2)) != NULL && strcmp(back2, start) == 0);
+        if (abs_roundtrip) {
             ok++;
         }
     }
@@ -61,6 +65,11 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("cwd ok=%d\n", ok);
+    /* De-ALIAS the sum. A cwd path is inherently host-dependent, so unlike the other
+      * fixtures there is no host-independent VALUE to print here -- but `ok=%d` is a
+      * SUM, and two backends that fail DIFFERENT checks produce the SAME total and
+      * compare equal. Naming each outcome removes that aliasing. */
+    printf("cwd ok=%d moved_differs=%d back1_eq=%d abs_roundtrip=%d\n",
+           ok, moved_differs, back1_eq, abs_roundtrip);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
