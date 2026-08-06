@@ -1054,3 +1054,62 @@ dbi = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "system-utils/vdso-getrandom"
+description = "Entropy reached through the vDSO specifically, where no syscall crosses the boundary"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/system-utils/vdso-getrandom.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Natively this varies by design; the case asserts determinization, not native behaviour"
+
+# BACKEND-TARGETED. The point of this case is that it must NOT run only under the
+# reference backend: __vdso_getrandom is determinized only TRANSITIVELY, via the
+# getrandom(2) that seeds its userspace CSPRNG, so it is exactly a backend that
+# misses that syscall which breaks it. Running this under ptrace alone would pass
+# forever and prove nothing about the backend where the bug lives.
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace", "dbi"]
+[test.modes.verify.backends_disabled]
+sabre = "KNOWN GAP, NOT COVERAGE -- measured failing, 3 runs gave 3 distinct values (2f7ffb12.., fb02b7f6.., bf24f060..) while every syscall-based source stayed identical, because SaBRe does not intercept the seeding getrandom(2). Enable this the moment the SaBRe vDSO fix lands; the expected result is a single repeated value."
+kvm = "KNOWN GAP -- not measured here: the KVM backend livelocks at guest startup on this host, so no verdict was obtained. Not to be read as passing."
+liteinst = "KNOWN GAP -- not measured; LiteInst coverage is owned by its backend compatibility partition"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "This case asserts strict-verification determinism, not the record/replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The vDSO guest is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
