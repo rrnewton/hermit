@@ -28,37 +28,44 @@
  * count so the golden output is backend-independent.
  */
 
+/*
+ * THE OBSERVED errno IS EMITTED PER ENTRY POINT. Three separate refusals summed
+ * into "sysvipc ok=3", so a backend that admitted semget and one that admitted
+ * msgget were indistinguishable, and the errno -- the actual content of the
+ * contract -- went only to stderr, which the cell observation excludes.
+ *
+ * Note the fail-fast structure also meant a leaked semget masked whether shmget
+ * and msgget were refused at all: the fixture returned before probing them. All
+ * three are now probed unconditionally, so one leak no longer hides two.
+ */
 int main(void) {
   enum { EXPECTED_CHECKS = 3 };
-  int ok = 0;
 
   errno = 0;
   int sem = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
-  if (sem == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(stderr, "semget rc=%d errno=%d (want -1/ENOSYS)\n", sem, errno);
-    return 1;
-  }
+  int sem_errno = errno;
+  int sem_refused = sem == -1 && sem_errno == ENOSYS;
 
   errno = 0;
   int shm = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
-  if (shm == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(stderr, "shmget rc=%d errno=%d (want -1/ENOSYS)\n", shm, errno);
-    return 1;
-  }
+  int shm_errno = errno;
+  int shm_refused = shm == -1 && shm_errno == ENOSYS;
 
   errno = 0;
   int msg = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
-  if (msg == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(stderr, "msgget rc=%d errno=%d (want -1/ENOSYS)\n", msg, errno);
-    return 1;
-  }
+  int msg_errno = errno;
+  int msg_refused = msg == -1 && msg_errno == ENOSYS;
 
-  printf("sysvipc ok=%d\n", ok);
-  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  int ok = sem_refused + shm_refused + msg_refused;
+  printf(
+      "sysvipc ok=%d sem_rc=%d sem_errno=%d shm_rc=%d shm_errno=%d "
+      "msg_rc=%d msg_errno=%d\n",
+      ok,
+      sem,
+      sem_errno,
+      shm,
+      shm_errno,
+      msg,
+      msg_errno);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }
