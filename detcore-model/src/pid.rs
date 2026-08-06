@@ -80,4 +80,50 @@ impl FromStr for DetPid {
 }
 
 /// Deterministic "virtual" version of `reverie::Tid`
-pub type DetTid = DetPid;
+///
+/// MEASUREMENT SCAFFOLD (not the proposed final shape): a distinct newtype, used only to make the
+/// compiler enumerate every site that currently conflates a thread id with a process id.
+#[derive(
+    PartialEq, Debug, Eq, Clone, Copy, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+pub struct DetTid(i32);
+
+impl fmt::Display for DetTid {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<unistd::Pid> for DetTid {
+    fn from(p: unistd::Pid) -> Self {
+        DetTid(p.into())
+    }
+}
+
+// implementing From<DetTid> for unistd::Pid would violate foreign trait rules
+#[allow(clippy::from_over_into)]
+impl Into<unistd::Pid> for DetTid {
+    fn into(self) -> unistd::Pid {
+        unistd::Pid::from_raw(self.0)
+    }
+}
+
+impl DetTid {
+    /// Create a DetTid from a raw tid.
+    pub const fn from_raw(tid: i32) -> DetTid {
+        DetTid(tid)
+    }
+
+    /// Convert to a raw integer.
+    pub fn as_raw(&self) -> i32 {
+        self.0
+    }
+}
+
+impl FromStr for DetTid {
+    type Err = <i32 as FromStr>::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_raw(s.parse::<i32>()?))
+    }
+}
