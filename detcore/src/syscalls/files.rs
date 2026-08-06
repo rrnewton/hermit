@@ -344,15 +344,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         result.map_err(Error::from)
     }
 
-    /// flock under Hermit. `flock(2)` places an advisory whole-file lock. Detcore
-    /// serializes guest threads onto a single virtual CPU, so a lock is never
-    /// truly contended within the run: a blocking `LOCK_EX`/`LOCK_SH` would
-    /// otherwise leave the deterministic scheduler waiting on an external event.
-    /// Treat every operation (lock/unlock, with or without `LOCK_NB`) as a
-    /// deterministic no-op success, mirroring how sched_setaffinity/ioprio_set are
-    /// suppressed. Re-enables `flock` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#791)
+    // TODO-HUMAN-REVIEW(#1742)
     /// Advisory whole-file locks, forwarded to the kernel.
     ///
     /// This was previously an unconditional no-op success, justified by the
@@ -376,10 +370,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `LOCK_UN`, release when the last descriptor for the open file
     /// description is closed, and release on process exit.
     ///
-    /// Determinism: the outcome is a function of which guest holds the lock,
-    /// and that is fixed by Detcore's deterministic schedule, so a given
-    /// program and seed produce the same acquisition outcome every run. No host
-    /// state enters the decision -- the contending parties are all guests.
+    /// Determinism, scoped to what is actually true. When every contender is
+    /// inside the container the outcome is a function of which guest holds the
+    /// lock, and that is fixed by Detcore's deterministic schedule, so a given
+    /// program and seed produce the same acquisition outcome every run.
+    ///
+    /// The scope is not decoration. Because this forwards to the kernel, a
+    /// process OUTSIDE the container holding a lock on a guest-visible file
+    /// does change the guest's result -- measured: with a host `flock -x`
+    /// holder, a guest `LOCK_EX|LOCK_NB` returns `EWOULDBLOCK`, and acquires
+    /// without one. That is a host-state leak, it is faithful to Linux, and it
+    /// is the same leak `fcntl` record locks have always had here. Hermit
+    /// already declines to make a mutating external filesystem deterministic,
+    /// and lock state on a shared file is part of that state. Do not restate
+    /// this as "no host state enters the decision": it does, and the previous
+    /// bug in this very function came from writing down a determinism argument
+    /// that was broader than the truth.
+    ///
+    /// Note that the no-op this replaced was not host-independent in any useful
+    /// sense either -- it was host-independent by being wrong in all cases.
     pub async fn handle_flock<G: Guest<Self>>(
         &self,
         guest: &mut G,
