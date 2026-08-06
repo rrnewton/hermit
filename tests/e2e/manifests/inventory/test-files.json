@@ -3185,6 +3185,12 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/c/hardware_trap_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend identity of HARDWARE-generated traps (#UD, #DE, #PF) by both wait status and siginfo si_code, with ptrace and dbi measured identical to native; SaBRe is disabled on a measured undelivered #UD and a hang on #DE"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/file_timestamp_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/file_timestamp_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
     }
   ],
   "schema": 2
