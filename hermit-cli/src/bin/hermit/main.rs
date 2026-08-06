@@ -27,6 +27,8 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod oci;
+mod podman_store;
 mod record;
 mod record_start;
 mod remove;
@@ -176,6 +178,7 @@ use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
+use self::oci::OciOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
@@ -227,6 +230,10 @@ enum Subcommand {
     /// Generate a JSON map of nondeterministic instructions in an ELF binary.
     #[clap(name = "instruction-map")]
     InstructionMap(InstructionMapOpts),
+
+    /// Discover and run OCI images from the local image store.
+    #[clap(name = "oci")]
+    Oci(Box<OciOpts>),
 }
 
 impl Subcommand {
@@ -317,6 +324,7 @@ impl Subcommand {
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),
+            Subcommand::Oci(x) => x.main(global),
         }
     }
 }
