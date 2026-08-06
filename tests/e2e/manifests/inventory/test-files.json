@@ -3049,28 +3049,10 @@
       "why": "tests/e2e/language-runtimes/tcl-rand-clock.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
-      "path": "tests/backend-parity/fixtures/pipe_capacity.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/pipe_capacity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/record_lock.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/record_lock.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
       "path": "tests/backend-parity/fixtures/cwd_roundtrip.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/cwd_roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/o_tmpfile_anon.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/o_tmpfile_anon.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/fixtures/fcntl_owner.c",
@@ -3085,10 +3067,40 @@
       "why": "tests/backend-parity/fixtures/membarrier_query.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/o_tmpfile_anon.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/o_tmpfile_anon.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "path": "tests/backend-parity/fixtures/personality_domain.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
       "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/pipe_capacity.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/pipe_capacity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/record_lock.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/record_lock.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/e2e/data-handling/zstd-multithread.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/data-handling.toml",
+      "why": "tests/e2e/data-handling/zstd-multithread.sh is owned by ci/test_harness.sh via tests/e2e/manifests/data-handling.toml: It exercises a real multithreaded zstd worker pool and asserts the reassembled frame is byte-identical under strict verification"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/node-v8-jit.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/node-v8-jit.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises V8 JIT code generation and Math.random entropy determinization under strict verification"
     }
   ],
   "schema": 2

@@ -8,13 +8,6 @@
       "test": "applications/timed-progress-bar"
     },
     {
-      "backend": "ptrace",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/personality-domain"
-    },
-    {
       "backend": "dbi",
       "category": "c-programs",
       "lane": "portable",
@@ -566,6 +559,27 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/tcl-rand-clock"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/personality-domain"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/node-v8-jit"
     }
   ],
   "schema": 1
