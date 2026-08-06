@@ -56,6 +56,22 @@ expected source/binary/test/config identity. The verifier dereferences every
 blob, re-parses the raw logs, recomputes message classes and digests, and returns
 a typed `qualified`, `diverged`, or `no_result` decision.
 
+Strict record/replay uses the same authority rather than the legacy boolean:
+
+```text
+hermit record start --verify --verify-strict --verify-json receipt.json -- PROGRAM ARGS...
+hermit record start --verify-receipt receipt.json \
+  --expected-source-revision FULL_40_HEX_SHA -- PROGRAM ARGS...
+```
+
+The second command is the consumer: it independently rebuilds the expected
+producer, guest, command, backend, and effective record configuration before
+calling the shared semantic verifier. A bare `bitwise_parity: true` document is
+therefore a no-result. SaBRe receipts retain its untouched multiplexed stderr
+transport before DETLOG extraction, preserving the original ordering within
+that stream. They remain a typed no-result until the backend has a lossless
+ordering transport between those events and the coordinator log.
+
 ## Further reading
 
 * Find hermit [CLI examples here](https://fb.workplace.com/notes/hermetic-infra-fyi/hermit-tech-preview-a-linux-reproducibility-tool/244656753248444/)

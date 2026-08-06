@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::num::NonZeroU64;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
@@ -24,6 +25,14 @@ use hermit::Error;
 use hermit::HermitData;
 use hermit::SerializableError;
 use hermit::Shebang;
+use hermit::verify_receipt::FileIdentity;
+use hermit::verify_receipt::STRICT_RECORD_REPLAY_PROFILE_V1;
+use hermit::verify_receipt::StrictReceiptBuildInput;
+use hermit::verify_receipt::StrictReceiptExpectation;
+use hermit::verify_receipt::StrictRunInput;
+use hermit::verify_receipt::TypedTermination;
+use hermit::verify_receipt::load_and_verify_strict_receipt;
+use hermit::verify_receipt::publish_strict_receipt;
 use nix::sys::signal::SaFlags;
 use nix::sys::signal::SigAction;
 use nix::sys::signal::SigHandler;
@@ -44,11 +53,20 @@ use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::VerificationReport;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
+use super::verify::verification_log_level;
 use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
+
+fn receipt_byte_identity(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": bytes.len() as u64,
+        "sha256": detcore::Digest::new(bytes).to_string(),
+    })
+}
 
 #[derive(Debug)]
 struct E9patchRecordOverlay {
@@ -198,8 +216,12 @@ pub struct StartOpts {
     #[clap(long)]
     verify: bool,
 
-    /// With --verify, write the verification verdict as a single JSON line to
-    /// this path: `{"verified":bool,"bitwise_parity":bool,
+    /// With --verify, write the verification verdict to this path. With
+    /// --verify-strict this is an authoritative versioned record/replay receipt
+    /// with content-addressed raw evidence; validate it through
+    /// --verify-receipt and an independently expected source/command identity.
+    /// Without --verify-strict the legacy diagnostic is a single JSON line:
+    /// `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
     /// "stripped"|"canonical","compare_logs":bool,"log_scope":
     /// "deterministic"|"info"|"full_trace","strip_lines":bool,
@@ -209,11 +231,9 @@ pub struct StartOpts {
     /// "guest_signal":int|null}`. This is the exit-code-independent verdict
     /// channel: `verified` reflects whether the record and replay runs matched,
     /// regardless of what the guest exited with, so a caller need not (and must
-    /// not) infer the verdict from the process exit code. This record/replay
-    /// payload is a legacy diagnostic, not the versioned backend-local strict
-    /// receipt emitted by `hermit run --strict --verify --verify-strict`. No
-    /// admission or parity ratchet may authorize from `verified` or
-    /// `bitwise_parity`; migrate through the shared strict receipt verifier.
+    /// not) infer the verdict from the process exit code. The flattened
+    /// `verified` and `bitwise_parity` fields are diagnostics only;
+    /// no admission or parity ratchet may authorize from them.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -232,6 +252,27 @@ pub struct StartOpts {
     /// comparison.
     #[clap(long, requires = "verify")]
     verify_strict: bool,
+
+    /// Verify an already-published record/replay strict receipt without running
+    /// the guest. The expected identity is rebuilt from this Hermit executable,
+    /// PROGRAM/ARGS, the effective record configuration, and
+    /// --expected-source-revision; a cached legacy boolean is never consulted.
+    #[clap(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["verify", "gdbex"],
+        requires = "expected_source_revision"
+    )]
+    verify_receipt: Option<PathBuf>,
+
+    /// Exact clean 40-hex source revision expected by --verify-receipt.
+    #[clap(
+        long,
+        value_name = "SHA",
+        requires = "verify_receipt",
+        conflicts_with = "verify"
+    )]
+    expected_source_revision: Option<String>,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -253,6 +294,129 @@ impl StartOpts {
     fn record_timeout(&self) -> Option<Duration> {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    fn selected_backend(&self, global: &GlobalOpts) -> Backend {
+        global.backend.unwrap_or_default()
+    }
+
+    fn runtime_backend(&self, global: &GlobalOpts) -> Backend {
+        if self.selected_backend(global) == Backend::E9patch {
+            Backend::Ptrace
+        } else {
+            self.selected_backend(global)
+        }
+    }
+
+    fn record_command(&self) -> Command {
+        let mut command = Command::new(self.program());
+        command.args(&self.args);
+        command
+    }
+
+    fn strict_receipt_guest_binary_path(&self, global: &GlobalOpts) -> Result<PathBuf, Error> {
+        if let Some(overlay) = self.prepare_e9patch_overlay(global)? {
+            return Ok(overlay.source);
+        }
+        let resolved = self
+            .record_command()
+            .find_program()
+            .with_context(|| format!("resolving record guest {}", self.program().display()))?;
+        fs::canonicalize(&resolved)
+            .with_context(|| format!("canonicalizing record guest {}", resolved.display()))
+    }
+
+    /// Build the identity expected by the record/replay receipt from the actual
+    /// invocation inputs, without consulting any field in a receipt.
+    fn strict_receipt_identity_material(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(FileIdentity, FileIdentity, Vec<u8>, Vec<u8>), Error> {
+        let producer_path = std::env::current_exe().context("locating Hermit producer binary")?;
+        let guest_path = self.strict_receipt_guest_binary_path(global)?;
+        let producer = FileIdentity::from_path(&producer_path)?;
+        let guest = FileIdentity::from_path(&guest_path)?;
+        let command = self.record_command();
+        let effective_args: Vec<serde_json::Value> = command
+            .get_args()
+            .map(|argument| receipt_byte_identity(argument.as_bytes()))
+            .collect();
+        let captured_environment: Vec<(Vec<u8>, u64, String)> = command
+            .get_captured_envs()
+            .into_iter()
+            .map(|(name, value)| {
+                let value = value.as_bytes();
+                (
+                    name.as_bytes().to_vec(),
+                    value.len() as u64,
+                    detcore::Digest::new(value).to_string(),
+                )
+            })
+            .collect();
+        let guest_command = serde_json::to_vec(&serde_json::json!({
+            "schema": "hermit-record-guest-command/v1",
+            "requested_program_path": receipt_byte_identity(self.program().as_os_str().as_bytes()),
+            "effective_guest_program_path": receipt_byte_identity(command.get_program().as_bytes()),
+            "arg0": receipt_byte_identity(command.get_arg0().as_bytes()),
+            "args": effective_args,
+            "captured_environment_value_identities": captured_environment,
+            "guest_binary_sha256": &guest.sha256,
+        }))?;
+        let selected_backend = self.selected_backend(global);
+        let runtime_backend = self.runtime_backend(global);
+        let capture_level =
+            verification_log_level(global.log, LogCompareStrictness::Canonical, false);
+        let effective_run_config = serde_json::to_vec(&serde_json::json!({
+            "schema": "hermit-record-replay-effective-config/v1",
+            "source_revision": option_env!("HERMIT_BUILD_GIT_FULL_SHA").unwrap_or("unknown"),
+            "profile": STRICT_RECORD_REPLAY_PROFILE_V1,
+            "selected_backend": selected_backend.as_str(),
+            "runtime_backend": runtime_backend.as_str(),
+            "capture_log_level": capture_level.to_string().to_ascii_lowercase(),
+            "record_timeout_seconds": self.record_timeout().map(|timeout| timeout.as_secs()),
+            "captured_environment_value_identities": captured_environment,
+        }))?;
+        Ok((producer, guest, guest_command, effective_run_config))
+    }
+
+    fn strict_receipt_expectation(
+        &self,
+        global: &GlobalOpts,
+        source_revision: &str,
+    ) -> Result<StrictReceiptExpectation, Error> {
+        let (producer, guest, guest_command, effective_run_config) =
+            self.strict_receipt_identity_material(global)?;
+        let guest_command_sha256 = detcore::Digest::new(&guest_command).to_string();
+        Ok(StrictReceiptExpectation {
+            source_revision: source_revision.to_owned(),
+            profile: STRICT_RECORD_REPLAY_PROFILE_V1.to_owned(),
+            producer_binary_sha256: producer.sha256,
+            producer_binary_bytes: producer.bytes,
+            guest_binary_sha256: guest.sha256,
+            guest_binary_bytes: guest.bytes,
+            test_id: format!("sha256:{guest_command_sha256}"),
+            effective_run_config_sha256: detcore::Digest::new(&effective_run_config).to_string(),
+            selected_backend: self.selected_backend(global).as_str().to_owned(),
+            runtime_backend: self.runtime_backend(global).as_str().to_owned(),
+        })
+    }
+
+    fn verify_published_strict_receipt(
+        &self,
+        global: &GlobalOpts,
+        path: &Path,
+        source_revision: &str,
+    ) -> Result<ExitStatus, Error> {
+        let expectation = self.strict_receipt_expectation(global, source_revision)?;
+        let decision = load_and_verify_strict_receipt(path, &expectation);
+        eprintln!(":: Strict record/replay receipt: {decision:?}");
+        if decision.is_qualified() {
+            Ok(ExitStatus::Exited(0))
+        } else {
+            Err(Error::msg(format!(
+                "record/replay receipt did not qualify: {decision:?}"
+            )))
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -355,7 +519,16 @@ impl StartOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        if self.verify {
+        if let Some(receipt) = &self.verify_receipt {
+            validate_log_level(global)?;
+            self.verify_published_strict_receipt(
+                global,
+                receipt,
+                self.expected_source_revision
+                    .as_deref()
+                    .expect("clap requires --expected-source-revision"),
+            )
+        } else if self.verify {
             validate_log_level(global)?;
             self.record_verify(global)
         } else if !self.gdbex.is_empty() {
@@ -420,6 +593,11 @@ impl StartOpts {
         };
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness);
+        let strict_identity_before = if self.verify_strict && self.verify_json.is_some() {
+            Some(self.strict_receipt_identity_material(global)?)
+        } else {
+            None
+        };
 
         let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
 
@@ -457,6 +635,35 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
+        // Preserve both raw logs before compare_two_runs consumes and deletes
+        // their TempPaths. Rebind executable, guest, command, and effective
+        // configuration after replay so a mid-run mutation cannot be certified.
+        let strict_receipt_material = if self.verify_strict && self.verify_json.is_some() {
+            let raw_log1 = fs::read(log1.path())
+                .with_context(|| format!("reading record log {}", log1.path().display()))?;
+            let raw_log2 = fs::read(log2.path())
+                .with_context(|| format!("reading replay log {}", log2.path().display()))?;
+            let identity_before = strict_identity_before
+                .expect("strict receipt identity was captured before recording");
+            let identity_after = self.strict_receipt_identity_material(global)?;
+            if identity_before != identity_after {
+                anyhow::bail!(
+                    "record/replay strict verification identity changed during execution"
+                );
+            }
+            let (producer, guest, guest_command, effective_run_config) = identity_before;
+            Some((
+                raw_log1,
+                raw_log2,
+                producer,
+                guest,
+                guest_command,
+                effective_run_config,
+            ))
+        } else {
+            None
+        };
+
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &recording,
@@ -481,7 +688,61 @@ impl StartOpts {
         // recorded whether or not the runs matched and independent of the guest's
         // own exit status.
         if let Some(path) = &self.verify_json {
-            write_verification_json(path, &outcome)?;
+            if let Some((
+                raw_log1,
+                raw_log2,
+                producer,
+                guest,
+                guest_command,
+                effective_run_config,
+            )) = strict_receipt_material
+            {
+                let legacy = match serde_json::to_value(VerificationReport::from(&outcome))? {
+                    serde_json::Value::Object(map) => map.into_iter().collect(),
+                    _ => unreachable!("VerificationReport serializes as an object"),
+                };
+                let decision = publish_strict_receipt(
+                    path,
+                    StrictReceiptBuildInput {
+                        source_revision: option_env!("HERMIT_BUILD_GIT_FULL_SHA")
+                            .unwrap_or("unknown"),
+                        profile: STRICT_RECORD_REPLAY_PROFILE_V1,
+                        producer_binary: producer,
+                        guest_binary: guest,
+                        guest_command: &guest_command,
+                        effective_run_config: &effective_run_config,
+                        selected_backend: self.selected_backend(global).as_str(),
+                        runtime_backend: self.runtime_backend(global).as_str(),
+                        selected_tests: 1,
+                        executed_runs: 2,
+                        require_detlog_heap: false,
+                        require_detlog_stack: false,
+                        fail_closed_strict_requested: true,
+                        verify_strict_requested: self.verify_strict,
+                        left: StrictRunInput {
+                            stdout: &recording.stdout,
+                            stderr: &recording.stderr,
+                            raw_log: &raw_log1,
+                            termination: TypedTermination::from(recording.status),
+                        },
+                        right: StrictRunInput {
+                            stdout: &replay.stdout,
+                            stderr: &replay.stderr,
+                            raw_log: &raw_log2,
+                            termination: TypedTermination::from(replay.status),
+                        },
+                        legacy,
+                    },
+                )?;
+                eprintln!(":: Strict record/replay receipt: {decision:?}");
+                if !decision.is_qualified() {
+                    return Err(Error::msg(format!(
+                        "record/replay produced no qualifying receipt: {decision:?}"
+                    )));
+                }
+            } else {
+                write_verification_json(path, &outcome)?;
+            }
         }
 
         outcome.into_exit_status()
@@ -569,6 +830,30 @@ impl StartOpts {
 mod tests {
     use super::*;
 
+    fn test_options(program: &str) -> StartOpts {
+        StartOpts {
+            program: Some(PathBuf::from(program)),
+            _strict: false,
+            args: Vec::new(),
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            verify_json: None,
+            verify_strict: false,
+            verify_receipt: None,
+            expected_source_revision: None,
+            gdbex: Vec::new(),
+        }
+    }
+
+    fn test_global() -> GlobalOpts {
+        GlobalOpts {
+            log: None,
+            log_file: None,
+            backend: None,
+        }
+    }
+
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
     // perpetually pending and silently disable the deadline. Arming must unblock
     // SIGALRM, and dropping must restore the prior blocked state without
@@ -610,21 +895,93 @@ mod tests {
 
     #[test]
     fn e9patch_record_target_rejects_proc_magic_links() {
-        let options = StartOpts {
-            program: Some(PathBuf::from("/proc/self/exe")),
-            _strict: false,
-            args: Vec::new(),
-            data_dir: None,
-            record_timeout: None,
-            verify: false,
-            verify_json: None,
-            verify_strict: false,
-            gdbex: Vec::new(),
-        };
+        let options = test_options("/proc/self/exe");
         let error = options.resolve_e9patch_record_target().unwrap_err();
         assert!(
             error.to_string().contains("resolves through /proc"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn production_consumer_rederives_record_receipt_and_rejects_legacy_json() {
+        const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
+        let options = test_options("/usr/bin/true");
+        let global = test_global();
+        let (producer, guest, guest_command, effective_run_config) =
+            options.strict_receipt_identity_material(&global).unwrap();
+        let expectation = StrictReceiptExpectation {
+            source_revision: SOURCE.to_owned(),
+            profile: STRICT_RECORD_REPLAY_PROFILE_V1.to_owned(),
+            producer_binary_sha256: producer.sha256.clone(),
+            producer_binary_bytes: producer.bytes,
+            guest_binary_sha256: guest.sha256.clone(),
+            guest_binary_bytes: guest.bytes,
+            test_id: format!("sha256:{}", detcore::Digest::new(&guest_command)),
+            effective_run_config_sha256: detcore::Digest::new(&effective_run_config).to_string(),
+            selected_backend: Backend::Ptrace.as_str().to_owned(),
+            runtime_backend: Backend::Ptrace.as_str().to_owned(),
+        };
+        let log = b"2026-08-06T01:00:00.000001Z INFO detcore: DETLOG [syscall] exit_group(0)\n\
+                    2026-08-06T01:00:00.000002Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 1\n";
+        let directory = tempfile::TempDir::new().unwrap();
+        let receipt = directory.path().join("record-receipt.json");
+        let decision = publish_strict_receipt(
+            &receipt,
+            StrictReceiptBuildInput {
+                source_revision: SOURCE,
+                profile: STRICT_RECORD_REPLAY_PROFILE_V1,
+                producer_binary: producer,
+                guest_binary: guest,
+                guest_command: &guest_command,
+                effective_run_config: &effective_run_config,
+                selected_backend: Backend::Ptrace.as_str(),
+                runtime_backend: Backend::Ptrace.as_str(),
+                selected_tests: 1,
+                executed_runs: 2,
+                require_detlog_heap: false,
+                require_detlog_stack: false,
+                fail_closed_strict_requested: true,
+                verify_strict_requested: true,
+                left: StrictRunInput {
+                    stdout: b"",
+                    stderr: b"",
+                    raw_log: log,
+                    termination: TypedTermination::Exited { code: 0 },
+                },
+                right: StrictRunInput {
+                    stdout: b"",
+                    stderr: b"",
+                    raw_log: log,
+                    termination: TypedTermination::Exited { code: 0 },
+                },
+                legacy: std::collections::BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        assert!(decision.is_qualified());
+        assert_eq!(
+            options
+                .verify_published_strict_receipt(&global, &receipt, SOURCE)
+                .unwrap(),
+            ExitStatus::Exited(0)
+        );
+
+        let legacy = directory.path().join("legacy.json");
+        fs::write(
+            &legacy,
+            br#"{"verified":true,"bitwise_parity":true,"verdict":"matched"}"#,
+        )
+        .unwrap();
+        assert!(
+            !load_and_verify_strict_receipt(&legacy, &expectation).is_qualified(),
+            "bare legacy JSON must never authorize"
+        );
+        let mut wrong_source = expectation;
+        wrong_source.source_revision = "f".repeat(40);
+        assert!(
+            !load_and_verify_strict_receipt(&receipt, &wrong_source).is_qualified(),
+            "an independently mismatched source must never authorize"
         );
     }
 }

@@ -39,12 +39,16 @@ pub const INFO_STREAM_FRAMING_V1: &str = "hermit-info-length-prefixed-u64be/v1";
 pub const WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
 pub const HOST_ADDRESS_ORDINAL_V1: &str = "marked-host-address-to-first-appearance-ordinal/v1";
 pub const STRICT_PROFILE_V1: &str = "backend-local-strict-repeat/v1";
+pub const STRICT_RECORD_REPLAY_PROFILE_V1: &str = "record-replay-strict/v1";
 
 const INFO_STREAM_MAGIC: &[u8] = b"HERMIT-INFO-V1\0";
 const INFO_LEVEL: &[u8] = b"INFO ";
-const COMMIT_TAG: &[u8] = b" COMMIT ";
-const DETLOG_TAG: &[u8] = b" DETLOG ";
-const MEMORY_DETLOG_TAG: &[u8] = b" DETLOG [memory]";
+const DETCORE_TARGET: &[u8] = b"detcore";
+const SCHEDULER_TARGET: &[u8] = b"detcore::scheduler";
+const DETLOG_PREFIX: &[u8] = b"DETLOG ";
+const MEMORY_DETLOG_PREFIX: &[u8] = b"DETLOG [memory]";
+const SCHED_STEP_COMMIT_PREFIX: &[u8] = b"[sched-step5] >>>>>>>\n\n COMMIT ";
+const BACKGROUND_COMMIT_PREFIX: &[u8] = b"[scheduler] >>>>>>>\n\n COMMIT ";
 // Stable tags emitted by `Detcore::detlog_memory_maps` through
 // `procmaps::display`: preserve their exact punctuation in the receipt class
 // classifier rather than guessing from a human-readable region name.
@@ -118,6 +122,8 @@ pub struct MessageEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunEvidence {
     pub stdout: ArtifactRef,
+    /// Untouched process stderr bytes. In particular, SaBRe's multiplexed
+    /// DETLOG transport is captured here before comparison-only extraction.
     pub stderr: ArtifactRef,
     pub raw_log: ArtifactRef,
     /// Length-prefixed canonical INFO messages. This is redundant with
@@ -218,6 +224,7 @@ pub enum NoResultReason {
     ZeroInfoMessages { side: String },
     MissingMessageClass { side: String, class: String },
     StrictModeNotRequested,
+    LosslessEventTransportOrderUnavailable { backend: String },
     ReceiptDecisionMismatch,
     MalformedReceipt { detail: String },
 }
@@ -263,6 +270,7 @@ pub struct StrictVerificationReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrictReceiptExpectation {
     pub source_revision: String,
+    pub profile: String,
     pub producer_binary_sha256: String,
     pub producer_binary_bytes: u64,
     pub guest_binary_sha256: String,
@@ -282,6 +290,7 @@ pub struct StrictRunInput<'a> {
 
 pub struct StrictReceiptBuildInput<'a> {
     pub source_revision: &'a str,
+    pub profile: &'a str,
     pub producer_binary: FileIdentity,
     pub guest_binary: FileIdentity,
     pub guest_command: &'a [u8],
@@ -407,6 +416,7 @@ pub fn publish_strict_receipt(
     };
     let expectation = StrictReceiptExpectation {
         source_revision: input.source_revision.to_owned(),
+        profile: input.profile.to_owned(),
         producer_binary_sha256: identity.producer_binary.sha256.clone(),
         producer_binary_bytes: identity.producer_binary.bytes,
         guest_binary_sha256: identity.guest_binary.sha256.clone(),
@@ -417,7 +427,7 @@ pub fn publish_strict_receipt(
         runtime_backend: input.runtime_backend.to_owned(),
     };
     let coverage = CoverageEvidence {
-        profile: STRICT_PROFILE_V1.to_owned(),
+        profile: input.profile.to_owned(),
         discovered_tests: 1,
         selected_tests: input.selected_tests,
         executed_runs: input.executed_runs,
@@ -592,8 +602,18 @@ pub fn verify_strict_receipt(
     if receipt.coverage.selected_tests == 0 {
         return no_result(NoResultReason::ZeroSelectedTests);
     }
-    if receipt.coverage.profile != STRICT_PROFILE_V1
-        || receipt.coverage.discovered_tests < receipt.coverage.selected_tests
+    if !matches!(
+        receipt.coverage.profile.as_str(),
+        STRICT_PROFILE_V1 | STRICT_RECORD_REPLAY_PROFILE_V1
+    ) {
+        return no_result(NoResultReason::CoverageCountsMismatch);
+    }
+    if receipt.coverage.profile != expectation.profile {
+        return no_result(NoResultReason::IdentityMismatch {
+            field: "profile".to_owned(),
+        });
+    }
+    if receipt.coverage.discovered_tests < receipt.coverage.selected_tests
         || receipt.coverage.filtered_tests
             != receipt
                 .coverage
@@ -610,7 +630,6 @@ pub fn verify_strict_receipt(
     if !receipt.coverage.fail_closed_strict_requested || !receipt.coverage.verify_strict_requested {
         return no_result(NoResultReason::StrictModeNotRequested);
     }
-
     for (field, reference) in [
         ("guest_command", &receipt.identity.guest_command),
         (
@@ -636,6 +655,15 @@ pub fn verify_strict_receipt(
         Ok(run) => run,
         Err(reason) => return no_result(reason),
     };
+    // This is derived from the independently expected runtime backend, not a
+    // producer boolean. SaBRe currently appends stderr-forwarded DETLOG events
+    // to the coordinator log after exit, so their cross-transport order is not
+    // observable and cannot qualify.
+    if receipt.identity.runtime_backend == "sabre" {
+        return no_result(NoResultReason::LosslessEventTransportOrderUnavailable {
+            backend: receipt.identity.runtime_backend.clone(),
+        });
+    }
 
     if receipt.coverage.compared_messages_left != left.message_count
         || receipt.coverage.compared_messages_right != right.message_count
@@ -763,12 +791,10 @@ fn identity_mismatch(
 }
 
 fn is_source_revision_identity(revision: &str) -> bool {
-    // A local development build may faithfully identify itself as
-    // `<exact-head>-dirty`; its producer-binary digest remains exact. An
-    // admission consumer expecting a clean exact head passes the clean SHA in
-    // `StrictReceiptExpectation`, so that dirty spelling cannot authorize it.
-    let commit = revision.strip_suffix("-dirty").unwrap_or(revision);
-    commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // A commit SHA identifies one exact source tree. `<sha>-dirty` identifies an
+    // unbounded family of worktrees and therefore cannot authorize a receipt,
+    // even when the producer binary itself has an exact digest.
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 struct VerifiedRun {
@@ -870,6 +896,20 @@ struct CanonicalInfoStream {
     evidence: MessageEvidence,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InfoEventClass {
+    Other,
+    Commit,
+    Detlog,
+    DetlogHeap,
+    DetlogStack,
+}
+
+struct CanonicalInfoMessage {
+    bytes: Vec<u8>,
+    class: InfoEventClass,
+}
+
 fn canonical_info_stream(raw: &[u8]) -> Result<CanonicalInfoStream, String> {
     let messages = parse_log_messages(raw)?;
     let mut address_ordinals = HashMap::<Vec<u8>, u64>::new();
@@ -877,39 +917,44 @@ fn canonical_info_stream(raw: &[u8]) -> Result<CanonicalInfoStream, String> {
     let mut infos = Vec::new();
     for message in messages {
         if message.starts_with(INFO_LEVEL) {
-            infos.push(canonicalize_marked_addresses(
-                &message,
-                &mut address_ordinals,
-                &mut next_ordinal,
-            )?);
+            let bytes =
+                canonicalize_marked_addresses(&message, &mut address_ordinals, &mut next_ordinal)?;
+            let class = classify_info_event(&bytes)?;
+            infos.push(CanonicalInfoMessage { bytes, class });
         }
     }
 
     let commits: Vec<Vec<u8>> = infos
         .iter()
-        .filter(|message| contains(message, COMMIT_TAG))
-        .cloned()
+        .filter(|message| message.class == InfoEventClass::Commit)
+        .map(|message| message.bytes.clone())
         .collect();
     let detlogs: Vec<Vec<u8>> = infos
         .iter()
-        .filter(|message| contains(message, DETLOG_TAG))
-        .cloned()
+        .filter(|message| {
+            matches!(
+                message.class,
+                InfoEventClass::Detlog | InfoEventClass::DetlogHeap | InfoEventClass::DetlogStack
+            )
+        })
+        .map(|message| message.bytes.clone())
         .collect();
     let heaps: Vec<Vec<u8>> = infos
         .iter()
-        .filter(|message| contains(message, MEMORY_DETLOG_TAG) && contains(message, HEAP_TAG))
-        .cloned()
+        .filter(|message| message.class == InfoEventClass::DetlogHeap)
+        .map(|message| message.bytes.clone())
         .collect();
     let stacks: Vec<Vec<u8>> = infos
         .iter()
-        .filter(|message| contains(message, MEMORY_DETLOG_TAG) && contains(message, STACK_TAG))
-        .cloned()
+        .filter(|message| message.class == InfoEventClass::DetlogStack)
+        .map(|message| message.bytes.clone())
         .collect();
+    let ordered: Vec<Vec<u8>> = infos.into_iter().map(|message| message.bytes).collect();
 
-    let framed = frame_messages(&infos);
+    let framed = frame_messages(&ordered);
     Ok(CanonicalInfoStream {
         evidence: MessageEvidence {
-            info: class_evidence(&infos),
+            info: class_evidence(&ordered),
             commit: class_evidence(&commits),
             detlog: class_evidence(&detlogs),
             detlog_heap: class_evidence(&heaps),
@@ -917,6 +962,44 @@ fn canonical_info_stream(raw: &[u8]) -> Result<CanonicalInfoStream, String> {
         },
         framed,
     })
+}
+
+/// Parse the tracing record into its target and payload before assigning an
+/// event class. A human-readable substring is not an event identity: only the
+/// exact Detcore target plus the exact producer prefix can satisfy COMMIT,
+/// DETLOG, heap, or stack coverage.
+fn classify_info_event(message: &[u8]) -> Result<InfoEventClass, String> {
+    let remainder = message
+        .strip_prefix(INFO_LEVEL)
+        .ok_or_else(|| "event classifier received a non-INFO message".to_owned())?;
+    let separator = find_subslice(remainder, b": ")
+        .ok_or_else(|| "INFO message has no target/payload separator".to_owned())?;
+    let target = &remainder[..separator];
+    let payload = &remainder[separator + 2..];
+
+    if target == SCHEDULER_TARGET
+        && (payload.starts_with(SCHED_STEP_COMMIT_PREFIX)
+            || payload.starts_with(BACKGROUND_COMMIT_PREFIX))
+    {
+        return Ok(InfoEventClass::Commit);
+    }
+
+    let detcore_target = target == DETCORE_TARGET || target.starts_with(b"detcore::");
+    if !detcore_target || !payload.starts_with(DETLOG_PREFIX) {
+        return Ok(InfoEventClass::Other);
+    }
+    if target != DETCORE_TARGET || !payload.starts_with(MEMORY_DETLOG_PREFIX) {
+        return Ok(InfoEventClass::Detlog);
+    }
+
+    let heap = contains(payload, HEAP_TAG) || contains(payload, b"[heap] ->");
+    let stack = contains(payload, STACK_TAG) || contains(payload, b"[stack] ->");
+    match (heap, stack) {
+        (true, false) => Ok(InfoEventClass::DetlogHeap),
+        (false, true) => Ok(InfoEventClass::DetlogStack),
+        (false, false) => Ok(InfoEventClass::Detlog),
+        (true, true) => Err("memory DETLOG ambiguously names both heap and stack".to_owned()),
+    }
 }
 
 fn class_evidence(messages: &[Vec<u8>]) -> MessageClassEvidence {
@@ -1155,7 +1238,7 @@ mod tests {
     fn base_log(timestamp: &str, pointer: &str) -> Vec<u8> {
         format!(
             "{timestamp} INFO detcore: DETLOG [syscall] write(fd=1, ptr=0x2, count=17, path=/tmp/exact-a, host=<hostaddr {pointer}>)\n\
-             {timestamp} INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 9 at time 946684800123\n\
+             {timestamp} INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 9 at time 946684800123\n\
              {timestamp} INFO detcore: DETLOG [memory] 0x602000-0x603000 [heap]->0123456789abcdef\n\
              {timestamp} INFO detcore: DETLOG [memory] 0x7fff0000-0x7fff1000 [stack]->fedcba9876543210\n"
         )
@@ -1165,7 +1248,7 @@ mod tests {
     fn no_memory_log(timestamp: &str) -> Vec<u8> {
         format!(
             "{timestamp} INFO detcore: DETLOG [syscall] write(fd=1, count=17)\n\
-             {timestamp} INFO detcore::scheduler: COMMIT turn 9 at time 946684800123\n"
+             {timestamp} INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 9 at time 946684800123\n"
         )
         .into_bytes()
     }
@@ -1200,6 +1283,7 @@ mod tests {
             &path,
             StrictReceiptBuildInput {
                 source_revision: SOURCE_REVISION,
+                profile: STRICT_PROFILE_V1,
                 producer_binary: identity(b"producer"),
                 guest_binary: identity(b"guest"),
                 guest_command: COMMAND,
@@ -1238,6 +1322,7 @@ mod tests {
     fn expectation(receipt: &StrictVerificationReceipt) -> StrictReceiptExpectation {
         StrictReceiptExpectation {
             source_revision: receipt.identity.source_revision.clone(),
+            profile: receipt.coverage.profile.clone(),
             producer_binary_sha256: receipt.identity.producer_binary.sha256.clone(),
             producer_binary_bytes: receipt.identity.producer_binary.bytes,
             guest_binary_sha256: receipt.identity.guest_binary.sha256.clone(),
@@ -1395,7 +1480,7 @@ mod tests {
                 "commit",
             ),
             (
-                b"2026-08-06T01:00:00.000001Z INFO detcore::scheduler: COMMIT turn 1\n".as_slice(),
+                b"2026-08-06T01:00:00.000001Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 1\n".as_slice(),
                 "detlog",
             ),
         ] {
@@ -1428,6 +1513,7 @@ mod tests {
             &path,
             StrictReceiptBuildInput {
                 source_revision: SOURCE_REVISION,
+                profile: STRICT_PROFILE_V1,
                 producer_binary: identity(b"producer"),
                 guest_binary: identity(b"guest"),
                 guest_command: COMMAND,
@@ -1515,6 +1601,7 @@ mod tests {
         let mut receipt = read_receipt(&path);
         for field in [
             "source_revision",
+            "profile",
             "producer_binary_sha256",
             "producer_binary_bytes",
             "guest_binary_sha256",
@@ -1527,6 +1614,7 @@ mod tests {
             let mut mismatched = expectation(&receipt);
             match field {
                 "source_revision" => mismatched.source_revision = "f".repeat(40),
+                "profile" => mismatched.profile = STRICT_RECORD_REPLAY_PROFILE_V1.to_owned(),
                 "producer_binary_sha256" => mismatched.producer_binary_sha256 = "f".repeat(64),
                 "producer_binary_bytes" => mismatched.producer_binary_bytes += 1,
                 "guest_binary_sha256" => mismatched.guest_binary_sha256 = "f".repeat(64),
@@ -1550,6 +1638,22 @@ mod tests {
         assert_no_result_reason(
             verify_strict_receipt(&receipt, &root, &expected),
             |reason| matches!(reason, NoResultReason::StrictModeNotRequested),
+        );
+
+        let mut lossy_transport = read_receipt(&path);
+        lossy_transport.identity.selected_backend = "sabre".to_owned();
+        lossy_transport.identity.runtime_backend = "sabre".to_owned();
+        let mut lossy_expected = expected.clone();
+        lossy_expected.selected_backend = "sabre".to_owned();
+        lossy_expected.runtime_backend = "sabre".to_owned();
+        assert_no_result_reason(
+            verify_strict_receipt(&lossy_transport, &root, &lossy_expected),
+            |reason| {
+                matches!(
+                    reason,
+                    NoResultReason::LosslessEventTransportOrderUnavailable { .. }
+                )
+            },
         );
     }
 
@@ -1581,7 +1685,9 @@ mod tests {
             ("order", {
                 let text = String::from_utf8(baseline.clone()).unwrap();
                 let mut lines: Vec<&str> = text.lines().collect();
-                lines.swap(0, 1);
+                // Swap two one-line DETLOG frames while leaving the scheduler
+                // COMMIT's multiline frame structurally intact.
+                lines.swap(0, 4);
                 format!("{}\n", lines.join("\n")).into_bytes()
             }),
         ] {
@@ -1779,6 +1885,15 @@ mod tests {
             |reason| matches!(reason, NoResultReason::InvalidSourceRevision { .. }),
         );
 
+        let mut dirty_sha = receipt.clone();
+        dirty_sha.identity.source_revision = format!("{SOURCE_REVISION}-dirty");
+        let mut dirty_sha_expected = expected.clone();
+        dirty_sha_expected.source_revision = dirty_sha.identity.source_revision.clone();
+        assert_no_result_reason(
+            verify_strict_receipt(&dirty_sha, &root, &dirty_sha_expected),
+            |reason| matches!(reason, NoResultReason::InvalidSourceRevision { .. }),
+        );
+
         let mut cached = receipt.clone();
         cached.declared_decision = StrictReceiptDecision::Diverged {
             dimensions: vec![DivergenceDimension::Stdout],
@@ -1788,5 +1903,40 @@ mod tests {
         assert_no_result_reason(load_and_verify_strict_receipt(&path, &expected), |reason| {
             matches!(reason, NoResultReason::ReceiptDecisionMismatch)
         });
+    }
+
+    #[test]
+    fn arbitrary_info_payloads_cannot_spoof_typed_event_coverage() {
+        let timestamp = "2026-08-06T01:00:00.000001Z";
+        let spoof = format!(
+            "{timestamp} INFO detcore: ordinary diagnostic containing COMMIT turn 1 and DETLOG [memory] [heap]->abc [stack]->def\n\
+             {timestamp} INFO guest::diagnostic: DETLOG [syscall] and COMMIT turn 2\n\
+             {timestamp} INFO detcore::other: DETLOG [memory] [heap]->abc [stack]->def\n"
+        );
+        let derived = canonical_info_stream(spoof.as_bytes()).unwrap();
+        assert_eq!(derived.evidence.info.count, 3);
+        assert_eq!(derived.evidence.commit.count, 0);
+        assert_eq!(derived.evidence.detlog.count, 1);
+        assert_eq!(derived.evidence.detlog_heap.count, 0);
+        assert_eq!(derived.evidence.detlog_stack.count, 0);
+
+        let directory = TempDir::new().unwrap();
+        let (_, decision) = publish(
+            &directory,
+            spoof.as_bytes(),
+            spoof.as_bytes(),
+            b"",
+            b"",
+            b"",
+            b"",
+            TypedTermination::Exited { code: 0 },
+            TypedTermination::Exited { code: 0 },
+            true,
+            true,
+        );
+        assert_no_result_reason(
+            decision,
+            |reason| matches!(reason, NoResultReason::MissingMessageClass { class, .. } if class == "commit"),
+        );
     }
 }

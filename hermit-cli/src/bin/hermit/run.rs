@@ -85,11 +85,16 @@ fn receipt_byte_identity(bytes: &[u8]) -> serde_json::Value {
     })
 }
 
-fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
+struct SabreDetlogExtraction {
+    guest_stderr: Vec<u8>,
+    syscall_records: usize,
+}
+
+fn extract_sabre_detlogs(path: &Path, raw_stderr: &[u8]) -> Result<SabreDetlogExtraction, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
-    let mut guest_stderr = Vec::with_capacity(stderr.len());
+    let mut guest_stderr = Vec::with_capacity(raw_stderr.len());
     let mut syscall_records = 0;
-    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
+    for line in raw_stderr.split_inclusive(|byte| *byte == b'\n') {
         let start = line
             .iter()
             .position(|byte| !byte.is_ascii_whitespace())
@@ -106,8 +111,10 @@ fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Err
             guest_stderr.extend_from_slice(line);
         }
     }
-    *stderr = guest_stderr;
-    Ok(syscall_records)
+    Ok(SabreDetlogExtraction {
+        guest_stderr,
+        syscall_records,
+    })
 }
 struct PreparedMounts {
     mounts: Vec<Mount>,
@@ -2814,9 +2821,17 @@ impl RunOpts {
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let mut out1: Output = self.run_verify(log1_file, global)?;
-        let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
-            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
-            .transpose()?;
+        // SaBRe transports deterministic events and guest stderr in one ordered
+        // byte stream. Preserve that untouched stream for the receipt before
+        // splitting a comparison-only guest-stderr view and normalized log.
+        let raw_stderr1 = out1.stderr.clone();
+        let sabre_syscalls1 = if self.selected_backend() == Backend::Sabre {
+            let extracted = extract_sabre_detlogs(&log1_path, &raw_stderr1)?;
+            out1.stderr = extracted.guest_stderr;
+            Some(extracted.syscall_records)
+        } else {
+            None
+        };
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -2846,8 +2861,11 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let mut out2 = self.run_verify(log2_file, global)?;
+        let raw_stderr2 = out2.stderr.clone();
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
+            let extracted = extract_sabre_detlogs(&log2_path, &raw_stderr2)?;
+            out2.stderr = extracted.guest_stderr;
+            let sabre_syscalls2 = extracted.syscall_records;
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
                 return Err(Error::msg(format!(
                     "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
@@ -2950,6 +2968,7 @@ impl RunOpts {
                     StrictReceiptBuildInput {
                         source_revision: option_env!("HERMIT_BUILD_GIT_FULL_SHA")
                             .unwrap_or("unknown"),
+                        profile: hermit::verify_receipt::STRICT_PROFILE_V1,
                         producer_binary: producer,
                         guest_binary: guest,
                         guest_command: &guest_command,
@@ -2964,13 +2983,13 @@ impl RunOpts {
                         verify_strict_requested: self.verify_strict,
                         left: StrictRunInput {
                             stdout: &out1.stdout,
-                            stderr: &out1.stderr,
+                            stderr: &raw_stderr1,
                             raw_log: &raw_log1,
                             termination: TypedTermination::from(out1.status),
                         },
                         right: StrictRunInput {
                             stdout: &out2.stdout,
-                            stderr: &out2.stderr,
+                            stderr: &raw_stderr2,
                             raw_log: &raw_log2,
                             termination: TypedTermination::from(out2.status),
                         },
@@ -3363,15 +3382,20 @@ mod tests {
             "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
         )
         .unwrap();
-        let mut stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
+        let raw_stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
               INFO detcore: DETLOG scheduler event\n\
               INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
             .to_vec();
-        let syscall_records = extract_sabre_detlogs(log.path(), &mut stderr).unwrap();
+        let before = raw_stderr.clone();
+        let extracted = extract_sabre_detlogs(log.path(), &raw_stderr).unwrap();
 
-        assert_eq!(syscall_records, 1);
         assert_eq!(
-            stderr,
+            raw_stderr, before,
+            "raw transport order must remain untouched"
+        );
+        assert_eq!(extracted.syscall_records, 1);
+        assert_eq!(
+            extracted.guest_stderr,
             b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n"
         );
         assert_eq!(
