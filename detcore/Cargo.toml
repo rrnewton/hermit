@@ -39,6 +39,10 @@ name = "detcore"
 name = "syscaller"
 path = "scripts/syscaller.rs"
 
+[[bin]]
+name = "randomness_probe"
+path = "scripts/randomness_probe.rs"
+
 [[test]]
 name = "tests_misc"
 path = "tests/misc/mod.rs"
