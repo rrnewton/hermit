@@ -16,6 +16,7 @@ use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::consts::SCHEDULE_NAME;
 use crate::error::Error;
 
 /// Hermit record version. Recorded as part of hermit-record, hermit-replay
@@ -44,7 +45,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,7 +143,7 @@ impl Metadata {
 }
 
 // TODO: Record this in the metadata instead of hardcoding this.
-pub fn record_or_replay_config(data: &Path) -> detcore::Config {
+fn common_record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same detcore
     // configuration. Otherwise, the behavior of the program could diverge
     // during replay.
@@ -232,6 +233,22 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     config
 }
 
+/// Detcore configuration for the producing half of record/replay.
+pub fn record_config(data: &Path) -> detcore::Config {
+    let mut config = common_record_or_replay_config(data);
+    config.record_preemptions = true;
+    config.record_preemptions_to = Some(data.join(SCHEDULE_NAME));
+    config
+}
+
+/// Detcore configuration for the consuming half of record/replay.
+pub fn replay_config(data: &Path) -> detcore::Config {
+    let mut config = common_record_or_replay_config(data);
+    config.replay_schedule_from = Some(data.join(SCHEDULE_NAME));
+    config.replay_exhausted_panic = true;
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +262,29 @@ mod tests {
 
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
-        assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+        let data = Path::new("replay-data");
+        assert!(record_config(data).passthru_opt);
+        assert!(replay_config(data).passthru_opt);
+    }
+
+    #[test]
+    fn record_and_replay_bind_the_same_schedule_artifact() {
+        let data = Path::new("replay-data");
+        let record = record_config(data);
+        let replay = replay_config(data);
+        let schedule = data.join(SCHEDULE_NAME);
+
+        assert!(record.record_preemptions);
+        assert_eq!(
+            record.record_preemptions_to.as_deref(),
+            Some(schedule.as_path())
+        );
+        assert_eq!(
+            replay.replay_schedule_from.as_deref(),
+            Some(schedule.as_path())
+        );
+        assert!(replay.replay_exhausted_panic);
+        assert!(replay.die_on_desync);
     }
 
     #[test]

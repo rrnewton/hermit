@@ -18,7 +18,7 @@ use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::metadata::Metadata;
-use crate::metadata::record_or_replay_config;
+use crate::metadata::record_config;
 use crate::recorder::Recorder;
 
 type RecordTool = detcore::Detcore<Recorder>;
@@ -46,7 +46,7 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let config = record_or_replay_config(dir);
+        let config = record_config(dir);
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)

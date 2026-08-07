@@ -320,6 +320,16 @@ fn record_strict_direct_cli_records_and_replays_echo() {
         record_output.stdout, b"hello\n",
         "recorded guest stdout changed"
     );
+    let recording_id = fs::read_to_string(data_dir.path().join("last"))
+        .expect("recording did not publish its last-id binding");
+    let schedule = data_dir
+        .path()
+        .join(recording_id.trim())
+        .join("schedule.json");
+    assert!(
+        fs::metadata(&schedule).is_ok_and(|metadata| metadata.len() != 0),
+        "recording did not publish a nonempty schedule artifact"
+    );
 
     let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
     replay
@@ -329,6 +339,24 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     assert_eq!(
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
+    );
+
+    fs::remove_file(&schedule).expect("failed to plant the missing-schedule negative");
+    let mut replay_without_schedule = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay_without_schedule
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let refused = replay_without_schedule
+        .output()
+        .expect("failed to start missing-schedule replay");
+    assert!(
+        !refused.status.success(),
+        "replay silently accepted a recording without its bound schedule"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("schedule.json"),
+        "missing-schedule refusal did not identify the absent authority: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
 }
 

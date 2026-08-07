@@ -17,3 +17,8 @@ pub const EXE_NAME: &str = "exe";
 /// replayer uses this to populate its chroot so that child processes can
 /// re-exec the same binaries.
 pub const EXEC_PATHS_NAME: &str = "exec_paths";
+
+/// The recorded total order of Detcore scheduling events. Replay consumes this
+/// exact artifact instead of trying to reconstruct the order from the same
+/// scheduler seed while external completions race.
+pub const SCHEDULE_NAME: &str = "schedule.json";

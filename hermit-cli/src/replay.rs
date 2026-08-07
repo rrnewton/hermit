@@ -27,7 +27,7 @@ use crate::error::Error;
 use crate::interp;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
-use crate::metadata::record_or_replay_config;
+use crate::metadata::replay_config;
 use crate::replayer::Replayer;
 
 type ReplayTool = detcore::Detcore<Replayer>;
@@ -76,7 +76,7 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let config = record_or_replay_config(dir);
+        let config = replay_config(dir);
         let sequentialize_threads = config.sequentialize_threads;
 
         let chroot =
