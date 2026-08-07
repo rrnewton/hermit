@@ -108,33 +108,29 @@ For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
-dynamically linked Linux x86-64 guests:
+explicit backend request. LiteInst is an experimental direct in-guest backend
+for dynamically linked Linux x86-64 guests:
 
 ```bash
-./scripts/stage-liteinst-runtime.sh dev \
-  "$PWD/target/debug/libreverie_liteinst.so" \
-  "$PWD/target/liteinst-runtime-build"
-cargo build --locked -p hermit --bin hermit
+cargo build --locked -p hermit --lib --bin hermit
 ./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
 ```
 
-The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.
-The standalone manifest enables and statically verifies the preload constructor;
-Hermit rejects non-runtime or constructor-free overrides before activation.
-The resulting Reverie preload DSO initializes only the LiteInst patch/helper
-side; it never installs another Tool in the guest. The host observes the first
-invocation of each eligible syscall site and installs an instruction-punning
-hook. Later invocations enter the LiteInst trampoline and return to the same
-ptrace-owned Detcore lifecycle.
+Hermit preloads `libhermit.so`, verifies its constructor, and installs a
+`Detcore` Tool in the guest before the program starts. The first invocation of
+each eligible syscall or subscribed CPU-instruction site faults to the in-guest
+runtime and installs a LiteInst hook; later invocations enter that hook without
+a ptracer in the syscall path. RCB accounting reads the current thread's PMU
+counter in guest, CPUID/RDTSC events are dispatched to the Tool in guest, and
+the shared Reverie vDSO patcher routes time symbols through the same Tool.
 
 `--verify` runs the normal Detcore comparison over captured status, output,
 and deterministic scheduler logs, so a successful result is an L2 claim.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
 unsupported because runtime rebootstrap after image replacement is not yet
-implemented. RCB preemption and CPUID/RDTSC interception use the ptrace host
-and retain its PMU and CPU capability requirements.
+implemented. The direct backend retains the PMU and CPU-faulting capability
+requirements needed by its in-guest RCB and instruction mechanisms.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-guest patch runtime is experimental
 and continues to receive compatibility and lifecycle improvements.

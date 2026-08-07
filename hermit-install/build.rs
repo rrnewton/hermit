@@ -265,53 +265,10 @@ fn replace_symlink(destination: &Path, target: &Path) -> io::Result<()> {
     symlink(target, destination)
 }
 
-fn replace_copy(source: &Path, destination: &Path) {
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() => {
-            panic!(
-                "refusing to replace directory {} with a runtime file",
-                destination.display()
-            )
-        }
-        Ok(_) => fs::remove_file(destination)
-            .unwrap_or_else(|error| panic!("failed to remove {}: {error}", destination.display())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => panic!("failed to inspect {}: {error}", destination.display()),
-    }
-    copy_file(source, destination);
-}
-
-fn build_liteinst_runtime(
-    repository: &Path,
-    build_root: &Path,
-    profile_dir: &Path,
-    resources: &Path,
-) {
-    // stage-liteinst-runtime.sh appends the canonical Reverie pin to this stable
-    // root, so cache invalidation has the same source of truth as the pin gate.
-    let target = build_root.join("liteinst-runtime");
-    let runtime = profile_dir.join("libreverie_liteinst.so");
-    run(
-        Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
-            .current_dir(repository)
-            .arg("release")
-            .arg(&runtime)
-            .arg(&target),
-        "build the constructor-enabled LiteInst runtime",
-    );
-    assert!(
-        runtime.is_file(),
-        "standalone build did not stage {}",
-        runtime.display()
-    );
-    replace_copy(&runtime, &resources.join("libreverie_liteinst.so"));
-}
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
-    println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
 
@@ -349,7 +306,7 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    for library in ["libdetcore_dbi.so", "libdetcore_sabre.so"] {
+    for library in ["libdetcore_dbi.so", "libdetcore_sabre.so", "libhermit.so"] {
         replace_symlink(
             &resources.join(library),
             &Path::new("../../release").join(library),
@@ -363,8 +320,6 @@ fn main() {
     let repository = manifest_dir
         .parent()
         .expect("hermit-install is not inside the Hermit repository");
-    build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
-
     let reverie_root = reverie_dbi::native_client_source_dir()
         .parent()
         .and_then(Path::parent)

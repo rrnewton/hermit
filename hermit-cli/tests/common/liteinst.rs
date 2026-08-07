@@ -24,7 +24,7 @@ pub(super) fn liteinst_runtime_library() -> PathBuf {
     hermit_binary()
         .parent()
         .expect("Hermit test binary should have a profile directory")
-        .join("libreverie_liteinst.so")
+        .join("libhermit.so")
 }
 
 pub(super) fn ensure_liteinst_runtime() {
@@ -47,26 +47,40 @@ pub(super) fn ensure_liteinst_runtime() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        // stage-liteinst-runtime.sh appends the current Reverie pin itself, so
-        // cache invalidation has the same source of truth as the pin gate.
-        let runtime_target = target_dir.join("liteinst-runtime-build");
+        let runtime_target = target_dir.join("liteinst-tool-build");
         let runtime = liteinst_runtime_library();
-        let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
+        if runtime.is_file() {
+            return;
+        }
+        let output = Command::new(env!("CARGO"))
             .current_dir(repository)
+            .args(["build", "--package", "hermit", "--lib", "--profile"])
             .arg(cargo_profile)
-            .arg(&runtime)
-            .arg(&runtime_target)
+            .env("CARGO_TARGET_DIR", &runtime_target)
             .output()
-            .expect("failed to build the LiteInst runtime");
+            .expect("failed to build the LiteInst Detcore tool DSO");
         assert!(
             output.status.success(),
-            "LiteInst runtime build failed:\nstdout:\n{}\nstderr:\n{}",
+            "LiteInst tool DSO build failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        let artifact_profile = if cargo_profile == OsStr::new("dev") {
+            OsStr::new("debug")
+        } else {
+            cargo_profile
+        };
+        let built = runtime_target.join(artifact_profile).join("libhermit.so");
+        std::fs::copy(&built, &runtime).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage LiteInst tool {} as {}: {error}",
+                built.display(),
+                runtime.display()
+            )
+        });
         assert!(
             runtime.is_file(),
-            "standalone LiteInst runtime build did not stage {}",
+            "LiteInst tool build did not stage {}",
             runtime.display(),
         );
     });
