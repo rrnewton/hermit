@@ -40,7 +40,25 @@ use hermit::Error;
 /// that an image layer often omits (busybox, distroless, and `scratch`-derived
 /// images ship no `/proc` or `/sys`). We create them so reverie can mount the
 /// deterministic `/proc` into the chrooted root.
-const REQUIRED_DIRS: &[&str] = &["proc", "sys", "dev", "tmp"];
+const REQUIRED_DIRS: &[&str] = &["proc", "sys", "dev", "tmp", "dev/pts", "dev/shm"];
+
+/// Character devices every ordinary program expects under `/dev`. Without at
+/// least `/dev/null` a plain `sh -c` fails immediately, so an image root with a
+/// bare empty `/dev` is not usable for real workloads.
+///
+/// These are *bind mount targets*, not device nodes: `mknod` of a character
+/// device is refused inside a user namespace (verified: `Operation not
+/// permitted`), which is exactly why podman's runtime bind-mounts the host
+/// nodes rather than creating its own. We pre-create empty placeholder files
+/// here so [`crate::container::image_container`] has something to bind over —
+/// the rootfs is remounted read-only before the guest runs, and a bind mount
+/// needs its target to already exist.
+///
+/// Binding the host's `/dev/random` and `/dev/urandom` does not weaken
+/// determinism: Detcore virtualizes the reads, not the inode. Verified on this
+/// tree — `head -c 16 /dev/urandom` under `hermit run --strict` yields the same
+/// bytes across repeated runs.
+pub(crate) const REQUIRED_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
 
 /// Basename of the captured `Config.Env` file (one `KEY=VALUE` per line).
 const ENV_BASENAME: &str = ".hermit-oci-env";
@@ -256,6 +274,14 @@ mp=$(buildah mount "$cid")
 	chmod u+w {dest}
 	mkdir -p {mkdirs}
 	chmod u+rwx {mkdirs}
+	for dev in {devices}; do
+		# Placeholder bind-mount targets; see REQUIRED_DEVICES. An image may
+		# already ship a real node here, in which case leave it alone.
+		# {dest} is already shell-quoted, so it must NOT be wrapped in further
+		# quotes; only the loop variable needs quoting.
+		[ -e {dest}/dev/"$dev" ] || : > {dest}/dev/"$dev"
+		chmod 0666 {dest}/dev/"$dev" || true
+	done
 	buildah inspect --type image --format '{{{{.OCIv1.Config.WorkingDir}}}}' {ref} > {workdir_file}
 	buildah inspect --type image --format '{{{{range .OCIv1.Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {ref} > {env_file}
 	cp -f {workdir_file} {dest}/{workdir_base}
@@ -265,6 +291,11 @@ mp=$(buildah mount "$cid")
         ref = shell_quote(image_ref),
         dest = shell_quote(&rootfs.to_string_lossy()),
         mkdirs = mkdirs,
+        devices = REQUIRED_DEVICES
+            .iter()
+            .map(|d| shell_quote(d))
+            .collect::<Vec<_>>()
+            .join(" "),
         workdir_file = shell_quote(&workdir_file(&cache).to_string_lossy()),
         env_file = shell_quote(&env_file(&cache).to_string_lossy()),
         workdir_base = WORKDIR_BASENAME,
