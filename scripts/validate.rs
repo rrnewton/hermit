@@ -901,6 +901,12 @@ fn envelope_cli_bracket() -> Result<(), String> {
         if plan.nonblocking.contains("envelope.build") {
             return Err("envelope CLI: the workspace build must stay BLOCKING".into());
         }
+        // The measurement must never be answered from the tree-keyed cache: the
+        // vector is an artifact consumers re-read, and with a baseline the
+        // verdict depends on a file that is not part of the key.
+        if plan.cacheable {
+            return Err("envelope CLI: the envelope profile must NOT be cacheable".into());
+        }
         accepted += 1;
     }
     // Negative: a missing FILE must be refused, not silently defaulted, and the
@@ -1406,6 +1412,18 @@ struct Plan {
     /// Forced on for the envelope profile, whose whole point is to measure every
     /// probe: an eager exit on the first probe failure would truncate the vector.
     force_keep_going: bool,
+    /// May a prior passing record for this tree be reused instead of running?
+    ///
+    /// The tree-keyed cache is only sound when the run is a pure function of the
+    /// tree. The envelope profile is neither: its verdict under
+    /// `--envelope-compare FILE` depends on a BASELINE FILE that is not part of
+    /// the key, and its purpose under `--envelope-only` is to (re)produce the
+    /// `envelope.json` ARTIFACT that `scripts/progress-report.sh` then reads — a
+    /// cache hit would answer a monotonicity question it never asked and leave
+    /// the artifact unwritten. `validate.sh` cached it anyway (its cache gate at
+    /// :655 runs before the `ENVELOPE_MODE` dispatch at :4877, with
+    /// `VALIDATION_PROFILE=envelope-only`); that is a bug, not a contract.
+    cacheable: bool,
 }
 
 struct EnvelopePlan {
@@ -1427,6 +1445,7 @@ impl Default for Plan {
             envelope: None,
             nonblocking: BTreeSet::new(),
             force_keep_going: false,
+            cacheable: true,
         }
     }
 }
@@ -1596,6 +1615,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             envelope: Some(EnvelopePlan { reps, baseline: baseline.clone() }),
             nonblocking,
             force_keep_going: true,
+            cacheable: false,
             ..Default::default()
         });
     }
@@ -2840,7 +2860,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         host: &host,
         toolchain: &toolchain,
     };
-    if !args.ignore_cache && !wt_dirty && !tree_dirty() && plan.selection_mode == "full" {
+    if !args.ignore_cache && plan.cacheable && !wt_dirty && !tree_dirty() && plan.selection_mode == "full" {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
             println!("# ============================================================");
             println!("# validate CACHE HIT for tree {tree}");
@@ -3097,8 +3117,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if envelope_regressed {
         exit_code = 1;
     }
-    if let Some((code, _)) = envelope_error {
-        exit_code = code;
+    if let Some((code, _)) = &envelope_error {
+        exit_code = *code;
     }
 
     // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
@@ -3204,6 +3224,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             "{excused} failing node(s) were NONBLOCKING by policy and excluded from the verdict \
              (see the ratchet lines above for which and why)"
         ));
+    }
+    // A nonzero exit that came from the envelope comparison rather than from a
+    // gate must SAY so: "0 blocking failure(s)" beside exit 2 is unreadable.
+    if envelope_regressed {
+        detail.push(
+            "the working-envelope vector REGRESSED below its baseline (see the monotonicity \
+             table above); no gate failed"
+                .into(),
+        );
+    }
+    if let Some((_, msg)) = &envelope_error {
+        detail.push(format!("envelope comparison could not run: {msg}"));
     }
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(
