@@ -215,7 +215,7 @@ enum Subcommand {
     /// Take the difference of two (run/record) logs written to files.
     LogDiff(LogDiffCLIOpts),
 
-    /// Analyze Pass and failing runs
+    /// Analyze passing and failing runs.
     Analyze(Box<AnalyzeOpts>),
 
     /// Bisect passing and failing schedules to localize a race.

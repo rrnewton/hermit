@@ -63,22 +63,24 @@ normally `~/.cargo/bin`:
 ```bash
 git clone https://github.com/rrnewton/hermit.git
 cd hermit
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
 ```
 
-To build without installing:
+To build without installing, use the lean default. It includes the ptrace,
+KVM, and LiteInst backends and never installs host packages:
 
 ```bash
-cargo build --workspace
+make
 ./target/debug/hermit --version
 ```
 
-An optimized workspace build also assembles every backend runtime into one
-installation staging directory:
+Use `make release-core` for the corresponding optimized binary. Building every
+backend is an explicit operation because DBI, SaBRe, and e9patch require native
+toolchains and runtime artifacts:
 
 ```bash
-cargo build --release
+make build-full
 ./target/install_pkg/hermit --version
 ```
 
@@ -101,9 +103,9 @@ hermit run -- /bin/echo hello
 The `--` separator is recommended so arguments beginning with `-` are passed to
 the guest. The command above prints `hello` and exits with the guest's status.
 
-Hermit's current defaults are strict and deterministic. `--strict` is retained
-as an explicit compatibility spelling for those defaults; it does not enable a
-stronger mode:
+Hermit's defaults enable deterministic scheduling and I/O. Add `--strict` for
+fail-closed execution: the run stops at the first unsupported syscall instead
+of allowing an incomplete determinization to continue:
 
 ```bash
 hermit run --strict -- /bin/echo hello
@@ -317,10 +319,11 @@ Hermit's deterministic ptrace backend should generally be budgeted at roughly
 overhead varies with syscall frequency, thread count, PMU availability, and the
 amount of scheduling and logging enabled.
 
-`--strict` uses the normal deterministic defaults and has the same performance
-profile as a default run. Chaos, verify, record/replay, and analyze modes may
-perform multiple executions or retain additional events, so their total cost
-can be higher. Benchmark your actual workload on the deployment CPU and kernel.
+`--strict` adds fail-closed syscall checks to the normal deterministic defaults;
+its overhead is normally small, but it can stop workloads that rely on an
+unsupported syscall. Chaos, verify, record/replay, and analyze modes may perform
+multiple executions or retain additional events, so their total cost can be
+higher. Benchmark your actual workload on the deployment CPU and kernel.
 
 ## Architecture
 

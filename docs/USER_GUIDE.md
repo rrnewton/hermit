@@ -46,17 +46,20 @@ facilities. Nested containers commonly block namespaces, `ptrace`, seccomp, or
 
 ### Build And Install
 
-From the repository root, build the workspace:
+From the repository root, build the lean development binary. This includes the
+ptrace, KVM, and LiteInst backends and does not install host packages:
 
 ```bash
-cargo build --workspace
+make
 ./target/debug/hermit --version
 ```
 
-The debug executable is `target/debug/hermit`. For an optimized build:
+The debug executable is `target/debug/hermit`. For an optimized lean build, run
+`make release-core`. Building and staging every backend is deliberately
+explicit because DBI, SaBRe, and e9patch need additional native tools:
 
 ```bash
-cargo build --release
+make build-full
 ./target/install_pkg/hermit --version
 ```
 
@@ -81,7 +84,7 @@ To install the current checkout into Cargo's binary directory, normally
 `~/.cargo/bin`:
 
 ```bash
-cargo install --path hermit-cli
+cargo install --locked --path hermit-cli
 hermit --version
 ```
 
@@ -109,9 +112,9 @@ hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
 Both invocations should print the same bytes when the command, inputs, and
 Hermit configuration are unchanged.
 
-Hermit uses strict deterministic execution by default. The explicit
-`--strict` option remains for command-line compatibility but does not make the
-default stricter.
+Hermit enables deterministic scheduling and I/O by default. The explicit
+`--strict` option additionally makes unsupported syscalls fail closed, stopping
+the run rather than continuing with incomplete determinization.
 
 ## Choosing A Mode
 
@@ -384,7 +387,7 @@ reproducible target condition.
 
 | Option | Effect |
 | --- | --- |
-| `--strict` | Compatibility spelling for the current deterministic defaults. |
+| `--strict` | Stop at the first unsupported syscall instead of continuing with incomplete determinization. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Unlisted syscalls bypass Detcore, weakening deterministic accounting. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |

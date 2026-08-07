@@ -31,7 +31,7 @@ use super::tracing::init_stderr_tracing;
 /// outputs from the computation.
 ///
 /// In record mode, inputs (both files and network traffic) are captured
-/// in a content addressible store (CAS).  In this preview version of
+/// in a content-addressed store (CAS). In this preview version of
 /// hermit, the CAS is stored locally in your home directory (~/.hermit).
 ///
 /// Below are options common to all subcommands.
