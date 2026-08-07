@@ -115,6 +115,10 @@ const LEDGER_SCHEMA_VERSION: i64 = 4;
 /// it without inference.
 const LEDGER_PRODUCER: &str = "validate.rs";
 
+/// The Reverie-pin preflight node's tag. Named once so the plan that creates it
+/// and the fail-closed assertion that requires it cannot drift apart.
+const PIN_GATE_TAG: &str = "pre.reverie_pin";
+
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 
@@ -2527,6 +2531,10 @@ struct LedgerCtx {
     cpu_sys: f64,
     /// Retry ROUNDS spent on environmental blocks; `0` for a clean first pass.
     env_block_retries: i64,
+    /// Whether THIS run observed the `pre.reverie_pin` gate pass. Recorded on the
+    /// row itself so a reader never has to infer from a bare `pass` that the
+    /// archival pin was proved current; the receipt verifier keys on it.
+    reverie_pin_current: bool,
     /// libtest counts parsed from the durable log; `None` is UNKNOWN.
     executed_tests: Option<i64>,
     filtered_tests: Option<i64>,
@@ -2642,6 +2650,7 @@ fn write_ledger(
         "git_behind": ctx.git_behind,
         "commit_anchored": ctx.commit_anchored,
         "tree_dirty": ctx.tree_dirty,
+        "reverie_pin_current": ctx.reverie_pin_current,
         "result": result,
         "raw_result": raw_result,
         "exit_code": exit_code,
@@ -3571,6 +3580,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let dirty_now = tree_dirty();
     let commit_anchored = commit != "unknown" && !dirty_now;
+    // Observed, not inferred: did the pin gate actually run and pass in THIS run?
+    let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -3587,6 +3598,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         commit_anchored,
         tree_dirty: dirty_now,
         dag_jobs: jobs,
+        reverie_pin_current: pin_gate_passed,
         concurrent_validates: peak_active,
         concurrency_proof: peak_active.map(|_| "live_flock_registry_cpu_delta"),
         interruption: interruption.clone(),
@@ -3741,6 +3753,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         exit_code = *code;
     }
 
+    // Receipt production is itself an enforcement path (validate.sh:1846).
+    //
+    // Every profile plans `pre.reverie_pin` and every lane node depends on it, so
+    // in principle a green cannot happen without it. This asserts that anyway: if
+    // a future fast path, cache branch, or early return ever bypasses the pin
+    // gate, it must not emit PASS merely because the tests it did select happened
+    // to pass. The archival pin is not a testing exemption, and "the DAG makes it
+    // impossible" is a structural argument, not an observation of this run.
+    let mut pin_gate_bypassed = false;
+    if exit_code == 0 && !pin_gate_passed {
+        eprintln!(
+            "validate: ERROR: this path produced a PASS without a passing {PIN_GATE_TAG} gate; \
+             refusing a passing receipt."
+        );
+        exit_code = 1;
+        pin_gate_bypassed = true;
+    }
+
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
@@ -3829,6 +3859,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+    }
+    if pin_gate_bypassed {
+        detail.push(
+            "this path reached a PASS without a passing pre.reverie_pin gate; the receipt was \
+             REFUSED and the verdict forced to fail (the archival pin is not a testing exemption)"
+                .into(),
+        );
     }
     if env_retries > 0 {
         detail.push(format!(
@@ -3937,6 +3974,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         commit_anchored: false,
         tree_dirty: tree_dirty(),
         dag_jobs: 0,
+        // The fixture runs no gates at all, so it never observed the pin gate.
+        reverie_pin_current: false,
         // The fixture never registers as a top-level driver, so it can neither
         // observe peers nor be counted as one.
         concurrent_validates: None,
