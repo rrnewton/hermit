@@ -3087,9 +3087,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             validate_runtime::ACTIVE_ENV
         );
     }
-    // Claim the marker for our own children AFTER reading it, so diagnostics name
-    // the run we are nested inside rather than ourselves.
-    validate_runtime::claim_active_marker();
+    // The marker is claimed LATER, after the cgroup re-exec -- see the call site
+    // below resolve_cgroups. Claiming it here made the driver REFUSE ITSELF:
+    // resolve_cgroups re-execs into a transient systemd scope for boxing, the
+    // re-exec inherits the environment, and the new process is a genuine
+    // DESCENDANT of the claimer -- so is_ancestor() was true and it read its own
+    // boxing re-exec as a nested run. Measured: a full profile could not start at
+    // all under boxing, refusing with "outer pid <the scope's own parent>" in 0s.
+    // --self-test and --show-plan both missed it because neither re-execs.
+    //
+    // The boxing re-exec is the SAME logical run, not a nested one. Only the
+    // process that survives the re-exec should claim the marker.
     if nesting.nested && args.focused.is_none() {
         let outer = nesting.outer_pid.unwrap_or(-1);
         eprintln!(
@@ -3395,7 +3403,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
 
     let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
-        Ok(c) => c,
+        Ok(c) => {
+            // Claim the re-entrancy marker HERE, not before resolve_cgroups.
+            // On the default path resolve_cgroups re-execs into a transient
+            // systemd scope and does not return, so the process that reaches
+            // this line is the one that will actually drive the run -- and it is
+            // the only one whose pid a nested payload should see. Claiming
+            // earlier made the driver read its own boxing re-exec as a nested
+            // invocation and refuse itself.
+            validate_runtime::claim_active_marker();
+            c
+        }
         Err(code) => {
             return RunSummary::refused(
                 code,
