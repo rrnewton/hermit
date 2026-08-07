@@ -789,21 +789,45 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// True when the tree differs from HEAD in ANY way (staged or not).
+/// Paths excluded from every dirtiness and anchoring judgement.
+///
+/// The ledger shard lives IN the repository, and validate is what writes it. If
+/// it counted as dirt, validate would poison the very tree it just judged: the
+/// next run would refuse on a dirty tree, and the tree hash — the result-cache
+/// key — would change after every run, so a cache could never hit. Validate's own
+/// output is not a source change, so it is excluded here rather than being
+/// gitignored (the shards are meant to be committed and unioned across machines).
+const SELF_OUTPUT_PREFIXES: &[&str] = &[LEDGER_DIR, "ignored/"];
+
+fn is_self_output(path: &str) -> bool {
+    SELF_OUTPUT_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Porcelain entries that are not validate's own output.
+fn foreign_porcelain(args: &[&str]) -> Vec<String> {
+    let Some(out) = sh("git", args) else { return Vec::new() };
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            // `XY path` for --porcelain; a bare path for ls-files.
+            let path = l.get(3..).unwrap_or(l).trim().trim_matches('"');
+            !is_self_output(path)
+        })
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// True when the tree differs from HEAD in any way validate did not itself cause.
 fn tree_dirty() -> bool {
-    sh("git", &["status", "--porcelain"]).is_some()
+    !foreign_porcelain(&["status", "--porcelain"]).is_empty()
 }
 
 /// True when the WORKING TREE proper carries changes `git add` would capture.
 /// This drives the hard gate, because staging or committing is the caller's
 /// escape from it.
 fn worktree_dirty() -> bool {
-    let unstaged = Command::new("git")
-        .args(["diff", "--quiet"])
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(false);
-    unstaged || sh("git", &["ls-files", "--others", "--exclude-standard"]).is_some()
+    let unstaged = !foreign_porcelain(&["diff", "--name-only"]).is_empty();
+    unstaged || !foreign_porcelain(&["ls-files", "--others", "--exclude-standard"]).is_empty()
 }
 
 fn utc_now() -> String {
@@ -1417,6 +1441,45 @@ fn human_duration(secs: f64) -> String {
     }
 }
 
+/// A positive-integer env override, or `None` when unset/empty/invalid.
+fn env_positive(name: &str) -> Option<i64> {
+    let v = std::env::var(name).ok()?;
+    if v.is_empty() {
+        return None;
+    }
+    match v.parse::<i64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            eprintln!("validate: {name}={v:?} is not a positive integer; ignoring");
+            None
+        }
+    }
+}
+
+/// Lower every node's wall ceiling to at most `cap`.
+fn clamp_wall(plan: &mut Plan, cap: i64) {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for s in cfg.steps.iter_mut() {
+            s.timeout = s.timeout.min(cap);
+        }
+    }
+}
+
+/// Lower every node's CPU budget to at most `cap`, including the DAG-level
+/// default that shipped lane nodes inherit.
+fn clamp_cpu(plan: &mut Plan, cap: i64) {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        cfg.default_step_cpu_timeout = if cfg.default_step_cpu_timeout > 0 {
+            cfg.default_step_cpu_timeout.min(cap)
+        } else {
+            cap
+        };
+        for s in cfg.steps.iter_mut() {
+            s.cpu_timeout = if s.cpu_timeout > 0 { s.cpu_timeout.min(cap) } else { cap };
+        }
+    }
+}
+
 // --------------------------------------------------------------------------- interruption
 
 /// Set from a signal handler when the operator stops the run.
@@ -1765,13 +1828,28 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let plan = match build_plan(&root, &args, &tmp) {
+    let mut plan = match build_plan(&root, &args, &tmp) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("validate: cannot build the execution plan: {e}");
             return ExitCode::from(2);
         }
     };
+
+    // Per-gate budget overrides, preserved from validate.sh
+    // (VALIDATE_GATE_TIMEOUT_SECONDS / VALIDATE_GATE_CPU_TIMEOUT_SECONDS). These
+    // LOWER a node's ceiling, never raise it: a caller tightening budgets to
+    // reproduce a timeout must not accidentally loosen a node that already
+    // declared something stricter. They are also how the timeout path is
+    // exercised on demand without waiting for a real runaway.
+    if let Some(cap) = env_positive("VALIDATE_GATE_TIMEOUT_SECONDS") {
+        clamp_wall(&mut plan, cap);
+        eprintln!("validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s");
+    }
+    if let Some(cap) = env_positive("VALIDATE_GATE_CPU_TIMEOUT_SECONDS") {
+        clamp_cpu(&mut plan, cap);
+        eprintln!("validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s");
+    }
 
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
     // while the driver still printed "boxing ACTIVE" — a green verifying less
