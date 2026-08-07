@@ -1677,6 +1677,34 @@ impl<T> ThreadState<T> {
             .map_object(start, len, object, object_offset);
     }
 
+    /// Reserve a canonical guest address for a non-fixed anonymous mmap.
+    pub(crate) fn reserve_anonymous_mmap_address(
+        &self,
+        len: usize,
+        map_32bit: bool,
+    ) -> Option<usize> {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .reserve_anonymous_address(len, map_32bit)
+    }
+
+    /// Release a canonical mmap reservation after the kernel rejected the mapping.
+    pub(crate) fn release_mmap_address_reservation(&self, start: usize, len: usize) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .release_address_reservation(start, len);
+    }
+
+    /// Record a successful mmap range for deterministic collision avoidance.
+    pub(crate) fn map_memory(&self, start: usize, len: usize) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_address(start, len);
+    }
+
     /// Remove a range from the shared mapping model.
     pub(crate) fn unmap_memory(&self, start: usize, len: usize) {
         self.memory_metadata
@@ -1692,11 +1720,12 @@ impl<T> ThreadState<T> {
         old_len: usize,
         new_start: usize,
         new_len: usize,
+        preserve_source: bool,
     ) {
         self.memory_metadata
             .lock()
             .expect("memory metadata mutex poisoned")
-            .remap(old_start, old_len, new_start, new_len);
+            .remap(old_start, old_len, new_start, new_len, preserve_source);
     }
 
     /// Build a singleton resource request from the current thread.

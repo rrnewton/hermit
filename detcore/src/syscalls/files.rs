@@ -39,6 +39,7 @@ use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::memory::checked_page_aligned_len;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
@@ -1380,8 +1381,60 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let len = call.len();
-        let result = self.record_or_replay(guest, call).await?;
+        let flags = call.flags();
+        let fixed = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+        let canonical_request = len != 0
+            && checked_page_aligned_len(len).is_some()
+            && flags.contains(MapFlags::MAP_ANONYMOUS)
+            && !fixed;
+        let canonical_address = if canonical_request {
+            match guest
+                .thread_state()
+                .reserve_anonymous_mmap_address(len, flags.contains(MapFlags::MAP_32BIT))
+            {
+                Some(start) => Some(start),
+                None => return Err(Errno::ENOMEM.into()),
+            }
+        } else {
+            None
+        };
+        // A non-fixed `addr` is only a Linux placement hint. Ignoring it and selecting another
+        // available address is valid mmap behavior and removes backend VMA layout from the
+        // guest-visible result. Exact MAP_FIXED and MAP_FIXED_NOREPLACE requests bypass this.
+        let injected_call = match canonical_address {
+            Some(start) => {
+                let address = Addr::from_raw(start)
+                    .expect("the canonical anonymous mmap arena excludes the null page");
+                call.with_addr(Some(address))
+                    .with_flags(flags | MapFlags::MAP_FIXED_NOREPLACE)
+            }
+            None => call,
+        };
+        let result = match self.record_or_replay(guest, injected_call).await {
+            Ok(result) => result,
+            Err(errno) => {
+                if let Some(start) = canonical_address {
+                    guest
+                        .thread_state()
+                        .release_mmap_address_reservation(start, len);
+                }
+                // In particular, do not turn MAP_FIXED_NOREPLACE/EEXIST into a search through
+                // backend-specific host VMAs. Canonical-arena collision fails closed.
+                return Err(errno.into());
+            }
+        };
         let start = usize::try_from(result).expect("a successful mmap must return an address");
+
+        if let Some(expected) = canonical_address
+            && start != expected
+        {
+            // Linux 4.17+ honors MAP_FIXED_NOREPLACE. Refuse an older kernel that ignored the
+            // flag instead of silently returning a backend-selected address.
+            guest
+                .thread_state()
+                .release_mmap_address_reservation(expected, len);
+            return Err(Errno::EOPNOTSUPP.into());
+        }
 
         guest.thread_state().unmap_memory(start, len);
         match backing {
@@ -1395,6 +1448,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => {}
         }
+        guest.thread_state().map_memory(start, len);
         Ok(result)
     }
 
@@ -1420,12 +1474,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
         let old_len = call.old_len();
         let new_len = call.new_len();
-        let result = self.record_or_replay(guest, call).await?;
+        let flags = call.flags();
+        let may_move = flags & libc::MREMAP_MAYMOVE as usize != 0;
+        let fixed = flags & libc::MREMAP_FIXED as usize != 0;
+        let dont_unmap = flags & libc::MREMAP_DONTUNMAP as usize != 0;
+        let canonical_address = if (new_len > old_len || dont_unmap)
+            && checked_page_aligned_len(new_len).is_some()
+            && may_move
+            && !fixed
+        {
+            match guest
+                .thread_state()
+                .reserve_anonymous_mmap_address(new_len, false)
+            {
+                Some(start) => Some(start),
+                None => return Err(Errno::ENOMEM.into()),
+            }
+        } else {
+            None
+        };
+        let injected_call = match canonical_address {
+            Some(start) => {
+                let address = AddrMut::from_raw(start)
+                    .expect("the canonical anonymous mmap arena excludes the null page");
+                call.with_flags(flags | libc::MREMAP_MAYMOVE as usize | libc::MREMAP_FIXED as usize)
+                    .with_new_addr(Some(address))
+            }
+            None => call,
+        };
+        let result = match self.record_or_replay(guest, injected_call).await {
+            Ok(result) => result,
+            Err(errno) => {
+                if let Some(start) = canonical_address {
+                    guest
+                        .thread_state()
+                        .release_mmap_address_reservation(start, new_len);
+                }
+                return Err(errno.into());
+            }
+        };
         let new_start =
             usize::try_from(result).expect("a successful mremap must return an address");
+        if let Some(expected) = canonical_address
+            && new_start != expected
+        {
+            guest
+                .thread_state()
+                .release_mmap_address_reservation(expected, new_len);
+            return Err(Errno::EOPNOTSUPP.into());
+        }
         guest
             .thread_state()
-            .remap_memory(old_start, old_len, new_start, new_len);
+            .remap_memory(old_start, old_len, new_start, new_len, dont_unmap);
         Ok(result)
     }
 
