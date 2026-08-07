@@ -74,6 +74,7 @@ use std::time::Duration;
 
 pub use config::BlockingMode;
 pub use config::Config;
+pub use config::DirectVvarAccessPolicy;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -98,12 +99,15 @@ use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
 pub use reverie::process::Namespace;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Mprotect;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -256,6 +260,46 @@ fn choose_rcb_timer(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn enforce_direct_vvar_policy<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        match guest.config().direct_vvar_access_policy {
+            DirectVvarAccessPolicy::Absent => {
+                info!("direct-vvar policy: guest mapping absent by backend construction");
+                Ok(())
+            }
+            DirectVvarAccessPolicy::Refuse => {
+                let mappings = procmaps::from_pid(guest.pid(), |mapping| {
+                    matches!(mapping.pathname, procmaps::MMapPath::Vvar)
+                        || matches!(
+                            &mapping.pathname,
+                            procmaps::MMapPath::Other(name) if name.starts_with("vvar_")
+                        )
+                })
+                .map_err(|error| {
+                    error!("direct-vvar policy could not inspect guest mappings: {error}");
+                    Errno::EIO
+                })?;
+
+                for mapping in &mappings {
+                    let result = guest
+                        .inject_with_retry(
+                            Mprotect::new()
+                                .with_addr(AddrMut::from_raw(mapping.address.0 as usize))
+                                .with_len((mapping.address.1 - mapping.address.0) as usize)
+                                .with_protection(ProtFlags::empty()),
+                        )
+                        .await?;
+                    if result != 0 {
+                        error!("direct-vvar policy received nonzero mprotect result {result}");
+                        return Err(Errno::EIO);
+                    }
+                }
+
+                info!("direct-vvar policy: direct reads refused when mappings are present");
+                Ok(())
+            }
+        }
+    }
+
     /// Registers a child whose native backend executed the clone syscall.
     ///
     /// The caller must initialize the child's local thread state from the same
@@ -1353,6 +1397,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
         }
+
+        // Direct loads from Linux's kernel-populated vvar pages never enter a clock syscall, so
+        // they would otherwise bypass every virtual-time policy. Refuse those loads before the
+        // first guest instruction; KVM selects `Absent` because its synthetic guest layout has no
+        // vvar page. This changes access, never the precision or progression of logical time.
+        self.enforce_direct_vvar_policy(guest).await?;
 
         self.post_handler_hook(guest).await;
         Ok(())
