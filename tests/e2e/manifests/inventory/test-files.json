@@ -3089,6 +3089,210 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
       "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
+    },
+    {
+      "path": "tests/e2e/manifests/performance.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "tests/e2e/manifests/performance.toml is owned by ci/test_harness.sh via ci/manifest-plan: The `performance` TOML file declares manual steady-state cells, complete mode/backend partitions, and ci=false recovery policy. It configures the common harness and is not executable test input."
+    },
+    {
+      "path": "tests/e2e/performance/barrier-rounds.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/barrier-rounds.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/condvar-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/condvar-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/epoll-eventfd-ring.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/epoll-eventfd-ring.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/eventfd-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/eventfd-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/fork-wait-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/fork-wait-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/futex-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/futex-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/mmap-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/mmap-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/mutex-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/mutex-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/nanosleep-yield.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/nanosleep-yield.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/pipe-fd-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/pipe-fd-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/pipe-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/pipe-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/poll-pipe-ring.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/poll-pipe-ring.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/rwlock-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/rwlock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/semaphore-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/semaphore-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/sigmask-toggle.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/sigmask-toggle.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/socketpair-roundtrip.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/socketpair-roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/steady_state_common.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e/performance profile wrappers",
+      "why": "tests/e2e/performance/steady_state_common.c is owned by tests/e2e/performance profile wrappers: It holds the shared synchronization, IPC, memory, and syscall workload implementation selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
+    },
+    {
+      "path": "tests/e2e/performance/steady_state_extra.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e/performance profile wrappers",
+      "why": "tests/e2e/performance/steady_state_extra.c is owned by tests/e2e/performance profile wrappers: It holds the second batch of synchronization, descriptor, and process-lifecycle workloads selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
+    },
+    {
+      "path": "tests/e2e/performance/syscall-mix.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/syscall-mix.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/thread-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/thread-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/trylock-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/trylock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/yield-storm.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/yield-storm.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/barrier-yield-rounds.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/barrier-yield-rounds.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/clock-query-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/clock-query-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/condvar-signal-baton.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/condvar-signal-baton.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/dup-close-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/dup-close-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/getrandom-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/getrandom-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/open-read-close-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/open-read-close-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/pipe-nonblock-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/pipe-nonblock-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/rwlock-mixed-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/rwlock-mixed-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/socketpair-dgram-churn.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/socketpair-dgram-churn.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/spin-trylock-contention.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false)",
+      "why": "tests/e2e/performance/spin-trylock-contention.c is owned by ci/test_harness.sh via tests/e2e/manifests/performance.toml (explicit mode selection; ci=false): Steady-state C guest has ptrace verification enabled for explicit runs; blocking CI and other backends remain disabled pending fresh current-head qualification"
+    },
+    {
+      "path": "tests/e2e/performance/steady_state_third.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e/performance profile wrappers",
+      "why": "tests/e2e/performance/steady_state_third.c is owned by tests/e2e/performance profile wrappers: It holds the third batch of descriptor, deterministic syscall, and synchronization workloads selected by each manifest-owned wrapper at compile time. It deliberately has no standalone profile definition and cannot be compiled as an independent test."
     }
   ],
   "schema": 2

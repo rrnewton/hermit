@@ -51,7 +51,7 @@ Filters:
   --test ID               exact category/test ID
   --ci-only               select only cells explicitly marked ci=true
   --prebuilt              require artifacts produced by the build command
-  --allow-empty           permit an empty selection (DAG build/bucket nodes only)
+  --allow-empty           permit an empty build selection (DAG build nodes only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
   --probe-disabled        run one explicitly disabled backend cell; requires exact
@@ -300,6 +300,17 @@ function assert_parallel_portable_workflow {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must derive one e2e matrix from the audited plan"
+    # These are the two live workflow-shaped run consumers. Bind them to the
+    # same parser contract as run_required: the matrix producer is nonempty by
+    # construction, so neither branch may carry the build-only --allow-empty.
+    [[ $(grep -Fxc '              --mode "${{ matrix.mode }}" --ci-only --prebuilt \' "$workflow") == 1 ]] ||
+        die "GitHub portable naked-cell run must use the supported nonempty invocation shape"
+    [[ $(grep -Fxc '              --ci-only --prebuilt \' "$workflow") == 1 ]] ||
+        die "GitHub portable backend-cell run must use the supported nonempty invocation shape"
+    [[ $(grep -Fc -- '--ci-only --allow-empty' "$workflow") == 0 ]] ||
+        die "GitHub portable run consumers must not retain build-only --allow-empty"
+    ! grep -Fq 'e2e cells run with --allow-empty' "$workflow" ||
+        die "GitHub portable workflow retains stale empty-run authority documentation"
     [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
@@ -648,10 +659,26 @@ function dag_critical_path_seconds {
 }
 
 function emit_manifest_buckets {
+    # A run node is an execution authority, so its bucket must contain at least
+    # one cell selected by the exact non-occasional CI plan. Merely having a
+    # discoverable/manual manifest is not sufficient authority to publish a
+    # successful executable node.
+    emit_required_plan | jq -sS '[.[] | {lane,category}] | unique | sort_by(.lane,.category)'
+}
+
+function emit_discoverable_manifest_buckets {
     local test
     for test in "${TESTS[@]}"; do
         metadata_json "$test" | jq -c '{lane,category}'
     done | jq -sS 'unique | sort_by(.lane,.category)'
+}
+
+# This is the run consumer's load-bearing green predicate. Keep the audit
+# brackets and run_required on this one authority: zero selected/executed work
+# is never a qualifying run result, even if a shell command itself returned 0.
+function run_result_qualifies {
+    local selected=$1 executed=$2 recorded=$3 nonpass=$4
+    ((selected > 0 && executed == selected && recorded == executed && nonpass == 0))
 }
 
 function audit_ci_correspondence {
@@ -980,11 +1007,12 @@ function audit_ci_correspondence {
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
         die "invalid E2E denominator ratchet"
-    local scratch current_plan expected_plan all_buckets
+    local scratch current_plan expected_plan all_buckets discoverable_buckets
     scratch=$(mktemp -d)
     current_plan="$scratch/current-plan.json"
     expected_plan="$scratch/expected-plan.json"
     all_buckets="$scratch/manifest-buckets.json"
+    discoverable_buckets="$scratch/discoverable-manifest-buckets.json"
     emit_required_plan | jq -sS 'sort_by(.category,.test,.mode,.backend)' >"$current_plan"
     jq -S '.cells | sort_by(.category,.test,.mode,.backend)' "$EXPECTED_PLAN" >"$expected_plan"
     if ! diff -u "$expected_plan" "$current_plan"; then
@@ -992,13 +1020,23 @@ function audit_ci_correspondence {
         die "required E2E plan changed; update ci/expected-e2e-plan.json in the same review"
     fi
     emit_manifest_buckets >"$all_buckets"
+    emit_discoverable_manifest_buckets >"$discoverable_buckets"
+
+    run_result_qualifies 1 1 1 0 || {
+        rm -rf "$scratch"
+        die "positive run-result bracket failed to qualify selected/executed work"
+    }
+    if run_result_qualifies 0 0 0 0; then
+        rm -rf "$scratch"
+        die "negative run-result bracket treated zero selected/executed work as green"
+    fi
 
     local selectors expected_buckets dag_buckets selected_cells lane_cells
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
         jq -e --arg lane "$lane" '
             def expected_command($m):
-                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
+                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
             ([.steps[] | select(.cmd | startswith("./ci/test_harness.sh run "))] | all(has("manifest")))
             and ([.steps[] | select(has("manifest"))] | all(
                 . as $step
@@ -1027,8 +1065,34 @@ function audit_ci_correspondence {
         cp "$selectors" "$dag_buckets"
         if ! diff -u "$expected_buckets" "$dag_buckets"; then
             rm -rf "$scratch"
-            die "$lane DAG must contain exactly one run node per manifest bucket"
+            die "$lane DAG must contain exactly one run node per CI-selected manifest bucket"
         fi
+
+        # Proxy-binding brackets for the actual DAG consumer. Positive: every
+        # published run-node selector dereferences to at least one exact cell in
+        # the ratcheted CI plan. Negative: every discoverable bucket omitted
+        # from that selected plan is absent from executable run-node selectors.
+        jq -e --arg lane "$lane" --slurpfile selectors "$selectors" '
+            . as $cells
+            | $selectors[0]
+            | all(.[];
+                .category as $category
+                | ([$cells[] | select(.lane == $lane and .category == $category)] | length) > 0)
+        ' "$current_plan" >/dev/null || {
+            rm -rf "$scratch"
+            die "$lane DAG has a run node whose real CI selector executes zero cells"
+        }
+        jq -e --arg lane "$lane" --slurpfile selected "$all_buckets" --slurpfile selectors "$selectors" '
+            [.[] | select(.lane == $lane)
+             | .category as $category
+             | select(($selected[0] | any(.[]; .lane == $lane and .category == $category)) | not)]
+            | all(.[];
+                .category as $category
+                | (($selectors[0] | any(.[]; .category == $category)) | not))
+        ' "$discoverable_buckets" >/dev/null || {
+            rm -rf "$scratch"
+            die "$lane manual-only bucket was exposed as a green executable run node"
+        }
 
         jq -S --arg lane "$lane" --slurpfile selectors "$selectors" '
             [.[] as $cell
@@ -1063,7 +1127,7 @@ function audit_ci_correspondence {
           privileged_critical_path_seconds:$privileged_critical_path_seconds,
           e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
           privileged_fingerprint:$privileged_fingerprint,
-          correspondence:"validated exact workflow/validate entrypoints, one DAG node per manifest bucket, and exact aggregate cells"}'
+          correspondence:"validated exact workflow/validate entrypoints, one nonempty DAG node per CI-selected manifest bucket, and exact aggregate cells"}'
 }
 
 # Enforce that the committed CI DAG stays in correspondence with the e2e test
@@ -1096,7 +1160,7 @@ function validate_dag_correspondence {
                 die "ci/dag/$lane.json: dependency '$dep_id' names no node (node removed or renamed?)"
         done < <(jq -r '.steps[] | (.deps // [])[]' "$dag" | LC_ALL=C sort -u)
 
-        # --- (2) e2e run-nodes must correspond to the planned cells. ---
+        # --- (2) e2e run-nodes must correspond to nonempty planned cells. ---
         # The e2e.metadata gate node (which runs this very `validate`) must exist.
         jq -e '[.steps[]
                 | select(.group == "e2e" and .job == "metadata"
@@ -1125,18 +1189,18 @@ function validate_dag_correspondence {
 
         if [[ $expected != "$actual" ]]; then
             {
-                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane manifest buckets."
-                echo "  manifest categories: $expected"
+                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to nonempty $lane CI buckets."
+                echo "  selected categories: $expected"
                 echo "  DAG run-node cats  : $actual"
                 comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
                     sed 's/^/  MISSING from DAG (node deleted or renamed?): /'
                 comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
                     sed 's/^/  EXTRA in DAG (no such manifest bucket): /'
             } >&2
-            die "DAG/manifest-bucket correspondence mismatch for lane $lane"
+            die "DAG/nonempty-CI-bucket correspondence mismatch for lane $lane"
         fi
     done
-    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the manifest buckets with no dangling deps"
+    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) exposes only nonempty CI-selected buckets with no dangling deps"
 }
 
 LANE_FILTER=
@@ -1184,9 +1248,7 @@ function parse_options {
         case $subcommand in
             build) [[ -n $LANE_FILTER || -n $CATEGORY_FILTER ]] ||
                 die "build --allow-empty requires an explicit --lane or --category" ;;
-            run) [[ -n $CATEGORY_FILTER ]] ||
-                die "run --allow-empty requires an explicit --category" ;;
-            *) die "--allow-empty is accepted by build and run only" ;;
+            *) die "--allow-empty is accepted by build only; an empty run is NO_RESULT, never green" ;;
         esac
     fi
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
@@ -1854,7 +1916,7 @@ function run_required {
     mkdir -p "$(dirname "$RESULTS")"
     : >"$RESULTS"
 
-    local planned test_id mode backend test metadata failures=0 selected=0
+    local planned test_id mode backend test metadata selected=0 executed=0 recorded=0 nonpass=0
     if ((PROBE_DISABLED)); then
         planned=$(emit_gap_plan)
     else
@@ -1865,20 +1927,27 @@ function run_required {
         selected=$((selected + 1))
         test=${TEST_BY_ID[$test_id]}
         metadata=$(metadata_json "$test")
-        run_cell "$test" "$metadata" "$mode" "$backend" || failures=$((failures + 1))
+        run_cell "$test" "$metadata" "$mode" "$backend" || :
+        executed=$((executed + 1))
     done < <(jq -r '[.test,.mode,(.backend // "")] | @tsv' <<<"$planned")
 
-    ((selected > 0)) || ((ALLOW_EMPTY == 1)) || die "filters selected no required test cells"
+    ((selected > 0)) || die "filters selected no required test cells (NO_RESULT)"
+    ((executed == selected)) || die "run execution shortfall: selected=$selected executed=$executed"
+    recorded=$(jq -s 'length' "$RESULTS")
+    nonpass=$(jq -s '[.[] | select(.outcome != "PASS")] | length' "$RESULTS")
     write_junit
-    jq -s '{schema:1,tests:(map(.test)|unique|length),cells:length,
+    jq -s --argjson selected "$selected" --argjson executed "$executed" --argjson recorded "$recorded" \
+        '{schema:1,selected:$selected,executed:$executed,recorded:$recorded,tests:(map(.test)|unique|length),cells:length,
         passed:(map(select(.outcome=="PASS"))|length),
         failed:(map(select(.outcome=="FAIL"))|length),
         errors:(map(select(.outcome=="ERROR"))|length),
+        qualifying_green:($selected > 0 and $executed == $selected and $recorded == $executed
+            and (map(select(.outcome=="FAIL" or .outcome=="ERROR"))|length) == 0),
         by_mode:(group_by(.mode)|map({key:.[0].mode,value:{cells:length,passed:(map(select(.outcome=="PASS"))|length)}})|from_entries)}' \
         "$RESULTS" >"$(dirname "$RESULTS")/summary.json"
     echo "Results: $RESULTS"
     echo "JUnit:  $JUNIT"
-    ((failures == 0))
+    run_result_qualifies "$selected" "$executed" "$recorded" "$nonpass"
 }
 
 subcommand=${1:-}

@@ -387,8 +387,7 @@ jobs:
           # ignored/e2e/build is created lazily by `test_harness.sh build` only
           # when at least one guest fixture stages; on trees that stage none it
           # never exists and `tar` would abort with "Cannot stat". Materialize an
-          # empty dir so the pack is robust — e2e cells run with --allow-empty and
-          # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
+          # empty dir so the pack is robust when no guest fixture needs staging.
           mkdir -p ignored/e2e/build
           test -f target/debug/deps/libdetcore_dbi.so
           # Cargo test shards may rewrite target/debug/deps. Keep the DBI runtime
@@ -693,12 +692,12 @@ jobs:
           out="ignored/e2e/portable/${{ matrix.slug }}"
           if [[ "${{ matrix.backend }}" == "naked" ]]; then
             ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
-              --mode "${{ matrix.mode }}" --ci-only --allow-empty --prebuilt \
+              --mode "${{ matrix.mode }}" --ci-only --prebuilt \
               --results "$out/results.jsonl" --junit "$out/junit.xml"
           else
             ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
               --mode "${{ matrix.mode }}" --backend "${{ matrix.backend }}" \
-              --ci-only --allow-empty --prebuilt \
+              --ci-only --prebuilt \
               --results "$out/results.jsonl" --junit "$out/junit.xml"
           fi
       - name: Pack deterministic parity transport archive
