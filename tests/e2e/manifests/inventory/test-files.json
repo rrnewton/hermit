@@ -14,6 +14,12 @@
     },
     {
       "disposition": "special-driver",
+      "path": "tests/backend-parity/classify_emission.py",
+      "runner": "backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output)",
+      "why": "tests/backend-parity/classify_emission.py is owned by backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output): Standalone census driver that runs every backend-parity C fixture under hermit, caches each fixture's complete stdout, stderr, and exit status to a file, and classifies the emission shape in Python so that no shell pipeline and no truncation can participate in the count. It exists because this census was re-derived by hand three times and produced three irreconcilable denominators, twice from method failures (a head -2 that truncated multi-line output, and a grep pipeline that classified the same input differently inside a loop). Fixtures must run under hermit rather than natively, because the refusal fixtures bail before their emit path when the syscall is allowed to succeed. It stays a manual driver rather than a manifest-plan program because it observes the fixture family as a whole rather than executing one program."
+    },
+    {
+      "disposition": "special-driver",
       "path": "tests/backend-parity/e9patch_corpus.py",
       "runner": "e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI)",
       "why": "tests/backend-parity/e9patch_corpus.py is owned by e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI): Standalone driver that compiles each freestanding corpus guest, rewrites it with e9tool, and enforces exit-status and stdout parity, golden and e9patch L2, full direct-AOT coverage with mapped==candidate, no SIGILL fallback with b0==0, and a guest-syscall DETLOG tail-match against golden ptrace. It needs e9tool and a hermit built --features e9patch, both absent in CI, so it is BLOCKED there like the KVM /dev/kvm gate rather than a manifest-plan program."
