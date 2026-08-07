@@ -31,6 +31,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -39,6 +40,7 @@ use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::MapsSanitizeError;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
@@ -59,6 +61,17 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+/// Refuse a maps read instead of returning any unsanitized host inode. The
+/// typed cause is logged without raw inode data, while the guest receives a
+/// visible, deterministic EIO and can take its normal error path.
+fn reject_unsanitized_maps(error: MapsSanitizeError) -> Error {
+    error!(
+        error = %error,
+        "refusing /proc/<pid>/maps snapshot that could not be fully sanitized"
+    );
+    Error::Errno(Errno::EIO)
+}
 
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
@@ -459,7 +472,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_maps_inodes())?;
         let mut maps_inodes = Vec::new();
         if needs_maps_inodes {
-            for raw_inode in crate::procfs::maps_raw_inodes(&contents) {
+            for raw_inode in
+                crate::procfs::maps_raw_inodes(&contents).map_err(reject_unsanitized_maps)?
+            {
                 let virtual_inode = determinize_inode(guest, raw_inode).await.0;
                 maps_inodes.push((raw_inode, virtual_inode));
             }
@@ -471,7 +486,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
         let random_uuid =
             needs_random_uuid.then(|| guest.thread_state_mut().thread_prng().random::<[u8; 16]>());
-        guest.thread_state().with_detfd(call.fd(), |detfd| {
+        let initialize_result = guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
@@ -485,8 +500,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     random_uuid,
                     maps_inodes: maps_inodes.clone(),
                 },
-            );
+            )
         })?;
+        initialize_result.map_err(reject_unsanitized_maps)?;
         Ok(())
     }
 
@@ -2672,6 +2688,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod test {
     use nix::fcntl::OFlag;
+    use reverie::Error;
+    use reverie::syscalls::Errno;
 
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
@@ -2679,6 +2697,15 @@ mod test {
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use crate::fd::FdType;
+    use crate::procfs::MapsSanitizeError;
+
+    #[test]
+    fn unsanitized_maps_is_visible_to_the_guest_as_eio() {
+        assert!(matches!(
+            super::reject_unsanitized_maps(MapsSanitizeError::MalformedRow { line: 1 }),
+            Error::Errno(Errno::EIO)
+        ));
+    }
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.

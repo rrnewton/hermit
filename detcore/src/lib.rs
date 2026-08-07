@@ -147,6 +147,21 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// Successful address-space mutations end the lifetime of every cached
+/// `/proc/<pid>/maps` scan in this process. Include pass-through mutations as
+/// well as Detcore's modeled mmap family.
+fn syscall_invalidates_procfs_maps(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::mmap
+            | Sysno::munmap
+            | Sysno::mremap
+            | Sysno::mprotect
+            | Sysno::brk
+            | Sysno::pkey_mprotect
+    )
+}
+
 /// Returns whether `sysno` is a kernel-keyring syscall (`add_key`,
 /// `request_key`, `keyctl`) that Detcore hides behind a deterministic
 /// `CONFIG_KEYS`-absent boundary under strict mode.
@@ -825,10 +840,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::pread64,
                 Sysno::lseek,
                 Sysno::fadvise64,
+                Sysno::brk,
                 Sysno::mmap,
                 Sysno::madvise,
                 Sysno::munmap,
                 Sysno::mremap,
+                Sysno::mprotect,
+                Sysno::pkey_mprotect,
                 Sysno::fcntl,
                 Sysno::arch_prctl,
                 Sysno::ioctl,
@@ -2267,6 +2285,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         };
 
+        if res.is_ok() && syscall_invalidates_procfs_maps(call.number()) {
+            guest.thread_state().invalidate_procfs_maps_snapshots();
+        }
+
         detlog!(
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
             dettid,
@@ -2427,6 +2449,29 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::pidfd_open)
         );
+    }
+
+    #[test]
+    fn passthru_opt_intercepts_every_maps_mutation() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        for expected in [
+            Sysno::mmap,
+            Sysno::munmap,
+            Sysno::mremap,
+            Sysno::mprotect,
+            Sysno::brk,
+            Sysno::pkey_mprotect,
+        ] {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|actual| actual == expected),
+                "passthru-opt omitted maps mutation {expected:?}"
+            );
+            assert!(syscall_invalidates_procfs_maps(expected));
+        }
+        assert!(!syscall_invalidates_procfs_maps(Sysno::read));
     }
 }
 

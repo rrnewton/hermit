@@ -596,7 +596,11 @@ impl ProcfsFile {
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
-    pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
+    pub(crate) fn initialize(
+        &mut self,
+        contents: Vec<u8>,
+        context: ProcfsSnapshotContext,
+    ) -> Result<(), MapsSanitizeError> {
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
             virtual_realtime_seconds,
@@ -608,7 +612,7 @@ impl ProcfsFile {
             random_uuid,
             maps_inodes,
         } = context;
-        self.contents = Some(match &self.kind {
+        let normalized = match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
                 sanitize_status(&contents, Some((virtual_pid, virtual_pid, virtual_ppid)))
@@ -662,7 +666,7 @@ impl ProcfsFile {
             ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
-            ProcfsKind::Maps => sanitize_maps(&contents, &maps_inodes),
+            ProcfsKind::Maps => sanitize_maps(&contents, &maps_inodes)?,
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
@@ -699,7 +703,19 @@ impl ProcfsFile {
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
             ),
-        });
+        };
+        self.contents = Some(normalized);
+        Ok(())
+    }
+
+    /// Discard a maps snapshot after the address space changes. The logical
+    /// open-file cursor is deliberately retained: aliases still share the same
+    /// Linux open file description, and a subsequent rewind/read starts a new
+    /// live scan without silently rewinding the guest's fd.
+    pub(crate) fn invalidate_maps_snapshot(&mut self) {
+        if self.kind == ProcfsKind::Maps {
+            self.contents = None;
+        }
     }
 
     /// Returns the next bytes from the normalized snapshot.
@@ -2594,23 +2610,69 @@ fn maps_row_inode_span(line: &str) -> Option<(Range<usize>, u64)> {
     None
 }
 
+/// A `/proc/<pid>/maps` snapshot that cannot be fully sanitized must never be
+/// returned to the guest: doing so would re-expose every raw host inode in the
+/// file. The error deliberately carries shape/location information but no raw
+/// inode value, so even the diagnostic does not become another host-identity
+/// channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MapsSanitizeError {
+    NonUtf8,
+    MalformedRow {
+        line: usize,
+    },
+    MissingInodeMapping {
+        line: usize,
+    },
+    InodeFieldTooNarrow {
+        line: usize,
+        available: usize,
+        required: usize,
+    },
+}
+
+impl std::fmt::Display for MapsSanitizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonUtf8 => write!(formatter, "maps snapshot is not valid UTF-8"),
+            Self::MalformedRow { line } => {
+                write!(
+                    formatter,
+                    "maps snapshot has an unparseable row at line {line}"
+                )
+            }
+            Self::MissingInodeMapping { line } => write!(
+                formatter,
+                "maps snapshot has an undeterminized nonzero inode at line {line}"
+            ),
+            Self::InodeFieldTooNarrow {
+                line,
+                available,
+                required,
+            } => write!(
+                formatter,
+                "maps inode field at line {line} has width {available}, needs {required}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MapsSanitizeError {}
+
 /// Every distinct nonzero raw inode named by a `/proc/<pid>/maps` snapshot, in
 /// order of first appearance. Zero means "no backing file" and is already
 /// deterministic, so it is not determinized.
-pub(crate) fn maps_raw_inodes(contents: &[u8]) -> Vec<u64> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
+pub(crate) fn maps_raw_inodes(contents: &[u8]) -> Result<Vec<u64>, MapsSanitizeError> {
+    let text = std::str::from_utf8(contents).map_err(|_| MapsSanitizeError::NonUtf8)?;
     let mut inodes: Vec<u64> = Vec::new();
-    for line in text.lines() {
-        if let Some((_, inode)) = maps_row_inode_span(line)
-            && inode != 0
-            && !inodes.contains(&inode)
-        {
+    for (index, line) in text.lines().enumerate() {
+        let (_, inode) =
+            maps_row_inode_span(line).ok_or(MapsSanitizeError::MalformedRow { line: index + 1 })?;
+        if inode != 0 && !inodes.contains(&inode) {
             inodes.push(inode);
         }
     }
-    inodes
+    Ok(inodes)
 }
 
 /// Replace host inode numbers in `/proc/<pid>/maps` with their determinized
@@ -2632,42 +2694,46 @@ pub(crate) fn maps_raw_inodes(contents: &[u8]) -> Vec<u64> {
 /// The pathname column is preserved: the width difference is absorbed by the
 /// padding the kernel already emits, so line lengths, read offsets and chunk
 /// boundaries are untouched.
-fn sanitize_maps(contents: &[u8], inode_map: &[(u64, u64)]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
+fn sanitize_maps(contents: &[u8], inode_map: &[(u64, u64)]) -> Result<Vec<u8>, MapsSanitizeError> {
+    let text = std::str::from_utf8(contents).map_err(|_| MapsSanitizeError::NonUtf8)?;
     let mut normalized = Vec::with_capacity(contents.len());
     let mut rows = 0;
 
-    for line in text.split_inclusive('\n') {
+    for (index, line) in text.split_inclusive('\n').enumerate() {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
 
-        // A row we cannot parse is a shape we do not model. Return the file
-        // byte-identical rather than half-normalizing it.
-        let Some((span, raw_inode)) = maps_row_inode_span(body) else {
-            return contents.to_vec();
-        };
+        let (span, raw_inode) =
+            maps_row_inode_span(body).ok_or(MapsSanitizeError::MalformedRow { line: index + 1 })?;
         rows += 1;
 
-        let virtual_inode = inode_map
-            .iter()
-            .find_map(|(host, virtualized)| (*host == raw_inode).then_some(*virtualized))
-            .unwrap_or(raw_inode);
+        let virtual_inode = if raw_inode == 0 {
+            0
+        } else {
+            inode_map
+                .iter()
+                .find_map(|(host, virtualized)| (*host == raw_inode).then_some(*virtualized))
+                .ok_or(MapsSanitizeError::MissingInodeMapping { line: index + 1 })?
+        };
         let replacement = virtual_inode.to_string();
 
         let bytes = body.as_bytes();
         let trailing = &bytes[span.end..];
         let padding = trailing.iter().take_while(|byte| **byte == b' ').count();
         let pathname = &trailing[padding..];
-        // Keep the pathname where the kernel put it by spending the freed (or
-        // borrowed) width on the padding run. Never collapse the separator to
-        // nothing when a pathname follows.
+        // Keep the pathname where the kernel put it by spending the freed width
+        // on the padding run. A replacement that cannot fit is an error rather
+        // than permission to grow the row and shift chunk/read offsets.
         let field_width = (span.end - span.start) + padding;
-        let mut keep = field_width.saturating_sub(replacement.len());
-        if keep == 0 && !pathname.is_empty() {
-            keep = 1;
+        let required = replacement.len() + usize::from(!pathname.is_empty());
+        if required > field_width {
+            return Err(MapsSanitizeError::InodeFieldTooNarrow {
+                line: index + 1,
+                available: field_width,
+                required,
+            });
         }
+        let keep = field_width - replacement.len();
 
         normalized.extend_from_slice(&bytes[..span.start]);
         normalized.extend_from_slice(replacement.as_bytes());
@@ -2680,9 +2746,10 @@ fn sanitize_maps(contents: &[u8], inode_map: &[(u64, u64)]) -> Vec<u8> {
     }
 
     if rows == 0 {
-        contents.to_vec()
+        Ok(contents.to_vec())
     } else {
-        normalized
+        debug_assert_eq!(normalized.len(), contents.len());
+        Ok(normalized)
     }
 }
 
@@ -3744,7 +3811,7 @@ mod tests {
 
     #[test]
     fn maps_inode_is_replaced_by_its_determinized_value() {
-        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]).unwrap();
         let text = std::str::from_utf8(&out).unwrap();
         assert!(
             !text.contains("314404"),
@@ -3760,7 +3827,7 @@ mod tests {
 
     #[test]
     fn maps_sanitizing_drops_no_row_and_no_guest_data() {
-        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]).unwrap();
         let text = std::str::from_utf8(&out).unwrap();
         assert_eq!(text.lines().count(), 3);
         // Every address, permission and pathname is preserved verbatim.
@@ -3778,7 +3845,7 @@ mod tests {
 
     #[test]
     fn maps_sanitizing_keeps_the_pathname_column() {
-        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]).unwrap();
         let original = std::str::from_utf8(MAPS_SAMPLE).unwrap();
         let text = std::str::from_utf8(&out).unwrap();
         for (before, after) in original.lines().zip(text.lines()) {
@@ -3799,7 +3866,7 @@ mod tests {
     fn maps_anonymous_zero_inode_is_left_alone() {
         // Zero means "no backing file"; it is already deterministic and must
         // not be rewritten into some virtual object.
-        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]).unwrap();
         let text = std::str::from_utf8(&out).unwrap();
         let heap = text.lines().find(|line| line.contains("[heap]")).unwrap();
         assert_eq!(heap.split_whitespace().nth(4), Some("0"));
@@ -3807,26 +3874,95 @@ mod tests {
 
     #[test]
     fn maps_raw_inodes_collects_distinct_nonzero_values_in_order() {
-        assert_eq!(maps_raw_inodes(MAPS_SAMPLE), vec![314404, 6029325]);
+        assert_eq!(maps_raw_inodes(MAPS_SAMPLE).unwrap(), vec![314404, 6029325]);
         // Repeats collapse; a memfd is mapped twice (r-x and rw-).
         let repeated = b"00380000-00400000 r-xs 00000000 00:01 42  /memfd:x\n\
                          00400000-00480000 rw-s 00000000 00:01 42  /memfd:x\n";
-        assert_eq!(maps_raw_inodes(repeated), vec![42]);
+        assert_eq!(maps_raw_inodes(repeated).unwrap(), vec![42]);
     }
 
     #[test]
-    fn maps_with_an_unparseable_row_is_returned_unchanged() {
-        // Fail closed: never half-normalize a shape we do not model.
+    fn maps_with_an_unparseable_row_fails_closed() {
         let malformed = b"this is not a maps row\n";
-        assert_eq!(sanitize_maps(malformed, &[(1, 2)]), malformed.to_vec());
+        let expected = MapsSanitizeError::MalformedRow { line: 1 };
+        assert_eq!(maps_raw_inodes(malformed), Err(expected.clone()));
+        assert_eq!(sanitize_maps(malformed, &[(1, 2)]), Err(expected));
     }
 
     #[test]
-    fn maps_without_a_determinized_entry_keeps_its_raw_inode() {
-        // An inode we were not given a mapping for must pass through rather
-        // than silently becoming zero or being dropped.
-        let out = sanitize_maps(MAPS_SAMPLE, &[]);
-        assert_eq!(out, MAPS_SAMPLE.to_vec());
+    fn maps_without_a_determinized_entry_fails_closed() {
+        assert_eq!(
+            sanitize_maps(MAPS_SAMPLE, &[]),
+            Err(MapsSanitizeError::MissingInodeMapping { line: 1 })
+        );
+    }
+
+    #[test]
+    fn maps_non_utf8_content_fails_closed() {
+        assert_eq!(maps_raw_inodes(b"\xff\n"), Err(MapsSanitizeError::NonUtf8));
+        assert_eq!(
+            sanitize_maps(b"\xff\n", &[]),
+            Err(MapsSanitizeError::NonUtf8)
+        );
+    }
+
+    #[test]
+    fn maps_replacement_that_cannot_preserve_width_fails_closed() {
+        let narrow = b"1-2 r--p 0 0:0 1 /x\n";
+        assert_eq!(
+            sanitize_maps(narrow, &[(1, u64::MAX)]),
+            Err(MapsSanitizeError::InodeFieldTooNarrow {
+                line: 1,
+                available: 2,
+                required: 21,
+            })
+        );
+    }
+
+    #[test]
+    fn real_maps_rows_preserve_width_with_maximum_virtual_inode() {
+        let input = std::fs::read("/proc/self/maps").unwrap();
+        let raw_inodes = maps_raw_inodes(&input).unwrap();
+        assert!(!raw_inodes.is_empty());
+        let inode_map = raw_inodes
+            .into_iter()
+            .map(|inode| (inode, u64::MAX))
+            .collect::<Vec<_>>();
+        let output = sanitize_maps(&input, &inode_map).unwrap();
+
+        let before = std::str::from_utf8(&input).unwrap().lines();
+        let after = std::str::from_utf8(&output).unwrap().lines();
+        let mut rows = 0;
+        for (original, sanitized) in before.zip(after) {
+            rows += 1;
+            assert_eq!(original.len(), sanitized.len(), "row {rows} changed width");
+            assert_eq!(
+                original.find('/').or_else(|| original.find('[')),
+                sanitized.find('/').or_else(|| sanitized.find('[')),
+                "row {rows} moved its pathname"
+            );
+        }
+        assert!(rows > 0);
+        assert_eq!(input.len(), output.len());
+    }
+
+    #[test]
+    fn maps_snapshot_invalidation_preserves_the_open_file_cursor() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/maps")).unwrap();
+        file.initialize(
+            MAPS_SAMPLE.to_vec(),
+            ProcfsSnapshotContext {
+                maps_inodes: vec![(314404, 7), (6029325, 8)],
+                ..ProcfsSnapshotContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(file.take(7).unwrap().len(), 7);
+        assert_eq!(file.position().0, 7);
+
+        file.invalidate_maps_snapshot();
+        assert!(file.needs_snapshot());
+        assert_eq!(file.position(), (7, None));
     }
 
     #[test]
@@ -4347,7 +4483,8 @@ mod tests {
                 virtual_ppid: 98,
                 ..ProcfsSnapshotContext::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             file.take(usize::MAX).unwrap(),
             b"Tgid:\t3\nPid:\t4\nPPid:\t1\nNStgid:\t3\nNSpid:\t4\n"
@@ -5121,7 +5258,8 @@ total_commit_ms 0\n"
                 virtual_ppid: 1,
                 ..ProcfsSnapshotContext::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
@@ -5136,7 +5274,8 @@ total_commit_ms 0\n"
                 virtual_pid: 1,
                 ..ProcfsSnapshotContext::default()
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(file.take(2).unwrap(), b"0\t");
         assert_eq!(file.take_at(4, 1).unwrap(), b"9");

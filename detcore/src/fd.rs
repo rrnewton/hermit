@@ -21,6 +21,7 @@ use nix::fcntl::OFlag;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::procfs::MapsSanitizeError;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::resources::ResourceID;
@@ -356,12 +357,24 @@ impl DetFd {
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
-    pub(crate) fn initialize_procfs(&self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
+    pub(crate) fn initialize_procfs(
+        &self,
+        contents: Vec<u8>,
+        context: ProcfsSnapshotContext,
+    ) -> Result<(), MapsSanitizeError> {
         self.description()
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, context);
+            .initialize(contents, context)
+    }
+
+    /// Invalidate the maps snapshot shared by all dup/fork aliases while
+    /// retaining their shared logical cursor.
+    pub(crate) fn invalidate_procfs_maps_snapshot(&self) {
+        if let Some(procfs) = self.description().procfs.as_mut() {
+            procfs.invalidate_maps_snapshot();
+        }
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.
@@ -574,13 +587,15 @@ mod tests {
             OpenFileId::new(owner, 0),
         );
         original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
-        original.initialize_procfs(
-            b"15\t0\t1000\n".to_vec(),
-            ProcfsSnapshotContext {
-                virtual_pid: 1,
-                ..ProcfsSnapshotContext::default()
-            },
-        );
+        original
+            .initialize_procfs(
+                b"15\t0\t1000\n".to_vec(),
+                ProcfsSnapshotContext {
+                    virtual_pid: 1,
+                    ..ProcfsSnapshotContext::default()
+                },
+            )
+            .unwrap();
         let duplicate = original.clone().with_fd(4);
 
         assert_eq!(original.take_procfs(2).unwrap(), b"0\t");

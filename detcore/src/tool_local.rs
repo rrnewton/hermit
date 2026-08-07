@@ -346,6 +346,12 @@ impl FileMetadata {
         self.file_handles.values().any(DetFd::is_loopback_peer)
     }
 
+    fn invalidate_procfs_maps_snapshots(&self) {
+        for detfd in self.file_handles.values() {
+            detfd.invalidate_procfs_maps_snapshot();
+        }
+    }
+
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         Self {
             files_id: FilesId::forked(child),
@@ -1775,6 +1781,14 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
+    }
+
+    /// Discard every cached maps scan owned by this process. FileMetadata is
+    /// process-shared, while each DetFd retains open-file-description sharing,
+    /// so this reaches every open fd and all of its aliases exactly where the
+    /// Linux address-space mutation becomes visible.
+    pub(crate) fn invalidate_procfs_maps_snapshots(&self) {
+        self.metadata().invalidate_procfs_maps_snapshots();
     }
 
     /// Whether this task owns a socket that attempted a loopback connection.
