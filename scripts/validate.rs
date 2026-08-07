@@ -2960,13 +2960,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let short = sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
         let vector = validate_envelope::score(&outcomes, env.reps, &short);
         let json_file = validate_envelope::json_path(&root);
-        match serde_json::to_string(&vector) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&json_file, format!("{text}\n")) {
-                    eprintln!("validate: warning: cannot write {}: {e}", json_file.display());
-                }
-            }
-            Err(e) => eprintln!("validate: warning: cannot serialize the envelope vector: {e}"),
+        let text = validate_envelope::to_ordered_json(&vector);
+        if let Err(e) = std::fs::write(&json_file, format!("{text}\n")) {
+            eprintln!("validate: warning: cannot write {}: {e}", json_file.display());
         }
         validate_envelope::print_summary(&vector, env.reps, &json_file);
         if let Some(baseline) = &env.baseline {
