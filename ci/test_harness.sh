@@ -676,12 +676,36 @@ function audit_ci_correspondence {
         die "DBI wrapper must select the explicit portable child-budget mode"
     [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
         die "DBI wrapper must bind its calibration through the canonical local-pin verifier"
-    [[ $(grep -Fc '6144323c5dab8b521278fce206f8774360c2b05f' "$budget_wrapper") == 1 ]] ||
-        die "DBI wrapper must name exactly one calibrated Reverie pin"
-    [[ $(grep -Fc '6144323c5dab8b521278fce206f8774360c2b05f' "$budget_config") == 2 ]] ||
-        die "DBI derivation must independently require and diagnose the calibrated Reverie pin"
+    # The calibrated identity lives in exactly one record, and neither consumer
+    # may carry a Reverie SHA of its own. A hardcoded pin here is the defect
+    # this binding exists to remove: the pin changed six times while the
+    # DynamoRIO recipe it stood for changed none.
+    local budget_calibration="$ROOT_DIR/ci/reverie-dbi-budget-calibration.env"
+    [[ -f $budget_calibration ]] ||
+        die "DBI budget calibration record must exist"
+    [[ $(grep -cE '\b[0-9a-f]{40}\b' "$budget_wrapper") == 0 ]] ||
+        die "DBI wrapper must not hardcode any Reverie SHA; the calibration record owns it"
+    [[ $(grep -cE '\b[0-9a-f]{40}\b' "$budget_config") == 0 ]] ||
+        die "DBI derivation must not hardcode any Reverie SHA; the calibration record owns it"
+    for consumer in "$budget_wrapper" "$budget_config"; do
+        [[ $(grep -Fc 'reverie-dbi-budget-calibration.env' "$consumer") -ge 1 ]] ||
+            die "DBI budget consumer $consumer must source the single calibration record"
+        [[ $(grep -Fc 'reverie_dbi_budget_pin_is_calibrated' "$consumer") == 1 ]] ||
+            die "DBI budget consumer $consumer must derive through the shared predicate"
+    done
+    # Both directions of the predicate, so a version that refuses everything
+    # cannot pass: the calibrated pin is accepted and a well-shaped
+    # non-calibrated one is refused.
+    (
+        # shellcheck source=ci/reverie-dbi-budget-calibration.env
+        source "$budget_calibration"
+        reverie_dbi_budget_pin_is_calibrated "$REVERIE_DBI_CALIBRATED_PIN" >/dev/null ||
+            die "calibration predicate must ACCEPT its own calibrated pin (positive bracket)"
+        ! reverie_dbi_budget_pin_is_calibrated 0000000000000000000000000000000000000000 2>/dev/null ||
+            die "calibration predicate must REFUSE an uncalibrated pin (negative bracket)"
+    ) || return 1
     # shellcheck disable=SC2016
-    local budget_record='reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}'
+    local budget_record='reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:$REVERIE_DBI_CALIBRATED_BASIS,binding:$REVERIE_DBI_BUDGET_BINDING,carried-to-pin-on-dynamorio-recipe-key:$REVERIE_DBI_CALIBRATED_RECIPE_KEY}'
     [[ $(grep -Fc "$budget_record" "$budget_wrapper") == 1 ]] ||
         die "DBI child wrapper must log the pin and every derivation condition"
 

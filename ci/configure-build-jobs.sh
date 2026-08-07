@@ -66,11 +66,20 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 6144323. The portable wrapper
-# obtains the repository's recorded pin through the canonical checker and
-# carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6144323c5dab8b521278fce206f8774360c2b05f ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6144323c5dab8b521278fce206f8774360c2b05f" >&2
+# The calibration below is valid only for a Reverie revision whose DynamoRIO
+# recipe inputs match ci/reverie-dbi-budget-calibration.env. The portable
+# wrapper obtains the repository's recorded pin through the canonical checker,
+# validates it against that record, and carries it here; a recipe change cannot
+# silently retain the old clamp or threshold.
+#
+# This is re-checked here rather than trusted from the wrapper: this file is
+# also sourced directly, so accepting an inherited REVERIE_DBI_BUDGET_BOUND_PIN
+# on faith would let a caller assert its own calibration. Independent
+# re-derivation is the point of the second check.
+# shellcheck source=ci/reverie-dbi-budget-calibration.env
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/reverie-dbi-budget-calibration.env"
+if ! reverie_dbi_budget_pin_is_calibrated "${REVERIE_DBI_BUDGET_BOUND_PIN:-}" >/dev/null; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to a Reverie revision matching calibrated DynamoRIO recipe key $REVERIE_DBI_CALIBRATED_RECIPE_KEY" >&2
     return 2
 fi
 
