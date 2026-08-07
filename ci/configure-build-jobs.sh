@@ -66,13 +66,85 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 038e993. The portable wrapper
-# obtains the repository's recorded pin through the canonical checker and
-# carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
+# Independently re-derive the repository's one recorded Reverie pin. The
+# wrapper carries that value with the budget tuple, while this check prevents a
+# direct or stale caller from substituting a different well-formed SHA. The
+# canonical scanner is the only pin authority; never mirror its result here.
+budget_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if ! budget_recorded_pin=$(
+    "$budget_repo_root/ci/run-reverie-pin-check.sh" \
+        --repo "$budget_repo_root" --print-pin
+); then
+    echo "configure-build-jobs.sh: could not derive the recorded Reverie pin" >&2
     return 2
 fi
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != "$budget_recorded_pin" ]]; then
+    echo "configure-build-jobs.sh: DBI budget pin ${REVERIE_DBI_BUDGET_BOUND_PIN:-<unset>} does not match recorded Reverie pin $budget_recorded_pin" >&2
+    return 2
+fi
+
+# Carry the measured threshold with the condition that makes it valid. The
+# pin is not that condition: it changed repeatedly while the DynamoRIO recipe
+# stayed byte-identical. reverie-dbi/build.rs computes its recipe key from its
+# own blob, vendor/dynamorio, CMAKE, and CMAKE_GENERATOR. Resolve the exact
+# package selected by locked Cargo metadata and compare those inputs before the
+# budget can reach the command. These calibrated object ids are stable recipe
+# identities, not a second list of moving Reverie pins.
+REVERIE_DBI_CALIBRATED_RECIPE_KEY=76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d
+REVERIE_DBI_CALIBRATED_BUILD_RS_OBJECT=9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
+REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT=de352475846e385002c1e4e54604fa0a7647b2de
+REVERIE_DBI_CALIBRATED_BASIS=github-portable-cold-miss-n3-affinity4
+
+if ! budget_metadata=$(cargo metadata --format-version 1 --locked \
+    --manifest-path "$budget_repo_root/Cargo.toml"); then
+    echo "configure-build-jobs.sh: could not resolve locked Cargo metadata for the DBI budget" >&2
+    return 2
+fi
+if ! budget_dbi_manifest=$(jq -er '
+    [.packages[] | select(.name == "reverie-dbi") | .manifest_path]
+    | unique
+    | if length == 1 then .[0] else error("expected exactly one reverie-dbi package") end
+' <<<"$budget_metadata"); then
+    echo "configure-build-jobs.sh: locked Cargo metadata did not identify exactly one reverie-dbi package" >&2
+    return 2
+fi
+if ! budget_reverie_root=$(git -C "$(dirname -- "$budget_dbi_manifest")" rev-parse --show-toplevel) ||
+    ! budget_package_pin=$(git -C "$budget_reverie_root" rev-parse HEAD) ||
+    ! budget_build_rs_object=$(git -C "$budget_reverie_root" rev-parse HEAD:reverie-dbi/build.rs) ||
+    ! budget_vendor_object=$(git -C "$budget_reverie_root" rev-parse HEAD:reverie-dbi/vendor/dynamorio); then
+    echo "configure-build-jobs.sh: could not derive the selected Reverie DBI recipe inputs" >&2
+    return 2
+fi
+
+budget_recipe_mismatch=0
+if [[ $budget_package_pin != "$budget_recorded_pin" ]]; then
+    echo "configure-build-jobs.sh: Cargo selected Reverie $budget_package_pin, not recorded pin $budget_recorded_pin" >&2
+    budget_recipe_mismatch=1
+fi
+if [[ $budget_build_rs_object != "$REVERIE_DBI_CALIBRATED_BUILD_RS_OBJECT" ]]; then
+    echo "configure-build-jobs.sh: reverie-dbi/build.rs object $budget_build_rs_object does not match calibrated object $REVERIE_DBI_CALIBRATED_BUILD_RS_OBJECT" >&2
+    budget_recipe_mismatch=1
+fi
+if [[ $budget_vendor_object != "$REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT" ]]; then
+    echo "configure-build-jobs.sh: reverie-dbi/vendor/dynamorio object $budget_vendor_object does not match calibrated object $REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT" >&2
+    budget_recipe_mismatch=1
+fi
+if [[ ${CMAKE-cmake} != cmake ]]; then
+    echo "configure-build-jobs.sh: CMAKE=${CMAKE} changes calibrated DynamoRIO recipe key $REVERIE_DBI_CALIBRATED_RECIPE_KEY" >&2
+    budget_recipe_mismatch=1
+fi
+if [[ -v CMAKE_GENERATOR ]]; then
+    echo "configure-build-jobs.sh: CMAKE_GENERATOR changes calibrated DynamoRIO recipe key $REVERIE_DBI_CALIBRATED_RECIPE_KEY" >&2
+    budget_recipe_mismatch=1
+fi
+if ((budget_recipe_mismatch != 0)); then
+    echo "configure-build-jobs.sh: DBI budget recipe mismatch; re-measure before applying its threshold" >&2
+    return 2
+fi
+REVERIE_DBI_BUDGET_RECIPE_BINDING=locked-cargo-git-object-identities
+unset budget_build_rs_object budget_dbi_manifest budget_metadata
+unset budget_package_pin budget_recipe_mismatch budget_recorded_pin
+unset budget_repo_root budget_reverie_root budget_vendor_object
 
 if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
     REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
@@ -200,26 +272,6 @@ fi
 # hosted-runner budget carries without re-derivation. Evidenced by tree identity
 # rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178 and 0ae0c01
 # carries above: no DBI build input changed, so there is nothing to re-measure.
-#
-# CARRY TO 038e993 (2026-08-07). NOTE: unlike the 6a6b4ec/dd3c178/0ae0c01/6144323
-# carries above, the whole reverie-dbi subtree is NOT identical this time, so the
-# argument is narrower and is stated explicitly rather than reused.
-#
-# 6144323..038e993 touches reverie-dbi/native/client.c, two test fixtures
-# (first_scrub_marker.c, stack_scrub_marker.c) and one test
-# (stack_scrub_preserves_guest_data.rs).
-#
-# The budget governs exactly one quantity: the elapsed time build_dynamorio()
-# reports on a DynamoRIO content-key MISS. source_recipe_key() is computed over
-# (source_dir = reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs, $CMAKE,
-# $CMAKE_GENERATOR) -- see reverie-dbi/build.rs:75-80 -- and ALL FOUR are
-# unchanged: vendor/dynamorio and build.rs are byte-identical at both pins.
-# build_dynamorio() only cmake-configures and cmake-builds source_dir
-# (build.rs:199-220); native/client.c is not referenced by build.rs at all and is
-# compiled outside the timed region. So the recipe identity remains
-# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
-# MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost is
-# unaffected by a client.c edit.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
