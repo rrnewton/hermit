@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-void reverie_liteinst_initialize(void) {}
+void hermit_liteinst_initialize(void) {}
 
 uint64_t reverie_liteinst_site_trap_count(uint64_t address) {
   (void)address;
