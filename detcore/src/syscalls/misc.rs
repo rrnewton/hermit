@@ -45,8 +45,18 @@ const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
 
-fn require_positive_process_group(pgid: i64) -> Result<i64, Errno> {
-    if pgid > 0 { Ok(pgid) } else { Err(Errno::EIO) }
+const INITIAL_NAMESPACE_PROCESS_GROUP: i64 = 1;
+
+fn virtualize_process_group_identity(pgid: i64) -> Result<i64, Errno> {
+    match pgid {
+        0 => Ok(INITIAL_NAMESPACE_PROCESS_GROUP),
+        value if value > 0 => Ok(value),
+        _ => Err(Errno::EIO),
+    }
+}
+
+fn is_current_process_group_query(requested_pid: i64, current_pid: i64) -> bool {
+    requested_pid == 0 || requested_pid == current_pid
 }
 
 fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
@@ -629,38 +639,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1933): Review root process-group normalization and
-    // the positive identity invariant for getpgid/getpgrp.
-    /// Give the root guest a real process group when its PID namespace inherited
-    /// one whose leader is outside the namespace. Linux renders that external
-    /// leader as 0. Creating the group before the first guest instruction makes
-    /// subsequent getpgid/getpgrp, fork inheritance, setpgid, and setsid use the
-    /// kernel's ordinary process-group state instead of fabricating return values.
-    pub async fn normalize_initial_process_group<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-    ) -> Result<(), Error> {
-        let initial = guest.inject(syscalls::Getpgrp::new()).await?;
-        if initial == 0 {
-            guest
-                .inject(syscalls::Setpgid::new().with_pid(0).with_pgid(0))
-                .await?;
-            require_positive_process_group(guest.inject(syscalls::Getpgrp::new()).await?)?;
-        } else {
-            require_positive_process_group(initial)?;
-        }
-        Ok(())
-    }
-
-    /// getpgid backed by the kernel process-group state established before the
-    /// root guest executes. A non-positive successful result would violate the
-    /// identity invariant and is rejected rather than exposed to the guest.
+    // TODO-HUMAN-REVIEW(PR-1933): Review zero-only process-group identity
+    // virtualization and the self-query alias used for backend parity.
+    /// Preserve positive kernel process-group identities, but replace Linux's
+    /// namespace-visible zero (an inherited group whose leader is outside the
+    /// namespace) with the stable identity of the namespace's initial group.
+    /// This query-only mapping deliberately leaves setpgid and setsid kernel
+    /// state and error semantics untouched.
     pub async fn handle_getpgid<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Getpgid,
     ) -> Result<i64, Error> {
-        Ok(require_positive_process_group(guest.inject(call).await?)?)
+        // The pinned Reverie Getpgid wrapper retains the raw pid argument but
+        // does not expose a typed getter for it.
+        let requested_pid = syscalls::SyscallArgs::from(call).arg0 as libc::pid_t as i64;
+        let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+        let pgid = if is_current_process_group_query(requested_pid, current_pid) {
+            // getpgrp is exactly getpgid(0). Using the alias for both zero and
+            // the current pid also covers backends that implement only getpgrp.
+            guest.inject(syscalls::Getpgrp::new()).await?
+        } else {
+            // Preserve explicit non-self lookup and kernel/backend errors.
+            guest.inject(call).await?
+        };
+        Ok(virtualize_process_group_identity(pgid)?)
     }
 
     /// getpgrp alias of getpgid(0), with the same positive identity invariant.
@@ -669,7 +672,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getpgrp,
     ) -> Result<i64, Error> {
-        Ok(require_positive_process_group(guest.inject(call).await?)?)
+        Ok(virtualize_process_group_identity(
+            guest.inject(call).await?,
+        )?)
     }
 
     /// setsid system call
@@ -802,10 +807,18 @@ mod tests {
 
     #[test]
     fn process_group_identity_must_be_positive() {
-        assert_eq!(require_positive_process_group(3), Ok(3));
-        assert_eq!(require_positive_process_group(1), Ok(1));
-        assert_eq!(require_positive_process_group(0), Err(Errno::EIO));
-        assert_eq!(require_positive_process_group(-1), Err(Errno::EIO));
+        assert_eq!(virtualize_process_group_identity(3), Ok(3));
+        assert_eq!(virtualize_process_group_identity(1), Ok(1));
+        assert_eq!(virtualize_process_group_identity(0), Ok(1));
+        assert_eq!(virtualize_process_group_identity(-1), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn getpgid_self_queries_use_the_getpgrp_alias() {
+        assert!(is_current_process_group_query(0, 37));
+        assert!(is_current_process_group_query(37, 37));
+        assert!(!is_current_process_group_query(38, 37));
+        assert!(!is_current_process_group_query(-1, 37));
     }
 
     #[test]
