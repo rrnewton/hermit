@@ -338,6 +338,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/instruction_nondeterminism.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace verify; explicit native mode)",
+      "why": "tests/backend-parity/fixtures/instruction_nondeterminism.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace verify; explicit native mode): Blocking ptrace establishes the CPUID/RDTSC reference trajectory, native multi-run execution brackets real instruction nondeterminism, and LiteInst remains explicitly disabled until direct RDRAND/RDSEED interception is proven"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/ioctl_fionread.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/ioctl_fionread.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

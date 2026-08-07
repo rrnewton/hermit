@@ -396,6 +396,67 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "backend-parity-c/instruction-nondeterminism"
+description = "Repeated CPUID/RDTSC trajectory plus direct RDRAND/RDSEED interception"
+lane = "privileged"
+requires = ["linux", "x86_64", "userns", "ptrace", "cpuid", "rdrand", "rdseed", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/instruction_nondeterminism.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+guest_args = { ptrace = ["--respect-features"] }
+[test.modes.verify.backends_disabled]
+dbi = "Qualify the direct instruction trajectory separately after the ptrace baseline"
+kvm = "KVM instruction interception is measured by its dedicated guest path"
+sabre = "SaBRe does not yet provide the complete direct instruction contract"
+liteinst = "Reverie PR #405 intercepts CPUID/RDTSC but does not yet hook direct RDRAND/RDSEED opcodes"
+
+[test.modes.naked]
+ci = false
+runs = 5
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+guest_args = { native = ["--plant-nondeterminism"] }
+[test.modes.naked.backends_disabled]
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from direct instruction interception"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The single-threaded instruction probe has no schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "The verify and naked modes own the deterministic and planted-negative contracts"
+dbi = "No custom direct-instruction contract has been qualified"
+kvm = "No custom direct-instruction contract has been qualified"
+sabre = "No custom direct-instruction contract has been qualified"
+liteinst = "Enable verify with --force-random after direct random-instruction hooks exist"
+
+[[test]]
 id = "backend-parity-c/cpuid-probe"
 description = "Strict verification for tests/backend-parity/fixtures/cpuid_probe.c"
 lane = "privileged"
