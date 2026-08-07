@@ -534,11 +534,17 @@ impl GlobalState {
             // TODO: output summary in machine-readable, JSON form.
             eprint!("{}\n{}", banner, summary);
         } else {
-            // Separate out the nondeterministic bits and print them at debug level:
+            // Separate out the nondeterministic bits and print them at trace
+            // level. This is wall-clock time, so it differs between otherwise
+            // identical runs; keeping it at `debug!` made the DEBUG log
+            // gratuitously irreproducible. Same treatment as the other
+            // deliberately-suppressed nondeterministic lines (see
+            // `detcore/src/scheduler.rs` around the polling-retry time
+            // advance), and it remains available at `--log=trace`.
             let rt = summary.realtime_elapsed.take();
             info!("\n{}\n{}", banner, summary);
             if let Some(x) = rt {
-                debug!("Nondeterministic realtime elapsed: {:?}", x);
+                trace!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
     }
