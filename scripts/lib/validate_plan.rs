@@ -265,6 +265,8 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_MEM_BYTES,
         ),
         node(
+            // Tag must stay `pre.reverie_pin`: scripts/validate.rs asserts a
+            // passing node with exactly this tag before it will emit a PASS.
             "pre",
             "reverie_pin",
             "Reverie pin consistency",
