@@ -2239,12 +2239,7 @@ mod tests {
         // POSITIVE: exactly the four ownership-mutation syscalls are in the
         // predicate AND are classified Determinized, so the lib.rs dispatch arm
         // that matches on the predicate is actually reachable for them.
-        for sysno in [
-            Sysno::chown,
-            Sysno::fchown,
-            Sysno::fchownat,
-            Sysno::lchown,
-        ] {
+        for sysno in [Sysno::chown, Sysno::fchown, Sysno::fchownat, Sysno::lchown] {
             assert!(
                 is_ownership_change_noop_syscall(sysno),
                 "{sysno:?} must be in the ownership-change no-op set"
