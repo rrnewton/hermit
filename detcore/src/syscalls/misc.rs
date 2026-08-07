@@ -629,7 +629,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-pending): Review root process-group normalization and
+    // TODO-HUMAN-REVIEW(PR-1933): Review root process-group normalization and
     // the positive identity invariant for getpgid/getpgrp.
     /// Give the root guest a real process group when its PID namespace inherited
     /// one whose leader is outside the namespace. Linux renders that external
