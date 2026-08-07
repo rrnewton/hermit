@@ -42,7 +42,19 @@ struct KeyChurn {
 }
 
 impl KeyChurn {
-    fn start() -> Option<Self> {
+    /// Start the churn, or fail the test.
+    ///
+    /// This deliberately does NOT return `Option` and does NOT skip. Without a
+    /// live key the quota columns never move, so a "deterministic" reading of
+    /// `/proc/key-users` proves nothing: the file would have been constant with
+    /// or without Hermit. A run that cannot churn has produced a NO-RESULT, and
+    /// reporting a no-result as a pass is what let this test report `ok` in
+    /// 0.7s while exercising nothing on any host lacking keyring support.
+    ///
+    /// There is deliberately no environment opt-out, because an opt-out would
+    /// just be the same silent pass under a new spelling. The adjacent
+    /// `/proc/key-users` existence check already hard-fails; this now matches it.
+    fn start() -> Self {
         let key_type = CString::new("user").unwrap();
         let description = CString::new(format!("hermit-key-users-{}", std::process::id())).unwrap();
         let payload = b"x";
@@ -56,13 +68,13 @@ impl KeyChurn {
                 KEY_SPEC_SESSION_KEYRING,
             )
         };
-        if key < 0 {
-            eprintln!(
-                "skipping /proc/key-users portable regression: add_key failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
-        }
+        assert!(
+            key >= 0,
+            "add_key failed ({}); /proc/key-users cannot be churned, so this test \
+             cannot establish determinism and must not report success. A host \
+             running this lane needs kernel keyring support (CONFIG_KEYS).",
+            std::io::Error::last_os_error()
+        );
 
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
@@ -89,12 +101,12 @@ impl KeyChurn {
             }
         });
 
-        Some(Self {
+        Self {
             key,
             stop,
             failed,
             worker: Some(worker),
-        })
+        }
     }
 
     fn assert_healthy(&self) {
@@ -197,6 +209,85 @@ fn assert_l2(case: &ProgramCase) {
     );
 }
 
+/// AUTONOMOUS-BOT-IMPLEMENTED
+/// TODO-HUMAN-REVIEW(PR-951): Review /proc/key-users access-form mediation.
+///
+/// Review items 1 and 2 on PR #951 predicted that alias spellings,
+/// dirfd-relative opens and positioned reads would bypass `/proc/key-users`
+/// normalization. The systemic procfs work (issue #973) closed all of them
+/// before this test existed; it is here so a regression is caught by CI rather
+/// than rediscovered by review. Nine access forms, all compared against the
+/// plain-`read` snapshot: seven must be mediated, two (`readv`, `preadv`) must
+/// be refused with ENOSYS. The probe asserts the refusal rather than counting
+/// it as mediation.
+#[test]
+fn key_users_access_forms_are_mediated_or_refused() {
+    let _guard = hermit_run_lock();
+    assert!(
+        Path::new(PROC_KEY_USERS).is_file(),
+        "{PROC_KEY_USERS} is required for the portable regression"
+    );
+    // Churn so the host file is genuinely moving underneath the guest; a stable
+    // host file would let a bypass masquerade as mediation.
+    let churn = KeyChurn::start();
+    assert_churn_is_visible(&churn);
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let source = repository.join("tests/c/key_users_access_forms_probe.c");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("key-users-access-forms-probe");
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile key-users access-form probe");
+    assert!(
+        compile.status.success(),
+        "probe compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new("timeout")
+        .args(["--kill-after", "10s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--backend=ptrace",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .output()
+        .expect("failed to run key-users access-form probe");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "strict run failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        run.status
+    );
+    // Each marker proves its group actually executed, so a probe that exited
+    // early cannot be mistaken for a pass.
+    for marker in [
+        "key-users-positioned-mediated-ok",
+        "key-users-vectored-refused-ok",
+        "key-users-aliases-mediated-ok",
+        "key-users-snapshot-stable-ok",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "probe omitted {marker}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    churn.assert_healthy();
+}
+
 #[test]
 fn key_user_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
@@ -204,9 +295,7 @@ fn key_user_consumers_are_deterministic_under_strict_verify() {
         Path::new(PROC_KEY_USERS).is_file(),
         "{PROC_KEY_USERS} is required for the portable regression"
     );
-    let Some(churn) = KeyChurn::start() else {
-        return;
-    };
+    let churn = KeyChurn::start();
     assert_churn_is_visible(&churn);
 
     let cases = [
