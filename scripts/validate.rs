@@ -660,6 +660,56 @@ fn self_test() -> Result<(), String> {
     super_plan_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
+    // ---- DAG-config carry + ungrantable-resource brackets -------------------
+    // BOTH directions. A check that refuses everything would pass the negative
+    // case alone, so the positive case (a real lane admits) is load-bearing.
+    {
+        let root = repo_root();
+        for lane in ["portable", "privileged"] {
+            let base = validate_plan::lane_config(&root, lane)?;
+            // POSITIVE: a real lane's own config must carry, and must be grantable.
+            let steps = validate_plan::lane_nodes(&root, lane, "", "gate.manifest")?;
+            let carried = validate_plan::config_from_base(&base, steps, "bracket");
+            validate_plan::assert_config_carried(&base, &carried)
+                .map_err(|e| format!("carry bracket: lane {lane} did not carry its config: {e}"))?;
+            if base.resource_caps.is_empty() {
+                return Err(format!("carry bracket: lane {lane} declares no resource_caps; \
+                                    the bracket would be vacuous"));
+            }
+            let bad = validate_plan::ungrantable_resources(&carried);
+            if !bad.is_empty() {
+                return Err(format!(
+                    "grantable bracket: lane {lane} carried its caps yet still reports {} \
+                     ungrantable demand(s): {:?}", bad.len(), &bad[..bad.len().min(3)]));
+            }
+            // NEGATIVE: drop the caps exactly as the bug did -> must be REFUSED,
+            // and must NAME the resource rather than sleeping on it.
+            let mut stripped = carried.clone();
+            stripped.resource_caps.clear();
+            let starved = validate_plan::ungrantable_resources(&stripped);
+            if starved.is_empty() {
+                return Err(format!(
+                    "grantable bracket: lane {lane} with resource_caps CLEARED reported nothing \
+                     ungrantable -- the check is inert and would not have caught the stall"));
+            }
+            let named = base.resource_caps.keys().any(|r| starved.iter().any(|b| b.contains(r)));
+            if !named {
+                return Err(format!("grantable bracket: refusal for {lane} names no resource: {:?}",
+                                   &starved[..starved.len().min(2)]));
+            }
+            // NEGATIVE 2: a dropped config must be DETECTED, not tolerated.
+            let defaulted = validate_plan::config_from(carried.steps.clone(), "bracket");
+            if validate_plan::assert_config_carried(&base, &defaulted).is_ok() {
+                return Err(format!(
+                    "carry bracket: lane {lane} rebuilt from Default::default() compared EQUAL to \
+                     its file config -- the assertion cannot detect the bug it exists for"));
+            }
+            println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
+cleared-caps refusal names {} starved step(s)",
+                     base.resource_caps.len(), base.default_step_timeout, starved.len());
+        }
+    }
+
     Ok(())
 }
 
@@ -1672,8 +1722,18 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         for s in b.iter_mut() {
             s.deps.retain(|d| d != gate);
         }
-        let cfg_a = validate_plan::config_from(a, "portable lane");
-        let cfg_b = validate_plan::config_from(b, "privileged lane");
+        // Each lane carries ITS OWN loaded config. They genuinely differ --
+        // portable default_step_timeout=600 vs privileged=120, and disjoint
+        // resource_caps -- so there is no correct single merged value; running
+        // them as two sequential DAGs lets each keep its own exactly.
+        let base_a = validate_plan::lane_config(root, lanes[0])?;
+        let base_b = validate_plan::lane_config(root, lanes[1])?;
+        let cfg_a = validate_plan::config_from_base(&base_a, a, "portable lane");
+        let cfg_b = validate_plan::config_from_base(&base_b, b, "privileged lane");
+        for (base, derived, lane) in [(&base_a, &cfg_a, lanes[0]), (&base_b, &cfg_b, lanes[1])] {
+            validate_plan::assert_config_carried(base, derived)
+                .map_err(|e| format!("lane {lane}: DAG config was not carried: {e}"))?;
+        }
         let mut planned = test_nodes_of(&cfg_a);
         planned.extend(test_nodes_of(&cfg_b));
         return Ok(Plan {
@@ -1700,7 +1760,36 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
-    let cfg = validate_plan::config_from(steps, "fused lanes");
+    // Fusing lanes means one config for both, but their configs DISAGREE
+    // (portable default_step_timeout=600 vs privileged=120). Any single value
+    // silently loosens one lane or tightens the other, so refuse rather than
+    // guess; resource_caps are disjoint and merge cleanly.
+    let bases: Vec<DagConfig> = lanes
+        .iter()
+        .map(|l| validate_plan::lane_config(root, l))
+        .collect::<Result<_, _>>()?;
+    let mut fused = bases[0].clone();
+    for (b, lane) in bases.iter().zip(lanes.iter()).skip(1) {
+        if b.default_step_timeout != fused.default_step_timeout {
+            return Err(format!(
+                "--merge-lanes refused: lane {} declares default_step_timeout={} but {} declares {}; \
+                 one fused value would loosen one lane or tighten the other. Run the lanes \
+                 sequentially (the default) so each keeps its own.",
+                lane, b.default_step_timeout, lanes[0], fused.default_step_timeout
+            ));
+        }
+        for (r, n) in &b.resource_caps {
+            if let Some(prev) = fused.resource_caps.get(r) {
+                if prev != n {
+                    return Err(format!(
+                        "--merge-lanes refused: resource {r} capped at {prev} and {n} by different lanes"
+                    ));
+                }
+            }
+            fused.resource_caps.insert(r.clone(), *n);
+        }
+    }
+    let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -3249,6 +3338,31 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
     // while the driver still printed "boxing ACTIVE" — a green verifying less
     // than it claims. Refuse rather than run.
+    // FAIL CLOSED on capacity that can never be granted. A step demanding a
+    // resource the config does not cap is unschedulable forever, and the
+    // scheduler expresses that as an infinite 50 ms sleep, not an error --
+    // measured: 21 of ~58 nodes done, then 14 minutes at 0% CPU with no exit.
+    // Refuse here so it is a named refusal before anything runs.
+    let mut ungrantable = validate_plan::ungrantable_resources(&plan.cfg);
+    if let Some(second) = &plan.second {
+        ungrantable.extend(validate_plan::ungrantable_resources(second));
+    }
+    if !ungrantable.is_empty() {
+        return RunSummary::refused(
+            3,
+            &plan.profile,
+            "ungrantable scarce-resource demand",
+            vec![
+                format!("{} step(s) demand capacity the DAG config never grants:", ungrantable.len()),
+            ]
+            .into_iter()
+            .chain(ungrantable.iter().take(8).map(|b| format!("  {b}")))
+            .chain(std::iter::once(
+                "the scheduler would sleep forever rather than fail: its only exit is                  running.is_empty() && done+skipped >= steps.len()".to_string(),
+            ))
+            .collect(),
+        );
+    }
     let mut undeclared = validate_plan::undeclared_nodes(&plan.cfg);
     if let Some(second) = &plan.second {
         undeclared.extend(validate_plan::undeclared_nodes(second));
