@@ -40,6 +40,9 @@ JOBS="${DEMO08_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
 CALIBRATION_SEEDS="${DEMO08_CALIBRATION_SEEDS:-64}"
 CALIBRATION_TIMEOUT="${DEMO08_CALIBRATION_TIMEOUT:-30}"
+# Test-only injection point. The runner receives SEED and IMAGE and writes the
+# same combined stdout/stderr that a real Hermit invocation would produce.
+CALIBRATION_RUNNER="${DEMO08_CALIBRATION_RUNNER:-}"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -58,48 +61,111 @@ done
 calibrate_crash_seed() {
   local artifacts="${DEMO08_ARTIFACTS:-$ROOT/ignored/demo08-run}"
   local image="$artifacts/chaos-buggy.img"
-  local output="$artifacts/.calibration.out"
-  local seed rc
+  local report="$artifacts/calibration.tsv"
+  local output seed source rc engagement uaf
+  local cached_seed=""
+  local attempted=0
+  local engaged=0
+  local uaf_hits=0
+  local found_seed=""
+  local -a seeds=()
+  local -a sources=()
 
   if [ -r "$ASSETS/.crash-seed" ]; then
-    seed="$(cat "$ASSETS/.crash-seed")"
-    [[ $seed =~ ^[0-9]+$ ]] || fail "invalid cached Demo 8 crash seed: $seed"
-    echo "Demo 8 crash seed ready (cached seed $seed)"
-    return
+    cached_seed="$(cat "$ASSETS/.crash-seed")"
+    [[ $cached_seed =~ ^[0-9]+$ ]] || \
+      fail "invalid cached Demo 8 crash seed: $cached_seed"
+    # A cache is only a selection hint, never evidence. Replay it and record
+    # both path engagement and the UAF signature before accepting it.
+    seeds+=("$cached_seed")
+    sources+=(cached)
   fi
+  for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
+    seeds+=("$seed")
+    sources+=(cold)
+  done
 
-  if [ ! -x "$HERMIT_RELEASE" ]; then
+  if [ -z "$CALIBRATION_RUNNER" ] && [ ! -x "$HERMIT_RELEASE" ]; then
     echo "Building release Hermit for Demo 8 seed calibration..."
     make -C "$ROOT" --no-print-directory build-hermit
   fi
-  [ -x "$HERMIT_RELEASE" ] || fail "release Hermit is unavailable: $HERMIT_RELEASE"
+  if [ -z "$CALIBRATION_RUNNER" ]; then
+    [ -x "$HERMIT_RELEASE" ] || \
+      fail "release Hermit is unavailable: $HERMIT_RELEASE"
+  else
+    [ -x "$CALIBRATION_RUNNER" ] || \
+      fail "Demo 8 calibration runner is not executable: $CALIBRATION_RUNNER"
+  fi
 
   mkdir -p "$artifacts"
+  printf 'seed\tsource\tengagement\tuaf\texit\toutput\n' >"$report"
   echo "Calibrating a deterministic crashing seed for this exact fixture..."
-  for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
+  for ((i = 0; i < ${#seeds[@]}; i++)); do
+    seed="${seeds[$i]}"
+    source="${sources[$i]}"
+    # Do not repeat a cached seed after it has already proved the sweep can
+    # fail. If the cached replay fails, the cold pass deliberately includes it
+    # again so the configured seed range remains complete.
+    if [ -n "$found_seed" ]; then
+      break
+    fi
     cp --reflink=auto "$ASSETS/pop-tiny.img" "$image"
+    output="$artifacts/calibration-${source}-seed-${seed}.out"
     set +e
-    # Box the bare hermit run so a livelock/escapee is reaped by cgroup.kill instead of
-    # leaking a burned core (a `timeout` wall-cap only reaches the outer hermit, not a
-    # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
-    # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
-    # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
-    "$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib \
-      --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
-      timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
-      --chaos --sched-seed "$seed" --no-virtualize-cpuid \
-      -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
+    if [ -n "$CALIBRATION_RUNNER" ]; then
+      "$CALIBRATION_RUNNER" "$seed" "$image" >"$output" 2>&1
+    else
+      # Box the bare hermit run so a livelock/escapee is reaped by cgroup.kill instead of
+      # leaking a burned core (a `timeout` wall-cap only reaches the outer hermit, not a
+      # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
+      # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
+      # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
+      "$ROOT/scripts/hermit-box-run" --passthrough \
+        --label "demo08.calib.${source}.${seed}" \
+        --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
+        timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
+        --chaos --sched-seed "$seed" --no-virtualize-cpuid \
+        -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
+    fi
     rc=$?
     set -e
+
+    attempted=$((attempted + 1))
+    engagement=did-not-reach
+    uaf=none
+    # This marker is emitted inside print_copied_inodes after the progress
+    # thread starts and immediately before its vulnerable task_period_wait.
+    if grep -qa 'Copy inodes \[' "$output"; then
+      engagement=reached
+      engaged=$((engaged + 1))
+    fi
     if grep -qa 'AddressSanitizer: heap-use-after-free' "$output"; then
-      printf '%s\n' "$seed" >"$ASSETS/.crash-seed"
-      rm -f -- "$image" "$output"
-      echo "Demo 8 crash seed calibrated: $seed (guest exit $rc)"
-      return
+      uaf=hit
+      uaf_hits=$((uaf_hits + 1))
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output" >>"$report"
+    printf '  seed=%s source=%s engagement=%s uaf=%s rc=%s output=%s\n' \
+      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output"
+
+    # A signature without the engagement witness is not accepted: it is not
+    # bound to the intended progress-thread path.
+    if [ "$engagement" = reached ] && [ "$uaf" = hit ]; then
+      found_seed="$seed"
     fi
   done
-  rm -f -- "$image" "$output"
-  fail "no ASAN UAF found in seeds 0-$((CALIBRATION_SEEDS - 1)) for the generated fixture"
+
+  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s report=%s\n' \
+    "$engaged" "$attempted" "$uaf_hits" "$attempted" "$report"
+  if [ -n "$found_seed" ]; then
+    printf '%s\n' "$found_seed" >"$ASSETS/.crash-seed"
+    echo "Demo 8 crash seed calibrated: $found_seed"
+    return
+  fi
+  if [ "$engaged" -eq 0 ]; then
+    fail "Demo 8 calibration NO-RESULT: path engagement 0/$attempted; 0 UAF hits cannot be reported as clean (report: $report)"
+  fi
+  fail "no ASAN UAF found after $attempted attempted seeds; path engagement $engaged/$attempted (report: $report)"
 }
 
 expected_stamp="prep=$PREP_VERSION btrfs=$BTRFS_COMMIT"
