@@ -364,6 +364,8 @@ function audit_ci_correspondence {
         die "shared build-job configuration accepted an invalid zero width"
     fi
 
+    # Smart affected-test selection is validated by its own dedicated harness.
+    "$ROOT_DIR/ci/test-validate-smart-selection.sh"
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
         jq -e '
