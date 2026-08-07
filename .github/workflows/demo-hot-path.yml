@@ -18,6 +18,10 @@ name: P0 Demo Gate (Hermit hot paths)
 # trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
 # detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
 on:
+  # Exercise the cache-bypassing calibration path deliberately instead of
+  # waiting for an accidental cache miss to discover that it is broken.
+  schedule:
+    - cron: "43 09 * * 0"
   push:
     branches: [main]
     paths:
@@ -62,6 +66,13 @@ on:
           ref's tip.
         required: false
         type: string
+      force_cold_calibration:
+        description: >-
+          Ignore a restored Demo 8 crash-seed hint and exercise the full cold
+          calibration path. Scheduled runs always enable this.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # Group each ref's runs, but NEVER cancel a RUNNING main demo (owner directive
@@ -81,6 +92,9 @@ concurrency:
   #     attribution (bisect a post-land main red by dispatching several `sha`
   #     inputs; they queue serially, or `git bisect` with
   #     scripts/super-validate.sh --demos-only).
+  #   * schedule -> FALSE, grouped per github.run_id (unique): the weekly
+  #     forced-cold calibration is never mistaken for or cancelled by a
+  #     change-triggered cache-replay run.
   # cancel-in-progress never touches COMPLETED runs, so a submodule bump or
   # queue-health check citing the newest completed main demo run is unaffected.
   group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
@@ -276,6 +290,7 @@ jobs:
           unshare --user --map-root-user --pid --fork true
 
       - name: Restore pinned heavy-demo assets
+        id: demo08-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -283,7 +298,50 @@ jobs:
             dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
           key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
 
+      - name: Select and label the Demo 8 calibration path
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.demo08-cache.outputs.cache-hit }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          seed_file="$SUITE_DIR/ignored/demo08-btrfs/.crash-seed"
+          seed_hint_present=false
+          if [[ -r "$seed_file" ]]; then
+            seed_hint_present=true
+          fi
+
+          if [[ "$FORCE_COLD" == true ]]; then
+            # The restored fixture/build cache remains warm; only its seed
+            # selection hint is removed in this ephemeral job. This makes the
+            # calibration consumer execute without mutating the remote cache.
+            rm -f -- "$seed_file"
+            selected_path=forced-cold-calibration
+            requested_mode=force-cold
+          elif [[ "$CACHE_HIT" == true && "$seed_hint_present" == true ]]; then
+            selected_path=cache-replay
+            requested_mode=auto
+          else
+            selected_path=cold-calibration-on-cache-miss
+            requested_mode=auto
+          fi
+
+          echo "DEMO08_SELECTED_PATH=$selected_path" >>"$GITHUB_ENV"
+          echo "DEMO08_REQUESTED_MODE=$requested_mode" >>"$GITHUB_ENV"
+          echo "::notice title=Demo 8 calibration path::$selected_path; cache_hit=${CACHE_HIT:-false}; seed_hint_present=$seed_hint_present"
+          {
+            echo "## Demo 8 calibration path"
+            echo
+            echo "- selected path: $selected_path"
+            echo "- cache restore hit: ${CACHE_HIT:-false}"
+            echo "- restored seed hint present: $seed_hint_present"
+            echo "- cadence: forced cold every Sunday at 09:43 UTC"
+            echo
+            echo "A cache-replay green is not evidence that cold calibration works."
+          } >>"$GITHUB_STEP_SUMMARY"
+
       - name: Run demos 1-8 at the exact Hermit SHA
+        id: demo-sweep
         working-directory: dev-hermit-demo-suite
         run: |
           set -euo pipefail
@@ -293,6 +351,90 @@ jobs:
           fi
           timeout --foreground --kill-after=60s 21000s \
             "${command[@]}" 2>&1 | tee demo-sweep-validation.log
+
+      - name: Record separate cache-replay and cold-calibration denominators
+        if: always()
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.demo08-cache.outputs.cache-hit }}
+          DEMO_SWEEP_OUTCOME: ${{ steps.demo-sweep.outcome }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+        run: |
+          set -euo pipefail
+          report="$SUITE_DIR/ignored/demo08-run/calibration.tsv"
+          summary="$SUITE_DIR/demo08-calibration-path.tsv"
+          cache_attempted=unmeasured
+          cache_engaged=unmeasured
+          cache_uaf=unmeasured
+          cold_attempted=unmeasured
+          cold_engaged=unmeasured
+          cold_uaf=unmeasured
+          evidence=legacy-no-report
+          actual_path_source=no-evidence
+
+          if [[ -r "$report" ]]; then
+            cache_attempted="$(awk -F '\t' 'NR > 1 && $2 == "cached" {n++} END {print n + 0}' "$report")"
+            cache_engaged="$(awk -F '\t' 'NR > 1 && $2 == "cached" && $3 == "reached" {n++} END {print n + 0}' "$report")"
+            cache_uaf="$(awk -F '\t' 'NR > 1 && $2 == "cached" && $4 == "hit" {n++} END {print n + 0}' "$report")"
+            cold_attempted="$(awk -F '\t' 'NR > 1 && $2 == "cold" {n++} END {print n + 0}' "$report")"
+            cold_engaged="$(awk -F '\t' 'NR > 1 && $2 == "cold" && $3 == "reached" {n++} END {print n + 0}' "$report")"
+            cold_uaf="$(awk -F '\t' 'NR > 1 && $2 == "cold" && $4 == "hit" {n++} END {print n + 0}' "$report")"
+            evidence=counted
+            if (( cache_attempted > 0 && cold_attempted > 0 )); then
+              actual_path_source=cache-replay+cold-calibration
+            elif (( cache_attempted > 0 )); then
+              actual_path_source=cache-replay
+            elif (( cold_attempted > 0 )); then
+              actual_path_source=cold-calibration
+            else
+              actual_path_source=no-attempts
+            fi
+          elif [[ -r "$SUITE_DIR/demo-sweep-validation.log" ]]; then
+            # Legacy parent harnesses have no counted TSV. Classify their path
+            # visibly, but keep every denominator unmeasured so the label is
+            # never promoted into evidence that the path worked.
+            if grep -q 'Demo 8 crash seed ready (cached seed' "$SUITE_DIR/demo-sweep-validation.log"; then
+              actual_path_source=cache-replay-legacy-unmeasured
+            elif grep -q 'Calibrating a deterministic crashing seed' "$SUITE_DIR/demo-sweep-validation.log"; then
+              actual_path_source=cold-calibration-legacy-unmeasured
+            fi
+          fi
+
+          parent_sha="$(git -C "$SUITE_DIR" rev-parse HEAD)"
+          printf 'event\trequested_mode\tselected_path\tcache_restore_hit\tactual_path_source\tdemo_sweep_outcome\tcache_attempted\tcache_engaged\tcache_uaf\tcold_attempted\tcold_engaged\tcold_uaf\tevidence\tparent_sha\thermit_sha\n' >"$summary"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$EVENT_NAME" "${DEMO08_REQUESTED_MODE:-unknown}" \
+            "${DEMO08_SELECTED_PATH:-unknown}" \
+            "${CACHE_HIT:-false}" "$actual_path_source" \
+            "${DEMO_SWEEP_OUTCOME:-unknown}" "$cache_attempted" \
+            "$cache_engaged" "$cache_uaf" "$cold_attempted" "$cold_engaged" \
+            "$cold_uaf" "$evidence" "$parent_sha" "$TARGET_SHA" >>"$summary"
+
+          {
+            echo
+            echo "### Demo 8 counted evidence"
+            echo
+            echo "- cache replay: attempted=$cache_attempted engaged=$cache_engaged uaf=$cache_uaf"
+            echo "- cold calibration: attempted=$cold_attempted engaged=$cold_engaged uaf=$cold_uaf"
+            echo "- actual path source: $actual_path_source"
+            echo "- demo sweep outcome: ${DEMO_SWEEP_OUTCOME:-unknown}"
+            echo "- evidence: $evidence"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # A deliberately forced cold run cannot be green on a cache replay,
+          # a missing report, zero selected cold seeds, or zero engagement.
+          if [[ "$FORCE_COLD" == true ]]; then
+            if [[ "$evidence" != counted ]]; then
+              echo "::error title=Demo 8 cold calibration NO-RESULT::forced cold calibration did not publish counted path evidence"
+              exit 1
+            fi
+            if [[ "$actual_path_source" != cold-calibration ]] || \
+               (( cache_attempted != 0 || cold_attempted == 0 || cold_engaged == 0 || cold_uaf == 0 )); then
+              echo "::error title=Demo 8 cold calibration NO-RESULT::forced cold calibration lacks a nonzero counted engagement denominator"
+              exit 1
+            fi
+          fi
 
       - name: Upload per-demo diagnostics
         if: always()
@@ -307,6 +449,8 @@ jobs:
             dev-hermit-demo-suite/ignored/demo07-drgn/
             dev-hermit-demo-suite/ignored/demo08-run/*.txt
             dev-hermit-demo-suite/ignored/demo08-run/*.out
+            dev-hermit-demo-suite/ignored/demo08-run/*.tsv
+            dev-hermit-demo-suite/demo08-calibration-path.tsv
           if-no-files-found: warn
           retention-days: 14
 
