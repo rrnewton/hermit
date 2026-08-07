@@ -23,6 +23,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # validate.sh accepts GitHub as an explicit producer only when both this
+  # workflow-owned marker and the runner-owned GITHUB_ACTIONS=true are present.
+  CI_HUB_VALIDATE_PRODUCER: github-actions-v1
   NEXTEST_VERSION: "0.9.100"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings

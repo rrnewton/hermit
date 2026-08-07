@@ -7,6 +7,31 @@
 
 set -uo pipefail
 
+# Local validation is admitted by dev-hermit's durable producer, which sets this
+# marker on the detached systemd service. GitHub Actions is the other explicit
+# producer: its workflow carries a distinct marker and the runner-provided
+# GITHUB_ACTIONS binding. Everything else is a direct invocation and must stop
+# before setup, dependency checks, builds, or validation output can begin.
+case ${CI_HUB_VALIDATE_PRODUCER:-} in
+    systemd-user-v1) ;;
+    github-actions-v1)
+        if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+            :
+        else
+            printf 'validate.sh: refusing invalid GitHub Actions producer binding.\n' >&2
+            printf 'Supported local entrypoint (run from the dev-hermit root):\n' >&2
+            printf '  ./ci-hub/ci-hub validate-run --checkout <worktree> --agent <agent> --target <exact-40-hex-head> --pr <number> -- full\n' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        printf 'validate.sh: direct invocation is disabled; refusing before validation.\n' >&2
+        printf 'Supported local entrypoint (run from the dev-hermit root):\n' >&2
+        printf '  ./ci-hub/ci-hub validate-run --checkout <worktree> --agent <agent> --target <exact-40-hex-head> --pr <number> -- full\n' >&2
+        exit 2
+        ;;
+esac
+
 # Deny warnings for every compiler and rustdoc invocation while preserving any
 # caller-provided flags.
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
@@ -4739,9 +4764,9 @@ if ((failures != 0)); then
 fi
 REVERIE_PIN_GATE_PASSED=1
 
-# Keep direct ./validate.sh invocations as self-sufficient as `make validate`.
-# This initializes Hermit's registered submodules; Cargo's pinned Reverie build
-# script separately materializes its nested DynamoRIO checkout.
+# Keep admitted validate.sh invocations self-sufficient after ci-hub has launched
+# them. This initializes Hermit's registered submodules; Cargo's pinned Reverie
+# build script separately materializes its nested DynamoRIO checkout.
 run_check "Initialize repository submodules" initialize_repository_submodules
 # Fail fast on Reverie pin drift before any heavy build/test work. Independent of
 # the pre-commit hook, which git commit --no-verify can bypass.
