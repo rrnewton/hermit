@@ -709,7 +709,7 @@ function audit_ci_correspondence {
             and .timeout >= 1200
         )] | length == 2
     ' "$DAG_ROOT/portable.json" >/dev/null ||
-        die "portable DBI builds must derive inside the child and allow 1050s DBI + 150s overhead"
+        die "portable DBI builds must derive inside the child and retain their overall timeout"
     jq -e '
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"
@@ -818,7 +818,7 @@ function audit_ci_correspondence {
                 REVERIE_DBI_BUDGET_BOUND_PIN="$recorded_pin" \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
-        [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
+        [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 334 84' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
@@ -826,20 +826,20 @@ function audit_ci_correspondence {
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
         )
-        [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
+        [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 334 21' ]] ||
             die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
 
         hosted_wrapper_log=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
                 CARGO_BUILD_JOBS=8 "$budget_wrapper" true 2>&1
         )
-        [[ $hosted_wrapper_log == *"pin:$recorded_pin,recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,recipe-binding:locked-cargo-git-object-identities,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263"* ]] ||
+        [[ $hosted_wrapper_log == *"pin:$recorded_pin,recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,recipe-binding:locked-cargo-git-object-identities,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:334,max-elapsed-seconds:84"* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
         boxed_wrapper_log=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true 2>&1
         )
-        [[ $boxed_wrapper_log == *"pin:$recorded_pin,recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,recipe-binding:locked-cargo-git-object-identities,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66"* ]] ||
+        [[ $boxed_wrapper_log == *"pin:$recorded_pin,recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,recipe-binding:locked-cargo-git-object-identities,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:334,max-elapsed-seconds:21"* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
         # The positive runs above prove the current pin's recipe is accepted.
@@ -870,7 +870,7 @@ function audit_ci_correspondence {
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
         )
-        [[ $clamp_boundaries == $'inherited-launch-cargo-build-jobs 15 15 15 child-nproc 64 16 15 1050 70\ninherited-launch-cargo-build-jobs 16 16 16 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 17 17 17 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 64 64 64 child-nproc 64 16 16 1050 66' ]] ||
+        [[ $clamp_boundaries == $'inherited-launch-cargo-build-jobs 15 15 15 child-nproc 64 16 15 334 23\ninherited-launch-cargo-build-jobs 16 16 16 child-nproc 64 16 16 334 21\ninherited-launch-cargo-build-jobs 17 17 17 child-nproc 64 16 16 334 21\ninherited-launch-cargo-build-jobs 64 64 64 child-nproc 64 16 16 334 21' ]] ||
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
@@ -880,7 +880,7 @@ function audit_ci_correspondence {
                 REVERIE_DBI_BUDGET_BOUND_PIN="$recorded_pin" \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
-        [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
+        [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 334 84\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 334 167' ]] ||
             die "child nproc boundary did not cap the budget width: $cpu_boundaries"
 
         # Split the tracked Cargo authority across two well-formed SHAs. The
@@ -926,7 +926,7 @@ function audit_ci_correspondence {
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
             REVERIE_DBI_BUDGET_BOUND_PIN="$recorded_pin" \
-            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
+            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=334 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a retired unconditioned DBI threshold"
         fi
