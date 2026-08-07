@@ -49,9 +49,32 @@ fail() {
   exit 1
 }
 
-for command in autoconf automake file git make mkfs.ext4 patch pkg-config sha256sum truncate; do
-  command -v "$command" >/dev/null 2>&1 || fail "$command is required to prepare Demo 8"
-done
+# TOOL GATES ARE SCOPED TO THE PATH THAT USES THEM.
+#
+# These ten are needed only to BUILD the btrfs-progs fixtures. Requiring them up
+# front made the cached path — stamp matches, fixtures present, calibrate and
+# exit without building anything — impossible on a host lacking a build
+# toolchain, which is the majority case for a calibration-only run and is
+# exactly what blocked the engagement test here: `autoconf is required to
+# prepare Demo 8` aborted before a single seed was attempted.
+#
+# Verified by inspection of calibrate_crash_seed rather than assumed: it invokes
+# NONE of these ten. Scoping the check therefore weakens nothing — the build
+# path still requires all of them, immediately before it builds.
+BUILD_TOOLS=(autoconf automake file git make mkfs.ext4 patch pkg-config sha256sum truncate)
+
+require_build_tools() {
+  local command
+  for command in "${BUILD_TOOLS[@]}"; do
+    command -v "$command" >/dev/null 2>&1 || fail "$command is required to build the Demo 8 fixtures"
+  done
+}
+
+# `timeout` IS used by the calibration path (it bounds every seed attempt) and
+# was not gated at all. An ungated dependency fails mid-sweep as a per-seed
+# error, which this harness would then record as a non-engaged seed -- a missing
+# tool would masquerade as "the path was never reached". Gate it up front.
+command -v timeout >/dev/null 2>&1 || fail "timeout is required to calibrate Demo 8"
 [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fail "DEMO08_BUILD_JOBS must be a positive integer"
 [[ $CALIBRATION_SEEDS =~ ^[1-9][0-9]*$ ]] || \
   fail "DEMO08_CALIBRATION_SEEDS must be a positive integer"
@@ -177,6 +200,9 @@ if [ "$(cat "$STAMP" 2>/dev/null || true)" = "$expected_stamp" ] \
   echo "Demo 8 assets ready (cached at $ASSETS)"
   exit 0
 fi
+
+# Past this point a build WILL happen, so the build toolchain is now mandatory.
+require_build_tools
 
 mkdir -p "$BUILD_ROOT"
 if [ ! -d "$SOURCE/.git" ]; then
