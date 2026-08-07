@@ -1301,6 +1301,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         } else if guest.is_root_thread() {
+            self.normalize_initial_process_group(guest).await?;
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -1885,6 +1886,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
                 Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Getpgid(s) => self.handle_getpgid(guest, s).await,
+                Syscall::Getpgrp(s) => self.handle_getpgrp(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {
