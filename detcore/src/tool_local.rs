@@ -1201,6 +1201,18 @@ impl GuestClock {
     }
 }
 
+/// Linux's initial per-task timer slack, in nanoseconds.
+///
+/// Measured on this kernel rather than assumed: a freshly-execed process reports
+/// `prctl(PR_GET_TIMERSLACK) == 50000` and `/proc/self/timerslack_ns == 50000`.
+/// Detcore reports the same figure so the guest sees real Linux's default
+/// instead of whatever slack Hermit's launcher happened to be running with.
+pub(crate) const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
+
+fn default_timer_slack_ns() -> u64 {
+    DEFAULT_TIMER_SLACK_NS
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -1257,6 +1269,26 @@ pub struct ThreadState<T> {
     /// Whether missing guest descriptors may be inspected in the current process.
     #[serde(default)]
     pub(crate) discover_live_file_metadata: bool,
+
+    /// Virtualized per-thread timer slack, in nanoseconds (`PR_SET_TIMERSLACK`
+    /// / `PR_GET_TIMERSLACK`).
+    ///
+    /// Held in Detcore rather than on the tracee. The physical value is never
+    /// written, because timer slack is not a return-value-only control: Detcore
+    /// retains genuinely host-timed paths (`record_or_replay_blocking` for
+    /// external I/O, and the `select`/`pselect6`/`ppoll` host waits), so a large
+    /// slack would change real wake latency, timeout behaviour, and external
+    /// completion ordering. Reading it from the tracee would also leak the
+    /// launcher's inherited value into the guest as unmodeled host state.
+    ///
+    /// `default_timer_slack_ns` is the value `PR_SET_TIMERSLACK 0` restores. It
+    /// is NOT a constant: Linux sets a new task's default to the creating
+    /// thread's *current* slack, so a thread created after a `SET` resets to
+    /// that inherited value rather than to the initial default.
+    #[serde(default = "default_timer_slack_ns")]
+    pub(crate) timer_slack_ns: u64,
+    #[serde(default = "default_timer_slack_ns")]
+    pub(crate) default_timer_slack_ns: u64,
 
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
@@ -1588,6 +1620,8 @@ impl<T> ThreadState<T> {
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
     /// state of the root thread of the container.
     pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
+        // (see DEFAULT_TIMER_SLACK_NS for why the root thread does not read the
+        // host's inherited slack)
         detlog!(
             "USER RAND: seeding PRNG for root thread with seed {}",
             cfg.rng_seed()
@@ -1627,6 +1661,8 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             last_accounted_user_time,
             last_accounted_system_time,
+            timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+            default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:

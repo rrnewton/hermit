@@ -84,15 +84,14 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // applications that explicitly disable or restore core-dump access.
             | libc::PR_SET_DUMPABLE
             | libc::PR_GET_DUMPABLE
-            // TODO-HUMAN-REVIEW(PR-924)
-            //
-            // Timer slack is a per-thread kernel control for coalescing timer
-            // wakeups. Detcore virtualizes sleeps and thread scheduling, so
-            // passthrough preserves Linux's set/get behavior without changing
-            // guest ordering or logical time. Recording the result also keeps
-            // the inherited default stable during replay.
-            | libc::PR_SET_TIMERSLACK
-            | libc::PR_GET_TIMERSLACK
+            // NOTE: PR_SET_TIMERSLACK / PR_GET_TIMERSLACK are deliberately
+            // absent from this list. They are not passed through; they are
+            // emulated against per-thread Detcore state in `handle_prctl`,
+            // which matches on them before reaching here. The previous
+            // passthrough was wrong in both directions: it let a large guest
+            // slack change real wake latency on Detcore's remaining host-timed
+            // paths, and it let the launcher's inherited slack leak into the
+            // guest as unmodeled host state.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#802)
             //
@@ -366,6 +365,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.option() {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-924): the determinization block for timer
+            // slack. This marker moved here from the `is_supported_prctl_option`
+            // passthrough entry, which this change removes -- the determinization
+            // now lives in these two arms rather than in the tracee.
+            //
+            // Timer slack is emulated in per-thread Detcore state and the
+            // physical tracee value is deliberately left alone; see
+            // `DEFAULT_TIMER_SLACK_NS` and `ThreadState::timer_slack_ns`.
+            libc::PR_SET_TIMERSLACK => {
+                let requested = call.arg2();
+                let state = guest.thread_state_mut();
+                // Linux: a zero argument restores this task's default rather
+                // than setting a zero slack. Any other value is stored as-is,
+                // reinterpreted as unsigned -- `prctl(PR_SET_TIMERSLACK, -1)`
+                // yields u64::MAX on real Linux and succeeds, it is not EINVAL.
+                state.timer_slack_ns = if requested == 0 {
+                    state.default_timer_slack_ns
+                } else {
+                    requested
+                };
+                Ok(0)
+            }
+            libc::PR_GET_TIMERSLACK => {
+                // The kernel returns the raw value from `prctl(2)`, whose return
+                // type is `long`; glibc's `int` wrapper is what truncates a
+                // large slack for the caller. Return the full value and let the
+                // guest's libc do exactly what it does natively.
+                Ok(guest.thread_state().timer_slack_ns as i64)
+            }
             option
                 if guest.config().backend_virtualizes_capability_prctls
                     && is_backend_virtualized_capability_prctl(option) =>
@@ -811,9 +840,6 @@ mod tests {
             // Deterministic per-process dumpability state.
             libc::PR_SET_DUMPABLE,
             libc::PR_GET_DUMPABLE,
-            // Deterministic per-thread timer-coalescing controls.
-            libc::PR_SET_TIMERSLACK,
-            libc::PR_GET_TIMERSLACK,
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,
@@ -825,6 +851,13 @@ mod tests {
         }
 
         assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
+
+        // Timer slack is emulated in `handle_prctl` against per-thread Detcore
+        // state, so it must NOT appear in the passthrough set. If it is ever
+        // re-added here, the physical tracee slack starts being written again
+        // and the host's inherited value starts leaking back to the guest.
+        assert!(!is_supported_prctl_option(libc::PR_SET_TIMERSLACK));
+        assert!(!is_supported_prctl_option(libc::PR_GET_TIMERSLACK));
     }
 
     #[test]
