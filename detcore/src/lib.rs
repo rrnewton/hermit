@@ -166,8 +166,6 @@ pub fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
 /// Running a `Determinized` syscall natively is a determinism hole even when it
 /// is not in the refusal set, because the modelling that makes it deterministic
 /// lives in a handler the backend never entered.
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1793): Review the copied-DBI-child determinized surface.
 pub fn is_determinized_syscall(sysno: Sysno) -> bool {
     matches!(
         syscall_classification::classify_syscall(sysno),
