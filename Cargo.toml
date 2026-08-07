@@ -40,3 +40,17 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# LOCAL-ONLY build override (NOT for commit) — points reverie git dep at slot checkout
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-ptrace" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-syscalls" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-process" }
+reverie-util = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-util" }
+safeptrace = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/safeptrace" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-rpc-transport" }
+reverie-dbi = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-dbi" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees/250-delegate/reverie/reverie-liteinst" }
