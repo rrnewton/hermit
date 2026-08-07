@@ -94,6 +94,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::getpgid
+        | Sysno::getpgrp
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
         | Sysno::getitimer
         | Sysno::getrandom
@@ -656,8 +659,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getppid
         | Sysno::getsid
         | Sysno::gettid
@@ -1293,7 +1294,9 @@ mod tests {
         // getgid, getegid, getresuid, getresgid) from PassThrough to
         // Determinized, so the census shifts 6 from column 1 to column 0
         // (283/89 -> 289/83). The total is unchanged and is re-asserted below.
-        assert_eq!(counts, [289, 83, 1]);
+        // getpgid/getpgrp now establish and query an explicit namespace-visible
+        // process group, shifting two more entries to Determinized.
+        assert_eq!(counts, [291, 81, 1]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1355,6 +1358,9 @@ mod tests {
             classify_syscall(Sysno::times),
             SyscallClassification::Determinized
         );
+        for sysno in [Sysno::getpgid, Sysno::getpgrp] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
         // BATCH 51: these previously fail-closed --strict; now determinized.
         for sysno in [
             Sysno::flock,
@@ -1469,8 +1475,6 @@ mod tests {
             Sysno::getppid,
             Sysno::getxattr,
             Sysno::lchown,
-            Sysno::getpgid,
-            Sysno::getpgrp,
             Sysno::getsid,
             Sysno::setpgid,
             Sysno::lgetxattr,

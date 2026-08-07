@@ -45,6 +45,10 @@ const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
 
+fn require_positive_process_group(pgid: i64) -> Result<i64, Errno> {
+    if pgid > 0 { Ok(pgid) } else { Err(Errno::EIO) }
+}
+
 fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
     if op > SECCOMP_GET_NOTIF_SIZES {
         return Err(Errno::EINVAL);
@@ -624,6 +628,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(n as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-pending): Review root process-group normalization and
+    // the positive identity invariant for getpgid/getpgrp.
+    /// Give the root guest a real process group when its PID namespace inherited
+    /// one whose leader is outside the namespace. Linux renders that external
+    /// leader as 0. Creating the group before the first guest instruction makes
+    /// subsequent getpgid/getpgrp, fork inheritance, setpgid, and setsid use the
+    /// kernel's ordinary process-group state instead of fabricating return values.
+    pub async fn normalize_initial_process_group<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        let initial = guest.inject(syscalls::Getpgrp::new()).await?;
+        if initial == 0 {
+            guest
+                .inject(syscalls::Setpgid::new().with_pid(0).with_pgid(0))
+                .await?;
+            require_positive_process_group(guest.inject(syscalls::Getpgrp::new()).await?)?;
+        } else {
+            require_positive_process_group(initial)?;
+        }
+        Ok(())
+    }
+
+    /// getpgid backed by the kernel process-group state established before the
+    /// root guest executes. A non-positive successful result would violate the
+    /// identity invariant and is rejected rather than exposed to the guest.
+    pub async fn handle_getpgid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getpgid,
+    ) -> Result<i64, Error> {
+        Ok(require_positive_process_group(guest.inject(call).await?)?)
+    }
+
+    /// getpgrp alias of getpgid(0), with the same positive identity invariant.
+    pub async fn handle_getpgrp<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getpgrp,
+    ) -> Result<i64, Error> {
+        Ok(require_positive_process_group(guest.inject(call).await?)?)
+    }
+
     /// setsid system call
     pub async fn handle_setsid<G: Guest<Self>>(
         &self,
@@ -800,6 +848,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_identity_must_be_positive() {
+        assert_eq!(require_positive_process_group(3), Ok(3));
+        assert_eq!(require_positive_process_group(1), Ok(1));
+        assert_eq!(require_positive_process_group(0), Err(Errno::EIO));
+        assert_eq!(require_positive_process_group(-1), Err(Errno::EIO));
+    }
 
     #[test]
     fn prctl_support_covers_deterministic_controls() {
