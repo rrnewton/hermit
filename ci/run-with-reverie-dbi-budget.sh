@@ -21,24 +21,20 @@ if (($# == 0)); then
     exit 2
 fi
 
-# Bind the calibration to the exact local Reverie revision before applying it.
-# --print-pin is deliberately offline: the separate latest-main gate owns the
-# network authority, while this check prevents a pin bump from silently reusing
-# an earlier revision's clamp and measured threshold.
-expected_pin=6144323c5dab8b521278fce206f8774360c2b05f
+# Bind the budget record to the exact local Reverie revision before applying
+# it. --print-pin is deliberately offline: the separate latest-main gate owns
+# the network authority, while the canonical scanner proves every tracked
+# Cargo pin site agrees. Do not duplicate the derived SHA here: doing so makes
+# a successful automatic pin bump fail until this wrapper is edited by hand.
 recorded_pin=$(
     "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
 )
-if [[ $recorded_pin != "$expected_pin" ]]; then
-    echo "run-with-reverie-dbi-budget.sh: no calibrated budget for Reverie pin $recorded_pin (expected $expected_pin)" >&2
-    exit 2
-fi
 REVERIE_DBI_BUDGET_BOUND_PIN=$recorded_pin
 export REVERIE_DBI_BUDGET_BOUND_PIN
 
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbi-budget-child
 
-echo "run-with-reverie-dbi-budget.sh: reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}" >&2
+echo "run-with-reverie-dbi-budget.sh: reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,recipe-key:$REVERIE_DBI_CALIBRATED_RECIPE_KEY,recipe-binding:$REVERIE_DBI_BUDGET_RECIPE_BINDING,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:$REVERIE_DBI_CALIBRATED_BASIS}" >&2
 
 exec "$@"
